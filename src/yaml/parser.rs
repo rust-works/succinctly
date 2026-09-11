@@ -116,6 +116,47 @@ pub struct NodeComments {
     pub foot: Vec<(u32, u32)>,
 }
 
+/// An open block sequence, as [`Parser::seq_frames`] tracks it (#1079).
+#[derive(Debug, Clone, Copy)]
+struct SeqFrame {
+    /// Identity that survives the frame's depth being reused by a later
+    /// sequence -- see [`Parser::next_seq_serial`].
+    serial: u32,
+    /// `indent_stack.len()` while this sequence is the top frame; only
+    /// used to drop entries whose frame has since been popped.
+    frame_len: usize,
+    /// The column of the sequence's `-` markers: a later node at a lower
+    /// column is a dedent out of it, which is when a floated comment can
+    /// become a foot at all.
+    indent: usize,
+    /// The nearest enclosing mapping key -- the key this sequence is the
+    /// value of, or the enclosing sequence's own when this one is nested in
+    /// an item: the node real yq gives a floated comment to as its `foot`
+    /// when the sequence closes to a following key.
+    owner_key_bp: Option<usize>,
+    /// Whether that key is this sequence's *own* (parent frame a mapping)
+    /// rather than inherited through an item. A directly-owned sequence's
+    /// floated comment is always the key's foot; an inherited one's is the
+    /// next outer item's when that is what opens next.
+    direct_key_value: bool,
+}
+
+/// A comment floated off an absent bare sequence item -- see
+/// [`Parser::floated_item_comment`] (#1079).
+#[derive(Debug, Clone, Copy)]
+struct FloatedItemComment {
+    /// Its byte range, as also held in [`Parser::pending_head_lines`].
+    range: (u32, u32),
+    /// The sequence the item belonged to, by [`SeqFrame::serial`].
+    seq_serial: u32,
+    /// That sequence's [`SeqFrame::indent`].
+    seq_indent: usize,
+    /// That sequence's [`SeqFrame::owner_key_bp`].
+    owner_key_bp: Option<usize>,
+    /// That sequence's [`SeqFrame::direct_key_value`].
+    direct_key_value: bool,
+}
+
 /// Output from parsing: the semi-index structures.
 #[derive(Debug)]
 pub struct SemiIndex {
@@ -304,6 +345,34 @@ struct Parser<'a, const HAS_CR: bool> {
     /// reach back across the boundary a second time. Consulted only by
     /// [`Self::flush_pending_head_lines`]'s no-`PREV` fallback.
     document_boundary_fallback_bp: Option<usize>,
+    /// One entry per open block sequence, innermost last (#1079). Not
+    /// popped where the frame closes -- several paths pop `indent_stack`
+    /// -- but trimmed lazily against `indent_stack.len()` wherever it is
+    /// read, which is only when a floated comment is being placed.
+    seq_frames: Vec<SeqFrame>,
+    /// Source of [`SeqFrame::serial`]; never reused, so a sequence that
+    /// closed and had another opened at the same depth is told apart from
+    /// one that is still open.
+    next_seq_serial: u32,
+    /// The most recent comment floated off a bare `- # c` item whose value
+    /// turned out absent (#1079), still sitting in
+    /// [`Self::pending_head_lines`] with the standalone lines. Real yq has
+    /// no node for such a comment and moves it: forward onto the next item
+    /// of the same sequence as its `head` (accumulating), or -- when the
+    /// sequence closes past a dedent first -- the *last* one becomes a
+    /// `foot` (see [`Self::settle_float_if_sequence_closed`] for whose)
+    /// while the rest go forward, or at end of document all of them become
+    /// the root's `foot`. The first of those is what the ordinary forward
+    /// attach already does; this records what
+    /// [`Self::flush_pending_head_lines`] needs for the other two.
+    floated_item_comment: Option<FloatedItemComment>,
+    /// Whether an absent bare `-` item, with or without a comment of its
+    /// own, has been seen since the last node that owns head/foot comments
+    /// opened (#1079). At end of document the pending block is then the
+    /// root's foot in real yq, not `PREV`'s (`- 1\n# c\n-\n` and
+    /// `- 1\n-\n# c\n` alike), whether or not a floated comment is still
+    /// in it.
+    block_passed_absent_item: bool,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -432,6 +501,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             saw_head_foot_node: false,
             seen_any_document: false,
             document_boundary_fallback_bp: None,
+            seq_frames: Vec::new(),
+            next_seq_serial: 0,
+            floated_item_comment: None,
+            block_passed_absent_item: false,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -732,16 +805,59 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Attach the pending standalone-comment block (#798), applying the
     /// measured rule in [`Self::record_standalone_comment`]'s doc comment.
     ///
-    /// `next_bp` is the node that just opened and would own the block as its
-    /// `head`, or `None` at end of input. Called at every point a node that
-    /// can own a head comment opens — a mapping key, a sequence item's
-    /// content, and a document's content node — plus once at end of parse.
-    /// A no-op when nothing is pending, which is the overwhelmingly common
-    /// case, so the hooks cost one `Vec::is_empty` each.
-    fn flush_pending_head_lines(&mut self, next_bp: Option<usize>) {
+    /// `next` is the node that just opened and would own the block as its
+    /// `head`, with the column its line starts at, or `None` at end of
+    /// input. Called at every point a node that can own a head comment
+    /// opens — a mapping key, a sequence item's content, and a document's
+    /// content node — plus once at end of parse. A no-op when nothing is
+    /// pending, which is the overwhelmingly common case, so the hooks cost
+    /// one `Vec::is_empty` each.
+    fn flush_pending_head_lines(&mut self, next: Option<(usize, usize)>) {
         if self.pending_head_lines.is_empty() {
             return;
         }
+        // The block passed through an absent bare `-` item (#1079): a
+        // comment floated off one may be in it, and real yq's placements
+        // for such a block differ from the rule below in two ways settled
+        // here. The third -- forward onto the next item of the same
+        // sequence, accumulating -- is the ordinary `NEXT.head` path and
+        // falls through to it.
+        let floated = self.floated_item_comment.take();
+        let passed_absent_item = core::mem::take(&mut self.block_passed_absent_item);
+        let Some((bp, column)) = next else {
+            if floated.is_some() || passed_absent_item {
+                // End of document: everything still pending is the root's
+                // foot, whatever `PREV` is -- `a:\n  - # c\n` answers
+                // `. | foot_comment`, not `.a | key | foot_comment`; `- # c\n`
+                // alone has no `PREV` at all yet is a foot, not a
+                // comment-only document's head; and `- 1\n# c\n-\n` is the
+                // root's, not `.[0]`'s (all measured).
+                let root = self.document_start_bp_pos;
+                self.drain_pending_into_foot(root);
+                return;
+            }
+            return self.flush_pending_head_lines_by_rule(None);
+        };
+        if let Some(floated) = floated {
+            // The sequence may have closed before this node opened: then
+            // the last floated comment becomes a foot -- of this node when
+            // it is an item of an outer sequence (`-\n  - # c\n- 2\n` is
+            // `.[1]`'s foot, measured), otherwise of the nearest enclosing
+            // key (`a:\n  - # c\n  - # d\nb: 2\n` gives `.a`'s key `d` and
+            // `.b`'s key `c`) -- and whatever else is pending goes forward
+            // as usual.
+            let is_item = self.current_type == Some(NodeType::SequenceItem);
+            self.settle_float_if_sequence_closed(floated, Some((bp, column, is_item)));
+            if self.pending_head_lines.is_empty() {
+                return;
+            }
+        }
+        self.flush_pending_head_lines_by_rule(Some(bp));
+    }
+
+    /// The #798 rule proper -- see [`Self::flush_pending_head_lines`],
+    /// which handles the floated-comment cases first.
+    fn flush_pending_head_lines_by_rule(&mut self, next_bp: Option<usize>) {
         // A blank line between the block and whatever follows detaches it
         // forward; so does having nothing follow at all. Either way it falls
         // back onto `PREV` — which `record_standalone_comment` has already
@@ -750,8 +866,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let detached_forward = next_bp.is_none() || self.blank_line_between(block_end, self.pos);
         if detached_forward {
             if let Some(prev) = self.last_head_foot_bp {
-                let pending = &mut self.pending_head_lines;
-                self.comments.entry(prev).or_default().foot.append(pending);
+                self.drain_pending_into_foot(prev);
                 return;
             }
             // No `PREV` in *this* document -- if nothing has opened here yet
@@ -761,29 +876,198 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // v4.53.3: `a: 1\n---\n# mid\n\nb: 2\n` puts `mid` on the first
             // document's own foot, not `.b`'s head, #798).
             if let Some(old_root) = self.document_boundary_fallback_bp {
-                let pending = &mut self.pending_head_lines;
-                self.comments
-                    .entry(old_root)
-                    .or_default()
-                    .foot
-                    .append(pending);
+                self.drain_pending_into_foot(old_root);
                 return;
             }
         }
         let root = self.document_start_bp_pos;
-        let pending = &mut self.pending_head_lines;
         match next_bp {
-            Some(bp) => self.comments.entry(bp).or_default().head.append(pending),
+            Some(bp) => {
+                let pending = &mut self.pending_head_lines;
+                self.comments.entry(bp).or_default().head.append(pending);
+            }
             // Nothing follows and nothing precedes it closely enough, so the
             // block belongs to the document root -- as its *foot* normally,
             // but as its *head* when the document never opened a node at all
             // (a comment-only document, where real yq answers
             // `. | head_comment`, not `foot_comment`).
-            None if self.saw_head_foot_node => {
-                self.comments.entry(root).or_default().foot.append(pending);
+            None if self.saw_head_foot_node => self.drain_pending_into_foot(root),
+            None => {
+                let pending = &mut self.pending_head_lines;
+                self.comments.entry(root).or_default().head.append(pending);
             }
-            None => self.comments.entry(root).or_default().head.append(pending),
         }
+    }
+
+    /// Move the whole pending block onto `bp`'s `foot`. The one place a
+    /// pending block leaves for a foot, so it is also where a floated item
+    /// comment (#1079) that was part of that block stops being pending --
+    /// left set, it would claim some later, unrelated block at end of
+    /// document.
+    fn drain_pending_into_foot(&mut self, bp: usize) {
+        self.floated_item_comment = None;
+        self.block_passed_absent_item = false;
+        let pending = &mut self.pending_head_lines;
+        self.comments.entry(bp).or_default().foot.append(pending);
+    }
+
+    /// Whether the block sequence [`SeqFrame::serial`] names is still on the
+    /// stack (#1079). Entries whose frame has been popped are dropped here;
+    /// a sequence that closed and had another opened at the same depth has
+    /// a different serial, so it correctly reads as closed.
+    fn sequence_still_open(&mut self, serial: u32) -> bool {
+        self.trim_seq_frames_to(self.indent_stack.len());
+        self.seq_frames.iter().any(|frame| frame.serial == serial)
+    }
+
+    /// Drop [`Self::seq_frames`] entries deeper than `max_frame_len`: their
+    /// frames were popped by one of the paths that don't touch this stack.
+    fn trim_seq_frames_to(&mut self, max_frame_len: usize) {
+        while self
+            .seq_frames
+            .last()
+            .is_some_and(|frame| frame.frame_len > max_frame_len)
+        {
+            self.seq_frames.pop();
+        }
+    }
+
+    /// The entry for the sequence just below the item frame on top of the
+    /// stack, if that sequence was registered (#1079).
+    fn enclosing_seq_frame(&mut self) -> Option<SeqFrame> {
+        let seq_frame_len = self.indent_stack.len() - 1;
+        self.trim_seq_frames_to(seq_frame_len);
+        self.seq_frames
+            .last()
+            .copied()
+            .filter(|frame| frame.frame_len == seq_frame_len)
+    }
+
+    /// A floated comment whose sequence has since closed becomes a foot
+    /// (#1079), leaving the rest of the pending block to go forward. `next`
+    /// is the node opening now, as (bp, column, is a sequence item), or
+    /// `None` when the trigger is another absent item.
+    ///
+    /// Real yq's placement, measured: a node at or past the sequence's own
+    /// column is not a dedent out of it, and the comment goes forward as
+    /// that node's head like any other (`a:\n- # c\nb: 2\n` heads `b`);
+    /// past a real dedent, the comment is the foot of the nearest enclosing
+    /// key when the sequence was that key's own value (`a:\n  - # c\nb: 2\n`,
+    /// and `k:\n- # c\n-\n` closing to an outer item alike), else -- the
+    /// sequence nested in an item -- of the outer item opening now
+    /// (`-\n  - # c\n- 2\n` is `.[1]`'s foot), or of the inherited key when
+    /// a key opens instead. A no-op while the sequence is still open, or
+    /// with no target at all (a root-level sequence nested in a sequence
+    /// closing to nothing: real yq drops the comment outright, and keeping
+    /// it pending, to go forward, is the ADR-0018 rule 4 answer to that).
+    fn settle_float_if_sequence_closed(
+        &mut self,
+        floated: FloatedItemComment,
+        next: Option<(usize, usize, bool)>,
+    ) {
+        if self.sequence_still_open(floated.seq_serial) {
+            return;
+        }
+        let target = match next {
+            Some((_, column, _)) if column >= floated.seq_indent => return,
+            Some((bp, _, true)) if !floated.direct_key_value => Some(bp),
+            _ => floated.owner_key_bp,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(idx) = self
+            .pending_head_lines
+            .iter()
+            .position(|&range| range == floated.range)
+        {
+            let range = self.pending_head_lines.remove(idx);
+            self.comments.entry(target).or_default().foot.push(range);
+        }
+    }
+
+    /// An absent item with no comment of its own (#1079): a comment
+    /// floated earlier in the *same* sequence can no longer become a foot
+    /// -- real yq heads the next key with it (`a:\n  - # c\n  -\nb: 2\n`).
+    /// One from a nested sequence that has already closed stays pending
+    /// for the next node to place (`a:\n  - b:\n      - # c\n  -\nz: 1\n`
+    /// is `.a[0].b`'s key's foot, measured). The pending lines themselves
+    /// stay to go forward -- and at end of document, lines pending after
+    /// any absent item are the root's foot (`- 1\n-\n# c\n`, measured).
+    fn end_float(&mut self) {
+        if let Some(previous) = self.floated_item_comment {
+            if self.sequence_still_open(previous.seq_serial) {
+                self.floated_item_comment = None;
+            }
+        }
+        self.block_passed_absent_item = true;
+    }
+
+    /// The owner key of the innermost open block sequence, for a sequence
+    /// about to open inside one of its items (#1079). Called before the new
+    /// sequence's own push, with the item frame on top.
+    fn enclosing_seq_owner_key(&mut self) -> Option<usize> {
+        self.enclosing_seq_frame()
+            .and_then(|frame| frame.owner_key_bp)
+    }
+
+    /// Record the block sequence that just became the top frame (#1079).
+    /// Called right after its `indent_stack`/`type_stack` push. Entries at
+    /// this depth or deeper belong to sequences that have since closed
+    /// through one of the paths that don't touch this stack, so they go
+    /// first.
+    fn register_seq_frame(
+        &mut self,
+        indent: usize,
+        owner_key_bp: Option<usize>,
+        direct_key_value: bool,
+    ) {
+        let frame_len = self.indent_stack.len();
+        self.trim_seq_frames_to(frame_len - 1);
+        let serial = self.next_seq_serial;
+        self.next_seq_serial += 1;
+        self.seq_frames.push(SeqFrame {
+            serial,
+            frame_len,
+            indent,
+            owner_key_bp,
+            direct_key_value,
+        });
+    }
+
+    /// A bare `- # c` item's trailing comment whose value turned out absent
+    /// (#1079): there is no node to attach it to, so real yq moves it -- see
+    /// [`Self::floated_item_comment`]. It joins the pending standalone
+    /// block, which is what carries it forward, in source order: the
+    /// absence lookahead has already recorded any comment-only lines that
+    /// follow it (`- # c\n# h\n- 2\n` reads `c\nh` on `.[1]`).
+    ///
+    /// Called with the item frame on top of the stack, so the sequence is
+    /// the frame below it.
+    fn float_absent_item_comment(&mut self, range: (u32, u32)) {
+        // An earlier float whose own sequence has closed since (this item
+        // is in an outer sequence: `a:\n  - b:\n      - # c\n  - # d\n`)
+        // settles onto its key's foot now, before this one takes its place
+        // as the pending float -- real yq gives `.a[0].b`'s key `c` there.
+        // One from this same sequence simply goes forward with the block.
+        if let Some(previous) = self.floated_item_comment.take() {
+            self.settle_float_if_sequence_closed(previous, None);
+        }
+        let Some(frame) = self.enclosing_seq_frame() else {
+            return; // omni-dev: coverage tolerate-line reason="unreachable: every block-sequence open registers a frame at its own depth before any item of it can be parsed (#1079)"
+        };
+        let idx = self
+            .pending_head_lines
+            .partition_point(|&(start, _)| start < range.0);
+        self.pending_head_lines.insert(idx, range);
+        self.block_passed_absent_item = true;
+        self.floated_item_comment = Some(FloatedItemComment {
+            range,
+            seq_serial: frame.serial,
+            seq_indent: frame.indent,
+            owner_key_bp: frame.owner_key_bp,
+            direct_key_value: frame.direct_key_value,
+        });
     }
 
     /// Settle a pending block whose forward attachment is already disproven
@@ -795,8 +1079,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return; // omni-dev: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
         }
         if let Some(prev) = self.last_head_foot_bp {
-            let pending = &mut self.pending_head_lines;
-            self.comments.entry(prev).or_default().foot.append(pending);
+            self.drain_pending_into_foot(prev);
         }
     }
 
@@ -810,17 +1093,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// standalone comment of their own (a comment above a nested mapping's
     /// first key belongs to that key, measured), and not for an inline
     /// `k: v`'s value node.
-    fn attach_head_foot_to_key(&mut self) {
-        self.attach_head_foot_at(self.last_open_bp_pos);
+    fn attach_head_foot_to_key(&mut self, column: usize) {
+        self.attach_head_foot_at(self.last_open_bp_pos, column);
     }
 
     /// [`Self::attach_head_foot_to_key`] for a node whose bp is known but
     /// which has not opened yet — a sequence item's content, flushed *before*
     /// `parse_value` runs so [`Self::flush_pending_head_lines`] still sees
     /// `self.pos` at the content's own line rather than past the whole value.
-    fn attach_head_foot_at(&mut self, bp: usize) {
-        self.flush_pending_head_lines(Some(bp));
+    fn attach_head_foot_at(&mut self, bp: usize, column: usize) {
+        self.flush_pending_head_lines(Some((bp, column)));
         self.last_head_foot_bp = Some(bp);
+        self.block_passed_absent_item = false;
         self.saw_head_foot_node = true;
         // A real node has now opened in this document, so a later blank
         // line detaching *its own* `PREV` must fall forward as usual, not
@@ -849,7 +1133,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// path.
     fn flush_pending_head_lines_at_boundary(
         &mut self,
-        next_bp: Option<usize>,
+        next: Option<(usize, usize)>,
         old_root_bp: Option<usize>,
     ) {
         if self.pending_head_lines.is_empty() {
@@ -859,36 +1143,42 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
             let adjacent_to_marker = !self.blank_line_between(block_end, self.pos);
             if adjacent_to_marker {
-                let pending = &mut self.pending_head_lines;
-                self.comments
-                    .entry(old_root)
-                    .or_default()
-                    .foot
-                    .append(pending);
+                self.drain_pending_into_foot(old_root);
                 return;
             }
         }
-        self.flush_pending_head_lines(next_bp);
+        self.flush_pending_head_lines(next);
     }
 
-    /// Whether a wholly blank line lies in `[from, to)` — i.e. whether the
-    /// text there holds two or more line breaks (`\r\n` counting once). One
-    /// break is just the end of the earlier line; a second means an empty
-    /// line came between.
+    /// Whether a wholly blank line (empty or inline whitespace only) lies in
+    /// `[from, to)`.
+    ///
+    /// Every caller passes `from` at the end of a comment line's text, so
+    /// the first break scanned is that line's own; `to` is always mid-line
+    /// (a key, a value, or just past a `---`), so a trailing partial line is
+    /// never counted. Lines with content in between are not blank: an
+    /// empty `-` item or a bare `-` whose value is deferred sits between a
+    /// comment block and the node it heads without attaching anything
+    /// itself, and counting its line break as a blank line sent the block
+    /// backwards onto `PREV`'s foot (`- 1\n# h\n-\n- 3\n` is `.[2]`'s head
+    /// in real yq, #1079).
     fn blank_line_between(&self, from: usize, to: usize) -> bool {
-        let mut breaks = 0usize;
+        let mut seen_content = true;
         let mut p = from;
         let end = to.min(self.input.len());
         while p < end {
-            if is_line_break(self.input[p]) {
-                breaks += 1;
-                if breaks >= 2 {
+            let byte = self.input[p];
+            if is_line_break(byte) {
+                if !seen_content {
                     return true;
                 }
+                seen_content = false;
                 // CRLF is one break.
-                if self.input[p] == b'\r' && p + 1 < end && self.input[p + 1] == b'\n' {
+                if byte == b'\r' && p + 1 < end && self.input[p + 1] == b'\n' {
                     p += 1;
                 }
+            } else if !Self::is_inline_whitespace(byte) {
+                seen_content = true;
             }
             p += 1;
         }
@@ -1805,7 +2095,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // a block still pending here may belong to the *closing* document
         // instead (see [`Self::flush_pending_head_lines_at_boundary`]).
         let root_bp = self.document_start_bp_pos;
-        self.flush_pending_head_lines_at_boundary(Some(root_bp), old_root_bp);
+        self.flush_pending_head_lines_at_boundary(Some((root_bp, 0)), old_root_bp);
         self.last_head_foot_bp = None;
         // Primes the no-`PREV` fallback for whatever comes next in the new
         // document -- see [`Self::document_boundary_fallback_bp`].
@@ -2797,11 +3087,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             || !self.sequence_frame_reaches(self.indent_stack.len() - 1, indent);
 
         if need_new_sequence {
+            // The nearest enclosing mapping key is where real yq puts a
+            // comment floated off an absent item of this sequence when the
+            // sequence closes past a dedent (#1079): the key whose value
+            // this sequence is -- the key whose line just ended -- or, for
+            // a sequence nested in a sequence item, the enclosing
+            // sequence's own. Read before the push below changes
+            // `current_type`. See `settle_float_if_sequence_closed`.
+            let (owner_key_bp, direct_key_value) = match self.current_type {
+                Some(NodeType::Mapping) => (self.last_head_foot_bp, true),
+                Some(NodeType::SequenceItem) => (self.enclosing_seq_owner_key(), false),
+                _ => (None, false),
+            };
             // Open new sequence
             self.write_bp_open();
             self.write_ty(true); // 1 = sequence
             self.indent_stack.push(indent);
             self.push_type(NodeType::Sequence);
+            self.register_seq_frame(indent, owner_key_bp, direct_key_value);
         }
 
         // Normalize to the sequence's own recorded indent for everything below:
@@ -2826,9 +3129,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // fresh line dispatch) claims it at its own, already-instrumented
         // key/wrapper-open site instead. The wrapper's own bp *is* read for
         // a bare item's (`had_property == false`) trailing comment when its
-        // value is deferred to the next line (#1079, below) — that comment
-        // has no node of its own yet, so the wrapper is the only bp
-        // available to key it against.
+        // value is deferred to a node on a later line (#1079, below) — that
+        // node hasn't opened yet, so the wrapper is the only bp available
+        // to key the comment against.
         let wrapper_bp = self.last_open_bp_pos;
 
         // Skip `- `
@@ -2867,19 +3170,60 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // value, not to the item's dash line (#784, same shape as
             // `parse_mapping_entry`'s anchor case). A property-prefixed
             // item defers it past the property (`defer_line_comment`,
-            // #784); a bare item has no property to defer past, so it's
-            // captured against the item wrapper's own bp instead (#1079) —
-            // the emitter only renders it when the deferred value
-            // materializes into a real node (a mapping, nested sequence, or
-            // scalar). An absent (null) value has nothing to attach it to
-            // and the comment is dropped here, matching current behavior —
-            // real yq floats it forward onto the next sibling item instead,
-            // which needs a multi-valued head/line/foot comment slot this
-            // codebase doesn't have yet (#798 PR2).
+            // #784). A bare item has no property to defer past, and where
+            // the comment goes depends on whether a value follows at all
+            // (#1079):
+            //
+            // - deferred to a node on a later line (a mapping, nested
+            //   sequence, or scalar): captured against the item wrapper's
+            //   own bp, which the emitter renders on the dash line (or, for
+            //   a scalar, above it) -- and that node, opening next at
+            //   `self.bp_pos`, is the one `.[i]` resolves to and real yq
+            //   answers `head_comment` from (`# h\n-\n  x\n` is `.[1]`'s
+            //   head, not `.[0]`'s foot), so any pending standalone block
+            //   attaches to it here, exactly as the plain-scalar arm below
+            //   does for `- x`;
+            // - absent (the next content is a sibling item, a dedent, or
+            //   end of input): there is no node, and real yq floats the
+            //   comment -- see `float_absent_item_comment`. An absent item
+            //   with no comment attaches nothing either, so a block above
+            //   it reaches the next item that does exist -- and it ends an
+            //   earlier floated comment's claim on the enclosing key's foot
+            //   (`a:\n  - # c\n  -\nb: 2\n` heads `b`, measured).
             if had_property {
                 self.defer_line_comment();
             } else {
-                self.maybe_capture_line_comment(wrapper_bp);
+                let trailing = self.scan_trailing_comment();
+                // The lookahead also records comment-only lines between
+                // this dash and the following content. Those sit *inside*
+                // the deferred value and belong to its first node
+                // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
+                // the lines already pending here are this value's own head.
+                let above_dash = self.pending_head_lines.len();
+                if self.following_value_is_null(indent) {
+                    match trailing {
+                        Some(range) => self.float_absent_item_comment(range),
+                        None => self.end_float(),
+                    }
+                    // A null item is still content: a block after it at end
+                    // of document is the root's foot, not a comment-only
+                    // document's head (`-\n# c\n`, measured).
+                    self.saw_head_foot_node = true;
+                } else {
+                    // The lookahead can also have *settled* the block (a
+                    // blank line after it resolves it backwards), so clamp.
+                    let above_dash = above_dash.min(self.pending_head_lines.len());
+                    let below_dash = self.pending_head_lines.split_off(above_dash);
+                    self.attach_head_foot_at(self.bp_pos, indent);
+                    self.pending_head_lines = below_dash;
+                    if let Some(range) = trailing {
+                        self.comments
+                            .entry(wrapper_bp)
+                            .or_default()
+                            .line
+                            .get_or_insert(range);
+                    }
+                }
             }
 
             // An anchor records the *next* BP position as its target, and a
@@ -2968,7 +3312,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // directly for one, with no `key` step (#798). Flushed before
             // `parse_value` so the blank-line check still sees `self.pos` on
             // the item's own line.
-            self.attach_head_foot_at(bp_pos_before_value);
+            self.attach_head_foot_at(bp_pos_before_value, indent);
             self.parse_value(indent)?;
             // Claim a comment deferred by an earlier anchor's deferred value
             // (#784): a plain-scalar item's own trailing comment lives on
@@ -3035,7 +3379,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Open key node
         self.write_bp_open();
         // Standalone comments attach to a mapping entry's *key* (#798).
-        self.attach_head_foot_to_key();
+        self.attach_head_foot_to_key(indent);
 
         // Check for a property on the key (`- &a k: v` / `- !!str k: v`) -
         // record it pointing to this key.
@@ -3281,7 +3625,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Open key node
         self.write_bp_open();
         // Standalone comments attach to a mapping entry's *key* (#798).
-        self.attach_head_foot_to_key();
+        self.attach_head_foot_to_key(indent);
 
         // Check for a property on the key - record it pointing to this key BP
         self.record_key_properties()?;
@@ -3662,6 +4006,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Check for a property before the key
         self.parse_node_properties()?;
 
+        // Standalone comments attach to the key node (#798), which every
+        // arm below opens at `self.bp_pos` -- inline, on a later line, or
+        // synthesized empty -- so attach before the dispatch, as
+        // `parse_mapping_entry` does at its key open. Also makes this key
+        // the owner of a same-indent sequence value's floated item comment
+        // (`? a\n:\n  - # c\nb: 2\n` is `.a`'s key's foot, #1079).
+        self.attach_head_foot_at(self.bp_pos, indent);
+
         // Check what the key is
         if self.at_line_end() {
             // Key content might be on next line(s), or this could be an empty key
@@ -3745,6 +4097,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_ty(true); // sequence
                 self.indent_stack.push(indent + 2); // Indent for sequence content
                 self.push_type(NodeType::Sequence);
+                // A key is nobody's value, so no owner key (#1079).
+                self.register_seq_frame(indent + 2, None, false);
 
                 // Parse first sequence item inline
                 self.write_bp_open_seq_item(); // item node

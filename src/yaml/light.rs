@@ -2237,14 +2237,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             if let Some(comment) = wrapper_comment {
                                 // #1079: real yq attaches a bare item's own
                                 // comment to the scalar node it defers to
-                                // (case C) -- an absent (null) value has no
-                                // node to attach it to and instead floats
-                                // it forward onto the next sibling item
-                                // (case D), which needs a multi-valued
-                                // head/line/foot comment slot this codebase
-                                // doesn't have yet (#798 PR2); only write
-                                // it here when the value actually
-                                // materializes. Gated on
+                                // (case C). The parser only parks a comment
+                                // on the wrapper when a child node follows,
+                                // but that child can still render as
+                                // absent -- a tag with no value (`- # c\n
+                                // !!str`), where real yq floats the comment
+                                // forward instead; leave that shape alone
+                                // rather than write a comment line above
+                                // an empty item. Gated on
                                 // `wrapper_comment.is_some()` (rare), so
                                 // this second `.value()` resolve -- on top
                                 // of the one `write_deferred_value` below
@@ -2267,21 +2267,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 sort_keys,
                             )?;
                             // A bare `- # c` item with nothing at all after
-                            // it (no key, no nested value) shares its bp
-                            // with the wrapper -- same as a genuine compact
-                            // scalar (`- foo # own`), since neither opens a
-                            // separate child node. `raw == cursor` covers
-                            // both shapes; only the absent one is a comment
-                            // `maybe_capture_line_comment` stashed here
-                            // earlier in this branch as a head-comment
-                            // slot (#1079), not a real same-line trailing
-                            // comment on a materialized node -- and real yq
-                            // never renders that inline either way (it
-                            // relocates or floats forward, #798 PR2), so
-                            // suppress it here instead of misrendering it.
-                            // A compact scalar's own genuine comment
-                            // (`is_deferred_value_absent_at` false there)
-                            // is unaffected.
+                            // it shares its bp with the wrapper -- same as
+                            // a genuine compact scalar (`- foo # own`),
+                            // since neither opens a separate child node.
+                            // The parser floats such a comment onto another
+                            // node's head/foot rather than parking it here
+                            // (#1079), with one gap: a deeper line that
+                            // writes no node (`- # c\n  !!str`, a tag with
+                            // no value, dropped along with its tag today)
+                            // reads as a present value at capture time, so
+                            // the wrapper still holds `c`. Real yq floats
+                            // that one too, so suppress it rather than
+                            // render it inline. A compact scalar's own
+                            // genuine comment (`is_deferred_value_absent_at`
+                            // false there) is unaffected.
                             let own_comment = cursor.line_comment_raw();
                             let own_comment = if own_comment.is_some()
                                 && raw.bp_position() == cursor.bp_position()

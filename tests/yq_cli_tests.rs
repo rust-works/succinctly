@@ -15934,16 +15934,26 @@ fn test_defer_line_comment_does_not_overwrite_already_pending_784() -> Result<()
 //
 // #784 (above) fixed this shape for a *property-prefixed* item (`- &x # c`);
 // this is the sibling gap for a *bare* item (`- # c`), same as #765 fixed
-// the mapping-key equivalent. Scoped to the three shapes where the deferred
-// value materializes into a real node - a mapping, a nested sequence, or a
-// scalar - since the comment is a `head_comment` on whichever node the
-// value contributes, per the issue's own oracle triage. An *absent* (null)
-// deferred value has no node to attach to; real yq instead floats the
-// comment forward onto the next sibling item that does exist, which needs a
-// multi-valued head/line/foot comment slot this codebase doesn't have yet
-// (#798 PR2) - that family stays exactly as it was (comment dropped), not a
-// regression, just not fixed here. Every expected string below was verified
-// byte-for-byte against the pinned real `yq` binary before being pinned.
+// the mapping-key equivalent. Two families, by whether the deferred value
+// exists at all:
+//
+// - it materializes into a real node (a mapping, a nested sequence, or a
+//   scalar): the comment is rendered with that node, and the tests below
+//   pin the identity output;
+// - it is *absent* (a sibling item, a dedent, or end of input follows):
+//   there is no node to attach to, and real yq *floats* the comment --
+//   forward onto the next item of the same sequence as its `head_comment`
+//   (accumulating across consecutive absent items), or, when the sequence
+//   closes to a mapping key first, the last one becomes the enclosing key's
+//   `foot_comment` while the rest go forward, or at end of document all of
+//   them become the root's `foot_comment`. The parser now attributes these
+//   exactly as yq reports them through the getters (the `_1079_float` tests
+//   below), but the streaming emitter does not yet print any head/foot
+//   comment (#2795), so the identity output for this family still drops
+//   them -- pinned as such so #2795 has to update those pins deliberately.
+//
+// Every expected value below was captured from the pinned real `yq` binary
+// before being pinned.
 
 /// The issue's own repro: a bare item's trailing comment, value deferred to
 /// a nested mapping.
@@ -16036,19 +16046,333 @@ fn test_bare_item_comment_not_exposed_via_line_comment_getter_1079() -> Result<(
     Ok(())
 }
 
-/// Known residual, out of scope for this fix: when the deferred value is
-/// *absent* (null - a sibling item follows at the same or lower indent),
-/// real yq floats the comment forward onto that sibling instead of
-/// attaching it here, which needs #798 PR2's multi-valued comment slot.
-/// Pinned as still-dropped (not the corrupted `- # c` inline rendering an
-/// earlier version of this fix produced) so a future #798 PR2 change has to
-/// deliberately update this test rather than silently drift.
+/// Run `filter` over `input` and compare its stdout (a getter's one-line
+/// answer, `\n`-terminated) against what the pinned real `yq` prints for
+/// the same pair; the message names both so a failing row is identifiable.
+fn assert_yq_getter(input: &str, filter: &str, expected: &str) -> Result<()> {
+    let (out, code) = run_yq_stdin(filter, input, &[])?;
+    assert_eq!(code, 0, "{filter} on {input:?} failed");
+    assert_eq!(out, expected, "{filter} on {input:?}");
+    Ok(())
+}
+
+/// The absent family's identity output: the comment is attributed (see the
+/// getter tests below) but not yet printed, because no emitter renders a
+/// head/foot comment at all (#2795). Real yq prints `-\n# comment\n- 2\n`.
+/// Pinned as still-dropped -- not the corrupted `- # c` inline rendering an
+/// earlier version of the A/B/C fix produced -- so #2795 has to update this
+/// deliberately rather than drift.
 #[test]
 fn test_bare_item_comment_still_dropped_when_value_absent_1079() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- # comment\n- 2\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(out, "-\n- 2\n");
+
+    let (out, code) = run_yq_stdin(".", "a:\n  - # c\n  - # d\nb: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\n  -\n  -\nb: 2\n");
     Ok(())
+}
+
+/// A sibling item follows: the comment is that item's head, whatever kind
+/// of node it is, and never the absent item's own line comment.
+#[test]
+fn test_absent_item_comment_floats_onto_next_sibling_head_1079_float() -> Result<()> {
+    assert_yq_getter("- # c\n- 2\n", ".[1] | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- 2\n", ".[0] | line_comment", "\n")?;
+    assert_yq_getter("- # c\n- 2\n", ".[0] | head_comment", "\n")?;
+    assert_yq_getter("- # c\n- 2 # own\n", ".[1] | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- 2 # own\n", ".[1] | line_comment", "own\n")?;
+    assert_yq_getter("- # c\n- &x 2\n", ".[1] | head_comment", "c\n")?;
+    assert_yq_getter("a:\n  - # c\n  - 2\n", ".a[1] | head_comment", "c\n")?;
+    assert_yq_getter("a:\n- # c\n- 2\n", ".a[1] | head_comment", "c\n")
+}
+
+/// Consecutive absent items accumulate onto the first item that exists, in
+/// source order, with any standalone comment lines in between -- `.[1]`
+/// gets nothing of its own.
+#[test]
+fn test_absent_item_comments_accumulate_forward_1079_float() -> Result<()> {
+    assert_yq_getter("- # c1\n- # c2\n- 3\n", ".[2] | head_comment", "c1\nc2\n")?;
+    assert_yq_getter("- # c1\n- # c2\n- 3\n", ".[1] | head_comment", "\n")?;
+    assert_yq_getter("- # c1\n- # c2\n- 3\n", ".[1] | line_comment", "\n")?;
+    assert_yq_getter("- # c\n# h\n- 2\n", ".[1] | head_comment", "c\nh\n")?;
+    assert_yq_getter("- # c\n  # h\n- 2\n", ".[1] | head_comment", "c\nh\n")?;
+    assert_yq_getter("- 1\n# h\n- # c\n- 3\n", ".[2] | head_comment", "h\nc\n")?;
+    assert_yq_getter("- 1\n# h\n- # c\n- 3\n", ".[0] | foot_comment", "\n")?;
+    assert_yq_getter("- # c\n-\n- 3\n", ".[2] | head_comment", "c\n")
+}
+
+/// The next item's own deferred scalar (case C above) keeps its comment in
+/// the item wrapper's slot, so the head getter answers only the floated
+/// one -- real yq joins both (`c1\nc2`). Once #2795 prints heads the
+/// rendering is identical (`-\n# c1\n# c2\n- x`), so this is pinned rather
+/// than fixed.
+#[test]
+fn test_absent_item_comment_before_deferred_scalar_item_1079_float() -> Result<()> {
+    assert_yq_getter("- # c1\n- # c2\n  x\n", ".[1] | head_comment", "c1\n")?;
+    let (out, code) = run_yq_stdin(".", "- # c1\n- # c2\n  x\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "-\n# c2\n- x\n");
+    Ok(())
+}
+
+/// Nothing follows in the document: everything pending is the root's foot,
+/// at any nesting depth and regardless of which node opened last -- not
+/// the previous item's foot and not the enclosing key's.
+#[test]
+fn test_absent_item_comment_at_end_is_root_foot_1079_float() -> Result<()> {
+    assert_yq_getter("- # c\n", ". | foot_comment", "c\n")?;
+    assert_yq_getter("- # c\n", ". | head_comment", "\n")?;
+    assert_yq_getter("- # c\n", ".[0] | line_comment", "\n")?;
+    assert_yq_getter("- 1\n- # c\n", ". | foot_comment", "c\n")?;
+    assert_yq_getter("- 1\n- # c\n", ".[0] | foot_comment", "\n")?;
+    assert_yq_getter("- 1\n- # c\n", ".[1] | foot_comment", "\n")?;
+    assert_yq_getter("- # c\n# h\n", ". | foot_comment", "c\nh\n")?;
+    assert_yq_getter("- # c1\n- # c2\n", ". | foot_comment", "c1\nc2\n")?;
+    assert_yq_getter("- 1\n-\n# c\n", ". | foot_comment", "c\n")?;
+    assert_yq_getter("- 1\n-\n# c\n", ".[0] | foot_comment", "\n")?;
+    assert_yq_getter("- 1\n-\n- 2\n# c\n", ".[2] | foot_comment", "c\n")?;
+    assert_yq_getter("a:\n  - # c\n", ". | foot_comment", "c\n")?;
+    assert_yq_getter("a:\n  - # c\n", ".a | key | foot_comment", "\n")?;
+    assert_yq_getter("a:\n  b:\n    - # c\n", ". | foot_comment", "c\n")?;
+    assert_yq_getter("a:\n- # c\n", ". | foot_comment", "c\n")
+}
+
+/// A document marker ends the document the same way end of input does.
+#[test]
+fn test_absent_item_comment_before_document_marker_is_root_foot_1079_float() -> Result<()> {
+    let (out, code) = run_yq_stdin(". | foot_comment", "- # c\n---\n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.lines().next(), Some("c"));
+    Ok(())
+}
+
+/// The sequence closes to a mapping key: the comment is the foot of the key
+/// the sequence was the value of -- the enclosing key, not the most recent
+/// one and not the previous item -- however deep, and whatever kind of key.
+#[test]
+fn test_absent_item_comment_before_dedent_is_enclosing_key_foot_1079_float() -> Result<()> {
+    assert_yq_getter("a:\n  - # c\nb: 2\n", ".a | key | foot_comment", "c\n")?;
+    assert_yq_getter("a:\n  - # c\nb: 2\n", ".b | key | head_comment", "\n")?;
+    assert_yq_getter(
+        "a:\n  - 1\n  - # c\nb: 2\n",
+        ".a | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter("a:\n  - 1\n  - # c\nb: 2\n", ".a[0] | foot_comment", "\n")?;
+    assert_yq_getter(
+        "a:\n  - b: 1\n  - # c\nd: 2\n",
+        ".a | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - b: 1\n  - # c\nd: 2\n",
+        ".a[0].b | key | foot_comment",
+        "\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  x: 1\n  y:\n    - # c\nb: 2\n",
+        ".a.y | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  x: 1\n  y:\n    - # c\nb: 2\n",
+        ".a | key | foot_comment",
+        "\n",
+    )?;
+    assert_yq_getter(
+        "- a: 1\n  b:\n    - # c\n  d: 2\n",
+        ".[0].b | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter("? a\n:\n  - # c\nb: 2\n", ".a | key | foot_comment", "c\n")?;
+    // A sequence at its key's own indent is not "closed to" that key in
+    // real yq's model: the comment goes forward onto the next key instead.
+    assert_yq_getter("a:\n- # c\nb: 2\n", ".a | key | foot_comment", "\n")?;
+    assert_yq_getter("a:\n- # c\nb: 2\n", ".b | key | head_comment", "c\n")
+}
+
+/// Several absent items before the dedent: only the *last* floated comment
+/// becomes the enclosing key's foot; the earlier ones, and any standalone
+/// lines, go forward onto the next key's head.
+#[test]
+fn test_last_of_several_absent_item_comments_is_the_foot_1079_float() -> Result<()> {
+    assert_yq_getter(
+        "a:\n  - # c\n  - # d\nb: 2\n",
+        ".a | key | foot_comment",
+        "d\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n  - # d\nb: 2\n",
+        ".b | key | head_comment",
+        "c\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n  - # d\n  - # e\nb: 2\n",
+        ".a | key | foot_comment",
+        "e\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n  - # d\n  - # e\nb: 2\n",
+        ".b | key | head_comment",
+        "c\nd\n",
+    )?;
+    assert_yq_getter("a:\n  - # c\n# d\nb: 2\n", ".a | key | foot_comment", "c\n")?;
+    assert_yq_getter("a:\n  - # c\n# d\nb: 2\n", ".b | key | head_comment", "d\n")
+}
+
+/// The sequence closes to an *outer item* rather than a key. A sequence
+/// that is a key's own value keeps that key as the target (`.a[0].b`, a
+/// same-indent `k:\n- # c` alike); one nested straight inside an item has
+/// no key of its own and the comment becomes the outer item's foot
+/// instead -- unless a key opens next, when it is the inherited key's.
+#[test]
+fn test_absent_item_comment_settles_when_inner_sequence_closes_1079_float() -> Result<()> {
+    let input = "a:\n  - b:\n      - # c\n  - # d\nz: 1\n";
+    assert_yq_getter(input, ".a[0].b | key | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".a | key | foot_comment", "d\n")?;
+    assert_yq_getter(input, ".a[1] | head_comment", "\n")?;
+    assert_yq_getter(input, ".z | key | head_comment", "\n")?;
+    let input = "a:\n  - b:\n      - # c\n  - 2\nz: 1\n";
+    assert_yq_getter(input, ".a[0].b | key | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".a[1] | head_comment", "\n")?;
+    let input = "a:\n  - b:\n      - # c\n  -\nz: 1\n";
+    assert_yq_getter(input, ".a[0].b | key | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".z | key | head_comment", "\n")?;
+    let input = "- k:\n  - # c\n- 2\n";
+    assert_yq_getter(input, ".[0].k | key | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".[1] | foot_comment", "\n")?;
+
+    assert_yq_getter("- - 1\n  - # c\n- 2\n", ".[1] | foot_comment", "c\n")?;
+    assert_yq_getter("- - 1\n  - # c\n- 2\n", ".[1] | head_comment", "\n")?;
+    assert_yq_getter("- - 1\n  - # c\n- 2\n", ".[0][1] | foot_comment", "\n")?;
+    let input = "a:\n  -\n    - # c\n  - 2\nb: 1\n";
+    assert_yq_getter(input, ".a[1] | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".a | key | foot_comment", "\n")?;
+    let input = "a:\n  -\n    - # c\nb: 1\n";
+    assert_yq_getter(input, ".a | key | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".b | key | head_comment", "\n")?;
+    let input = "a:\n  -\n    - # c\n  - # d\nb: 1\n";
+    assert_yq_getter(input, ".a | key | foot_comment", "c\nd\n")
+}
+
+/// Real yq *drops* the first of two floated comments in a nested sequence
+/// that closes to an outer absent item (`c1` here appears in no slot and
+/// is not printed). Discarding it to match is exactly what ADR-0018 rule 4
+/// forbids, so it goes forward onto the next key like any other pending
+/// comment -- a recorded divergence, not an oversight.
+#[test]
+fn test_nested_double_float_keeps_the_comment_yq_drops_1079_float() -> Result<()> {
+    let input = "a:\n  - b:\n      - # c1\n      - # c2\n  - # d\nz: 1\n";
+    assert_yq_getter(input, ".a[0].b | key | foot_comment", "c2\n")?;
+    assert_yq_getter(input, ".a | key | foot_comment", "d\n")?;
+    assert_yq_getter(input, ".z | key | head_comment", "c1\n")
+}
+
+/// Known residuals, pinned with real yq's answer in the comment so a change
+/// is deliberate:
+///
+/// - a sibling item that is a compact mapping or a nested sequence -- real
+///   yq answers `.[1] | head_comment` directly; here the comment attaches
+///   to the first key / inner item instead, the same attribution #798's
+///   standalone-line capture already has for `- 1\n# h\n- b: 1\n` (#2811);
+/// - a tag with no value on the item's next line (`- # c\n  !!str`) --
+///   real yq keeps the tag and floats the comment (`- !!str\n# c\n- 2`);
+///   here the tag is dropped (a pre-existing gap) and the comment with it;
+/// - several floated comments in a sequence that closes to an outer item
+///   or to end of input: real yq keeps only the last (`- k:\n  - # c\n
+///   - # d\n- 2\n` has `d` on `.[0].k`'s foot and `c` nowhere); here the
+///   rest go forward as the next node's head, per ADR-0018 rule 4.
+#[test]
+fn test_absent_item_comment_residuals_1079_float() -> Result<()> {
+    assert_yq_getter("- # c\n- b: 1\n", ".[1] | head_comment", "\n")?;
+    assert_yq_getter("- # c\n- b: 1\n", ".[1].b | key | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- - 1\n", ".[1] | head_comment", "\n")?;
+    assert_yq_getter("- # c\n- - 1\n", ".[1][0] | head_comment", "c\n")?;
+
+    assert_yq_getter("- # c\n  !!str\n- 2\n", ".[1] | head_comment", "\n")?;
+    let (out, code) = run_yq_stdin(".", "- # c\n  !!str\n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "-\n- 2\n");
+
+    let input = "- k:\n  - # c\n  - # d\n- 2\n";
+    assert_yq_getter(input, ".[0].k | key | foot_comment", "d\n")?;
+    assert_yq_getter(input, ".[1] | head_comment", "c\n")
+}
+
+/// A standalone block above a bare `-` whose value is deferred to the next
+/// line is that value's head -- the node `.[1]` resolves to -- not the
+/// previous item's foot. Before this fix the bare item attached nothing,
+/// and its own line break was then miscounted as a blank line that
+/// "detached" the block backwards onto `.[0]`. Same for an empty `-` item
+/// with no value at all, which real yq skips over entirely.
+#[test]
+fn test_standalone_block_above_bare_deferred_item_is_its_head_1079_float() -> Result<()> {
+    assert_yq_getter("- 1\n# h\n-\n  x\n", ".[1] | head_comment", "h\n")?;
+    assert_yq_getter("- 1\n# h\n-\n  x\n", ".[0] | foot_comment", "\n")?;
+    assert_yq_getter("- 1\n# h\n-\n  b: 1\n", ".[1] | head_comment", "h\n")?;
+    assert_yq_getter("- 1\n# h\n-\n  - 2\n", ".[1] | head_comment", "h\n")?;
+    assert_yq_getter("- 1\n# h\n-\n- 3\n", ".[2] | head_comment", "h\n")?;
+    assert_yq_getter("- 1\n# h\n-\n- 3\n", ".[0] | foot_comment", "\n")?;
+    // The deferred value is now `PREV` for a later detached block.
+    assert_yq_getter("-\n  x\n# f\n\n- 2\n", ".[0] | foot_comment", "f\n")?;
+    assert_yq_getter("-\n  x\n# f\n\n- 2\n", ".[1] | head_comment", "\n")?;
+    // A property-prefixed item keeps deferring to its first key, which is
+    // where real yq puts the block for a mapping value.
+    assert_yq_getter(
+        "- 1\n# h\n- &x\n  b: 1\n",
+        ".[1].b | key | head_comment",
+        "h\n",
+    )?;
+    assert_yq_getter("- 1\n# h\n- &x\n  b: 1\n", ".[0] | foot_comment", "\n")
+}
+
+/// A blank line inside the absence lookahead's gap settles the pending
+/// block backwards while the bare item is still deciding what to do with
+/// it -- the split around that lookahead must not assume the block is
+/// still there (this panicked with `split index should be <= len` when
+/// found by differential fuzzing). Blank-line placement itself is a
+/// residual (real yq: `.[2] | head_comment` is `c\n\nh`, blank preserved
+/// inside the value); only the exit code and shape are pinned.
+#[test]
+fn test_blank_line_in_absence_lookahead_gap_does_not_panic_1079_float() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- 1\n- # c\n\n-\n  # h\n  x\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- 1\n-\n- x\n");
+    Ok(())
+}
+
+/// Residual: a property-prefixed item whose deferred value is a *scalar*
+/// still attaches nothing (real yq: `.[1] | head_comment` is `h`), so the
+/// block now travels on to the next item that does -- previously it was
+/// misfiled as `.[0]`'s foot. Pinned so the shape changes deliberately.
+#[test]
+fn test_standalone_block_above_anchored_deferred_scalar_item_residual_1079_float() -> Result<()> {
+    assert_yq_getter("- 1\n# h\n- &x\n  2\n- 3\n", ".[1] | head_comment", "\n")?;
+    assert_yq_getter("- 1\n# h\n- &x\n  2\n- 3\n", ".[2] | head_comment", "h\n")?;
+    assert_yq_getter("- 1\n# h\n- &x\n  2\n- 3\n", ".[0] | foot_comment", "\n")
+}
+
+/// An explicit key owns head/foot comments like any other key (real yq
+/// answers `.a | key | head_comment`), which `parse_explicit_key` never
+/// hooked up -- the block fell back onto the previous key's foot.
+#[test]
+fn test_explicit_key_owns_head_and_foot_comments_1079_float() -> Result<()> {
+    assert_yq_getter(
+        "x: 0\n# h\n? a\n: 1\nb: 2\n",
+        ".a | key | head_comment",
+        "h\n",
+    )?;
+    assert_yq_getter(
+        "x: 0\n# h\n? a\n: 1\nb: 2\n",
+        ".x | key | foot_comment",
+        "\n",
+    )?;
+    assert_yq_getter("x: 0\n# h\n?\n  a\n: 1\n", ".a | key | head_comment", "h\n")?;
+    assert_yq_getter("? a\n: 1\n# f\n\nb: 2\n", ".a | key | foot_comment", "f\n")?;
+    assert_yq_getter("? a\n: 1\n# f\n\nb: 2\n", ".b | key | head_comment", "\n")?;
+    assert_yq_getter("? a\n: 1\n# h\nb: 2\n", ".b | key | head_comment", "h\n")
 }
 
 // ============================================================================

@@ -3616,6 +3616,29 @@ reads comments straight off the live cursor at ~9 sites and never consults `Node
 plain `yq '.'` goes through here — while the DOM emitter (`emit_yaml_value_at_depth`,
 `yq_runner.rs`) does consult `NodeMeta` but is never given head/foot to print.
 
+The same gap covers a bare sequence item's own trailing comment when its value is
+*absent* (`- # c` followed by a sibling item, a dedent, or end of input — #1079's
+deferred half). Real yq has no node for that comment and floats it: forward onto the
+next item of the same sequence as its `head_comment` (accumulating across consecutive
+absent items), or — when the sequence closes past a dedent first — the last one becomes
+a `foot_comment` (of the key whose value the sequence is, or of the next outer item when
+the sequence is nested straight inside an item) while the rest go forward, or at end of
+document all of them become the root's `foot_comment`. The parser now attributes these
+the way yq reports them, so the getters agree (`- # c\n- 2\n` answers `c` for
+`.[1] | head_comment` and nothing for `.[0] | line_comment`), but the identity output
+still drops them until this entry's emitter work lands. Three placements are recorded
+divergences, not gaps: real yq *drops* every floated comment but the last when a
+sequence holding several closes to an outer item or to end of input inside a mapping
+(`- k:\n  - # c\n  - # d\n- 2\n` keeps only `d`), which ADR-0018 rule 4 forbids
+matching — the rest go forward as the next node's head; a tag with no value on the
+item's next line (`- # c\n  !!str\n- 2\n`) drops both tag and comment here where yq
+keeps the tag and floats the comment; and a floated comment whose next sibling is a
+compact mapping or a nested sequence attaches to that item's first key / inner item
+rather than the item itself, the attribution #798's standalone-line capture already has
+(`- 1\n# h\n- b: 1\n` is `.[1] | head_comment` in real yq, `.[1].b | key |
+head_comment` here — [#2811](https://github.com/rust-works/succinctly/issues/2811)). Blank lines in any of these shapes are unmodelled on both sides
+(yq keeps a `\n` inside the slot value and reorders).
+
 Four known gaps this write shares with every other write form, none specific to #798:
 
 - **No read-after-write within one pipe.** The `line_comment`/`style`/`anchor` GET-forms
