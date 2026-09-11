@@ -9856,12 +9856,25 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
             && owned_identity_leaving_stage_supported(first)
             && owned_identity_pipe_supported(rest)
     });
+    // #2763: `key` on a string-keyed member emits the key *node* -- a live
+    // cursor whose position is its own (`cursor_path_and_ancestors` climbs
+    // from it), so it never left the cursor domain and needs no owned
+    // identity. The rest continues as the ordinary cursor pipe from that
+    // node, which is what gives `key | select(line == 2) | path` and
+    // `key | (line, path)` the key's metadata. Only `key`: a `keys[]` item
+    // is a key cursor too, but at a *constructed* position (`.a | keys[] |
+    // path` is `[0]` in yq v4.53.3), which the identity route models.
+    let key_stage =
+        identity_from_first.is_some() && matches!(strip_parens(first), Expr::Builtin(Builtin::Key));
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
     // this closure also runs once per item stage 1 produces.
     let mut rest = RestPipe::new(rest);
     let upstream = {
         let mut driver = |item: GenericItem<V>| -> Demand {
             let flow = match identity_from_first {
+                Some(_) if key_stage && matches!(item, GenericItem::OneCursor(_)) => {
+                    continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink)
+                }
                 Some(c) => match owned_identity_materialize::<V>(item) {
                     Ok(o) => match owned_identity_leaving_cursor::<S, V>(first, c, &o, optional) {
                         Ok(id) => eval_owned_identity_pipe::<S, V>(
@@ -14646,6 +14659,14 @@ struct PathContextPos<V: DocumentValue> {
     node: PathNode<V>,
     path: Vec<OwnedValue>,
     ancestors: Vec<PathNode<V>>,
+    /// `node` is a member's *key* node (#2763): the walk was seeded from the
+    /// cursor `key` emitted. It stands at its member's position -- `path`
+    /// and a `parent` hop answer as they would for the value -- but a key has
+    /// no key of its own, so `key` here emits nothing. Only
+    /// `path_context_root` (from `cursor_path_and_ancestors`) and a zero hop
+    /// (`parent(0)`) can produce a position with this set; every step lands
+    /// on an ordinary node.
+    at_key: bool,
 }
 
 impl<V: DocumentValue> Clone for PathContextPos<V> {
@@ -14654,6 +14675,7 @@ impl<V: DocumentValue> Clone for PathContextPos<V> {
             node: self.node.clone(),
             path: self.path.clone(),
             ancestors: self.ancestors.clone(),
+            at_key: self.at_key,
         }
     }
 }
@@ -14751,7 +14773,8 @@ fn path_context_hop<V: DocumentValue>(
     n: usize,
 ) -> Option<PathContextPos<V>> {
     let len = pos.path.len().checked_sub(n)?;
-    let node = if len == pos.path.len() {
+    let stays = len == pos.path.len();
+    let node = if stays {
         pos.node.clone()
     } else {
         pos.ancestors[len].clone()
@@ -14760,6 +14783,10 @@ fn path_context_hop<V: DocumentValue>(
         node,
         path: pos.path[..len].to_vec(),
         ancestors: pos.ancestors[..len].to_vec(),
+        // `parent(0)` is the node itself, key node included (`[.a | key |
+        // parent(0) | key]` is `[]` in yq v4.53.3); any real hop lands on a
+        // container.
+        at_key: stays && pos.at_key,
     })
 }
 
@@ -14796,6 +14823,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     node: PathNode::Owned(Rc::new(var.value.clone())),
                     path: Vec::new(),
                     ancestors: Vec::new(),
+                    at_key: false,
                 }),
             }
             Ok(())
@@ -14829,6 +14857,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     node,
                     path,
                     ancestors,
+                    at_key: false,
                 });
             }
             stepped.map_err(Control::Error)
@@ -15037,6 +15066,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     node: PathNode::Owned(Rc::new(OwnedValue::Null)),
                     path: pos.path.clone(),
                     ancestors: pos.ancestors.clone(),
+                    at_key: false,
                 }),
             }
             Ok(())
@@ -15053,6 +15083,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     node: PathNode::Owned(Rc::new(v)),
                     path: pos.path.clone(),
                     ancestors: pos.ancestors.clone(),
+                    at_key: false,
                 });
             }
             control.map_or(Ok(()), Err)
@@ -15108,12 +15139,14 @@ fn path_context_push_owned_children<V: DocumentValue>(
                     node,
                     path,
                     ancestors,
+                    at_key: false,
                 });
             }
             None => out.push(PathContextPos {
                 node,
                 path: pos.path.clone(),
                 ancestors: pos.ancestors.clone(),
+                at_key: false,
             }),
         }
     }
@@ -15547,6 +15580,7 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
             node: PathNode::Owned(Rc::new(v)),
             path: pos.path.clone(),
             ancestors: pos.ancestors.clone(),
+            at_key: false,
         });
     }
     control.map_or(Ok(()), Err)
@@ -15675,6 +15709,7 @@ fn path_context_step_target<S: EvalSemantics, V: DocumentValue>(
             node: PathNode::Owned(Rc::new(value)),
             path: Vec::new(),
             ancestors: Vec::new(),
+            at_key: false,
         });
     }
     control.map_or(Ok(()), Err)
@@ -15808,23 +15843,43 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     })
 }
 
-/// `key`/`path` (no arg)'s value at `pos` -- the sole caller is
+/// `key`/`path` (no arg)'s output at `pos` -- the sole caller is
 /// `path_context_walk_generic`'s own terminal arm, extracted only to keep
 /// that arm's body short once `PathNoArg`/`Key` were merged into one match
-/// arm (#2149). `Ok(None)` only for `key` at the document root, which
-/// emits nothing (see the caller's own doc comment for why).
+/// arm (#2149). `Ok(None)` only for `key` where there is none: at the
+/// document root, which emits nothing (see the caller's own doc comment for
+/// why), and at a key node (`key | key`, #2763).
+///
+/// `key` on the value of a string-keyed member emits the **key node itself**
+/// (#2763): a live cursor, so `line_comment`/`head_comment`/`line`/`column`/
+/// `style`/`anchor` after it read the key's own metadata, as they do in real
+/// yq. The node is the value's previous sibling ([`member_key_node`]), an O(1)
+/// hop that keeps `[.[] | key | line]` linear; a mismatch there, an index
+/// component and an absent or owned node keep the trail's spelling, as
+/// before.
 fn path_context_emitting_value<V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
-) -> Result<Option<OwnedValue>, EvalError> {
+) -> Result<Option<GenericItem<V>>, EvalError> {
+    let owned = |v: OwnedValue| Some(GenericItem::Owned(v));
     match expr {
-        Expr::Builtin(Builtin::PathNoArg) => Ok(Some(OwnedValue::Array(pos.path.clone()))),
+        Expr::Builtin(Builtin::PathNoArg) => Ok(owned(OwnedValue::Array(pos.path.clone()))),
+        Expr::Builtin(Builtin::Key) if pos.at_key => Ok(None),
         Expr::Builtin(Builtin::Key) => match pos.path.last() {
             Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
-                PathNode::At(c) => cursor_key(c),
-                _ => Ok(Some(OwnedValue::Int(*i))),
+                PathNode::At(c) => Ok(cursor_key(c)?.and_then(owned)),
+                _ => Ok(owned(OwnedValue::Int(*i))),
             },
-            Some(key) => Ok(Some(key.clone())),
+            Some(OwnedValue::String(key)) => Ok(Some(match &pos.node {
+                PathNode::At(c) => match member_key_node(c, key) {
+                    Some(kc) => GenericItem::OneCursor(kc),
+                    None => GenericItem::Owned(OwnedValue::String(key.clone())),
+                },
+                PathNode::Absent | PathNode::Owned(_) => {
+                    GenericItem::Owned(OwnedValue::String(key.clone()))
+                }
+            })),
+            Some(key) => Ok(owned(key.clone())),
             None => Ok(None),
         },
         // Unreachable: the sole caller (path_context_walk_generic's merged
@@ -15898,10 +15953,13 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // `c: [10, 20]` (captured live; `[20,1]`, and `[10,0]` for `-2`).
         // Only then is the sibling scan paid, so `[.[] | key]` keeps its
         // per-element constant. Shared with `path_context_walk_pipe`'s own
-        // `Key`/`PathNoArg`-then-more-stages case (#2149).
+        // `Key`/`PathNoArg`-then-more-stages case (#2149). Since #2763 a
+        // string key on a live node is emitted as the key *node* (one
+        // sibling hop, still constant) so the metadata builtins after it
+        // answer from the key -- see `path_context_emitting_value`.
         Expr::Builtin(Builtin::PathNoArg | Builtin::Key) => {
             match path_context_emitting_value(expr, pos) {
-                Ok(Some(v)) => Ok(sink(GenericItem::Owned(v))),
+                Ok(Some(item)) => Ok(sink(item)),
                 Ok(None) => Ok(Demand::Continue),
                 // `cursor_key`'s malformed-member-key error path, pre-existing
                 // before this refactor merged this arm with `PathNoArg`'s.
@@ -16067,6 +16125,16 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
         items.push(item);
         Demand::Continue
     });
+    collected_items_result(items, flow)
+}
+
+/// The `GenericResult` of a sink evaluation that collected `items` and ended
+/// in `flow`: the items themselves when the sink ran out, else the prefix
+/// delivered before the escape, carrying it.
+fn collected_items_result<V: DocumentValue>(
+    items: Vec<GenericItem<V>>,
+    flow: Flow,
+) -> GenericResult<V> {
     let control = match flow {
         Flow::Exhausted | Flow::Stopped { pending: None } => {
             return match items_to_generic_result(items) {
@@ -16191,6 +16259,35 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
 /// `select(key == "a")`, `{k: key}` and every other construct evaluate
 /// path-context builtins in the generic evaluator with no dedicated arm.
 fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError> {
+    Ok(match cursor_slot(c)? {
+        Some(CursorSlot::Value { key, .. }) => Some(key),
+        Some(CursorSlot::Element(index)) => Some(OwnedValue::Int(index)),
+        // A live key node has no key of its own: `.a.b | key | key` prints
+        // nothing in yq v4.53.3 (#2471).
+        Some(CursorSlot::Key(_)) | None => None,
+    })
+}
+
+/// Where `c` sits in its parent (#2763): the value of an object member, the
+/// **key** of one, or an element of an array. `None` at the document root.
+///
+/// The key node is a position of its own, not just a string `key` spells:
+/// its metadata (`line_comment`, `head_comment`, `line`, `column`, `style`,
+/// `anchor`) is what real yq answers after `key`, and it is a live cursor in
+/// both indexed formats -- the sibling *before* the member value. This is the
+/// one scan that recognises both halves of a member, so `cursor_key`,
+/// `cursor_path_and_ancestors` and the `key` emissions cannot disagree about
+/// which node is which.
+enum CursorSlot<C> {
+    /// `c` is the value of a member whose key is `key`, standing at `key_cursor`.
+    Value { key: OwnedValue, key_cursor: C },
+    /// `c` is itself the key node of a member spelled `key`.
+    Key(OwnedValue),
+    /// `c` is the element at this index of a sequence.
+    Element(i64),
+}
+
+fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalError> {
     let Some(parent) = c.document_parent() else {
         return Ok(None);
     };
@@ -16198,11 +16295,20 @@ fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError>
     if let Some(fields) = parent_value.as_object() {
         let mut f = fields.clone();
         while let Some((field, rest)) = f.uncons() {
-            if field.value_cursor.same_node(c) {
+            let is_value = field.value_cursor.same_node(c);
+            if is_value || field.key_cursor.same_node(c) {
                 let Some(key) = key_display_string(&field.key) else {
                     return Err(fields.malformed_member_error());
                 };
-                return Ok(Some(OwnedValue::String(key.into_owned())));
+                let key = OwnedValue::String(key.into_owned());
+                return Ok(Some(if is_value {
+                    CursorSlot::Value {
+                        key,
+                        key_cursor: field.key_cursor,
+                    }
+                } else {
+                    CursorSlot::Key(key)
+                }));
             }
             f = rest;
         }
@@ -16212,7 +16318,7 @@ fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError>
         let mut e = elements;
         while let Some((elem, rest)) = e.uncons_cursor() {
             if elem.same_node(c) {
-                return Ok(Some(OwnedValue::Int(index)));
+                return Ok(Some(CursorSlot::Element(index)));
             }
             index += 1;
             e = rest;
@@ -16223,26 +16329,74 @@ fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError>
     }
 }
 
-/// The path from the document root to `c`, and the node at every proper
-/// prefix of it -- `(path, ancestors)` in the shape [`PathContextPos`] holds
-/// them. Empty at the root.
+/// The key node `key` emits for the member value `c` -- its previous sibling
+/// -- when that node is a plain string spelling exactly `expected`, the
+/// display string the caller already holds for the member (#2763).
+///
+/// The equality is the self-check that makes the O(1) sibling hop safe to
+/// take without a scan: a node that is not the raw member value, a complex
+/// (`? [a, b]`) key, a key whose bytes do not decode, an explicitly tagged
+/// key, and a *typed* key (`1: x`, `true: y`, `null: z`) all answer `None`,
+/// and `key` then keeps emitting the owned display string it always has.
+/// Typed keys are excluded on purpose: real yq's `key` there is an `!!int`/
+/// `!!bool`/`!!null` node, but its scalar `==` is stringly (`1 == "1"` is
+/// `true`) where succinctly's is typed, so a typed key node would break
+/// `select(key == "1")`, which matches yq today -- recorded in
+/// `docs/compliance/yq/limitations.md`.
+fn member_key_node<C: DocumentCursor>(c: &C, expected: &str) -> Option<C> {
+    let kc = c.prev_sibling()?;
+    key_node_spells(&kc, expected).then_some(kc)
+}
+
+/// Whether the key node `kc` is a plain string that materializes as exactly
+/// `expected` -- the scalar order [`to_owned_at_depth`] applies, without the
+/// allocation.
+fn key_node_spells<C: DocumentCursor>(kc: &C, expected: &str) -> bool {
+    if kc.explicit_tag().is_some() {
+        return false;
+    }
+    let v = kc.value();
+    !v.is_null()
+        && v.as_bool().is_none()
+        && v.number_literal().is_none()
+        && v.as_i64().is_none()
+        && v.as_f64().is_none()
+        && v.as_str().is_some_and(|s| s == expected)
+}
+
+/// The path from the document root to `c`, the node at every proper prefix
+/// of it -- `(path, ancestors)` in the shape [`PathContextPos`] holds them --
+/// and whether `c` is itself a member's key node. Empty at the root.
+///
+/// A key node's path is its member's path: `.a.b | key | path` is
+/// `["a","b"]` in yq v4.53.3, and `parent` from it is the mapping, so the
+/// climb treats a `Key` slot exactly as the `Value` slot beside it (#2763).
 fn cursor_path_and_ancestors<C: DocumentCursor>(
     c: &C,
-) -> Result<(Vec<OwnedValue>, Vec<C>), EvalError> {
+) -> Result<(Vec<OwnedValue>, Vec<C>, bool), EvalError> {
     let mut path = Vec::new();
     let mut ancestors = Vec::new();
+    let mut at_key = false;
     let mut cur = *c;
+    let mut first = true;
     while let Some(parent) = cur.document_parent() {
-        let Some(key) = cursor_key(&cur)? else {
-            break;
+        let key = match cursor_slot(&cur)? {
+            Some(CursorSlot::Value { key, .. }) => key,
+            Some(CursorSlot::Key(key)) => {
+                at_key |= first;
+                key
+            }
+            Some(CursorSlot::Element(index)) => OwnedValue::Int(index),
+            None => break,
         };
+        first = false;
         path.push(key);
         ancestors.push(parent);
         cur = parent;
     }
     path.reverse();
     ancestors.reverse();
-    Ok((path, ancestors))
+    Ok((path, ancestors, at_key))
 }
 
 /// `n` levels up from `c`, or `None` at or above the document root.
@@ -16754,7 +16908,7 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
     // stage handed it (#2416 phase 3). `path`/`parent` are absolute, so the
     // position starts from the input's real path and ancestors, climbed
     // from the cursor itself.
-    let (path, ancestors) = match cursor_path_and_ancestors(&root) {
+    let (path, ancestors, at_key) = match cursor_path_and_ancestors(&root) {
         Ok(found) => found,
         Err(e) => return Err(Control::Error(e)),
     };
@@ -16762,6 +16916,7 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
         node: PathNode::At(root),
         path,
         ancestors: ancestors.into_iter().map(PathNode::At).collect(),
+        at_key,
     })
 }
 
@@ -16771,10 +16926,11 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
 /// `first(.[] | key)` stops after one element instead of materializing the
 /// document into a `Vec` and then taking its head.
 ///
-/// `optional` is deliberately `false` for `rest`, for the same reason the
-/// non-sink route passes `false` to `fold_pipe_stages`: the bridge this
-/// replaces restarts every evaluation at `false` regardless of what its
-/// caller passed, so `false` is what it actually delivered.
+/// `optional` is deliberately `false` for `rest`: the bridge this replaces
+/// restarted every evaluation at `false` regardless of what its caller
+/// passed, so `false` is what it actually delivered. Since #2763 the non-sink
+/// route drives this same function whenever there is a `rest`, so the two
+/// cannot disagree about that either.
 fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     root: V::Cursor,
@@ -16821,6 +16977,23 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
     root: V::Cursor,
 ) -> Option<GenericResult<V>> {
     let (walked, rest) = path_context_walk_split(exprs)?;
+    if !rest.is_empty() {
+        // #2763: `rest` is folded per walked item, through the sink route,
+        // rather than after collapsing the items into one result. The
+        // collapse (`path_context_items_to_result`) keeps cursors only when
+        // *every* item is one, and a `key` walk over a document mixing
+        // string keys (emitted as key nodes) with sequence indices or typed
+        // keys (emitted owned) would hand `rest` a cursorless copy of the
+        // key nodes too -- `.. | key | line` answering `0` for every key of
+        // a document with one sequence in it, where `[.[] | key | line]`
+        // already answered from the nodes. One driver for both routes.
+        let mut items: Vec<GenericItem<V>> = Vec::new();
+        let flow = try_path_context_walk_sink::<S, V>(exprs, root, &mut |item| {
+            items.push(item);
+            Demand::Continue
+        })?;
+        return Some(collected_items_result(items, flow));
+    }
     let root_pos = match path_context_root::<V>(root) {
         Ok(pos) => pos,
         Err(control) => {
@@ -16836,7 +17009,7 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
         items.push(item);
         Demand::Continue
     });
-    let resolved = match walked_result {
+    Some(match walked_result {
         Ok(_) => path_context_items_to_result(items),
         // Whatever resolved before the failure still stands: jq's generator
         // never un-emits an output it already produced. A decode failure
@@ -16846,15 +17019,6 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
             let (prefix, failure) = path_context_items_to_owned(items);
             partial_generic(prefix, failure.map_or(control, Control::Error))
         }
-    };
-    Some(if rest.is_empty() {
-        resolved
-    } else {
-        // `false`, not the caller's `optional`, for the same reason the
-        // bridge this replaces passes `false`: that entry point restarts
-        // every evaluation at `false` regardless of what its caller passed,
-        // so `false` is what it actually delivered.
-        fold_pipe_stages::<S, V>(resolved, rest, false)
     })
 }
 
@@ -18103,17 +18267,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // newline-joined -- real yq returns one string, not a list, and ""
         // when there are none.
         //
-        // Answered from whatever cursor the pipe stands on, which reaches
-        // a sequence item and the document root but *not* a mapping
-        // entry's: those comments live on the entry's **key** node, and a
-        // `key` stage leaves the cursor domain, so `.b | key | head_comment`
-        // is still `""` where real yq answers the comment. That is the same
-        // gap `line_comment` has had since #765 -- `.a | key | line_comment`
-        // is `""` here and `keyc` in yq -- and closing it means routing a
-        // `... | key | <metadata>` pipe to a position-carrying evaluator,
-        // which the walk route currently intercepts. Tracked separately;
-        // these two builtins deliberately inherit the existing gap rather
-        // than inventing a second, different one.
+        // Answered from whatever cursor the pipe stands on. A mapping
+        // entry's comments live on its **key** node, which `key` emits as a
+        // live cursor since #2763, so `.b | key | head_comment` answers the
+        // comment the same way `.a | key | line_comment` does.
         Builtin::HeadComment => GenericResult::Owned(OwnedValue::String(
             cursor
                 .map(|c| c.head_comment().join("\n"))
@@ -19386,14 +19543,25 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // value with no cursor still goes to the eager evaluator below,
         // which is the one place owned-domain path tracking lives
         // (`[1,2] | .[0] | key` is `0` in real yq).
-        Builtin::Key if cursor.is_some() => match cursor_key(&cursor.expect("guarded")) {
-            Ok(Some(key)) => GenericResult::Owned(key),
-            Ok(None) => GenericResult::None,
+        // #2763: the key of a string-keyed member is emitted as its key
+        // *node*, so `first(key) | line`, `(key // .) | line_comment` and
+        // every other construct that threads this result on reads the key's
+        // own metadata. `cursor_slot`'s scan already holds the key cursor;
+        // `key_node_spells` is the same string/tag check the walk applies.
+        Builtin::Key if cursor.is_some() => match cursor_slot(&cursor.expect("guarded")) {
+            Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
+                OwnedValue::String(s) if key_node_spells(&key_cursor, s) => {
+                    GenericResult::OneCursor(key_cursor)
+                }
+                _ => GenericResult::Owned(key),
+            },
+            Ok(Some(CursorSlot::Element(index))) => GenericResult::Owned(OwnedValue::Int(index)),
+            Ok(Some(CursorSlot::Key(_)) | None) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
         },
         Builtin::PathNoArg if cursor.is_some() => {
             match cursor_path_and_ancestors(&cursor.expect("guarded")) {
-                Ok((path, _)) => GenericResult::Owned(OwnedValue::Array(path)),
+                Ok((path, _, _)) => GenericResult::Owned(OwnedValue::Array(path)),
                 Err(e) => GenericResult::Error(e),
             }
         }
@@ -19407,7 +19575,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::ParentN(n_expr) if cursor.is_some() => {
             let c = cursor.expect("guarded");
             let depth = match cursor_path_and_ancestors(&c) {
-                Ok((path, _)) => path.len(),
+                Ok((path, _, _)) => path.len(),
                 Err(e) => return GenericResult::Error(e),
             };
             let (counts, control) =
@@ -19454,7 +19622,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // else, since no other caller installs a table.
         Builtin::FileIndex if cursor.is_some() => {
             match cursor_path_and_ancestors(&cursor.expect("guarded")) {
-                Ok((path, _)) => GenericResult::Owned(OwnedValue::Int(file_index_for_path(&path))),
+                Ok((path, _, _)) => {
+                    GenericResult::Owned(OwnedValue::Int(file_index_for_path(&path)))
+                }
                 Err(e) => GenericResult::Error(e),
             }
         }
@@ -19597,6 +19767,12 @@ impl<V: DocumentValue> OwnedIdentity<V> {
 
     /// `key`: the last component taken, else the base node's own key, else
     /// nothing (a detached root, or the document root -- #2421).
+    ///
+    /// A base that is itself a key node (#2763: `key | tostring` hands the
+    /// key cursor on) answers the member's key, not nothing: an owned value
+    /// *positioned at* the key node has that key (`.a.b | key | tostring |
+    /// key` is `"b"` in yq v4.53.3), whereas the live key node itself has
+    /// none -- that is `key_node` above, and `cursor_key`'s own answer.
     fn key(&self) -> Result<Option<OwnedValue>, EvalError> {
         if self.key_node {
             return Ok(None);
@@ -19604,7 +19780,11 @@ impl<V: DocumentValue> OwnedIdentity<V> {
         match self.ancestors.last() {
             Some((_, component)) => Ok(Some(component.clone())),
             None => match self.base {
-                Some(c) => cursor_key(&c),
+                Some(c) => Ok(match cursor_slot(&c)? {
+                    Some(CursorSlot::Value { key, .. } | CursorSlot::Key(key)) => Some(key),
+                    Some(CursorSlot::Element(index)) => Some(OwnedValue::Int(index)),
+                    None => None,
+                }),
                 None => Ok(None),
             },
         }
@@ -22091,17 +22271,114 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         // #2471: the emitted key keeps the node's position, flagged so a
         // second `key` emits nothing -- `id.key()` answers `None` for a key
         // node, which is exactly yq's own `.a.b | key | key`.
-        Expr::Builtin(Builtin::Key) => match id.key() {
-            Ok(Some(key)) => eval_owned_identity_stages::<S, V>(
-                rest,
-                key,
-                id.with_key_node(true),
-                optional,
-                tail,
-            ),
-            Ok(None) => Flow::Exhausted,
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
+        //
+        // #2763: at a live document node the key is a *node* too -- the
+        // member's key cursor (or the base itself, when `key | tostring`
+        // already handed the key cursor on) -- and real yq answers the key's
+        // own metadata after it (`.a | tostring | key | line` is `1`). With a
+        // sink to emit to, the rest of the pipe is handed back to the cursor
+        // pipe from that node, exactly as `continue_owned_identity_ancestor`
+        // hands `parent` back; a `Pairs` tail keeps the owned position.
+        Expr::Builtin(Builtin::Key) => {
+            let key_node = match (id.key_node, id.ancestors.as_slice(), id.base) {
+                (false, [], Some(c)) => match cursor_slot(&c) {
+                    Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
+                        OwnedValue::String(s) if key_node_spells(&key_cursor, s) => {
+                            Some(key_cursor)
+                        }
+                        _ => None,
+                    },
+                    Ok(Some(CursorSlot::Key(_))) => Some(c),
+                    Ok(Some(CursorSlot::Element(_)) | None) => None,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                },
+                _ => None,
+            };
+            if let Some(kc) = key_node {
+                if let OwnedIdentityTail::Sink(sink) = tail.reborrow() {
+                    return eval_each_pipe_generic::<S, V>(
+                        rest,
+                        kc.value(),
+                        optional,
+                        Some(kc),
+                        sink,
+                    );
+                }
+                // An enclosing stage wants pairs, so the pipe stays in the
+                // owned domain -- but it stays at the *key* node, which is
+                // what lets the metadata arm below answer from it and what
+                // a binding's `BindOrigin` then carries (`key as $k | $k |
+                // line`).
+                let key = match id.key() {
+                    Ok(Some(key)) => key,
+                    Ok(None) => return Flow::Exhausted,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+                return eval_owned_identity_stages::<S, V>(
+                    rest,
+                    key,
+                    OwnedIdentity::kept(kc).with_key_node(true),
+                    optional,
+                    tail,
+                );
+            }
+            match id.key() {
+                Ok(Some(key)) => eval_owned_identity_stages::<S, V>(
+                    rest,
+                    key,
+                    id.with_key_node(true),
+                    optional,
+                    tail,
+                ),
+                Ok(None) => Flow::Exhausted,
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            }
+        }
+        // #2763: the node-metadata getters at a key-node position. Every
+        // other stage in this route is evaluated by `eval_each_owned`, which
+        // has no cursor and answers these with their `""`/`0` defaults --
+        // correct for a value the query *built*, wrong for the key `key`
+        // just emitted, which is a document node real yq reads the entry's
+        // comments, line, column, style and anchor from. Narrowed to a key
+        // node deliberately: whether an *ordinary* kept owned value should
+        // answer metadata from its base is the wider question this issue
+        // does not settle (`.a | del(.b) | line` is `2` in yq, `0` here).
+        Expr::Builtin(
+            builtin @ (Builtin::Line
+            | Builtin::Column
+            | Builtin::Style
+            | Builtin::Anchor
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment),
+        ) if id.key_node && id.ancestors.is_empty() && id.base.is_some() => {
+            let c = id.base.expect("guarded");
+            let outputs = eval_builtin::<S, V>(builtin, c.value(), optional, Some(c));
+            let mut downstream: Option<Flow> = None;
+            let flow = drain_result_generic::<V>(outputs, &mut |item| {
+                let output = match owned_identity_materialize::<V>(item) {
+                    Ok(o) => o,
+                    Err(control) => {
+                        return stop_with_downstream(&mut downstream, Flow::Escaped(control))
+                    }
+                };
+                // Every one of these is `OwnedIdentityRule::Keeps`, so the
+                // output stands where its input did -- at the key node, no
+                // longer *as* the key (`.a.b | key | line | key` is `"b"` in
+                // yq v4.53.3).
+                match eval_owned_identity_stages::<S, V>(
+                    rest,
+                    output,
+                    id.clone().with_key_node(false),
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => Demand::Continue,
+                    other => stop_with_downstream(&mut downstream, other),
+                }
+            });
+            downstream.unwrap_or(flow)
+        }
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
             Ok(path) => eval_owned_identity_stages::<S, V>(
                 rest,
@@ -32602,6 +32879,7 @@ mod tests {
                 OwnedValue::String("x".to_string()),
             ],
             ancestors: vec![PathNode::At(root), PathNode::Absent],
+            at_key: false,
         };
         for filter in [
             "key",
@@ -32874,7 +33152,8 @@ mod tests {
             cursor_key(&at(".a.b[1]")).unwrap(),
             Some(OwnedValue::Int(1))
         );
-        let (path, ancestors) = cursor_path_and_ancestors(&at(".a.b[1]")).unwrap();
+        let (path, ancestors, at_key) = cursor_path_and_ancestors(&at(".a.b[1]")).unwrap();
+        assert!(!at_key);
         assert_eq!(
             path,
             vec![
@@ -32891,6 +33170,69 @@ mod tests {
         assert!(
             cursor_ancestor(&at(".a.b[1]"), 4).is_none(),
             "above the root"
+        );
+    }
+
+    /// #2763: the key node is a slot of its own, and it is the member
+    /// value's previous sibling in the tree -- so `key` can emit it without
+    /// a second scan, and the climb from it answers the member's own path.
+    #[test]
+    fn the_key_node_is_a_slot_of_its_own_2763() {
+        let json = br#"{"a":{"b":[10,20]},"c":1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let at = |f: &str| {
+            let expr = parse(f).unwrap();
+            match eval_with_cursor(&expr, root) {
+                GenericResult::OneCursor(c) => c,
+                other => panic!("`{f}` is not one cursor: {other:?}"),
+            }
+        };
+
+        let value = at(".a.b");
+        let key_cursor = match cursor_slot(&value).unwrap() {
+            Some(CursorSlot::Value { key, key_cursor }) => {
+                assert_eq!(key, OwnedValue::String("b".into()));
+                key_cursor
+            }
+            other => panic!("a member value is a Value slot, got {:?}", other.is_none()),
+        };
+        // The O(1) hop the emission takes, and the check that guards it.
+        assert!(value.prev_sibling().unwrap().same_node(&key_cursor));
+        assert!(member_key_node(&value, "b").unwrap().same_node(&key_cursor));
+        assert!(
+            member_key_node(&value, "elsewhere").is_none(),
+            "the spelling has to match the member's own key"
+        );
+        assert!(value.first_child().unwrap().prev_sibling().is_none());
+
+        // From the key node: its own slot is `Key`, so `key` emits nothing
+        // there, while its path and ancestors are the member's.
+        assert!(matches!(
+            cursor_slot(&key_cursor).unwrap(),
+            Some(CursorSlot::Key(_))
+        ));
+        assert_eq!(cursor_key(&key_cursor).unwrap(), None);
+        let (path, ancestors, at_key) = cursor_path_and_ancestors(&key_cursor).unwrap();
+        assert!(at_key);
+        assert_eq!(
+            path,
+            vec![
+                OwnedValue::String("a".into()),
+                OwnedValue::String("b".into())
+            ]
+        );
+        assert_eq!(ancestors.len(), 2);
+        assert!(ancestors[1].same_node(&at(".a")));
+
+        // An array element is an index, with no key node to hop to.
+        assert!(matches!(
+            cursor_slot(&at(".a.b[1]")).unwrap(),
+            Some(CursorSlot::Element(1))
+        ));
+        assert!(
+            cursor_slot(&root).unwrap().is_none(),
+            "the root has no slot"
         );
     }
 

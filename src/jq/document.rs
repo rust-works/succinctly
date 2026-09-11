@@ -232,6 +232,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Navigate to the next sibling.
     fn next_sibling(&self) -> Option<Self>;
 
+    /// Navigate to the previous sibling; `None` at a first child.
+    ///
+    /// Both indexed formats lay an object member out as two consecutive
+    /// siblings, key then value (`uncons` is defined that way), so the key
+    /// node of a member *value* is exactly its previous sibling -- the O(1)
+    /// answer that `eval_generic`'s `cursor_slot` would otherwise need a scan
+    /// of the parent's members for (#2763).
+    fn prev_sibling(&self) -> Option<Self>;
+
     /// Navigate to the parent container.
     fn parent(&self) -> Option<Self>;
 

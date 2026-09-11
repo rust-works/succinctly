@@ -2739,6 +2739,17 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         }
     }
 
+    /// Navigate to the previous sibling in the tree.
+    ///
+    /// `None` for a first child (the position before it is the parent's
+    /// open) and for the root.
+    pub fn prev_sibling(&self, p: usize) -> Option<usize> {
+        if p == 0 || !self.is_open(p) || !self.is_close(p - 1) {
+            return None;
+        }
+        self.find_open(p - 1)
+    }
+
     /// Navigate to first child.
     pub fn first_child(&self, p: usize) -> Option<usize> {
         if !self.is_open(p) || p + 1 >= self.len {
@@ -3072,10 +3083,27 @@ mod tests {
         // No next sibling for second child
         assert_eq!(bp.next_sibling(3), None);
 
+        // Previous sibling: the inverse, `None` at a first child and the root
+        assert_eq!(bp.prev_sibling(3), Some(1));
+        assert_eq!(bp.prev_sibling(1), None);
+        assert_eq!(bp.prev_sibling(0), None);
+        // A close position is not a node
+        assert_eq!(bp.prev_sibling(2), None);
+
         // Parent navigation
         assert_eq!(bp.parent(1), Some(0));
         assert_eq!(bp.parent(3), Some(0));
         assert_eq!(bp.parent(0), None);
+    }
+
+    #[test]
+    fn test_prev_sibling_skips_a_subtree() {
+        // "((())())" : root, first child with one grandchild, second child
+        //  positions: 0=( 1=( 2=( 3=) 4=) 5=( 6=) 7=)
+        let bp = BalancedParens::new(vec![0b00100111u64], 8);
+        assert_eq!(bp.next_sibling(1), Some(5));
+        assert_eq!(bp.prev_sibling(5), Some(1));
+        assert_eq!(bp.prev_sibling(2), None);
     }
 
     #[test]
