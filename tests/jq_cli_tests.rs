@@ -48210,3 +48210,120 @@ fn range_max_iterations_rule_survives_the_native_arm_2698() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2666: `map(f) | .[]` is atomic outside a truncating consumer, exactly as
+/// in jq -- a failing element discards every element `map` already
+/// produced, because real jq builds the whole array before `.[]` can
+/// observe it. Before this, every spelling that reached
+/// `each_lazy_seq_iterate_sink` through the generic evaluator leaked the
+/// prefix `2` to stdout before raising.
+///
+/// The table is the whole of #2666's §0, in three blocks, and every row is
+/// one assertion on `(stdout, exit code)`. The **must-preserve** block carries
+/// the *divergent* literal on purpose: `first`/`limit(1)`/`.[0]`/`nth(0)`
+/// over a `LazySeq` pull one element and stop (#725, #1565), and that is
+/// the deliberate, recorded trade this fix keeps -- so the boundary is
+/// pinned in both directions, not just the direction that moved. Real jq
+/// 1.7.1 exits 5 with no output on every one of those.
+///
+/// Two rows the plan listed as must-preserve now match jq instead --
+/// `first(try (map(.+1)|.[]) catch "c")` and `first((map(.+1)|.[]) // 0)`
+/// -- because the atomic default applies inside `try`/`//` before any
+/// `forward` opt-in. That is fidelity gained for free, so they sit in the
+/// first block.
+#[test]
+fn test_map_iterate_atomicity_outside_truncators_2666() -> Result<()> {
+    let input = r#"[1,"x",3]"#;
+
+    // Block 1 -- matches jq: no output, and the exit code jq gives.
+    let match_jq: &[(&str, &str, i32)] = &[
+        ("map(.+1) | .[]", "", 5),
+        ("map(.+1)[]", "", 5),
+        (". as $a | $a | map(.+1) | .[]", "", 5),
+        ("map(.+1) | .[] | select(.>1)", "", 5),
+        ("map(.+1) | .[] | tostring", "", 5),
+        ("map(.+1) | map(.+1) | .[]", "", 5),
+        // The comma's own left branch still emits; only the leak is gone.
+        ("99, (map(.+1) | .[])", "99", 5),
+        ("foreach (map(.+1)|.[]) as $x (0; .+$x)", "", 5),
+        // The escape happens before anything is emitted, so `try` sees an
+        // error and no output -- jq's own answer.
+        (r#"try (map(.+1)|.[]) catch "caught""#, r#""caught""#, 0),
+        ("(map(.+1)|.[])?", "", 0),
+        ("(map(.+1) | .[]) as $x | $x", "", 5),
+        ("def f: map(.+1) | .[]; f", "", 5),
+        ("if true then (map(.+1)|.[]) else 0 end", "", 5),
+        ("(map(.+1)|.[]) // 0", "", 5),
+        // `limit(n)` with n >= the array's length pulls the whole window, so
+        // the failing third element is inside it -- the row a boolean flag
+        // could never get right.
+        ("limit(2; map(.+1) | .[])", "", 5),
+        ("limit(3; map(.+1) | .[])", "", 5),
+        // Gained for free (see the doc comment).
+        (r#"first(try (map(.+1)|.[]) catch "c")"#, r#""c""#, 0),
+        ("first((map(.+1)|.[]) // 0)", "", 5),
+        // Already atomic before this change; must not regress.
+        ("[map(.+1)|.[]]", "", 5),
+        ("map(.+1)|last", "", 5),
+        ("map(.+1)|length", "", 5),
+        ("reduce (map(.+1)|.[]) as $x (0;.+$x)", "", 5),
+        ("isempty(map(.+1)|.[])", "", 5),
+        ("any(map(.+1)|.[]; .>1)", "", 5),
+        ("first(map(.+1) | .[] | select(.>2))", "", 5),
+        ("first(map(.+1) | .[] , 9)", "", 5),
+        ("{a: .} | .a | map(.+1) | .[]", "", 5),
+        ("{a: .} | .a | first(map(.+1) | .[])", "", 5),
+    ];
+    for (filter, want_out, want_code) in match_jq {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want_out, *want_code),
+            "#2666: `{filter}` must match jq 1.7.1 -- stderr: {err:?}"
+        );
+    }
+
+    // Block 2 -- the deliberate divergence, pinned as such: one element is
+    // pulled and the consumer stops before the failing one is ever reached.
+    // jq: exit 5, no output, on every row.
+    let preserved: &[(&str, &str)] = &[
+        ("first(map(.+1) | .[])", "2"),
+        ("limit(1; map(.+1) | .[])", "2"),
+        ("map(.+1) | .[0]", "2"),
+        ("nth(0; map(.+1)|.[])", "2"),
+    ];
+    for (filter, want_out) in preserved {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want_out, 0),
+            "#2666: `{filter}` is the #725/#1565 trade and must keep yielding -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2666's table again, through the owned route (`-n --argjson`), for the
+/// rows that changed: the owned evaluator was already atomic here, and the
+/// point of the fix is that the two routes now agree.
+#[test]
+fn test_map_iterate_atomicity_owned_and_generic_agree_2666() -> Result<()> {
+    for filter in [
+        "$d | map(.+1) | .[]",
+        "$d | (map(.+1)|.[])?",
+        r#"$d | try (map(.+1)|.[]) catch "caught""#,
+        "$d | limit(3; map(.+1) | .[])",
+    ] {
+        let (owned_out, _, owned_code) =
+            run_jq_full(&["-nc", "--argjson", "d", r#"[1,"x",3]"#, filter], None)?;
+        let generic_filter = filter.replacen("$d | ", "", 1);
+        let (generic_out, _, generic_code) =
+            run_jq_full(&["-c", &generic_filter], Some(r#"[1,"x",3]"#))?;
+        assert_eq!(
+            (owned_out.trim(), owned_code),
+            (generic_out.trim(), generic_code),
+            "#2666: owned vs generic route disagree on `{generic_filter}`"
+        );
+    }
+    Ok(())
+}
