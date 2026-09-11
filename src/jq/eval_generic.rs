@@ -18536,11 +18536,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             Some(Err(_)) => GenericResult::Error(EvalError::invalid_utf8_in_comment()),
             Some(Ok(first)) => {
                 let mut joined = first.unwrap_or_default();
-                if let Some(c) = cursor {
-                    for extra in c.line_comments().into_iter().skip(1) {
-                        joined.push('\n');
-                        joined.push_str(&extra);
-                    }
+                for extra in cursor
+                    .into_iter()
+                    .flat_map(|c| c.line_comments().into_iter().skip(1))
+                {
+                    joined.push('\n');
+                    joined.push_str(&extra);
                 }
                 GenericResult::Owned(OwnedValue::String(joined))
             }
