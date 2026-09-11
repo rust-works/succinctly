@@ -1507,15 +1507,11 @@ fn test_loc_top_level_2688() -> Result<()> {
 
     let mut filter_file = NamedTempFile::new()?;
     writeln!(filter_file, "$__loc__")?;
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.arg("jq").arg("-c").arg("-f").arg(filter_file.path());
-            cmd
-        },
-        Some(b"null"),
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", filter_file.path().to_str().unwrap()],
+        Some("null"),
     )?;
-    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim(), r#"{"file":"<top-level>","line":1}"#);
 
     Ok(())
