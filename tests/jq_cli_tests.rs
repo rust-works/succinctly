@@ -46016,6 +46016,13 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         // outcome deterministic across environments.
         ("[env(NONEXISTENT_VAR_XYZ_2173)?]", "[]"),
         ("[strenv(NONEXISTENT_VAR_XYZ_2173)?]", "[]"),
+        // #2794: `isempty(f)`/`any(gen; cond)`/`all(gen; cond)` contribute
+        // nothing of their own -- `bridge_ambient_input` sees only their
+        // (closed) argument(s), same as every other row here.
+        ("isempty(empty)", "true"),
+        ("isempty(1)", "false"),
+        ("any(range(3); . > 1)", "true"),
+        ("all(range(3); . >= 0)", "true"),
     ];
     for doc in docs {
         for (filter, want) in closed {
