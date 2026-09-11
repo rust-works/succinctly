@@ -47896,3 +47896,83 @@ fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
 
     Ok(())
 }
+
+/// #2698: `range`'s bounds are evaluated from the cursor, not from a
+/// materialized copy of the document.
+///
+/// The win is memory (2022 MB -> 105 MB on a 77 MB input, for a root whose
+/// `length` is 9), which a CLI test cannot assert cheaply. What it *can*
+/// assert is the half that would silently break if the native arm got the
+/// semantics wrong: `range` is a fan-out generator whose bounds are
+/// themselves generators, and the arm it replaced was chosen (#2180 WP2b)
+/// precisely for that behaviour. Every row is captured from jq 1.7.1.
+#[test]
+fn range_bounds_keep_their_fanout_semantics_2698() -> Result<()> {
+    // (filter, input, expected stdout)
+    let rows = [
+        // The row #2180 WP2b's own comment records -- a `?//` alternative in
+        // the `from` position. The eager fallback answered `[1]` here.
+        ("[first(range((1 as $x ?// $y | 1); 3))]", "1", "[1,1]"),
+        // Each bound position fans out, and the nesting order is
+        // from-major, then to, then step.
+        ("[range((1,2);4)]", "null", "[1,2,3,2,3]"),
+        ("[range(1;(3,5))]", "null", "[1,2,1,2,3,4]"),
+        ("[range(1;5;(1,2))]", "null", "[1,2,3,4,1,3]"),
+        // A bound that reads the document -- the shape this change is about.
+        ("[range(length)]", "[7,8,9]", "[0,1,2]"),
+        ("[first(range(length;3))]", "[7,8,9]", "[]"),
+        ("last(range(length))", "[7,8,9]", "2"),
+        ("[range(0;length)]", "[7,8,9]", "[0,1,2]"),
+        ("reduce range(length) as $x (0; .+$x)", "[7,8,9]", "3"),
+        ("[limit(2; range(length))]", "[7,8,9,10,11]", "[0,1]"),
+        // Float and descending paths through the same arm.
+        ("[range(0;1;0.3)]", "null", "[0,0.3,0.6,0.8999999999999999]"),
+        ("[range(5;0;-1)]", "null", "[5,4,3,2,1]"),
+        // Degenerate bounds still produce nothing rather than erroring.
+        ("[range(0;0)]", "null", "[]"),
+        ("[range(3;1)]", "null", "[]"),
+        ("[range(0;3;0)]", "null", "[]"),
+    ];
+    for (filter, input, want) in rows {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2698: `{filter}` on {input} -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2698 keeps #2089's `MAX_RANGE` rule: truncation raises only once a
+/// consumer has taken the whole capped batch and still wants more.
+///
+/// This is the rule most at risk from moving where the bounds are evaluated,
+/// because it depends on what the *sink* does, not on the bounds -- and the
+/// native arm now owns both sides of that conversation. Real jq has no cap
+/// and would try to build 10^18 elements here, so there is no oracle row:
+/// these pin succinctly's own documented divergence.
+#[test]
+fn range_max_iterations_rule_survives_the_native_arm_2698() -> Result<()> {
+    // A demand-driven consumer stops inside the capped batch and never sees
+    // the truncation.
+    let (out, _, code) = run_jq_full(&["-c", "first(range(1e18))"], Some("null"))?;
+    assert_eq!((out.trim(), code), ("0", 0));
+    let (out, _, code) = run_jq_full(&["-c", "[limit(3; range(1e18))]"], Some("null"))?;
+    assert_eq!((out.trim(), code), ("[0,1,2]", 0));
+
+    // An unbounded one takes everything and must raise rather than silently
+    // return a 100000-element prefix.
+    for filter in ["[range(1e18)]", "reduce range(1e18) as $x (0;.+$x)"] {
+        let (_, err, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_ne!(
+            code, 0,
+            "#2698: `{filter}` must raise, not truncate silently"
+        );
+        assert!(
+            err.contains("maximum iterations exceeded"),
+            "#2698: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}

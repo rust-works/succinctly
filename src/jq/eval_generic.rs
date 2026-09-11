@@ -63,15 +63,16 @@ use super::eval::{
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, resume_from_escape, select_emits,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
-    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses,
-    tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
+    range_values_f64, range_values_int, resume_from_escape, select_emits, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read, stop_with_downstream, stop_with_error,
+    stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
+    substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -7041,6 +7042,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `test_arithmetic_validates_only_what_it_reads_2626`.
         Expr::Arithmetic { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2698: `range`'s bounds are evaluated by `each_range_generic` from
+        // the cursor, so collecting that arm keeps the whole-collection
+        // spellings (`[range(length)]`, `last(range(length))`) off the
+        // wildcard bridge's whole-document materialization -- 2022 MB to
+        // 105 MB on a 77 MB input, for a root whose `length` is 9. The
+        // demand-driven spellings (`first`, `limit`, `reduce`) already reach
+        // the native arm directly through `eval_each_generic`.
+        Expr::Range { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         // Spine 2416 (the exit): unary minus over a path-context operand.
         // The eager evaluator carried this as `eval_negate_with_path_context`
         // (#1100) so `-file_index` mid-pipe read at the node; with that
@@ -8168,9 +8178,24 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // doc comment gives. Captured live against jq 1.7.1, input `1`:
         // `[first(range((1 as $x ?// $y | 1); 3))]` is `[1,1]`, where the
         // eager fallback answered `[1]`.
-        Expr::Range { .. } => {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
-        }
+        //
+        // #2698: native since the bridge's `bridge_ambient_input` cost a
+        // whole-document `OwnedValue` copy whenever a *bound* reads the
+        // document -- `range(length; 3)` measured 2032 MB peak on a 77 MB
+        // input against 105 MB for `length` alone. `each_range_generic`
+        // keeps this arm's demand forwarding and its `?//` fan-out row by
+        // mirroring `each_range`'s nesting rather than replacing it; only
+        // where the bounds are *evaluated* changes, from the eager
+        // evaluator over a materialized ambient to this one over the cursor.
+        Expr::Range { from, to, step } => each_range_generic::<S, V>(
+            from,
+            to.as_deref(),
+            step.as_deref(),
+            value,
+            optional,
+            cursor,
+            sink,
+        ),
 
         // #2180 WP3: `foreach`'s own demand-forwarding arm, native rather
         // than bridged for the same reason this file's eager `Expr::Foreach`
@@ -11243,6 +11268,136 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
         binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
         &mut |bit| sink(GenericItem::Owned(OwnedValue::Bool(bit))),
     )
+}
+
+/// `range(from; to; step)` with the cursor threaded into its bound
+/// expressions (#2698) -- the generic twin of [`super::eval::each_range`],
+/// loop for loop.
+///
+/// `eval_each_generic`'s `Expr::Range` arm went to `bridge_to_each_owned_flow`
+/// (#2180 WP2b), whose first act is `bridge_ambient_input`. That buys the
+/// demand forwarding and the jq-matching `?//` fan-out the arm's comment
+/// records, but for a bound that *reads the document* it also buys a whole
+/// `OwnedValue` copy of it. `range(length; 3)` measured 2032 MB peak on a
+/// 77 MB document against 105 MB for `length` alone -- ~19x, for a filter
+/// whose outputs are three numbers. `range(0; length)` is the idiomatic
+/// index-iteration spelling, so this is not an exotic shape.
+///
+/// Evaluating the bounds through *this* evaluator instead reads them from
+/// the cursor, and the demand forwarding the bridge provided is kept because
+/// this mirrors `each_range`'s own nesting rather than replacing it: each of
+/// `from`/`to`/`step` drives the one inside it, and a `Demand::Stop` from the
+/// sink unwinds all three. The values themselves come from
+/// [`super::eval::range_values_int`]/[`super::eval::range_values_f64`], the
+/// same `MAX_RANGE`-capped definitions `each_range` uses -- one cap, not a
+/// second copy to drift.
+fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
+    from: &Expr,
+    to: Option<&Expr>,
+    step: Option<&Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    // `Cell` for the same reason `each_range` uses one: `emit` and the three
+    // operand closures are live simultaneously and each must be able to
+    // record an escape it discovers on its own.
+    let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
+    let mut sink_stopped = false;
+
+    let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
+        let (values, truncated) = match (from_val, to_val, step_val) {
+            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => range_values_int(f, t, st),
+            (f, t, st) => range_values_f64(f.as_f64(), t.as_f64(), st.as_f64()),
+        };
+        for v in values {
+            if sink(GenericItem::Owned(v)) == Demand::Stop {
+                sink_stopped = true;
+                return Demand::Stop;
+            }
+        }
+        // Truncation only raises once the sink has taken everything the
+        // capped batch held and still wants more -- `each_range`'s #2089
+        // rule, unchanged: `first(range(1e18))` stops early and never sees
+        // this, `[range(1e18)]` does.
+        if truncated {
+            return stop_with_escape_cell(&escape, Control::Error(range_max_exceeded_error()));
+        }
+        Demand::Continue
+    };
+
+    let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
+        let from_val = match generic_item_into_owned(item)
+            .and_then(|v| range_num(&v).map_err(Control::Error))
+        {
+            Ok(n) => n,
+            Err(control) => return stop_with_escape_cell(&escape, control),
+        };
+
+        let Some(to_expr) = to else {
+            // `range(n)` -- unreachable from any query today, mirroring
+            // `each_range`'s own note on this branch.
+            return match from_val {
+                RangeNum::Int(t) => emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1)),
+                RangeNum::Float(t) => emit(
+                    RangeNum::Float(0.0),
+                    RangeNum::Float(t),
+                    RangeNum::Float(1.0),
+                ),
+            };
+        };
+
+        let to_flow =
+            eval_each_generic::<S, V>(to_expr, value.clone(), optional, cursor, &mut |to_item| {
+                let to_val = match generic_item_into_owned(to_item)
+                    .and_then(|v| range_num(&v).map_err(Control::Error))
+                {
+                    Ok(n) => n,
+                    Err(control) => return stop_with_escape_cell(&escape, control),
+                };
+
+                match step {
+                    None => emit(from_val, to_val, RangeNum::Int(1)),
+                    Some(step_expr) => {
+                        let step_flow = eval_each_generic::<S, V>(
+                            step_expr,
+                            value.clone(),
+                            optional,
+                            cursor,
+                            &mut |step_item| {
+                                let step_val = match generic_item_into_owned(step_item)
+                                    .and_then(|v| range_num(&v).map_err(Control::Error))
+                                {
+                                    Ok(n) => n,
+                                    Err(control) => return stop_with_escape_cell(&escape, control),
+                                };
+                                emit(from_val, to_val, step_val)
+                            },
+                        );
+                        match step_flow {
+                            Flow::Exhausted => Demand::Continue,
+                            Flow::Stopped { .. } => Demand::Stop,
+                            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+                        }
+                    }
+                }
+            });
+
+        match to_flow {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => Demand::Stop,
+            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
+        }
+    });
+
+    if sink_stopped {
+        return Flow::Stopped { pending: None };
+    }
+    match escape.into_inner() {
+        Some(control) => Flow::Escaped(control),
+        None => from_flow,
+    }
 }
 
 /// Unary minus with the cursor threaded into its operand (#2626) -- the

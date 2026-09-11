@@ -38197,13 +38197,13 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// A numeric argument to `range()`: kept as `i64` when exact so all-integer
 /// ranges emit `Int` values, promoted to `f64` when any argument is a float.
 #[derive(Clone, Copy)]
-enum RangeNum {
+pub(crate) enum RangeNum {
     Int(i64),
     Float(f64),
 }
 
 impl RangeNum {
-    fn as_f64(self) -> f64 {
+    pub(crate) fn as_f64(self) -> f64 {
         match self {
             Self::Int(i) => i as f64,
             Self::Float(f) => f,
@@ -38216,7 +38216,7 @@ impl RangeNum {
 /// Was a `QueryResult` matcher with its own `Halt`/`Break`/`Partial` arms;
 /// since #1279 gave `range` a real fan-out, [`stream_outputs_lossy`] owns those and
 /// this is left as a pure per-value classifier.
-fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
+pub(crate) fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
     match value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => {
             Ok(RangeNum::Int(*i))
@@ -38294,7 +38294,7 @@ const MAX_RANGE: usize = 100000;
 /// The error [`each_range`]'s `emit` raises once a caller that actually
 /// wanted every value (its sink kept answering [`Demand::Continue`]) hits a
 /// [`MAX_RANGE`]-truncated batch -- shared so callers can't drift in wording.
-fn range_max_exceeded_error() -> EvalError {
+pub(crate) fn range_max_exceeded_error() -> EvalError {
     // #2132: uncatchable -- `[range(100001)?] | length` answered `100000`
     // at exit 0 with a plain `new`, the silent truncation #2089 closed for
     // the un-suppressed spelling. See `EvalError::resource_limit`.
@@ -38421,6 +38421,19 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     to: i64,
     step: i64,
 ) -> (QueryResult<'a, W>, bool) {
+    let (values, truncated) = range_values_int(from, to, step);
+    (owned_vec_to_result(values), truncated)
+}
+
+/// [`eval_range_values`]'s body, stopping at the `Vec` (#2698).
+///
+/// `eval_generic.rs`'s own `each_range_generic` needs these values as owned
+/// numbers to hand its `GenericItem` sink, not wrapped in a `QueryResult` it
+/// would have to unwrap again -- and duplicating the `MAX_RANGE` cap and its
+/// two overflow proofs into a second copy is exactly the drift the
+/// `MAX_RANGE` doc comment above already warns about. One definition, two
+/// wrappers.
+pub(crate) fn range_values_int(from: i64, to: i64, step: i64) -> (Vec<OwnedValue>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
@@ -38480,7 +38493,7 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
         }
     }
 
-    (owned_vec_to_result(values), truncated)
+    (values, truncated)
 }
 
 /// Helper to generate range values over floats, capped at [`MAX_RANGE`] per
@@ -38495,6 +38508,13 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
     to: f64,
     step: f64,
 ) -> (QueryResult<'a, W>, bool) {
+    let (values, truncated) = range_values_f64(from, to, step);
+    (owned_vec_to_result(values), truncated)
+}
+
+/// [`eval_range_values_f64`]'s body, stopping at the `Vec` -- the float twin
+/// of [`range_values_int`], same reasoning (#2698).
+pub(crate) fn range_values_f64(from: f64, to: f64, step: f64) -> (Vec<OwnedValue>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
@@ -38519,7 +38539,7 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
         truncated = i > to;
     }
 
-    (owned_vec_to_result(values), truncated)
+    (values, truncated)
 }
 
 /// Builtin: recurse (recurse(.[]))
