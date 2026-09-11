@@ -3594,6 +3594,42 @@ go-yaml's way: first line after the value, each further line as its own comment 
 the key's indent, an empty line left empty, and — top level only — one blank line before
 the continuation (`a: 1 # m` / blank / `# l`, but `  b: 1 # m` / `  # l` when nested).
 
+### Object-construction shorthand (`{x}`, `{$a}`) has no real-yq equivalent at all (#2783)
+
+Real yq's `{...}` object-construction grammar has no shorthand concept whatsoever -- not
+even the plain, non-`$` field shorthand jq accepts. Confirmed live against yq v4.53.3:
+
+```console
+$ printf 'x: 1\n' | yq '{x}'
+Error: 1:2: lexer: invalid input text "x}"
+```
+
+a bare lexer rejection, not a compile or runtime error. `succinctly yq` already diverges
+here -- it accepts `{x}` as sugar for `{x: .x}`, a deliberate (if previously undocumented)
+convenience extension beyond real yq's stricter grammar.
+
+The `$var` case (`{$a}`, jq's variable-shorthand sugar fixed for jq mode by #2724) is left
+unextended: `succinctly yq` still raises its pre-existing "expected identifier, found '$'"
+parse error, matching neither jq's sugar nor real yq's own behavior for the same input,
+which is a third thing again -- not an error at all:
+
+```console
+$ printf 'x: 1\n' | yq '1 as $a | {$a}'
+$ echo $?
+0
+```
+
+Empty stdout, exit 0. `--verbose` shows why: `$a` is evaluated as an ordinary
+`GET_VARIABLE` op and handed to `COLLECT_OBJECT` as a bare, non-`key: value` entry, which
+degrades the whole construction to zero results (`"collectObjectOperation, length of
+rotated is 0"` -> `"no matching results, nothing to print"`) -- an incidental quirk of
+yq's object-collection operator, not a deliberate feature.
+
+Reproducing real yq's exact behavior needs evaluator-level work (an object-construction
+entry that consumes zero pairs and yields nothing), not a parser change, and interacts
+with the pre-existing, separately-undocumented `{x}` extension above -- both tracked
+together in #2783.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
