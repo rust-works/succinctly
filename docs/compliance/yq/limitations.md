@@ -928,6 +928,31 @@ the fast path here would cost M2's performance for JSON input with no correctnes
 is a real, broader, non-destructive sibling gap — tracked as a further follow-up rather than
 folded into #2276.
 
+**Closed by [#2279](https://github.com/rust-works/succinctly/issues/2279), in the parser
+rather than on either route.** Declining the fast path was indeed no help, and neither was
+the obvious alternative of giving `YamlCursor` the `DocumentCursor` delimiter overrides
+(`container_gap_ok`/`trailing_element_gap_ok`/`preceding_delimiter_ok`): those methods are
+never called on this path at all — JSON's own validation lives in `json::light`'s
+module-private walk functions, so overriding the trait for `YamlCursor` installs code nothing
+calls (verified by instrumenting it). The giveaway is that `length` on `[1,]` also answered
+`1`: that count comes from the BP structure, so no output-side check could have reached it.
+
+The fix restores the invariant `preceding_delimiter_ok`'s own doc comment states — *every
+format but JSON validates delimiters while parsing*. JSON-sourced YAML was the one case that
+did neither. `YamlIndex::build_json_sourced` now parses with `Parser::json_strict` set and
+marks the index in one step (a post-build `mark_json_sourced()` has already accepted the bad
+input), so `[1,]`, `[,1]`, `[1,,2]`, `[,]` and their nested forms error on every route.
+
+Scope is flow **sequences** only, and never scalar grammar, because that is where real yq
+(v4.53.3, captured live) actually draws the line — the asymmetry this section already
+describes above. Tightening mappings would refuse `{"a":1,}`/`{,}`, and tightening scalars
+would refuse `[01]`/`[00]`/`[1.]`, all of which real yq accepts. The remaining divergences on
+this route are tracked separately: the flow-mapping grammar in
+[#2777](https://github.com/rust-works/succinctly/issues/2777) (including one silent wrong
+value, `{"a":1 "b":2}`), the non-comma sequence cases in
+[#2778](https://github.com/rust-works/succinctly/issues/2778), and genuine-YAML `[,]`/`{,}`
+in [#2779](https://github.com/rust-works/succinctly/issues/2779).
+
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
 more lenient about a comma or colon inside a JSON *object* than #1975's own delimiter checks
