@@ -3200,7 +3200,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // (`-\n  # c\n  - x\n` heads `.[0][0]`, measured), so only
                 // the lines already pending here are this value's own head.
                 let above_dash = self.pending_head_lines.len();
-                if self.following_value_is_null(indent) {
+                let value_is_null = self
+                    .next_line_settles_value_is_null(indent)
+                    .unwrap_or_else(|| self.following_value_is_null(indent));
+                if value_is_null {
                     match trailing {
                         Some(range) => self.float_absent_item_comment(range),
                         None => self.end_float(),
@@ -3362,6 +3365,37 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let is_null = self.peek().is_none() || self.count_indent().unwrap_or(0) <= indent;
         self.pos = saved_pos;
         is_null
+    }
+
+    /// [`Self::following_value_is_null`]'s answer read straight off the
+    /// next line when that line settles it by itself: ordinary content at
+    /// some indent, or end of input. `None` when the next line is blank,
+    /// comment-only, or tab-led -- anything `skip_newlines` has an opinion
+    /// about -- so the caller falls back to the full lookahead and the two
+    /// cannot disagree. Called with `self.pos` on the current line's break.
+    ///
+    /// Exists for the bare `-` item, the common shape in record-style
+    /// documents (`-\n  name: ...` per record, #1079): the full lookahead
+    /// measured +0.9% on that shape, this reads a handful of bytes.
+    #[inline]
+    fn next_line_settles_value_is_null(&self, indent: usize) -> Option<bool> {
+        let mut p = self.pos;
+        let Some(&b) = self.input.get(p) else {
+            return Some(true);
+        };
+        if !Self::is_break(b) {
+            return None;
+        }
+        p += 1;
+        if b == b'\r' && self.input.get(p) == Some(&b'\n') {
+            p += 1;
+        }
+        let spaces = super::simd::count_leading_spaces(self.input, p);
+        match self.input.get(p + spaces) {
+            Some(&b) if !Self::is_break(b) && b != b'#' && b != b'\t' => Some(spaces <= indent),
+            None if spaces == 0 => Some(true),
+            _ => None,
+        }
     }
 
     /// Parse a compact mapping entry within a sequence item.
