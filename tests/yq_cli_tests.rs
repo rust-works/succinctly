@@ -41959,6 +41959,13 @@ const JSON_SOURCED_DELIMITER_ROWS: &[(&str, Option<&str>)] = &[
     ("[1,,2]", None),
     ("[1,2,,]", None),
     ("[[1,],2]", None),
+    // CRLF rejection rows, deliberately alongside the accepting `[1,\r\n2]`
+    // below: the flag is threaded into *both* `HAS_CR` monomorphizations
+    // (#340), and only a `\r`-bearing row that must REJECT can tell whether
+    // `Parser::<true>` still carries it -- an accepting row passes either way,
+    // since a valid document never reaches the check.
+    ("[1,\r\n]", None),
+    ("[\r\n,1]", None),
     (r#"{"a":[1,]}"#, None),
     // --- flow mappings: real yq ACCEPTS these; we must not start -------
     // refusing them. yq ignores punctuation inside `{}` and pairs up
@@ -41998,10 +42005,13 @@ fn json_sourced_flow_sequence_delimiters_match_yq_2279() -> Result<()> {
                 );
             }
             None => {
-                assert_ne!(
-                    code, 0,
-                    "#2279: {input:?} must be rejected (real yq v4.53.3 rejects it), \
-                     got stdout {stdout:?}"
+                // Exactly 1, not merely non-zero: a panic (101) or abort
+                // (134) would satisfy `assert_ne!` just as well, and real yq
+                // exits 1 here.
+                assert_eq!(
+                    code, 1,
+                    "#2279: {input:?} must be rejected with exit 1 (real yq v4.53.3 \
+                     rejects it), got stdout {stdout:?}"
                 );
             }
         }
@@ -42020,9 +42030,9 @@ fn json_sourced_delimiter_check_covers_every_route_2279() -> Result<()> {
             "[1,]",
             &["--input-format", "json", "-o=json", "-I=0"],
         )?;
-        assert_ne!(
-            code, 0,
-            "#2279: `{filter}` on `[1,]` must be rejected, got stdout {stdout:?}"
+        assert_eq!(
+            code, 1,
+            "#2279: `{filter}` on `[1,]` must be rejected with exit 1, got stdout {stdout:?}"
         );
     }
     Ok(())
