@@ -4565,6 +4565,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         self.err_unexpected_char(self.pos, "expected ',' or ']' in flow sequence")
                     );
                 }
+                let comma_pos = self.pos;
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace();
 
@@ -4577,10 +4578,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
                 // Allow trailing comma -- except for JSON-sourced input
                 // (#2279), where `[1,]` is exactly what real yq rejects.
+                // Reported against the offending `,`, not the `]` that
+                // merely revealed it.
                 if self.peek() == Some(b']') {
                     if self.json_strict {
-                        return Err(self
-                            .err_unexpected_char(self.pos, "trailing ',' in JSON array (#2279)"));
+                        return Err(
+                            self.err_unexpected_char(comma_pos, "trailing ',' in JSON array")
+                        );
                     }
                     break;
                 }
@@ -6304,18 +6308,23 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
 /// Other variants report malformed YAML. (Pathological YAML can also push the
 /// BP bit count past `u32::MAX` before the text does; `BalancedParens`
 /// asserts its own ceiling as a loud backstop.)
+pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(input, false)
+}
+
 /// [`build_semi_index`], enforcing JSON's flow-sequence delimiter rules
 /// (#2279) -- for callers that already know the bytes are JSON and pair this
 /// with [`YamlIndex::mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
 ///
 /// See `Parser::json_strict` for what this does and does not tighten (flow
 /// sequences only; never flow mappings, never scalar grammar).
+///
+/// # Errors
+///
+/// As [`build_semi_index`], plus the JSON flow-sequence delimiter violations
+/// above, which that function accepts.
 pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError> {
     build_semi_index_impl(input, true)
-}
-
-pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
-    build_semi_index_impl(input, false)
 }
 
 fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, YamlError> {

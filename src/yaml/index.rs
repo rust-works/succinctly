@@ -126,6 +126,10 @@ impl YamlIndex<Vec<u64>> {
     /// Returns [`YamlError::InputTooLarge`] for inputs over `u32::MAX` bytes
     /// (just under 4 GiB): the semi-index stores text positions as `u32`
     /// (#188). Other variants report malformed YAML.
+    pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
+        Self::from_semi_index(yaml, build_semi_index(yaml)?)
+    }
+
     /// [`build`](Self::build) for input the caller already knows is JSON,
     /// pairing the parse with [`mark_json_sourced`](Self::mark_json_sourced)
     /// so the two can never drift apart (#2279).
@@ -134,15 +138,17 @@ impl YamlIndex<Vec<u64>> {
     /// delimiter rules real yq enforces for `-p json` (`[1,]`, `[,1]`,
     /// `[1,,2]`) can only be applied while parsing, so a caller that marks
     /// the index afterwards has already accepted the malformed input. See
-    /// `Parser::json_strict` for the exact scope.
+    /// `Parser::json_strict` for the exact scope — flow sequences only,
+    /// never flow mappings, never scalar grammar.
+    ///
+    /// # Errors
+    ///
+    /// As [`build`](Self::build), plus the JSON flow-sequence delimiter
+    /// violations above, which that function accepts.
     pub fn build_json_sourced(yaml: &[u8]) -> Result<Self, YamlError> {
         let mut index = Self::from_semi_index(yaml, build_semi_index_json_strict(yaml)?)?;
         index.mark_json_sourced();
         Ok(index)
-    }
-
-    pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
-        Self::from_semi_index(yaml, build_semi_index(yaml)?)
     }
 
     fn from_semi_index(yaml: &[u8], semi: SemiIndex) -> Result<Self, YamlError> {

@@ -941,7 +941,18 @@ The fix restores the invariant `preceding_delimiter_ok`'s own doc comment states
 format but JSON validates delimiters while parsing*. JSON-sourced YAML was the one case that
 did neither. `YamlIndex::build_json_sourced` now parses with `Parser::json_strict` set and
 marks the index in one step (a post-build `mark_json_sourced()` has already accepted the bad
-input), so `[1,]`, `[,1]`, `[1,,2]`, `[,]` and their nested forms error on every route.
+input), so `[1,]`, `[,1]`, `[1,,2]`, `[,]` and their nested forms error on every route that
+parses through `YamlIndex` — the plain stdout path this issue was filed about, for every
+filter.
+
+**One shape is still accepted, and it is on the other family of routes**: a *top-level*
+`[,]` (only `[,]` itself — `[[,]]` and `{"a":[,]}` are refused) still passes on
+`--slurp`/`--eval-all`/`--inplace`, which materialize through `JsonIndex`'s DOM bridge
+rather than this parser, and whose check needs a cursor for the outermost container that
+the bridge does not have. `succinctly yq -p json -i '.'` on a file containing `[,]`
+therefore rewrites it to `[]`, where real yq refuses the file and leaves it untouched.
+That route disagreeing with the stdout route is *new* — before #2279 both accepted it —
+and it is tracked as [#2781](https://github.com/rust-works/succinctly/issues/2781).
 
 Scope is flow **sequences** only, and never scalar grammar, because that is where real yq
 (v4.53.3, captured live) actually draws the line — the asymmetry this section already
