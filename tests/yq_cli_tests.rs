@@ -41986,11 +41986,8 @@ const JSON_SOURCED_DELIMITER_ROWS: &[(&str, Option<&str>)] = &[
 #[test]
 fn json_sourced_flow_sequence_delimiters_match_yq_2279() -> Result<()> {
     for (input, expected) in JSON_SOURCED_DELIMITER_ROWS {
-        let (stdout, code) = run_yq_stdin(
-            ".",
-            input,
-            &["--input-format", "json", "-o=json", "-I=0"],
-        )?;
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
         match expected {
             Some(want) => {
                 assert_eq!(
