@@ -18947,6 +18947,114 @@ fn test_object_pattern_var_shorthand_with_alt_patterns_720_1139() -> Result<()> 
 }
 
 // =============================================================================
+// #2724: object *construction* shorthand `{$a}` -- the construction-side
+// mirror of #1139's destructuring-pattern shorthand above. `{$a}` desugars
+// to `{a: $a}` (key inferred from the variable's own name); `$__loc__`/
+// `$ENV` still get their own dedicated Expr via the same `dollar_var_expr`
+// helper the primary `$var` dispatch uses. An explicit `{$a: value}` is a
+// different, unrelated jq feature: `$a` there is an ordinary *dynamic-key*
+// expression (its bound *value* becomes the key), not sugar for `"a"`. All
+// cases live-verified against jq 1.7.1.
+// =============================================================================
+
+#[test]
+fn test_object_construction_var_shorthand_bare_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "1 as $a | {$a}"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_object_construction_var_shorthand_mixed_with_explicit_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "1 as $a | {$a, \"b\": 2}"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"a":1,"b":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_object_construction_var_shorthand_multiple_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#""foo" as $a | "bar" as $b | {$a, $b, "c": 3}"#],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"a":"foo","b":"bar","c":3}"#);
+    Ok(())
+}
+
+#[test]
+fn test_object_construction_var_shorthand_nested_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "1 as $a | [{$a}]"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[{"a":1}]"#);
+    Ok(())
+}
+
+/// `$__loc__`/`$ENV` inside the shorthand desugar to their own dedicated
+/// node (matching the primary `$var` dispatch), not a plain variable
+/// lookup -- `{$__loc__}` is `{"__loc__": $__loc__}`, per #2688.
+#[test]
+fn test_object_construction_pseudo_var_shorthand_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "{$__loc__}"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim_end(),
+        r#"{"__loc__":{"file":"<top-level>","line":1}}"#
+    );
+    Ok(())
+}
+
+/// `{$a: value}` (with an explicit colon) is a different feature from the
+/// shorthand: `$a`'s own bound *value* becomes the key, not its name --
+/// confirmed jq treats it identically to `{($a): value}`.
+#[test]
+fn test_object_construction_dollar_key_is_dynamic_key_not_shorthand_2724() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", r#""foo" as $a | {$a: 99}"#], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"{"foo":99}"#);
+    Ok(())
+}
+
+/// `$ENV` is an ordinary bound variable in jq's own grammar (just
+/// pre-bound to the environment), so `{$ENV: value}` parses like any other
+/// `{$var: value}` -- it only fails at *runtime*, because an object can't
+/// be used as a key.
+#[test]
+fn test_object_construction_dollar_env_key_fails_at_runtime_not_parse_2724() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(&["-c", "{$ENV: 5}"], Some("null"))?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot use object") && stderr.contains("as object key"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// `$__loc__` is different: real jq lexes it as a distinct pseudo-variable
+/// token, not a plain `'$' IDENT`, so `{$__loc__: value}` is a *compile*
+/// error there ("may need parentheses around object key expression"), not
+/// a runtime one -- confirmed live, and confirmed `$ENV` does NOT share
+/// this restriction (previous test).
+#[test]
+fn test_object_construction_dollar_loc_key_is_a_parse_error_2724() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(&["-c", "{$__loc__: 5}"], Some("null"))?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr
+            .to_lowercase()
+            .contains("parentheses around object key expression"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+// (yq mode's own untouched-by-#2724 behavior is covered in
+// tests/yq_cli_tests.rs, not here -- see
+// test_object_construction_var_shorthand_is_jq_mode_only_2724.)
+
+// =============================================================================
 // #1204: object destructuring pattern entry `{$x: Pattern}` (bind and
 // further destructure). Real jq's `$IDENT: Pattern` entry binds the
 // matched value to `$IDENT` -- same as the `{$x}` shorthand (#1139) --

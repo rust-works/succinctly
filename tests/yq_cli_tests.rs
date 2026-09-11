@@ -42057,3 +42057,18 @@ fn genuine_yaml_flow_sequences_keep_their_trailing_comma_2279() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2724: jq mode's `{$a}` object-construction shorthand fix is scoped to
+/// jq mode only -- yq mode still raises the same pre-existing parse error
+/// it always has ("expected identifier, found '$'"), not jq's `{"a":1}".
+/// Real yq's own behavior for this shape is a third, unrelated thing
+/// (silently produces zero output, per a `COLLECT_OBJECT` quirk on a bare
+/// non-pair entry) -- reproducing that needs evaluator-level work, tracked
+/// separately as #2783.
+#[test]
+fn test_object_construction_var_shorthand_is_jq_mode_only_2724() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("1 as $a | {$a}", "x: 1\n", &[])?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(stderr.contains("expected identifier"), "stderr: {stderr:?}");
+    Ok(())
+}

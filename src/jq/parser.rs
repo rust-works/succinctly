@@ -188,6 +188,26 @@ fn is_ident_start_char(c: char) -> bool {
     c.is_alphabetic() || c == '_'
 }
 
+/// The one definition of what `$name` (the `$` already consumed) desugars
+/// to: jq's two pseudo-variables, `$__loc__`/`$ENV`, get their own
+/// dedicated node; every other name is an ordinary bound-variable
+/// reference. `line` is the 1-based source line the `$` itself started on
+/// (only `$__loc__` uses it, for its own `{file, line}` payload). Shared
+/// by the primary `$var` expression dispatch and the `{$a}`/`{$a: ...}`
+/// object-construction forms (#2724) so the two can't independently drift
+/// on which names get pseudo-variable treatment -- the exact "duplicated
+/// predicates diverge silently" shape #2728 found for identifier-start
+/// rules, per CLAUDE.md's #106 note.
+fn dollar_var_expr(name: String, line: usize) -> Expr {
+    if name == "__loc__" {
+        Expr::Loc { line }
+    } else if name == "ENV" {
+        Expr::Env
+    } else {
+        Expr::Var(name)
+    }
+}
+
 /// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
 /// identifier spelled after a `def` keyword anywhere in `input` -- see
 /// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
@@ -1310,6 +1330,34 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
 
+            // #2724: `{$a}` and `{$a: expr}` -- captured here rather than
+            // folded into the shorthand check below, because the two
+            // forms diverge in what `$name` means: with no `:` it's sugar
+            // for `{name: $name}` (`dollar_var_expr` -- same desugaring as
+            // the primary `$var` dispatch, so `$__loc__`/`$ENV` still get
+            // their own node); with an explicit `:`, `$name` is an
+            // ordinary *dynamic-key* expression whose bound value becomes
+            // the key (jq 1.7.1 confirmed live: `"x" as $a | {$a: 1}` is
+            // `{"x":1}`, not `{"a":1}`) -- and that holds for `$ENV` too
+            // (`{$ENV: 1}` parses; it only fails at runtime, "Cannot use
+            // object ... as object key", since `$ENV` is an ordinary
+            // bound variable in jq's own grammar, just pre-bound to the
+            // environment). `$__loc__` alone is different: real jq lexes
+            // it as a distinct pseudo-variable token, not a plain `'$'
+            // IDENT`, so `{$__loc__: 1}` is a *compile* error there ("may
+            // need parentheses around object key expression") -- confirmed
+            // live, and confirmed `$ENV` does NOT share that restriction.
+            //
+            // yq mode is deliberately left untouched here (falls through
+            // to the identifier branch below, whose "expected identifier,
+            // found '$'" error is unchanged) -- real yq has no such sugar
+            // at all; `{$a}` there parses via an unrelated mechanism
+            // (`$a` as a bare non-pair COLLECT_OBJECT entry) and silently
+            // produces zero output rather than either jq's `{"a":1}` or
+            // an error. Reproducing that exactly needs evaluator-level
+            // work, not a parser tweak, and is tracked separately (#2783).
+            let mut dollar_shorthand_value: Option<Expr> = None;
+
             // Parse key
             let key = if self.peek() == Some('(') {
                 // Dynamic key: (expr)
@@ -1321,6 +1369,23 @@ impl<'a> Parser<'a> {
                 // String key
                 let s = self.parse_string_literal()?;
                 ObjectKey::Literal(s)
+            } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
+                let line = self.current_line();
+                self.next();
+                let name = self.parse_ident()?;
+                self.skip_ws();
+                if self.peek() == Some(':') {
+                    if name == "__loc__" {
+                        return Err(ParseError::new(
+                            "may need parentheses around object key expression",
+                            self.pos,
+                        ));
+                    }
+                    ObjectKey::Expr(Box::new(dollar_var_expr(name, line)))
+                } else {
+                    dollar_shorthand_value = Some(dollar_var_expr(name.clone(), line));
+                    ObjectKey::Literal(name)
+                }
             } else {
                 // Identifier key
                 let name = self.parse_ident()?;
@@ -1330,7 +1395,9 @@ impl<'a> Parser<'a> {
             self.skip_ws();
 
             // Check for shorthand: `{foo}` means `{foo: .foo}`
-            let value = if self.peek() == Some(':') {
+            let value = if let Some(v) = dollar_shorthand_value {
+                v
+            } else if self.peek() == Some(':') {
                 self.next();
                 self.skip_ws();
                 // jq's `ExpD`, not `Exp`: the `,` here separates entries, so a
@@ -1666,13 +1733,7 @@ impl<'a> Parser<'a> {
                 let line = self.current_line();
                 self.next();
                 let name = self.parse_ident()?;
-                let expr = if name == "__loc__" {
-                    Expr::Loc { line }
-                } else if name == "ENV" {
-                    Expr::Env
-                } else {
-                    Expr::Var(name)
-                };
+                let expr = dollar_var_expr(name, line);
                 self.parse_postfix(expr)
             }
 
