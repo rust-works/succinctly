@@ -2460,7 +2460,7 @@ expression answered differently depending only on which consumer wrapped it, mea
 
 | filter (input `{"a":1,}`)     | before #2669 | after   |
 |-------------------------------|--------------|---------|
-| `(.,.) and true` (bare)       | `true`       | `true`  |
+| `(.,.) and true` (bare)       | `true` `true` | `true` `true` |
 | `first((.,.) and true)`       | `true`       | `true`  |
 | `[limit(2; (.,.) and true)]`  | `[true,true]`| `[true,true]` |
 | `[(.,.) and true]`            | **exit 5**   | `[true,true]` |

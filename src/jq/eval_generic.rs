@@ -10948,12 +10948,14 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
 /// `and`/`or` with the cursor threaded into both operands (spine 2416 gate
 /// reason 3, #2473) -- the boolean twin of [`eval_compare_generic`] above.
 ///
-/// The loop itself is `eval::boolean_fanout_bools`, shared with the eager
-/// route rather than copied, so #2460's zero-output-operand rule and #2470's
-/// read-only operand scope have one definition across both. What this adds is
-/// the operand strategy: `eval_single` *with* `cursor`, so `.[] | key == "a"
-/// and true` reads each element's own key instead of being handed a `null`
-/// by the eager bridge.
+/// The loop itself is `eval::boolean_fanout_bools`, shared with `eval.rs`'s
+/// own collecting route rather than copied, so #2460's zero-output-operand
+/// rule and #2470's read-only operand scope have one definition across both.
+/// What this adds is the cursor: the operand strategy is
+/// [`boolean_operand_bits_generic`] -- `eval_each_generic` *with* `cursor`
+/// since #2669, `eval_single` with it before -- so `.[] | key == "a" and
+/// true` reads each element's own key instead of being handed a `null` by
+/// the eager bridge.
 ///
 /// `short_circuit` is the truth value that ends the pairing -- `false` for
 /// `and`, `true` for `or` -- exactly as `eval::eval_and`/`eval::eval_or`
@@ -10979,14 +10981,15 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     // nothing -- and stopped at "reads `.`"; #2692 takes the other half,
     // because `. and true` reads `.`'s *truthiness*, which is `is_falsy` and
     // decodes nothing either. Each operand still validates whatever it
-    // materializes, via `eval_single` below.
-    // #2669: `eval_each_generic`, not `eval_single` -- the operand strategy
-    // is what decides whether the loop can interleave, and this collecting
-    // entry point kept the eager one long after `each_boolean_generic` had
-    // the lazy one, so `[(..) and (..)]` ordered its operands differently
-    // from `first((..) and (..))` on the identical expression. Identical
-    // closure to `each_boolean_generic`'s; the two differ only in what they
-    // do with the bits.
+    // materializes, inside `boolean_operand_bits_generic`'s drive.
+    //
+    // #2669: that drive is `eval_each_generic`, not `eval_single`. The
+    // operand strategy is what decides whether the loop can interleave, and
+    // this collecting entry point kept an eager one long after
+    // `each_boolean_generic` had the lazy one, so `[(..) and (..)]` ordered
+    // its operands differently from `first((..) and (..))` on the identical
+    // expression. Same strategy as `each_boolean_generic` now, by
+    // construction; the two differ only in what they do with the bits.
     let (bools, control) = boolean_fanout_bools(
         |operand, bit_sink| {
             boolean_operand_bits_generic::<S, V>(operand, value.clone(), optional, cursor, bit_sink)
@@ -11141,29 +11144,6 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// Demand-forwarding twin of [`eval_boolean_generic`] (#2180 WP2a), for the
-/// streaming `and`/`or` route.
-///
-/// Originally introduced only for an `and`/`or` whose operands read path
-/// context, gated to match `eval_single`'s own then-gated pair; the
-/// `eval_each_generic` dispatch is ungated since #2692, so this is now the
-/// implementation for every streaming `and`/`or`, path-context operand or
-/// not (see the dispatch's own comment for why the gate had nothing left to
-/// preserve).
-///
-/// The loop is `eval::boolean_fanout_each`, shared with every other route
-/// (see its own doc comment for the oracle rows that pinned the left-outer
-/// nesting and the short-circuit rule); this supplies
-/// [`eval_each_generic`] *plus the cursor* as the operand strategy, so
-/// `key`/`parent`/`path` inside an operand still resolve against the node
-/// this stage stands on while a wrapping consumer's [`Demand::Stop`] reaches
-/// through to a generator -- or a `?//` bind (#1519) -- inside it.
-///
-/// The escape channel is per-strategy-call, not shared: a truthiness probe
-/// that fails (`generic_item_truthiness`'s `Err`) can only answer `Demand`
-/// to the loop, so the control it carries is recorded beside the drive and
-/// folded in as this operand's own `Flow::Escaped` -- the same out-of-band
-/// shape `fanout_arg_each`/`each_any_all_gen_cond` use in `eval.rs`.
 /// The one `and`/`or` operand strategy for this evaluator (#2669): drive
 /// `operand` through [`eval_each_generic`] and hand each output's truthiness
 /// bit to `bit_sink`.
@@ -11174,10 +11154,16 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// operands are enumerated, which is the whole point of #2669: the collecting
 /// route used to enumerate them eagerly and so could not interleave.
 ///
+/// The escape channel is per-strategy-call, not shared: a truthiness probe
+/// that fails (`generic_item_truthiness`'s `Err`) can only answer `Demand`
+/// to the loop, so the control it carries is recorded beside the drive and
+/// folded in as this operand's own `Flow::Escaped` -- the same out-of-band
+/// shape `fanout_arg_each`/`each_any_all_gen_cond` use in `eval.rs`.
+///
 /// One definition rather than the same closure written twice (the #106 rule).
-/// The first cut of #2669 did copy it, which would have left the
-/// `Err(control)` arm duplicated -- and that arm is reached by neither copy in
-/// the suite today, so a second one is a second thing to keep honest for no
+/// The first cut of #2669 did copy it, which would have left that
+/// `Err(control)` arm duplicated -- and it is reached by neither route in
+/// the suite today, so a second copy is a second thing to keep honest for no
 /// gain.
 fn boolean_operand_bits_generic<S: EvalSemantics, V: DocumentValue>(
     operand: &Expr,
@@ -11196,6 +11182,26 @@ fn boolean_operand_bits_generic<S: EvalSemantics, V: DocumentValue>(
     resume_from_escape(escape, flow)
 }
 
+/// Demand-forwarding twin of [`eval_boolean_generic`] (#2180 WP2a), for the
+/// streaming `and`/`or` route.
+///
+/// Originally introduced only for an `and`/`or` whose operands read path
+/// context, gated to match `eval_single`'s own then-gated pair; the
+/// `eval_each_generic` dispatch is ungated since #2692, so this is now the
+/// implementation for every streaming `and`/`or`, path-context operand or
+/// not (see the dispatch's own comment for why the gate had nothing left to
+/// preserve).
+///
+/// The loop is `eval::boolean_fanout_each`, and since #2669 the operand
+/// strategy is [`boolean_operand_bits_generic`]'s, both shared with the
+/// collecting route ([`eval_boolean_generic`]); this only forwards each
+/// pairing's boolean to `sink`. The strategy drives [`eval_each_generic`]
+/// *with the cursor*, so `key`/`parent`/`path` inside an operand still
+/// resolve against the node this stage stands on while a wrapping consumer's
+/// [`Demand::Stop`] reaches through to a generator -- or a `?//` bind
+/// (#1519) -- inside it. See the loop's own doc comment for the oracle rows
+/// that pinned the left-outer nesting and the short-circuit rule, and the
+/// strategy's for how a failed truthiness probe's control is carried out.
 fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     left: &Expr,
     right: &Expr,
