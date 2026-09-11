@@ -743,15 +743,14 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
         // (`1: x`) is an `!!int` node in real yq's `keys`, and this writer
         // is the M2 fast path `keys` takes under default flags, so it has
         // to agree with the materializing routes.
-        let key = match key_owned_value(&key, &cursor) {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                *error = Some(fields.malformed_member_error());
-                break;
-            }
+        let key = match key_owned_value(&key, &cursor)
+            .transpose()
+            .unwrap_or_else(|| Err(fields.malformed_member_error()))
+        {
+            Ok(key) => key,
             Err(e) => {
-                *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
-                break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
+                *error = Some(e);
+                break;
             }
         };
         if i > 0 {
@@ -1108,15 +1107,14 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             // non-stringifiable key (#1194) stops the walk and reports via
             // `error` instead of silently skipping it. A typed key is
             // written as its node (#2785), as in `stream_lazy_keys_json`.
-            let key = match key_owned_value(&key, &cursor) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    *error = Some(fields.malformed_member_error());
-                    break;
-                }
+            let key = match key_owned_value(&key, &cursor)
+                .transpose()
+                .unwrap_or_else(|| Err(fields.malformed_member_error()))
+            {
+                Ok(key) => key,
                 Err(e) => {
-                    *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
-                    break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
+                    *error = Some(e);
+                    break;
                 }
             };
             if i > 0 {
@@ -1134,15 +1132,14 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         // Block style
         let mut cursors = DistinctKeyCursors::new(fields, collapse);
         for (i, (key, cursor)) in cursors.by_ref().enumerate() {
-            let key = match key_owned_value(&key, &cursor) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    *error = Some(fields.malformed_member_error());
-                    break;
-                }
+            let key = match key_owned_value(&key, &cursor)
+                .transpose()
+                .unwrap_or_else(|| Err(fields.malformed_member_error()))
+            {
+                Ok(key) => key,
                 Err(e) => {
-                    *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
-                    break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
+                    *error = Some(e);
+                    break;
                 }
             };
             if i > 0 {
