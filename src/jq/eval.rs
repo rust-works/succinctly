@@ -12770,12 +12770,28 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // itself -- see `compare_values`'s own doc comment).
                 // Checked *after* the non-negative-int arm above so that
                 // arm still owns the success path unchanged.
+                //
+                // jq mode only: real yq's own grammar rejects every one of
+                // those shapes at *parse* time -- `flatten(null)`,
+                // `flatten(false)`, `flatten(-1)` are all "bad expression,
+                // please check expression syntax" (live-verified against
+                // v4.53.3; yq's `flatten` takes a bare non-negative integer
+                // literal token, nothing else). So there is no reachable yq
+                // behaviour here to match, and yq mode keeps the exact
+                // pre-#2747 wording below instead of acquiring jq's --
+                // review on this PR caught this widening changing yq-mode
+                // text with no yq oracle behind it.
                 ref other
-                    if compare_values(other, &OwnedValue::Int(0)) == core::cmp::Ordering::Less =>
+                    if S::TAG == EvalTag::Jq
+                        && compare_values(other, &OwnedValue::Int(0))
+                            == core::cmp::Ordering::Less =>
                 {
                     return QueryResult::Error(EvalError::new(
                         "flatten depth must not be negative",
                     ));
+                }
+                OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+                    return QueryResult::Error(EvalError::new("depth must be non-negative"));
                 }
                 _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
             };
