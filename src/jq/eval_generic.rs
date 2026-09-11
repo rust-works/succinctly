@@ -19701,10 +19701,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // #2785: `key_owned_value`, not `key_display_string` --
                     // a typed key is an `!!int`/`!!bool`/`!!null` node in
                     // real yq's `to_entries` too.
-                    let key = match key_owned_value(&field.key, &field.key_cursor) {
-                        Ok(Some(key)) => key,
-                        Ok(None) => return GenericResult::Error(fields.malformed_member_error()), // omni-dev: coverage tolerate-line reason="unreachable: `malformed_object_member` above already proved every key stringifies, the same `else` this arm replaced (#2785)"
-                        Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
+                    let key = match key_owned_value(&field.key, &field.key_cursor)
+                        .transpose()
+                        .unwrap_or_else(|| Err(fields.malformed_member_error()))
+                    {
+                        Ok(key) => key,
+                        Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: `malformed_object_member` above already proved every key stringifies (the `None` half), and `to_owned_cursor` on an untagged key `decoded_key_str` decoded cannot fail (the `Err` half) (#2785)"
                     };
                     // #1677: `malformed_object_member` above only checked
                     // the comma before each key; this loop already resolves
@@ -19779,16 +19781,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             {
                 return partial_generic(Vec::new(), control);
             }
-            // `map` emits exactly one array (or nothing, when `f` was
-            // suppressed under `optional`).
-            match outputs.pop() {
-                Some(OwnedValue::Array(mapped)) => match entries_to_object::<S, _>(mapped) {
-                    Ok(fields) => GenericResult::Owned(OwnedValue::Object(fields)),
-                    Err(_) if optional => GenericResult::None,
-                    Err(e) => GenericResult::Error(e),
-                },
-                Some(other) => GenericResult::Owned(other), // omni-dev: coverage tolerate-line reason="unreachable: `map(f)` on an array emits exactly one array; kept so a future `map` shape is merely passed through, never a panic (#2785)"
-                None => GenericResult::None,
+            // `map` on an array emits exactly one array. `optional` is never
+            // `true` here (same reasoning as `ToEntries`'s own arm below:
+            // #693's dispatch only forces it for `IndexExpr`/`SliceExpr`),
+            // so a `from_entries` failure raises and the enclosing `?`
+            // converts it, exactly as the composed form did.
+            let Some(OwnedValue::Array(mapped)) = outputs.pop() else {
+                return GenericResult::None; // omni-dev: coverage tolerate-line reason="unreachable: `map(f)` over an array emits exactly one array; kept so a future `map` shape produces no output rather than a panic (#2785)"
+            };
+            match entries_to_object::<S, _>(mapped) {
+                Ok(fields) => GenericResult::Owned(OwnedValue::Object(fields)),
+                Err(e) => GenericResult::Error(e),
             }
         }
 
