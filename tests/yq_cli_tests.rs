@@ -42345,3 +42345,51 @@ mod key_node_metadata_2763 {
         Ok(())
     }
 }
+
+/// #2698: `range`'s bounds see the document the cursor sees, not a
+/// materialized copy with its duplicate mapping keys already collapsed.
+///
+/// This is the #2626 bug class, one construct over: the owned bridge's first
+/// act is to build an `OwnedValue` of the ambient, and that collapses
+/// duplicate keys *before* the bound expression runs. So the same binary
+/// disagreed with itself -- `length` answered `3` (real yq v4.53.3 agrees,
+/// it keeps duplicates) while `[range(length)]` produced only two values,
+/// because the bound had been evaluated against a 2-key copy.
+///
+/// `range` is jq-only surface in yq mode (#1512), hence `--jq-extensions`;
+/// the duplicate-key document is the point, and yq mode is where duplicates
+/// survive to be seen.
+#[test]
+fn range_bounds_see_uncollapsed_duplicate_keys_2698() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("dup.yaml");
+    std::fs::write(&path, "b: 1\na: 2\nb: 3\n")?;
+    let file = path.to_str().expect("utf-8 path");
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    // The premise: three keys, duplicates kept.
+    let (out, code) = run_yq_file("length", file, &args)?;
+    assert_eq!(
+        (out.trim(), code),
+        ("3", 0),
+        "#2698: premise -- yq keeps duplicate keys"
+    );
+
+    // Therefore a bound reading `length` must fan out three times, not two.
+    for (filter, want) in [
+        ("[range(length)]", "[0,1,2]"),
+        ("[range(0;length)]", "[0,1,2]"),
+        ("last(range(length))", "2"),
+        ("[range(length)]|length", "3"),
+        ("[limit(9; range(length))]", "[0,1,2]"),
+    ] {
+        let (out, code) = run_yq_file(filter, file, &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2698: `{filter}` must agree with `length` == 3; a bridged bound \
+             sees the collapsed 2-key copy and answers as if length were 2"
+        );
+    }
+    Ok(())
+}
