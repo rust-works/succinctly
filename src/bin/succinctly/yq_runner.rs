@@ -1767,13 +1767,18 @@ fn query_result_to_owned_values(
             vs
         }
         QueryResult::None => vec![],
-        QueryResult::Error(e) => {
+        // Real yq streams nothing before a top-level error/break — a
+        // `Partial`'s already-produced prefix is discarded the same way an
+        // outright `Error`/`Break` already is (#2392). `Halt` is the one
+        // control that keeps its prefix (jq's own `halt` contract, #791/
+        // #1897), so it stays its own arm below.
+        QueryResult::Error(e) | QueryResult::Partial(_, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
             vec![]
         }
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
-        QueryResult::Break(label) => {
+        QueryResult::Break(label) | QueryResult::Partial(_, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             vec![]
         }
@@ -1785,15 +1790,8 @@ fn query_result_to_owned_values(
             vec![]
         }
         // The outputs already produced no longer vanish behind the failure
-        // (#400, #494).
-        QueryResult::Partial(vs, jq::Control::Error(e)) => {
-            sink.report(DiagStyle::Yq, &e, &no_location());
-            vs
-        }
-        QueryResult::Partial(vs, jq::Control::Break(label)) => {
-            sink.report_break(DiagStyle::Yq, &label, &no_location());
-            vs
-        }
+        // (#400, #494) — but only for `Halt`; see the merged `Error`/`Break`
+        // arms above (#2392).
         QueryResult::Partial(vs, jq::Control::Halt(code)) => {
             sink.request_halt(code);
             vs
@@ -3929,13 +3927,18 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             }
         },
         GenericResult::None => Ok(vec![]),
-        GenericResult::Error(e) => {
+        // Real yq streams nothing before a top-level error/break — a
+        // `Partial`'s already-produced prefix is discarded the same way an
+        // outright `Error`/`Break` already is (#2392). `Halt` is the one
+        // control that keeps its prefix (jq's own `halt` contract, #791/
+        // #1897), so it stays its own arm below.
+        GenericResult::Error(e) | GenericResult::Partial(_, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
             Ok(vec![])
         }
         GenericResult::Owned(v) => Ok(vec![no_comments(v)]),
         GenericResult::ManyOwned(vs) => Ok(vs.into_iter().map(no_comments).collect()),
-        GenericResult::Break(label) => {
+        GenericResult::Break(label) | GenericResult::Partial(_, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Yq, &label, &no_location());
             Ok(vec![])
         }
@@ -3947,15 +3950,8 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             Ok(vec![])
         }
         // The outputs already produced no longer vanish behind the failure
-        // (#400, #494).
-        GenericResult::Partial(vs, jq::Control::Error(e)) => {
-            sink.report(DiagStyle::Yq, &e, &no_location());
-            Ok(vs.into_iter().map(no_comments).collect())
-        }
-        GenericResult::Partial(vs, jq::Control::Break(label)) => {
-            sink.report_break(DiagStyle::Yq, &label, &no_location());
-            Ok(vs.into_iter().map(no_comments).collect())
-        }
+        // (#400, #494) — but only for `Halt`; see the merged `Error`/`Break`
+        // arms above (#2392).
         GenericResult::Partial(vs, jq::Control::Halt(code)) => {
             sink.request_halt(code);
             Ok(vs.into_iter().map(no_comments).collect())
@@ -5527,6 +5523,23 @@ fn get_input_files(args: &YqCommand) -> Vec<String> {
     files
 }
 
+/// Collapse a top-level `Partial(prefix, Error|Break)` into a bare
+/// `Error`/`Break`, discarding `prefix`. Real yq streams nothing before a
+/// top-level error/break (#2392) — `evaluate_yaml_cursor` and
+/// `query_result_to_owned_values` apply the identical rule by merging into
+/// their existing `Error`/`Break` match arms directly, but the M2 streaming
+/// path (`stream_cursor!` below) has no match statement to merge into, so
+/// this collapses the result before it reaches `produces_output()`/
+/// `stream_yaml`/`stream_json`. `Halt` keeps its prefix (jq's own `halt`
+/// contract, #791/#1897) and passes through unchanged.
+fn discard_yq_partial_prefix<V: DocumentValue>(result: GenericResult<V>) -> GenericResult<V> {
+    match result {
+        GenericResult::Partial(_, jq::Control::Error(e)) => GenericResult::Error(e),
+        GenericResult::Partial(_, jq::Control::Break(label)) => GenericResult::Break(label),
+        other => other,
+    }
+}
+
 /// Main entry point for the yq command.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Handle --version
@@ -6178,7 +6191,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                 } else {
                     // M2 YAML path: evaluate and stream YAML results
-                    let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                    //
+                    // Collapsed via `discard_yq_partial_prefix` (#2392)
+                    // immediately, before `produces_output()` below is ever
+                    // consulted -- a `Partial(_, Break)` must answer `false`
+                    // there just like a bare `Break` already does, not the
+                    // unconditional `true` a raw `Partial` would give.
+                    let result = discard_yq_partial_prefix(
+                        eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor),
+                    );
                     // `produces_output` is an exhaustive match on
                     // `GenericResult`, not a hand-maintained exclusion
                     // list — a halt/halt_error (#791) with no prior
@@ -6319,7 +6340,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     }
                 } else {
                     // M2 path: evaluate and stream results
-                    let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                    //
+                    // Collapsed via `discard_yq_partial_prefix` (#2392); this
+                    // branch never calls `produces_output()` (the 4th
+                    // `stream_maybe_colored` arg below is a hardcoded
+                    // `None`), so there's no ordering constraint here beyond
+                    // preceding `stream_json` itself.
+                    let result = discard_yq_partial_prefix(
+                        eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor),
+                    );
                     let stats = stream_maybe_colored(
                         $writer,
                         $use_color,

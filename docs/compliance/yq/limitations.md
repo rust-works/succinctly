@@ -1376,6 +1376,63 @@ which was true only before #1534.
   `inside` at all to verify it against — see the fan-out table above). Confirmed by
   `test_yq_contains_scalar_vs_scalar_kind_mismatch_answers_false_1649` and its siblings.
 
+### A top-level `Partial` result never streams its prefix in yq mode
+
+**Fixed by [#2392](https://github.com/rust-works/succinctly/issues/2392).** The prefix rule
+above covers a *gated argument* (`has`, `split`, `contains`, ...) escaping mid fan-out. This is
+the same rule applied to a different mechanism: the *entire result of a yq evaluation* escaping
+at the runner's own emission boundary, not inside `fanout_arg`.
+
+jq's own #400/#494 contract is "the outputs a generator already produced survive an escape that
+happens later in the same stream" — `GenericResult`/`QueryResult::Partial(prefix, control)`
+models exactly that, and jq mode's runner streams `prefix` before reporting `control`. Real yq
+(v4.53.3, live-verified) has no such contract at the top level: it prints nothing at all before
+a top-level error or break, in every shape checked —
+
+```bash
+$ yq '(1,2,error("x"))' doc.yaml            # Error: x   (no 1, no 2)
+$ yq '.arr[] | keys' mix.yaml               # Error: cannot get keys of !!int, ...
+$ yq '.arr | .[(0,"a")] | key' arr.yaml     # Error: cannot index array with 'a' ...
+```
+
+succinctly's yq-mode runner (`src/bin/succinctly/yq_runner.rs`) used to mirror jq mode's
+`Partial` handling unconditionally at three arms, carrying jq's own #400/#494 doc comment over
+without an oracle check for the yq side — the same "mirrored precedent inherited jq's bug"
+pattern as the computed-slice-bound section below. #2392 discards the prefix instead, at every
+point a yq-mode result leaves the evaluator: `evaluate_yaml_cursor`'s and
+`query_result_to_owned_values`'s `Partial(_, Error|Break)` arms merge directly into their
+existing bare `Error`/`Break` arms (identical reporting, prefix dropped); the M2 streaming path
+has no match statement to merge into, so a small `discard_yq_partial_prefix` helper collapses
+the result immediately after evaluation, before `produces_output()`/`stream_yaml`/`stream_json`
+ever see it. `Control::Halt` is excluded everywhere — jq's own `halt` contract keeps
+already-emitted output (#791/#1897), and real yq has no `halt`/`halt_error` to check against.
+
+This is a distinct mechanism from "A computed comma-bound slice's own prefix is never streamed
+in yq mode" below: that one discards inside the *shared evaluator*, at three internal
+slice-bound-resolution call sites (gated per-site since only those call sites lack an oracle);
+this one discards at the *runner's* emission boundary, unconditionally for every yq-mode result,
+since the whole file is yq-only.
+
+**Open divergence, not fixed here:** real yq's discard is whole-*run*, not per-document/
+per-result. A late error partway through a multi-document input also erases an earlier
+document's already-streamed output in real yq —
+
+```bash
+$ printf 'a: 1\n---\na: 2\n' | yq '(.a, (select(.a==2) | error("x")))'   # (nothing) -- doc 1's `1` is gone too
+```
+
+succinctly's fix (above) discards per top-level result, so under plain multi-document input
+(no `--eval-all`) each document still gets its own independent collapse decision — document 1's
+output survives even though a later document's evaluation fails. Matching real yq exactly would
+mean buffering every document's output for the whole run and discarding it on any late failure,
+which would give up the M2 streaming architecture's core memory advantage (3–4% of yq's at
+100 MB) for every run, not just the ones that error. Tracked as an explicit, deliberate
+divergence rather than an oversight — see
+[#2427](https://github.com/rust-works/succinctly/issues/2427) for the sibling per-run-vs-
+per-node streaming residue, and
+[#2810](https://github.com/rust-works/succinctly/issues/2810) for the whole-run case
+specifically.
+
 ### Regex flag grammar — `test`/`match`/`capture` fixed
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't
