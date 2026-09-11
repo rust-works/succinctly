@@ -15636,11 +15636,11 @@ fn test_explicit_value_anchor_comment_preserved_with_nested_mapping_value_784() 
 /// earlier anchor's deferred-to-null value collides with a *different*
 /// key's own genuine same-line comment, the key's own comment must survive
 /// unharmed - it was already correct before #784 and #784 must not destroy
-/// working #765/#785 behavior to gain new coverage. The floated comment is
-/// dropped here (single comment slot per node; not part of #784's scope to
-/// preserve both), matching this exact input's behavior on `main` before
-/// #784's change existed at all - confirmed by diffing against an
-/// unmodified build, not just asserted here.
+/// working #765/#785 behavior to gain new coverage. Before #1085, the
+/// floated comment was dropped here (single comment slot per node); #1085
+/// widened the slot so both now survive, matching real yq (`b: # deferred
+/// comment\n  # b own comment\n    c: 1` on yq v4.53.3) - re-pinned here to
+/// the oracle-matching output rather than the single-slot one.
 #[test]
 fn test_anchor_floated_comment_does_not_clobber_sibling_own_comment_784() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -15649,11 +15649,19 @@ fn test_anchor_floated_comment_does_not_clobber_sibling_own_comment_784() -> Res
         &[],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: &anc\n  b: # b own comment\n    c: 1\n");
+    assert_eq!(
+        out,
+        "a: &anc\n  b: # deferred comment\n  # b own comment\n    c: 1\n"
+    );
     Ok(())
 }
 
-/// Same regression class, the compact-mapping-key variant.
+/// Same regression class, the compact-mapping-key variant, with a deferred
+/// *scalar* value rather than a container: the scalar renders pulled back
+/// onto the key's line (existing, unrelated behavior), with the floated
+/// comment sharing that line and the key's own comment following as a
+/// standalone line (#1085) - matching real yq (`- k: 1 # deferred
+/// comment\n    # k own comment` on yq v4.53.3).
 #[test]
 fn test_anchor_floated_comment_does_not_clobber_compact_key_own_comment_784() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -15662,7 +15670,76 @@ fn test_anchor_floated_comment_does_not_clobber_compact_key_own_comment_784() ->
         &[],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: &anc\n  - k: 1 # k own comment\n");
+    assert_eq!(
+        out,
+        "a: &anc\n  - k: 1 # deferred comment\n    # k own comment\n"
+    );
+    Ok(())
+}
+
+/// #1085: three comments colliding at once - a floated comment and the
+/// key's own comment on `b` (both queued on the key), plus an independent
+/// comment on `c` (its own node, never in contention). Pins that the third,
+/// unrelated comment is untouched by the two-comment slot on `b`. Matches
+/// the oracle (yq v4.53.3).
+#[test]
+fn test_anchor_floated_and_own_comment_plus_unrelated_child_comment_1085() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".",
+        "a: &anc # deferred\n  b: # own\n    c: 1 # inner\n",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: # deferred\n  # own\n    c: 1 # inner\n");
+    Ok(())
+}
+
+/// #1085, deferred-*scalar* shape: `b`'s value defers to a bare scalar with
+/// no comment of its own, so the key's two queued comments (floated, then
+/// own) both render - the first sharing the line the scalar gets pulled
+/// back onto (existing, unrelated behavior), the second as a standalone
+/// line at the key's own indent. Matches the oracle.
+#[test]
+fn test_anchor_floated_and_own_comment_deferred_scalar_value_1085() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # deferred\n  b: # own\n    1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: 1 # deferred\n  # own\n");
+    Ok(())
+}
+
+/// #1085, deferred-scalar shape where the scalar *also* has its own
+/// trailing comment: the value's own comment wins the inline slot outright,
+/// and both of the key's queued comments (floated and own) are dropped
+/// entirely rather than rendered anywhere else - not merely losing the
+/// inline race like the container shape above. This was not in #1085's own
+/// investigation and was found by probing the oracle directly; the
+/// mechanism is the pre-existing `value.line_comment_raw().or_else(key...)`
+/// priority in `stream_yaml_value`, which already never falls back to the
+/// key once the value has a comment of its own, and now simply never
+/// consults the key's *multiple* queued comments either. Matches the
+/// oracle (yq v4.53.3): both `deferred` and `own` vanish, only `inner`
+/// survives.
+#[test]
+fn test_anchor_floated_and_own_comment_suppressed_by_value_own_comment_1085() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: &anc # deferred\n  b: # own\n    1 # inner\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: &anc\n  b: 1 # inner\n");
+    Ok(())
+}
+
+/// #1085 read-side: `key | line_comment` on a key holding both a floated
+/// and an own comment returns them newline-joined, source order (floated
+/// first) - matching the oracle exactly
+/// (`.a.b | key | line_comment` on yq v4.53.3).
+#[test]
+fn test_key_line_comment_joins_floated_and_own_comment_1085() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a.b | key | line_comment",
+        "a: &anc # deferred\n  b: # own\n    c: 1\n",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "deferred\nown\n");
     Ok(())
 }
 

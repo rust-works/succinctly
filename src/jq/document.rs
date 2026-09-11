@@ -660,6 +660,17 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         Ok(None)
     }
 
+    /// This node's trailing same-line comment(s), stripped of each entry's
+    /// leading `#`/space, one entry per comment in source order (#1085).
+    /// Usually zero or one entry, like [`line_comment`](Self::line_comment);
+    /// a mapping key can hold two — a comment floated onto it from an
+    /// earlier anchor's deferred value, then its own genuine same-line
+    /// comment. Empty for formats without comments at all (JSON), mirroring
+    /// [`head_comment`](Self::head_comment)'s "not available" contract.
+    fn line_comments(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Get the standalone comment lines directly above this node — its
     /// *head* comment (#798) — stripped of each line's leading `#`/space,
     /// one entry per line in source order. Empty when the node has none, and

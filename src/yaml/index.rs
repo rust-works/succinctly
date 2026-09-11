@@ -550,23 +550,26 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.tags.get(&bp_pos).map(alloc::string::String::as_str)
     }
 
-    /// Get the raw trailing-comment byte range for a BP position, if the
-    /// node at that position has a same-line comment (issue #710).
+    /// Get the raw trailing-comment byte range(s) for a BP position, if the
+    /// node at that position has any same-line comment (issue #710).
+    /// Usually zero or one entry; a mapping key can hold two (#1085) -- a
+    /// comment floated onto it from an earlier anchor's deferred value, and
+    /// the key's own genuine same-line comment, in source order.
     ///
-    /// The range starts at `#` and runs to end of line, exclusive of the
+    /// Each range starts at `#` and runs to end of line, exclusive of the
     /// line break — the caller slices it out of the original source text
     /// and strips the leading `#`/space at the point of use, mirroring how
     /// [`YamlCursor::style`](super::light::YamlCursor::style) reads from
     /// already-retained text rather than a stored string.
     #[inline]
-    pub fn get_line_comment(&self, bp_pos: usize) -> Option<(u32, u32)> {
-        self.comments.get(&bp_pos).and_then(|c| c.line)
+    pub fn get_line_comments(&self, bp_pos: usize) -> &[(u32, u32)] {
+        self.comments.get(&bp_pos).map_or(&[], |c| &c.line)
     }
 
     /// Get the standalone `#` comment lines directly above a BP position:
     /// its *head* comment (#798), one entry per line in source order.
     ///
-    /// Ranges are raw, `#` included, like [`Self::get_line_comment`] --
+    /// Ranges are raw, `#` included, like [`Self::get_line_comments`] --
     /// the caller strips a leading `"# "` at the point of use. A mapping
     /// entry's head lives on its *key* node; a sequence item's on the
     /// item's content node.
@@ -1118,11 +1121,11 @@ mod tests {
             if k.raw_bytes() == b"a" {
                 // This position does carry other comment metadata (a line
                 // comment), so `comments.get` takes the `Some` arm.
-                assert!(index.get_line_comment(bp_pos).is_some());
+                assert!(!index.get_line_comments(bp_pos).is_empty());
             } else {
                 // This position has no entry in `comments` at all, so
                 // `map_or` falls through to its `&[]` default.
-                assert!(index.get_line_comment(bp_pos).is_none());
+                assert!(index.get_line_comments(bp_pos).is_empty());
             }
         }
     }

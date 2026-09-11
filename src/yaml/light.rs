@@ -1906,11 +1906,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         // Check if value needs newline
                         let value = field.value_cursor();
                         if is_yaml_cursor_container(&value) && value.style() != "flow" {
-                            // The key's own trailing comment (#765), then
-                            // the anchor/tag: with no comment, both go on
-                            // this line via the shared `write_anchor_tag`
-                            // helper #1077/#1113's scalar/absent branch
-                            // also uses; with one, it's written first, then
+                            // The key's own trailing comment(s) (#765), then
+                            // the anchor/tag: with none, both go on this
+                            // line via the shared `write_anchor_tag` helper
+                            // #1077/#1113's scalar/absent branch also uses;
+                            // with any, the first is written inline, then
                             // the anchor/tag move to their own line at
                             // column 0 -- this branch stops hand-writing
                             // (and dropping) the tag, and stops mis-placing
@@ -1925,8 +1925,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // node is never a container), so both
                             // `explicit_tag()` calls below skip a second
                             // resolve via `explicit_tag_at(None)`.
-                            if let Some(comment) = field.key_cursor().line_comment_raw() {
-                                write_line_comment(out, Some(comment))?;
+                            //
+                            // A container value never has a same-line
+                            // comment of its own (its content, if any,
+                            // starts on the next line), so the key can hold
+                            // up to two here (#1085): a comment floated onto
+                            // it from an earlier anchor's deferred value,
+                            // and its own genuine comment. The first entry
+                            // renders inline exactly as a single comment
+                            // always did; any further entries render as
+                            // their own `#` lines at this key's own indent,
+                            // via `write_extra_line_comments`, before the
+                            // anchor/tag -- matching the oracle
+                            // (`b: # floated\n  # own\n    c: 1`).
+                            let key_cursor = field.key_cursor();
+                            let mut key_comments = key_cursor.line_comments_raw();
+                            if let Some(first) = key_comments.next() {
+                                write_line_comment(out, Some(first))?;
+                                write_extra_line_comments(out, indent, key_comments)?;
                                 // Same anchor/tag rendering as the `else`
                                 // arm below, differing only in its leading
                                 // separator: a newline here, because the
@@ -1991,7 +2007,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 sort_keys,
                             )?;
                             // The value's own comment takes priority; fall
-                            // back to the key's own comment when the value
+                            // back to the key's comment(s) when the value
                             // has none - covers an explicit key's trailing
                             // comment (`? k # key comment\n: v\n`), which
                             // the parser captures against the key's own
@@ -2003,11 +2019,30 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // whichever node's text ends there last, which
                             // for `a: v # c` is always the value, never
                             // the key.
+                            //
+                            // #1085: when the value *does* have its own
+                            // comment, the key's queued comment(s) -- one or
+                            // two -- are dropped entirely rather than
+                            // rendered anywhere else; verified against the
+                            // oracle (`a: &anc # floated\n  b: # own\n
+                            // 1 # inner` prints only `b: 1 # inner`, both
+                            // `floated` and `own` gone). Only when the value
+                            // has none do the key's comments render, first
+                            // inline sharing this line with the pulled-up
+                            // value, any further entries as their own `#`
+                            // lines at this key's own indent (matching
+                            // `b: 1 # floated\n  # own`).
                             let key_cursor = field.key_cursor();
-                            let comment = value
-                                .line_comment_raw()
-                                .or_else(|| key_cursor.line_comment_raw());
-                            write_line_comment(out, comment)?;
+                            match value.line_comment_raw() {
+                                Some(comment) => write_line_comment(out, Some(comment))?,
+                                None => {
+                                    let mut key_comments = key_cursor.line_comments_raw();
+                                    if let Some(first) = key_comments.next() {
+                                        write_line_comment(out, Some(first))?;
+                                        write_extra_line_comments(out, indent, key_comments)?;
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(())
@@ -2688,19 +2723,26 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.index.get_tag(self.bp_pos)
     }
 
-    /// Get the raw byte range of this node's trailing same-line comment and
-    /// decode it as UTF-8, distinguishing "no comment" (`Ok(None)`) from
-    /// "comment present but not valid UTF-8" (`Err(_)`) — the shared
-    /// decode point for [`Self::line_comment_raw`] (tolerant: invalid bytes
-    /// collapse to `None`, for output/write paths that must keep rendering
-    /// the rest of the document) and [`Self::line_comment_checked`] (strict:
-    /// invalid bytes surface as an error, issue #797).
+    /// Get the raw byte range of this node's *first* trailing same-line
+    /// comment and decode it as UTF-8, distinguishing "no comment"
+    /// (`Ok(None)`) from "comment present but not valid UTF-8" (`Err(_)`) —
+    /// the shared decode point for [`Self::line_comment_raw`] (tolerant:
+    /// invalid bytes collapse to `None`, for output/write paths that must
+    /// keep rendering the rest of the document) and
+    /// [`Self::line_comment_checked`] (strict: invalid bytes surface as an
+    /// error, issue #797).
+    ///
+    /// "First" only differs from "only" at a mapping key that has both a
+    /// floated anchor comment and its own genuine comment (#1085) — see
+    /// [`Self::line_comments_raw`] for the full, possibly-multi-entry form.
+    /// Every other node kind still ever has at most one entry, so this
+    /// keeps its pre-#1085 meaning for every other caller.
     /// See [`Self::anchor`]'s doc comment: deliberately does not resolve a
     /// bare `-` sequence-item wrapper itself, for the same hot-path
     /// performance reason.
     #[inline]
     fn line_comment_raw_checked(&self) -> Result<Option<&str>, core::str::Utf8Error> {
-        let Some((start, end)) = self.index.get_line_comment(self.bp_pos) else {
+        let Some(&(start, end)) = self.index.get_line_comments(self.bp_pos).first() else {
             return Ok(None);
         };
         core::str::from_utf8(&self.text[start as usize..end as usize]).map(Some)
@@ -2803,6 +2845,30 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             Some(raw) => Ok(Some(raw.strip_prefix("# ").unwrap_or(raw))),
             None => Ok(None),
         }
+    }
+
+    /// This node's trailing same-line comment(s), raw, `#` and all, one
+    /// entry per comment in source order (#1085). Usually zero or one
+    /// entry, like [`Self::line_comment_raw`]; a mapping key can hold two —
+    /// a comment floated onto it from an earlier anchor's deferred value,
+    /// then its own genuine same-line comment, in that order (matching the
+    /// oracle: `.a.b | key | line_comment` joins them `"floated\nown"`).
+    ///
+    /// A line whose bytes aren't valid UTF-8 is skipped, matching
+    /// [`Self::line_comment_raw`]'s tolerance: these getters serve output
+    /// paths that must keep rendering the rest of the document.
+    #[inline]
+    pub fn line_comments_raw(&self) -> impl Iterator<Item = &str> {
+        Self::decode_comment_lines(self.text, self.index.get_line_comments(self.bp_pos))
+    }
+
+    /// [`Self::line_comments_raw`] with each entry's leading `#` and at most
+    /// one following space stripped, the same `"# "`-only rule
+    /// [`Self::line_comment`] applies.
+    #[inline]
+    pub fn line_comments(&self) -> impl Iterator<Item = &str> {
+        self.line_comments_raw()
+            .map(|raw| raw.strip_prefix("# ").unwrap_or(raw))
     }
 
     /// Get the anchor name that this alias references.
@@ -6772,6 +6838,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn line_comments(&self) -> Vec<String> {
+        YamlCursor::line_comments(self)
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[inline]
     fn head_comment(&self) -> Vec<String> {
         YamlCursor::head_comment(self)
             .map(ToString::to_string)
@@ -7837,6 +7910,31 @@ fn write_line_comment<Out: core::fmt::Write>(
         }
         None => Ok(()),
     }
+}
+
+/// Write every remaining entry of a mapping key's trailing-comment
+/// iterator as its own standalone `#` line at `indent`, immediately after
+/// the caller has already written the first entry inline via
+/// [`write_line_comment`] (issue #1085).
+///
+/// A mapping key can hold more than one trailing comment -- a comment
+/// floated onto it from an earlier anchor's deferred value, plus its own
+/// genuine same-line comment -- and real yq renders every entry past the
+/// first this way rather than letting it share the first entry's line.
+/// `rest` having already yielded nothing (the overwhelmingly common case:
+/// at most one comment) makes this a no-op, so callers can invoke it
+/// unconditionally after writing the first entry.
+fn write_extra_line_comments<'t, Out: core::fmt::Write>(
+    out: &mut Out,
+    indent: &str,
+    rest: impl Iterator<Item = &'t str>,
+) -> core::fmt::Result {
+    for extra in rest {
+        out.write_char('\n')?;
+        out.write_str(indent)?;
+        out.write_str(extra)?;
+    }
+    Ok(())
 }
 
 /// Write the last item's own trailing comment in a flow-style sequence or
