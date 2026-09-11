@@ -760,6 +760,19 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         })
     }
 
+    /// Navigate to the previous sibling.
+    ///
+    /// Returns `None` if this is the first sibling.
+    #[inline]
+    pub fn prev_sibling(&self) -> Option<Self> {
+        let new_pos = self.index.bp().prev_sibling(self.bp_pos)?;
+        Some(JsonCursor {
+            text: self.text,
+            index: self.index,
+            bp_pos: new_pos,
+        })
+    }
+
     /// Navigate to the parent.
     ///
     /// Returns `None` if this is the root.
@@ -2392,6 +2405,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn next_sibling(&self) -> Option<Self> {
         JsonCursor::next_sibling(self)
+    }
+
+    #[inline]
+    fn prev_sibling(&self) -> Option<Self> {
+        JsonCursor::prev_sibling(self)
     }
 
     #[inline]

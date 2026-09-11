@@ -13852,21 +13852,20 @@ mod head_foot_comment_798 {
         Ok(())
     }
 
-    /// Known gap, deliberately inherited rather than newly invented: a
-    /// mapping entry's head/foot live on its **key** node, and a `key` stage
-    /// leaves the cursor domain, so this is `""` where real yq answers
-    /// `mid`. `line_comment` has had exactly this gap since #765
-    /// (`.a | key | line_comment` is `""` here, `keyc` in yq) — pinned so
-    /// the follow-up that closes it updates both together, deliberately.
+    /// The gap this used to pin, now closed by #2763: a mapping entry's
+    /// head/foot (and its line comment, and its line/column/style/anchor)
+    /// live on the entry's **key** node, and `key` emits that node.
+    /// `line_comment` had the same gap from #765 onwards, which is why the
+    /// two are asserted together here — one cause, one fix.
     #[test]
-    fn key_node_head_comment_is_not_reachable_yet_798() -> Result<()> {
+    fn key_node_metadata_is_the_keys_own_2763() -> Result<()> {
         let (out, code) = run_yq_stdin(".b | key | head_comment", "a: 1\n# mid\nb: 2\n", &[])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "\n");
+        assert_eq!(out, "mid\n");
 
         let (out, code) = run_yq_stdin(".a | key | line_comment", "a: # keyc\n  b: 1\n", &[])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "\n");
+        assert_eq!(out, "keyc\n");
         Ok(())
     }
 
@@ -42071,4 +42070,254 @@ fn test_object_construction_var_shorthand_is_jq_mode_only_2724() -> Result<()> {
     assert_ne!(code, 0, "stdout: {stdout:?}");
     assert!(stderr.contains("expected identifier"), "stderr: {stderr:?}");
     Ok(())
+}
+
+/// #2763: a mapping entry's metadata lives on its **key** node, and `key`
+/// emits that node -- so `line_comment`, `head_comment`, `foot_comment`,
+/// `line`, `column`, `style` and `anchor` after a `key` stage read the key's
+/// own, as real yq does. Before this they all answered the no-cursor default
+/// (`""`/`0`), which is exactly what an "asserts absent" test accepts, so
+/// every row here asserts a *non-empty* value through a full pipe.
+///
+/// Every expectation was captured from pinned `yq` v4.53.3 before being
+/// written here.
+mod key_node_metadata_2763 {
+    use super::{run_jq_stdin, run_yq_stdin};
+    use anyhow::Result;
+
+    /// `a: # keyc` -- the comment is the key's, and `.a` is the mapping under it.
+    const KEYC: &str = "a: # keyc\n  b: 1\n";
+    /// Four entries at known lines, one of them a sequence (whose *items*
+    /// have no key), one quoted, one a block scalar.
+    const MIXED: &str =
+        "a: &anc # keyc\n  b: 1\nx:\n  - 1 # e0\n  - 2\n\"qk\": 1\nk2: |\n  block\n";
+
+    fn yq(filter: &str, input: &str) -> Result<String> {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+        Ok(out)
+    }
+
+    fn check(rows: &[(&str, &str, &str)]) -> Result<()> {
+        for (filter, input, want) in rows {
+            assert_eq!(yq(filter, input)?, *want, "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// The issue's own table, row for row.
+    #[test]
+    fn the_six_getters_answer_from_the_key_2763() -> Result<()> {
+        check(&[
+            (".a | key | line_comment", KEYC, "keyc\n"),
+            (".a | key | line", KEYC, "1\n"),
+            (".a | key | column", KEYC, "1\n"),
+            (".b | key | head_comment", "a: 1\n# mid\nb: 2\n", "mid\n"),
+            (".b | key | foot_comment", "a: 1\nb: 2\n# foot\n", "foot\n"),
+            (".qk | key | style", "\"qk\": 1\n", "double\n"),
+            (".a | key | anchor", "&ka a: 1\n", "ka\n"),
+            // Already correct before the fix, because both are computed from
+            // the value rather than read from a cursor.
+            (".a | key | tag", KEYC, "!!str\n"),
+            (".a | key | kind", KEYC, "scalar\n"),
+        ])
+    }
+
+    /// The iterating shape routes differently from direct navigation -- it
+    /// was the walk route that intercepted `... | key | <metadata>` and
+    /// evaluated the tail from a materialized node.
+    #[test]
+    fn the_iterating_shapes_answer_too_2763() -> Result<()> {
+        check(&[
+            ("[.[] | key | line]", MIXED, "- 1\n- 3\n- 6\n- 7\n"),
+            (".[] | key | line", MIXED, "1\n3\n6\n7\n"),
+            ("[.[] | key | line_comment]", KEYC, "- keyc\n"),
+            // Recursive descent reaches the sequence *items* too, which have
+            // no key of their own and so answer 0 -- as in yq.
+            (
+                "[.. | key | line]",
+                MIXED,
+                "- 1\n- 2\n- 3\n- 0\n- 0\n- 6\n- 7\n",
+            ),
+        ])
+    }
+
+    /// Key-as-a-node must not disturb what `key` already answered. Every row
+    /// here was correct before #2763 and is pinned against the two designs
+    /// the issue records as wrong -- returning the key cursor without giving
+    /// the key node a path of its own regresses all of them.
+    #[test]
+    fn path_parent_and_a_second_key_are_unchanged_2763() -> Result<()> {
+        check(&[
+            (".a.b | key | path", KEYC, "- a\n- b\n"),
+            (".a.b | key | parent | key", KEYC, "a\n"),
+            // A key has no key of its own.
+            (".a.b | key | key", KEYC, ""),
+            ("[.a | key | parent(0) | key]", KEYC, "[]\n"),
+            // ... but a value merely *standing* at the key node does.
+            (".a.b | key | tostring | key", KEYC, "b\n"),
+            (".a | key | tostring | path", KEYC, "- a\n"),
+            (".a.b | key | line | key", KEYC, "b\n"),
+            (".a.b | key | line | path", KEYC, "- a\n- b\n"),
+        ])
+    }
+
+    /// The key node survives the constructs that carry a position: a
+    /// `select` filter, a comma, an `as` binding, a bounded consumer, and a
+    /// second navigation out of it.
+    #[test]
+    fn the_key_node_survives_the_carrying_constructs_2763() -> Result<()> {
+        check(&[
+            (".a.b | key | select(line == 2) | path", KEYC, "- a\n- b\n"),
+            (".a.b | key | select(line == 2) | parent | key", KEYC, "a\n"),
+            (".a | key | select(line_comment == \"keyc\")", KEYC, "a\n"),
+            (
+                ".[] | select((key | line_comment) == \"keyc\") | key",
+                KEYC,
+                "a\n",
+            ),
+            (".a | key | (line, path)", KEYC, "1\n- a\n"),
+            (
+                ".a | key | [line, column, line_comment]",
+                KEYC,
+                "- 1\n- 1\n- keyc\n",
+            ),
+            (".a | key | . as $k | $k | line", KEYC, "1\n"),
+            ("(.a | key) as $k | $k | line", KEYC, "1\n"),
+            (".a | key as $k | $k | line_comment", KEYC, "keyc\n"),
+            (".a | first(key | line)", KEYC, "1\n"),
+            (".a | key | parent | .a | key | line", KEYC, "1\n"),
+            (".a.b | key | parent | key | line", KEYC, "1\n"),
+            // `(key, .)`: the key's own metadata, then the value's.
+            (".a | (key, .) | line", KEYC, "1\n2\n"),
+        ])
+    }
+
+    /// An owned value that stands *at* a node reaches its key the same way.
+    #[test]
+    fn a_positioned_owned_value_reaches_the_key_node_2763() -> Result<()> {
+        check(&[
+            (".a | tostring | key | line", KEYC, "1\n"),
+            (".a | key | tostring | key | line", KEYC, "1\n"),
+            (".a | key | tostring | key | line_comment", KEYC, "keyc\n"),
+            (".a | tostring | key", KEYC, "a\n"),
+        ])
+    }
+
+    /// The YAML shapes where "the key node" is not simply the token before
+    /// the value: an alias value, a merge-key-resolved entry, a flow
+    /// mapping, an explicit `? k` key, and a sequence item (which has none).
+    #[test]
+    fn the_awkward_yaml_shapes_2763() -> Result<()> {
+        const DOC: &str =
+            "a: &x\n  q: 1\nb: *x\nm:\n  <<: *x\n  r: 2\nf: {fa: 1, fb: 2}\n? ek\n: ev\n";
+        check(&[
+            // An alias value's key is its own, not the anchor's.
+            (".b | key | line", DOC, "3\n"),
+            (".b | key", DOC, "b\n"),
+            // A merged entry's key belongs to the merge *source*.
+            (".m.q | key | line", DOC, "2\n"),
+            (".f.fb | key | column", DOC, "12\n"),
+            ("[.f[] | key | column]", DOC, "- 5\n- 12\n"),
+            (".ek | key | line", DOC, "8\n"),
+            // A sequence element has an index, not a key node: 0 in yq too.
+            (".x[0] | key | line", MIXED, "0\n"),
+            // An absent node likewise.
+            (".zz | key | line", KEYC, "0\n"),
+        ])
+    }
+
+    /// A *typed* (non-string) mapping key keeps the display string real yq
+    /// renders as an `!!int`/`!!bool`/`!!null` node, so its metadata still
+    /// reads the no-cursor default. Deliberate and recorded in
+    /// `docs/compliance/yq/limitations.md`: yq's scalar `==` is stringly
+    /// (`1 == "1"` is `true`) where succinctly's is typed, so emitting a
+    /// typed key node would break `select(key == "1")`, which matches yq
+    /// today. Pinned so closing that gap has to update this together.
+    #[test]
+    fn a_typed_key_keeps_its_display_string_2763() -> Result<()> {
+        const TYPED: &str = "1: x\ntrue: y\n";
+        check(&[
+            (".[\"1\"] | key | line", TYPED, "0\n"),
+            ("[.[] | key | select(. == \"1\")]", TYPED, "- \"1\"\n"),
+            (".[] | select(key == \"1\")", TYPED, "x\n"),
+            // A string key beside a typed one still answers, on both the
+            // sink route and the collecting one.
+            (".[] | key | line", "a: 1\n1: 2\n", "1\n0\n"),
+            ("[.[] | key | line]", "a: 1\n1: 2\n", "- 1\n- 0\n"),
+        ])
+    }
+
+    /// The key node is a node, but it is still printed as the plain key it
+    /// always was -- no anchor, tag or style leaks into the output, and the
+    /// write paths are untouched. Every row is byte-identical to what this
+    /// binary printed before #2763; two of them (`[.[] | key]` and `keys`,
+    /// where real yq re-emits the key's own `"qk"` quoting and its `&ka`
+    /// anchor) diverge from yq exactly as they did before, which is a
+    /// rendering question this issue does not touch.
+    #[test]
+    fn the_rendering_and_write_paths_are_unchanged_2763() -> Result<()> {
+        check(&[
+            (".a | key", MIXED, "a\n"),
+            (".[] | key", MIXED, "a\nx\nqk\nk2\n"),
+            ("[.[] | key]", MIXED, "- a\n- x\n- qk\n- k2\n"),
+            ("keys", MIXED, "- a\n- x\n- qk\n- k2\n"),
+            (".a | key | tostring | key", KEYC, "a\n"),
+            // A write *through* a key is still positional, unchanged.
+            ("(.a | key) = \"z\"", KEYC, "a: # keyc\n  b: 1\n"),
+            (
+                "(.a | key | line_comment) = \"x\"",
+                KEYC,
+                "a: # keyc\n  b: 1\n",
+            ),
+        ])?;
+        let (out, code) = run_yq_stdin("[.[] | key]", MIXED, &["-o", "json"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "[\n  \"a\",\n  \"x\",\n  \"qk\",\n  \"k2\"\n]\n");
+        Ok(())
+    }
+
+    /// The DOM-forcing flags take a different output route and must answer
+    /// the same (`-P` and `--arg` both build a `CommentTree`).
+    #[test]
+    fn the_dom_forcing_flags_answer_the_same_2763() -> Result<()> {
+        for args in [
+            vec!["-P"],
+            vec!["--arg", "x", "1"],
+            vec!["-r"],
+            vec!["--sort-keys"],
+        ] {
+            let (out, code) = run_yq_stdin(".a | key | line_comment", KEYC, &args)?;
+            assert_eq!(code, 0, "{args:?}");
+            assert_eq!(out, "keyc\n", "{args:?}");
+
+            let (out, code) = run_yq_stdin(".a | key | line", KEYC, &args)?;
+            assert_eq!(code, 0, "{args:?}");
+            assert_eq!(out, "1\n", "{args:?}");
+        }
+        Ok(())
+    }
+
+    /// jq 1.7.1 has no `key`/`line`/`column` at all (`key/0 is not
+    /// defined`), so these are succinctly extensions in jq mode with no
+    /// oracle to capture from -- modelled on yq, as ADR-0018 rule 5 says an
+    /// extension is. They answer from the key node there too: JSON has no
+    /// comments, but it does have positions.
+    #[test]
+    fn jq_mode_answers_from_the_key_node_too_2763() -> Result<()> {
+        let doc = "{\"a\": {\"b\": 1},\n \"c\": 2}";
+        for (filter, want) in [
+            (".c | key | line", "2\n"),
+            (".c | key | column", "2\n"),
+            ("[.[] | key | line]", "[\n  1,\n  2\n]\n"),
+            // Unchanged: the key's path and a second `key`.
+            (".a.b | key | path", "[\n  \"a\",\n  \"b\"\n]\n"),
+            (".a.b | key | key", ""),
+        ] {
+            let (out, code) = run_jq_stdin(filter, doc, &[])?;
+            assert_eq!(code, 0, "`{filter}`");
+            assert_eq!(out, want, "`{filter}`");
+        }
+        Ok(())
+    }
 }

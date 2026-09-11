@@ -78361,16 +78361,21 @@ mod tests {
 
     #[test]
     fn test_key_object() {
-        // Test key on object iteration
+        // Test key on object iteration.
+        //
+        // `Many`, not `ManyOwned`: a string key is emitted as its own
+        // document node since #2763 (so the metadata getters after it read
+        // the key's line/column/comments), and `generic_to_query_result`
+        // renders a batch of cursors as their borrowed values. Unchanged
+        // keys.
         query!(br#"{"a": 1, "b": 2, "c": 3}"#, ".[] | key",
-            QueryResult::ManyOwned(results) => {
+            QueryResult::Many(results) => {
                 assert_eq!(results.len(), 3);
                 // Check that all results are string keys
                 let keys: Vec<String> = results.iter().filter_map(|v| {
-                    if let OwnedValue::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
+                    match to_owned_lossy(v) {
+                        OwnedValue::String(s) => Some(s),
+                        _ => None,
                     }
                 }).collect();
                 assert!(keys.contains(&"a".to_string()));
@@ -78414,10 +78419,14 @@ mod tests {
 
     #[test]
     fn test_key_nested() {
-        // Test key on nested access
+        // Test key on nested access. `OneCursor`, not `Owned`: see
+        // `test_key_object` above (#2763).
         query!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "inner");
+            QueryResult::OneCursor(c) => {
+                assert_eq!(
+                    crate::jq::eval_generic::to_owned_cursor(&c).expect("decodes"),
+                    OwnedValue::String("inner".to_string())
+                );
             }
         );
     }

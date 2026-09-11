@@ -124,6 +124,17 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         })
     }
 
+    /// Navigate to the previous sibling.
+    #[inline]
+    pub fn prev_sibling(&self) -> Option<Self> {
+        let new_pos = self.index.bp().prev_sibling(self.bp_pos)?;
+        Some(YamlCursor {
+            text: self.text,
+            index: self.index,
+            bp_pos: new_pos,
+        })
+    }
+
     /// Navigate to the parent.
     #[inline]
     pub fn parent(&self) -> Option<Self> {
@@ -6610,6 +6621,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn next_sibling(&self) -> Option<Self> {
         YamlCursor::next_sibling(self)
+    }
+
+    #[inline]
+    fn prev_sibling(&self) -> Option<Self> {
+        YamlCursor::prev_sibling(self)
     }
 
     #[inline]
