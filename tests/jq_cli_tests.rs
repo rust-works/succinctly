@@ -47466,3 +47466,83 @@ fn test_resource_limit_tag_leaves_ordinary_errors_catchable_2132() -> Result<()>
 
     Ok(())
 }
+
+/// #2132, second half (review finding): the `?//` destructuring-alternative
+/// retry is a catch boundary too, and it was still consulting
+/// `is_decode_failure()` alone -- #1620/#1660's own exclusion -- rather than
+/// the shared value-position predicate. So a cap raised *inside* a `?//`
+/// body read as "this alternative failed, try the next", and the truncated
+/// body passed as the next alternative's clean answer: measured before the
+/// fix, `[. as $x ?// $y | if $x != null then range(100002) else 1 end] |
+/// length` answered `100001` at exit 0 (jq 1.7.1: `100002`).
+///
+/// Every `?//` site now uses `is_uncatchable_at_value_position()`, the same
+/// predicate the six `?`/`try` dispatch points already did: eager
+/// (`try_pattern_alternatives`), streaming (`each_pattern_alternatives` and
+/// its generic twin), and the `reduce`/`foreach` source form
+/// (`is_retryable_control`). `suppresses`, the ambient-`?` rule every fold
+/// construct shares, was the last one spelling a member out by hand and is
+/// on the same predicate now.
+#[test]
+fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
+    for (label, doc, filter, want_err) in [
+        (
+            "eager ?//, range",
+            "1",
+            "[. as $x ?// $y | if $x != null then range(100002) else 1 end] | length",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "eager ?//, recursion",
+            "1",
+            "[. as $x ?// $y | if $x != null then (def f: f; f) else 1 end]",
+            "f/0 exceeded maximum recursion depth",
+        ),
+        (
+            "streaming ?// under limit",
+            "[[1]]",
+            "[limit(300000; .[] as [$y] ?// $z | if $y != null then range(100002) else $z end)] | length",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "reduce source ?//",
+            "null",
+            "[reduce (1,2) as $x ?// $y (0; if $x != null then range(100002) else 1 end)]",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "foreach source ?//",
+            "null",
+            "[foreach (1,2) as $x ?// $y (0; if $x != null then range(100002) else 1 end; .)] | length",
+            "foreach: maximum iterations exceeded",
+        ),
+        (
+            "ambient ? over a fold (suppresses)",
+            "null",
+            "[(reduce range(50001) as $x ((0,1); .+$x))?] | length",
+            "reduce: maximum iterations exceeded",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "[{label}] `{filter}`: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stderr.contains(want_err), "[{label}] stderr {stderr:?}");
+    }
+
+    // Ordinary errors inside a `?//` body still fall through to the next
+    // alternative -- jq's own rule, each row captured from jq 1.7.1.
+    for (doc, filter, want) in [
+        (
+            "[1]",
+            r#". as [$a] ?// $b | if $a != null then error("x") else "second" end"#,
+            r#""second""#,
+        ),
+        ("[1]", "[1] as [$a] ?// $b | $b", "null"),
+        ("[[1,2]]", ".[] as [$a] ?// [$b] | [$a,$b]", "[1,null]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    Ok(())
+}

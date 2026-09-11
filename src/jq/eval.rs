@@ -4420,8 +4420,11 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 /// react, so it correctly leaves `Break` alone and only ever silences a
 /// trailing `Error`.
 /// Whether `e` should be suppressed under an ambient `optional`: true for
-/// an ordinary error, false for a decode failure (#1620), which `optional`
-/// never suppresses. One definition for a rule `finish_fork` below,
+/// an ordinary error, false for anything
+/// [`EvalError::is_uncatchable_at_value_position`] -- a decode failure
+/// (#1620), a yq negative-index raise (#2254, documented as never
+/// suppressed by `optional`), or a resource-limit raise (#2132), none of
+/// which `optional` may suppress. One definition for a rule `finish_fork` below,
 /// `finish_fork_generic` (`eval_generic.rs`), and every `eval_reduce`/
 /// `eval_foreach` input/INIT arm all need, instead of each hand-copying
 /// `optional && !e.is_decode_failure()` -- this exact condition already
@@ -4430,7 +4433,13 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 /// drift); one shared predicate is the actual fix for a bug class that
 /// otherwise recurs every time a new match arm needs the same check.
 pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
-    optional && !e.is_decode_failure()
+    // #2132: the shared value-position predicate, not `is_decode_failure()`
+    // alone -- a resource cap under an ambient `?` was reporting a truncated
+    // fold as a clean answer, the same class #1620 closed for decode
+    // failures. Every `?`/`try` dispatch site already consults this
+    // predicate; this was the one suppression rule still spelling out one
+    // of its members by hand.
+    optional && !e.is_uncatchable_at_value_position()
 }
 
 /// Fold `e` into a terminal suppress-or-raise `QueryResult`, per
@@ -5852,10 +5861,14 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 return Flow::Stopped { pending };
             }
-            // #1620/#1660: same decode-failure exclusion as
+            // #1620/#1660: same uncatchable exclusion as
             // `try_pattern_alternatives` -- always propagates, `is_last` or
-            // not.
-            Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+            // not. #2132 widened it from `is_decode_failure()` to the shared
+            // value-position predicate: a resource cap raised inside a `?//`
+            // body was read as "this alternative failed, try the next", and
+            // the truncated body passed as the next alternative's clean
+            // answer.
+            Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                 return Flow::Escaped(Control::Error(e));
             }
             // #1457: `Break` falls through like `Error`, not immediately
@@ -30545,6 +30558,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 ResolveFlow::Escaped(EvalEscape::Error(e)) => {
                     if is_last
                         || e.is_decode_failure()
+                        || e.is_resource_limit()
                         || e.is_untracked_navigation_error()
                         || e.is_invalid_path_expression()
                     {
@@ -36394,7 +36408,10 @@ fn detach_from_temp_document<'a, W: Clone + AsRef<[u64]>>(
 /// guard against a future change reopening a path to one.
 fn is_retryable_control(control: &Control, is_last: bool) -> bool {
     match control {
-        Control::Error(e) if e.is_decode_failure() => false,
+        // #2132: the shared value-position predicate -- a resource cap is
+        // no more a reason to try the next alternative than a decode
+        // failure is.
+        Control::Error(e) if e.is_uncatchable_at_value_position() => false,
         Control::Error(_) | Control::Break(_) => !is_last,
         Control::Halt(_) => false,
     }
@@ -48480,7 +48497,10 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // alternative failed to match, try the next one" -- it always
             // propagates, `is_last` or not, the same way `eval_try` never
             // suppresses it regardless of whether a `catch` handler exists.
-            QueryResult::Error(e) if e.is_decode_failure() => {
+            // #2132: widened from `is_decode_failure()` to the shared
+            // value-position predicate, same reasoning as
+            // `each_pattern_alternatives`.
+            QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
                 return Ok((carried, Some(Control::Error(e))));
             }
             QueryResult::Error(e) => {
