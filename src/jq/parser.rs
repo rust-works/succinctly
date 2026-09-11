@@ -1315,6 +1315,30 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse object construction: `{key: value, ...}`
+    /// The shared "peek past `$name`" lookahead behind both `{$a}`/
+    /// `{$a: expr}` (`parse_object_construction`, below, #2724) and
+    /// `{$a}`/`{$a: Pattern}` (`parse_pattern_inner`, #1139/#1204): both
+    /// need to look one token past a `$`-led name to tell the bare-
+    /// shorthand and explicit-colon forms apart before committing to
+    /// either desugaring, and previously each site hand-rolled its own
+    /// copy of exactly that lookahead -- the same "duplicated predicates
+    /// diverge silently" shape #2728 found for identifier-start rules.
+    /// The `$` must already be the current character; consumes the `$`
+    /// and the name, but deliberately does NOT consume a following `:`
+    /// even when present, since what follows it differs completely
+    /// between the two call sites (an `Expr` vs a `Pattern`). Returns the
+    /// name, the 1-based source line the `$` itself started on (only
+    /// object-construction's `$__loc__` case uses it), and whether a `:`
+    /// follows.
+    fn parse_dollar_name(&mut self) -> Result<(String, usize, bool), ParseError> {
+        let line = self.current_line();
+        self.next();
+        let name = self.parse_ident()?;
+        self.skip_ws();
+        let has_colon = self.peek() == Some(':');
+        Ok((name, line, has_colon))
+    }
+
     fn parse_object_construction(&mut self) -> Result<Expr, ParseError> {
         self.expect('{')?;
         self.skip_ws();
@@ -1356,40 +1380,40 @@ impl<'a> Parser<'a> {
             // produces zero output rather than either jq's `{"a":1}` or
             // an error. Reproducing that exactly needs evaluator-level
             // work, not a parser tweak, and is tracked separately (#2783).
-            let mut dollar_shorthand_value: Option<Expr> = None;
-
-            // Parse key
-            let key = if self.peek() == Some('(') {
+            //
+            // Returns the shorthand's already-desugared value alongside
+            // the key when the `$name` form (no `:`) was taken, since
+            // that value is fully known here and the ordinary shorthand
+            // check below (`{foo}` means `{foo: .foo}`) doesn't apply to
+            // it -- `{$a}` means `{a: $a}`, not `{a: .a}`.
+            let (key, dollar_shorthand_value) = if self.peek() == Some('(') {
                 // Dynamic key: (expr)
                 self.next();
                 let key_expr = self.parse_expr()?;
                 self.expect(')')?;
-                ObjectKey::Expr(Box::new(key_expr))
+                (ObjectKey::Expr(Box::new(key_expr)), None)
             } else if self.peek() == Some('"') {
                 // String key
                 let s = self.parse_string_literal()?;
-                ObjectKey::Literal(s)
+                (ObjectKey::Literal(s), None)
             } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
-                let line = self.current_line();
-                self.next();
-                let name = self.parse_ident()?;
-                self.skip_ws();
-                if self.peek() == Some(':') {
+                let (name, line, has_colon) = self.parse_dollar_name()?;
+                if has_colon {
                     if name == "__loc__" {
                         return Err(ParseError::new(
                             "may need parentheses around object key expression",
                             self.pos,
                         ));
                     }
-                    ObjectKey::Expr(Box::new(dollar_var_expr(name, line)))
+                    (ObjectKey::Expr(Box::new(dollar_var_expr(name, line))), None)
                 } else {
-                    dollar_shorthand_value = Some(dollar_var_expr(name.clone(), line));
-                    ObjectKey::Literal(name)
+                    let value = dollar_var_expr(name.clone(), line);
+                    (ObjectKey::Literal(name), Some(value))
                 }
             } else {
                 // Identifier key
                 let name = self.parse_ident()?;
-                ObjectKey::Literal(name)
+                (ObjectKey::Literal(name), None)
             };
 
             self.skip_ws();
@@ -2584,12 +2608,12 @@ impl<'a> Parser<'a> {
                     // matching jq's own refusal at the second step there.
                     // `PatternEntry.bind` carries the `$a` binding so a single
                     // entry can do both jobs. Peeking past the identifier for
-                    // `:` is required to tell the two `$`-led shapes apart.
+                    // `:` is required to tell the two `$`-led shapes apart --
+                    // shared with `parse_object_construction`'s own `{$a}`/
+                    // `{$a: expr}` lookahead (#2724) via `parse_dollar_name`.
                     if self.peek() == Some('$') {
-                        self.next();
-                        let name = self.parse_ident()?;
-                        self.skip_ws();
-                        if self.peek() == Some(':') {
+                        let (name, _line, has_colon) = self.parse_dollar_name()?;
+                        if has_colon {
                             self.next();
                             self.skip_ws();
                             let nested = self.parse_pattern()?;
