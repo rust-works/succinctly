@@ -144,7 +144,16 @@ FILTERS=(
   'map(.x) | .[]'
   'first(map(.x) | .[])'
   'limit(1; map(.x) | .[])'
-  # materializing eager twin / native streaming arm
+  # materializing eager twin / native streaming arm.
+  #
+  # #2710: a historical label. It classifies each shape by what the *eager*
+  # route did when there were two routes to compare; that route is gone, and
+  # several rows here forward a cursor today rather than materializing --
+  # `. as $x | $x`, `if . then . else . end`, `. | .` and `first(.)` among
+  # them, which is why they echo an undecodable key's raw source bytes. Do
+  # not read the grouping as a live statement about materialization; the
+  # boundary that still holds is pinned by
+  # `test_undecodable_key_spelling_follows_materialization_2710`.
   '.,.'
   'if . then . else . end'
   'try .'
