@@ -2122,6 +2122,21 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `eval_single`'s 0-stub `file_index` instead of erroring or
         // resolving correctly.
         Expr::Negate(inner) => needs_path_context(inner),
+        // #2698: a `range` bound reads position exactly as a `Negate` operand
+        // does, and `eval_single` now evaluates all three bounds natively
+        // from the cursor (`each_range_generic`). Without this arm a `key`
+        // or `line` inside a bound was invisible here, so the live-cursor
+        // routes resolved it while every other route still stubbed it --
+        // the #2797 review's "spelling-dependent" finding, ADR-0021's
+        // silent-fallback class one construct over. Registering it here is
+        // necessary but not sufficient: the routes that reach `eval.rs`'s
+        // own `each_range` still stub, because *that* function's bounds
+        // carry no position frame -- tracked as #2803.
+        Expr::Range { from, to, step } => {
+            needs_path_context(from)
+                || to.as_deref().is_some_and(needs_path_context)
+                || step.as_deref().is_some_and(needs_path_context)
+        }
         Expr::Builtin(Builtin::Select(cond)) => needs_path_context(cond),
         // `map(f)` needs the same recursion as `Select` above -- e.g.
         // `map(select(file_index == 0))`, previously silently stubbed to 0

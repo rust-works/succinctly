@@ -42393,3 +42393,32 @@ fn range_bounds_see_uncollapsed_duplicate_keys_2698() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2698's yq twin of `range_bounds_validate_only_what_they_read_2698`:
+/// same fault (a bad escape in a leaf value `length` never decodes), same
+/// rule. Real yq v4.53.3 rejects the document at read time for every
+/// filter; `range` is `--jq-extensions` surface here (#1512).
+#[test]
+fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
+    let doc = "a: \"bad\\q\"\nb: 5\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, want) in [
+        ("[range(length)]", "[0,1]"),
+        ("[limit(2; range(length))]", "[0,1]"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#2698: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    for filter in [".a", "[range(.a|length)]"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_ne!(
+            code, 0,
+            "#2698: `{filter}` must still raise -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}

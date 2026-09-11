@@ -7049,7 +7049,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // 105 MB on a 77 MB input, for a root whose `length` is 9. The
         // demand-driven spellings (`first`, `limit`, `reduce`) already reach
         // the native arm directly through `eval_each_generic`.
-        Expr::Range { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+        //
+        // `stream_owned_outputs_generic`, not `collect_each_generic`: `range`
+        // only ever emits `GenericItem::Owned` numbers, and the latter
+        // buffers every output as an 80-byte `GenericItem<V>` before copying
+        // into a `Vec<OwnedValue>` -- which the #2797 review measured at
+        // +66% peak and +27% time on a large-output `[range(..)]` against
+        // the bridge it replaced, undoing the win for the closed shape. The
+        // `Negate` arm above collects the same way for the same reason.
+        Expr::Range { .. } => {
+            let (values, control) =
+                stream_owned_outputs_generic::<S, V>(expr, value, optional, cursor);
+            finish_fork_generic(values, control, optional)
+        }
 
         // Spine 2416 (the exit): unary minus over a path-context operand.
         // The eager evaluator carried this as `eval_negate_with_path_context`
@@ -16974,6 +16986,15 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // arm, above): unary minus over a path-context operand is evaluated
         // with the cursor, like the binary arithmetic just above.
         Expr::Negate(inner) => path_context_single_native(inner),
+        // #2698: `eval_single`'s own `Expr::Range` arm evaluates every bound
+        // through `each_range_generic`, cursor threaded, so a range is native
+        // exactly when each of its bounds is -- the same shape as
+        // `Arithmetic`'s two operands just above.
+        Expr::Range { from, to, step } => {
+            path_context_single_native(from)
+                && to.as_deref().map_or(true, path_context_single_native)
+                && step.as_deref().map_or(true, path_context_single_native)
+        }
         // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
         // `Expr::And`/`Expr::Or` arms, above, over `eval_boolean_generic`.
         // Those arms lost their `needs_path_context` gate in #2476, and the
