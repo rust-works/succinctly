@@ -30071,7 +30071,12 @@ fn drive_fold_source_by_value<S: EvalSemantics>(
 /// the same way [`resume_from_escape`] does for a [`Flow`]-shaped reclaim.
 fn reclaim_fold_escape(aborted: Option<Control>, source: Option<Control>) -> Option<Control> {
     if aborted.is_some() {
-        clear_nonretryable_stop();
+        // `nonretryable_stop::clear()` directly, as `resume_from_escape`
+        // does -- not `clear_nonretryable_stop()`, which since #2691 also
+        // announces a `?//` attempt to `resolve_terminal`'s sink. A reclaim
+        // is not an attempt, and bumping here would let a producer that
+        // drove past `Demand::Stop` after a fold-step escape slip the check.
+        nonretryable_stop::clear();
     }
     aborted.or(source)
 }
@@ -34234,7 +34239,13 @@ fn resolve_terminal<'a, S: EvalSemantics>(
             if let Some(generation) = refused_at.take() {
                 debug_assert!(
                     terminal_retry::began_since(generation),
-                    "resolve_terminal's sink was re-invoked after refusing a branch, but no                      `?//` alternative retry began in between -- a producer drove past                      `Demand::Stop`, and the refusal it just cleared would have been a                      false success (#2691): expr={expr:?}"
+                    concat!(
+                        "resolve_terminal's sink was re-invoked after refusing a branch, but no ",
+                        "`?//` alternative retry began in between -- a producer drove past ",
+                        "`Demand::Stop`, and the refusal it just cleared would have been a ",
+                        "false success (#2691): expr={:?}"
+                    ),
+                    expr
                 );
             }
             violation = None;
@@ -36733,13 +36744,13 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
 ///
 /// Also the one place a `?//` attempt announces itself to
 /// [`resolve_terminal`]'s sink ([`terminal_retry::begin_attempt`], #2691).
-/// Every `?//` attempt loop in both evaluators -- value-mode
-/// [`each_pattern_alternatives`]/[`try_pattern_alternatives`], the fold
-/// forms, `eval_generic`'s twin, and the resolver's own
-/// [`resolve_as_pattern`] -- already calls this on entry, so putting the
-/// bump here rather than at any retry site makes "a retry began since the
-/// refusal" true by construction for every retry form, including the one
-/// that is easy to miss: a refusal at the resolver's terminal sink inside a
+/// Every `?//` attempt loop that can re-drive a *sink* after a
+/// `Demand::Stop` calls this on entry -- [`each_pattern_alternatives`], its
+/// `eval_generic` twin, [`try_foreach_step_alternatives`], and the
+/// resolver's own [`resolve_as_pattern`] -- so putting the bump here rather
+/// than at any retry site makes "a retry began since the refusal" true by
+/// construction for every retry form, including the one that is easy to
+/// miss: a refusal at the resolver's terminal sink inside a
 /// `foreach`/`reduce` whose *source* holds the `?//`. That source is pulled
 /// by demand (#2235), so the sink's `Demand::Stop` crosses the value/path
 /// boundary and it is the **value-mode** retry that drives the next source
@@ -36747,6 +36758,15 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
 /// $v (.; .; if $v == 1 then 1 else . end))` is jq's `[]` only because of
 /// it. A first cut of #2691 bumped at `resolve_as_pattern` alone and fired
 /// on exactly that row.
+///
+/// The eager loops ([`try_pattern_alternatives`],
+/// [`try_reduce_step_alternatives`]) do not call this, and need not: they
+/// collect their alternative's outputs before anything downstream sees
+/// them, so no sink can have stopped on a refusal mid-attempt for them to
+/// retry past. Path-mode `resolve_reduce`/`resolve_foreach` admit only a
+/// bare `$var` pattern and cannot retry at all. A reclaim of a fold-step
+/// escape ([`reclaim_fold_escape`]) is not an attempt either, and clears
+/// the flag directly rather than through here.
 pub(crate) fn clear_nonretryable_stop() {
     nonretryable_stop::clear();
     terminal_retry::begin_attempt();
