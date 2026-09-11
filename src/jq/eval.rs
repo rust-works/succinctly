@@ -27271,8 +27271,10 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
                 }
             });
         if over_budget {
+            // #2132: `resource_limit`, not `new` -- a cap `?`/`try` must not
+            // swallow. Same for every other raise below; see the constructor.
             return ResolveFlow::Escaped(
-                EvalError::new("repeat: maximum iterations exceeded".to_string()).into(),
+                EvalError::resource_limit("repeat: maximum iterations exceeded").into(),
             );
         }
         if stopped {
@@ -35062,7 +35064,8 @@ pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 /// `what` names the construct in the resulting error message.
 pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     if *budget == 0 {
-        return Some(Control::Error(EvalError::new(format!(
+        // #2132: uncatchable -- see `EvalError::resource_limit`.
+        return Some(Control::Error(EvalError::resource_limit(format!(
             "{what}: maximum iterations exceeded"
         ))));
     }
@@ -37695,7 +37698,8 @@ fn until_step<S: EvalSemantics>(
 ) -> Result<(), Control> {
     loop {
         if *budget == 0 {
-            return Err(Control::Error(EvalError::new(
+            // #2132: uncatchable -- see `EvalError::resource_limit`.
+            return Err(Control::Error(EvalError::resource_limit(
                 "until: maximum iterations exceeded",
             )));
         }
@@ -37788,7 +37792,8 @@ fn while_step<S: EvalSemantics>(
             // `finish_fork` at the call site like every other termination
             // cause, so `outputs` gathered before the cap no longer vanish
             // (deliberate minor behavior change — not pinned by any test).
-            return Err(Control::Error(EvalError::new(
+            // #2132: uncatchable -- see `EvalError::resource_limit`.
+            return Err(Control::Error(EvalError::resource_limit(
                 "while: maximum iterations exceeded",
             )));
         }
@@ -38004,7 +38009,10 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    let control = Control::Error(EvalError::new("repeat: maximum iterations exceeded"));
+    // #2132: uncatchable -- see `EvalError::resource_limit`.
+    let control = Control::Error(EvalError::resource_limit(
+        "repeat: maximum iterations exceeded",
+    ));
     finish_fork(outputs, Some(control), optional)
 }
 
@@ -38109,7 +38117,10 @@ const MAX_RANGE: usize = 100000;
 /// wanted every value (its sink kept answering [`Demand::Continue`]) hits a
 /// [`MAX_RANGE`]-truncated batch -- shared so callers can't drift in wording.
 fn range_max_exceeded_error() -> EvalError {
-    EvalError::new("range: maximum iterations exceeded")
+    // #2132: uncatchable -- `[range(100001)?] | length` answered `100000`
+    // at exit 0 with a plain `new`, the silent truncation #2089 closed for
+    // the un-suppressed spelling. See `EvalError::resource_limit`.
+    EvalError::resource_limit("range: maximum iterations exceeded")
 }
 
 /// Helper to generate range values, capped at [`MAX_RANGE`] per call --
@@ -49023,7 +49034,10 @@ pub(crate) fn bind_def_call<'e>(
 ) -> Result<&'e Rc<Expr>, EvalError> {
     bound.get_or_try_init(|| {
         if frames >= MAX_EVAL_FRAMES {
-            return Err(EvalError::new(format!(
+            // #2132: uncatchable -- `def f: f; try f catch "caught"` answered
+            // `"caught"` at exit 0 with a plain `new`. See
+            // `EvalError::resource_limit`.
+            return Err(EvalError::resource_limit(format!(
                 "{}/{} exceeded maximum recursion depth",
                 def.name,
                 def.params.len()

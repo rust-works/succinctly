@@ -3526,6 +3526,28 @@ output is unaffected, since neither appears in JSON
 for the feature-level gaps (position builtins after DOM conversion; `file_index`/`key`/
 `document_index` inside object literals or `any`/`all`).
 
+## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
+
+The five caps `succinctly jq` documents -- `MAX_RANGE`, `WHILE_UNTIL_MAX_STEPS`,
+`REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES` -- are shared
+evaluator limits, so they apply to `succinctly yq` as well; real yq v4.53.3 has none of them.
+The reachable ones without `--jq-extensions` are `while`/`until` and a recursive `def`
+(`range`/`repeat` are gated, #1512). Since #2132 the raise is `ErrorKind::ResourceLimit`,
+which `?`/`try`/`catch` never swallow, in both modes alike:
+
+```console
+$ printf 'a: 1\n' | succinctly yq '[.a | while(true; .+1)?] | length'
+Error: while: maximum iterations exceeded
+$ printf 'a: 1\n' | succinctly yq 'def f: f; try f catch "caught"'
+Error: f/0 exceeded maximum recursion depth
+```
+
+This is a rule 4(b) decision, not a mode difference: the caps are not a reference behaviour in
+either tool, so there is no yq catch semantics to match, and letting `try` swallow one would
+report a truncated result as a clean answer. See the jq page's "Every resource cap is
+uncatchable" section for the full account and oracle rows; pinned by
+`test_resource_limit_caps_are_uncatchable_in_yq_mode_2132` (`tests/yq_cli_tests.rs`).
+
 ## Where the two modes deliberately differ from each other
 
 Not divergences — these are ADR-0018 rule 2 working correctly. The same filter text means

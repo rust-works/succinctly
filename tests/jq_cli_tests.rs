@@ -47286,3 +47286,183 @@ fn test_boolean_routes_agree_on_a_malformed_document_2669() -> Result<()> {
 
     Ok(())
 }
+
+/// #2132: an evaluator-imposed resource cap is **uncatchable** -- never
+/// suppressed by `?`, never handed to `catch` -- under all three spellings,
+/// for every guard.
+///
+/// These caps (`MAX_RANGE`, `WHILE_UNTIL_MAX_STEPS`, `REDUCE_FOREACH_MAX_STEPS`,
+/// `repeat`'s `MAX_ITERATIONS`, `MAX_EVAL_FRAMES`) are succinctly's own, with
+/// no jq counterpart: `[range(100001)?] | length` is `100001` in jq 1.7.1,
+/// which has no cap at all. A `?`/`try` written against jq semantics cannot
+/// have meant "accept a truncated result", so letting the catch swallow the
+/// cap reopened the silent-wrong-data class #2089 closed for the
+/// un-suppressed spelling. Measured before this fix:
+/// `[range(100001)?] | length` answered `100000` at exit 0,
+/// `[try range(100001) catch "caught"] | length` answered `100001` (prefix
+/// plus the handler's value), and `def f: f; try f catch "caught"` answered
+/// `"caught"`.
+///
+/// Under ADR-0018's decision order this is rule 4(b) -- matching the
+/// reference's catch semantics for an error it cannot raise would corrupt
+/// data -- and it is `ErrorKind::ResourceLimit` riding the same uncatchable
+/// machinery as a decode failure (#1840), not a `Control::Halt`: the CLI
+/// still prints it and exit-codes it as an ordinary error (5), and it still
+/// flows through `Partial` so the prefix streamed before the cap reaches
+/// stdout, exactly as #2089 established.
+#[test]
+fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
+    for (label, expr, want_err) in [
+        (
+            "MAX_RANGE",
+            "range(100001)",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "WHILE_UNTIL_MAX_STEPS/while",
+            "while(true; .+1)",
+            "while: maximum iterations exceeded",
+        ),
+        (
+            "WHILE_UNTIL_MAX_STEPS/until",
+            "until(false; .+1)",
+            "until: maximum iterations exceeded",
+        ),
+        // Genuine fan-out past the shared reduce/foreach budget -- the same
+        // shape `test_reduce_budget_exceeded_errors` uses: two INIT forks
+        // over a 50,001-element source is 100,002 UPDATE evaluations.
+        (
+            "REDUCE_FOREACH_MAX_STEPS/reduce",
+            "reduce range(50001) as $x ((0,1); .+$x)",
+            "reduce: maximum iterations exceeded",
+        ),
+        (
+            "REDUCE_FOREACH_MAX_STEPS/foreach",
+            "foreach range(50001) as $x ((0,1); .+$x; empty)",
+            "foreach: maximum iterations exceeded",
+        ),
+        (
+            "repeat MAX_ITERATIONS",
+            "repeat(.)",
+            "repeat: maximum iterations exceeded",
+        ),
+        (
+            "MAX_EVAL_FRAMES",
+            "def f: f; f",
+            "f/0 exceeded maximum recursion depth",
+        ),
+        (
+            "MAX_EVAL_FRAMES, generator",
+            "def f: 1, f; f",
+            "f/0 exceeded maximum recursion depth",
+        ),
+    ] {
+        for spelling in [
+            format!("[{expr}?] | length"),
+            format!("[try ({expr})] | length"),
+            format!("[try ({expr}) catch \"caught\"] | length"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &spelling], Some("null"))?;
+            assert_eq!(
+                code, 5,
+                "[{label}] `{spelling}`: the cap must not be caught -- stdout {stdout:?} stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(want_err),
+                "[{label}] `{spelling}`: stderr {stderr:?} lacks {want_err:?}"
+            );
+            assert!(
+                !stdout.contains("caught"),
+                "[{label}] `{spelling}`: the handler ran: {stdout:?}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// #2132: the prefix a generator streamed before hitting its cap is still
+/// printed -- the cap is an error that ends the stream, not one that
+/// retroactively discards it. Bare (not inside a `[...]` collector) so the
+/// prefix is observable on stdout, with the cap's error on stderr after it.
+#[test]
+fn test_resource_limit_prefix_still_streams_before_the_cap_2132() -> Result<()> {
+    for (spelling, want_last_line, want_err) in [
+        (
+            "range(100001)?",
+            "99999",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "try range(100001)",
+            "99999",
+            "range: maximum iterations exceeded",
+        ),
+        (
+            "try range(100001) catch \"caught\"",
+            "99999",
+            "range: maximum iterations exceeded",
+        ),
+        // `reduce` emits its first fork's result before the second exhausts
+        // the shared budget.
+        (
+            "try (reduce range(50001) as $x ((0,1); .+$x)) catch \"caught\"",
+            "1250025000",
+            "reduce: maximum iterations exceeded",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", spelling], Some("null"))?;
+        assert_eq!(code, 5, "`{spelling}`: stderr {stderr:?}");
+        assert_eq!(
+            stdout.trim_end().lines().last().unwrap_or(""),
+            want_last_line,
+            "`{spelling}`: the prefix must still stream: {}",
+            stdout.len()
+        );
+        assert!(stderr.contains(want_err), "`{spelling}`: stderr {stderr:?}");
+        assert!(!stdout.contains("caught"), "`{spelling}`: {stdout:?}");
+    }
+
+    Ok(())
+}
+
+/// #2132: what the fix must **not** change, each row captured live from jq
+/// 1.7.1.
+///
+/// - An ordinary error under `?`/`try` keeps the prefix and catches the
+///   terminal error -- jq's own semantics, which succinctly already matched.
+///   The issue's broad reading ("discard what already came out") would have
+///   been a divergence, not a fix.
+/// - An early-stopping consumer never reaches the cap, so `?` has nothing
+///   to see: `[limit(5; range(100001))?]` is unaffected.
+/// - A user's own `error(..)` whose *message* happens to match a cap's is
+///   still catchable -- the tag decides, not the text, which is #1660's
+///   lesson and the reason `ErrorKind` exists.
+#[test]
+fn test_resource_limit_tag_leaves_ordinary_errors_catchable_2132() -> Result<()> {
+    for (filter, want) in [
+        (r#"[(1,2,error("x"),3)?]"#, "[1,2]"),
+        (r#"[try (1,2,error("x"),3) catch "c"]"#, r#"[1,2,"c"]"#),
+        ("[limit(5; range(100001))?]", "[0,1,2,3,4]"),
+        ("[limit(3; repeat(.)?)]", "[null,null,null]"),
+        ("first(repeat(1)?)", "1"),
+        (
+            r#"try error("range: maximum iterations exceeded") catch "user""#,
+            r#""user""#,
+        ),
+        (
+            r#"try error("f/0 exceeded maximum recursion depth") catch "user""#,
+            r#""user""#,
+        ),
+        (
+            r#"[error("repeat: maximum iterations exceeded")?] | length"#,
+            "0",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    Ok(())
+}

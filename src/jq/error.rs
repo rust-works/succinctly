@@ -95,6 +95,12 @@ pub enum ErrorKind {
     /// See [`EvalError::is_untracked_navigation_error`] -- ordinarily
     /// catchable, with one narrow bare-postfix-`?` exception.
     UntrackedNavigation,
+    /// See [`EvalError::is_resource_limit`] -- always uncatchable (#2132).
+    /// An evaluator-imposed cap (`MAX_RANGE`, `WHILE_UNTIL_MAX_STEPS`,
+    /// `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s `MAX_ITERATIONS`,
+    /// `MAX_EVAL_FRAMES`) that has no jq counterpart, so no `?`/`try` can
+    /// have been written to expect it.
+    ResourceLimit,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -1251,12 +1257,51 @@ impl EvalError {
         matches!(self.value, EvalErrorPayload::Kind(ErrorKind::DecodeFailure))
     }
 
+    /// An evaluator-imposed resource cap was exceeded (#2132): `range`'s
+    /// `MAX_RANGE`, `while`/`until`'s `WHILE_UNTIL_MAX_STEPS`,
+    /// `reduce`/`foreach`'s `REDUCE_FOREACH_MAX_STEPS`, `repeat`'s
+    /// `MAX_ITERATIONS`, or a recursive `def` past `MAX_EVAL_FRAMES`.
+    ///
+    /// These are succinctly's own limits with no jq counterpart --
+    /// `[range(100001)?] | length` is `100001` in jq 1.7.1, which has no cap
+    /// -- so a `?`/`try` written against jq semantics cannot have meant
+    /// "accept a truncated result". Letting the catch swallow the cap
+    /// reopened exactly the silent-wrong-data class #2089 closed:
+    /// `[range(100001)?] | length` answered `100000` at exit 0, and
+    /// `def f: f; try f catch "caught"` answered `"caught"`. Tagged
+    /// uncatchable instead, the same machinery as [`Self::decode_failure`]:
+    /// never suppressed by `?`, never handed to `catch`, still an ordinary
+    /// error to the CLI (exit 5), and still carried through `Partial` so the
+    /// prefix emitted before the cap reaches the output as #2089 established.
+    ///
+    /// Under ADR-0018's decision order this is rule 4(b) -- matching the
+    /// reference's catch semantics for an error the reference cannot raise
+    /// would corrupt data -- decided identically in both modes, since the
+    /// caps are not a reference behaviour in either.
+    ///
+    /// Ordinary user-raised or type errors are deliberately *not* this:
+    /// jq keeps the prefix and catches the terminal error
+    /// (`[(1,2,error("x"),3)?]` is `[1,2]`), succinctly matches it, and
+    /// nothing here changes that. A user's own
+    /// `error("range: maximum iterations exceeded")` stays catchable too --
+    /// the tag, not the message, decides (#1660's lesson).
+    pub fn resource_limit(message: impl Into<String>) -> Self {
+        Self::with_kind(message, ErrorKind::ResourceLimit)
+    }
+
+    /// Whether this is a [`Self::resource_limit`] -- see there for why it is
+    /// always uncatchable (#2132).
+    pub fn is_resource_limit(&self) -> bool {
+        matches!(self.value, EvalErrorPayload::Kind(ErrorKind::ResourceLimit))
+    }
+
     /// Whether this error class is *always* uncatchable, with no positional
     /// nuance — [`Self::is_invalid_path_expression`],
-    /// [`Self::is_decode_failure`], or [`Self::is_yq_negative_index_error`]
-    /// (#2254). Unlike [`Self::is_untracked_navigation_error`], which
+    /// [`Self::is_decode_failure`], [`Self::is_yq_negative_index_error`]
+    /// (#2254), or [`Self::is_resource_limit`] (#2132). Unlike
+    /// [`Self::is_untracked_navigation_error`], which
     /// genuinely depends on *where* the error was caught (a bare postfix `?`
-    /// on the primitive that raised it vs. anything else), all three mean
+    /// on the primitive that raised it vs. anything else), all four mean
     /// the same thing at every call site that checks them: never suppressed
     /// by `?`, never handed to a `catch` handler. `resolve_node`'s
     /// `Expr::Try` and `Expr::Optional` arms (`?`'s two path-context
@@ -1276,11 +1321,13 @@ impl EvalError {
         self.is_invalid_path_expression()
             || self.is_decode_failure()
             || self.is_yq_negative_index_error()
+            || self.is_resource_limit()
     }
 
     /// [`Self::is_uncatchable`], narrowed to the subset that also applies at
-    /// *value* position -- a decode failure or a yq negative-index raise,
-    /// but not [`Self::is_invalid_path_expression`]. That third condition is
+    /// *value* position -- a decode failure, a yq negative-index raise, or a
+    /// resource-limit raise (#2132), but not
+    /// [`Self::is_invalid_path_expression`]. That third condition is
     /// meaningful only in path context (`path()`/`getpath`'s own walker,
     /// `resolve_node`) and was never verified against value position, so
     /// widening a value-position dispatch point to the full
@@ -1303,7 +1350,7 @@ impl EvalError {
     /// the deleted eager path-context evaluator's own `Expr::Optional`/`Expr::Try`
     /// arms (`eval.rs`).
     pub fn is_uncatchable_at_value_position(&self) -> bool {
-        self.is_decode_failure() || self.is_yq_negative_index_error()
+        self.is_decode_failure() || self.is_yq_negative_index_error() || self.is_resource_limit()
     }
 
     /// `Cannot check whether <container> has a <key type> key`.
@@ -2011,5 +2058,32 @@ mod tests {
             EvalError::urid_invalid_escape(b"%\xe4\xb8").message,
             r#"invalid URL escape "%\xe4\xb8""#
         );
+    }
+
+    /// #2132: a resource-limit raise is uncatchable at both predicates, and
+    /// a user's own `error(..)` carrying the identical *message* is not --
+    /// the tag decides, never the text. That second half is the #1660 class
+    /// of bug `ErrorKind` exists to make structurally impossible: a
+    /// message-matching classifier once forced a user's
+    /// `error("invalid escape sequence")` uncatchable because it collided
+    /// with a literal list.
+    #[test]
+    fn resource_limit_is_uncatchable_by_tag_not_message_2132() {
+        let capped = EvalError::resource_limit("range: maximum iterations exceeded");
+        assert!(capped.is_resource_limit());
+        assert!(capped.is_uncatchable());
+        assert!(capped.is_uncatchable_at_value_position());
+        // Not any *other* kind: the predicates must not overlap.
+        assert!(!capped.is_decode_failure());
+        assert!(!capped.is_invalid_path_expression());
+
+        let user = EvalError::new("range: maximum iterations exceeded");
+        assert!(!user.is_resource_limit());
+        assert!(!user.is_uncatchable());
+        assert!(!user.is_uncatchable_at_value_position());
+
+        // Message text is unchanged by the tag -- every existing
+        // message-asserting test stays valid.
+        assert_eq!(capped.message, user.message);
     }
 }
