@@ -48766,6 +48766,19 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
             "{\"a\":[1,2,3,4]}\n",
         ),
         (r#"{"a":[1,2,3]}"#, "del(. as {(\"a\"):$q} | $q)", "{}\n"),
+        // #2677 review: a `def`-bound function, or an outer-bound `$var`,
+        // referenced *inside* a computed key expression -- both used to
+        // wrongly refuse "undefined function"/leave the variable
+        // unsubstituted, because `map_subexprs`'s own `Expr::AsPattern`/
+        // `Reduce`/`Foreach` arms cloned `patterns` verbatim rather than
+        // descending into a computed key's own `Expr` (the same gap every
+        // one of these three arms had before this fix, predating #2677 --
+        // patterns held no `Expr` to miss until #2677's own
+        // `ObjectKey::Expr`). `install_def_calls`/`bind_def` and
+        // `substitute_var_impl` both route through `map_subexprs`, so
+        // fixing it once repairs both.
+        (r#"{"a":1}"#, "def f: \"a\"; . as {(f):$q} | $q", "1\n"),
+        (r#"{"a":1}"#, "\"a\" as $k | . as {($k):$q} | $q", "1\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
