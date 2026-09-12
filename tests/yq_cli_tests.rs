@@ -16316,6 +16316,49 @@ fn test_absent_item_comment_settles_when_inner_sequence_closes_1079_float() -> R
     assert_yq_getter(input, ".a | key | foot_comment", "c\nd\n")
 }
 
+/// A node's `foot` can accumulate from two different code paths: a floated
+/// comment settling via `settle_float_if_sequence_closed` when its sequence
+/// closes onto an outer item, and a later, wholly separate standalone block
+/// falling backward onto that same item as `PREV` (the ordinary #798 rule).
+/// Both must land in source order -- `.[1]`'s own inner float first, the
+/// later detached block second -- not the reverse.
+#[test]
+fn test_floated_and_ordinary_foot_entries_on_the_same_node_stay_in_order_1079_float() -> Result<()>
+{
+    assert_yq_getter(
+        "- - 1\n  - # c\n- 2\n# f\n\n- 3\n",
+        ".[1] | foot_comment",
+        "c\nf\n",
+    )
+}
+
+/// `SeqFrame::serial` (`Parser::seq_frames`) exists to tell a still-open
+/// sequence apart from a *different* one that has since opened at the same
+/// stack depth -- pins that this identity tracking is load-bearing, not
+/// redundant with the depth (`indent_stack.len()`) it also carries.
+///
+/// `k`'s two inline-nested-sequence items (`- - # c1`, `- - # c2`) each open
+/// their own inner sequence at the same depth, back to back, with no
+/// intervening node open (an inline `- - x` item never calls
+/// `attach_head_foot_at` for its own dash -- it recurses straight into the
+/// nested sequence) to settle `c1` in between. By the time `c2`'s own
+/// absent item registers its float, item 1's inner sequence has already
+/// replaced item 0's at that same depth: a depth-only check (matching a
+/// hypothetical simplification that reads a sequence's identity off
+/// `type_stack`/`indent_stack` alone, dropping `serial`) would wrongly read
+/// this as "still open" and never settle `c1` onto `k`'s foot at all --
+/// confirmed by a throwaway experimental patch during #1079's review that
+/// this exact input diverges from real yq (empty instead of `c1`) with that
+/// simplification and matches with `serial` intact.
+#[test]
+fn test_seq_frame_serial_distinguishes_sibling_frames_at_the_same_depth_1079_float() -> Result<()> {
+    assert_yq_getter(
+        "k:\n  - - # c1\n  - - # c2\n",
+        ".k | key | foot_comment",
+        "c1\n",
+    )
+}
+
 /// Real yq *drops* the first of two floated comments in a nested sequence
 /// that closes to an outer absent item (`c1` here appears in no slot and
 /// is not printed). Discarding it to match is exactly what ADR-0018 rule 4
