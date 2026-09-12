@@ -48720,6 +48720,53 @@ fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
     Ok(())
 }
 
+/// #2677 step 1/2 (parser + type-change only, per the issue's own suggested
+/// landing order): an object destructuring pattern now *parses* a computed
+/// key (`{(EXPR): P}`) or an interpolated-string key (`{"\(EXPR)": P}`) the
+/// same way object *construction* already does -- real jq accepts every row
+/// below, where succinctly previously raised a *compile* error (exit 3).
+/// Evaluation of the computed key itself is not implemented yet (the rest of
+/// #2677's plan: `extract_pattern_bindings`/`walk_pattern` growing real
+/// generator/path-tracking logic, the `?//` fallthrough rules, and the
+/// walker-invariant audit) -- every row here now parses and then raises a
+/// dedicated, clearly-worded runtime error (exit 5) instead, which is
+/// intentional, incremental, and independently testable from the parser fix
+/// alone. This test pins that intermediate state; once evaluation lands,
+/// these rows move to a `_2677` accept-matrix test with jq's own values.
+#[test]
+fn test_pattern_computed_key_parses_but_not_yet_evaluated_2677() -> Result<()> {
+    // Control: a plain literal key is completely unaffected.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ". as {\"a\":$q} | $q"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "[1,2,3]\n");
+
+    for (input, filter) in [
+        (r#"{"a":[1,2,3]}"#, ". as {(\"a\"):$q} | $q"),
+        (r#"{"a":[1,2,3]}"#, ". as {(\"a\",\"b\"):$q} | $q"),
+        (r#"{"a":1,"b":2}"#, ". as {(\"a\",\"b\"):$q} | $q"),
+        (r#"{"a":[1,2,3],"k":"a"}"#, r#". as {"\(.k)":$q} | $q"#),
+    ] {
+        // Real jq accepts every one of these (confirmed live, jq 1.7.1) --
+        // not asserted here since this intermediate state doesn't match it
+        // yet; only that succinctly now *parses* (no longer exit 3) and
+        // fails with this issue's own dedicated error, not a generic one.
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+        assert!(
+            stderr.contains("computed keys in a destructuring pattern are not yet supported"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("parse error") && !stderr.contains("compile error"),
+            "`{filter}` must parse, not compile-error -- stderr: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2103 review (coverage-diff bot, PR #2652): `eval_each_pipe_generic`'s
 /// empty-`exprs` tail fix changed the shape of item that flows out of a
 /// bare `keys_unsorted[]` (`OneCursorValue` instead of `One`), which

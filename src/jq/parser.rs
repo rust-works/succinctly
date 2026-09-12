@@ -2797,23 +2797,36 @@ impl<'a> Parser<'a> {
                             self.skip_ws();
                             let nested = self.parse_pattern()?;
                             entries.push(PatternEntry {
-                                key: name.clone(),
+                                key: ObjectKey::Literal(name.clone()),
                                 bind: Some(name),
                                 pattern: nested,
                             });
                         } else {
                             entries.push(PatternEntry {
-                                key: name.clone(),
+                                key: ObjectKey::Literal(name.clone()),
                                 bind: None,
                                 pattern: Pattern::Var(name),
                             });
                         }
                     } else {
-                        // Parse key (must be identifier or string)
-                        let key = if self.peek() == Some('"') {
-                            self.parse_string_literal()?
+                        // Parse key: `(expr)` (#2677, a computed key -- the
+                        // same production object construction's own
+                        // `(expr):` branch uses, just above in this file),
+                        // a plain or interpolated string (`"..."`/`"\(...)"`
+                        // -- an interpolation is itself a computed key, so
+                        // it shares the `Expr` arm), or a bare identifier.
+                        let key = if self.peek() == Some('(') {
+                            self.next();
+                            let key_expr = self.parse_expr()?;
+                            self.expect(')')?;
+                            ObjectKey::Expr(Box::new(key_expr))
+                        } else if self.peek() == Some('"') {
+                            match self.parse_string_or_interpolation()? {
+                                Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
+                                interpolated => ObjectKey::Expr(Box::new(interpolated)),
+                            }
                         } else {
-                            self.parse_ident()?
+                            ObjectKey::Literal(self.parse_ident()?)
                         };
 
                         self.skip_ws();
@@ -7908,6 +7921,69 @@ mod tests {
                 assert!(matches!(entries[0].key, ObjectKey::Expr(_)));
             }
             _ => panic!("expected Object"),
+        }
+    }
+
+    /// #2677: an object *destructuring pattern*'s own key entry now accepts
+    /// the same `(EXPR)`/interpolated-string computed-key shapes object
+    /// *construction* already did (previous test) -- `PatternEntry.key`
+    /// widened from a plain `String` to `ObjectKey`. Parse-acceptance only:
+    /// evaluation of a computed pattern key still raises a dedicated "not
+    /// yet supported" error (see `tests/jq_cli_tests.rs`'s
+    /// `test_pattern_computed_key_parses_but_not_yet_evaluated_2677`) until
+    /// the rest of this issue's plan lands.
+    #[test]
+    fn test_object_pattern_computed_key_2677() {
+        let parenthesized = parse(". as {(.key): $q} | $q").unwrap();
+        match parenthesized {
+            Expr::AsPattern { patterns, .. } => {
+                let [Pattern::Object(entries)] = patterns.as_slice() else {
+                    panic!("expected a single Object pattern, got {patterns:?}");
+                };
+                assert_eq!(entries.len(), 1);
+                assert!(matches!(entries[0].key, ObjectKey::Expr(_)));
+                assert_eq!(entries[0].bind, None);
+            }
+            other => panic!("expected AsPattern, got {other:?}"),
+        }
+
+        let interpolated = parse(r#". as {"\(.k)": $q} | $q"#).unwrap();
+        match interpolated {
+            Expr::AsPattern { patterns, .. } => {
+                let [Pattern::Object(entries)] = patterns.as_slice() else {
+                    panic!("expected a single Object pattern, got {patterns:?}");
+                };
+                assert!(matches!(entries[0].key, ObjectKey::Expr(_)));
+            }
+            other => panic!("expected AsPattern, got {other:?}"),
+        }
+
+        // A plain (non-interpolated) string key still parses as `Literal`,
+        // unaffected by widening `key` to `ObjectKey`.
+        let literal = parse(r#". as {"a": $q} | $q"#).unwrap();
+        match literal {
+            Expr::AsPattern { patterns, .. } => {
+                let [Pattern::Object(entries)] = patterns.as_slice() else {
+                    panic!("expected a single Object pattern, got {patterns:?}");
+                };
+                assert_eq!(entries[0].key, ObjectKey::Literal("a".into()));
+            }
+            other => panic!("expected AsPattern, got {other:?}"),
+        }
+
+        // The `{$a}`/`{$a: P}` shorthands still key on the bound name
+        // itself, always `Literal` -- never computed.
+        let shorthand = parse(". as {$a} | $a").unwrap();
+        match shorthand {
+            Expr::AsPattern { patterns, .. } => {
+                let [Pattern::Object(entries)] = patterns.as_slice() else {
+                    panic!("expected a single Object pattern, got {patterns:?}");
+                };
+                assert_eq!(entries[0].key, ObjectKey::Literal("a".into()));
+                assert_eq!(entries[0].bind, None);
+                assert_eq!(entries[0].pattern, Pattern::Var("a".into()));
+            }
+            other => panic!("expected AsPattern, got {other:?}"),
         }
     }
 

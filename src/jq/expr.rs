@@ -1085,8 +1085,12 @@ pub enum Pattern {
 /// An entry in an object destructuring pattern.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternEntry {
-    /// The key to match (always a string literal in patterns)
-    pub key: String,
+    /// The key to match -- a literal (`{a: P}`, `{"a": P}`, the `{$a}`/
+    /// `{$a: P}` shorthands) or a computed expression (`{(EXPR): P}`, or an
+    /// interpolated string `{"\(EXPR)": P}`, #2677). A `$name`-shorthand
+    /// entry's key is always [`ObjectKey::Literal`] -- the bound name itself,
+    /// never computed.
+    pub key: ObjectKey,
     /// The `$name` of a `{$name: P}` entry, bound to the matched value before
     /// `pattern` runs on it. `None` for `{key: P}` and for the `{$name}`
     /// shorthand (which desugars to `key: name, pattern: Var(name)`).
