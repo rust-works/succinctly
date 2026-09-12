@@ -1049,11 +1049,12 @@ succinctly's own streaming path give `"5"`), and `\L`/`\P`'s `\u2028`/`\u2029` e
 #1700 moved the escaping to the output *sink* (`AsciiEscapeWriter`, `src/jq/escape.rs`)
 instead of into the streamers, which returns the flag to the streaming route and recovers all
 three at once. The DOM emitter's own `!!str` and `\L`/`\P` divergences are unaffected by that
-fix and remain live for the routes that genuinely materialize — `-P` without `-I0`, `--arg`/
-`--argjson`, `-r`/`-j`/`-0`, `--eval-all`, `--split-exp` (each verified live against this
-binary; `--slurpfile` is a jq flag `succinctly yq` does not accept, and `-P -I0` streams,
-because `-I0`'s own `compact` already satisfies the gate) —
-[#1982](https://github.com/rust-works/succinctly/issues/1982).
+fix and remain live for the routes that genuinely materialize — `-P` (with or without `-I0`,
+since #2606 fixed `-I0`'s own then-"compact" status wrongly satisfying `can_yaml_fast_path`'s
+gate on its own regardless of `-P`; every `-P` invocation now forces the DOM route
+unconditionally), `--arg`/`--argjson`, `-r`/`-j`/`-0`, `--eval-all`, `--split-exp` (each
+verified live against this binary; `--slurpfile` is a jq flag `succinctly yq` does not
+accept) — [#1982](https://github.com/rust-works/succinctly/issues/1982).
 
 `scripts/streaming-dom-diff.py` mechanizes the routing-divergence lesson above: it runs a
 corpus of documents through both output routes (forcing DOM via `--arg unused 1`, which

@@ -641,10 +641,11 @@ impl OutputConfig {
         }
     }
 
-    /// The YAML clamp itself -- `-I0`/`-I1` both landing on width 2 -- is
-    /// `IndentSpec::for_yaml`'s rule (#1486, #1575, #1685; shared with the
-    /// M2 streaming fast path's own indent setup below, previously an
-    /// independently hand-encoded copy of the identical formula). `indent_str`
+    /// The YAML width table itself -- `0 -> 4`, `1 -> 2`, `2..=9 -> n`,
+    /// `>= 10 -> 2` -- is `IndentSpec::for_yaml`'s rule (#1486, #1575,
+    /// #1685, #2606; shared with the M2 streaming fast path's own indent
+    /// setup below, previously an independently hand-encoded copy of the
+    /// identical formula). `indent_str`
     /// is shared by both formats' DOM emitters (see its use in the JSON
     /// branch of `output_value`), so the clamp only applies when
     /// `output_value` will actually take the YAML branch, i.e.
@@ -6089,13 +6090,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.front_matter.is_none()
         && context.named.is_empty();
 
-    // Indent width/unit for the fast path's streamers. YAML's clamp
-    // (`-I0`/`-I1` both landing on width 2, `--tab` always one tab per
-    // level) is `IndentSpec::for_yaml`'s rule -- shared with
+    // Indent width/unit for the fast path's streamers. YAML's width table
+    // (`0 -> 4`, `1 -> 2`, `2..=9 -> n`, `>= 10 -> 2`; `--tab` always one
+    // tab per level) is `IndentSpec::for_yaml`'s rule -- shared with
     // `OutputConfig::compute_indent_str`'s DOM-path equivalent above,
     // previously an independently hand-encoded copy of the identical
-    // formula (#1685). JSON has no such clamp: `-I0` means compact/flow and
-    // `-I1` genuinely means a literal 1-space step, for both real yq and
+    // formula (#1685, #2606). JSON has no such table: `-I0` means
+    // compact/flow and `-I1` genuinely means a literal 1-space step, for
+    // both real yq and
     // succinctly today (verified live: `-I1 -o=json` indents 1/2/3 spaces
     // per level in real yq, not clamped) -- `--tab` still means one tab per
     // level regardless of format, so `json_indent` threads `args.tab`

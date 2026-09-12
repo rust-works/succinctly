@@ -550,7 +550,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | Flag                  | Description                                   |
 |-----------------------|-----------------------------------------------|
 | `-r, --unwrapScalar`  | Output raw strings without quotes             |
-| `-I, --indent N`      | Indent level (0 for compact JSON; for YAML, 0 means 4 spaces, matching real yq, #2606) |
+| `-I, --indent N`      | Indent level (0 = compact for JSON, 4 spaces for YAML, #2606) |
 | `-o, --output-format` | Output format: `yaml`, `json`, `auto`         |
 | `-i, --inplace`       | Update file in place                          |
 | `-0, --nul-output`    | Use NUL separator instead of newline          |
