@@ -1129,20 +1129,18 @@ fn gather_input_sources(
 /// `echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'`
 /// used to exit 0 with `1`, where real yq rejects it.
 ///
-/// `[,]`/`{,}` remain unchecked only at the *true top level*: the bare
-/// `value: &V` this function's own public entry point receives has no
-/// cursor for the container itself, so once a container's child walk is
-/// exhausted there is no cursor left to find its opening bracket from.
-/// `eval_generic::to_owned_at_depth` had the identical shape, and #2358
-/// closed it there by threading each recursive call's already-resolved
-/// child cursor through as the next level's container cursor -- #2403
-/// applies the same fix here (`to_owned_canonicalizing_numbers_at_depth`'s
-/// own `cursor` parameter below), closing the gap for every *nested*
-/// container the same way.
-fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
-    to_owned_canonicalizing_numbers_at_depth(value, None, 0)
-}
-
+/// `eval_generic::to_owned_at_depth` had the identical shape at every level
+/// before #2358 closed it there by threading each recursive call's
+/// already-resolved child cursor through as the next level's container
+/// cursor; #2403 applied the same fix here for every *nested* container.
+/// #2781 closed the one case #2403 left: the *true top level* was believed
+/// to have no cursor for the container itself to close `[,]`/`{,}` with, but
+/// that premise was false -- `parse_input`'s JSON arm already holds the root
+/// cursor when it calls this function, it simply was not being passed down.
+/// `cursor` below is `None` only for a handful of direct unit-test callers
+/// that intentionally probe this function without a container cursor in
+/// scope; every real call site (`parse_input`, and every recursive call this
+/// function makes for a child) always has one.
 fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
@@ -1391,7 +1389,17 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         InputFormat::Json => {
             let index = JsonIndex::build(bytes);
             let cursor = index.root(bytes);
-            let value = to_owned_canonicalizing_numbers(&cursor.value())
+            // #2781: pass the root cursor through rather than going via the
+            // cursor-less `to_owned_canonicalizing_numbers` wrapper -- the
+            // premise that "there is no cursor for the true top-level
+            // container" was false at this call site all along; the root
+            // cursor is already in hand here, it just was not threaded down.
+            // Without it, `tail_gap_ok` falls back to `child_tail_gap_ok`,
+            // which can only see a last child and so misses a stray `,` in
+            // an empty top-level container (`[,]`/`{,}`) -- every *nested*
+            // level already gets `Some(cursor)` (#2403) and closes the same
+            // gap via `container_tail_gap_ok`.
+            let value = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(vec![value])
         }
@@ -8768,13 +8776,14 @@ mod tests {
         let json = linear_json_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        let owned =
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_json_nest(256);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let result = to_owned_canonicalizing_numbers(&cursor.value());
+        let result = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0);
         assert!(
             result.is_err(),
             "to_owned_canonicalizing_numbers should raise a catchable error at depth 256"
@@ -8792,7 +8801,8 @@ mod tests {
         let json = br#"{"int": 1, "float": 1.50, "exp": 1e2, "neg": -3, "arr": [1.0, 2], "s": "x", "b": true, "n": null}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        let owned =
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap();
         let OwnedValue::Object(map) = owned else {
             panic!("expected an object")
         };
@@ -8843,7 +8853,8 @@ mod tests {
         for json in [br#"{"n": 5.}"#.as_slice(), br#"{"n": .5}"#.as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+            let owned = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
+                .unwrap();
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
@@ -8870,7 +8881,8 @@ mod tests {
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+            let owned = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
+                .unwrap();
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
@@ -8902,7 +8914,7 @@ mod tests {
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            to_owned_canonicalizing_numbers(&cursor.value())
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
                 .expect_err(&format!("{json:?} is not well-formed JSON"));
         }
 
@@ -8910,7 +8922,8 @@ mod tests {
         let json = br#"{"a": 1, "b": 2}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        let owned =
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap();
         assert_eq!(
             owned,
             OwnedValue::Object(IndexMap::from([
@@ -8923,7 +8936,7 @@ mod tests {
         let json = br"[1 2, 3]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        to_owned_canonicalizing_numbers(&cursor.value())
+        to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
             .expect_err("a missing ',' between array elements is not well-formed JSON");
     }
 
@@ -8942,7 +8955,7 @@ mod tests {
         let json = br#"{"a": 1, 123: 2, "b": 3}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        to_owned_canonicalizing_numbers(&cursor.value())
+        to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
             .expect_err("a non-string key is not well-formed JSON");
 
         // A structurally malformed value token (not a decode failure -- a
@@ -8951,7 +8964,7 @@ mod tests {
         let json = br"[xyz123]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        to_owned_canonicalizing_numbers(&cursor.value())
+        to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
             .expect_err("an unclassifiable value token is not well-formed JSON");
     }
 
@@ -8968,16 +8981,17 @@ mod tests {
         for json in [&br"[1,]"[..], &br#"{"a":1,}"#[..]] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            to_owned_canonicalizing_numbers(&cursor.value()).expect_err(&format!(
-                "{json:?}: a trailing comma after a real last child is not JSON"
-            ));
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).expect_err(
+                &format!("{json:?}: a trailing comma after a real last child is not JSON"),
+            );
         }
 
         // Well-formed data is unaffected.
         let json = br#"{"a":1,"b":2}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        let owned =
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap();
         assert_eq!(
             owned,
             OwnedValue::Object(IndexMap::from([
@@ -8989,7 +9003,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         assert_eq!(
-            to_owned_canonicalizing_numbers(&cursor.value()).unwrap(),
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap(),
             OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2),
@@ -8998,27 +9012,52 @@ mod tests {
         );
     }
 
-    /// #2262: unlike the trailing-comma case above, a stray `,` with *zero*
-    /// real children (`[,]`, `{,}`) remains a known, deliberately unclosed
-    /// gap here -- #2211's `container_gap_ok` needs a cursor to the
-    /// *container itself* to find its opening bracket, and this function is
-    /// only ever given a bare `value: &V` (never a cursor for the container,
-    /// unlike `eval_generic::to_owned_cursor_at_depth`'s own `cursor`
-    /// parameter). Once the child walk is exhausted there is nothing left
-    /// to check against. `eval_generic::to_owned_at_depth` had the
-    /// identical value-only shape, but #2358 closed it there by threading
-    /// each recursive call's already-resolved child cursor through as the
-    /// next level's container cursor -- untouched here, out of #2358's own
-    /// scope (tracked as #2403). Pinned rather than left silently
-    /// uncovered.
+    /// #2781: a stray `,` with *zero* real children (`[,]`, `{,}`) at the
+    /// *true top level* now raises, closing the one case #2403 left --
+    /// `parse_input`'s JSON arm always holds the root cursor, it just was
+    /// not being passed through to this function, so `tail_gap_ok` fell back
+    /// to the cursor-less `child_tail_gap_ok`, which can only see a last
+    /// child and so missed an empty container's own stray comma. With the
+    /// root cursor threaded down, `container_tail_gap_ok` closes it exactly
+    /// as it already did for every nested container (#2403). The `{,}` row
+    /// is a deliberate behavior change beyond `[,]`, not a side effect:
+    /// real yq accepts top-level `{,}` (`{}`), but this function's nested
+    /// arm already rejected `{"a":{,}}` before this fix (`{,}` remains
+    /// accepted only at the top level) -- passing the root cursor makes the
+    /// top level consistent with every level below it rather than carving
+    /// out an exception to preserve an accidental agreement with the
+    /// reference. That mapping-grammar divergence is recorded under #2777,
+    /// not reintroduced here as a special case.
     #[test]
-    fn to_owned_canonicalizing_numbers_stray_comma_in_empty_container_remains_a_known_gap_2262() {
+    fn to_owned_canonicalizing_numbers_raises_on_top_level_stray_comma_in_empty_container_2781() {
         for json in [&br"[,]"[..], &br"{,}"[..]] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            if let Err(e) = to_owned_canonicalizing_numbers(&cursor.value()) {
-                panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
-            }
+            let err = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
+                .expect_err("a stray comma in a top-level empty container is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2781 regression guard: a well-formed top-level empty container
+    /// (`[]`, `{}`) -- including with inner whitespace, the shape most
+    /// likely to false-positive against the check above -- is unaffected.
+    #[test]
+    fn to_owned_canonicalizing_numbers_wellformed_top_level_empty_container_unaffected_2781() {
+        for json in [&br"[]"[..], &br"[ ]"[..], &br"{}"[..], &br"{ }"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let owned = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
+                .unwrap_or_else(|e| panic!("{json:?}: expected Ok, got {e:?}"));
+            assert!(
+                matches!(&owned, OwnedValue::Array(v) if v.is_empty())
+                    || matches!(&owned, OwnedValue::Object(m) if m.is_empty()),
+                "{json:?}: expected an empty container, got {owned:?}"
+            );
         }
     }
 
@@ -9038,7 +9077,7 @@ mod tests {
         for json in [&br#"{"a": {,}}"#[..], &br#"{"a": [,]}"#[..]] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = to_owned_canonicalizing_numbers(&cursor.value())
+            let err = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
                 .expect_err("a stray comma in a nested empty container is not JSON");
             assert!(
                 err.message.contains("Invalid JSON text"),
@@ -9058,7 +9097,7 @@ mod tests {
         for json in [&br#"{"a": {"b":1,}}"#[..], &br#"{"a": [1,]}"#[..]] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = to_owned_canonicalizing_numbers(&cursor.value())
+            let err = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0)
                 .expect_err("a stray trailing comma after a real nested child is not JSON");
             assert!(
                 err.message.contains("Invalid JSON text"),
@@ -9089,7 +9128,7 @@ mod tests {
             ("d".to_string(), OwnedValue::Array(vec![])),
         ]));
         assert_eq!(
-            to_owned_canonicalizing_numbers(&cursor.value()).unwrap(),
+            to_owned_canonicalizing_numbers_at_depth(&cursor.value(), Some(&cursor), 0).unwrap(),
             expected
         );
     }

@@ -945,14 +945,25 @@ input), so `[1,]`, `[,1]`, `[1,,2]`, `[,]` and their nested forms error on every
 parses through `YamlIndex` — the plain stdout path this issue was filed about, for every
 filter.
 
-**One shape is still accepted, and it is on the other family of routes**: a *top-level*
-`[,]` (only `[,]` itself — `[[,]]` and `{"a":[,]}` are refused) still passes on
-`--slurp`/`--eval-all`/`--inplace`, which materialize through `JsonIndex`'s DOM bridge
-rather than this parser, and whose check needs a cursor for the outermost container that
-the bridge does not have. `succinctly yq -p json -i '.'` on a file containing `[,]`
-therefore rewrites it to `[]`, where real yq refuses the file and leaves it untouched.
-That route disagreeing with the stdout route is *new* — before #2279 both accepted it —
-and it is tracked as [#2781](https://github.com/rust-works/succinctly/issues/2781).
+**Closed on the other family of routes by [#2781](https://github.com/rust-works/succinctly/issues/2781).**
+A *top-level* `[,]` (only `[,]` itself — `[[,]]` and `{"a":[,]}` were already refused)
+still passed on `--slurp`/`--eval-all`/`--inplace`, which materialize through `JsonIndex`'s
+DOM bridge rather than this parser. The premise that the bridge's check "needs a cursor for
+the outermost container it does not have" was false: `yq_runner.rs`'s `parse_input` already
+holds the root cursor when it builds the initial `OwnedValue`, it simply was not threading it
+down to `to_owned_canonicalizing_numbers_at_depth` — every *nested* container already got its
+own cursor this same way (#2403). Passing the root cursor through closes the top-level gap
+the identical way. `succinctly yq -p json -i '.'` on a file containing `[,]` used to rewrite
+it to `[]`; it now raises and leaves the file untouched, matching real yq's own refusal.
+
+Passing the root cursor also makes the DOM-bridge route's **top-level `{,}`** consistent
+with its own nested rejection — before #2781 the top level accepted `{,}` (agreeing with real
+yq only by construction, since the check simply could not reach it) while `{"a":{,}}` was
+already refused one level down. #2781 chose consistency with the route's own nested behaviour
+over preserving that accidental top-level agreement; the resulting divergence from real yq
+(which does accept top-level and nested `{,}`) is not new to this fix and is recorded with
+the DOM bridge's other flow-mapping delimiter gaps in #2777 below, not carved out as a
+special case here.
 
 Scope is flow **sequence delimiters** only, and never mapping delimiters, because that is
 where real yq (v4.53.3, captured live) actually draws the line — the asymmetry this section
