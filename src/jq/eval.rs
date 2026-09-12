@@ -26613,6 +26613,18 @@ impl Frame {
 /// here directly (#2042 review -- an earlier version listed them too, which
 /// switched the per-stage `Frame::extend` on for `def`-carrying targets
 /// with no binding in them at all).
+///
+/// A fold's own loop-variable pattern (`reduce SOURCE as PATTERN (..)`,
+/// `foreach SOURCE as PATTERN (..)`) is not an `Expr::As`/`AsPattern` node --
+/// `patterns` sits beside `input`/`init`/`update`/`extract`, so
+/// [`any_subexpr`]'s ordinary descent never sees it. #2676: when any
+/// alternative is a destructuring `Pattern::Object`/`Pattern::Array`, jq's
+/// `bind_alternation_matchers` tracks the pattern's own index steps against
+/// SOURCE exactly as a plain `. as PATTERN` bind would (`resolve_reduce`/
+/// `resolve_foreach` walk it that way once this gate lets them). A bare
+/// `Pattern::Var` fold performs no step and stays off this gate -- `at`
+/// remains free for the ordinary write workloads (`.[] |= f`) that use
+/// neither shape.
 fn may_bind_navigated(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(
@@ -26621,6 +26633,10 @@ fn may_bind_navigated(expr: &Expr) -> bool {
                 | Expr::AsPattern { .. }
                 | Expr::FuncCall { .. }
                 | Expr::NamespacedCall { .. }
+        ) || matches!(
+            e,
+            Expr::Reduce { patterns, .. } | Expr::Foreach { patterns, .. }
+                if patterns.iter().any(|p| !matches!(p, Pattern::Var(_)))
         )
     })
 }
@@ -28101,39 +28117,53 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `FoldRegister` for the full model, derived empirically against
         // jq 1.7.1.
         //
-        // The guard is `[Pattern::Var(_)]` — exactly one alternative, and
-        // that alternative a bare `$var` — because everything outside it
-        // is a shape real jq itself refuses in path position, or one this
+        // The guard admits exactly one pattern alternative — either a bare
+        // `$var`, in any mode, or (jq mode only, #2676) a destructuring
+        // `Pattern::Object`/`Pattern::Array` — because everything else is a
+        // shape real jq itself refuses in path position, or one this
         // resolver cannot model:
         //
-        // - **A destructuring pattern** (`as [$i]`, `as {v:$v}`) is refused
-        //   by jq *unconditionally* here, even when it matches cleanly:
-        //   `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises "near
-        //   attempt to access element 0 of [1]", and the object form raises
-        //   the analogous message (both confirmed live against jq 1.7.1),
-        //   while the bare-`$var` spelling of the same fold is `[]`. So
-        //   falling through to `resolve_leaf` for a destructuring pattern
-        //   is jq's own behaviour, not a divergence — matching it here is
-        //   what keeps `resolve_reduce`/`resolve_foreach` from *accepting*
-        //   a fold jq rejects (and, on the write side, mutating a document
-        //   jq leaves untouched). The refusal matches; only the wording
-        //   does not — the catch-all names the whole fold's own value
-        //   rather than the destructuring step jq blames, which is the
-        //   pre-existing `resolve_leaf` message gap, not a new one.
+        // - **A destructuring pattern** (`as [$i]`, `as {v:$v}`) is tracked
+        //   by real jq exactly when the fold's own SOURCE resolves through
+        //   the path register: `path(foreach .b as {c:$x} (.; .; $x))` is
+        //   `["b","c"]`, not a refusal (confirmed live against jq 1.7.1,
+        //   issue #2676) — jq compiles the pattern's own `INDEX` matchers
+        //   the same tracked way `bind_alternation_matchers` compiles a
+        //   plain `. as PATTERN` bind (#2649), and the fold's SOURCE is
+        //   itself tracked whenever it is register-derived. A prior version
+        //   of this guard refused every destructuring fold unconditionally,
+        //   generalising past a test matrix that happened to use only
+        //   non-register sources (`path(. as $x | reduce ([1]) as [$i] (0;
+        //   $x))`, whose SOURCE is the literal `([1])`) — see
+        //   `resolve_reduce`/`resolve_foreach` and `FoldRegister` for how a
+        //   register-derived element's own destructuring is walked
+        //   (`walk_pattern`, shared with #2649), and
+        //   `docs/compliance/jq/limitations.md` for the residual refuse-only
+        //   gap this still leaves (yq mode, and jq mode's own known
+        //   `resolve_leaf`-message-wording gap on an ordinary accumulator
+        //   navigation, both pre-existing and orthogonal to this pattern
+        //   widening).
         //
-        // - **`?//`-alternatives** (`patterns.len() > 1`) are the one case
-        //   where falling through *is* a divergence: real jq still tracks a
-        //   variable through them (confirmed live: `path(. as $x | reduce
-        //   (1) as $y ?// $z (0; $x))` is `[]`). #1365's retry machinery
+        // - **`?//`-alternatives** (`patterns.len() > 1`) still fall
+        //   through: real jq tracks a variable through them too (confirmed
+        //   live: `path(. as $x | reduce (1) as $y ?// $z (0; $x))` is
+        //   `[]`), but #1365's retry machinery
         //   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`,
         //   plus its null-fill for names the matching alternative doesn't
-        //   bind) landed on `main` after this arm was designed and isn't
-        //   threaded through path-tracking, so refusing is the safe answer
-        //   until it is — a refuse-only divergence, never a wrong path,
-        //   documented in `docs/compliance/jq/limitations.md`.
+        //   bind) isn't threaded through path-tracking, so refusing is the
+        //   safe answer until it is — a refuse-only divergence, never a
+        //   wrong path, documented in `docs/compliance/jq/limitations.md`.
         //
-        // Both fallbacks are pinned by
-        // `test_reduce_foreach_path_dispatch_falls_back_1440`.
+        // - **yq mode** stays refuse-only for a destructuring pattern too:
+        //   real yq's lexer rejects `reduce`/`foreach`/`path` outright
+        //   (confirmed live against yq v4.53.3), so there is no oracle to
+        //   widen against, and an un-gated widening would risk turning a
+        //   refusal into a write where real yq no-ops instead (the same
+        //   reasoning `resolve_foreach`'s own `#2161`/`#2632` widenings are
+        //   already gated on `S::TAG == EvalTag::Jq` for).
+        //
+        // Both fallbacks (a `?//` chain, and yq mode's own destructuring
+        // pattern) are pinned by `test_reduce_foreach_path_dispatch_falls_back_1440`.
         //
         // Native to the sink since #2235: each fold emission goes straight
         // downstream, so the terminal `path()` check (`resolve_terminal`)
@@ -28144,40 +28174,45 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             patterns,
             init,
             update,
-        } if matches!(patterns.as_slice(), [Pattern::Var(_)]) => resolve_reduce::<S>(
-            input,
-            &patterns[0],
-            init,
-            update,
-            value,
-            trackable,
-            snapshot,
-            frame,
-            keep,
-            sink,
-        ),
+        } if matches!(patterns.as_slice(), [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq) => {
+            resolve_reduce::<S>(
+                input,
+                &patterns[0],
+                init,
+                update,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            )
+        }
         Expr::Foreach {
             input,
             patterns,
             init,
             update,
             extract,
-        } if matches!(patterns.as_slice(), [Pattern::Var(_)]) => resolve_foreach::<S>(
-            input,
-            &patterns[0],
-            init,
-            update,
-            extract.as_deref(),
-            value,
-            trackable,
-            snapshot,
-            frame,
-            keep,
-            sink,
-        ),
-        // A destructuring pattern or a `?//`-alternatives list falls back
-        // to the ordinary eager evaluator for both fold kinds alike — see
-        // the guarded arms' own doc comment above `Expr::Reduce` for why.
+        } if matches!(patterns.as_slice(), [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq) => {
+            resolve_foreach::<S>(
+                input,
+                &patterns[0],
+                init,
+                update,
+                extract.as_deref(),
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            )
+        }
+        // A `?//`-alternatives list (either fold kind), or a destructuring
+        // pattern in yq mode, falls back to the ordinary eager evaluator —
+        // see the guarded arms' own doc comment above `Expr::Reduce` for
+        // why.
         Expr::Reduce { .. } | Expr::Foreach { .. } => drain_path_result(
             resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
             sink,
@@ -30844,23 +30879,8 @@ fn bind_pattern_body(
         }
         Pattern::Object(_) | Pattern::Array(_) => {
             let bindings = dedup_pattern_bindings(pattern, bindings, invert_dedup);
-            let mut substituted = body.clone();
-            for binding in &bindings {
-                bound_names.push(binding.name.clone());
-                substituted = match &binding.origin {
-                    Some(origin) => {
-                        let marker = LazyMarker::new(&binding.value, origin.clone(), None);
-                        substitute_var_impl(
-                            &substituted,
-                            &binding.name,
-                            &binding.value,
-                            Some(&marker),
-                        )
-                    }
-                    None => substitute_var(&substituted, &binding.name, &binding.value),
-                };
-            }
-            substituted
+            bound_names.extend(bindings.iter().map(|b| b.name.clone()));
+            apply_pattern_bindings(body, &bindings)
         }
     };
     let null_value = OwnedValue::Null;
@@ -30868,6 +30888,26 @@ fn bind_pattern_body(
         if !bound_names.iter().any(|n| n == name) {
             substituted = substitute_var(&substituted, name, &null_value);
         }
+    }
+    substituted
+}
+
+/// Splice a walk's own bindings (already deduplicated) into `expr`, one
+/// [`PatternBinding`] at a time -- the substitution half of
+/// [`bind_pattern_body`]'s `Object`/`Array` arm, factored out so
+/// [`resolve_foreach`]'s own destructuring case (#2676) shares it rather
+/// than re-deriving the same `LazyMarker`/`substitute_var_impl` splice a
+/// second time.
+fn apply_pattern_bindings(expr: &Expr, bindings: &[PatternBinding]) -> Expr {
+    let mut substituted = expr.clone();
+    for binding in bindings {
+        substituted = match &binding.origin {
+            Some(origin) => {
+                let marker = LazyMarker::new(&binding.value, origin.clone(), None);
+                substitute_var_impl(&substituted, &binding.name, &binding.value, Some(&marker))
+            }
+            None => substitute_var(&substituted, &binding.name, &binding.value),
+        };
     }
     substituted
 }
@@ -31381,8 +31421,52 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // frozen value must be told apart from a coincidentally-equal
             // computed one, exactly the distinction `PathBranch::snapshot`
             // already exists to carry).
+            // #2676: a destructuring pattern's own steps are checked
+            // against `value_at_path` regardless of whether any bound `$var`
+            // is ever referenced downstream — confirmed live against jq
+            // 1.7.1: `path(. as $x | reduce ([1]) as [$i] (0; $x))` refuses
+            // ("near attempt to access element 0 of [1]") even though `$i`
+            // goes unused in UPDATE (`$x`, a *different*, outer-bound var).
+            // `walk_pattern` (#2649) reproduces that refusal, seeded the
+            // same two ways `resolve_foreach`'s own walk is (its own doc
+            // comment has the full derivation, including the `null`/`bool`
+            // coincidence rule for a non-register-derived element).
+            //
+            // Once the walk clears, the bound values are substituted
+            // *untracked*, unconditionally — `reduce` (unlike `foreach`)
+            // never seeds a per-step register from `elem.register_path`, so
+            // a bound `$var` is only ever recognised when it happens to be
+            // `register_identical` to `reg` (the fold's own, INIT-seeded,
+            // persistent register) — exactly the same test a bare `$var`
+            // bound from a register-derived element already fails whenever
+            // its value differs from `reg`'s own (confirmed live:
+            // `path(reduce .b as $x (.; $x))` refuses on `{"a":..,"b":..}`
+            // the same way `path(reduce .b as {c:$x} (.; $x))` does — see
+            // `resolve_node_sink`'s dispatch arm doc comment). Marking a
+            // destructured binding `Expr::TrackedVar` here would cost
+            // nothing beyond what this same structural check already
+            // refuses, so the plain, untracked substitution stays the
+            // simpler, equally-correct choice.
+            if matches!(pattern, Pattern::Object(_) | Pattern::Array(_)) {
+                let seed = match &elem.register_path {
+                    Some(path) => PatternRegister {
+                        path: Rc::clone(path),
+                        value: elem.value.clone(),
+                        is_input: true,
+                    },
+                    None => PatternRegister {
+                        path: Rc::clone(&reg.path),
+                        value: reg.value.clone(),
+                        is_input: false,
+                    },
+                };
+                let mut bindings = Vec::new();
+                if let Err(e) = walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
+                    return stop_with_escape(&mut aborted, Control::Error(e));
+                }
+            }
             let substituted = match extract_pattern_bindings(pattern, &elem.value, false) {
-                Ok(b) if elem.register_path.is_some() => {
+                Ok(b) if elem.register_path.is_some() && matches!(pattern, Pattern::Var(_)) => {
                     substitute_var_tracked(update, &b[0].0, &b[0].1)
                 }
                 Ok(b) => substitute_vars(update, as_var_refs(&b)),
@@ -31628,7 +31712,69 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // unreachable-in-practice (#1369). #2031: a trackable element's
             // `$var` is substituted as `Expr::TrackedVar` (into both), the
             // same reasoning as `resolve_reduce`'s own substitution.
-            let (substituted_update, substituted_extract) =
+            // #2676: a destructuring pattern is walked the same way a plain
+            // `. as PATTERN` bind is (#2649's `walk_pattern`) — jq's own
+            // compiled matcher performs real, tracked `INDEX` steps here
+            // too, checked against whatever `value_at_path` currently is,
+            // exactly as `walk_pattern_step`'s own `path_intact` rule
+            // already models. Seeded two ways depending on whether *this*
+            // source element is itself register-derived:
+            //
+            // - `elem.register_path.is_some()`: the element's own position
+            //   is the register (confirmed live: `path(foreach .b as
+            //   {c:$x} (.; .; $x))` is `["b","c"]`, not a refusal).
+            // - `None` (a computed element -- a literal source, or one whose
+            //   own navigation was untracked): jq's register is untouched by
+            //   this element, so path_intact is checked against wherever it
+            //   already was — the fold's own persistent `reg` (mirroring the
+            //   bare-`$var` `None` arm below) — which only ever admits the
+            //   walk through `walk_pattern_step`'s `null`/`bool` identity
+            //   exception, never through `reg.value == elem.value` (a
+            //   structural coincidence, not a real `jv_identical`). Confirmed
+            //   live: `path(foreach (null) as {a:$x} (.; .; $x))` is `["a"]`
+            //   on a `null` document (the ambient register is `null` too),
+            //   but `path(foreach (5) as {a:$x} (.; .; $x))` refuses on any
+            //   document ("near attempt to access element \"a\" of 5") even
+            //   though `$x` goes unused, and `path(foreach (null) as {a:$x}
+            //   (.; .; $x))` *also* refuses once the ambient document isn't
+            //   itself `null`/a bool.
+            //
+            // The walk's own final position becomes this step's active
+            // register below, replacing the naive whole-element `step_reg`
+            // the bare-`$var` arm still uses — see `resolve_node_sink`'s
+            // dispatch arm for why this is jq mode only. A refusal from the
+            // walk (jq's own "near attempt to access" wording, e.g.
+            // `path(foreach .a as [$x,$y] (.; .; $x))` on `{"a":[1,2,3]}`)
+            // is this step's own escape, exactly like any other
+            // UPDATE/EXTRACT failure.
+            let walked = match pattern {
+                Pattern::Object(_) | Pattern::Array(_) => {
+                    let seed = match &elem.register_path {
+                        Some(path) => PatternRegister {
+                            path: Rc::clone(path),
+                            value: elem.value.clone(),
+                            is_input: true,
+                        },
+                        None => PatternRegister {
+                            path: Rc::clone(&reg.path),
+                            value: reg.value.clone(),
+                            is_input: false,
+                        },
+                    };
+                    let mut bindings = Vec::new();
+                    match walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
+                        Ok(w) => Some((w, dedup_pattern_bindings(pattern, bindings, false))),
+                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                    }
+                }
+                Pattern::Var(_) => None,
+            };
+            let (substituted_update, substituted_extract) = if let Some((_, bindings)) = &walked {
+                (
+                    apply_pattern_bindings(update, bindings),
+                    extract.map(|ext| apply_pattern_bindings(ext, bindings)),
+                )
+            } else {
                 match extract_pattern_bindings(pattern, &elem.value, false) {
                     Ok(b) if elem.register_path.is_some() => (
                         substitute_var_tracked(update, &b[0].0, &b[0].1),
@@ -31639,99 +31785,117 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
                     ),
                     Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
-                };
+                }
+            };
             // #2031: see `resolve_reduce`'s identical per-step register
             // override.
-            let (active_reg, active_at_register) = match &elem.register_path {
-                Some(path) => {
-                    let step_reg = FoldRegister {
-                        path: Rc::clone(path),
-                        value: elem.value.clone(),
-                        trackable: true,
-                        frame: frame.extend(path),
-                    };
-                    let at_register = register_identical(
-                        &step_reg.value,
-                        &step_reg.frame,
-                        &state,
-                        &state_snapshot,
-                    );
-                    (step_reg, at_register)
+            let (active_reg, active_at_register) = if let Some((walked_reg, _)) = &walked {
+                let step_reg = FoldRegister {
+                    path: Rc::clone(&walked_reg.path),
+                    value: walked_reg.value.clone(),
+                    trackable: walked_reg.is_input,
+                    frame: frame.extend(&walked_reg.path),
+                };
+                let at_register =
+                    register_identical(&step_reg.value, &step_reg.frame, &state, &state_snapshot);
+                (step_reg, at_register)
+            } else {
+                match &elem.register_path {
+                    Some(path) => {
+                        let step_reg = FoldRegister {
+                            path: Rc::clone(path),
+                            value: elem.value.clone(),
+                            trackable: true,
+                            frame: frame.extend(path),
+                        };
+                        let at_register = register_identical(
+                            &step_reg.value,
+                            &step_reg.frame,
+                            &state,
+                            &state_snapshot,
+                        );
+                        (step_reg, at_register)
+                    }
+                    // #2161: `state_at_register` cannot come from the previous
+                    // step's `branch_provenance`, which answers "did the last
+                    // UPDATE branch end *at* the register's own path". The
+                    // register is fixed for the whole fold and UPDATE almost
+                    // always navigates away from it, so that answer is `false`
+                    // from step 2 onward and every later step refuses its own
+                    // navigation as untracked -- even though real jq re-enters
+                    // each step from the register, not from the previous step's
+                    // result.
+                    //
+                    // The register's own doc comment already states the model
+                    // ("fixed once per INIT fork -- never advances across
+                    // source-element iterations"): what decides a step is jq's
+                    // `jv_identical(current_input, value_at_path)`, i.e. whether
+                    // the accumulator coming into this step is still the
+                    // register's own value. That is exactly the check the
+                    // `Some(path)` arm above already performs via
+                    // `register_identical`, and it is the missing *second* way
+                    // a step can be at the register.
+                    //
+                    // It has to be an `||` rather than a replacement, because
+                    // neither answer subsumes the other. `register_identical`
+                    // demands `snapshot || Null | Bool` -- structural equality
+                    // is not jq's pointer identity, so a container counts only
+                    // when it is known to be the frozen node itself. So it
+                    // answers `false` for step 1 of an object-valued register,
+                    // where the carried `init_branch.trackable` is the correct
+                    // `true`; and the carried provenance answers `false` from
+                    // step 2 onward, where the identity check is the correct
+                    // `true` for a `null`/`bool` accumulator. Dropping either
+                    // half regresses one of the two shapes below.
+                    //
+                    // **jq mode only**, for exactly the reason
+                    // [`trackable_step_register_eligible`] gates its own
+                    // re-establishment the same way: the new half turns a step
+                    // that would have refused into one that navigates, and on
+                    // the *write* side that is a write where yq no-ops. Live
+                    // against yq v4.53.3, `(null | .a) = 5` on `null` is a
+                    // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
+                    // `a: 5` would be exactly the silent corruption that gate's
+                    // doc comment calls "a worse outcome than the refusal it
+                    // would replace". yq mode therefore stays refuse-only here,
+                    // as it already is for the single-step and carried-forward
+                    // shapes. The carried half is left ungated: it is the
+                    // pre-existing behaviour, not something this change
+                    // introduces.
+                    //
+                    // Live against jq 1.7.1, on `{"a":1}`:
+                    //
+                    // ```console
+                    // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
+                    // ["b","a"]
+                    // ["b","a"]
+                    // ["b","a"]
+                    // ```
+                    //
+                    // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
+                    // `["b","a"]` once and then raises "attempt to access
+                    // element \"a\" of {\"a\":9}" -- the accumulator has stopped
+                    // being the register's value, so step 2 is genuinely
+                    // untracked. Both fall out of the identity check; neither
+                    // falls out of the path comparison.
+                    None => (
+                        FoldRegister {
+                            path: Rc::clone(&reg.path),
+                            value: reg.value.clone(),
+                            trackable: reg.trackable,
+                            frame: reg.frame.clone(),
+                        },
+                        state_at_register
+                            || (S::TAG == EvalTag::Jq
+                                && reg.trackable
+                                && register_identical(
+                                    &reg.value,
+                                    &reg.frame,
+                                    &state,
+                                    &state_snapshot,
+                                )),
+                    ),
                 }
-                // #2161: `state_at_register` cannot come from the previous
-                // step's `branch_provenance`, which answers "did the last
-                // UPDATE branch end *at* the register's own path". The
-                // register is fixed for the whole fold and UPDATE almost
-                // always navigates away from it, so that answer is `false`
-                // from step 2 onward and every later step refuses its own
-                // navigation as untracked -- even though real jq re-enters
-                // each step from the register, not from the previous step's
-                // result.
-                //
-                // The register's own doc comment already states the model
-                // ("fixed once per INIT fork -- never advances across
-                // source-element iterations"): what decides a step is jq's
-                // `jv_identical(current_input, value_at_path)`, i.e. whether
-                // the accumulator coming into this step is still the
-                // register's own value. That is exactly the check the
-                // `Some(path)` arm above already performs via
-                // `register_identical`, and it is the missing *second* way
-                // a step can be at the register.
-                //
-                // It has to be an `||` rather than a replacement, because
-                // neither answer subsumes the other. `register_identical`
-                // demands `snapshot || Null | Bool` -- structural equality
-                // is not jq's pointer identity, so a container counts only
-                // when it is known to be the frozen node itself. So it
-                // answers `false` for step 1 of an object-valued register,
-                // where the carried `init_branch.trackable` is the correct
-                // `true`; and the carried provenance answers `false` from
-                // step 2 onward, where the identity check is the correct
-                // `true` for a `null`/`bool` accumulator. Dropping either
-                // half regresses one of the two shapes below.
-                //
-                // **jq mode only**, for exactly the reason
-                // [`trackable_step_register_eligible`] gates its own
-                // re-establishment the same way: the new half turns a step
-                // that would have refused into one that navigates, and on
-                // the *write* side that is a write where yq no-ops. Live
-                // against yq v4.53.3, `(null | .a) = 5` on `null` is a
-                // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
-                // `a: 5` would be exactly the silent corruption that gate's
-                // doc comment calls "a worse outcome than the refusal it
-                // would replace". yq mode therefore stays refuse-only here,
-                // as it already is for the single-step and carried-forward
-                // shapes. The carried half is left ungated: it is the
-                // pre-existing behaviour, not something this change
-                // introduces.
-                //
-                // Live against jq 1.7.1, on `{"a":1}`:
-                //
-                // ```console
-                // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
-                // ["b","a"]
-                // ["b","a"]
-                // ["b","a"]
-                // ```
-                //
-                // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
-                // `["b","a"]` once and then raises "attempt to access
-                // element \"a\" of {\"a\":9}" -- the accumulator has stopped
-                // being the register's value, so step 2 is genuinely
-                // untracked. Both fall out of the identity check; neither
-                // falls out of the path comparison.
-                None => (
-                    FoldRegister {
-                        path: Rc::clone(&reg.path),
-                        value: reg.value.clone(),
-                        trackable: reg.trackable,
-                        frame: reg.frame.clone(),
-                    },
-                    state_at_register
-                        || (S::TAG == EvalTag::Jq
-                            && reg.trackable
-                            && register_identical(&reg.value, &reg.frame, &state, &state_snapshot)),
-                ),
             };
             let update_branches = match active_reg.resolve::<S>(
                 &substituted_update,
@@ -87883,28 +88047,27 @@ mod tests {
         assert!(foreach_paths.iter().all(|p| p == r"[]"));
     }
 
-    /// `resolve_node`'s fold dispatch admits exactly `[Pattern::Var(_)]`;
-    /// this pins both of its fallbacks, which have opposite reasons for
-    /// existing and would otherwise be silently re-routed into
-    /// `resolve_reduce`/`resolve_foreach` by a future widening.
+    /// `resolve_node`'s fold dispatch admits a single pattern alternative --
+    /// a bare `$var` in any mode, or (jq mode only, since #2676) a
+    /// destructuring `Pattern::Object`/`Pattern::Array` too. This pins what
+    /// still falls back to `resolve_leaf`'s catch-all, which would
+    /// otherwise be silently re-routed into `resolve_reduce`/
+    /// `resolve_foreach` by a future widening.
     ///
-    /// **A destructuring pattern falls back, which matches jq only while
-    /// the fold's source is not the register.** Confirmed live against jq
-    /// 1.7.1: `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises
-    /// "Invalid path expression near attempt to access element 0 of [1]"
-    /// and the object form raises the analogous message -- the pattern's
-    /// own tracked index step compares its input against the register,
-    /// and a constructed `[1]` is not it. With a register-derived source
-    /// jq *answers* (`path(foreach .b as {c:$x} (.; .; $x))` on
-    /// `{"b":{"c":5}}` is `["b","c"]`, the step having moved the register),
-    /// so the fall-back is a refuse-only divergence there, tracked as
-    /// #2676. Widening the guard without performing the pattern's register
-    /// step (the `walk_pattern` model #2649 gave `Expr::AsPattern`) would
-    /// accept the `([1])` shape jq rejects and, on the write side, mutate a
-    /// document jq leaves untouched -- which is why the guard stays until
-    /// #2676 lands. Only the refusal is asserted, not the message: the
-    /// catch-all says "Invalid path expression with result ..." where jq
-    /// says "near attempt to access ...", a pre-existing `resolve_leaf`
+    /// **A destructuring pattern whose SOURCE is not register-derived still
+    /// refuses**, because the pattern's own tracked index step compares its
+    /// input against `value_at_path`, and a constructed `[1]` is never it
+    /// (confirmed live against jq 1.7.1: `path(. as $x | reduce ([1]) as
+    /// [$i] (0; $x))` raises "near attempt to access element 0 of [1]" even
+    /// though `$i` goes unused in UPDATE (`$x`, a *different*, outer-bound
+    /// var) -- the refusal is about the pattern's own step, not about
+    /// whether any bound name is read downstream). With a register-derived
+    /// source jq *answers* instead (`path(foreach .b as {c:$x} (.; .; $x))`
+    /// on `{"b":{"c":5}}` is `["b","c"]`, the step having moved the
+    /// register) -- see `test_fold_pattern_destructuring_tracks_register_2676`
+    /// for that side. Only the refusal is asserted here, not the message:
+    /// the catch-all says "Invalid path expression with result ..." where
+    /// jq says "near attempt to access ...", a pre-existing `resolve_leaf`
     /// wording gap.
     ///
     /// **`?//`-alternatives fall back despite jq accepting them** — the one
@@ -87932,7 +88095,8 @@ mod tests {
             }
         };
 
-        // Destructuring patterns: refuse, matching jq.
+        // Destructuring patterns on a non-register-derived source: refuse,
+        // matching jq (#2676's residual gap -- see the doc comment above).
         refuses("path(. as $x | reduce ([1]) as [$i] (0; $x))");
         // Spaces after the object-pattern colons are cosmetic to jq (the
         // spaced and unspaced spellings raise identically there) but keep
@@ -87945,6 +88109,11 @@ mod tests {
         // `?//` alternatives: refuse (jq accepts -- documented divergence).
         refuses("path(. as $x | reduce (1) as $y ?// $z (0; $x))");
         refuses("path(. as $x | foreach (1) as $y ?// $z (0; $x))");
+        // A destructuring alternative inside a `?//` chain refuses too --
+        // `patterns.len() > 1` never reaches the walk regardless of pattern
+        // shape.
+        refuses("path(. as $x | reduce (1) as {v: $y} ?// $z (0; $x))");
+        refuses("path(. as $x | foreach (1) as {v: $y} ?// $z (0; $x))");
 
         // The admitted shape still works, so the guard didn't over-narrow.
         assert_eq!(
@@ -87958,6 +88127,161 @@ mod tests {
             ),
             [r#"["a"]"#]
         );
+    }
+
+    /// #2676: a fold's own destructuring pattern is tracked exactly the way
+    /// a plain `. as PATTERN` bind is (#2649's `walk_pattern`), whenever the
+    /// fold's SOURCE resolves through the path register. Every row here is
+    /// confirmed live against jq 1.7.1 (the issue's own repro, plus the
+    /// follow-up probes that pinned the `None`-register seeding rule).
+    #[test]
+    fn test_fold_pattern_destructuring_tracks_register_2676() {
+        let doc: &[u8] = br#"{"a":[1,2,3],"b":{"c":5}}"#;
+
+        // Accepted: the pattern's own step(s) move the register.
+        assert_eq!(
+            outputs(doc, "path(foreach .b as {c:$x} (.; .; $x))"),
+            [r#"["b","c"]"#]
+        );
+        assert_eq!(
+            outputs(doc, "path(foreach .a as [$x] (.; .; $x))"),
+            [r#"["a",0]"#]
+        );
+        assert_eq!(outputs(doc, "path(reduce .b as {c:$x} (.; .))"), [r"[]"]);
+        assert_eq!(
+            outputs(
+                br#"{"p":{"q":{"r":42}}}"#,
+                "path(foreach .p as {q:{r:$v}} (.; .; $v))"
+            ),
+            [r#"["p","q","r"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"x":[{"c":1},{"c":2}]}"#,
+                "path(foreach .x[] as {c:$v} (.; .; $v))"
+            ),
+            [r#"["x",0,"c"]"#, r#"["x",1,"c"]"#]
+        );
+
+        // Refused: real jq's own array-pattern matcher walks in *reverse*
+        // index order, so a second element's own step runs first and moves
+        // the register off the array node -- the first element's step then
+        // fails `path_intact` (#2649's `walk_pattern` doc comment has the
+        // full derivation; this is the same rule, one level up).
+        let refuses = |src: &str, want: &str| {
+            let expr = parse(src).unwrap();
+            let index = JsonIndex::build(doc);
+            match eval::<Vec<u64>, JqSemantics>(&expr, index.root(doc)) {
+                QueryResult::Error(e) => assert_eq!(e.message, want, "{src}"),
+                other => panic!("{src}: expected a refusal, got {other:?}"),
+            }
+        };
+        refuses(
+            "path(foreach .a as [$x,$y] (.; .; $x))",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+        );
+        // A genuine navigation on the *accumulator* still refuses exactly
+        // as it does for a bare `$var` pattern (a pre-existing,
+        // orthogonal divergence in the refusal's wording, not its verdict
+        // -- `resolve_leaf`'s catch-all names the whole fold's value where
+        // jq names the destructuring step).
+        match eval::<Vec<u64>, JqSemantics>(
+            &parse("path(reduce .b as {c:$x} (.; .b))").unwrap(),
+            JsonIndex::build(doc).root(doc),
+        ) {
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.starts_with("Invalid path expression"),
+                    "{}",
+                    e.message
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // A `null`/`bool`-valued fold register still lets a *computed*
+        // (non-register-derived) source element's own destructuring step
+        // through, mirroring `walk_pattern_step`'s `null_bool_identical`
+        // exception -- confirmed live: `path(foreach (null) as {a:$x} (.;
+        // .; $x))` on a `null` document is `["a"]`.
+        assert_eq!(
+            outputs(b"null", "path(foreach (null) as {a:$x} (.; .; $x))"),
+            [r#"["a"]"#]
+        );
+        // ...but not when the ambient register isn't itself null/bool, even
+        // though the source element is: `path(foreach (null) as {a:$x} (.;
+        // .; $x))` on `{}` refuses (the coincidence needs the *register*'s
+        // own value, not just the element's, to be null/bool).
+        match eval::<Vec<u64>, JqSemantics>(
+            &parse("path(foreach (null) as {a:$x} (.; .; $x))").unwrap(),
+            JsonIndex::build(br#"{}"#).root(br#"{}"#),
+        ) {
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.starts_with("Invalid path expression"),
+                    "{}",
+                    e.message
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        // Write side: `|=`, `del()` route through the same tracked path.
+        query!(
+            doc,
+            "(foreach .b as {c:$x} (.; .; $x)) |= .+1",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":[1,2,3],"b":{"c":6}}"#);
+            }
+        );
+        query!(
+            doc,
+            "del(foreach .b as {c:$x} (.; .; $x))",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":[1,2,3],"b":{}}"#);
+            }
+        );
+
+        // yq mode's dispatch guard stays `[Pattern::Var(_)]`-only (#2676's
+        // widening is jq-mode-only): a destructuring fold pattern falls
+        // through to the exact same `resolve_leaf` catch-all under
+        // `YqSemantics` whether or not the source is register-derived,
+        // matching the bare-`$var` spelling's own (unrelated, pre-existing)
+        // yq-mode result byte-for-byte -- there is no separate widening
+        // path here for the guard to have accidentally taken.
+        let yq_result = |src: &str| {
+            format!(
+                "{:?}",
+                eval::<Vec<u64>, YqSemantics>(
+                    &parse(src).unwrap(),
+                    JsonIndex::build(doc).root(doc)
+                )
+            )
+        };
+        assert_eq!(
+            yq_result("path(foreach .b as {c:$x} (.; .; $x))"),
+            yq_result("path(foreach .b as $x (.; .; $x))"),
+        );
+    }
+
+    /// #2676 step 1: `may_bind_navigated`'s syntactic gate widens to admit a
+    /// fold's own destructuring pattern, but not a bare `$var` one -- the
+    /// bare spelling performs no index step of its own, so `at` stays free
+    /// for it exactly as before.
+    #[test]
+    fn test_frame_enter_gate_widens_only_for_destructuring_fold_patterns_2676() {
+        let gated = |filter: &str| Frame::enter(&parse(filter).unwrap()).at.is_some();
+
+        assert!(gated("path(foreach .b as {c:$x} (.; .; $x))"));
+        assert!(gated("path(reduce .b as {c:$x} (.; .))"));
+        assert!(gated("path(foreach .a as [$x] (.; .; $x))"));
+        assert!(!gated("path(foreach .b as $x (.; .; $x))"));
+        assert!(!gated("path(reduce .b as $x (.; .))"));
+        // A `?//` chain with a destructuring alternative also gates -- the
+        // widening is keyed on *any* alternative being a destructuring
+        // pattern, not on the guard `resolve_node_sink` later applies to
+        // `patterns.len()`.
+        assert!(gated("path(reduce .b as {c:$x} ?// $z (0; $x))"));
     }
 
     // =========================================================================
