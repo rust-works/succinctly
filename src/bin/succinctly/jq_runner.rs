@@ -2011,11 +2011,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // rather than before the caller's loop starts. That puts
                 // `out`, `sink`, `had_output` and `last_output` under
                 // `AssertUnwindSafe`, which stays sound: `write_output_jq_value`
-                // below can still panic on other, unrelated guards this
-                // closure doesn't control (e.g. a genuine stack-depth guard
-                // elsewhere in the write path), so `out`'s writer is not
-                // mid-record when *those* unwind either, and the other three
-                // are plain data regardless.
+                // below is panic-free for depth as of #2850 (`try_materialize`,
+                // not the panicking `materialize`), but `evaluate_bytes_streaming`
+                // above it is not -- `to_owned_cursor_at_depth`'s own panic
+                // (sort/join, described just above) and `eval_generic.rs`'s
+                // path-tracking `assert_nesting_depth` calls (`path()`/
+                // `setpath`/`del()`/assignment operators on deep input) both
+                // still reach the panicking guard during *evaluation*, ahead
+                // of this closure's write. `out`'s writer is not mid-record
+                // when either unwinds, and the other three are plain data
+                // regardless.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut on_value =
                         |sink: &mut ErrorSink, result: JqValue<'_, Vec<u64>>| -> Result<bool> {

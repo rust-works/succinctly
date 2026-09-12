@@ -2492,12 +2492,29 @@ flag that forces whole-batch materialization up front (`--slurp`, `-S`/`--sort-k
 (`check_nesting_depth`, `src/jq/eval_generic.rs`) rather than `catch_unwind`, since that
 walk already threads a `Result` and runs before any user filter evaluates at all.
 
-Still uncaught, tracked separately, not fixed by either #1793 or #1818: `-e`/
-`--exit-status`'s own separate materializer (`src/jq/lazy.rs`, already pinned uncaught by
-`test_exit_status_query_rejects_adversarial_nesting_998`); and `succinctly yq`, which has
-no equivalent guard on either its default or materializing path at all (#1817). Confirmed
-live, also pre-existing and unrelated to either fix: `print_json`'s own guard can flush
-corrupted/truncated JSON to stdout before it fires (#1819).
+**Closed by [#2850](https://github.com/rust-works/succinctly/issues/2850).** `-e`/
+`--exit-status`'s own separate materializer (`src/jq/lazy.rs`) now reports a clean, catchable
+diagnostic instead of panicking, via a new checked twin (`JqValue::try_materialize`) rather
+than the panicking `materialize` #1818 above left untouched. `test_exit_status_query_rejects_
+adversarial_nesting_998` (`tests/jq_cli_tests.rs`) is unaffected and stays green either way --
+it exercises `-e -c .[0]`, a shape #1793's own `catch_unwind` already reported cleanly before
+#2850 (only the exit code and message were pinned, not the absence of leaked panic text).
+`test_exit_status_over_depth_document_reports_cleanly_not_panic_2850` is a new, separate test
+that does assert `!stderr.contains("panicked")` -- the specific property this issue fixes.
+
+That same fix also closes a gap #2662 (unrelated to #2850, landed independently) opened in
+`-S`/`-C`/`--ascii-output`'s own #1818 protection above: moving those three flags onto the
+lazy/`JqValue::Cursor` dispatch bypasses `validate_json_delimiters`'s earlier checked guard,
+the one #1818 actually credited for closing their gap — reaching `write_output_jq_value`'s own
+materialize call directly, the identical panicking route `-e` always took. #2850's
+`try_materialize` closes that call site too, so the net effect across both issues landing
+together is unchanged from #1818's original guarantee: `-S`/`-a`/`-C` still cannot panic on
+over-deep input, now via a different, more direct mechanism than the one #2662 stepped past.
+
+`succinctly yq` still has no equivalent guard on either its default or materializing path at
+all (#1817) — untouched by #2850, which is jq-mode only. Confirmed live, also pre-existing and
+unrelated to any of #1793/#1818/#2850: `print_json`'s own guard can flush corrupted/truncated
+JSON to stdout before it fires (#1819).
 
 [#2692](https://github.com/rust-works/succinctly/issues/2692) widens the "accepts at
 parse/index time" story above to more filters, by the same mechanism as `.[1]`/`length`:

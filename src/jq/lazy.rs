@@ -497,6 +497,13 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// `Err` when a string scalar in the tree cannot be decoded (#1247) --
     /// it used to materialize as an empty string, silently replacing the
     /// value with something that compares, sorts and prints as real data.
+    ///
+    /// # Panics
+    ///
+    /// Past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// levels of nesting (#1021) -- deliberate for a library caller that
+    /// treats over-deep nesting as a bug. Use [`try_materialize`](Self::try_materialize)
+    /// instead for untrusted-depth input at a CLI-output boundary (#2850).
     pub fn materialize(&self) -> Result<OwnedValue, EvalError> {
         self.materialize_at_depth(0)
     }
@@ -567,11 +574,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     }
 
     fn try_materialize_at_depth(&self, depth: usize) -> Result<OwnedValue, EvalError> {
-        if depth >= super::value::MAX_VALUE_TREE_DEPTH {
-            return Err(EvalError::new(
-                super::value::nesting_depth_exceeded_message(super::value::MAX_VALUE_TREE_DEPTH),
-            ));
-        }
+        super::value::check_value_tree_depth(depth)?;
         Ok(match self {
             JqValue::Cursor(c) => try_cursor_to_owned(c)?,
             JqValue::Null => OwnedValue::Null,

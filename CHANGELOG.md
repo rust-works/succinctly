@@ -129,21 +129,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`succinctly jq -e`, and `-S`/`-a`/`-C`, no longer leak a raw Rust panic
   backtrace to stderr on deeply-nested input** (#2850). The exit code (5) and
-  final diagnostic (`nesting depth exceeds limit of N`) were always correct;
-  only extraneous `thread '<unnamed>' panicked at ...` noise ahead of them
-  was the bug. `-e`'s own exit-status materialize call in `jq_runner.rs`
-  used the panicking `JqValue::materialize()` at a CLI-output boundary
-  rather than the evaluator's own hot recursion, where a panic stays
-  deliberate (#1818's established split). `write_output_jq_value`'s own
-  materialize call (`-S`/`-a`/`-C`) shared the identical risk, confirmed live
-  after #2662 moved those three flags onto the same lazy/`JqValue::Cursor`
-  route `-e` already used. Both now use a new checked twin,
-  `JqValue::try_materialize`, added alongside the panicking original rather
-  than replacing it -- library callers that already treat over-deep nesting
-  as a bug keep that contract unchanged, and `try_materialize` preserves the
-  original's raw JSON number spelling exactly
-  (`OwnedValue::from_number_bytes`, not a canonicalizing reformat), so
-  `--preserve-input` semantics are unaffected.
+  final diagnostic (`nesting depth exceeds limit of N`) were always correct
+  for a *single-result* document; only extraneous
+  `thread '<unnamed>' panicked at ...` noise ahead of them was the bug there.
+  `-e`'s own exit-status materialize call in `jq_runner.rs` used the
+  panicking `JqValue::materialize()` at a CLI-output boundary rather than the
+  evaluator's own hot recursion, where a panic stays deliberate (#1818's
+  established split). `write_output_jq_value`'s own materialize call
+  (`-S`/`-a`/`-C`) shared the identical risk, confirmed live after #2662
+  moved those three flags onto the same lazy/`JqValue::Cursor` route `-e`
+  already used. Both now use a new checked twin, `JqValue::try_materialize`,
+  added alongside the panicking original rather than replacing it -- library
+  callers that already treat over-deep nesting as a bug keep that contract
+  unchanged, and `try_materialize` preserves the original's raw JSON number
+  spelling exactly (`OwnedValue::from_number_bytes`, not a canonicalizing
+  reformat), so `--preserve-input` semantics are unaffected.
+
+  **For `-e` specifically, a multi-result filter's output also changes**
+  (`.[]` over a document with one over-deep element among well-formed
+  siblings): the old panic unwound through the whole per-document
+  `catch_unwind`, silently dropping every remaining sibling result for that
+  document; the new `Err` is caught by this call site's own existing
+  `sink.report(...)` + continue path -- the identical one a decode failure
+  (#1247) already took at this exact call site before this fix, and still
+  does. This makes the two failure classes consistent with each other at
+  this call site rather than introducing new behavior: a depth violation now
+  skips just the one result, the same as a decode failure always has, instead
+  of the whole document. `write_output_jq_value`'s call site (`-S`/`-a`/`-C`)
+  is unaffected by this nuance -- its own error routing
+  (`MalformedJsonError`) already halts the whole document for *any* `Err`,
+  before and after this fix.
 
 - **`succinctly yq` no longer answers arithmetic from a collapsed copy of the
   document** (#2626). `printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length + 0'`
