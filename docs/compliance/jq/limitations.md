@@ -863,14 +863,13 @@ is the revert that established what the other one costs.
    (`path(def f: . as {a:$q} \| $q; f)`, jq `["a"]`) resolves as an opaque leaf — the same `def`
    limitation that table already records.
 
-   Two follow-ups are filed rather than closed here.
-   [#2676](https://github.com/rust-works/succinctly/issues/2676) is the fold's own loop
-   variable: `path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` and
-   `path(reduce .b as {c:$x} (.; .))` is `[]` in jq, while `resolve_node`'s `[Pattern::Var(_)]`
-   guard still falls through (see the fold paragraph below).
+   One follow-up is filed rather than closed here.
    [#2678](https://github.com/rust-works/succinctly/issues/2678) is a parse gap that predates
    path mode entirely: a computed-key pattern (`. as {("a"): $q} \| $q`, jq `["a"]`) is
-   `parse error at position 11: expected identifier, found '('` here, exit 3.
+   `parse error at position 11: expected identifier, found '('` here, exit 3. The fold's own
+   loop variable (`reduce`/`foreach`'s own `as PATTERN`, one level up from a plain `as` bind) is
+   closed by [#2676](https://github.com/rust-works/succinctly/issues/2676) — see the fold
+   paragraph below.
 
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
@@ -878,8 +877,11 @@ is the revert that established what the other one costs.
    support for `reduce`/`foreach`'s own `as` clause) landed after `resolve_reduce`/
    `resolve_foreach` were designed, adding a retry-with-rollback matrix
    (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`) neither function threads
-   path-tracking through. `resolve_node`'s dispatch arm admits exactly `[Pattern::Var(_)]`
-   and falls to `resolve_leaf`'s catch-all otherwise.
+   path-tracking through. `resolve_node`'s dispatch arm admits a single pattern alternative
+   only (`patterns.len() == 1`) — a bare `$var` in any mode, or, since
+   [#2676](https://github.com/rust-works/succinctly/issues/2676), a destructuring
+   `Pattern::Object`/`Pattern::Array` in jq mode — and falls to `resolve_leaf`'s catch-all for
+   a `?//` chain of any pattern shape.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an
@@ -904,32 +906,51 @@ register's value was promoted: `(reduce (1) as $i (.; {a:.a})) = 9` wrote `9` wh
 raises and leaves the input untouched. That was the one divergence in this section that ran
 in the unsafe direction, and it is closed.
 
-The fold's own **loop-variable destructuring pattern** (`as [$i]`, `as {v:$v}`) splits along
-the same line #2649 drew for a plain `as` — whether the fold's *source* is the register — and
-`resolve_node`'s `[Pattern::Var(_)]` guard (pinned by
-`test_reduce_foreach_path_dispatch_falls_back_1440`, `src/jq/eval.rs`) falls through for both
-halves, so both refuse here.
+The fold's own **loop-variable destructuring pattern** (`as [$i]`, `as {v:$v}`) is tracked
+since [#2676](https://github.com/rust-works/succinctly/issues/2676), one level up from #2649's
+own plain-`as` fix: jq compiles a fold's pattern with the same tracked `INDEX` matchers a plain
+`. as PATTERN` bind gets, and the fold's SOURCE is itself tracked whenever it resolves through
+the path register — so destructuring a register-derived source element moves the register the
+same way `. as {..}` does. On `{"a":[1,2,3],"b":{"c":5}}`, `path(foreach .b as {c:$x} (.; .;
+$x))` is `["b","c"]` and `path(reduce .b as {c:$x} (.; .))` is `[]`, both now matching jq. The
+walk reuses #2649's own `walk_pattern`, seeded at the source element's own register path
+(`elem.register_path`, #2031) instead of at `PathPrefix::root()`; its final position becomes a
+fresh per-step `FoldRegister` that UPDATE/EXTRACT resolve against, in `resolve_foreach`, in
+place of the naive whole-element `step_reg` the bare-`$var` arm still builds. `resolve_reduce`
+does not need the analogous override — its own accumulator is checked against the fold's
+*persistent*, INIT-seeded register unconditionally (unaffected by SOURCE or pattern shape, a
+pre-existing #2031 rule) — so a destructured `$var` there is only ever recognised when it
+happens to be `register_identical` to that persistent register, exactly the same test a bare
+`$var` bound from a register-derived element already fails whenever its value differs (`path
+(reduce .b as $x (.; $x))` refuses the same way `path(reduce .b as {c:$x} (.; $x))` does); the
+walk still runs there, purely to reproduce jq's own refusal for the pattern's own step.
 
-Where the source is **not** the register, jq refuses too and only the **wording** differs:
-`path(. as $x \| reduce ([1]) as [$i] (0; $x))` raises "Invalid path expression near attempt
-to access element 0 of [1]" in jq 1.7.1 (while the bare-`$var` spelling of the same fold is
-`[]`), and falling through to `resolve_leaf`'s catch-all names the whole fold's own value
-("Invalid path expression with result `{"a":1}`") rather than the destructuring step jq
-blames. A multi-element array pattern refuses in jq even when its source *is* the register,
-for the reverse-order reason #2649 records above — `path(foreach .a as [$x,$y] (.; .; $x))`
-on `{"a":[1,2,3],"b":{"c":5}}` raises at element `0` of `[1,2,3]` in jq, where the catch-all
-names `1` here. Same outcome, same exit 5, no document written either side; that is the
-general message-fidelity gap covered above, not a fold-specific one.
+**Two residual, refuse-only gaps remain**, both pinned by
+`test_reduce_foreach_path_dispatch_falls_back_1440` and
+`test_fold_pattern_destructuring_tracks_register_2676` (`src/jq/eval.rs`) plus
+`test_fold_destructuring_pattern_moves_path_register_2676` (`tests/jq_cli_tests.rs`):
 
-Where the source **is** the register, jq answers and succinctly refuses — a real behavioural
-divergence, refuse-only, tracked as
-[#2676](https://github.com/rust-works/succinctly/issues/2676). On
-`{"a":[1,2,3],"b":{"c":5}}`, `path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` in jq and
-`path(reduce .b as {c:$x} (.; .))` is `[]`, against "with result 5" and "with result
-`{"a":[1,2,3],"b":{"c":5}}`" here. #2649 gave a plain `as` the machinery for this
-(`walk_pattern` plus an `Origin::At` marker per binding); what #2676 still needs is to run it
-per element inside `resolve_reduce`/`resolve_foreach`'s own `FoldRegister` model, which has
-its own persistence rule and so its own oracle round.
+- **A destructuring pattern whose SOURCE is not register-derived still refuses
+  unconditionally**, even when the bound name goes unused downstream — jq's own path_intact
+  check compares the pattern's own step against wherever `value_at_path` already is, regardless
+  of whether any bound name is ever read: `path(. as $x \| reduce ([1]) as [$i] (0; $x))`
+  raises "Invalid path expression near attempt to access element 0 of [1]" in jq 1.7.1 even
+  though `$i` goes unused in UPDATE (`$x`, a *different*, outer-bound var). `walk_pattern` is
+  seeded from the fold's own persistent register in this case (mirroring the bare-`$var` `None`
+  arm), so it still answers correctly through the `null`/`bool` identity exception —
+  `path(foreach (null) as {a:$x} (.; .; $x))` is `["a"]` on a `null` document (the ambient
+  register is `null` too) but refuses once the document isn't itself null/bool, or once the
+  source element isn't (`path(foreach (5) as {a:$x} (.; .; .))` refuses on any document, `$x`
+  unused, exactly the message-fidelity gap covered above — the catch-all names the whole fold's
+  value rather than the destructuring step jq blames).
+- **A multi-element array pattern refuses in jq even when its source *is* the register**, for
+  the reverse-order reason #2649 records above —
+  `path(foreach .a as [$x,$y] (.; .; $x))` on `{"a":[1,2,3],"b":{"c":5}}` raises at element `0`
+  of `[1,2,3]` in jq, and `walk_pattern` reproduces that exactly (verbatim wording, not just the
+  verdict), since it's the same function #2649 already uses.
+
+`?//`-alternatives stay on the refuse-only path regardless of pattern shape (item 2 above) —
+`patterns.len() > 1` never reaches the walk.
 
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
 [#1872](https://github.com/rust-works/succinctly/issues/1872),
