@@ -44078,6 +44078,135 @@ fn genuine_yaml_flow_sequences_keep_their_trailing_comma_2279() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// #2778: JSON-sourced scalar-grammar validation
+// ============================================================================
+
+/// Captured live against Homebrew `yq` v4.53.3 (`goccy/go-json` v0.10.6),
+/// the full accept/reject matrix from #2778's triage plan. Both columns
+/// matter: the accepted non-RFC-8259 rows (`01`, `00`, `1.`, `-.5`,
+/// `1.e5`) are what makes this "not strict JSON", not a stricter one.
+const JSON_SOURCED_SCALAR_GRAMMAR_ROWS: &[(&str, Option<&str>)] = &[
+    // --- rejected: not a value real yq's token scanner ever starts ------
+    ("[a]", None),
+    ("['a']", None),
+    ("[True]", None),
+    ("[a: 1]", None),
+    ("[\"a\":1]", None),
+    ("[.5]", None),
+    ("[.]", None),
+    ("[.e1]", None),
+    ("[+1]", None),
+    ("[~]", None),
+    ("[nul]", None),
+    ("[tru]", None),
+    ("[[a]]", None),
+    ("{\"a\":True}", None),
+    ("True", None),
+    ("a", None),
+    // --- rejected: a value-shaped token ParseFloat itself refuses -------
+    ("[1 2]", None),
+    ("[a b]", None),
+    ("[1\"a\"]", None),
+    ("[1e]", None),
+    ("[0e]", None),
+    ("[1.e]", None),
+    ("[1.5e+]", None),
+    ("[1e+]", None),
+    ("[-]", None),
+    ("[-.]", None),
+    ("[--1]", None),
+    ("[-e1]", None),
+    ("[1-2]", None),
+    ("[1+2]", None),
+    ("[1..2]", None),
+    ("[1e1.5]", None),
+    ("[1e5e5]", None),
+    ("[1.2.3]", None),
+    ("[0x1A]", None),
+    ("[1_000]", None),
+    ("[NaN]", None),
+    ("[Infinity]", None),
+    ("[-Infinity]", None),
+    ("[.inf]", None),
+    ("[1,2 3]", None),
+    // --- rejected: `ErrRange` overflow, not a grammar rejection ----------
+    ("[1e999]", None),
+    ("[2e308]", None),
+    // --- rejected: bare top level without enclosing `{}`/`[]` -----------
+    (".5", None),
+    ("+1", None),
+    ("1e", None),
+    ("'a'", None),
+    ("-", None),
+    ("a: 1", None),
+    ("- 1", None),
+    // --- accepted: not RFC 8259, but yq's ParseFloat allows these -------
+    ("[01]", Some("[1]")),
+    ("[00]", Some("[0]")),
+    ("[1.]", Some("[1]")),
+    ("[0.]", Some("[0]")),
+    ("[00.5]", Some("[0.5]")),
+    ("[1.e5]", Some("[100000]")),
+    ("[-01]", Some("[-1]")),
+    ("[-.5]", Some("[-0.5]")),
+    ("[-01.50e+01]", Some("[-15]")),
+    ("[1e-999]", Some("[0]")),
+    // --- accepted: well-formed controls ----------------------------------
+    ("[1]", Some("[1]")),
+    ("[true,false,null]", Some("[true,false,null]")),
+    ("{\"a\":1}", Some("{\"a\":1}")),
+];
+
+#[test]
+fn json_sourced_scalar_grammar_matches_yq_2778() -> Result<()> {
+    for (input, expected) in JSON_SOURCED_SCALAR_GRAMMAR_ROWS {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        match expected {
+            Some(want) => {
+                assert_eq!(
+                    (stdout.trim(), code),
+                    (*want, 0),
+                    "#2778: {input:?} must still be accepted with this exact value \
+                     (real yq v4.53.3 accepts it)"
+                );
+            }
+            None => {
+                assert_eq!(
+                    code, 1,
+                    "#2778: {input:?} must be rejected with exit 1 (real yq v4.53.3 \
+                     rejects it), got stdout {stdout:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The tightening is gated on JSON-sourced input; genuine YAML keeps its
+/// own grammar, where every one of these is ordinary and legal.
+#[test]
+fn genuine_yaml_scalars_are_unaffected_by_json_strict_2778() -> Result<()> {
+    for (input, want) in [
+        ("a: 1", r#"{"a":1}"#),
+        ("- 1", "[1]"),
+        ("['a']", r#"["a"]"#),
+        ("[True]", "[true]"),
+        ("[.5]", "[0.5]"),
+        ("[+1]", "[1]"),
+        ("key: 'value'", r#"{"key":"value"}"#),
+    ] {
+        let (stdout, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#2778: genuine YAML {input:?} must be unaffected by the JSON-sourced gate"
+        );
+    }
+    Ok(())
+}
+
 /// #2724: jq mode's `{$a}` object-construction shorthand fix is scoped to
 /// jq mode only -- yq mode still raises the same pre-existing parse error
 /// it always has ("expected identifier, found '$'"), not jq's `{"a":1}".
