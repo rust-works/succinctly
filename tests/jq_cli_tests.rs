@@ -47545,6 +47545,53 @@ fn test_postfix_applies_directly_to_a_collection_literal_2667() -> Result<()> {
     Ok(())
 }
 
+/// #2741: same `Term` rule as #2667 above, for the two literal kinds that
+/// issue's own repro table and title left out -- string and number. Every
+/// row captured live from jq 1.7.1; the error-shaped rows still parse (jq
+/// accepts the program) and only fail at evaluation, which is the point --
+/// they were parse errors here before this fix.
+#[test]
+fn test_postfix_applies_directly_to_a_string_or_number_literal_2741() -> Result<()> {
+    for (filter, want, want_code) in [
+        (r#""abc"[0:1]"#, "\"a\"", 0),
+        (r#""abc"[1:]"#, "\"bc\"", 0),
+        (
+            "1[0]",
+            "jq: error (at <unknown>): Cannot index number with number",
+            5,
+        ),
+        (
+            r#""abc"[0]"#,
+            "jq: error (at <unknown>): Cannot index string with number",
+            5,
+        ),
+        (
+            r#""abc".x"#,
+            "jq: error (at <unknown>): Cannot index string with string \"x\"",
+            5,
+        ),
+        (
+            r#""abc"["x"]"#,
+            "jq: error (at <unknown>): Cannot index string with string \"x\"",
+            5,
+        ),
+        (r#""\(1)"[0:1]"#, "\"1\"", 0),
+        (r#""abc"[]?"#, "", 0),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(
+            code, want_code,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        if want_code == 0 {
+            assert_eq!(stdout.trim(), want, "`{filter}`");
+        } else {
+            assert!(stderr.contains(want), "`{filter}` -- stderr: {stderr:?}");
+        }
+    }
+    Ok(())
+}
+
 /// #2667: making a collection literal a postfix target must not swallow the
 /// `[`/`{` that opens a **destructuring pattern** after `as`, which is the
 /// one place the same two characters follow a term and mean something else.

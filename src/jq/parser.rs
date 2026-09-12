@@ -1666,13 +1666,49 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(object)
             }
 
-            // String literal or interpolation
+            // String literal or interpolation. #2741, jq mode only: same
+            // `Term` rule #2667 fixed for collection literals --
+            // `"abc"[0:1]`/`"abc"[0]`/`"abc"[]` are all valid jq 1.7.1 and
+            // were parse errors here, since only `(...)`/`[...]`/`{...}`
+            // routed through `parse_postfix`. This covers plain and
+            // interpolated strings alike (`parse_string_or_interpolation`
+            // returns one `Expr` either way); confirmed live that jq
+            // applies the same postfix chain to an interpolated string
+            // (`"\(1)"[0:1]` is `"1"`). yq mode is excluded: real yq
+            // rejects every one of these at parse time too (`bad
+            // expression, please check expression syntax`, confirmed live
+            // against v4.53.3 for both `"abc"[0:1]` and `"abc".x`) --
+            // unlike #2667's own array-literal case, where real yq
+            // happens to accept the same postfix shape (`[1,2][0]`
+            // succeeds there), there is no reachable yq behaviour here to
+            // match, so widening this arm unconditionally would introduce
+            // a brand new divergence rather than close one.
+            Some('"') if self.mode == ParserMode::Jq => {
+                let string = self.parse_string_or_interpolation()?;
+                self.parse_postfix(string)
+            }
             Some('"') => self.parse_string_or_interpolation(),
 
             // Format strings: @text, @json, @uri, etc.
             Some('@') => self.parse_format_string(),
 
-            // Number literal (starts with digit)
+            // Number literal (starts with digit). #2741, jq mode only,
+            // same reasoning as the string arm above -- `1[0]` is a valid
+            // (if always-erroring at runtime, "Cannot index number with
+            // number") jq 1.7.1 program and was a parse error here; real
+            // yq rejects it at parse time too (confirmed live). Also
+            // deliberately not extended to the unary-minus arm below: real
+            // jq's `-1[0]` parses as `-(1[0])` (confirmed live: errors
+            // "Cannot index number with number", naming the *positive*
+            // operand), which would need that arm to stop eagerly folding
+            // `-`+digits into one negative-literal token whenever a
+            // postfix could follow -- a materially larger restructure of
+            // the #1035 negative-literal-preservation logic there, out of
+            // this issue's scope.
+            Some(c) if c.is_ascii_digit() && self.mode == ParserMode::Jq => {
+                let lit = self.parse_number_literal()?;
+                self.parse_postfix(Expr::Literal(lit))
+            }
             Some(c) if c.is_ascii_digit() => {
                 let lit = self.parse_number_literal()?;
                 Ok(Expr::Literal(lit))
