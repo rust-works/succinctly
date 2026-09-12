@@ -44698,6 +44698,157 @@ fn genuine_yaml_scalars_are_unaffected_by_json_strict_2778() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// #2777: JSON-sourced flow-mapping token-pairing grammar
+// ============================================================================
+
+/// Captured live against Homebrew `yq` v4.53.3 (`goccy/go-json` v0.10.6).
+/// Real yq's own object grammar ignores punctuation inside `{}` entirely and
+/// pairs up tokens (key, value, key, value, ...) rather than validating
+/// JSON structure -- a fundamentally different model from YAML's own
+/// flow-mapping grammar, which this fix reproduces on the "plain" route
+/// (`YamlIndex`-backed `-p json`, not `--inplace`/DOM-bridge routes -- see
+/// `docs/compliance/yq/limitations.md` for that separately-tracked gap,
+/// #2872's sibling for this issue). `None` marks a row real yq accepts but
+/// with no value-preserving output worth pinning (would-panic rows); those
+/// are asserted separately below since only their exit code, not stdout,
+/// is meaningfully comparable.
+const JSON_SOURCED_FLOW_MAPPING_ROWS: &[(&str, Option<&str>)] = &[
+    // --- the issue's own 8 rows -----------------------------------------
+    (r#"{"a":1 "b":2}"#, Some(r#"{"a":1,"b":2}"#)),
+    (r#"{"a":1"b":2}"#, Some(r#"{"a":1,"b":2}"#)),
+    ("{,}", Some("{}")),
+    (r#"{,"a":1}"#, Some(r#"{"a":1}"#)),
+    (r#"{"a":1,,"b":2}"#, Some(r#"{"a":1,"b":2}"#)),
+    (r#"{"a" 1}"#, Some(r#"{"a":1}"#)),
+    // --- must-not-change controls ---------------------------------------
+    (r#"{"a":1,}"#, Some(r#"{"a":1}"#)),
+    (r#"{"a":1,"b":2,}"#, Some(r#"{"a":1,"b":2}"#)),
+    ("{}", Some("{}")),
+    (r#"{"a":{"b":1 "c":2}}"#, Some(r#"{"a":{"b":1,"c":2}}"#)),
+    (r#"[{"a":1 "b":2}]"#, Some(r#"[{"a":1,"b":2}]"#)),
+    // --- nested arrays keep their own, unrelated strict rules -----------
+    (r#"{"a":[1 2]}"#, None),
+    (r#"{"a":[1,]}"#, None),
+];
+
+#[test]
+fn json_sourced_flow_mapping_token_pairing_matches_yq_2777() -> Result<()> {
+    for (input, expected) in JSON_SOURCED_FLOW_MAPPING_ROWS {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        match expected {
+            Some(want) => {
+                assert_eq!(
+                    (stdout.trim(), code),
+                    (*want, 0),
+                    "#2777: {input:?} must be accepted with this exact value \
+                     (real yq v4.53.3 accepts it)"
+                );
+            }
+            None => {
+                assert_eq!(
+                    code, 1,
+                    "#2777: {input:?} must be rejected with exit 1 (real yq v4.53.3 \
+                     rejects it), got stdout {stdout:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rule-4(c) carve-out (ADR-0018): real yq's object grammar does an
+/// unchecked cast of a non-string JSON literal key to `string`, which
+/// panics (Go interface-conversion panic, exit 2) rather than erroring
+/// cleanly -- reproducing the *rejection*, as a clean parse error, not the
+/// crash. `{:1}` is included because the leading `:` is itself skipped as
+/// a separator (the same rule that skips a leading `,`), leaving a bare
+/// numeric "key".
+#[test]
+// `"{1:1}"`/`"{:1}"` are JSON-source test fixtures, not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn json_sourced_flow_mapping_non_string_key_refuses_cleanly_2777() -> Result<()> {
+    for input in [
+        "{1:1}",
+        "{1.5:1}",
+        "{true:1}",
+        "{false:1}",
+        "{null:1}",
+        "{:1}",
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 1,
+            "#2777: {input:?} must be rejected cleanly (real yq panics, exit 2, \
+             here) with exit 1, not a crash -- got stdout {stdout:?}"
+        );
+        assert!(
+            stderr.contains("panic"),
+            "#2777: {input:?} error should name the reference's own panic -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A malformed key that isn't even a well-formed JSON literal is an
+/// ordinary scanner-level error in the reference too (`invalid character
+/// ... as token`), not a panic -- these must not be conflated with the
+/// rule-4(c) rows above.
+#[test]
+fn json_sourced_flow_mapping_malformed_key_is_an_ordinary_error_2777() -> Result<()> {
+    for input in ["{abc:1}", "{'a':1}"] {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 1,
+            "#2777: {input:?} must be rejected with exit 1, got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The gap was never output-shaped: `length` and `keys` answer from the BP
+/// structure too, matching #2279's own coverage rationale for its sibling
+/// delimiter fix.
+#[test]
+fn json_sourced_flow_mapping_check_covers_every_route_2777() -> Result<()> {
+    for filter in [".", ".a", "keys", "length"] {
+        let (stdout, code) = run_yq_stdin(
+            filter,
+            r#"{"a":1 "b":2}"#,
+            &["--input-format", "json", "-o=json", "-I=0"],
+        )?;
+        assert_eq!(
+            code, 0,
+            "#2777: `{filter}` on a space-separated pair must be accepted, got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The tightening is gated on JSON-sourced input. Genuine YAML keeps its
+/// own flow-mapping grammar, where a bare `{"a" 1}`/stray comma is either
+/// a different, legal shape (implicit-null value) or an outright parse
+/// error -- neither of which is what real yq does with `-p json`.
+#[test]
+fn genuine_yaml_flow_mappings_keep_their_own_grammar_2777() -> Result<()> {
+    // `{a 1}` in real YAML is an unquoted plain-scalar key `a 1` (a space is
+    // ordinary key content), not a key/value pair -- unaffected by #2777.
+    let (stdout, code) = run_yq_stdin(".", "{a 1}", &["-o=json", "-I=0"])?;
+    assert_eq!((stdout.trim(), code), (r#"{"a 1":null}"#, 0));
+
+    // `{,}` in genuine YAML reads as a `""` key bound to an implicit `null`
+    // (the pre-#2777 -- and pre-#2279 -- YAML flow-mapping rule, unrelated
+    // to #2777's own json_strict-gated leniency, which instead drops the
+    // whole entry and gives a clean `{}`).
+    let (stdout, code) = run_yq_stdin(".", "{,}", &["-o=json", "-I=0"])?;
+    assert_eq!((stdout.trim(), code), (r#"{"":null}"#, 0));
+    Ok(())
+}
+
 /// #2724: jq mode's `{$a}` object-construction shorthand fix is scoped to
 /// jq mode only -- yq mode still raises the same pre-existing parse error
 /// it always has ("expected identifier, found '$'"), not jq's `{"a":1}".
