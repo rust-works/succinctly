@@ -47577,6 +47577,12 @@ fn test_postfix_applies_directly_to_a_string_or_number_literal_2741() -> Result<
         ),
         (r#""\(1)"[0:1]"#, "\"1\"", 0),
         (r#""abc"[]?"#, "", 0),
+        // #2741 review: `@format` shares the same `Term` rule.
+        (
+            r#""AAAA" | @base64[0]"#,
+            "jq: error (at <unknown>): Cannot index string with number",
+            5,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
         assert_eq!(

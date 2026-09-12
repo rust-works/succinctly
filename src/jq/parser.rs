@@ -1666,37 +1666,36 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(object)
             }
 
-            // String literal or interpolation. #2741, jq mode only: same
-            // `Term` rule #2667 fixed for collection literals --
-            // `"abc"[0:1]`/`"abc"[0]`/`"abc"[]` are all valid jq 1.7.1 and
-            // were parse errors here, since only `(...)`/`[...]`/`{...}`
-            // routed through `parse_postfix`. This covers plain and
-            // interpolated strings alike (`parse_string_or_interpolation`
-            // returns one `Expr` either way); confirmed live that jq
-            // applies the same postfix chain to an interpolated string
-            // (`"\(1)"[0:1]` is `"1"`). yq mode is excluded: real yq
-            // rejects every one of these at parse time too (`bad
-            // expression, please check expression syntax`, confirmed live
-            // against v4.53.3 for both `"abc"[0:1]` and `"abc".x`) --
-            // unlike #2667's own array-literal case, where real yq
-            // happens to accept the same postfix shape (`[1,2][0]`
-            // succeeds there), there is no reachable yq behaviour here to
-            // match, so widening this arm unconditionally would introduce
-            // a brand new divergence rather than close one.
-            Some('"') if self.mode == ParserMode::Jq => {
+            // String literal or interpolation. #2741: same `Term` rule
+            // #2667 fixed for collection literals -- `"abc"[0:1]`/
+            // `"abc"[0]`/`"abc"[]` are all valid jq 1.7.1 and were parse
+            // errors here, since only `(...)`/`[...]`/`{...}` routed
+            // through `parse_postfix`. This covers plain and interpolated
+            // strings alike (`parse_string_or_interpolation` returns one
+            // `Expr` either way); confirmed live that jq applies the same
+            // postfix chain to an interpolated string (`"\(1)"[0:1]` is
+            // `"1"`). See `postfix_if_jq`'s own doc comment for the
+            // jq-mode gate.
+            Some('"') => {
                 let string = self.parse_string_or_interpolation()?;
-                self.parse_postfix(string)
+                self.postfix_if_jq(string)
             }
-            Some('"') => self.parse_string_or_interpolation(),
 
-            // Format strings: @text, @json, @uri, etc.
-            Some('@') => self.parse_format_string(),
+            // Format strings: @text, @json, @uri, etc. #2741 review: the
+            // same `Term` rule applies here too -- `@base64[0]` is a valid
+            // (if always-erroring at runtime, "Cannot index string with
+            // number") jq 1.7.1 program, confirmed live, and real yq
+            // rejects it at parse time the same way it rejects the string/
+            // number cases (confirmed live against v4.53.3).
+            Some('@') => {
+                let format = self.parse_format_string()?;
+                self.postfix_if_jq(format)
+            }
 
-            // Number literal (starts with digit). #2741, jq mode only,
-            // same reasoning as the string arm above -- `1[0]` is a valid
-            // (if always-erroring at runtime, "Cannot index number with
-            // number") jq 1.7.1 program and was a parse error here; real
-            // yq rejects it at parse time too (confirmed live). Also
+            // Number literal (starts with digit). #2741, same reasoning as
+            // the string arm above -- `1[0]` is a valid (if
+            // always-erroring at runtime, "Cannot index number with
+            // number") jq 1.7.1 program and was a parse error here. Also
             // deliberately not extended to the unary-minus arm below: real
             // jq's `-1[0]` parses as `-(1[0])` (confirmed live: errors
             // "Cannot index number with number", naming the *positive*
@@ -1705,13 +1704,9 @@ impl<'a> Parser<'a> {
             // postfix could follow -- a materially larger restructure of
             // the #1035 negative-literal-preservation logic there, out of
             // this issue's scope.
-            Some(c) if c.is_ascii_digit() && self.mode == ParserMode::Jq => {
-                let lit = self.parse_number_literal()?;
-                self.parse_postfix(Expr::Literal(lit))
-            }
             Some(c) if c.is_ascii_digit() => {
                 let lit = self.parse_number_literal()?;
-                Ok(Expr::Literal(lit))
+                self.postfix_if_jq(Expr::Literal(lit))
             }
 
             // Unary minus: either a negative number literal or negation of an expression
@@ -5233,6 +5228,24 @@ impl<'a> Parser<'a> {
             }
             Some('c') if self.matches_keyword("catch") => true,
             _ => false,
+        }
+    }
+
+    /// #2741: applies `parse_postfix` in jq mode, leaves `expr` untouched in
+    /// yq mode. Shared by the string, `@format`, and number-literal arms of
+    /// `parse_primary_inner` -- unlike #2667's own array/object-literal
+    /// fix (which real yq happens to accept the identical postfix shape
+    /// for, `[1,2][0]`/`{"a":1}.a`), real yq rejects a postfix chain
+    /// applied directly to any of these three literal kinds at parse time
+    /// (`bad expression, please check expression syntax`, confirmed live
+    /// against v4.53.3 for `"abc"[0:1]`, `1[0]` and `@base64[0]`), so
+    /// widening unconditionally would introduce a new divergence rather
+    /// than close one.
+    fn postfix_if_jq(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        if self.mode == ParserMode::Jq {
+            self.parse_postfix(expr)
+        } else {
+            Ok(expr)
         }
     }
 

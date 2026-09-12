@@ -41961,20 +41961,33 @@ fn test_flatten_depth_widening_is_jq_mode_only_2755() -> Result<()> {
 
 /// #2741: unlike #2667's own collection-literal postfix fix (which real yq
 /// happens to accept for the same shapes -- `[1,2][0]`, `{"a":1}.a`), real
-/// yq rejects a postfix chain applied directly to a string or number
-/// literal at parse time (`bad expression, please check expression
-/// syntax`, confirmed live against v4.53.3). Per ADR-0018 the mode
-/// decides: jq mode gets the #2741 fix
+/// yq rejects a postfix chain applied directly to a string, number or
+/// `@format` literal at parse time (`bad expression, please check
+/// expression syntax`, confirmed live against v4.53.3). Per ADR-0018 the
+/// mode decides: jq mode gets the #2741 fix
 /// (`test_postfix_applies_directly_to_a_string_or_number_literal_2741` in
 /// `tests/jq_cli_tests.rs`), yq mode keeps its pre-existing rejection
-/// unchanged.
+/// unchanged -- pinned by the specific (unrelated-wording, succinctly's
+/// own) error text below, not just a nonzero exit code, so a future
+/// regression that let these start *parsing* in yq mode (even if they then
+/// failed at evaluation instead, the way jq mode's own runtime errors do)
+/// would still be caught here.
 #[test]
 fn test_postfix_on_string_or_number_literal_is_jq_mode_only_2741() -> Result<()> {
-    for filter in [r#""abc"[0:1]"#, "1[0]", r#""abc".x"#] {
+    for (filter, want_err) in [
+        (r#""abc"[0:1]"#, "unexpected character '['"),
+        ("1[0]", "unexpected character '['"),
+        (r#""abc".x"#, "unexpected character '.'"),
+        (r#""AAAA"|@base64d[0]"#, "unexpected character '['"),
+    ] {
         let (_stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
-        assert_ne!(
-            code, 0,
+        assert_eq!(
+            code, 1,
             "`{filter}` unexpectedly compiled: stderr {stderr:?}"
+        );
+        assert!(
+            stderr.contains(want_err),
+            "`{filter}` -- stderr: {stderr:?}"
         );
     }
     Ok(())
