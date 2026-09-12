@@ -210,6 +210,20 @@ destructure-alt-artefact-guard-del	{"a":[1,2,3]}	del(. as {a:$q} ?// $z | if $q 
 destructure-comma-marker-nav	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q[0], $q)
 carried-register-passthrough	{"a":{"b":1}}	path(.a as $y | .a | 5 | select(true) | $y)
 destructure-passthrough-stage	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | select(true) | $q)
+fold-destructure-foreach-object	{"a":[1,2,3],"b":{"c":5}}	path(foreach .b as {c:$x} (.; .; $x))
+fold-destructure-foreach-array	{"a":[1,2,3],"b":{"c":5}}	path(foreach .a as [$x] (.; .; $x))
+fold-destructure-reduce-identity	{"a":[1,2,3],"b":{"c":5}}	path(reduce .b as {c:$x} (.; .))
+fold-destructure-nested	{"p":{"q":{"r":42}}}	path(foreach .p as {q:{r:$v}} (.; .; $v))
+fold-destructure-iterate	{"x":[{"c":1},{"c":2}]}	path(foreach .x[] as {c:$v} (.; .; $v))
+fold-destructure-update-add	{"a":[1,2,3],"b":{"c":5}}	(foreach .b as {c:$x} (.; .; $x)) |= .+1
+fold-destructure-del	{"a":[1,2,3],"b":{"c":5}}	del(foreach .b as {c:$x} (.; .; $x))
+fold-destructure-null-bool-coincidence	null	path(foreach (null) as {a:$x} (.; .; $x))
+fold-destructure-nonregister-source	{}	path(. as $x | reduce ([1]) as [$i] (0; $x))
+fold-destructure-array-reverse	{"a":[1,2,3],"b":{"c":5}}	path(foreach .a as [$x,$y] (.; .; $x))
+fold-destructure-accumulator-nav	{"a":[1,2,3],"b":{"c":5}}	path(reduce .b as {c:$x} (.; .b))
+fold-destructure-qq-alt	{"a":[1,2,3],"b":{"c":5}}	path(reduce .b as {c:$x} ?// $z (0; $x))
+fold-destructure-duplicate-key	{"a":[1,2,3],"b":{"c":5}}	path(foreach .b as {c:$x,c:$x} (.; .; $x))
+fold-destructure-nonnull-register	{}	path(foreach (null) as {a:$x} (.; .; $x))
 CASES_EOF
 )
 
