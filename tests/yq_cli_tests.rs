@@ -2320,6 +2320,91 @@ fn test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276()
     Ok(())
 }
 
+/// #2781: a top-level `[,]` -- a stray comma with *zero* real children --
+/// still leaked through `--slurp`/`--eval-all`/`--inplace`'s DOM-bridge
+/// route after #2279 closed the plain-route parser and #2403 closed every
+/// *nested* occurrence on this route. Confirmed live before this fix:
+/// `--slurp`/`--eval-all` answered `[[]]`/`[]` at exit 0, and `--inplace`
+/// rewrote the file to `[]` -- for input real yq v4.53.3 refuses to read at
+/// all (`bad file ...: json: null unexpected end of JSON input`, exit 1,
+/// file untouched).
+#[test]
+fn test_yq_top_level_stray_comma_in_empty_container_rejected_on_dom_bridge_routes_2781(
+) -> Result<()> {
+    // --slurp
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "[,]",
+        &["--slurp", "--input-format", "json", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+
+    // --eval-all
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "[,]",
+        &["--eval-all", "--input-format", "json", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+
+    // --inplace -- the destructive one: must raise *and* leave the file
+    // byte-for-byte untouched, not "heal" it to `[]` on disk.
+    let json = "[,]";
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{json}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .args(["--input-format", "json"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace should raise, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+    let file_contents = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        file_contents, json,
+        "a raised --inplace write must leave the file byte-for-byte untouched"
+    );
+
+    // Positive control: a well-formed empty container still round-trips on
+    // all three routes -- the fix must not have turned `[]`/`{}` into false
+    // positives.
+    let (output, code) = run_yq_stdin(
+        ".",
+        "[]",
+        &["--slurp", "--input-format", "json", "-o", "json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[[]]");
+
+    let (output, code) = run_yq_stdin(
+        ".",
+        "{}",
+        &["--eval-all", "--input-format", "json", "-o", "json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{}");
+
+    Ok(())
+}
+
 /// #2276 review: `any_input_is_json` is one run-wide boolean, not a
 /// per-file switch (see its own doc comment in `yq_runner.rs` for why a
 /// per-file version wasn't attempted here) -- so a single JSON-sourced
