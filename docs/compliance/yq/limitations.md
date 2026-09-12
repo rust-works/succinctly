@@ -954,15 +954,61 @@ therefore rewrites it to `[]`, where real yq refuses the file and leaves it unto
 That route disagreeing with the stdout route is *new* — before #2279 both accepted it —
 and it is tracked as [#2781](https://github.com/rust-works/succinctly/issues/2781).
 
-Scope is flow **sequences** only, and never scalar grammar, because that is where real yq
-(v4.53.3, captured live) actually draws the line — the asymmetry this section already
-describes above. Tightening mappings would refuse `{"a":1,}`/`{,}`, and tightening scalars
-would refuse `[01]`/`[00]`/`[1.]`, all of which real yq accepts. The remaining divergences on
-this route are tracked separately: the flow-mapping grammar in
+Scope is flow **sequence delimiters** only, and never mapping delimiters, because that is
+where real yq (v4.53.3, captured live) actually draws the line — the asymmetry this section
+already describes above. Tightening mappings would refuse `{"a":1,}`/`{,}`, all of which
+real yq accepts. The remaining divergences on this route are tracked separately: the
+flow-mapping *delimiter* grammar in
 [#2777](https://github.com/rust-works/succinctly/issues/2777) (including one silent wrong
-value, `{"a":1 "b":2}`), the non-comma sequence cases in
-[#2778](https://github.com/rust-works/succinctly/issues/2778), and genuine-YAML `[,]`/`{,}`
-in [#2779](https://github.com/rust-works/succinctly/issues/2779).
+value, `{"a":1 "b":2}`), and genuine-YAML `[,]`/`{,}` in
+[#2779](https://github.com/rust-works/succinctly/issues/2779). (Scalar grammar, `[01]` vs
+`.5`, was the other half of #2279's original scope note — closed separately below by
+[#2778](https://github.com/rust-works/succinctly/issues/2778).)
+
+**Closed by [#2778](https://github.com/rust-works/succinctly/issues/2778): scalar grammar
+at every value position.** #2279 above closed *delimiters*; every scalar `-p json` accepted
+that real yq rejects survived it, because delimiter checks never look at scalar text. The
+boundary is not "strict JSON" — it is exactly `goccy/go-json` v0.10.6's own two layers,
+re-derived from its source and pinned across ~60 probes against v4.53.3:
+
+1. **Token scanner** (`internal/decoder/stream.go` `skipValue`): a value token may start only
+   with `{ [ " t f n -` or a digit. `t`/`f`/`n` must spell exactly `true`/`false`/`null`. A
+   number token greedily consumes `[0-9.eE+-]`; the first byte after it must be a delimiter.
+   Anything else (a bare letter, `'`, `.`, `+`, `~`) never reaches step 2 at all.
+2. **Number parse** (`strconv.ParseFloat`): optional `-`, `digits ['.' digits*] | '.' digits`,
+   optional `[eE][+-]?digits`, at least one mantissa digit, leading zeros allowed, `ErrRange`
+   on overflow (`1e999`/`2e308` reject; Rust's equivalent returns `inf`, so the port checks
+   `is_finite()` instead of erroring).
+
+`json_strict_plain_scalar_ok` (`src/yaml/parser.rs`) implements this with Rust's own
+`f64::from_str`, which matches Go's `ParseFloat` row-for-row on the pinned matrix — including
+every non-RFC-8259 acceptance real yq's leniency still allows: leading zeros (`[01]`→`[1]`,
+`[00]`→`[0]`) and a bare trailing `.` (`[1.]`→`[1]`, `[1.e5]`→`[100000]`) all survive, while
+`.5`, `+1`, `1e`, `'a'`, `True`, `~` all error — because layer 1 never lets a `.`/`+`/letter
+token through to `ParseFloat`, not because `ParseFloat` itself would reject them.
+
+Applied at every scalar *value* position the JSON-sourced parser reaches — flow-sequence
+item, flow-mapping value, and bare block/top-level scalar — under the same `json_strict`
+flag #2279 introduced, so `a`, `True`, `.5`, `1e999` are rejected identically whether nested
+in `[...]`, in `{"k": ...}`, or standing alone as the whole document. A bare top-level
+`key: value` (no enclosing `{}`) and a bare `- item` (no enclosing `[]`) are rejected
+structurally at the same point — the reference's token scanner never reaches YAML's block
+grammar at all, since it has no spelling for it.
+
+**Mapping *keys* are exempt — deliberately, not an oversight.** Real yq's own JSON decoder
+*panics* (does not cleanly error) on a non-string key — `{1:1}`, `{true:1}` both crash with
+`interface conversion: json.Token is float64, not string` (exit 2, confirmed live). Per
+ADR-0018 rule 4(c), succinctly does not reproduce a reference panic; `{"1":1}` (succinctly's
+existing behavior for a numeric-looking key) is unchanged. Key *delimiter* and *quoting*
+rules (e.g. real yq also rejects an unquoted or single-quoted key, `{a:1}`/`{'a':1}`, which
+succinctly still accepts) are the mapping-key half of #2777, not this issue — #2778 only
+ever touches what a scalar *value* token may spell.
+
+**Anchor/tag-prefixed content is untouched.** `&anchor`/`!!tag` have no JSON spelling at
+all, so real yq's front end would reject them before ever reaching a scalar to validate —
+but this is unobserved territory (not in the pinned matrix) and this fix does not attempt
+it; a document reaching a scalar through an anchor/tag prefix parses exactly as it did
+before #2778.
 
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
