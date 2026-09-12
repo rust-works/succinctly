@@ -42804,6 +42804,20 @@ fn test_object_construction_var_shorthand_is_jq_mode_only_2724() -> Result<()> {
     Ok(())
 }
 
+/// #2788: jq mode's object-construction trailing-comma allowance
+/// (`{a:1,}`) is likewise jq-mode only -- real yq rejects it too, just for
+/// an unrelated reason of its own (`',' expects 2 args but there is 1`,
+/// live-verified against v4.53.3), so this stays the same pre-existing
+/// parse error succinctly yq always raised for a trailing comma, not jq's
+/// `{"a":1}`.
+#[test]
+fn test_object_construction_trailing_comma_is_jq_mode_only_2788() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"{"a":1,}"#, "x: 1\n", &[])?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(stderr.contains("expected identifier"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #2763: a mapping entry's metadata lives on its **key** node, and `key`
 /// emits that node -- so `line_comment`, `head_comment`, `foot_comment`,
 /// `line`, `column`, `style` and `anchor` after a `key` stage read the key's
