@@ -580,6 +580,26 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// Whether this cursor stands on a document's own content node -- a
+    /// direct child of the document stream, the node the parser keys a
+    /// document's own head/foot comments on (#2795 PR B).
+    ///
+    /// `false` for formats with no document-stream concept (JSON), where it
+    /// monomorphizes away entirely. Only YAML cursors override this.
+    ///
+    /// Needed to reproduce real yq's own root-vs-navigated distinction for a
+    /// bare scalar result's standalone comments: `. ` on `# h\n42\n` keeps
+    /// `# h` (this cursor *is* the document's content node), but `.a` on
+    /// `# h\na: 1\n` and `.items[0]` on `items:\n  # h\n  - 1\n` both drop it
+    /// (navigated away from that node) -- live-verified against pinned yq
+    /// v4.53.3. A navigated-to *container* keeps its own head/foot
+    /// regardless (`.items[0]` on a mapping item does print `# h`), which is
+    /// why this only needs consulting where a bare scalar result's own
+    /// metadata gets cleared, not generally.
+    fn is_document_content(&self) -> bool {
+        false
+    }
+
     /// Whether this cursor's *document* declares any `*name` alias at all.
     ///
     /// A whole-document property, not a property of this node, and O(1) --
@@ -716,6 +736,25 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// The standalone comment lines directly below this node — its *foot*
     /// comment (#798). See [`head_comment`](Self::head_comment).
     fn foot_comment(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// This node's standalone head comment lines, `#` and all, exactly as
+    /// they appear in the source (#798 PR2) — the raw counterpart of
+    /// [`head_comment`](Self::head_comment), used by the write path
+    /// ([`crate::jq::eval_generic::to_owned_with_comments`]) to re-emit them
+    /// verbatim. See [`line_comment_raw`](Self::line_comment_raw) for why
+    /// the raw and stripped forms intentionally differ, and
+    /// [`head_comment`](Self::head_comment) for the key-vs-value attribution
+    /// rule on a mapping entry.
+    fn head_comment_raw(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// This node's standalone foot comment lines, `#` and all, exactly as
+    /// they appear in the source (#798 PR2). See
+    /// [`head_comment_raw`](Self::head_comment_raw).
+    fn foot_comment_raw(&self) -> Vec<String> {
         Vec::new()
     }
 

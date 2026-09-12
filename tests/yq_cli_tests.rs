@@ -15013,8 +15013,9 @@ mod standalone_comment_attribution_2811_review {
 /// #2795: standalone (head/foot) comments print on the streaming YAML
 /// route. Every expected string was captured from pinned yq v4.53.3 on the
 /// same input and arguments. Shapes whose *attribution* the parser still
-/// diverges on (#2811) are left to that fix; the DOM route (`-P`, writes)
-/// is the second half of #2795 and not asserted here.
+/// diverges on (#2811) are left to that fix; the DOM route (`-P`, writes) is
+/// the second half of #2795, covered separately by `dom_standalone_comments_2795`
+/// below.
 mod standalone_comments_2795 {
     use super::run_yq_stdin;
     use anyhow::Result;
@@ -15152,6 +15153,165 @@ mod standalone_comments_2795 {
         // a scalar root, but prints both around a flow-collection root.
         assert_eq!(yq(".", "# lead\n42\n", &[])?, "# lead\n42\n");
         assert_eq!(yq(".", "# lead\n[1]\n", &[])?, "# lead\n[1]\n");
+        Ok(())
+    }
+}
+
+/// #2795 PR B: standalone (head/foot) comments print on the DOM route too --
+/// `-P`, `.a = 5`, `del(...)` and every other write, previously the
+/// documented gap left by `standalone_comments_2795` above. Every expected
+/// string was captured from pinned yq v4.53.3 on the same input and
+/// arguments (`-P` forces the DOM route for a plain read the same way
+/// `--arg` does elsewhere in this file). Shapes whose *attribution* the
+/// parser still diverges on (#2811) are out of scope here too, same as the
+/// streaming module.
+mod dom_standalone_comments_2795 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    fn yq_p(filter: &str, input: &str, args: &[&str]) -> Result<String> {
+        let mut full_args = vec!["-P"];
+        full_args.extend_from_slice(args);
+        let (out, code) = run_yq_stdin(filter, input, &full_args)?;
+        assert_eq!(code, 0, "{out}");
+        Ok(out)
+    }
+
+    const ISSUE_DOC: &str = "# lead\na: 1\n# mid\nb: 2\n\n# trail\n";
+
+    #[test]
+    fn identity_keeps_every_standalone_comment_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", ISSUE_DOC, &[])?,
+            "# lead\na: 1\n# mid\nb: 2\n# trail\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_write_keeps_unrelated_standalone_comments_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".a = 5", ISSUE_DOC, &[])?,
+            "# lead\na: 5\n# mid\nb: 2\n# trail\n"
+        );
+        Ok(())
+    }
+
+    /// `del(.b)` drops `# mid` (owned by `b`'s key) but keeps `# lead`/
+    /// `# trail` (the root's own head/foot) -- the issue's own ownership-
+    /// model confirmation, now on the write route that actually needs it.
+    #[test]
+    fn delete_drops_only_the_deleted_keys_own_head_2795() -> Result<()> {
+        assert_eq!(yq_p("del(.b)", ISSUE_DOC, &[])?, "# lead\na: 1\n# trail\n");
+        Ok(())
+    }
+
+    #[test]
+    fn json_output_still_drops_them_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", ISSUE_DOC, &["-o=json", "-I=0"])?,
+            "{\"a\":1,\"b\":2}\n"
+        );
+        Ok(())
+    }
+
+    /// A bare scalar field navigated to directly drops its comment, same as
+    /// the streaming route -- it belongs to the mapping entry (its key),
+    /// never to the bare extracted value.
+    #[test]
+    fn a_navigated_scalar_field_prints_bare_2795() -> Result<()> {
+        assert_eq!(yq_p(".a", "# lead\na: 1\n# foot\n", &[])?, "1\n");
+        Ok(())
+    }
+
+    /// A navigated sequence-item *scalar* also drops it (same reasoning),
+    /// but a navigated sequence-item *container* keeps its own -- real yq's
+    /// root-vs-navigated distinction only ever applies to a bare scalar
+    /// result, live-verified against pinned v4.53.3.
+    #[test]
+    fn a_navigated_sequence_item_head_follows_its_own_kind_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".items[0]", "items:\n  # h\n  - 1\n  - 2\n", &[])?,
+            "1\n"
+        );
+        assert_eq!(
+            yq_p(".items[0]", "items:\n  # h\n  - a: 1\n  - b: 2\n", &[])?,
+            "# h\na: 1\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_and_sequence_placement_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", "a:\n  # inner\n  b: 1\n  c: 2\nd: 3\n", &[])?,
+            "a:\n  # inner\n  b: 1\n  c: 2\nd: 3\n"
+        );
+        assert_eq!(
+            yq_p(".", "- 1\n# mid\n- 2\n# foot\n", &[])?,
+            "- 1\n# mid\n- 2\n# foot\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_foot_followed_by_a_sibling_gets_one_blank_line_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", "a: 1\n# mid\n\nb: 2\n", &[])?,
+            "a: 1\n# mid\n\nb: 2\n"
+        );
+        assert_eq!(
+            yq_p(".", "a: 1\n# f\n\n# g\n\nb: 2\n", &[])?,
+            "a: 1\n# f\n\n# g\nb: 2\n"
+        );
+        Ok(())
+    }
+
+    /// `-P` forces block/plain style regardless of source (#705) -- in both
+    /// tools, so the quoted style from the streaming module's equivalent
+    /// test is gone here (`&x q`, not `&x "q"`), live-verified against
+    /// pinned yq. The head-line-before-anchor ordering is unaffected.
+    #[test]
+    fn head_lines_precede_anchor_style_and_line_comment_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", "# h\na: &x \"q\" # line\n", &[])?,
+            "# h\na: &x q # line\n"
+        );
+        Ok(())
+    }
+
+    /// A scalar root prints its head and drops its foot; a flow-collection
+    /// root prints both -- same asymmetry the streaming route documents,
+    /// now confirmed through the DOM route's own root-vs-navigated pass in
+    /// `evaluate_yaml_cursor` (`owned_with_comments`/the `#852` rebuild).
+    /// `-P` also forces the flow collection to block style (`- 1`, not
+    /// `[1]`, same reasoning as the anchor/style test above).
+    #[test]
+    fn a_scalar_root_prints_its_head_and_drops_its_foot_2795() -> Result<()> {
+        assert_eq!(yq_p(".", "# lead\n42\n", &[])?, "# lead\n42\n");
+        assert_eq!(yq_p(".", "# lead\n42\n# foot\n", &[])?, "# lead\n42\n");
+        assert_eq!(yq_p(".", "# lead\n[1]\n", &[])?, "# lead\n- 1\n");
+        assert_eq!(
+            yq_p(".", "# lead\n[1]\n# foot\n", &[])?,
+            "# lead\n- 1\n# foot\n"
+        );
+        Ok(())
+    }
+
+    /// Known, recorded residual: real yq's `--header-preprocess` slurps a
+    /// leading blank line / `%YAML`/`---` marker verbatim ahead of the first
+    /// document (the streaming route's own `write_yq_header`, #2795 PR A) --
+    /// the DOM route only carries structured head/foot *comment lines*, not
+    /// that raw verbatim header, so a marker or an interior blank line in
+    /// the header block does not survive a write. Plain leading `#` comment
+    /// lines (no blank line, no marker) are unaffected -- see the tests
+    /// above. Pinned here so a future header-unification fix has a failing
+    /// test to flip, not a silent behavior change.
+    #[test]
+    fn header_verbatim_reproduction_is_streaming_only_2795() -> Result<()> {
+        // Real yq: "# lead\n\na: 1\n" (keeps the blank line and the marker).
+        assert_eq!(yq_p(".", "# lead\n\na: 1\n", &[])?, "# lead\na: 1\n");
+        assert_eq!(yq_p(".", "---\na: 1\n", &[])?, "a: 1\n");
         Ok(())
     }
 }

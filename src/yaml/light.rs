@@ -6974,6 +6974,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn is_document_content(&self) -> bool {
+        YamlCursor::is_document_content(self)
+    }
+
+    #[inline]
     fn document_has_aliases(&self) -> bool {
         self.index.has_aliases()
     }
@@ -7025,6 +7030,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn foot_comment(&self) -> Vec<String> {
         YamlCursor::foot_comment(self)
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[inline]
+    fn head_comment_raw(&self) -> Vec<String> {
+        YamlCursor::head_comment_raw(self)
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[inline]
+    fn foot_comment_raw(&self) -> Vec<String> {
+        YamlCursor::foot_comment_raw(self)
             .map(ToString::to_string)
             .collect()
     }
