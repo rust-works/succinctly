@@ -1642,8 +1642,21 @@ practice #2243's own issue text cites for not folding into #2211):
   before the tail check -- and now thread it through the same way, via a shared
   `tail_gap_ok` helper (`document.rs`) extracted in review rather than a third and fourth
   hand-copy of the `container_tail_gap_ok`/`child_tail_gap_ok` dispatch. Only the true top
-  level (`to_owned`'s and `to_owned_canonicalizing_numbers`'s own depth-0 entry points, no
-  cursor to give) keeps the gap, matching `eval_generic.rs`'s own residual scope above.
+  level (`to_owned`'s own depth-0 entry point, no cursor to give) keeps the gap, matching
+  `eval_generic.rs`'s own residual scope above.
+
+  **Update (#2781, yq mode)**: `to_owned_canonicalizing_numbers`'s own depth-0 entry point
+  -- the true-top-level exception this note originally named alongside `to_owned`'s -- is
+  closed. `parse_input`'s JSON arm (`yq_runner.rs`, the only caller reaching this
+  materializer, for `--slurp`/`--eval-all`/`--inplace --input-format json`) already held the
+  root cursor and simply was not threading it through; `to_owned_canonicalizing_numbers`
+  is now folded into `to_owned_canonicalizing_numbers_at_depth`, whose `cursor` parameter is
+  a bare `&V::Cursor` (no longer `Option`) since every call site in that file has one.
+  `to_owned`'s own top-level gap (jq mode, `eval.rs`/`eval_generic.rs`) is untouched by
+  #2781 -- currently not independently reachable there (parser-level validation intercepts
+  a top-level `[,]`/`{,}` before `to_owned` runs on every route probed), but that is
+  incidental protection from a different layer, not a guarantee `to_owned_at_depth`'s own
+  signature enforces the way `to_owned_canonicalizing_numbers_at_depth`'s now does.
 - **#2263**: `jq_runner.rs` still carries its own independent, hand-copied
   `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
   a cleanup, not a behavior gap, but the same "duplicated predicates diverge
