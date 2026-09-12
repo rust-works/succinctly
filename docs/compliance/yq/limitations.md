@@ -990,10 +990,30 @@ token through to `ParseFloat`, not because `ParseFloat` itself would reject them
 Applied at every scalar *value* position the JSON-sourced parser reaches — flow-sequence
 item, flow-mapping value, and bare block/top-level scalar — under the same `json_strict`
 flag #2279 introduced, so `a`, `True`, `.5`, `1e999` are rejected identically whether nested
-in `[...]`, in `{"k": ...}`, or standing alone as the whole document. A bare top-level
-`key: value` (no enclosing `{}`) and a bare `- item` (no enclosing `[]`) are rejected
-structurally at the same point — the reference's token scanner never reaches YAML's block
-grammar at all, since it has no spelling for it.
+in `[...]`, in `{"k": ...}`, or standing alone as the whole document.
+
+Alongside scalar-grammar validation, four YAML-only *structural* tokens are rejected the
+same way, because none of them have a JSON spelling at all regardless of what text follows
+them — real yq's token scanner refuses the byte itself, never reaching a "value" to
+validate:
+
+- A bare top-level `key: value` (no enclosing `{}`) or `- item` (no enclosing `[]`) —
+  rejected at `parse_block_node`'s single chokepoint for every illegal value-start byte,
+  which also covers `?`/`&`/`!`/`*`/`'` uniformly rather than each needing its own arm.
+- `?` (the explicit-key indicator), in *both* the block-context and flow-mapping (`{? "a":
+  1}`) spellings — a structural rejection of the marker itself, not a key-grammar check, so
+  it stays in scope even though mapping-key *text* grammar (#2777) does not.
+- `&anchor`/`!!tag` prefixing any value — real yq errors on the prefix byte before it would
+  ever reach a scalar, an anchor, or a nested container behind it, so `&x True`, `&x 'y'`,
+  and even this fix's own new `&x - 1` structural rejection are all refused uniformly.
+- `--- |`/`--- >` (a block-scalar indicator right after a document marker) — this shape
+  bypasses the ordinary block dispatcher via its own dedicated fast path
+  (`parse_inline_document_value`), so it needed its own separate gate alongside the
+  chokepoint above.
+
+An implicit single-pair mapping inside a JSON *array* (`[a: 1]`, `["a":1]`) is rejected the
+same way, in `parse_flow_sequence_inner` — a JSON array element is a value, never a `key:
+value` pair, so the whole construct errors before the key's own text is even examined.
 
 **Mapping *keys* are exempt — deliberately, not an oversight.** Real yq's own JSON decoder
 *panics* (does not cleanly error) on a non-string key — `{1:1}`, `{true:1}` both crash with
@@ -1002,13 +1022,8 @@ ADR-0018 rule 4(c), succinctly does not reproduce a reference panic; `{"1":1}` (
 existing behavior for a numeric-looking key) is unchanged. Key *delimiter* and *quoting*
 rules (e.g. real yq also rejects an unquoted or single-quoted key, `{a:1}`/`{'a':1}`, which
 succinctly still accepts) are the mapping-key half of #2777, not this issue — #2778 only
-ever touches what a scalar *value* token may spell.
-
-**Anchor/tag-prefixed content is untouched.** `&anchor`/`!!tag` have no JSON spelling at
-all, so real yq's front end would reject them before ever reaching a scalar to validate —
-but this is unobserved territory (not in the pinned matrix) and this fix does not attempt
-it; a document reaching a scalar through an anchor/tag prefix parses exactly as it did
-before #2778.
+ever touches what a scalar *value* token may spell, plus the four structural, key-agnostic
+rejections above.
 
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far

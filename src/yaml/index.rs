@@ -152,16 +152,19 @@ impl YamlIndex<Vec<u64>> {
     /// pairing the parse with [`mark_json_sourced`](Self::mark_json_sourced)
     /// so the two can never drift apart (#2279).
     ///
-    /// Prefer this over `build` + `mark_json_sourced`: the flow-sequence
-    /// delimiter rules real yq enforces for `-p json` (`[1,]`, `[,1]`,
-    /// `[1,,2]`) can only be applied while parsing, so a caller that marks
-    /// the index afterwards has already accepted the malformed input. See
-    /// `Parser::json_strict` for the exact scope — flow sequences only,
-    /// never flow mappings, never scalar grammar.
+    /// Prefer this over `build` + `mark_json_sourced`: the JSON grammar
+    /// rules real yq enforces for `-p json` (flow-sequence delimiters
+    /// `[1,]`/`[,1]`/`[1,,2]` (#2279); scalar grammar at every value
+    /// position, `True`/`.5`/`+1`/a bare `- 1`/`a: 1` (#2778)) can only be
+    /// applied while parsing, so a caller that marks the index afterwards
+    /// has already accepted the malformed input. See `Parser::json_strict`
+    /// for the exact scope — delimiters: sequences only, never mappings;
+    /// scalar grammar: values only, never keys, never anchor/tag-prefixed
+    /// content.
     ///
     /// # Errors
     ///
-    /// As [`build`](Self::build), plus the JSON flow-sequence delimiter
+    /// As [`build`](Self::build), plus the JSON delimiter and scalar-grammar
     /// violations above, which that function accepts.
     pub fn build_json_sourced(yaml: &[u8]) -> Result<Self, YamlError> {
         let mut index = Self::from_semi_index(yaml, build_semi_index_json_strict(yaml)?)?;
