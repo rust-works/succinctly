@@ -47091,6 +47091,97 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
     Ok(())
 }
 
+/// #2852: `--preserve-input` must also preserve number spelling on the
+/// materializing `-S`/`-a`/`-C`/`-s` routes, not just the default `-c`
+/// cursor-streaming path (`test_preserve_input_still_echoes_raw_number_text`
+/// pins that one). Two independent root causes, both fixed together here:
+/// `format_json`/`JsonFormatOpts` had no jq_compat/preserve split at all
+/// (`-S`/`-a`/`-C`'s own *output*-formatting call), and
+/// `evaluate_input_streaming`'s input-side reindex round-trip always called
+/// the unconditionally-reformatting `OwnedValue::to_json()` (`--slurp` and
+/// any query touching `input`/`inputs`, both of which must materialize the
+/// whole document before the filter runs).
+#[test]
+fn test_preserve_input_number_spelling_survives_materializing_routes_2852() -> Result<()> {
+    let input = r#"{"a":1e-3}"#;
+
+    // `-S`/`-a`, alone and combined -- both route through
+    // `write_output_jq_value`'s `format_json` call.
+    for args in [vec!["-a"], vec!["-S"], vec!["-S", "-a"]] {
+        let mut full_args = args.clone();
+        full_args.push("-c");
+        full_args.push("--preserve-input");
+        let (out, code) = run_jq_stdin(".", input, &full_args)?;
+        assert_eq!(code, 0, "args={args:?}");
+        assert_eq!(out.trim_end(), r#"{"a":1e-3}"#, "args={args:?}");
+    }
+
+    // `-C` takes the identical `format_json` call but wraps the result in
+    // ANSI color codes, so check containment rather than an exact match.
+    let (out, code) = run_jq_stdin(".", input, &["-C", "-c", "--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("1e-3"), "lost the source spelling: {out:?}");
+    assert!(!out.contains("0.001"), "reformatted the number: {out:?}");
+
+    // `-s`/`--slurp` -- routes through `write_output`, which shares the
+    // same `format_json`, but before this fix the *input* to the evaluator
+    // was already reformatted by the time the filter ran.
+    let (out, code) = run_jq_stdin(".[0]", input, &["-c", "--slurp", "--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"{"a":1e-3}"#);
+
+    // The same reindex bug also reached the outer document under a bare
+    // `input`/`inputs` call (without `--slurp`) -- see the dedicated
+    // multi-file test below for that shape.
+
+    // Without `--preserve-input`, all of the above still reformat --
+    // regression guard against accidentally making preserve the default.
+    let (out, code) = run_jq_stdin(".", input, &["-a", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"{"a":0.001}"#);
+    let (out, code) = run_jq_stdin(".[0]", input, &["-c", "--slurp"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"{"a":0.001}"#);
+
+    Ok(())
+}
+
+/// #2852: the `input`/`inputs`-builtin reindex gap specifically, across two
+/// real files -- the outer document (read via `.`, materialized directly by
+/// `evaluate_input_streaming`) used to reformat under `--preserve-input`
+/// even though a *second* document read via the `input` builtin itself
+/// never did (that one resolves from an already-materialized queue that
+/// never reindexes through `OwnedValue::to_json()` at all).
+#[test]
+fn test_preserve_input_outer_document_survives_input_builtin_reindex_2852() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let file1 = dir.path().join("doc1.json");
+    let file2 = dir.path().join("doc2.json");
+    std::fs::write(&file1, r#"{"a":1e-3}"#)?;
+    std::fs::write(&file2, r#"{"b":2e-3}"#)?;
+
+    let (out, _stderr, code) = run_jq_full(
+        &[
+            "-a",
+            "-c",
+            "--preserve-input",
+            "., input",
+            file1.to_str().unwrap(),
+            file2.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {out:?}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        vec![r#"{"a":1e-3}"#, r#"{"b":2e-3}"#],
+        "stdout: {out:?}"
+    );
+
+    Ok(())
+}
+
 /// #2692: **a filter validates only what it materializes**, stated as a
 /// corpus. Every malformed-document class succinctly's checks can detect,
 /// probed through a filter that reads nothing (`try (1+1)`) and through every

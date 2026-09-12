@@ -2173,6 +2173,29 @@ impl OwnedValue {
         )
     }
 
+    /// The `--preserve-input`-aware sibling of [`to_json`](Self::to_json):
+    /// identical except a finite `NumberLiteral` echoes its source spelling
+    /// verbatim instead of jq's own reformatting (#2852).
+    ///
+    /// Used by the non-lazy evaluator's own input-side reindex round-trip
+    /// (`jq_runner.rs`'s `evaluate_input_streaming`, needed for `--slurp`
+    /// and any query using `input`/`inputs`): before this fix, that
+    /// round-trip always called plain [`to_json`](Self::to_json), silently
+    /// reformatting every number in the outer input document regardless of
+    /// `--preserve-input` -- a document read via the `input`/`inputs`
+    /// builtin themselves was unaffected (they resolve from an
+    /// already-materialized queue, never round-tripping through either
+    /// `to_json` variant), only the one input value this function's own
+    /// caller receives directly.
+    pub fn to_json_jq_preserve(&self) -> String {
+        self.to_json_at_depth(
+            0,
+            crate::jq::stream::real_output_finite_literal,
+            jq_bare_float_display,
+            infinite_float_preview_text,
+        )
+    }
+
     /// The yq-mode sibling of [`to_json`](Self::to_json) (#1030): identical
     /// except a finite `NumberLiteral` echoes its document-sourced spelling
     /// verbatim rather than being reformatted per jq's own rules -- real yq

@@ -4482,6 +4482,10 @@ fn output_value<W: Write>(
             },
             json_sourced: config.json_sourced_floats,
             control_escape: ControlEscape::Yq,
+            // Only meaningful alongside `ControlEscape::Jq` -- yq mode has
+            // its own `json_sourced`-gated preserve/reformat split above
+            // and never consults this field.
+            jq_compat: true,
         },
     );
 

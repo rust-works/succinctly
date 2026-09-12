@@ -1757,6 +1757,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         &context,
                         &at,
                         &mut sink,
+                        output_config.jq_compat,
                         &mut |sink, result| {
                             had_output = true;
                             if args.exit_status {
@@ -2245,6 +2246,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     &context,
                     &ErrorAt::Live(&locations),
                     &mut sink,
+                    output_config.jq_compat,
                     &mut |sink, result| {
                         had_output = true;
                         last_output = Some(result.clone());
@@ -2282,6 +2284,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         &context,
                         &ErrorAt::Live(&locations),
                         &mut sink,
+                        output_config.jq_compat,
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
@@ -2315,6 +2318,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     &context,
                     &at,
                     &mut sink,
+                    output_config.jq_compat,
                     &mut |sink, result| {
                         had_output = true;
                         last_output = Some(result.clone());
@@ -4747,9 +4751,21 @@ fn evaluate_input_streaming(
     _context: &EvalContext,
     at: &ErrorAt<'_>,
     sink: &mut ErrorSink,
+    jq_compat: bool,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
 ) -> Result<()> {
-    let json_str = input.to_json();
+    // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
+    // spelling -- before this, every call site here reindexed through it
+    // unconditionally, silently reformatting this one input value's own
+    // numbers regardless of `--preserve-input` (a document read via the
+    // `input`/`inputs` builtin themselves was unaffected, since those
+    // resolve from an already-materialized queue that never reaches this
+    // function or either `to_json` variant).
+    let json_str = if jq_compat {
+        input.to_json()
+    } else {
+        input.to_json_jq_preserve()
+    };
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
@@ -6964,6 +6980,11 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         // `JsonFormatOpts::json_sourced`'s own doc comment) -- jq mode
         // never consults it.
         json_sourced: false,
+        // #2852: was missing entirely, so `-S`/`-a`/`-C`/`-s` always
+        // reformatted a `NumberLiteral` regardless of `--preserve-input`,
+        // disagreeing with `print_json`'s `JqCompatFormatter`/
+        // `PreserveFormatter` split on the default `-c` route.
+        jq_compat: config.jq_compat,
     };
     let json = output::format_json(value, &opts);
 

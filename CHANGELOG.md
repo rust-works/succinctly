@@ -127,6 +127,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq --preserve-input` no longer silently reformats number
+  spelling under `-S`/`-a`/`-C`/`-s`** (#2852). `--preserve-input` is
+  documented to echo a document's numbers exactly as written (`4e4` stays
+  `4e4`, never `40000`) — true for the default `-c`/pretty route, but not for
+  these four flags, which all force a materializing route with its own
+  formatting logic.
+
+  Two independent root causes, both fixed together: `format_json`/
+  `JsonFormatOpts` (`-S`/`-a`/`-C`'s own *output*-formatting call in
+  `write_output_jq_value`) had no `jq_compat`/preserve split on a
+  `NumberLiteral` at all — it always reformatted, regardless of the flag.
+  `JsonFormatOpts` gained a new `jq_compat: bool` field, mirroring how its
+  existing `json_sourced` field is only meaningful for yq mode.
+
+  Separately, `evaluate_input_streaming` (needed for `-s`/`--slurp` and any
+  query using `input`/`inputs`, both of which must materialize the whole
+  input document before the filter can run) always reindexed the outer input
+  value through the unconditionally-reformatting `OwnedValue::to_json()`
+  before evaluation even started — so the number was already reformatted by
+  the time the filter ran, independent of the first fix. A *second* document
+  read via the `input`/`inputs` builtin itself was never affected: those
+  resolve from an already-materialized queue that never reaches either
+  `to_json` variant, only the one input value `evaluate_input_streaming`'s
+  caller hands it directly (confirmed live: `jq --preserve-input -a '.,
+  input' a.json b.json` reformatted `a.json`'s numbers but not `b.json`'s).
+  A new `OwnedValue::to_json_jq_preserve()` — the jq-mode sibling of the
+  existing yq-mode `to_json_yq()` — closes that half.
+
 - **`succinctly jq -e`, and `-S`/`-a`/`-C`, no longer leak a raw Rust panic
   backtrace to stderr on deeply-nested input** (#2850). The exit code (5) and
   final diagnostic (`nesting depth exceeds limit of N`) were always correct
