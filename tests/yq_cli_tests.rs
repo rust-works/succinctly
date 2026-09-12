@@ -18486,6 +18486,34 @@ fn test_bare_break_outside_label_reports_error() -> Result<()> {
     Ok(())
 }
 
+/// #2687: `label`/`break`/`def` are all ungated succinctly extensions in yq
+/// mode (real yq v4.53.3 rejects all three at its lexer) -- extension-on-
+/// extension, no oracle, but the same fix applies here since `yq_runner`
+/// runs the identical `resolve_func_calls` pass. Mirrors
+/// `test_break_desugars_to_a_shadowable_error_call_2687` in
+/// `jq_cli_tests.rs`.
+#[test]
+fn test_yq_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
+    let doc = "a: 1\n";
+    for (filter, want) in [
+        (
+            r#"def error: "S"; label $out | (1, break $out, 3)"#,
+            "1\n\"S\"\n3",
+        ),
+        (r#"def error(m): "S1"; label $out | 1, break $out"#, "1"),
+        (r"label $out | (1, break $out, 3)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#2687: `{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "#2687: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // --split-exp Tests (#715)
 // ============================================================================

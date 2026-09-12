@@ -7316,6 +7316,59 @@ fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
     Ok(())
 }
 
+/// #2687: real jq does not treat `break` as a primitive -- it desugars
+/// `break $x` into a *named call* to `error/0`, resolved through ordinary
+/// lexical scope. A `def error:` (arity 0) in scope at the break's own
+/// position therefore shadows it: the label stops catching it, the def's
+/// value becomes an ordinary extra output, and evaluation continues past
+/// the break instead of unwinding. Every row verified live against jq
+/// 1.7.1.
+#[test]
+fn test_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
+    for (filter, want_stdout) in [
+        // Basic shadowing: the def's value replaces the break, evaluation
+        // continues past it.
+        (
+            r#"def error: "S"; label $out | (1, break $out, 3)"#,
+            "1\n\"S\"\n3\n",
+        ),
+        // An arity-1 `def error(m):` does not shadow a bare (arity-0) break.
+        (r#"def error(m): "S1"; label $out | 1, break $out"#, "1\n"),
+        // Scope is resolved at the break's own position, not the label's --
+        // a def declared only inside the label body shadows.
+        (r#"label $out | (def error: "S"; break $out)"#, "\"S\"\n"),
+        // The shadowing def's value is an ordinary output, not an error --
+        // nothing here for `try`/`catch` to catch.
+        (
+            r#"def error: "S"; try (label $out | break $out) catch "C""#,
+            "\"S\"\n",
+        ),
+        // Shadowing reaches a break wherever it's reached from, including
+        // through `repeat`/`limit`.
+        (
+            r#"def error: "S"; label $out | [limit(3; repeat(break $out))]"#,
+            "[\"S\",\"S\",\"S\"]\n",
+        ),
+        // With no `def error` anywhere in the program, behavior is
+        // unchanged from before this fix.
+        (r"label $out | (1, break $out, 3)", "1\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want_stdout, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // `error/1` (a def taking an argument) is unaffected -- jq's desugaring
+    // is specifically to the zero-arg call.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"def error: "S"; error("x")"#], Some("null"))?;
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
 #[test]
 fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
     // A `break $label` raised from inside `while`/`foreach`/`repeat`'s
