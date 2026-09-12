@@ -42923,6 +42923,34 @@ fn test_slice_bound_not_ruled_on_without_a_sliceable_target_2546() -> Result<()>
     Ok(())
 }
 
+/// #2546: a bound that resolves to an undecodable document string (a lone
+/// surrogate escape, which real jq rejects at parse time -- no oracle row,
+/// this is #1746's own rule: raise, never substitute `""`) is the bound
+/// generator's own escape, raised through `pull_slice_bound_generic`'s
+/// decode-failure arm after the pairs already sliced are delivered:
+/// `.a[(0,.k):]` prints `[1,2,3]` for the `0` bound, then raises on `.k`;
+/// a single undecodable bound raises with no output at all.
+#[test]
+fn test_slice_bound_decode_failure_is_the_generator_escape_2546() -> Result<()> {
+    let doc = r#"{"a":[1,2,3],"k":"\ud800"}"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a[(0,.k):]"], Some(doc))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n");
+    assert!(
+        stderr.contains("invalid unicode escape sequence"),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a[.k:]"], Some(doc))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("invalid unicode escape sequence"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2546 on the bridge route: `--slurp` forces `eval::eval_slice_expr`
 /// (the CLI's ordinary cursor path hits `eval_generic::eval_slice_expr`
 /// instead), so the same rewrite is confirmed on both twins -- laziness,
