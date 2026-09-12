@@ -1541,11 +1541,15 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // (also excluded, conservatively), a later result's failure could
     // follow already-written earlier ones, and falling back would
     // duplicate them.
-    // #2662: `evaluate_m2_fast_path` takes `sort_keys` directly (already
-    // correct on this path), but has no `color`/`ascii` handling of its
-    // own -- `color_output` and `ascii_output` route to the general lazy
-    // path below instead, which applies both (the latter via
-    // `AsciiEscapeWriter` at its own call site).
+    // #2662: `evaluate_m2_fast_path` takes `sort_keys` directly -- its
+    // handling was already correct, just newly *exercised* here for the
+    // first time, since `sort_keys` could never reach this gate before
+    // (the outer `can_use_lazy_path` excluded it outright). It has no
+    // `color`/`ascii` handling of its own, though: `color_output` and
+    // `ascii_output` route to the general lazy path below instead, which
+    // applies both by materializing the one output value and reusing
+    // `format_json`'s existing `ascii`/color options (see
+    // `write_output_jq_value`'s own comment on that branch).
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
         && !output_config.raw_output
@@ -1720,12 +1724,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // here too, sending every `-S`/`-C`/`-a` invocation to the
     // materializing path below (which validates the whole document before
     // the filter runs, #2103's own divergence from the default route).
-    // None of the three actually need materialization: `write_output_jq_value`
-    // already handles `sort_keys`/`color_output` itself (materializing just
-    // the *output* value, not the input), and `ascii_output` is applied by
-    // wrapping its writer in `AsciiEscapeWriter` at the one lazy-path call
-    // site below, the way `yq_runner.rs` already does for its own streaming
-    // routes (#1700).
+    // None of the three actually need materialization of the *input*:
+    // `write_output_jq_value` materializes just the one *output* value
+    // when any of the three is set, reusing `format_json`'s existing
+    // `sort_keys`/`ascii`/color options (already correct on the
+    // pre-existing DOM route) rather than a separate streaming-writer
+    // mechanism -- unlike `yq_runner.rs`'s own `AsciiEscapeWriter`
+    // wrapping (#1700) for its M2 streamers, which this file does not use
+    // at all (`print_json`'s `Out` is bound to `std::io::Write`, not the
+    // `core::fmt::Write` `AsciiEscapeWriter` implements, so reusing it here
+    // would need its own adapter -- not attempted by this change).
     let can_use_lazy_path = !args.slurp
         && !args.raw_input
         && args.input_dsv.is_none()
@@ -5505,29 +5513,35 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // confirmed live against jq 1.7.1: `-acr '"café"'` prints `"café"`,
     // quoted and escaped, not the unquoted raw string `-r` alone would give.
     // `-a` on a non-string value (`-ar '42'` -> `42`) is unaffected, since
-    // `raw_str` is `None` there regardless. Skipping the raw branch here
+    // `as_str()` is `None` there regardless. Skipping the raw branch here
     // (rather than escaping its content in place) reproduces that exactly:
     // falls through to the quoted/escaped write below, the same as if `-r`
     // had never been passed.
-    let raw_str = if config.raw_output && !config.ascii_output {
+    //
+    // `as_str` is resolved once, gated only on `raw_output` (not also
+    // `ascii_output`), and reused for both the `--seq` decision below and
+    // the raw-content decision just after -- computing it twice would
+    // decode the same string twice for no reason. The two *uses* of it
+    // still differ deliberately: `--seq`'s RS-suppression must key on
+    // whether this value *would have been* raw-shaped by `-r` alone (a
+    // string, full stop), not on whether `-a` went on to override that
+    // shaping -- confirmed live against jq 1.7.1, which suppresses the RS
+    // byte for `--seq -acr` on a string exactly as it does for plain
+    // `--seq -r`, even though the printed bytes are quoted+escaped either
+    // way. Keying it off the post-override `raw_str` instead (this
+    // function's first cut at the `-a`-wins fix) emitted a spurious RS byte
+    // under `--seq -a -r`, contradicting the reference.
+    let as_str = if config.raw_output {
         value.as_str()
     } else {
         None
     };
+    let was_raw_shaped = as_str.is_some();
+    let raw_str = if config.ascii_output { None } else { as_str };
     if let Some(s) = &raw_str {
         reject_raw_output0_nul(s, config)?;
     }
-
-    // #1913: see `should_write_seq_separator`'s own doc comment. This is
-    // `write_output_jq_value`'s copy of the identical fix in `write_output`
-    // below -- currently dead in practice, since this function's only call
-    // site is gated by `can_use_lazy_path`, which already excludes
-    // `args.seq` entirely (`--seq` always takes the materializing path
-    // through `write_output` instead). Kept anyway as a correctness
-    // guarantee that doesn't depend on that gate staying in place: if a
-    // future change ever let `--seq` reach the lazy path, this would
-    // already be right instead of silently reintroducing #1913.
-    if should_write_seq_separator(config, raw_str.is_some()) {
+    if should_write_seq_separator(config, was_raw_shaped) {
         out.write_all(&[ASCII_RS])?;
     }
 
@@ -5641,10 +5655,12 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     // sibling fix). A single RS write below then covers both the raw and
     // non-raw cases, rather than one copy per branch.
     //
-    // #2662: `--ascii-output` wins over `-r`/`-j` for a *string* value, the
-    // same as `write_output_jq_value`'s sibling fix above -- see that
-    // comment for the live jq 1.7.1 confirmation.
-    let raw_str = if config.raw_output && !config.ascii_output {
+    // #2662: `--ascii-output` wins over `-r`/`-j` for a *string* value, and
+    // `--seq`'s RS-suppression keys on the pre-override `-r` shape, not the
+    // post-override write -- both the same as `write_output_jq_value`'s
+    // sibling fix above, see that comment for the live jq 1.7.1
+    // confirmation and the `--seq -acr` regression it closes.
+    let as_str = if config.raw_output {
         match value {
             OwnedValue::String(s) => Some(s.as_str()),
             _ => None,
@@ -5652,12 +5668,13 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     } else {
         None
     };
+    let raw_str = if config.ascii_output { None } else { as_str };
     if let Some(s) = raw_str {
         reject_raw_output0_nul(s, config)?;
     }
 
     // #1913: see `should_write_seq_separator`'s own doc comment.
-    if should_write_seq_separator(config, raw_str.is_some()) {
+    if should_write_seq_separator(config, as_str.is_some()) {
         out.write_all(&[ASCII_RS])?;
     }
 
