@@ -443,12 +443,19 @@ struct Parser<'a> {
     /// wrong-arity call is an `Expr::FuncCall` -- no `Builtin` at all -- so
     /// an arm that has already parsed its arguments and then finds the
     /// boundary wrong ([`Self::builtin_wrong_arity_or_expect`]) has nowhere
-    /// to return it. It parks it here and answers `Ok(None)`, the same "not
-    /// this builtin after all" signal [`Self::parse_required_single_arg`]'s
-    /// rewind already uses; `parse_primary_inner`'s `Ok(None)` arm takes it
-    /// instead of re-parsing the call from source.
+    /// to return it. It parks it here and answers `Ok(None)`; `parse_primary_
+    /// inner`'s `Ok(None)` arm takes it instead of re-parsing the call from
+    /// source.
     ///
-    /// Always `None` between calls: the arm returns immediately after
+    /// #2749: [`Self::parse_required_single_arg`]'s own trailing-`)`
+    /// checkpoint is a second, direct writer into this same field (via
+    /// `builtin_wrong_arity_or_expect::<Expr>`, the same generic helper
+    /// genericized over its answer type for exactly this) -- not merely an
+    /// external caller mimicking the signal, as it was before that fix; only
+    /// that function's *first* checkpoint (no `(` at all) still rewinds
+    /// without touching this field.
+    ///
+    /// Always `None` between calls: every writer returns immediately after
     /// parking, and the sole caller takes it as the first thing it does.
     wrong_arity_call: Option<Expr>,
 }
@@ -3152,9 +3159,12 @@ impl<'a> Parser<'a> {
     }
 
     /// The `Expr`-returning counterpart of
-    /// [`Self::zero_arity_or_wrong_arity_call`]/
-    /// [`Self::parse_required_single_arg`]'s shared "detected wrong arity,
-    /// rewind and delegate" tail, for the dedicated-parse-function family
+    /// [`Self::zero_arity_or_wrong_arity_call`]'s "detected wrong arity,
+    /// rewind and delegate" shape -- also still how
+    /// [`Self::parse_required_single_arg`]'s *first* checkpoint (no `(` at
+    /// all) resolves a wrong-arity call; its *second* checkpoint no longer
+    /// rewinds at all as of #2749, see [`Self::wrong_arity_call`] -- for the
+    /// dedicated-parse-function family
     /// (`parse_range_expr`, `parse_first_expr`, `parse_limit_expr`, ...)
     /// that returns `Expr` directly rather than going through
     /// [`Self::try_parse_builtin`]'s `Option<Builtin>` fallback protocol
