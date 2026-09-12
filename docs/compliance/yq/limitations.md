@@ -3665,15 +3665,13 @@ ruled out), even though real yq supports every one of them:
 - **`tag =`, `head_comment =`, `foot_comment =`, `comments =`** raise `<slot> = ... is not
   yet supported`. Real yq's `.a tag = "!!str"` coerces the value's type, `.a head_comment
   = "hi"`/`.a foot_comment = "bye"` insert standalone comment lines, and `.a comments =
-  "x"` sets head, line and foot together. None has a write mechanism here yet, though the
-  reason has changed since this entry was written: `NodeMeta` (`src/jq/eval_generic.rs`)
-  still has no tag slot (#747), but head/foot comments *do* now have a backing field —
-  `NodeComments { head, line, foot }` (#2690), which the parser populates (#2704, #2718)
-  and the `head_comment`/`foot_comment` getters read (#2758). What is still missing on the
-  write side is the other half of that pipeline: `NodeMeta.head_foot_comment` is `None` at
-  every construction site and the DOM emitter renders no head/foot lines (the streaming
-  emitter does since #2795), so a write would have nowhere to land and nothing to print
-  it. See the identity-round-trip entry below.
+  "x"` sets head, line and foot together. None has a write mechanism here yet: `NodeMeta`
+  (`src/jq/eval_generic.rs`) still has no tag slot (#747), and — though #2795 PR B (below)
+  closed the *read-and-print* half, `NodeMeta.head_foot_comment` is now populated from the
+  parsed document and both emitters print it — there is still no way for a filter to
+  *write* a new head/foot value that didn't already exist in the source: `head_comment =`/
+  `foot_comment =`/`comments =` would need their own write mechanism into `CommentTree`,
+  which this issue didn't add. See the identity-round-trip entry below.
   Remaining: the write forms (`comments =`/`comments |=`) and `...` recursive descent in yq
   mode; cross-link #1079/#1080/#1085 above.
 - **`style = "literal"`/`"folded"`/`"tagged"`** raise `style = "<name>" is not yet
@@ -3746,17 +3744,36 @@ Three narrower residuals of the same fix, each captured live from v4.53.3:
   itself stands on) and `0` here. Only the key-node case is answered, because only it is
   what `key` emits.
 
-### Standalone comments print on the streaming route only, so far (#2795, #798)
+### Standalone comments print on both routes now (#2795, #798)
 
-The parser captures head/foot comments and the getters read them (#2758); since #2795 the
-*streaming* emitter (`stream_yaml_value_at`/`stream_yaml_as_document`, `src/yaml/light.rs`)
-prints them too — the route plain `yq '.'`, `select(true)` and every other cursor-forwarded
-result take. On `# lead\na: 1\n# mid\nb: 2\n\n# trail\n`, real yq and succinctly now
-agree byte-for-byte on `.` and `select(true)`; `-o=json` drops them in both, correctly.
-The **DOM** emitter (`emit_yaml_value_at_depth`, `yq_runner.rs`) is the other half and is
-still never given head/foot to print, so `-P '.'`, `.a = 5` and `del(.b)` keep dropping
-every standalone comment (real yq keeps them, minus `# mid`, which belongs to the deleted
-key). `NodeMeta.head_foot_comment` is `None` at every construction site until that lands.
+The parser captures head/foot comments and the getters read them (#2758); the *streaming*
+emitter (`stream_yaml_value_at`/`stream_yaml_as_document`, `src/yaml/light.rs`, PR A) and
+the **DOM** emitter (`emit_yaml_value_at_depth`, `yq_runner.rs`, PR B) both print them now.
+On `# lead\na: 1\n# mid\nb: 2\n\n# trail\n`, real yq and succinctly agree byte-for-byte on
+`.`, `select(true)`, `-P '.'`, `.a = 5` and `del(.b)` (which keeps `# lead`/`# trail` but
+drops `# mid`, owned by the deleted key); `-o=json` drops them on both routes, correctly.
+
+`NodeMeta.head_foot_comment` (`src/jq/eval_generic.rs`) is populated by
+`to_owned_with_comments_at_depth`, reading `DocumentCursor::head_comment_raw`/
+`foot_comment_raw` (new trait methods, empty-by-default so JSON pays nothing) off the
+node the parser actually keys head/foot to — the *key* cursor for a mapping entry, not the
+value cursor `to_owned_with_comments_at_depth` otherwise recurses with (`.b | key |
+head_comment` is non-empty, `.b | head_comment` is `""`) — and both
+`reconcile_presentation_at_depth` and `strip_presentation_style_at_depth` already carried
+it through a write for free, via their existing whole-`NodeMeta` clones.
+
+One DOM-route-only residual, not shared with the streaming route: real yq's own root-vs-
+navigated distinction for a bare *scalar* result (a container keeps its head/foot
+regardless of navigation, matching the streaming route's rule below, but a navigated-away
+scalar drops both even though its own cursor may still carry them structurally — e.g. a
+sequence item's scalar value keys head/foot off its own position the same way whether or
+not it's ever reached by navigation). `evaluate_yaml_cursor`'s `owned_with_comments`
+clears them immediately for a non-root scalar cursor (new `DocumentCursor::is_document_content`,
+mirroring `light.rs`'s private method of the same name), and the pre-existing #852
+style/anchor-clearing pass for a bare scalar result now preserves whatever head survives
+that gate while always dropping foot (matching the streaming route's own root-only
+asymmetry below). Pinned by `dom_standalone_comments_2795`
+(`tests/yq_cli_tests.rs`).
 
 What the streaming route reproduces, all measured against pinned v4.53.3:
 
@@ -3770,10 +3787,19 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   a `---` marker — is re-emitted verbatim in front of the first document whenever the
   result is that document itself (`# lead\n\na: 1` keeps its blank; `---\na: 1` and
   `%YAML 1.2\n---\na: 1` keep their markers; `-N` drops the markers, as in yq; `.a` prints
-  no header). `--header-preprocess=false` itself is not implemented;
+  no header). `--header-preprocess=false` itself is not implemented. **DOM-route-only
+  gap (#2795 PR B):** this verbatim byte-range mechanism is streaming-only — the DOM route
+  only carries structured head/foot *comment lines* through `CommentTree`, not the raw
+  header text, so a blank line or a `---`/`%YAML` marker in the header block does not
+  survive `-P`/a write (`# lead\n\na: 1\n` under `-P '.'` prints `# lead\na: 1\n`, dropping
+  the blank; a bare `---\na: 1\n` drops the marker entirely). Plain leading `#` comment
+  lines with no blank line or marker between them are unaffected. Pinned by
+  `header_verbatim_reproduction_is_streaming_only_2795`
+  (`tests/yq_cli_tests.rs`), so a future header-unification fix has a test to flip rather
+  than a silent behavior change to notice;
 - a scalar root prints its head and *drops* its foot, a flow or block collection root
   prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers
-  `foot`).
+  `foot`). The DOM route reproduces this asymmetry too (#2795 PR B).
 
 Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
 
@@ -3807,8 +3833,13 @@ a `foot_comment` (of the key whose value the sequence is, or of the next outer i
 the sequence is nested straight inside an item) while the rest go forward, or at end of
 document all of them become the root's `foot_comment`. The parser now attributes these
 the way yq reports them, so the getters agree (`- # c\n- 2\n` answers `c` for
-`.[1] | head_comment` and nothing for `.[0] | line_comment`), but the identity output
-still drops them until this entry's emitter work lands. One placement is a recorded
+`.[1] | head_comment` and nothing for `.[0] | line_comment`), and both emitters now print
+the floated comment itself in the right place (#2795 PR A/B) — `- # c\n- 2\n` prints its
+`# c` between the two items on both routes. A separate, pre-existing, unrelated gap
+remains on the item's own *value*: real yq prints a bare `-` for the absent item (`-\n#
+c\n- 2\n`), while succinctly's DOM route materializes it as an explicit `null` (`- null\n#
+c\n- 2\n`) — an `OwnedValue` representation gap, nothing to do with comment placement, out
+of scope here. One placement is a recorded
 divergence, not a gap: real yq *drops* every floated comment but the last when a
 sequence holding several closes to an outer item or to end of input inside a mapping
 (`- k:\n  - # c\n  - # d\n- 2\n` keeps only `d`), which ADR-0018 rule 4 forbids

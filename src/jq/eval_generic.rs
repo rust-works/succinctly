@@ -1051,16 +1051,16 @@ pub struct NodeMeta {
     /// This node's `&anchor`/`*alias` syntax (issue #763), or `None` if it
     /// carried neither.
     pub anchor: Option<AnchorMark>,
-    /// Standalone head/foot comment lines (#798 PR2), boxed behind a single
-    /// `Option` rather than kept as two inline `Vec<String>` fields: a
-    /// review of this widening found that the extra ~48 stack bytes of two
-    /// always-empty `Vec`s was enough to make `reconcile_presentation_at_depth`
-    /// overflow the real stack *before* its own `MAX_VALUE_TREE_DEPTH` guard
-    /// could fire (`reconcile_presentation_panics_past_nesting_depth_limit_1005`).
-    /// `None` here costs one pointer and no allocation — exactly the
-    /// "always empty today" state every construction site below sets — and
-    /// only the (still unimplemented) capture work that fills these in pays
-    /// for the `Box`.
+    /// Standalone head/foot comment lines (#798 PR2, populated by #2795 PR
+    /// B), boxed behind a single `Option` rather than kept as two inline
+    /// `Vec<String>` fields: a review of this widening found that the extra
+    /// ~48 stack bytes of two always-empty `Vec`s was enough to make
+    /// `reconcile_presentation_at_depth` overflow the real stack *before*
+    /// its own `MAX_VALUE_TREE_DEPTH` guard could fire
+    /// (`reconcile_presentation_panics_past_nesting_depth_limit_1005`).
+    /// `None` here costs one pointer and no allocation — the shape the
+    /// overwhelmingly common no-standalone-comment node still gets, via
+    /// [`Self::with_head_foot`].
     head_foot_comment: Option<Box<HeadFootComment>>,
 }
 
@@ -1068,14 +1068,27 @@ pub struct NodeMeta {
 /// One entry per standalone `#` line, in source order; consecutive lines
 /// join into one logical block (real yq treats them as one comment either
 /// way, and #1085 needs more than one comment associated with a single node
-/// at all). Always empty today -- capturing these is separate, follow-up
-/// work; this type only prepares a place for that work to write into.
+/// at all).
 #[derive(Debug, Clone, Default)]
 struct HeadFootComment {
     /// Standalone `#` lines directly above the node.
     head: Vec<String>,
     /// Standalone `#` lines directly below the node.
     foot: Vec<String>,
+}
+
+impl HeadFootComment {
+    /// `None` when both `head` and `foot` are empty, else boxed -- the one
+    /// place this "only allocate when there's something to say" rule is
+    /// defined, shared by every [`NodeMeta`] construction site that can
+    /// produce head/foot data (#2795 PR B).
+    fn boxed_if_any(head: Vec<String>, foot: Vec<String>) -> Option<Box<Self>> {
+        if head.is_empty() && foot.is_empty() {
+            None
+        } else {
+            Some(Box::new(Self { head, foot }))
+        }
+    }
 }
 
 impl NodeMeta {
@@ -1104,13 +1117,14 @@ impl NodeMeta {
     }
 
     /// Standalone comment lines directly above this node, in source order
-    /// (#798 PR2). Always empty today -- capturing these is follow-up work.
+    /// (#798 PR2). Populated by [`Self::with_head_foot`]; empty for a node
+    /// with no head comment.
     pub fn head_comment(&self) -> &[String] {
         self.head_foot_comment.as_deref().map_or(&[], |hf| &hf.head)
     }
 
-    /// Standalone comment lines directly below this node (#798 PR2). Always
-    /// empty today -- see [`Self::head_comment`].
+    /// Standalone comment lines directly below this node (#798 PR2). See
+    /// [`Self::head_comment`].
     pub fn foot_comment(&self) -> &[String] {
         self.head_foot_comment.as_deref().map_or(&[], |hf| &hf.foot)
     }
@@ -1139,6 +1153,23 @@ impl NodeMeta {
     pub fn with_style(&self, style: &'static str) -> Self {
         Self {
             style,
+            ..self.clone()
+        }
+    }
+
+    /// This node's own metadata with standalone head/foot comment lines
+    /// replaced, everything else (comment, style, anchor) kept as-is (#798
+    /// PR2). `head_foot_comment` stays private across the bin/lib crate
+    /// boundary for the same reason [`Self::empty_with_anchor`] is a method
+    /// rather than a struct-update literal — see that doc comment.
+    ///
+    /// Boxes only when at least one of `head`/`foot` is non-empty, so the
+    /// (still overwhelmingly common) no-standalone-comment case stays the
+    /// same "one pointer, no allocation" shape every other construction site
+    /// already gets — see the field's own doc comment for why that matters.
+    pub fn with_head_foot(&self, head: Vec<String>, foot: Vec<String>) -> Self {
+        Self {
+            head_foot_comment: HeadFootComment::boxed_if_any(head, foot),
             ..self.clone()
         }
     }
@@ -1396,11 +1427,23 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     } else {
         own_anchor
     };
+    // Standalone head/foot comments (#798 PR2, #2795 PR B): correct as-is
+    // for a scalar, an array element, or the document root, whose own
+    // cursor is exactly the node the parser attaches head/foot to. Wrong
+    // for a mapping field, whose head/foot instead lives on the *key* node
+    // (see `head_comment`'s own doc comment) -- the object arm below
+    // overrides this empty read with `field.key_cursor`'s once it has one.
+    let own_head = cursor
+        .map(DocumentCursor::head_comment_raw)
+        .unwrap_or_default();
+    let own_foot = cursor
+        .map(DocumentCursor::foot_comment_raw)
+        .unwrap_or_default();
     let own_meta = NodeMeta {
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
-        head_foot_comment: None,
+        head_foot_comment: HeadFootComment::boxed_if_any(own_head, own_foot),
     };
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -1424,12 +1467,22 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             // is `pub`, so a future JSON-typed caller silently inherited a
             // walk that accepted `{"a" 1}` -- closing that latent gap.
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-            let (v, c) = to_owned_with_comments_at_depth(
+            let (v, mut c) = to_owned_with_comments_at_depth(
                 &field.value,
                 Some(&field.value_cursor),
                 depth + 1,
                 child_under_alias,
             )?;
+            // Standalone head/foot comments on a mapping entry live on its
+            // *key* node, not its value (#798 PR2, #2795 PR B) -- see
+            // `DocumentCursor::head_comment`'s own doc comment. The generic
+            // read above used `field.value_cursor`, which has none, so this
+            // replaces that (already-empty) read with the key's.
+            let field_head = field.key_cursor.head_comment_raw();
+            let field_foot = field.key_cursor.foot_comment_raw();
+            if !field_head.is_empty() || !field_foot.is_empty() {
+                *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
+            }
             map.insert(key.clone(), v);
             comment_map.insert(key.clone(), c);
             // A comment trailing the key's own line, when the value is

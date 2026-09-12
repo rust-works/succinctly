@@ -3821,7 +3821,24 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // YAML output, which already went through the cursor-aware path.
     let owned_with_comments = |c: &YamlCursor<'_, W>| {
         if need_comments {
-            to_owned_with_comments(&c.value(), Some(c))
+            // A bare scalar result's standalone head/foot only survives
+            // when `c` is the document's own content node (#2795 PR B) --
+            // real yq drops both for a navigated-away scalar (`.a`,
+            // `.items[0]` when item 0 is a scalar) even though a navigated
+            // *container* keeps its own (`.items[0]` when item 0 is a
+            // mapping still prints its head). `to_owned_with_comments`
+            // can't see this by itself: a sequence item's head/foot keys off
+            // its own cursor the same way whether or not that cursor is
+            // ever reached via navigation, so this clears it right after,
+            // before the later unconditional style/anchor-clearing pass
+            // (#852) decides what to keep for a bare scalar.
+            let is_document_root = DocumentCursor::is_document_content(c);
+            to_owned_with_comments(&c.value(), Some(c)).map(|(v, mut comments)| {
+                if !is_document_root && !matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_)) {
+                    *comments.meta_mut() = comments.meta().with_head_foot(Vec::new(), Vec::new());
+                }
+                (v, comments)
+            })
         } else {
             generic_to_owned_cursor(c).map(&no_comments)
         }
@@ -4024,13 +4041,24 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // the whole `NodeMeta` here covers an alias mark too, which
     // `enforce_anchor_soundness` below would drop regardless (see
     // `output_value`'s own note on why a root `*name` is never emittable).
+    //
+    // The standalone *head* comment is the one exception (#2795 PR B): real
+    // `yq` keeps it for the true, unnavigated document root (`. ` on
+    // `# h\n42\n` prints `# h`), even though it drops style and anchor there
+    // too. `owned_with_comments` above already cleared `comments`' head/foot
+    // for every navigated-away scalar, so whatever survives to here is
+    // exactly the root case -- `.with_head_foot` carries it through this
+    // rebuild unchanged. The *foot* is dropped unconditionally instead,
+    // root included (`# h\n42\n# f\n` prints `# h\n42`, live-verified) --
+    // real yq's own asymmetry, not a succinctly gap.
     if let Ok(docs) = &mut docs {
         for (value, comments) in docs.iter_mut() {
             if !matches!(value, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                *comments = CommentTree::Leaf(NodeMeta::from_comment_and_style(
-                    comments.own().map(str::to_string),
-                    "",
-                ));
+                let head = comments.meta().head_comment().to_vec();
+                *comments = CommentTree::Leaf(
+                    NodeMeta::from_comment_and_style(comments.own().map(str::to_string), "")
+                        .with_head_foot(head, Vec::new()),
+                );
             }
         }
     }
@@ -4385,6 +4413,14 @@ fn output_value<W: Write>(
                 _ => rendered,
             }
         };
+        // A root's own standalone head comment (#798 PR2, #2795 PR B) has no
+        // parent call site either, same reasoning as the trailing comment
+        // below — append it here. Unlike the trailing comment, this applies
+        // to every root kind including a bare scalar: verified against the
+        // pinned real `yq` binary, `# lead\n42\n` keeps `# lead` on both the
+        // streaming and DOM routes (the streaming route's own `foot` root
+        // exclusion just below is scalar-only).
+        let body = prepend_head_comment_lines(body, comments.meta().head_comment(), "");
         // Every non-root node's own trailing comment is appended by its
         // *parent* during `emit_yaml_value`'s recursion (see its Array/Object
         // arms), but the root has no parent call site to do that for it —
@@ -4408,11 +4444,17 @@ fn output_value<W: Write>(
         // `yq`'s flow-preserving output, before `CommentTree` carried style
         // data to tell the two cases apart.
         let output = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
-            if is_flow_safe(value, comments) {
+            let with_own_comment = if is_flow_safe(value, comments) {
                 format!("{body}{}", trailing_comment_suffix(comments, ""))
             } else {
                 append_own_comment_line(body, comments.own(), "")
-            }
+            };
+            // A root's own standalone foot comment (#798 PR2, #2795 PR B),
+            // same "no parent call site" reasoning as above -- collection
+            // roots only, matching the streaming route's own scalar-root
+            // exclusion (`# lead\n42\n# foot` keeps `# lead`, drops `# foot`,
+            // live-verified against pinned yq; the getter still answers it).
+            append_foot_comment_lines(with_own_comment, comments.meta().foot_comment(), "").0
         } else {
             body
         };
@@ -4610,6 +4652,65 @@ fn append_own_comment_line(body: String, own_comment: Option<&str>, indent: &str
     }
 }
 
+/// Prepend a node's standalone head comment lines (#798 PR2, #2795 PR B) at
+/// `indent`, one per source line, before `body` — the DOM twin of
+/// `write_head_comments_at`/`write_head_comment_lines` in `light.rs`'s
+/// streaming route. `head` is already raw (`#` and all); an empty entry is a
+/// blank line *within* the head block and is written bare (no indent),
+/// matching [`append_own_comment_line`]'s same per-line convention and the
+/// streaming route's own reproduction of an interior blank line.
+fn prepend_head_comment_lines(body: String, head: &[String], indent: &str) -> String {
+    if head.is_empty() {
+        return body;
+    }
+    let mut out = String::with_capacity(body.len());
+    for line in head {
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out.push_str(&body);
+    out
+}
+
+/// Append a node's standalone foot comment lines (#798 PR2, #2795 PR B) at
+/// `indent`, one per source line, after `body` — the DOM twin of
+/// `write_foot_comments_at`/`write_foot_comment_lines` in `light.rs`'s
+/// streaming route. Returns whether anything was appended, so a caller can
+/// reproduce that route's rule of a blank line between a foot and a
+/// following sibling in the same collection.
+fn append_foot_comment_lines(body: String, foot: &[String], indent: &str) -> (String, bool) {
+    let out = foot.iter().fold(body, |mut acc, line| {
+        acc.push('\n');
+        if !line.is_empty() {
+            acc.push_str(indent);
+            acc.push_str(line);
+        }
+        acc
+    });
+    (out, !foot.is_empty())
+}
+
+/// Join block-mapping/-sequence entries with `"\n"`, inserting one extra
+/// blank line before an entry whose predecessor ended in a foot comment
+/// (#2795 PR B) — the DOM twin of `stream_yaml_value`'s `prev_had_foot`
+/// handling in `light.rs` for the same rule.
+fn join_block_entries(entries: Vec<(String, bool)>) -> String {
+    let mut out = String::new();
+    for (i, (entry, _)) in entries.iter().enumerate() {
+        if i > 0 {
+            if entries[i - 1].1 {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(entry);
+    }
+    out
+}
+
 /// Emit a YAML value as a string, appending each node's trailing same-line
 /// comment from the parallel `comments` tree (issue #710). Flow-style
 /// (`in_flow`) contexts never append one — flow items are comma-joined on
@@ -4736,12 +4837,12 @@ fn emit_yaml_value_at_depth(
                 format!("[{}]", items.join(", "))
             } else {
                 // Block style sequence
-                let items: Vec<_> = arr
+                let items: Vec<(String, bool)> = arr
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
-                        if defers_to_own_block(v, elem_comments) {
+                        let rendered = if defers_to_own_block(v, elem_comments) {
                             // Both arms below share this same 2-column
                             // "compact" offset — the `- ` prefix's own
                             // width, not a full `config.indent_str` step
@@ -4788,54 +4889,55 @@ fn emit_yaml_value_at_depth(
                                 );
                                 let val =
                                     append_own_comment_line(val, elem_comments.own(), &val_indent);
-                                return format!("{indent}- &{anchor}\n{val}");
+                                format!("{indent}- &{anchor}\n{val}")
+                            } else {
+                                // A non-empty mapping/sequence element renders
+                                // in real yq's "compact" form: `- ` shares its
+                                // line with the value's own first field/
+                                // element, and the rest of the value's own
+                                // content aligns under that first line's
+                                // content (`indent` plus the 2-character width
+                                // of `- `), not under `indent` plus a full
+                                // `config.indent_str` step like an ordinary
+                                // nested block (#785).
+                                //
+                                // `emit_yaml_value` derives every line's own
+                                // indent purely from the `indent` string it's
+                                // handed, so rendering the element at
+                                // `compact_indent` and then stripping that
+                                // exact prefix from just the start of the
+                                // result (leaving every subsequent line's own
+                                // copy of the prefix untouched) reproduces the
+                                // "no separate indent for the first line"
+                                // effect `stream_yaml_value`'s cursor-based
+                                // sibling gets for free from its per-field/
+                                // per-element loop only indenting 2nd+ items.
+                                // #1485 (code review): `recursion_base` is
+                                // *this invocation's own* `recursion_base`,
+                                // forwarded unchanged -- see the anchor branch
+                                // above for the full rationale.
+                                let inner = emit_yaml_value_at_depth(
+                                    v,
+                                    elem_comments,
+                                    config,
+                                    &compact_indent,
+                                    false,
+                                    depth + 1,
+                                    recursion_base,
+                                );
+                                // The element's own comment goes on its own
+                                // line rather than glued onto its last
+                                // grandchild's line (#793).
+                                let inner = append_own_comment_line(
+                                    inner,
+                                    elem_comments.own(),
+                                    &compact_indent,
+                                );
+                                let first_line = inner
+                                    .strip_prefix(compact_indent.as_str())
+                                    .unwrap_or(&inner);
+                                format!("{indent}- {first_line}")
                             }
-                            // A non-empty mapping/sequence element renders
-                            // in real yq's "compact" form: `- ` shares its
-                            // line with the value's own first field/
-                            // element, and the rest of the value's own
-                            // content aligns under that first line's
-                            // content (`indent` plus the 2-character width
-                            // of `- `), not under `indent` plus a full
-                            // `config.indent_str` step like an ordinary
-                            // nested block (#785).
-                            //
-                            // `emit_yaml_value` derives every line's own
-                            // indent purely from the `indent` string it's
-                            // handed, so rendering the element at
-                            // `compact_indent` and then stripping that
-                            // exact prefix from just the start of the
-                            // result (leaving every subsequent line's own
-                            // copy of the prefix untouched) reproduces the
-                            // "no separate indent for the first line"
-                            // effect `stream_yaml_value`'s cursor-based
-                            // sibling gets for free from its per-field/
-                            // per-element loop only indenting 2nd+ items.
-                            // #1485 (code review): `recursion_base` is
-                            // *this invocation's own* `recursion_base`,
-                            // forwarded unchanged -- see the anchor branch
-                            // above for the full rationale.
-                            let rendered = emit_yaml_value_at_depth(
-                                v,
-                                elem_comments,
-                                config,
-                                &compact_indent,
-                                false,
-                                depth + 1,
-                                recursion_base,
-                            );
-                            // The element's own comment goes on its own
-                            // line rather than glued onto its last
-                            // grandchild's line (#793).
-                            let rendered = append_own_comment_line(
-                                rendered,
-                                elem_comments.own(),
-                                &compact_indent,
-                            );
-                            let first_line = rendered
-                                .strip_prefix(compact_indent.as_str())
-                                .unwrap_or(&rendered);
-                            format!("{indent}- {first_line}")
                         } else {
                             let val_indent = format!("{indent}{}", config.indent_str);
                             let item = emit_yaml_value_at_depth(
@@ -4850,10 +4952,20 @@ fn emit_yaml_value_at_depth(
                             let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
                             format!("{indent}-{anchor} {item}{comment_suffix}")
-                        }
+                        };
+                        let rendered = prepend_head_comment_lines(
+                            rendered,
+                            elem_comments.meta().head_comment(),
+                            indent,
+                        );
+                        append_foot_comment_lines(
+                            rendered,
+                            elem_comments.meta().foot_comment(),
+                            indent,
+                        )
                     })
                     .collect();
-                items.join("\n")
+                join_block_entries(items)
             }
         }
         OwnedValue::Object(obj) => {
@@ -4891,7 +5003,7 @@ fn emit_yaml_value_at_depth(
                     obj.iter().collect()
                 };
 
-                let items: Vec<_> = entries
+                let items: Vec<(String, bool)> = entries
                     .iter()
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
@@ -4906,7 +5018,7 @@ fn emit_yaml_value_at_depth(
                         // flow-styled container stays on the key's own line
                         // instead, the same as a scalar (#739), and so does
                         // an alias, however large its target (#763).
-                        if defers_to_own_block(v, field_comments) {
+                        let rendered = if defers_to_own_block(v, field_comments) {
                             // A comment trailing the key's own line, when the
                             // value is deferred to the next line, belongs to
                             // the key, not the value (#765).
@@ -4969,10 +5081,20 @@ fn emit_yaml_value_at_depth(
                                 comment_suffix
                             };
                             format!("{indent}{key}:{anchor} {val}{comment_suffix}")
-                        }
+                        };
+                        let rendered = prepend_head_comment_lines(
+                            rendered,
+                            field_comments.meta().head_comment(),
+                            indent,
+                        );
+                        append_foot_comment_lines(
+                            rendered,
+                            field_comments.meta().foot_comment(),
+                            indent,
+                        )
                     })
                     .collect();
-                items.join("\n")
+                join_block_entries(items)
             }
         }
     }
