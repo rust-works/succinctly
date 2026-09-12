@@ -3626,18 +3626,22 @@ the sequence is nested straight inside an item) while the rest go forward, or at
 document all of them become the root's `foot_comment`. The parser now attributes these
 the way yq reports them, so the getters agree (`- # c\n- 2\n` answers `c` for
 `.[1] | head_comment` and nothing for `.[0] | line_comment`), but the identity output
-still drops them until this entry's emitter work lands. Three placements are recorded
-divergences, not gaps: real yq *drops* every floated comment but the last when a
+still drops them until this entry's emitter work lands. One placement is a recorded
+divergence, not a gap: real yq *drops* every floated comment but the last when a
 sequence holding several closes to an outer item or to end of input inside a mapping
 (`- k:\n  - # c\n  - # d\n- 2\n` keeps only `d`), which ADR-0018 rule 4 forbids
-matching — the rest go forward as the next node's head; a tag with no value on the
-item's next line (`- # c\n  !!str\n- 2\n`) drops both tag and comment here where yq
-keeps the tag and floats the comment; and a floated comment whose next sibling is a
-compact mapping or a nested sequence attaches to that item's first key / inner item
-rather than the item itself, the attribution #798's standalone-line capture already has
+matching — the rest go forward as the next node's head instead of being discarded to
+match. Two more are separate, pre-existing gaps, not divergences licensed by that
+rule: a tag with no value on the item's next line (`- # c\n  !!str\n- 2\n`) drops both
+tag and comment here where yq keeps the tag and floats the comment; and a floated
+comment whose next sibling is a compact mapping or a nested sequence attaches to that
+item's first key / inner item rather than the item itself — the same misattribution
+#798's standalone-line capture already has for an ordinary (non-floated) comment
 (`- 1\n# h\n- b: 1\n` is `.[1] | head_comment` in real yq, `.[1].b | key |
-head_comment` here — [#2811](https://github.com/rust-works/succinctly/issues/2811)). Blank lines in any of these shapes are unmodelled on both sides
-(yq keeps a `\n` inside the slot value and reorders).
+head_comment` here), neither introduced by nor fixable within this entry, tracked as a
+follow-up in [#2811](https://github.com/rust-works/succinctly/issues/2811). Blank
+lines in any of these shapes are unmodelled on both sides (yq keeps a `\n` inside the
+slot value and reorders).
 
 Four known gaps this write shares with every other write form, none specific to #798:
 
