@@ -130,6 +130,29 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
     None
 }
 
+/// Extract a module's function definitions and stamp every `$__loc__` in
+/// each def's body with that module's own canonical (symlink-resolved)
+/// path (#2774) -- confirmed live against jq 1.7.1, and the same shape a
+/// `resolved_path` reaches this function through either way: an
+/// `include`d/`import`ed module (via [`resolve_module_in`]) or `~/.jq`
+/// (found directly, never searched for).
+///
+/// A free function rather than a `ModuleLoader` method for the same reason
+/// [`resolve_module_in`] is: [`ModuleLoader::ensure_module_loaded`] holds a
+/// mutable borrow of the module cache across the call.
+///
+/// `canonicalize` can fail (a module deleted between resolving and reading
+/// it, a race no real program depends on); fall back to `resolved_path`
+/// as-is rather than failing a load that already succeeded.
+fn extract_and_stamp_func_defs(expr: &Expr, resolved_path: PathBuf) -> FuncDefList {
+    let canonical_path = std::fs::canonicalize(&resolved_path).unwrap_or(resolved_path);
+    let loc_file: std::rc::Rc<str> = canonical_path.to_string_lossy().into();
+    extract_func_defs(expr)
+        .into_iter()
+        .map(|(name, params, body)| (name, params, stamp_loc_file(&body, &loc_file)))
+        .collect()
+}
+
 impl ModuleLoader {
     /// Create a new module loader with the given search paths.
     pub fn new(library_paths: &[PathBuf]) -> Self {
@@ -162,15 +185,7 @@ impl ModuleLoader {
                     if let Ok(program) = jq::parse_program(&contents) {
                         // #2774: same stamping as an `include`d module's
                         // defs, using `~/.jq`'s own canonical path.
-                        let canonical_path =
-                            std::fs::canonicalize(&jq_path).unwrap_or_else(|_| jq_path.clone());
-                        let loc_file: std::rc::Rc<str> = canonical_path.to_string_lossy().into();
-                        auto_loaded_defs = extract_func_defs(&program.expr)
-                            .into_iter()
-                            .map(|(name, params, body)| {
-                                (name, params, stamp_loc_file(&body, &loc_file))
-                            })
-                            .collect();
+                        auto_loaded_defs = extract_and_stamp_func_defs(&program.expr, jq_path);
                     }
                 }
             } else if jq_path.is_dir() {
@@ -219,24 +234,7 @@ impl ModuleLoader {
                     anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
                 })?;
 
-                // #2774: jq's own `$__loc__` inside a module-sourced def
-                // names that module's *canonical* (symlink-resolved) path,
-                // not the path as given on `-L`/`include` -- confirmed live
-                // against jq 1.7.1. `canonicalize` can fail (a module
-                // deleted between resolving and reading it, a race no real
-                // program depends on); fall back to the resolved path as-is
-                // rather than failing a load that already succeeded.
-                let canonical_path = std::fs::canonicalize(&file_path).unwrap_or(file_path);
-                let loc_file: std::rc::Rc<str> = canonical_path.to_string_lossy().into();
-
-                // Extract function definitions from the expression, then
-                // stamp every $__loc__ in each def's body with this
-                // module's own path.
-                let defs = extract_func_defs(&program.expr)
-                    .into_iter()
-                    .map(|(name, params, body)| (name, params, stamp_loc_file(&body, &loc_file)))
-                    .collect();
-                Ok(entry.insert(defs))
+                Ok(entry.insert(extract_and_stamp_func_defs(&program.expr, file_path)))
             }
         }
     }
