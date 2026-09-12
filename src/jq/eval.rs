@@ -12835,11 +12835,11 @@ fn flatten_owned<S: EvalSemantics>(
 
 /// `depth` (the *remaining flatten levels* the caller asked for, e.g. from
 /// `flatten(depth)`) and `tree_depth` (this recursion's own descent so
-/// far) are two independent counters: `depth` already self-terminates
-/// (`depth == 0` stops), but a user-supplied `flatten(N)` for a large `N`
-/// places no ceiling of its own on how deep the *array's own structure*
-/// (not the flatten count) can be walked before that termination kicks
-/// in. Panics past
+/// far) are two independent counters: `depth` already self-terminates (the
+/// `Array` match arm's own guard below only recurses while `depth != 0`),
+/// but a user-supplied `flatten(N)` for a large `N` places no ceiling of
+/// its own on how deep the *array's own structure* (not the flatten
+/// count) can be walked before that termination kicks in. Panics past
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels of
 /// `tree_depth` (#1017) -- currently only reachable at a `tree_depth`
 /// this deep via a value already capped there by an upstream guard
