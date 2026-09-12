@@ -16960,21 +16960,22 @@ fn assert_yq_getter(input: &str, filter: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// The absent family's identity output: the comment is attributed (see the
-/// getter tests below) but not yet printed, because no emitter renders a
-/// head/foot comment at all (#2795). Real yq prints `-\n# comment\n- 2\n`.
-/// Pinned as still-dropped -- not the corrupted `- # c` inline rendering an
-/// earlier version of the A/B/C fix produced -- so #2795 has to update this
-/// deliberately rather than drift.
+/// The absent family's identity output, now that #2795 renders a
+/// head/foot comment: real yq prints `-\n# comment\n- 2\n`, matched here.
+/// The second case's rendering (`# d` then a blank line then `# c`, both
+/// after the sequence) follows directly from the attribution the getter
+/// tests below already pin -- `d` (the last floated comment) is `.a`'s key
+/// foot, `c` (ADR-0018 rule 4: succinctly keeps what real yq drops) travels
+/// forward onto `.b`'s key head.
 #[test]
-fn test_bare_item_comment_still_dropped_when_value_absent_1079() -> Result<()> {
+fn test_bare_item_comment_printed_when_value_absent_1079() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- # comment\n- 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "-\n- 2\n");
+    assert_eq!(out, "-\n# comment\n- 2\n");
 
     let (out, code) = run_yq_stdin(".", "a:\n  - # c\n  - # d\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a:\n  -\n  -\nb: 2\n");
+    assert_eq!(out, "a:\n  -\n  -\n# d\n\n# c\nb: 2\n");
     Ok(())
 }
 
@@ -17009,15 +17010,17 @@ fn test_absent_item_comments_accumulate_forward_1079_float() -> Result<()> {
 
 /// The next item's own deferred scalar (case C above) keeps its comment in
 /// the item wrapper's slot, so the head getter answers only the floated
-/// one -- real yq joins both (`c1\nc2`). Once #2795 prints heads the
-/// rendering is identical (`-\n# c1\n# c2\n- x`), so this is pinned rather
-/// than fixed.
+/// one -- real yq joins both (`c1\nc2`). #2795 prints heads, and the two
+/// separately-attached comments (`c1` floated onto the wrapper, `c2` the
+/// item's own) render adjacently, making the rendering identical to yq's
+/// joined answer (`-\n# c1\n# c2\n- x`) even though the attribution itself
+/// is still split -- pinned rather than fixed.
 #[test]
 fn test_absent_item_comment_before_deferred_scalar_item_1079_float() -> Result<()> {
     assert_yq_getter("- # c1\n- # c2\n  x\n", ".[1] | head_comment", "c1\n")?;
     let (out, code) = run_yq_stdin(".", "- # c1\n- # c2\n  x\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "-\n# c2\n- x\n");
+    assert_eq!(out, "-\n# c1\n# c2\n- x\n");
     Ok(())
 }
 
@@ -17345,12 +17348,15 @@ fn test_standalone_block_above_bare_deferred_item_is_its_head_1079_float() -> Re
 /// still there (this panicked with `split index should be <= len` when
 /// found by differential fuzzing). Blank-line placement itself is a
 /// residual (real yq: `.[2] | head_comment` is `c\n\nh`, blank preserved
-/// inside the value); only the exit code and shape are pinned.
+/// inside the value); only the exit code and shape are pinned -- #2795 now
+/// prints both `c` (`.[0]`'s own foot, the blank line having settled the
+/// pending block backwards) and `h` (`.[2]`'s own head) in source order,
+/// still without the blank line between them.
 #[test]
 fn test_blank_line_in_absence_lookahead_gap_does_not_panic_1079_float() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- 1\n- # c\n\n-\n  # h\n  x\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- 1\n-\n- x\n");
+    assert_eq!(out, "- 1\n# c\n\n-\n# h\n- x\n");
     Ok(())
 }
 
