@@ -45232,9 +45232,12 @@ fn test_yq_sort_keys_unclosed_paren_is_a_parse_error_2855() -> Result<()> {
     Ok(())
 }
 
-/// #2855: a decode failure at the target reaches `sort_keys(.)` the same
-/// way it reaches any other write (`test_select_and_write_agree_on_corruption_1803`'s
-/// own `"a\\qb"` invalid-escape trigger).
+/// #2855: a decode failure anywhere in the document reaches `sort_keys(.)`
+/// the same way it reaches any other write (`test_select_and_write_agree_on_corruption_1803`'s
+/// own `"a\\qb"` invalid-escape trigger) -- via `eval_update_impl`'s own
+/// upfront whole-document `to_owned`, before `sort_keys`'s own filter ever
+/// runs (confirmed live: the same error fires whether `sort_keys` targets
+/// the decode-failure node directly or not).
 #[test]
 fn test_yq_sort_keys_raises_on_decode_failure_2855() -> Result<()> {
     let input = "bad: \"a\\qb\"\nkeep: 5\n";

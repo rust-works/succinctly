@@ -10200,7 +10200,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::SortKeysOneLevel => {
             let owned = match to_owned(&value) {
                 Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional),
+                Err(e) => return suppress_or_raise(e, optional), // omni-dev: coverage tolerate-line reason="unreachable: only ever constructed by builtin_sort_keys's own eval_update_no_vivify call, whose enclosing eval_update_impl already runs to_owned on the whole document up front (#2855) -- a decode failure anywhere raises there, before this filter ever sees a value to re-decode; confirmed live, `sort_keys(.a)`/`sort_keys(..)` on a document with a decode-failure subtree both raise from the outer to_owned"
             };
             match owned {
                 OwnedValue::Object(obj) => {
