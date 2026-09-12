@@ -23379,26 +23379,49 @@ fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
     Ok(())
 }
 
-/// Characterization test, **pinning a known divergence from jq**: succinctly
-/// resolves `include "m.jq"` to the file `m.jq`, where real jq appends `.jq`
-/// unconditionally and therefore looks for `m.jq.jq` -- so jq rejects this
-/// program with `module not found: m.jq` (exit 3) while succinctly runs it.
+/// #2702: real jq appends `.jq` to a module path unconditionally, even when
+/// the path already ends in `.jq` -- `include "mod.jq"` looks for
+/// `mod.jq.jq`, never `mod.jq` itself. Confirmed live against jq 1.7.1:
+/// with only `mod.jq` present, jq rejects the program with
+/// `module not found: mod.jq` (exit 3); succinctly used to resolve `mod.jq`
+/// directly and run it (`ends_with(".jq")` special-cased the suffix away).
 ///
-/// Verified live against jq 1.7.1 both ways: with only `m.jq` present jq errors
-/// and succinctly returns the module's def, and with `m.jq.jq` also present jq
-/// reads *that* file while succinctly still reads `m.jq`.
+/// Row 2 confirms the mechanism rather than just the rejection: with
+/// `mod.jq.jq` also present, `include "mod.jq"` resolves to *that* file's
+/// definition, not `mod.jq`'s -- pinning that the fix is "append `.jq`
+/// unconditionally," not merely "reject an already-suffixed path."
 ///
-/// Pre-existing and unrelated to #2395, which only relocated the `ends_with(".jq")`
-/// arm responsible; tracked as issue 2702. This test exists so that arm is
-/// covered rather than silently untested, and **is expected to flip** when 2702
-/// is fixed -- at which point it should assert jq's `module not found` and exit
-/// 3 instead.
+/// Pre-existing and unrelated to #2395, which only relocated the
+/// `ends_with(".jq")` arm responsible.
 #[test]
-fn test_include_with_explicit_jq_suffix_diverges_from_jq_2702() -> Result<()> {
+fn test_include_appends_jq_suffix_unconditionally_2702() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(
         temp_dir.path().join("mod.jq"),
         "def length: \"s-length\";\n",
+    )?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "mod.jq"; length"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("mod.jq") && stderr.to_lowercase().contains("not found"),
+        "stderr: {stderr:?}"
+    );
+
+    std::fs::write(
+        temp_dir.path().join("mod.jq.jq"),
+        "def length: \"double-suffix\";\n",
     )?;
     let (output, code) = spawn_with_signal_retry(
         || {
@@ -23416,9 +23439,10 @@ fn test_include_with_explicit_jq_suffix_diverges_from_jq_2702() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(
         stdout.trim_end(),
-        r#""s-length""#,
-        "succinctly resolves the explicit .jq suffix; real jq would error here (issue 2702)"
+        r#""double-suffix""#,
+        "stderr: {stderr:?}"
     );
+
     Ok(())
 }
 
