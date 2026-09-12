@@ -1,5 +1,6 @@
 ---
 source: tests/cli_golden_tests.rs
+assertion_line: 54
 expression: output
 ---
 Generate synthetic JSON files for benchmarking and testing
@@ -18,18 +19,19 @@ Options:
           JSON pattern to generate
 
           Possible values:
-          - comprehensive: Comprehensive pattern testing all JSON features (default, best for benchmarking)
-          - users:         Array of user objects (realistic structure)
-          - nested:        Deeply nested objects (tests nesting and BP operations)
-          - arrays:        Array of arrays (tests array handling)
-          - mixed:         Mix of all types (balanced distribution)
-          - strings:       String-heavy with escapes (tests string parsing and escape handling)
-          - numbers:       Number-heavy documents (tests number parsing)
-          - literals:      Boolean and null heavy (tests literal parsing)
-          - unicode:       Unicode-heavy strings (tests UTF-8 handling)
-          - pathological:  Worst-case for parsing (maximum structural density)
-          - pretty:        Indented, pretty-printed documents (tests whitespace skipping)
-          - wide:          Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
+          - comprehensive:     Comprehensive pattern testing all JSON features (default, best for benchmarking)
+          - users:             Array of user objects (realistic structure)
+          - nested:            Deeply nested objects (tests nesting and BP operations)
+          - arrays:            Array of arrays (tests array handling)
+          - mixed:             Mix of all types (balanced distribution)
+          - strings:           String-heavy with escapes (tests string parsing and escape handling)
+          - numbers:           Number-heavy documents (tests number parsing)
+          - literals:          Boolean and null heavy (tests literal parsing)
+          - unicode:           Unicode-heavy strings (tests UTF-8 handling)
+          - pathological:      Worst-case for parsing (maximum structural density)
+          - pretty:            Indented, pretty-printed documents (tests whitespace skipping)
+          - wide:              Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
+          - wide-escaped-keys: Wide flat object like `wide`, but a fraction of keys (per --escape-density) contain a JSON escape sequence (tests escaped-key decode cost, #2637)
           
           [default: comprehensive]
 

@@ -550,6 +550,10 @@ enum PatternArg {
     Pretty,
     /// Wide flat object: many distinct top-level keys, no nesting (tests keys_unsorted)
     Wide,
+    /// Wide flat object like `wide`, but a fraction of keys (per
+    /// --escape-density) contain a JSON escape sequence (tests escaped-key
+    /// decode cost, #2637)
+    WideEscapedKeys,
 }
 
 /// Generate a suite of JSON files with various sizes and patterns for benchmarking
@@ -1245,6 +1249,7 @@ impl From<PatternArg> for generators::Pattern {
             PatternArg::Pathological => Self::Pathological,
             PatternArg::Pretty => Self::Pretty,
             PatternArg::Wide => Self::Wide,
+            PatternArg::WideEscapedKeys => Self::WideEscapedKeys,
         }
     }
 }
@@ -2559,6 +2564,14 @@ mod tests {
         assert!(matches!(
             generators::Pattern::from(PatternArg::Wide),
             generators::Pattern::Wide
+        ));
+    }
+
+    #[test]
+    fn test_pattern_arg_wide_escaped_keys_maps_to_generator_pattern() {
+        assert!(matches!(
+            generators::Pattern::from(PatternArg::WideEscapedKeys),
+            generators::Pattern::WideEscapedKeys
         ));
     }
 
