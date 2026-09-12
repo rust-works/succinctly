@@ -48597,3 +48597,77 @@ fn test_reverse_follows_jqs_own_definition_2730() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2771: `owned_identity_step` (`src/jq/eval_generic.rs`) had no arm for
+/// `Expr::Literal`, reachable only through `owned_identity_operand`'s
+/// `Pipe`/`Paren`-wrapped case (its own top-level short-circuit already
+/// handles the bare spelling) -- so a literal reached *through* a pipe
+/// inside a ruled arithmetic/comparison operand, followed by a
+/// `key`/`path`/`parent`/`file_index` metadata read downstream, aborted the
+/// process with exit 101. A panic in the library is a failed assertion, a
+/// panic in the binary is a crash, which is why this is asserted at the CLI
+/// level, matching `test_path_cursor_walk_accepts_composite_pipe_heads_2061`.
+///
+/// Every expectation is what succinctly already produces for the bare
+/// `(1 + 2)`-shaped analogue (a literal has no position of its own, so it
+/// answers exactly like any other detached value would).
+#[test]
+fn test_literal_inside_pipe_operand_does_not_abort_2771() -> Result<()> {
+    let input = r#"{"a":{"b":1}}"#;
+    for (filter, want) in [
+        (".a | ((.b | 1) + 2) | path", "[]\n"),
+        (".a | ((.b | 1) + 2) | key", ""),
+        (".a | ((.b | 1) + 2) | parent", ""),
+        (".a | ((.b | 1) + 2) | file_index", "0\n"),
+        (
+            ".a | ((.b | 1) + 2) | [path, key, parent, file_index]",
+            "[[],0]\n",
+        ),
+        (".a | ((1 | .) + 2) | key", ""),
+        (".a | ((.b | 1) == 1) | path", "[]\n"),
+        (".a | (-(.b | 1)) | path", "[]\n"),
+        (
+            r#".a | (("x" | .[0:1]) + "y") | path"#,
+            "[{\"start\":0,\"end\":1}]\n",
+        ),
+        (
+            r#".a | (("abc" | .)[0:1] + "x") | path"#,
+            "[{\"start\":0,\"end\":1}]\n",
+        ),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: out={out:?}");
+        assert_eq!(out, want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2771 review: three shapes that must stay exactly as they were, so the
+/// fix above is proven to add coverage rather than widen it. All three
+/// confirmed live against jq 1.7.1.
+#[test]
+fn test_literal_inside_pipe_operand_must_not_change_shapes_2771() -> Result<()> {
+    let input = r#"{"a":{"b":1}}"#;
+
+    // `path(...)` wraps the same expression -- still a genuine "Invalid
+    // path expression" compile-time-shaped runtime error, unaffected by
+    // the identity-tracking fix (this route never reached the crash site).
+    let (out, err, code) = run_jq_full(&["-c", "path(.a | ((.b | 1) + 2))"], Some(input))?;
+    assert_eq!(code, 5, "out={out:?} err={err:?}");
+    assert!(
+        err.contains("Invalid path expression with result 3"),
+        "err={err:?}"
+    );
+
+    // The bare arithmetic, with no downstream metadata read, is untouched.
+    let (out, code) = run_jq_stdin(".a | ((.b | 1) + 2)", input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "3\n");
+
+    // An empty operand value stream never reaches the identity route at
+    // all, so this stays empty/exit 0 as it did before.
+    let (out, code) = run_jq_stdin(".a | ((1 | .b?) + 2) | path", input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+    Ok(())
+}
