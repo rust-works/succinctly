@@ -1824,6 +1824,39 @@ mod tests {
         ));
     }
 
+    /// #2850 coverage: the `Bool`/`Float`/`RawNumber` scalar arms of both
+    /// `materialize_at_depth`/`try_materialize_at_depth`, the `Cursor` arm's
+    /// `Bool` case in `cursor_to_owned_at_depth`, and its `Null` case in
+    /// `try_cursor_to_owned_at_depth`, weren't exercised by any existing
+    /// test -- `test_materialize` above covers `Int`/`String`/`Null` (via a
+    /// direct `JqValue::Null`, never through a `Cursor`), and the two
+    /// depth-limit tests above only ever build arrays/ints.
+    #[test]
+    fn materialize_and_try_materialize_cover_the_remaining_scalar_arms_2850() {
+        use crate::json::JsonIndex;
+
+        let b: JqValue<'_, Vec<u64>> = JqValue::bool(true);
+        assert_eq!(b.materialize().unwrap(), OwnedValue::Bool(true));
+
+        let f: JqValue<'_, Vec<u64>> = JqValue::float(1.5);
+        assert_eq!(f.try_materialize().unwrap(), OwnedValue::Float(1.5));
+
+        let raw: JqValue<'_, Vec<u64>> = JqValue::RawNumber(b"4e4");
+        assert_eq!(raw.try_materialize().unwrap().to_json(), "4E+4");
+
+        let bool_json = b"true";
+        let index = JsonIndex::build(bool_json);
+        let cursor = index.root(bool_json);
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(val.materialize().unwrap(), OwnedValue::Bool(true));
+
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert_eq!(val.try_materialize().unwrap(), OwnedValue::Null);
+    }
+
     /// #1021: `JqValue::into_owned` had no depth guard at all before this
     /// issue -- same gap as `materialize`, just on the consuming twin.
     #[test]
