@@ -310,8 +310,16 @@ fn parse_int_or_float(s: &str) -> ResolvedScalar {
 /// exactly go-yaml's accept/reject boundary. The spellings `inf`/`nan`/
 /// `Infinity` never reach this function (first-byte dispatch), and signed
 /// forms like `+inf` that do reach it parse non-finite and are rejected here.
+///
+/// `pub(crate)`, not `fn`: [`crate::yaml::parser::json_strict_plain_scalar_ok`]
+/// (#2778) reuses the finite-`f64`-parse primitive for the *unrelated*
+/// question of JSON's `strconv.ParseFloat`-derived scalar boundary, which
+/// happens to want the identical `s.parse::<f64>()` + `is_finite()` check —
+/// share the primitive, not the surrounding core-schema dispatch above,
+/// which that caller must not pull in (it accepts `~`/`.inf`/`0x2A`/`+1`,
+/// all of which real yq's JSON front end rejects).
 #[inline(always)]
-fn parse_float(s: &str) -> ResolvedScalar {
+pub(crate) fn parse_float(s: &str) -> ResolvedScalar {
     match s.parse::<f64>() {
         Ok(f) if f.is_finite() => ResolvedScalar::Float(f),
         _ => ResolvedScalar::Str,

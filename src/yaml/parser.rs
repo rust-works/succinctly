@@ -559,12 +559,22 @@ struct Parser<'a, const HAS_CR: bool> {
     /// **Scalar grammar: values only, never keys.** Mapping *keys* are
     /// exempt (real yq panics on a non-string JSON key -- `{1:1}`,
     /// `{true:1}` -- which succinctly does not reproduce; see
-    /// `docs/compliance/yq/limitations.md`) and so is anything reached only
-    /// through an `&anchor`/`!tag` prefix, which JSON has no spelling for
-    /// at all. `json_strict_plain_scalar_ok` is the predicate; yq accepts
-    /// `[01]`/`[00]`/`[1.]` (leading zeros, a bare trailing `.` survive)
-    /// while rejecting `.5`/`+1`/`1e` -- not "strict JSON", the boundary is
+    /// `docs/compliance/yq/limitations.md`). `json_strict_plain_scalar_ok`
+    /// is the predicate; yq accepts `[01]`/`[00]`/`[1.]` (leading zeros, a
+    /// bare trailing `.` survive) while rejecting `.5`/`+1`/`1e` -- not
+    /// "strict JSON", the boundary is
     /// `goccy/go-json`'s own token scanner plus `strconv.ParseFloat`.
+    ///
+    /// **Structural, key-agnostic rejections.** `?` (explicit key), `&`/`!`
+    /// (anchor/tag), `*` (alias), and `'` (single quote) have no JSON
+    /// spelling at all regardless of what follows them, so `parse_block_node`
+    /// rejects the byte itself at one chokepoint rather than each dispatch
+    /// arm needing its own check -- an anchor/tag-prefixed value is refused
+    /// before the prefix's own target is even examined, not merely left
+    /// unvalidated. Two shapes bypass that chokepoint's own dispatch and
+    /// carry their own identical gate instead: `--- |`/`--- >`
+    /// (`parse_inline_document_value`'s dedicated fast path) and `?` inside
+    /// a flow mapping (`parse_flow_mapping_inner`).
     json_strict: bool,
 }
 
@@ -2779,6 +2789,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // that position already does, rather than this function's dedicated
         // block-scalar arm — parity with the anchor case, not a new gap.
         if matches!(self.peek(), Some(b'|' | b'>')) {
+            // #2778: this dedicated arm bypasses `parse_block_node` (see
+            // above), so it needs its own `json_strict` gate rather than
+            // inheriting one from there -- `|`/`>` have no JSON spelling
+            // either way (real yq's token scanner rejects both).
+            if self.json_strict {
+                return Err(
+                    self.err_unexpected_char(self.pos, "block scalar indicator in JSON input")
+                );
+            }
             return self.parse_block_scalar(0);
         }
 
@@ -5810,10 +5829,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             }
             first = false;
 
-            // Check for explicit key `? key : value` in flow context
-            if self.json_strict
-                && (self.looks_like_explicit_flow_key() || self.looks_like_flow_mapping_entry())
-            {
+            // Check for explicit key `? key : value` in flow context. Both
+            // lookaheads scan up to the element's own length, not O(1), so
+            // they're hoisted into locals and reused below rather than
+            // re-run by the json_strict check and the dispatch separately.
+            let is_explicit_key = self.looks_like_explicit_flow_key();
+            let is_mapping_entry = is_explicit_key || self.looks_like_flow_mapping_entry();
+            if self.json_strict && is_mapping_entry {
                 // #2778: a JSON array element is a value, never a `key:
                 // value` pair -- real yq's front end has no concept of an
                 // implicit single-pair mapping inside `[...]` at all, so
@@ -5822,9 +5844,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // other json_strict rejection in this loop.
                 return Err(self.err_unexpected_char(self.pos, "mapping entry inside JSON array"));
             }
-            if self.looks_like_explicit_flow_key() {
+            if is_explicit_key {
                 self.parse_explicit_flow_mapping_entry()?;
-            } else if self.looks_like_flow_mapping_entry() {
+            } else if is_mapping_entry {
                 // Handles all key forms, including a leading anchor or alias
                 // (`[&x k: 1, *x: 2]`, #409), { and [, quoted, and plain scalar
                 // keys. This is an implicit single-pair mapping: [ key : value ]
@@ -5928,6 +5950,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // span. The flow-sequence path has always done it in this order (#402).
             let explicit = self.looks_like_explicit_flow_key();
             if explicit {
+                // #2778: `?` has no JSON spelling at all -- this is a
+                // structural rejection of the marker itself (real yq's
+                // token scanner never accepts it as a value-start byte,
+                // regardless of what follows), not a key-grammar check, so
+                // it stays in scope even though key *text* grammar (#2777)
+                // does not.
+                if self.json_strict {
+                    return Err(
+                        self.err_unexpected_char(self.pos, "explicit key marker in JSON input")
+                    );
+                }
                 self.advance();
                 self.skip_flow_whitespace();
             }
@@ -7270,6 +7303,29 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // close_deeper_indents will handle closing any SequenceItem entries
         // when we return to a lower indent level
 
+        // #2778: a single chokepoint for every value-start byte real yq's
+        // token scanner (goccy/go-json's `skipValue`) would refuse outright
+        // -- `?` (explicit key), `&`/`!` (anchor/tag, no JSON spelling at
+        // all), `*` (alias), `'` (single quote) -- ahead of the per-arm
+        // dispatch below, so a *new* arm added to that match can't reopen
+        // this gap by omission the way the sequence-dash and bare-mapping
+        // checks further down (which still need their own, narrower logic:
+        // `-1` is a legal number but `- 1` is not, and a quoted key still
+        // reaches its own arm) could not cover on their own. `#`/a line
+        // break/EOF are not JSON tokens either, but are harmless between or
+        // after a value, so they still fall through unchanged.
+        if self.json_strict
+            && !matches!(
+                self.peek(),
+                Some(
+                    b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'
+                        ..=b'9' | b'#' | b'\n' | b'\r'
+                ) | None
+            )
+        {
+            return Err(self.err_unexpected_char(self.pos, "not a valid JSON value"));
+        }
+
         // Check what kind of content this is
         match self.peek() {
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
@@ -7609,10 +7665,16 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
     {
         return false;
     }
-    core::str::from_utf8(bytes)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .is_some_and(f64::is_finite)
+    let Ok(s) = core::str::from_utf8(bytes) else {
+        return false;
+    };
+    // The finite-`f64`-parse primitive, not the core-schema dispatch around
+    // it -- see `parse_float`'s doc comment for why only this much is
+    // shared with `resolve_plain`.
+    matches!(
+        super::scalar::parse_float(s),
+        super::scalar::ResolvedScalar::Float(_)
+    )
 }
 
 /// Build a semi-index from YAML input.
