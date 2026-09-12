@@ -365,7 +365,7 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 use super::expr::{
     ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
     FuncDefData, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param,
-    Pattern, StringPart, Tracked,
+    Pattern, PatternEntry, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -5875,7 +5875,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
+        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
             Ok(b) => b,
             Err(e) => {
                 if is_last {
@@ -30771,7 +30771,7 @@ fn walk_pattern_step(
 /// - **a bare `$x` performs no step**: it binds the current input and leaves
 ///   the register alone, marked with [`Frame::origin_at`] exactly when that
 ///   input *is* the register's node.
-fn walk_pattern(
+fn walk_pattern<S: EvalSemantics>(
     pattern: &Pattern,
     input: &OwnedValue,
     reg: PatternRegister,
@@ -30806,18 +30806,48 @@ fn walk_pattern(
                     reg.is_input = false;
                 }
                 first = false;
-                // #2677: a computed key (`{(EXPR): P}`, or an interpolated
-                // string) is not yet walked in path position -- landing
-                // separately from the parse-acceptance half so each is
-                // independently testable (see this repo's own issue #2677
-                // triage). `extract_pattern_bindings`'s value-mode arm below
-                // carries the identical stub.
-                let ObjectKey::Literal(key) = &entry.key else {
-                    return Err(EvalError::new(
-                        "computed keys in a destructuring pattern are not yet supported in path position (#2677)",
-                    ));
+                // #2677: a computed key is resolved against `input` -- the
+                // pattern's own current node -- exactly like value mode's
+                // identical resolution in `fold_object_pattern_entry`
+                // (this function's own doc comment there has the full
+                // derivation, oracle-verified against jq 1.7.1 in *both*
+                // positions: the "Cannot index X with Y" wording is the
+                // same in path mode as value mode, since it comes from the
+                // key-resolution step, not from `walk_pattern_step`'s own
+                // *separate* register-tracking check below, whose "near
+                // attempt to access" wording is unrelated). Scoped down to
+                // exactly one valid string output for this first increment
+                // -- see `extract_single_pattern_binding`'s own doc comment
+                // for why 0/2+/break/halt refuse clearly here too rather
+                // than being modelled.
+                let key: Cow<'_, str> = match &entry.key {
+                    ObjectKey::Literal(key) => Cow::Borrowed(key.as_str()),
+                    ObjectKey::Expr(key_expr) => {
+                        let (mut key_values, control) =
+                            eval_owned_expr_fork::<S>(key_expr, input, false);
+                        match (key_values.len(), control) {
+                            (1, None) => match key_values.pop().unwrap() {
+                                OwnedValue::String(s) => Cow::Owned(s),
+                                other => {
+                                    return Err(EvalError::cannot_index_with_type(
+                                        owned_type_name(input),
+                                        owned_type_name(&other),
+                                    ));
+                                }
+                            },
+                            (0, Some(Control::Error(e))) => return Err(e),
+                            _ => {
+                                return Err(EvalError::new(
+                                    "a computed key in a destructuring pattern produced zero \
+                                     outputs, more than one output, or was interrupted by \
+                                     break/halt, none of which are yet supported in path \
+                                     position (#2677)",
+                                ));
+                            }
+                        }
+                    }
                 };
-                let step = PatternStep::Field(key);
+                let step = PatternStep::Field(&key);
                 let (child, moved) = walk_pattern_step(&step, input, &reg)?;
                 // `{$b: P}`: the bind names the node the register just moved
                 // to, so it carries that position's marker, and is pushed
@@ -30829,7 +30859,7 @@ fn walk_pattern(
                         origin: frame.origin_at(&moved.path),
                     });
                 }
-                reg = walk_pattern(&entry.pattern, &child, moved, frame, out)?;
+                reg = walk_pattern::<S>(&entry.pattern, &child, moved, frame, out)?;
             }
             Ok(reg)
         }
@@ -30846,7 +30876,7 @@ fn walk_pattern(
                 first = false;
                 let step = PatternStep::Index(i);
                 let (child, moved) = walk_pattern_step(&step, input, &reg)?;
-                reg = walk_pattern(pat, &child, moved, frame, out)?;
+                reg = walk_pattern::<S>(pat, &child, moved, frame, out)?;
             }
             Ok(reg)
         }
@@ -30940,7 +30970,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 value: value.clone(),
                 is_input: identical,
             };
-            let reg = match walk_pattern(pattern, bound, seed, frame, &mut bindings) {
+            let reg = match walk_pattern::<S>(pattern, bound, seed, frame, &mut bindings) {
                 Ok(reg) => reg,
                 Err(e) => {
                     if is_last {
@@ -31615,7 +31645,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 Pattern::Object(_) | Pattern::Array(_) => {
                     let seed = fold_pattern_seed(&elem, &reg);
                     let mut bindings = Vec::new();
-                    match walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
+                    match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
                         // `reduce` substitutes every binding *untracked*
                         // (`origin` cleared) regardless of what the walk
                         // computed — see this arm's own doc comment above:
@@ -31632,13 +31662,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
                     }
                 }
-                Pattern::Var(_) => match extract_pattern_bindings(pattern, &elem.value, false) {
-                    Ok(b) if elem.register_path.is_some() => {
-                        substitute_var_tracked(update, &b[0].0, &b[0].1)
+                Pattern::Var(_) => {
+                    match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
+                        Ok(b) if elem.register_path.is_some() => {
+                            substitute_var_tracked(update, &b[0].0, &b[0].1)
+                        }
+                        Ok(b) => substitute_vars(update, as_var_refs(&b)),
+                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
                     }
-                    Ok(b) => substitute_vars(update, as_var_refs(&b)),
-                    Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
-                },
+                }
             };
             // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
             // (#2161) — `acc_at_register` alone is the previous step's
@@ -31919,7 +31951,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 Pattern::Object(_) | Pattern::Array(_) => {
                     let seed = fold_pattern_seed(&elem, &reg);
                     let mut bindings = Vec::new();
-                    match walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
+                    match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
                         Ok(w) => Some((w, dedup_pattern_bindings(pattern, bindings, false))),
                         Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
                     }
@@ -31932,7 +31964,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     extract.map(|ext| apply_pattern_bindings(ext, bindings)),
                 )
             } else {
-                match extract_pattern_bindings(pattern, &elem.value, false) {
+                match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
                     Ok(b) if elem.register_path.is_some() => (
                         substitute_var_tracked(update, &b[0].0, &b[0].1),
                         extract.map(|ext| substitute_var_tracked(ext, &b[0].0, &b[0].1)),
@@ -36046,7 +36078,8 @@ where
             patterns
                 .iter()
                 .map(|pattern| {
-                    let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+                    let bindings =
+                        extract_single_pattern_binding::<S>(pattern, input_val, invert_dedup)?;
                     // #1368: bound and null-filled names never overlap (the
                     // filter below excludes anything `bindings` already
                     // covers), so fold order between the two groups can't
@@ -37826,7 +37859,7 @@ pub(crate) fn pattern_alternatives_var_names(patterns: &[Pattern]) -> Vec<String
 /// therefore never hoist a whole matrix, could share it (#768/#822). WP3's
 /// review then drove the eager path the same way, so the matrix form is gone
 /// entirely and this is the only spelling left.
-pub(crate) fn substitute_foreach_steps(
+pub(crate) fn substitute_foreach_steps<S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
     update: &Expr,
@@ -37837,7 +37870,7 @@ pub(crate) fn substitute_foreach_steps(
     patterns
         .iter()
         .map(|pattern| {
-            let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+            let bindings = extract_single_pattern_binding::<S>(pattern, input_val, invert_dedup)?;
             // #1368: bound and null-filled names never overlap (the
             // filter below excludes anything `bindings` already
             // covers), so fold order between the two groups can't
@@ -37953,7 +37986,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
             // the way the pre-review eager path did (#695), and with the
             // eager path now driven the same way there is no matrix left to
             // hoist anywhere.
-            let row = substitute_foreach_steps(
+            let row = substitute_foreach_steps::<S>(
                 patterns,
                 &all_var_names,
                 update,
@@ -49246,7 +49279,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
+        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
             Ok(b) => b,
             Err(e) => {
                 if is_last {
@@ -49417,13 +49450,36 @@ pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<Strin
 /// inverted for the *inner* array sub-pattern too, not just the outermost
 /// container -- so `invert` threads through every recursive call
 /// unchanged, it is not computed once and only applied at the top.
-pub(crate) fn extract_pattern_bindings(
+///
+/// **#2677**: returns every alternative binding-set a computed key's own
+/// generator can produce, plus whatever [`Control`] stopped generation
+/// early (a key expression's own error/break/halt, or a structural
+/// mismatch) -- [`eval_owned_expr_fork`]'s own `(Vec<T>, Option<Control>)`
+/// shape, reused here rather than inventing a sink/stream abstraction. A
+/// pattern with no computed key anywhere in it still produces exactly one
+/// binding-set on success, matching this function's pre-#2677
+/// single-`Result` shape byte-for-byte. jq compiles multiple entries (and a
+/// multi-output computed key within one entry) as nested generator forks
+/// (`gen_object_matcher`), so entries run left to right and, within one
+/// entry, its own key outputs run in the order its expression yields them --
+/// confirmed live: `{"a":1,"b":2} | . as {("a","b"):$q} | $q` prints `1`
+/// then `2`. The very first failure anywhere -- a key expression's own
+/// error, a non-string key value, an `INDEX` against a non-object, or a
+/// recursive sub-pattern failure -- stops the whole pipeline immediately
+/// (jq's own single-threaded generator model), keeping every combination
+/// already completed before that point (confirmed live:
+/// `[. as {("a",1,"b"):$q} ?// $q | $q]` on `{"a":1,"b":2}` is
+/// `[1,{"a":1,"b":2}]` -- the `1` key output already succeeded and its
+/// binding was consumed by the body *before* the `1` (number) key output's
+/// own type error aborted the rest of that alternative, retrying `?//`'s
+/// own next alternative from there).
+pub(crate) fn extract_pattern_bindings<S: EvalSemantics>(
     pattern: &Pattern,
     value: &OwnedValue,
     invert: bool,
-) -> Result<Vec<(String, OwnedValue)>, EvalError> {
+) -> (Vec<Vec<(String, OwnedValue)>>, Option<Control>) {
     match pattern {
-        Pattern::Var(name) => Ok(vec![(name.clone(), value.clone())]),
+        Pattern::Var(name) => (vec![vec![(name.clone(), value.clone())]], None),
         Pattern::Object(entries) => {
             // Real jq lets `null` absorb any further field access the same
             // way plain `.foo` on `null` does (`null | .foo` is `null`) --
@@ -49434,51 +49490,36 @@ pub(crate) fn extract_pattern_bindings(
             // code review) so this path upholds the same "no duplicate
             // names in the result" invariant every other path does, rather
             // than relying on "every value happens to be Null anyway" to
-            // paper over a skipped step.
+            // paper over a skipped step. No entry's own key expression is
+            // evaluated here either -- confirmed live,
+            // `null | . as {(error("x")):$q} | $q` is `null`, not a raised
+            // `"x"`, so `null` short-circuits before any key expression
+            // (computed or not) ever runs, same as it already did for a
+            // literal key.
             if matches!(value, OwnedValue::Null) {
                 let mut names = Vec::new();
                 collect_pattern_var_names(pattern, &mut names);
                 let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
-                return Ok(dedup_object_bindings(bindings, invert));
+                return (vec![dedup_object_bindings(bindings, invert)], None);
             }
-            let mut bindings = Vec::new();
+            let mut frontier: Vec<Vec<(String, OwnedValue)>> = vec![Vec::new()];
             for entry in entries {
-                // #2677: a computed key is not yet evaluated in value
-                // position either -- see `walk_pattern`'s identical stub
-                // (path position) for the shared rationale. Checked before
-                // the non-object-target check just below, matching real
-                // jq's own order (the key expression's own error, or a
-                // `Cannot index ... with ...` naming its actual type, would
-                // otherwise be masked by a generic non-object refusal here).
-                let ObjectKey::Literal(key) = &entry.key else {
-                    return Err(EvalError::new(
-                        "computed keys in a destructuring pattern are not yet supported (#2677)",
-                    ));
-                };
-                // jq destructures by indexing once per key, so a non-object
-                // reports exactly what `.<key>` would — and a pattern with no
-                // keys never indexes, so it cannot fail.
-                let obj = match value {
-                    OwnedValue::Object(o) => o,
-                    _ => {
-                        return Err(EvalError::cannot_index_with_field(
-                            owned_type_name(value),
-                            key,
-                        ))
-                    }
-                };
-                let field_value = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
-                // `{$b: P}` binds `$b` to the matched value *before* running
-                // `P` against that same value (one `INDEX` step in jq's own
-                // compilation, #2649) -- pushed ahead of the sub-pattern's
-                // own bindings so this preserves today's order (and hence
-                // `dedup_object_bindings`'s first/last-wins result) exactly
-                // as when this was desugared into two separate entries.
-                if let Some(bind) = &entry.bind {
-                    bindings.push((bind.clone(), field_value.clone()));
+                let (next, control) =
+                    fold_object_pattern_entry::<S>(entry, value, frontier, invert);
+                frontier = next;
+                if let Some(control) = control {
+                    // A later entry never runs once an earlier one has
+                    // stopped generation -- jq's own sequential generator
+                    // model, and the reason this doesn't also dedup+return
+                    // the partial `frontier` through the loop's normal exit
+                    // below (which still applies the `#1366` dedup rule to
+                    // whatever combinations already completed).
+                    let deduped = frontier
+                        .into_iter()
+                        .map(|b| dedup_object_bindings(b, invert))
+                        .collect();
+                    return (deduped, Some(control));
                 }
-                let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value, invert)?;
-                bindings.extend(sub_bindings);
             }
             // #1366: an object pattern binding the same variable name from
             // more than one field (`{x:$a,y:$a}`) keeps the *first* field's
@@ -49490,42 +49531,195 @@ pub(crate) fn extract_pattern_bindings(
             // the value's. Opposite of the Array arm below, and inverted
             // again under `?//` -- see `extract_pattern_bindings`'s own doc
             // comment and `dedup_object_bindings`'s for why.
-            Ok(dedup_object_bindings(bindings, invert))
+            let deduped = frontier
+                .into_iter()
+                .map(|b| dedup_object_bindings(b, invert))
+                .collect();
+            (deduped, None)
         }
         Pattern::Array(patterns) => {
             // Same `null`-absorbs-further-access tolerance as the Object arm
             // above, for array-shaped destructuring (#1239); same "route
-            // through the real dedup step anyway" reasoning too.
+            // through the real dedup step anyway" reasoning too. Array
+            // patterns have no computed keys of their own (positional), but
+            // a nested `Pattern::Object` element can still carry one.
             if matches!(value, OwnedValue::Null) {
                 let mut names = Vec::new();
                 collect_pattern_var_names(pattern, &mut names);
                 let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
-                return Ok(dedup_array_bindings(bindings, invert));
+                return (vec![dedup_array_bindings(bindings, invert)], None);
             }
-            let mut bindings = Vec::new();
+            let arr = match value {
+                OwnedValue::Array(a) => a,
+                _ => {
+                    let err = EvalError::cannot_index_with_type(owned_type_name(value), "number");
+                    return (Vec::new(), Some(Control::Error(err)));
+                }
+            };
+            let mut frontier: Vec<Vec<(String, OwnedValue)>> = vec![Vec::new()];
             for (i, pat) in patterns.iter().enumerate() {
-                // As above: one index per element position, so the error is
-                // the one `.[i]` would raise.
-                let arr = match value {
-                    OwnedValue::Array(a) => a,
-                    _ => {
-                        return Err(EvalError::cannot_index_with_type(
-                            owned_type_name(value),
-                            "number",
-                        ))
-                    }
-                };
                 let elem_value = arr.get(i).cloned().unwrap_or(OwnedValue::Null);
-                let sub_bindings = extract_pattern_bindings(pat, &elem_value, invert)?;
-                bindings.extend(sub_bindings);
+                let (sub_results, sub_control) =
+                    extract_pattern_bindings::<S>(pat, &elem_value, invert);
+                // No pre-sized capacity hint: `frontier.len() *
+                // sub_results.len()` is a product of two generator fan-outs
+                // an attacker-controlled query could grow arbitrarily
+                // large, and `Vec::with_capacity` on that product risks an
+                // uncatchable allocation panic/abort rather than jq's own
+                // "stream one output at a time" behavior for a cross
+                // product this size (#1669/#1721's own guard exists for
+                // exactly this class) -- an unsized `Vec::new()` growing by
+                // ordinary amortized `push` is the safe default here.
+                let mut next = Vec::new();
+                for partial in &frontier {
+                    for sub in &sub_results {
+                        let mut combined = partial.clone();
+                        combined.extend(sub.iter().cloned());
+                        next.push(combined);
+                    }
+                }
+                frontier = next;
+                if let Some(control) = sub_control {
+                    let deduped = frontier
+                        .into_iter()
+                        .map(|b| dedup_array_bindings(b, invert))
+                        .collect();
+                    return (deduped, Some(control));
+                }
             }
             // #1366: an array pattern binding the same variable name at more
             // than one position (`[$a,$a]`) keeps the *last* position's
             // value in real jq -- confirmed live: `[1,2] | . as [$a,$a] |
             // $a` is `2`. Opposite of the Object arm above, and inverted
             // again under `?//`.
-            Ok(dedup_array_bindings(bindings, invert))
+            let deduped = frontier
+                .into_iter()
+                .map(|b| dedup_array_bindings(b, invert))
+                .collect();
+            (deduped, None)
         }
+    }
+}
+
+/// One [`Pattern::Object`] entry's own contribution to
+/// [`extract_pattern_bindings`]'s cartesian fold (#2677): for every key
+/// value `entry.key` yields against `value` (one for a
+/// [`ObjectKey::Literal`], possibly many for an [`ObjectKey::Expr`]
+/// generator) and every already-accumulated partial binding-set in
+/// `frontier`, extends that partial set with the entry's own `{$bind}`
+/// marker (if any) and every binding its sub-pattern produces against the
+/// matched field -- the full `frontier × keys × sub_pattern_bindings`
+/// cross product, in that nesting order (matches jq's own left-to-right,
+/// outer-to-inner generator compilation). Stops at the first failure
+/// anywhere in that generation, keeping whatever combinations already
+/// completed.
+fn fold_object_pattern_entry<S: EvalSemantics>(
+    entry: &PatternEntry,
+    value: &OwnedValue,
+    frontier: Vec<Vec<(String, OwnedValue)>>,
+    invert: bool,
+) -> (Vec<Vec<(String, OwnedValue)>>, Option<Control>) {
+    // The key expression runs against `value` -- the pattern's own current
+    // node -- regardless of whether `value` even is an object: real jq's
+    // `INDEX` bytecode needs the key *value* in hand before it can raise
+    // its own "Cannot index <type> with <type>" (confirmed live: `{("a"):
+    // $q}` on `[1,2,3]` raises "Cannot index array with string \"a\"" --
+    // the literal key evaluates fine, and only the *subsequent* indexing
+    // attempt fails; `{(.a):$q}` on `5` raises "Cannot index number with
+    // string \"a\"" too, but via the key expression's *own* `.a` navigation
+    // failing on `5`, a different mechanism landing on the same wording).
+    let (key_values, key_control): (Vec<OwnedValue>, Option<Control>) = match &entry.key {
+        ObjectKey::Literal(key) => (vec![OwnedValue::String(key.clone())], None),
+        ObjectKey::Expr(key_expr) => eval_owned_expr_fork::<S>(key_expr, value, false),
+    };
+
+    let mut new_frontier = Vec::new();
+    for key_value in &key_values {
+        let key = match key_value {
+            OwnedValue::String(s) => s,
+            other => {
+                // #2677: a computed key evaluating to a non-string is the
+                // pattern's own `INDEX`-shaped refusal, not construction's
+                // "Cannot use ... as object key" (that's a different jq
+                // bytecode op) -- confirmed live: `. as {(.n):$q} | $q` on
+                // `{"a":1,"n":1}` raises "Cannot index object with number".
+                // A bare non-string *literal* key (`{(1):$q}`) is a
+                // compile-time check in real jq, not modelled here --
+                // matching object construction's own pre-existing,
+                // out-of-scope gap for the identical shape (`{(1): 1}`,
+                // #2677's own triage explicitly scopes this out).
+                let err = EvalError::cannot_index_with_type(
+                    owned_type_name(value),
+                    owned_type_name(other),
+                );
+                return (new_frontier, Some(Control::Error(err)));
+            }
+        };
+        // jq destructures by indexing once per key, so a non-object target
+        // reports exactly what `.<key>` would.
+        let obj = match value {
+            OwnedValue::Object(o) => o,
+            _ => {
+                let err = EvalError::cannot_index_with_field(owned_type_name(value), key);
+                return (new_frontier, Some(Control::Error(err)));
+            }
+        };
+        let field_value = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
+        let (sub_results, sub_control) =
+            extract_pattern_bindings::<S>(&entry.pattern, &field_value, invert);
+        for partial in &frontier {
+            for sub in &sub_results {
+                let mut combined = partial.clone();
+                // `{$b: P}` binds `$b` to the matched value *before* running
+                // `P` against that same value (one `INDEX` step in jq's own
+                // compilation, #2649) -- pushed ahead of the sub-pattern's
+                // own bindings so this preserves the existing order (and
+                // hence `dedup_object_bindings`'s first/last-wins result)
+                // exactly as when this was desugared into two separate
+                // entries.
+                if let Some(bind) = &entry.bind {
+                    combined.push((bind.clone(), field_value.clone()));
+                }
+                combined.extend(sub.iter().cloned());
+                new_frontier.push(combined);
+            }
+        }
+        if let Some(control) = sub_control {
+            return (new_frontier, Some(control));
+        }
+    }
+    (new_frontier, key_control)
+}
+
+/// [`extract_pattern_bindings`], collapsed back to its pre-#2677
+/// single-`Result` shape (#2677 step 3, first increment): a pattern with no
+/// computed key anywhere still produces exactly one binding-set with no
+/// trailing control, so every existing call site is unaffected byte-for-
+/// byte, and so does a computed key whose own expression yields exactly one
+/// valid string (the common real-world shape -- `{(.key): $q}`, `{"\(.k)":
+/// $q}`). A computed key that is itself a *generator* (`{("a","b"):$q}`,
+/// jq's own multi-output fan-out per key) needs each call site's own
+/// alternative-retry/fold-matrix machinery threaded through to fan out
+/// correctly rather than silently keeping one output or dropping the rest
+/// -- not yet done (tracked on #2677 itself), so it -- along with the rarer
+/// zero-output (`{(empty):$q}`) and `break`/`halt`-inside-a-key-expression
+/// shapes -- refuses clearly here instead, at every one of this adapter's
+/// call sites uniformly, rather than risking a wrong answer at any one of
+/// them individually.
+pub(crate) fn extract_single_pattern_binding<S: EvalSemantics>(
+    pattern: &Pattern,
+    value: &OwnedValue,
+    invert: bool,
+) -> Result<Vec<(String, OwnedValue)>, EvalError> {
+    let (mut binding_sets, control) = extract_pattern_bindings::<S>(pattern, value, invert);
+    match (binding_sets.len(), control) {
+        (1, None) => Ok(binding_sets.pop().unwrap()),
+        (0, Some(Control::Error(e))) => Err(e),
+        _ => Err(EvalError::new(
+            "a computed key in a destructuring pattern produced zero outputs, more than \
+             one output, or was interrupted by break/halt, none of which are yet \
+             supported at this call site (#2677)",
+        )),
     }
 }
 
@@ -86237,7 +86431,7 @@ mod tests {
             is_input,
         };
         let mut out = Vec::new();
-        let result = walk_pattern(&patterns[alt], input, seed, &frame, &mut out);
+        let result = walk_pattern::<JqSemantics>(&patterns[alt], input, seed, &frame, &mut out);
         (frame, result, out)
     }
 
