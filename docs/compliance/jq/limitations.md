@@ -2902,6 +2902,19 @@ yq has no `def` at all — its lexer rejects `def f: 42; f` outright — so succ
 support there is an extension (ADR-0018 rule 5) rather than a behaviour with a reference to
 match.
 
+**"Regardless of whether reached" above means an unreached *branch* of executed code**
+(`if false then f(1;2;3) else 1 end` still rejects `f/3`), **not a `def` nobody ever calls at
+all** — [#2740](https://github.com/rust-works/succinctly/issues/2740) closed that residual
+gap: `resolve_func_calls_all` first builds a call graph among every `def`'s body (keyed by
+each body's own heap address, since neither pass restructures the tree between building the
+graph and walking it for real) and only checks a body reachable from the program's own
+top-level execution, exactly mirroring jq's substitution-based compiler, which only ever
+compiles a `def` at the call site referencing it. `def h: nosuchfn; 1` now compiles (`h` is
+declared but never mentioned anywhere), matching jq; `def h: nosuchfn; h` still rejects it,
+and a def referenced only as an unused filter *argument* (`def use(f): 1; use(h)`) still
+counts as reached, confirmed live: real jq's own argument-closure compilation needs that
+reference to resolve independent of whether the callee's body ever invokes the parameter.
+
 ### The other three compile-error paths — one closed, two still open (#2703)
 
 [#2703](https://github.com/rust-works/succinctly/issues/2703) found that the shape above
