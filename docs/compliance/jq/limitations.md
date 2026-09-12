@@ -952,6 +952,23 @@ walk still runs there, purely to reproduce jq's own refusal for the pattern's ow
 `?//`-alternatives stay on the refuse-only path regardless of pattern shape (item 2 above) —
 `patterns.len() > 1` never reaches the walk.
 
+**One further gap is not refuse-only, and is not new here** —
+[#2860](https://github.com/rust-works/succinctly/issues/2860): `foreach`'s own EXTRACT
+fabricates a tracked path (accept-where-jq-refuses, corrupting a write) when it references the
+loop variable again after navigating through a missing object key or other null-absorbing step
+on it first — confirmed with a **bare `$var` pattern, no destructuring**, reproducing
+byte-for-byte on a pre-#2676 build: `path(foreach .a as $v0 (.; $v0; (.zzz \| $v0)))` on
+`{"a":{"b":1}}` is `["a"]` here, "Invalid path expression with result `{"b":1}`" in jq. The
+defect lives entirely in `FoldRegister`'s pre-existing UPDATE→EXTRACT chain
+(`FoldRegister::advance`/`resolve`, `resolve_seq`'s #2046 carried-register mechanism) — #2676
+does not touch that machinery, only gives a destructured loop variable a tracked marker
+(`apply_pattern_bindings`) for the first time, which inherits this pre-existing defect the same
+splice already had for a bare `$var`. Not fixed here: the root cause needs tracing
+`resolve_seq_stage`'s handling of a missing-key/null-absorbing step (real jq tracks a missing
+key as a genuine, null-valued navigation — `path({} \| .foo)` is `["foo"]` — which this
+resolver's own carried-register fallback does not appear to model correctly), which is a
+separate, pre-existing investigation from this issue's own scope.
+
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
 [#1872](https://github.com/rust-works/succinctly/issues/1872),
 [#2031](https://github.com/rust-works/succinctly/issues/2031) and
