@@ -49649,15 +49649,33 @@ pub(crate) fn install_def_calls(
                 // Don't expand in the body or then - this is a new definition
                 expr.clone()
             } else {
-                Expr::FuncDef {
-                    name: inner_name.clone(),
-                    params: inner_params.clone(),
-                    body: Box::new(install_def_calls(
+                // #2738: a nested def's own *parameters* also shadow `def`
+                // within that def's body when `def` is zero-arity -- a
+                // parameter is referenced as a bare zero-argument call, so it
+                // occupies the same namespace slot as a zero-arity def. This
+                // mirrors `substitute_func_param_impl`'s own `body_scope`
+                // check for the same reason: `def b: 8; def h(b): b; h(6)`
+                // must resolve `b` inside `h`'s body to the parameter, not to
+                // the outer `def b`, even though `h`'s own name/arity don't
+                // match `b`/0 at all. The shadowing is scoped to `inner_body`
+                // only -- jq's parameter scope never extends past the def's
+                // own body, so `then` still gets `def` installed normally.
+                let body_shadowed =
+                    def.params.is_empty() && inner_params.iter().any(|p| p.name() == def.name);
+                let new_body = if body_shadowed {
+                    inner_body.clone()
+                } else {
+                    Box::new(install_def_calls(
                         inner_body,
                         def,
                         frames + 1,
                         in_recursive_body,
-                    )),
+                    ))
+                };
+                Expr::FuncDef {
+                    name: inner_name.clone(),
+                    params: inner_params.clone(),
+                    body: new_body,
                     then: Box::new(install_def_calls(then, def, frames + 1, in_recursive_body)),
                     // Rebuilt above, so any cache from the pre-install node
                     // is stale (#2094) -- the shadowed branch above instead
