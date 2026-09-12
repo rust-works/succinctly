@@ -1528,15 +1528,21 @@ mod tests {
     }
 
     #[test]
-    fn indentation_does_not_affect_attachment_798() {
-        // A comment indented deeper or shallower than the following key
-        // still attaches to it -- measured, indentation is irrelevant.
+    fn indentation_within_prevs_block_does_not_affect_attachment_798() {
+        // A comment indented deeper than the following key still attaches
+        // to it, and so does one at the key's own column after a dedent --
+        // measured. Indentation only matters once the comment sits *below*
+        // the block the previous node is in and away from the next node's
+        // column (#2811; `a:\n  b: 1\n  # after\nc: 2\n` is `.a.b`'s
+        // key's foot, pinned in `tests/yq_cli_tests.rs`).
         let (head, _) = field_key_head_foot(b"a: 1\n      # deep\nb: 2\n", "b");
         assert_eq!(head, ["# deep"]);
         let (head, _) = field_key_head_foot(b"a:\n  b: 1\n# after\nc: 2\n", "c");
         assert_eq!(head, ["# after"]);
         let (head, _) = field_key_head_foot(b"a:\n  b: 1\n\n# after\nc: 2\n", "c");
         assert_eq!(head, ["# after"]);
+        let (_, b_foot) = nested_key_head_foot(b"a:\n  b: 1\n  # after\nc: 2\n", "a", "b");
+        assert_eq!(b_foot, ["# after"]);
     }
 
     #[test]
