@@ -276,11 +276,9 @@ impl ModuleLoader {
         //   "pb"; foo` answers `pb`'s `foo`, and reversing the two
         //   `include`s reverses the answer.
         //
-        // So `program.includes` is walked in reverse (declaration order
-        // last-to-first) so the last-declared include is processed first
-        // and ends up innermost, and the whole includes block runs before
-        // the `~/.jq` block below so every include ends up nested inside
-        // `~/.jq`'s own defs, not the other way around.
+        // Hence `.rev()` below (last-declared include processed first, so
+        // it ends up innermost) and the whole includes block running before
+        // the `~/.jq` block that follows it.
         for include in program.includes.iter().rev() {
             let defs = self.load_module(&include.path)?;
             // Wrap expression with function definitions from the included module
