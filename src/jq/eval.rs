@@ -3574,8 +3574,11 @@ pub(crate) fn prefer_pending_control(
 /// *conservative* pre-#2226 behaviour that happens to match real yq, so a new
 /// site that forgets the gate diverges loudly in jq mode and silently in yq
 /// mode. [`fold_escaped_generator_prefix`] is the whole-arm shape built on
-/// top of this predicate; the two `eval_slice_bound`s and the two key-stream
-/// matches, which have no accumulator to fold into, call it directly.
+/// top of this predicate; the two slice-bound pulls ([`each_slice_bound`]
+/// and `eval_generic::each_slice_bound_generic`, whose yq-mode arm collects
+/// the bound eagerly and discards it whole on escape, #2546) and the two
+/// key-stream matches, which have no accumulator to fold into, call it
+/// directly.
 #[inline]
 pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
     S::TAG != EvalTag::Yq
@@ -21114,7 +21117,11 @@ fn each_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Stop => Flow::Stopped { pending: None },
         };
     };
-    if S::TAG == EvalTag::Yq {
+    // #2374: the mode test is `streams_escaped_generator_prefix`, the
+    // family's one definition of "does this mode stream an escaped
+    // sub-generator's prefix" -- the eager collection below is what
+    // *discarding* it looks like once the pushes are the prefix.
+    if !streams_escaped_generator_prefix::<S>() {
         let mut collected: Vec<ComputedSliceBound> = Vec::new();
         match pull_slice_bound::<W, S>(expr, value, round, &mut |b| {
             collected.push(b);
@@ -36431,7 +36438,7 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
 /// `eval_owned_expr_fork` directly instead, since each needs the full
 /// `(Vec<OwnedValue>, Option<Control>)` shape to avoid silently dropping a
 /// trailing error/break behind values already produced (#855). Same fix
-/// [`eval_slice_bound`] already applies to slice bounds.
+/// [`each_slice_bound`] already applies to slice bounds.
 ///
 /// #1559 (code review): a thin wrapper over [`eval_owned_expr_opt`] rather
 /// than its own copy of that function's own trailing-`Control` fix -- see its
