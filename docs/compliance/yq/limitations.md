@@ -3177,18 +3177,33 @@ against jq 1.7.1: `path(.[(0,1,"x"):(2,3)])` on `[10,20,30]` prints all four
 `{start,end}` combinations of the two valid `start` values before raising on `"x"`.
 
 yq mode conservatively discards this prefix at every one of the three sites that
-resolve a computed bound (`eval_slice_bound`, `eval_slice_bound_with_path_context`,
-`resolve_slice_bound` — the read, path-context-read, and `=`/`|=`/`del()`/`path()`
-write-path resolvers respectively, #2372/#2385) instead of streaming it — real yq has
-no clean model for a computed comma-bound at all, confirmed live against yq v4.53.3:
-`.[(0,"x"):3]` on `[10,20,30]` rejects the bound outright ("expected to find 1 number,
-got 2 instead"), not the type-error message succinctly's own comma-bound generator
-model produces. Since real yq's own behavior for this input shape is "reject the query
-before evaluation," not "stream then error," there is no oracle output to match by
-streaming a prefix here — the conservative discard is the closer approximation of "no
-usable output" a real yq user would see, even though the specific error message
-differs (succinctly raises succinctly's own generator-model error; real yq raises its
-own parse-time rejection).
+resolve a computed bound (`each_slice_bound`, `each_slice_bound_generic`,
+`resolve_slice_bound` — the bridge-route read, CLI-route read, and
+`=`/`|=`/`del()`/`path()` write-path resolvers respectively, #2372/#2385) instead of
+streaming it — real yq has no clean model for a computed comma-bound at all, confirmed
+live against yq v4.53.3: `.[(0,"x"):3]` on `[10,20,30]` rejects the bound outright
+("expected to find 1 number, got 2 instead"), not the type-error message succinctly's
+own comma-bound generator model produces. Since real yq's own behavior for this input
+shape is "reject the query before evaluation," not "stream then error," there is no
+oracle output to match by streaming a prefix here — the conservative discard is the
+closer approximation of "no usable output" a real yq user would see, even though the
+specific error message differs (succinctly raises succinctly's own generator-model
+error; real yq raises its own parse-time rejection).
+
+The same three sites keep their *eager* shape in yq mode after
+[#2546](https://github.com/rust-works/succinctly/issues/2546) made jq mode's bound pull
+lazy and deferred its bound-type check to the slice step: real yq evaluates a bound
+expression in full before it slices, and parses every bound before it looks at the
+target — `.["x":]` is `Error: strconv.ParseInt: parsing "x": invalid syntax` on an
+array, a mapping, a scalar *and* `null` alike, and `.["x":]?` raises the same
+(confirmed live against yq v4.53.3; jq answers `null` for the null target, `Cannot
+index object with object` for the mapping, and suppresses all three under `?`). So in
+yq mode a non-numeric bound still raises succinctly's `Array/string slice indices must
+be integers` for every target kind, `?` does not suppress it, and a bound generator's
+later `error(...)` still outranks an earlier non-numeric value
+(`.[(0,"x",error("y")):3]` is `Error: y`, `.[(0,1,error("x")):(2,3,error("y"))]` is
+`Error: x` — `end` is never reached) — only the message text differs from real yq's, as
+above.
 
 ### An integer-shaped overflow float gains a trailing `.0` on the value route (#2419)
 

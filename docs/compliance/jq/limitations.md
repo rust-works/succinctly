@@ -2584,15 +2584,43 @@ Two sentences arrived with the feature — `A slice of an array can only be assi
 array` and `Array/string slice indices must be integers` — and both were already pinned as
 probes, so the two-sided manifest check forced them to start matching in the same change.
 
-What #366 did *not* build: computed bounds. `.[$a:$b]` is still a parse error, because the
-parser folds slice bounds to integer literals; see
-[docs/reference/jq-language.md](../../reference/jq-language.md). Writing through a slice
-against `null` used to raise `Cannot index null with object` instead of auto-vivifying —
-[#1340](https://github.com/rust-works/succinctly/issues/1340) brought that in line with
-jq's own `setpath()` behavior, and [#1873](https://github.com/rust-works/succinctly/issues/1873)
-later fixed a gap in that same auto-vivification for a slice with more path *after* it
-(`.a[0:1][]? = 9` on a missing `.a` now no-ops instead of raising a write-time error, matching
-jq).
+What #366 did *not* build: computed bounds. `.[$a:$b]` was a parse error at the time,
+because the parser folds slice bounds to integer literals (see
+[docs/reference/jq-language.md](../../reference/jq-language.md));
+[#499](https://github.com/rust-works/succinctly/issues/499) added them later. Writing
+through a slice against `null` used to raise `Cannot index null with object` instead of
+auto-vivifying — [#1340](https://github.com/rust-works/succinctly/issues/1340) brought
+that in line with jq's own `setpath()` behavior, and
+[#1873](https://github.com/rust-works/succinctly/issues/1873) later fixed a gap in that
+same auto-vivification for a slice with more path *after* it (`.a[0:1][]? = 9` on a
+missing `.a` now no-ops instead of raising a write-time error, matching jq).
+
+### A computed bound is ruled on at the slice step, after the target's kind (#2546)
+
+jq's `INDEX` opcode looks at the target before it parses a slice descriptor's bounds:
+`null | .["x":]` is `null`, `{"a":1} | .["x":]` is `Cannot index object with object`, and
+only an array/string target ever raises `Array/string slice indices must be integers`. The
+postfix `?` is the same opcode's `INDEX_OPT` form, so it suppresses the slice step of *one*
+`(start, end, target)` triple and the generators resume — `[1,2] | [.[(0,"x",1):]?]` is
+`[[1,2],[2]]` where `[try .[(0,"x",1):]]` is `[[1,2]]` — and the bound generators are pulled
+lazily, `start` outermost and `end` per start value, so a pair's error stops them before the
+next value's side effect: `.[("x",(1|debug)):]` raises with no DEBUG line, and
+`.[(0,1|debug):(2,3|debug)]` writes DEBUG `0 2 3 1 2 3`. All captured live from jq 1.7.1;
+succinctly used to classify every bound eagerly at the pull site, outside the per-pair `?`
+and ahead of the target, so every one of those rows raised the slice-indices error (or, for
+the DEBUG rows, ran the generator to exhaustion first). Both value-mode evaluators and the
+path-mode resolver now follow jq's order.
+
+One corner of path mode is still open: a non-numeric bound over a **null** target. jq
+resolves that path (`null | path(.["x":])` is `[{"start":"x","end":null}]`, `?` or not) and
+leaves it to the write to refuse it — `= 5` and `|= 5` raise `Array/string slice indices must
+be integers`, `del()` no-ops to `null`. succinctly's `Expr::Slice` path component holds only
+integer bounds, so the resolver raises that same error at resolution instead, unsuppressed by
+`?`: identical for every write jq refuses, wrong only for `path()` (jq reports the descriptor)
+and `del()` (jq answers `null`). Tracked as a follow-up to #2546. The path-mode resolver also
+still drains each bound generator eagerly before slicing — the same gap
+[#2267](https://github.com/rust-works/succinctly/issues/2267) records for `resolve_index_expr`
+— so `path(.[("x",(1|debug)):])` still prints the DEBUG line jq never reaches.
 
 ## Reading a path is indexing
 
