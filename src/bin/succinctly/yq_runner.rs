@@ -2073,6 +2073,15 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
             | Expr::CompoundAssign { path, .. }
             | Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, false, out),
             Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, false, out),
+            // #2855: `sort_keys(f)` is a write (reorders `f`'s own mapping
+            // entries in place) exactly like `|=`'s -- same `WriteKind::Set`,
+            // never fresh, since it only reorders what's already there. A
+            // bare `sort_keys`/`sort_keys()` (no path at all) never reaches
+            // a write; it always raises at evaluation, so it's treated the
+            // same as `Expr::Identity` above -- no target, but not a reason
+            // to give up on the whole expression's write analysis either.
+            Expr::Builtin(Builtin::SortKeys(Some(path))) => push(path, WriteKind::Set, false, out),
+            Expr::Builtin(Builtin::SortKeys(None)) => true,
             // `setpath(["a", 0]; v)` / `delpaths([["a", 0]])` name their
             // paths as array literals (#1351 made both alias-sensitive, so
             // they reach this walk). Only a literal path list is static; a

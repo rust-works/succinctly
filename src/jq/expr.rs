@@ -1528,6 +1528,22 @@ pub enum Builtin {
     /// Each output from this operator should be printed with `---` separator.
     /// Semantically returns the input unchanged, but signals document boundary.
     SplitDoc,
+    /// `sort_keys(f)` (yq): for every path `f` resolves, reorder that node's
+    /// own mapping entries by key -- shallow, one level (#2855). `None` when
+    /// the call was written with no usable argument (bare `sort_keys` or
+    /// `sort_keys()`), which is a *runtime* error in real yq ("expects 1 arg
+    /// but received none"), not a parse error -- confirmed live: it isn't
+    /// raised early even when the call sits in an unevaluated branch.
+    SortKeys(Option<Box<Expr>>),
+    /// The shallow reorder-by-key step `SortKeys` desugars its resolved
+    /// paths through via [`crate::jq::eval::eval_update`], reusing that
+    /// function's own generic path-resolution/write machinery instead of
+    /// reimplementing it. Never spelled directly in source -- constructed
+    /// only by `SortKeys`'s own evaluation, so it has no parser entry and no
+    /// arity/shadowing concerns of its own. Given a `Mapping`, reorders its
+    /// entries by key (the same comparator `--sort-keys` already uses);
+    /// given anything else, returns it unchanged.
+    SortKeysOneLevel,
 
     // Phase 11: Path manipulation
     /// `del(path)` - delete value at path

@@ -4131,6 +4131,44 @@ impl<'a> Parser<'a> {
             self.consume_keyword("upcase");
             return Ok(Some(Builtin::AsciiUpcase));
         }
+        // `sort_keys(f)` is a real yq v4.53.3 builtin with no jq equivalent
+        // (jq 1.7.1 also reports "sort_keys/1 is not defined") -- the same
+        // always-on-in-yq-mode, never-in-jq-mode pattern `downcase`/
+        // `upcase` above already use (#2855).
+        if self.mode == ParserMode::Yq && self.matches_keyword("sort_keys") {
+            let keyword_start = self.pos;
+            self.consume_keyword("sort_keys");
+            self.skip_ws();
+            if self.peek() != Some('(') {
+                // Confirmed live against yq v4.53.3: a bare `sort_keys`
+                // (no parens at all) is a *runtime* error --
+                // "'sort_keys' expects 1 arg but received none", exit 1
+                // -- not a parse-time one, so `Builtin::SortKeys(None)`
+                // parses cleanly here and `builtin_sort_keys` raises it
+                // at evaluation instead.
+                return Ok(Some(Builtin::SortKeys(None)));
+            }
+            self.next(); // consume '('
+            self.skip_ws();
+            if self.peek() == Some(')') {
+                self.next();
+                // `sort_keys()` (empty parens) is the identical "received
+                // none" runtime error -- confirmed live.
+                return Ok(Some(Builtin::SortKeys(None)));
+            }
+            let path = self.parse_expr()?;
+            self.skip_ws();
+            // yq mode accepts (and ignores) any further `; expr` arguments
+            // -- confirmed live against yq v4.53.3: `sort_keys(.; .; .)`
+            // parses and behaves identically to `sort_keys(.)`, the same
+            // leniency #1122 established for `sub`.
+            self.parse_yq_arity_leniency_tail()?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![path]);
+            }
+            self.next();
+            return Ok(Some(Builtin::SortKeys(Some(Box::new(path)))));
+        }
         if self.matches_keyword("ltrimstr") {
             self.reject_unless_jq_extensions("ltrimstr")?;
             let keyword_start = self.pos;
