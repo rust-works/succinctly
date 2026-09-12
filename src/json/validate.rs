@@ -173,6 +173,9 @@ pub struct Validator<'a> {
     column: usize,
     /// Current container nesting depth, capped at [`MAX_NESTING_DEPTH`].
     nesting_depth: usize,
+    /// Whether to accept the number and escape spellings real jq accepts
+    /// but RFC 8259 does not -- see [`validate_jq_lenient`].
+    jq_lenient: bool,
 }
 
 impl<'a> Validator<'a> {
@@ -184,7 +187,17 @@ impl<'a> Validator<'a> {
             line: 1,
             column: 1,
             nesting_depth: 0,
+            jq_lenient: false,
         }
+    }
+
+    /// This validator, switched to jq's own accept-set for numbers and
+    /// unicode escapes -- see [`validate_jq_lenient`] for the exact rules
+    /// and why they live here rather than in a text-rewriting pre-pass.
+    #[must_use]
+    pub fn jq_lenient(mut self) -> Self {
+        self.jq_lenient = true;
+        self
     }
 
     /// Validate the entire input as JSON.
@@ -217,6 +230,10 @@ impl<'a> Validator<'a> {
             Some(b'[') => self.validate_array(),
             Some(b'"') => self.validate_string(),
             Some(b'-' | b'0'..=b'9') => self.validate_number(),
+            // #2052: an elided integer part (`.5`) starts a number only in
+            // jq's accept-set; RFC 8259 has no value starting with `.`, so
+            // strict mode keeps falling through to the error arm below.
+            Some(b'.') if self.jq_lenient => self.validate_number(),
             Some(b't' | b'f' | b'n') => self.validate_keyword(),
             Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
             Some(_) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
@@ -503,8 +520,13 @@ impl<'a> Validator<'a> {
                             self.error(ValidationErrorKind::UnpairedSurrogate { codepoint: high })
                         );
                     }
-                } else if (0xDC00..=0xDFFF).contains(&high) {
-                    // Lone low surrogate
+                } else if (0xDC00..=0xDFFF).contains(&high) && !self.jq_lenient {
+                    // Lone *low* surrogate. jq accepts it and substitutes
+                    // U+FFFD (#2012, the same leniency #2008 gave this
+                    // crate's own decoder), so lenient mode lets it through.
+                    // A lone *high* surrogate is rejected by both and is
+                    // handled by the arm above, which lenient mode leaves
+                    // alone.
                     return Err(
                         self.error(ValidationErrorKind::UnpairedSurrogate { codepoint: high })
                     );
@@ -579,35 +601,67 @@ impl<'a> Validator<'a> {
         }
 
         // Integer part
-        match self.peek() {
+        let integer_digits = match self.peek() {
             Some(b'0') => {
                 self.advance();
-                // Check for leading zero (e.g., 01, 007)
+                // A redundant leading zero (`01`, `007`) is RFC 8259's own
+                // rejection; jq accepts it (#1094), so lenient mode reads
+                // the run and moves on.
                 if matches!(self.peek(), Some(b'0'..=b'9')) {
-                    return Err(self.error(ValidationErrorKind::LeadingZero));
+                    if !self.jq_lenient {
+                        return Err(self.error(ValidationErrorKind::LeadingZero));
+                    }
+                    self.skip_digits();
                 }
+                1
             }
             Some(b'1'..=b'9') => {
                 self.advance();
-                self.skip_digits();
+                1 + self.skip_digits()
             }
+            // jq accepts a missing integer part before the decimal point
+            // (`.5`, `-.5`, #2240). The fraction below then has to supply
+            // at least one digit, which is what keeps a bare `.`, `-.` and
+            // `.e5` rejected here exactly as jq rejects them.
+            Some(b'.') if self.jq_lenient => 0,
             Some(_) | None => {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit after minus sign",
                 }));
             }
-        }
+        };
 
         // Optional fractional part
         if self.peek() == Some(b'.') {
             self.advance();
 
-            // Must have at least one digit after decimal point
-            if self.skip_digits() == 0 {
+            // Must have at least one digit after the decimal point --
+            // except in lenient mode, where a fraction elided before an
+            // exponent (`1.e5`, #2240) is a spelling jq accepts.
+            //
+            // A *bare* trailing dot (`5.`, `007.`, `0.`) stays rejected even
+            // there, and deliberately: jq answers `5`, but admitting it here
+            // would route `99999999999999999.` through `from_number_bytes`'s
+            // large-integer gap and materialize the wrong integer. That is
+            // the recorded rule-4c divergence in
+            // `docs/compliance/jq/limitations.md` (#2240), and this is the
+            // check that holds it.
+            let fraction_digits = self.skip_digits();
+            let elided_before_exponent =
+                self.jq_lenient && integer_digits > 0 && matches!(self.peek(), Some(b'e' | b'E'));
+            if fraction_digits == 0 && !elided_before_exponent {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
                     reason: "expected digit after decimal point",
                 }));
             }
+        } else if integer_digits == 0 {
+            // Lenient mode entered on a `.` that turned out not to be one:
+            // unreachable today (the arm above only matches `.`), kept so a
+            // future relaxation of the integer part cannot silently admit a
+            // number with no digits at all.
+            return Err(self.error(ValidationErrorKind::InvalidNumber {
+                reason: "expected digit after minus sign",
+            }));
         }
 
         // Optional exponent
@@ -742,6 +796,66 @@ impl<'a> Validator<'a> {
 /// ```
 pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
     Validator::new(input).validate()
+}
+
+/// [`validate`], with the accept-set real jq applies to a JSON *value*
+/// argument (`--argjson`/`--jsonargs`, and a `--seq` record) rather than
+/// RFC 8259's (#2052).
+///
+/// Four spellings jq accepts and RFC 8259 does not, each captured live from
+/// jq 1.7.1 via `jq -nc --argjson x <value> '$x'`:
+///
+/// | spelling | jq 1.7.1 | rule |
+/// |---|---|---|
+/// | `007`, `00`, `00.5` | `7`, `0`, `0.5` | redundant leading zero (#1094) |
+/// | `.5`, `-.5`, `.05` | `0.5`, `-0.5`, `0.05` | elided integer part (#2240) |
+/// | `1.e5`, `1.E5` | `1E+5` | fraction elided before an exponent (#2240) |
+/// | `"\udc00"` (escaped) | U+FFFD | lone *low* surrogate escape (#2012) |
+///
+/// Nothing else moves. A lone *high* surrogate, a control character in a
+/// string, trailing content, `0x10`, `1_000` and `1.2.3` stay rejected, as
+/// they are in jq. Three spellings jq *does* accept stay rejected here
+/// because the decoder behind this validator cannot materialize them yet --
+/// a leading `+` (`+1` is `1` there), `nan`/`NaN` (`null`) and
+/// `Infinity`/`-Infinity` (the `f64` extremes); they are tracked separately
+/// as #2877 rather than opened here, since admitting a spelling this
+/// module's own decoder refuses is the #1247 failure shape.
+///
+/// **A bare trailing dot (`5.`, `007.`, `0.`) is rejected on purpose**,
+/// even though jq answers `5`: see `Validator::validate_number`'s own
+/// comment (private) and the rule-4c row in
+/// `docs/compliance/jq/limitations.md` (#2240).
+///
+/// This mode exists because the alternative -- rewriting the input text
+/// once per leniency to get it past a stricter validator -- does not scale.
+/// That was `jq_runner`'s shape until #2052: three hand-written normalizers
+/// composed in an order-sensitive chain, each independently reimplementing
+/// the mismatch between `serde_json`'s grammar and this crate's own
+/// decoder, and a fourth needed for every leniency after. #2012 had already
+/// shipped and then fixed a composition bug in it (two normalizers applied
+/// independently against the untouched original rejected a value needing
+/// both). Stating the accept-set once, in the validator that already walks
+/// the grammar, replaces all of it -- and drops `serde_json`'s own
+/// magnitude rejection with it, which was a jq divergence rather than a
+/// safeguard (`--argjson x 1e400` is `1E+400` in jq 1.7.1).
+///
+/// **The accept-set must equal what the decoder materializes.** A spelling
+/// admitted here that `json_bytes_to_owned_value_checked` then refuses is a
+/// #1247-shaped "validated, then failed to decode" error;
+/// `jq_lenient_accept_set_matches_the_decoder_2052` in this module's tests
+/// runs both sides over every spelling above to hold the two together.
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::{validate, validate_jq_lenient};
+///
+/// assert!(validate(b"007").is_err());
+/// assert!(validate_jq_lenient(b"007").is_ok());
+/// assert!(validate_jq_lenient(b"5.").is_err()); // rule-4c divergence, on purpose
+/// ```
+pub fn validate_jq_lenient(input: &[u8]) -> Result<(), ValidationError> {
+    Validator::new(input).jq_lenient().validate()
 }
 
 /// True if `bytes` is *exactly* one RFC 8259 JSON number token, with
@@ -945,6 +1059,186 @@ pub fn has_leading_dot(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // validate_jq_lenient tests (#2052)
+    // ========================================================================
+
+    /// The four spellings jq accepts and RFC 8259 does not: strict mode
+    /// rejects each, lenient mode accepts each. Every expectation captured
+    /// from `/usr/bin/jq` 1.7.1 via `jq -nc --argjson x <value> '$x'`.
+    #[test]
+    fn jq_lenient_accepts_exactly_the_four_documented_leniencies_2052() {
+        for s in [
+            // redundant leading zero (#1094)
+            "007",
+            "00",
+            "00.5",
+            "01",
+            "-01",
+            "-00",
+            "007e5",
+            "00e5",
+            "0099999999999999999999999",
+            // elided integer part (#2240)
+            ".5",
+            "-.5",
+            ".05",
+            ".0",
+            ".5e3",
+            // fraction elided before an exponent (#2240)
+            "1.e5",
+            "1.E5",
+            "007.e5",
+            // lone low surrogate escape (#2012)
+            r#""\udc00""#,
+            r#""\uDFFF""#,
+            r#""a\udc00b""#,
+            // and all of them at once, the composition #2012's own retry got
+            // wrong before it was fixed
+            r#"[007,"\udc00",.5,1.e5]"#,
+        ] {
+            assert!(
+                validate(s.as_bytes()).is_err(),
+                "strict mode must still reject: {s:?}"
+            );
+            assert!(
+                validate_jq_lenient(s.as_bytes()).is_ok(),
+                "lenient mode must accept: {s:?}"
+            );
+        }
+    }
+
+    /// Lenient mode moves nothing else. The first group is rejected by jq
+    /// too; the second is the deliberate rule-4c divergence (jq accepts a
+    /// bare trailing dot, this validator must not -- see
+    /// `Validator::validate_number`); the third is #2877's trio, which jq
+    /// accepts and the decoder behind this validator cannot yet
+    /// materialize, so admitting them here would be the #1247 shape.
+    #[test]
+    fn jq_lenient_rejects_everything_outside_the_four_leniencies_2052() {
+        for s in [
+            // jq rejects these too
+            r#""\ud800""#,
+            r#"{"a":1,}"#,
+            "[1,]",
+            "1 2",
+            "1e",
+            "0x10",
+            "'a'",
+            "1.2.3",
+            "1_000",
+            ".",
+            "-.",
+            "-",
+            ".e5",
+            "..5",
+            "1.e",
+            ".5.",
+            "0..5",
+            "\"tab\tin\"",
+            "[,]",
+            "{,}",
+            // rule-4c: jq answers 5 / 7 / 0 for these; rejected on purpose
+            "5.",
+            "-5.",
+            "[5.]",
+            r#"{"a":5.}"#,
+            "1.",
+            "0.",
+            "007.",
+            // #2877: jq accepts, the decoder cannot represent them yet
+            "+1",
+            "nan",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ] {
+            assert!(
+                validate_jq_lenient(s.as_bytes()).is_err(),
+                "lenient mode must reject: {s:?}"
+            );
+        }
+    }
+
+    /// Ordinary RFC 8259 documents are unaffected: whatever strict mode
+    /// accepts, lenient mode accepts identically -- the mode only ever
+    /// *widens*, so a leniency bug cannot narrow the base grammar.
+    #[test]
+    fn jq_lenient_accepts_everything_strict_mode_does_2052() {
+        for s in [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0",
+            "42",
+            "-42",
+            "0.0",
+            "1e10",
+            "1E+10",
+            "-1.5e-3",
+            r#""x""#,
+            r#""é""#,
+            r#""😀""#,
+            "[]",
+            "{}",
+            "[1,2,3]",
+            r#"{"a":[1,{"b":2.5}],"c":null}"#,
+            " 1 ",
+            "1.500",
+            "99999999999999999",
+        ] {
+            assert_eq!(
+                validate(s.as_bytes()).is_ok(),
+                validate_jq_lenient(s.as_bytes()).is_ok(),
+                "strict and lenient must agree on: {s:?}"
+            );
+            assert!(validate_jq_lenient(s.as_bytes()).is_ok(), "{s:?}");
+        }
+    }
+
+    /// The accept-set must equal what the decoder materializes, or an
+    /// admitted spelling becomes a #1247 "validated, then failed to decode"
+    /// error one layer down. `from_number_bytes` is that decoder's number
+    /// half, and it routes the two dot leniencies through this module's own
+    /// [`has_leading_dot`]/[`has_trailing_dot_before_exponent`] gates -- so
+    /// this asserts the two agree rather than assuming it.
+    #[test]
+    fn jq_lenient_accept_set_matches_the_decoder_2052() {
+        use crate::jq::OwnedValue;
+        for s in [
+            "007",
+            "00",
+            "00.5",
+            "01",
+            "-01",
+            "007e5",
+            ".5",
+            "-.5",
+            ".05",
+            ".0",
+            ".5e3",
+            "1.e5",
+            "1.E5",
+            "0099999999999999999999999",
+            "42",
+            "-1.5e-3",
+            "1e400",
+        ] {
+            assert!(
+                validate_jq_lenient(s.as_bytes()).is_ok(),
+                "test bug -- not a lenient-accepted spelling: {s:?}"
+            );
+            assert!(
+                matches!(
+                    OwnedValue::from_number_bytes(s.as_bytes()),
+                    OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+                ),
+                "validator admits a number the decoder does not read as one: {s:?}"
+            );
+        }
+    }
 
     // ========================================================================
     // is_valid_number tests (#957/#966)
