@@ -50262,11 +50262,18 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // one -- confirmed live against jq 1.7.1, `def f($a): def a: 99;
             // $a; f(2)` is `2` (this used to block both namespaces and
             // answered "undefined variable: $a").
-            let then_scope = if name == param && params.is_empty() {
+            // #2737 review: `then_scope` and `body_scope` both start from
+            // this same self-shadow check -- computed once here so a future
+            // edit to the condition (or to a new namespace rule) cannot be
+            // applied to one and not the other the way #2737 itself
+            // happened (the check below was added to `then_scope` alone by
+            // #2077 and stayed missing from `body_scope` for years).
+            let self_shadow_scope = if name == param && params.is_empty() {
                 scope.without_bare()
             } else {
                 scope
             };
+            let then_scope = self_shadow_scope;
             // #2283 review: this blanket "any matching param name shadows,
             // bare or `$`-style alike" is correct as-is for the *bare*
             // `param`-reference substitution this arm mostly exists for --
@@ -50295,17 +50302,20 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // shadowed only when the binding one is `$`-style.
             // #2737: `def` is recursive in jq -- a nested zero-argument
             // `def` of `param`'s own name is in scope inside its *own*
-            // `body` too, exactly as it is in `then` above, so the same
-            // `name == param && params.is_empty()` condition applies here.
-            // Before this fix only `then_scope` cleared it, so a bare
-            // self-reference inside the nested def's own body kept
-            // resolving to the outer parameter's substituted argument
-            // instead of recursing.
-            let mut body_scope = if name == param && params.is_empty() {
-                scope.without_bare()
-            } else {
-                scope
-            };
+            // `body` too, exactly as it is in `then` above, so `body_scope`
+            // starts from the identical `self_shadow_scope` computed above
+            // rather than plain `scope`. Before this fix `body_scope` never
+            // narrowed for this case, so a bare self-reference inside the
+            // nested def's own body kept resolving to the outer parameter's
+            // substituted argument instead of recursing.
+            //
+            // The two `if`s below are mutually exclusive with
+            // `self_shadow_scope`'s own condition: they fire only when
+            // `params` is non-empty, which `self_shadow_scope`'s
+            // `params.is_empty()` rules out -- so there is no double-clear
+            // to reason about, only three independent ways to reach
+            // `without_bare()`/`without_dollar()` (idempotent either way).
+            let mut body_scope = self_shadow_scope;
             if params.iter().any(|p| p.name() == param) {
                 body_scope = body_scope.without_bare();
             }
