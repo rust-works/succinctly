@@ -57,24 +57,24 @@ use super::eval::{
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
     enter_def_call_frame, entries_to_object, eval_each_owned, eval_full as full_eval,
-    eval_reduce_with_values, extract_single_pattern_binding, finish_fork_flow,
-    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
-    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, resolve_computed_slice_bounds, resume_from_escape,
-    reverse_length_is_empty, select_emits, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult,
-    RangeNum, SliceTargetKind, YqSemantics,
+    eval_reduce_with_values, extract_pattern_bindings, extract_single_pattern_binding,
+    finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
+    foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
+    index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
+    is_retryable_stop, literal_to_owned, mark_nonretryable_escape, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
+    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
+    range_max_exceeded_error, range_num, range_values_f64, range_values_int,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, ComputedSliceBound, Control,
+    Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachElementSink,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, SliceTargetKind, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -9375,89 +9375,115 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
-            Ok(b) => b,
-            Err(e) => {
-                if is_last {
+        // #2677: fan out over every binding-set a computed key's own
+        // generator yields, in turn, running `body` once per one -- see
+        // `eval::each_pattern_alternatives`'s identical shape and doc
+        // comment (this is its generic-evaluator twin).
+        let (binding_sets, key_control) =
+            extract_pattern_bindings::<S>(pattern, bound_val, invert_dedup);
+
+        let mut retry_next_alternative = false;
+        for bindings in &binding_sets {
+            let null_value = OwnedValue::Null;
+            let substituted_body = substitute_vars(
+                body,
+                as_var_refs(bindings).chain(
+                    all_var_names
+                        .iter()
+                        .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                        .map(|name| (name.as_str(), &null_value)),
+                ),
+            );
+
+            let mut lazy_fault: Option<Control> = None;
+            // #2180 WP3 review: one attempt, one clear -- see
+            // `eval::each_pattern_alternatives`'s identical call and
+            // `eval::nonretryable_stop`.
+            clear_nonretryable_stop();
+            let flow = eval_each_generic::<S, V>(
+                &substituted_body,
+                value.clone(),
+                optional,
+                cursor,
+                &mut |item| match check_lazy_item_for_try(item) {
+                    Ok(item) => sink.push(item),
+                    Err(control) => stop_with_escape(&mut lazy_fault, control),
+                },
+            );
+            let flow = resume_from_escape(lazy_fault, flow);
+
+            match flow {
+                Flow::Exhausted => {}
+                // #1519: a satisfied consumer is jq's escaping `break`, so it
+                // retries the next alternative just like `Control::Break` below.
+                // `pending` is dropped on the retry, matching
+                // `eval::each_pattern_alternatives`'s own arm.
+                Flow::Stopped { pending } => {
+                    if is_retryable_stop(is_last) {
+                        retry_next_alternative = true;
+                        break;
+                    }
+                    return Flow::Stopped { pending };
+                }
+                // #1620/#1660: same decode-failure exclusion as
+                // `eval::each_pattern_alternatives` -- always propagates,
+                // `is_last` or not. Live and load-bearing, not merely
+                // stale-twin parity: `first([.p,.q] as [$y] ?// [$z,$y] | ...)`
+                // reaches this loop via `eval_each_generic`'s own native
+                // `Expr::AsPattern` arm (`each_as_pattern_generic`), not
+                // `eval_single`'s wildcard fallback -- confirmed by removing
+                // this arm and observing the exact silently-wrong-value bug
+                // #1660 fixes elsewhere reappear here too.
+                //
+                // #2132: widened from `is_decode_failure()` to the shared
+                // value-position predicate, in step with `eval.rs`'s
+                // `each_pattern_alternatives` -- a resource cap inside a `?//`
+                // body must not read as "try the next alternative" either.
+                Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                     return Flow::Escaped(Control::Error(e));
                 }
-                continue;
-            }
-        };
-
-        let null_value = OwnedValue::Null;
-        let substituted_body = substitute_vars(
-            body,
-            as_var_refs(&bindings).chain(
-                all_var_names
-                    .iter()
-                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                    .map(|name| (name.as_str(), &null_value)),
-            ),
-        );
-
-        let mut lazy_fault: Option<Control> = None;
-        // #2180 WP3 review: one attempt, one clear -- see
-        // `eval::each_pattern_alternatives`'s identical call and
-        // `eval::nonretryable_stop`.
-        clear_nonretryable_stop();
-        let flow = eval_each_generic::<S, V>(
-            &substituted_body,
-            value.clone(),
-            optional,
-            cursor,
-            &mut |item| match check_lazy_item_for_try(item) {
-                Ok(item) => sink.push(item),
-                Err(control) => stop_with_escape(&mut lazy_fault, control),
-            },
-        );
-        let flow = resume_from_escape(lazy_fault, flow);
-
-        match flow {
-            Flow::Exhausted => return Flow::Exhausted,
-            // #1519: a satisfied consumer is jq's escaping `break`, so it
-            // retries the next alternative just like `Control::Break` below.
-            // `pending` is dropped on the retry, matching
-            // `eval::each_pattern_alternatives`'s own arm.
-            Flow::Stopped { pending } => {
-                if is_retryable_stop(is_last) {
-                    continue;
+                // #1457: `Break` falls through like `Error`, not immediately
+                // like `Halt` -- same live-verified correction
+                // `eval::each_pattern_alternatives` itself documents.
+                Flow::Escaped(Control::Error(e)) => {
+                    if is_last {
+                        return Flow::Escaped(Control::Error(e));
+                    }
+                    retry_next_alternative = true;
+                    break;
                 }
-                return Flow::Stopped { pending };
+                Flow::Escaped(Control::Break(label)) => {
+                    if is_last {
+                        return Flow::Escaped(Control::Break(label));
+                    }
+                    retry_next_alternative = true;
+                    break;
+                }
+                Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
             }
-            // #1620/#1660: same decode-failure exclusion as
-            // `eval::each_pattern_alternatives` -- always propagates,
-            // `is_last` or not. Live and load-bearing, not merely
-            // stale-twin parity: `first([.p,.q] as [$y] ?// [$z,$y] | ...)`
-            // reaches this loop via `eval_each_generic`'s own native
-            // `Expr::AsPattern` arm (`each_as_pattern_generic`), not
-            // `eval_single`'s wildcard fallback -- confirmed by removing
-            // this arm and observing the exact silently-wrong-value bug
-            // #1660 fixes elsewhere reappear here too.
-            //
-            // #2132: widened from `is_decode_failure()` to the shared
-            // value-position predicate, in step with `eval.rs`'s
-            // `each_pattern_alternatives` -- a resource cap inside a `?//`
-            // body must not read as "try the next alternative" either.
-            Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+        }
+        if retry_next_alternative {
+            continue;
+        }
+
+        match key_control {
+            None => return Flow::Exhausted,
+            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                 return Flow::Escaped(Control::Error(e));
             }
-            // #1457: `Break` falls through like `Error`, not immediately
-            // like `Halt` -- same live-verified correction
-            // `eval::each_pattern_alternatives` itself documents.
-            Flow::Escaped(Control::Error(e)) => {
+            Some(Control::Error(e)) => {
                 if is_last {
                     return Flow::Escaped(Control::Error(e));
                 }
                 continue;
             }
-            Flow::Escaped(Control::Break(label)) => {
+            Some(Control::Break(label)) => {
                 if is_last {
                     return Flow::Escaped(Control::Break(label));
                 }
                 continue;
             }
-            Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
         }
     }
 

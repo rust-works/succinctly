@@ -5864,73 +5864,117 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
-            Ok(b) => b,
-            Err(e) => {
-                if is_last {
+        // #2677: a computed key's own generator can yield more than one
+        // binding-set (`{("a","b"):$q}` fans out one full run of `body` per
+        // key it yields, jq's own nested-fork compilation of
+        // `gen_object_matcher`) -- every binding-set here runs `body` in
+        // turn, *not* a try-until-one-succeeds loop like the alternatives
+        // loop itself; only once every binding-set's own body has run does
+        // this alternative's own trailing `control` (the key generator's
+        // own error/break/halt, or a structural mismatch) get the *same*
+        // is_last/continue retry treatment the pre-#2677 single-binding-set
+        // shape already gave a match failure. A body failure partway
+        // through the fan-out abandons the *remaining* binding-sets of
+        // this same alternative (jq's single-threaded generator model) and
+        // retries the next `?//` alternative from there -- confirmed live:
+        // `[. as {("a","b"):$q} ?// $z | if $q==2 then error("boom") else
+        // $q end]` on `{"a":1,"b":2}` is `[1,null]` (the first output
+        // survives, "b"'s own binding-set is never tried, and the retried
+        // `$z` alternative's own `$q` is unbound -> null).
+        let (binding_sets, key_control) =
+            extract_pattern_bindings::<S>(pattern, bound_val, invert_dedup);
+
+        let mut retry_next_alternative = false;
+        for bindings in &binding_sets {
+            let null_value = OwnedValue::Null;
+            let substituted_body = substitute_vars(
+                body,
+                as_var_refs(bindings).chain(
+                    all_var_names
+                        .iter()
+                        .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                        .map(|name| (name.as_str(), &null_value)),
+                ),
+            );
+
+            // #2180 WP3 review: cleared per attempt, so what the retry
+            // decision below reads is exactly "did this attempt's own
+            // evaluation end in a `Halt`/decode failure a driver had to
+            // stash out-of-band" -- see [`nonretryable_stop`].
+            clear_nonretryable_stop();
+            match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
+                Flow::Exhausted => {}
+                // #1519: a satisfied consumer is jq's escaping `break`, so
+                // it retries the next alternative just like `Control::Break`
+                // below. `pending` is dropped on the retry rather than
+                // carried: it is only ever `Some` when an eager fallback had
+                // already raised a trailing control before the stop, and
+                // real jq -- which would never have evaluated that far --
+                // ignores it, the same reasoning `builtin_isempty` records
+                // at its own `Flow::Stopped` arm.
+                Flow::Stopped { pending } => {
+                    if is_retryable_stop(is_last) {
+                        retry_next_alternative = true;
+                        break;
+                    }
+                    return Flow::Stopped { pending };
+                }
+                // #1620/#1660: same uncatchable exclusion as
+                // `try_pattern_alternatives` -- always propagates, `is_last`
+                // or not. #2132 widened it from `is_decode_failure()` to the
+                // shared value-position predicate: a resource cap raised
+                // inside a `?//` body was read as "this alternative failed,
+                // try the next", and the truncated body passed as the next
+                // alternative's clean answer.
+                Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                     return Flow::Escaped(Control::Error(e));
                 }
-                continue;
-            }
-        };
-
-        let null_value = OwnedValue::Null;
-        let substituted_body = substitute_vars(
-            body,
-            as_var_refs(&bindings).chain(
-                all_var_names
-                    .iter()
-                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                    .map(|name| (name.as_str(), &null_value)),
-            ),
-        );
-
-        // #2180 WP3 review: cleared per attempt, so what the retry decision
-        // below reads is exactly "did this attempt's own evaluation end in a
-        // `Halt`/decode failure a driver had to stash out-of-band" -- see
-        // [`nonretryable_stop`].
-        clear_nonretryable_stop();
-        match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
-            Flow::Exhausted => return Flow::Exhausted,
-            // #1519: a satisfied consumer is jq's escaping `break`, so it
-            // retries the next alternative just like `Control::Break` below.
-            // `pending` is dropped on the retry rather than carried: it is
-            // only ever `Some` when an eager fallback had already raised a
-            // trailing control before the stop, and real jq -- which would
-            // never have evaluated that far -- ignores it, the same reasoning
-            // `builtin_isempty` records at its own `Flow::Stopped` arm.
-            Flow::Stopped { pending } => {
-                if is_retryable_stop(is_last) {
-                    continue;
+                // #1457: `Break` falls through like `Error`, not immediately
+                // like `Halt` -- same live-verified correction
+                // `try_pattern_alternatives` itself documents.
+                Flow::Escaped(Control::Error(e)) => {
+                    if is_last {
+                        return Flow::Escaped(Control::Error(e));
+                    }
+                    retry_next_alternative = true;
+                    break;
                 }
-                return Flow::Stopped { pending };
+                Flow::Escaped(Control::Break(label)) => {
+                    if is_last {
+                        return Flow::Escaped(Control::Break(label));
+                    }
+                    retry_next_alternative = true;
+                    break;
+                }
+                Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
             }
-            // #1620/#1660: same uncatchable exclusion as
-            // `try_pattern_alternatives` -- always propagates, `is_last` or
-            // not. #2132 widened it from `is_decode_failure()` to the shared
-            // value-position predicate: a resource cap raised inside a `?//`
-            // body was read as "this alternative failed, try the next", and
-            // the truncated body passed as the next alternative's clean
-            // answer.
-            Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+        }
+        if retry_next_alternative {
+            continue;
+        }
+
+        // Every binding-set's own body ran to completion. Now the key
+        // generator's *own* trailing control (if it stopped early rather
+        // than exhausting) gets the same is_last/continue treatment a
+        // pre-#2677 match failure already had.
+        match key_control {
+            None => return Flow::Exhausted,
+            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                 return Flow::Escaped(Control::Error(e));
             }
-            // #1457: `Break` falls through like `Error`, not immediately
-            // like `Halt` -- same live-verified correction
-            // `try_pattern_alternatives` itself documents.
-            Flow::Escaped(Control::Error(e)) => {
+            Some(Control::Error(e)) => {
                 if is_last {
                     return Flow::Escaped(Control::Error(e));
                 }
                 continue;
             }
-            Flow::Escaped(Control::Break(label)) => {
+            Some(Control::Break(label)) => {
                 if is_last {
                     return Flow::Escaped(Control::Break(label));
                 }
                 continue;
             }
-            Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
         }
     }
 
