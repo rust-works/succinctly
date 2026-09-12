@@ -57,9 +57,9 @@ use super::eval::{
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
     enter_def_call_frame, entries_to_object, eval_each_owned, eval_full as full_eval,
-    eval_reduce_with_values, extract_pattern_bindings, finish_fork_flow, finish_fork_from_flow,
-    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
-    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    eval_reduce_with_values, extract_single_pattern_binding, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
@@ -9375,7 +9375,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
+        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
             Ok(b) => b,
             Err(e) => {
                 if is_last {
@@ -23578,7 +23578,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             names.dedup();
             let null = OwnedValue::Null;
             for bound in bound_values {
-                let bindings = match extract_pattern_bindings(pattern, &bound, false) {
+                let bindings = match extract_single_pattern_binding::<S>(pattern, &bound, false) {
                     Ok(b) => b,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
