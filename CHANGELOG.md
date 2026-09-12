@@ -127,6 +127,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq`/`yq` no longer reject a `def` nobody ever calls** (#2740).
+  `def h: nosuchfn; 1` used to fail at compile time (`nosuchfn/0 is not
+  defined`) even though `h` is never referenced anywhere in the program;
+  real jq compiles it fine, since its substitution-based compiler only ever
+  compiles a `def`'s body at the call site that references it — a
+  definition nobody calls is simply never compiled, however malformed its
+  body.
+
+  `resolve_func_calls_all` (`src/jq/resolve.rs`) now builds a call graph
+  among every `def`'s body first (keyed by each body's own heap address,
+  computed independently by each of the two passes rather than a shared
+  sequential counter, since the graph-building pass and the real
+  error-checking pass never restructure the tree between the two) and only
+  checks a body actually reachable from the program's own top-level
+  execution. `def h: nosuchfn; h` (and any def reached transitively through
+  several others, or referenced only as an unused filter argument) still
+  rejects the undefined name exactly as before — this only narrows *which*
+  bodies get checked at all, not the check itself.
+
 - **`succinctly jq --preserve-input` no longer silently reformats number
   spelling under `-S`/`-a`/`-C`/`-s`** (#2852). `--preserve-input` is
   documented to echo a document's numbers exactly as written (`4e4` stays
