@@ -531,6 +531,73 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         })
     }
 
+    /// [`materialize`](Self::materialize)'s checked twin: reports a value
+    /// nested past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// as an ordinary [`EvalError`] instead of panicking (#2850), the same
+    /// relationship [`try_from_owned`](Self::try_from_owned) already has to
+    /// `from_owned` (#1371) -- this is that fix's own sibling gap, not a new
+    /// pattern.
+    ///
+    /// For a **CLI-output-boundary** call site (`write_output_jq_value`'s
+    /// materialize arm and `-e`'s exit-status check, `jq_runner.rs`) rather
+    /// than the evaluator's own hot recursion, where a panic stays deliberate
+    /// -- the identical split [`eval_generic::check_nesting_depth`] already
+    /// draws from [`eval_generic::assert_nesting_depth`] (#1818). Confirmed
+    /// live: `-e` alone on 500 levels of `[...]`-nested JSON used to leak
+    /// Rust's raw panic backtrace to stderr ahead of the clean, correctly
+    /// exit-5'd diagnostic `write_output`'s own `catch_unwind` already
+    /// produced -- the exit code and final message were always right, only
+    /// the extra noise ahead of them was the bug.
+    ///
+    /// Delegates to [`try_cursor_to_owned`] for the `Cursor` arm rather than
+    /// the panicking [`cursor_to_owned`] -- the two nested depth budgets
+    /// (this one, `MAX_VALUE_TREE_DEPTH`-bounded; that one,
+    /// `MAX_NESTING_DEPTH`-bounded, restarting from 0 whenever a `Cursor` is
+    /// reached) mirror `materialize_at_depth`'s own split exactly, just with
+    /// both sides checked instead of both sides panicking. Preserves
+    /// [`cursor_to_owned`]'s raw-number-byte semantics via
+    /// [`try_cursor_to_owned`] rather than switching to
+    /// `eval_generic::to_owned_cursor`'s canonicalizing twin, which would
+    /// silently reformat a JSON-sourced number's spelling on every
+    /// `-S`/`-a`/`-C`/`-e` run -- exactly the risk that made a plain
+    /// delegation to the already-checked `eval_generic` materializer unsafe
+    /// (see this issue's own "why not a quick fix" note).
+    pub fn try_materialize(&self) -> Result<OwnedValue, EvalError> {
+        self.try_materialize_at_depth(0)
+    }
+
+    fn try_materialize_at_depth(&self, depth: usize) -> Result<OwnedValue, EvalError> {
+        if depth >= super::value::MAX_VALUE_TREE_DEPTH {
+            return Err(EvalError::new(
+                super::value::nesting_depth_exceeded_message(super::value::MAX_VALUE_TREE_DEPTH),
+            ));
+        }
+        Ok(match self {
+            JqValue::Cursor(c) => try_cursor_to_owned(c)?,
+            JqValue::Null => OwnedValue::Null,
+            JqValue::Bool(b) => OwnedValue::Bool(*b),
+            JqValue::Int(n) => OwnedValue::Int(*n),
+            JqValue::Float(f) => OwnedValue::Float(*f),
+            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
+            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal),
+            JqValue::String(s) => OwnedValue::String(s.clone()),
+            JqValue::Array(arr) => OwnedValue::Array(
+                arr.iter()
+                    .map(|v| v.try_materialize_at_depth(depth + 1))
+                    .collect::<Result<_, _>>()?,
+            ),
+            JqValue::Object(obj) => OwnedValue::Object(
+                obj.iter()
+                    .map(|(k, v)| Ok((k.clone(), v.try_materialize_at_depth(depth + 1)?)))
+                    .collect::<Result<_, EvalError>>()?,
+            ),
+            JqValue::LazyKeysArray { fields, collapse } => {
+                lazy_keys_array_to_owned(fields, *collapse)?
+            }
+            JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(*len),
+        })
+    }
+
     /// Convert to OwnedValue, consuming self.
     ///
     /// More efficient than `materialize()` when you don't need to keep the original.
@@ -927,6 +994,76 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         // becoming `null`. #2286: decode_failure, not new -- same class as
         // the malformed member/delimiter errors; confirmed live that real
         // jq treats this uncatchably too.
+        StandardJson::Error(msg) => return Err(EvalError::decode_failure(msg)),
+    })
+}
+
+/// [`cursor_to_owned`]'s checked twin (#2850): reports a value nested past
+/// [`super::eval_generic::MAX_NESTING_DEPTH`] as an ordinary [`EvalError`]
+/// instead of panicking, for [`JqValue::try_materialize`]'s `Cursor` arm --
+/// a CLI-output-boundary caller, not the evaluator's own hot recursion
+/// [`cursor_to_owned`]'s own panicking contract stays deliberate for (see
+/// that function's doc comment). Otherwise byte-for-byte identical,
+/// including the raw-number-byte preservation
+/// (`OwnedValue::from_number_bytes`) that rules out delegating to
+/// `eval_generic::to_owned_cursor`'s canonicalizing twin instead.
+fn try_cursor_to_owned<W: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    try_cursor_to_owned_at_depth(cursor, 0)
+}
+
+fn try_cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+    depth: usize,
+) -> Result<OwnedValue, EvalError> {
+    super::eval_generic::check_nesting_depth(depth)?;
+    Ok(match cursor.value() {
+        StandardJson::Null => OwnedValue::Null,
+        StandardJson::Bool(b) => OwnedValue::Bool(b),
+        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
+        StandardJson::String(s) => OwnedValue::String(
+            s.as_str()
+                .map_err(|e| EvalError::decode_failure(format!("{e}")))?
+                .into_owned(),
+        ),
+        StandardJson::Array(_) => {
+            let mut items = Vec::new();
+            let mut is_first = true;
+            let mut last_elem: Option<JsonCursor<'_, W>> = None;
+            for child in cursor.children() {
+                if !child.element_gap_ok(is_first) {
+                    return Err(child.malformed_delimiter_error());
+                }
+                items.push(try_cursor_to_owned_at_depth(&child, depth + 1)?);
+                last_elem = Some(child);
+                is_first = false;
+            }
+            container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
+            OwnedValue::Array(items)
+        }
+        StandardJson::Object(fields) => {
+            let mut map = IndexMap::new();
+            let mut guard = DisplayKeyGuard::default();
+            let mut f = fields;
+            let mut is_first = true;
+            let mut last_field: Option<JsonCursor<'_, W>> = None;
+            while let Some((field, rest)) = DocumentFields::uncons(&f) {
+                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+                map.insert(
+                    key,
+                    try_cursor_to_owned_at_depth(&field.value_cursor, depth + 1)?,
+                );
+                last_field = Some(field.value_cursor);
+                f = rest;
+                is_first = false;
+            }
+            if f.ends_unpaired() {
+                return Err(f.malformed_member_error());
+            }
+            container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
+            OwnedValue::Object(map)
+        }
         StandardJson::Error(msg) => return Err(EvalError::decode_failure(msg)),
     })
 }
@@ -1577,6 +1714,111 @@ mod tests {
             result.is_err(),
             "materialize should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// #2850: [`JqValue::try_materialize`]'s own boundary coverage --
+    /// [`materialize_panics_past_nesting_depth_limit_1021`]'s checked twin.
+    /// Reports past `MAX_VALUE_TREE_DEPTH` as an ordinary `Err` instead of
+    /// panicking, the way a CLI-output-boundary call site
+    /// (`jq_runner.rs`'s `write_output_jq_value` and `-e`'s exit-status
+    /// check) needs -- confirmed live before this fix that `-e` alone on
+    /// deeply-nested input leaked Rust's raw panic backtrace to stderr
+    /// ahead of the clean, correctly exit-5'd diagnostic.
+    #[test]
+    fn try_materialize_reports_past_nesting_depth_limit_2850() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(matches!(
+            under.try_materialize().unwrap(),
+            OwnedValue::Array(_)
+        ));
+
+        // Exercise the `Object` arm too -- see `materialize`'s sibling test
+        // above for why.
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
+            "a".to_string(),
+            JqValue::Array(vec![JqValue::Null]),
+        )]));
+        assert!(matches!(
+            nested_object.try_materialize().unwrap(),
+            OwnedValue::Object(_)
+        ));
+
+        let over = linear_jqvalue_nest(MAX_VALUE_TREE_DEPTH);
+        let err = over
+            .try_materialize()
+            .expect_err("try_materialize should report an Err at MAX_VALUE_TREE_DEPTH, not panic");
+        assert!(
+            err.message.contains("nesting depth exceeds limit"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    /// #2850: the `Cursor` arm's own, *separate* depth budget --
+    /// `try_materialize`'s recursion through a real `JsonCursor` (built from
+    /// raw JSON text, as `-e`/`-S`/`-a`/`-C` actually encounter it) restarts
+    /// at 0 and is capped by `MAX_NESTING_DEPTH` (256), not
+    /// `MAX_VALUE_TREE_DEPTH` (384) -- the two guards this fix's own
+    /// `try_cursor_to_owned`/`try_materialize_at_depth` split mirrors from
+    /// the panicking `cursor_to_owned`/`materialize_at_depth` pair. A
+    /// `JqValue` tree built directly (as the test above does) never
+    /// exercises this arm at all.
+    #[test]
+    fn try_cursor_to_owned_reports_past_nesting_depth_limit_2850() {
+        use crate::json::JsonIndex;
+
+        let mut json = String::new();
+        for _ in 0..300 {
+            json.push('[');
+        }
+        json.push('1');
+        for _ in 0..300 {
+            json.push(']');
+        }
+
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+
+        // The existing panicking contract is unchanged.
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| val.materialize().unwrap()));
+        assert!(
+            panicked.is_err(),
+            "materialize should still panic past MAX_NESTING_DEPTH through a Cursor"
+        );
+
+        // The checked twin reports the identical condition cleanly instead.
+        let index = JsonIndex::build(json.as_bytes());
+        let cursor = index.root(json.as_bytes());
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        let err = val
+            .try_materialize()
+            .expect_err("try_materialize should report an Err at MAX_NESTING_DEPTH, not panic");
+        assert!(
+            err.message.contains("nesting depth exceeds limit of 256"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        // A well-formed, under-the-limit cursor round-trips correctly.
+        let mut shallow = String::new();
+        for _ in 0..10 {
+            shallow.push('[');
+        }
+        shallow.push('1');
+        for _ in 0..10 {
+            shallow.push(']');
+        }
+        let index = JsonIndex::build(shallow.as_bytes());
+        let cursor = index.root(shallow.as_bytes());
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        assert!(matches!(
+            val.try_materialize().unwrap(),
+            OwnedValue::Array(_)
+        ));
     }
 
     /// #1021: `JqValue::into_owned` had no depth guard at all before this

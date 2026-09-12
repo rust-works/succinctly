@@ -127,6 +127,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq -e`, and `-S`/`-a`/`-C`, no longer leak a raw Rust panic
+  backtrace to stderr on deeply-nested input** (#2850). The exit code (5) and
+  final diagnostic (`nesting depth exceeds limit of N`) were always correct;
+  only extraneous `thread '<unnamed>' panicked at ...` noise ahead of them
+  was the bug. `-e`'s own exit-status materialize call in `jq_runner.rs`
+  used the panicking `JqValue::materialize()` at a CLI-output boundary
+  rather than the evaluator's own hot recursion, where a panic stays
+  deliberate (#1818's established split). `write_output_jq_value`'s own
+  materialize call (`-S`/`-a`/`-C`) shared the identical risk, confirmed live
+  after #2662 moved those three flags onto the same lazy/`JqValue::Cursor`
+  route `-e` already used. Both now use a new checked twin,
+  `JqValue::try_materialize`, added alongside the panicking original rather
+  than replacing it -- library callers that already treat over-deep nesting
+  as a bug keep that contract unchanged, and `try_materialize` preserves the
+  original's raw JSON number spelling exactly
+  (`OwnedValue::from_number_bytes`, not a canonicalizing reformat), so
+  `--preserve-input` semantics are unaffected.
+
 - **`succinctly yq` no longer answers arithmetic from a collapsed copy of the
   document** (#2626). `printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length + 0'`
   answered `2` while the same binary's bare `length` answered `3` — and real yq
