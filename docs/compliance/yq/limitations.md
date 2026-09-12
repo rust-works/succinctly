@@ -318,6 +318,36 @@ kind drops its `&anchor`, where real yq keeps it),
 [#1352](https://github.com/rust-works/succinctly/issues/1352) and
 [#1353](https://github.com/rust-works/succinctly/issues/1353).
 
+**`sort_keys(f)`'s "don't vivify an absent target" rule has a gap past a fan-out
+([#2870](https://github.com/rust-works/succinctly/issues/2870)).** `sort_keys(.nope)` on a
+document with no `.nope` correctly leaves it unchanged (unlike plain `|=`, which creates
+it) — but only when the absent component sits *before* any `Iterate`/`Slice` in `f`. A
+static field *after* a fan-out point still gets vivified, since the existence pre-filter
+only checks the resolved path's prefix up to that point (`navigate_read_only` has no arm
+for `Iterate`/`Slice`, so requiring the whole path to pre-exist would wrongly drop a
+genuinely-existing target like `sort_keys(.a[])` itself) and hands the rest to
+`update_path`'s ordinary per-element vivification, which has no "skip absent" gate of its
+own:
+
+```bash
+$ printf 'a:\n  - b: 2\n    q: 1\n  - q: 3\n' | yq            'sort_keys(.a[].b)'
+a:
+  - b: 2
+    q: 1
+  - q: 3
+$ printf 'a:\n  - b: 2\n    q: 1\n  - q: 3\n' | succinctly yq 'sort_keys(.a[].b)'
+a:
+  - b: 2
+    q: 1
+  - q: 3
+    b: null
+```
+
+Fixing this properly needs either threading a skip-absent flag through
+`update_path`/`update_path_steps` (shared by every `|=`-family operator, too high a blast
+radius for a `sort_keys`-only fix) or a dedicated post-fan-out pre-filter inside
+`builtin_sort_keys` itself.
+
 ### `-0`/`--nul-output` multi-document separator — rule 4(a)
 
 Real yq's own `-0` output on multi-document input is not readable by real yq itself: the

@@ -45297,3 +45297,23 @@ fn test_yq_sort_keys_absent_prefix_before_iterate_2855() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2870 (known gap, found reviewing #2855): the "don't vivify" rule above
+/// only covers a resolved path's prefix *before* its first `Iterate`/
+/// `Slice` -- a static field *after* the fan-out still reaches
+/// `update_path`'s ordinary per-element vivification, wrongly creating it
+/// on an array element that never had it. Pinning succinctly's own current
+/// (documented, not fixed) behavior here, not real yq's -- see
+/// `docs/compliance/yq/limitations.md`. Real yq leaves the second element
+/// as `q: 3` with no `b` key added at all.
+#[test]
+fn test_yq_sort_keys_vivifies_past_a_fanout_known_gap_2870() -> Result<()> {
+    let input = "a:\n  - b: 2\n    q: 1\n  - q: 3\n";
+    let (out, code) = run_yq_stdin("sort_keys(.a[].b)", input, &[])?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(
+        out.trim_end(),
+        "a:\n  - b: 2\n    q: 1\n  - q: 3\n    b: null"
+    );
+    Ok(())
+}
