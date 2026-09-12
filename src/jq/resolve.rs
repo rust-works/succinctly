@@ -57,6 +57,7 @@
 //! binds: jq's `def f($a): …` desugars to `def f(a): a as $a | …`, which
 //! leaves `a` callable at arity 0 regardless of which spelling was written.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -338,6 +339,402 @@ const JQ_BUILTIN_ROSTER: &[(&str, usize)] = &[
 /// and truncating is cheaper than cloning a map per node.
 type Scope = Vec<(String, usize)>;
 
+/// [`Scope`]'s sibling for [`build_call_graph`] (#2740): each entry also
+/// carries the identity of the `def` it resolves to -- a parameter has none
+/// (`None`), since it has no body of its own to ever mark reachable.
+///
+/// A `def`'s identity is its `body`'s own heap address (`&**body as *const
+/// Expr as usize`), not a sequential counter: computing it needs no walk
+/// state threaded through this pass at all, and -- the property that
+/// actually matters -- [`check`]'s own later, separate, `&mut`-based walk
+/// over the *same* tree can recompute the identical address for the same
+/// `Expr::FuncDef` node without this pass having to hand it anything, since
+/// this pass never restructures the tree it walks. A sequential counter
+/// would need the two passes to agree on visitation order down to the
+/// exact node, forever, as a silent invariant nothing enforces; a
+/// recomputed address needs the two passes to agree on nothing at all past
+/// "this box hasn't moved since the last pass read its address".
+type ReachScope = Vec<(String, usize, ScopeHit)>;
+
+/// What a [`ReachScope`] entry resolves to: a real `def` (identified by its
+/// body's address, for [`build_call_graph`]'s call graph) or a parameter,
+/// which has no body of its own to ever mark reachable.
+#[derive(Clone, Copy)]
+enum ScopeHit {
+    Def(usize),
+    Param,
+}
+
+/// Whether `(name, arity)` resolves against `scope`, and if so, which
+/// `def`'s body it reaches (or that it's a parameter). Innermost first,
+/// mirroring [`in_scope`].
+fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> Option<ScopeHit> {
+    scope
+        .iter()
+        .rev()
+        .find(|(n, a, _)| *a == arity && n == name)
+        .map(|(_, _, hit)| *hit)
+}
+
+/// Read-only twin of [`builtin_fallback_into_args`]: yields `fallback`'s own
+/// sub-expressions by reference rather than consuming it, for
+/// [`build_call_graph`] (#2740), which only needs to see into them, not
+/// resolve or replace the call itself. Kept in sync with that function by
+/// construction, not just convention: both match the exact same shapes
+/// `builtin_fallback_arity` names, one returning owned children, this one
+/// borrowed ones.
+fn builtin_fallback_children(fallback: &Expr) -> Vec<&Expr> {
+    match fallback {
+        Expr::Not => Vec::new(),
+        Expr::Limit { n, expr } => alloc::vec![n.as_ref(), expr.as_ref()],
+        Expr::Until { cond, update } | Expr::While { cond, update } => {
+            alloc::vec![cond.as_ref(), update.as_ref()]
+        }
+        Expr::Repeat(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            alloc::vec![inner.as_ref()]
+        }
+        Expr::Paren(inner) if matches!(inner.as_ref(), Expr::Range { .. }) => {
+            match inner.as_ref() {
+                Expr::Range { to: Some(to), .. } => alloc::vec![to.as_ref()],
+                Expr::Range { .. } => Vec::new(),
+                _ => unreachable!("guarded by the outer match arm's pattern"),
+            }
+        }
+        Expr::Range { from, to, step } => {
+            let mut children = alloc::vec![from.as_ref()];
+            children.extend(to.as_deref());
+            children.extend(step.as_deref());
+            children
+        }
+        Expr::Error(msg) => msg.iter().map(alloc::boxed::Box::as_ref).collect(),
+        Expr::Break(_) => Vec::new(),
+        Expr::Builtin(builtin) => match builtin_kids(builtin) {
+            BuiltinKids::None => Vec::new(),
+            BuiltinKids::One(a) => alloc::vec![a],
+            BuiltinKids::Two(a, b) => alloc::vec![a, b],
+            BuiltinKids::Three(a, b, c) => alloc::vec![a, b, c],
+        },
+        // Genuinely unreachable -- see `builtin_fallback_arity`'s own
+        // identical fallback arm.
+        _ => Vec::new(),
+    }
+}
+
+/// Builds the call graph among `def` bodies (#2740): an edge from `def` `A`
+/// (identified by its body's address, or the virtual root -- `None` --  for
+/// code outside every `def` body, always reachable) to `def` `B` records
+/// that `A`'s body (or the root) contains a call resolving to `B`. A call
+/// resolving to a parameter contributes no edge -- a parameter is not a
+/// `def` with a body to reach, and its actual argument flows from wherever
+/// the enclosing function is itself called, a different question this
+/// pass does not answer.
+///
+/// Mirrors [`check`]'s own structure arm for arm (both must stay
+/// exhaustive over every [`Expr`] variant, so a missing arm here is a
+/// compile error, not a silent gap), but does no error reporting and never
+/// mutates: it only needs to know *which* calls exist and where they sit,
+/// not to resolve or rewrite them, so `#2036`'s `builtin_fallback` shadowing
+/// decision is made read-only here via [`reach_in_scope`]/
+/// [`builtin_fallback_children`] rather than the consuming
+/// [`builtin_fallback_into_args`].
+fn build_call_graph(
+    expr: &Expr,
+    scope: &mut ReachScope,
+    enclosing: Option<usize>,
+    graph: &mut BTreeMap<usize, Vec<usize>>,
+    roots: &mut Vec<usize>,
+) {
+    let mut record_edge = |target: usize, graph: &mut BTreeMap<usize, Vec<usize>>| match enclosing {
+        Some(e) => graph.entry(e).or_default().push(target),
+        None => roots.push(target),
+    };
+
+    match expr {
+        Expr::Shared(inner) => build_call_graph(inner, scope, enclosing, graph, roots),
+        Expr::DefCall { args, .. } => {
+            for arg in args {
+                build_call_graph(arg, scope, enclosing, graph, roots);
+            }
+        }
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::Literal(_)
+        | Expr::RecursiveDescent
+        | Expr::Not
+        | Expr::Format(_)
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Break(_) => {}
+
+        Expr::Optional(inner)
+        | Expr::Array(inner)
+        | Expr::Paren(inner)
+        | Expr::Negate(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Repeat(inner)
+        | Expr::Label { body: inner, .. } => {
+            build_call_graph(inner, scope, enclosing, graph, roots);
+        }
+
+        Expr::Error(inner) => {
+            if let Some(e) = inner.as_deref() {
+                build_call_graph(e, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right)
+        | Expr::IndexExpr {
+            target: left,
+            key: right,
+        }
+        | Expr::Limit {
+            n: left,
+            expr: right,
+        }
+        | Expr::NthExpr {
+            n: left,
+            expr: right,
+        }
+        | Expr::Until {
+            cond: left,
+            update: right,
+        }
+        | Expr::While {
+            cond: left,
+            update: right,
+        }
+        | Expr::As {
+            expr: left,
+            body: right,
+            ..
+        }
+        | Expr::AsPattern {
+            expr: left,
+            body: right,
+            ..
+        }
+        | Expr::Assign {
+            path: left,
+            value: right,
+        }
+        | Expr::Update {
+            path: left,
+            filter: right,
+        }
+        | Expr::CompoundAssign {
+            path: left,
+            value: right,
+            ..
+        }
+        | Expr::AlternativeAssign {
+            path: left,
+            value: right,
+        }
+        | Expr::MetaAssign {
+            target: left,
+            value: right,
+            ..
+        } => {
+            build_call_graph(left, scope, enclosing, graph, roots);
+            build_call_graph(right, scope, enclosing, graph, roots);
+        }
+
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } => {
+            let body_addr = body.as_ref() as *const Expr as usize;
+            graph.entry(body_addr).or_default();
+
+            let outer = scope.len();
+            scope.push((name.clone(), params.len(), ScopeHit::Def(body_addr)));
+            let with_self = scope.len();
+            for p in params {
+                scope.push((p.name().to_string(), 0, ScopeHit::Param));
+            }
+            build_call_graph(body, scope, Some(body_addr), graph, roots);
+            scope.truncate(with_self);
+
+            build_call_graph(then, scope, enclosing, graph, roots);
+            scope.truncate(outer);
+        }
+
+        Expr::Try { expr, catch } => {
+            build_call_graph(expr, scope, enclosing, graph, roots);
+            if let Some(c) = catch.as_deref() {
+                build_call_graph(c, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            build_call_graph(cond, scope, enclosing, graph, roots);
+            build_call_graph(then_branch, scope, enclosing, graph, roots);
+            build_call_graph(else_branch, scope, enclosing, graph, roots);
+        }
+
+        Expr::SliceExpr { target, start, end } => {
+            build_call_graph(target, scope, enclosing, graph, roots);
+            if let Some(s) = start.as_deref() {
+                build_call_graph(s, scope, enclosing, graph, roots);
+            }
+            if let Some(e) = end.as_deref() {
+                build_call_graph(e, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::Range { from, to, step } => {
+            build_call_graph(from, scope, enclosing, graph, roots);
+            if let Some(t) = to.as_deref() {
+                build_call_graph(t, scope, enclosing, graph, roots);
+            }
+            if let Some(s) = step.as_deref() {
+                build_call_graph(s, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::Reduce {
+            input,
+            init,
+            update,
+            ..
+        } => {
+            build_call_graph(input, scope, enclosing, graph, roots);
+            build_call_graph(init, scope, enclosing, graph, roots);
+            build_call_graph(update, scope, enclosing, graph, roots);
+        }
+
+        Expr::Foreach {
+            input,
+            init,
+            update,
+            extract,
+            ..
+        } => {
+            build_call_graph(input, scope, enclosing, graph, roots);
+            build_call_graph(init, scope, enclosing, graph, roots);
+            build_call_graph(update, scope, enclosing, graph, roots);
+            if let Some(e) = extract.as_deref() {
+                build_call_graph(e, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+            for e in exprs {
+                build_call_graph(e, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } => {
+            let arity = if args.is_empty() {
+                builtin_fallback
+                    .as_deref()
+                    .map_or(0, builtin_fallback_arity)
+            } else {
+                args.len()
+            };
+            match reach_in_scope(scope, name, arity) {
+                Some(hit) => {
+                    if let ScopeHit::Def(target) = hit {
+                        record_edge(target, graph);
+                    }
+                    if !args.is_empty() {
+                        for a in args {
+                            build_call_graph(a, scope, enclosing, graph, roots);
+                        }
+                    } else if let Some(fallback) = builtin_fallback.as_deref() {
+                        for child in builtin_fallback_children(fallback) {
+                            build_call_graph(child, scope, enclosing, graph, roots);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(fallback) = builtin_fallback.as_deref() {
+                        build_call_graph(fallback, scope, enclosing, graph, roots);
+                    } else {
+                        for a in args {
+                            build_call_graph(a, scope, enclosing, graph, roots);
+                        }
+                    }
+                }
+            }
+        }
+
+        Expr::NamespacedCall { args, .. } => {
+            for a in args {
+                build_call_graph(a, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::Object(entries) => {
+            for entry in entries {
+                if let ObjectKey::Expr(k) = &entry.key {
+                    build_call_graph(k, scope, enclosing, graph, roots);
+                }
+                build_call_graph(&entry.value, scope, enclosing, graph, roots);
+            }
+        }
+
+        Expr::StringInterpolation(parts) => {
+            for part in parts {
+                if let StringPart::Expr(e) = part {
+                    build_call_graph(e, scope, enclosing, graph, roots);
+                }
+            }
+        }
+
+        Expr::Builtin(builtin) => {
+            let kids: Vec<&Expr> = match builtin_kids(builtin) {
+                BuiltinKids::None => Vec::new(),
+                BuiltinKids::One(a) => alloc::vec![a],
+                BuiltinKids::Two(a, b) => alloc::vec![a, b],
+                BuiltinKids::Three(a, b, c) => alloc::vec![a, b, c],
+            };
+            for a in kids {
+                build_call_graph(a, scope, enclosing, graph, roots);
+            }
+        }
+    }
+}
+
+/// Every `def` body address reachable from `roots` by following `graph`
+/// -- iterative, not recursive, so a long call chain (or the pathological
+/// self-recursive/mutually-recursive cases this graph handles trivially,
+/// same as any graph reachability computation) never grows this pass's own
+/// stack the way naive recursion would.
+fn compute_reachable(graph: &BTreeMap<usize, Vec<usize>>, roots: &[usize]) -> BTreeSet<usize> {
+    let mut reachable = BTreeSet::new();
+    let mut stack: Vec<usize> = roots.to_vec();
+    while let Some(id) = stack.pop() {
+        if reachable.insert(id) {
+            if let Some(callees) = graph.get(&id) {
+                stack.extend(callees.iter().copied());
+            }
+        }
+    }
+    reachable
+}
+
 /// Check every function call in `expr` against the `def`s, parameters and
 /// builtins in scope at its position, the way real jq's compiler does.
 ///
@@ -366,9 +763,20 @@ pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
 /// this is what lets the jq runner match that instead of always reporting
 /// `jq: 1 compile error` (#2037).
 pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
+    // #2740: a `def` whose call never appears anywhere reachable is never
+    // checked -- jq's own compiler never compiles such a body either, since
+    // it only ever compiles a `def` at the call site substituting it in.
+    // `build_call_graph` (read-only) computes which bodies are reachable
+    // before `check` (below, `&mut`-mutating) walks the tree for real.
+    let mut reach_scope = ReachScope::new();
+    let mut graph = BTreeMap::new();
+    let mut roots = Vec::new();
+    build_call_graph(expr, &mut reach_scope, None, &mut graph, &mut roots);
+    let reachable = compute_reachable(&graph, &roots);
+
     let mut scope = Scope::new();
     let mut errors = Vec::new();
-    check(expr, &mut scope, &mut errors);
+    check(expr, &mut scope, &mut errors, &reachable);
     errors
 }
 
@@ -502,7 +910,12 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
 /// unresolvable call to `errors` rather than stopping at the first, matching
 /// how real jq's own compiler keeps going to report every compile error in
 /// one pass (#2037).
-fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
+fn check(
+    expr: &mut Expr,
+    scope: &mut Scope,
+    errors: &mut Vec<UnresolvedCall>,
+    reachable: &BTreeSet<usize>,
+) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
         // freshly parsed program, before evaluation begins; both are built
@@ -526,11 +939,11 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // one clone in the (self-inflicted, still never hit by this crate's
         // own callers) multi-owner case.
         Expr::Shared(inner) => {
-            check(Rc::make_mut(inner), scope, errors);
+            check(Rc::make_mut(inner), scope, errors, reachable);
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, scope, errors);
+                check(arg, scope, errors, reachable);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
@@ -557,11 +970,11 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
         | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => check(inner, scope, errors),
+        | Expr::Label { body: inner, .. } => check(inner, scope, errors, reachable),
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, scope, errors);
+                check(e, scope, errors, reachable);
             }
         }
 
@@ -628,8 +1041,8 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             value: right,
             ..
         } => {
-            check(left, scope, errors);
-            check(right, scope, errors);
+            check(left, scope, errors, reachable);
+            check(right, scope, errors, reachable);
         }
 
         // The one arm that changes scope. `body` sees the function itself
@@ -656,17 +1069,30 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             for p in params.iter() {
                 scope.push((p.name().to_string(), 0));
             }
-            check(body, scope, errors);
+            // #2740: a `def` whose call never appears anywhere reachable is
+            // never compiled by real jq either -- its own substitution model
+            // only ever compiles a body at the call site that references it.
+            // `build_call_graph` (run once, up front, in
+            // `resolve_func_calls_all`) already answered this for every
+            // `def` in the program by the time this walk reaches it, keyed
+            // by the same body-address identity recomputed here -- so
+            // skipping the check costs nothing (this is not a second
+            // graph walk, just one `BTreeSet` lookup) and never revisits
+            // scope/`then`, which still need the same treatment either way.
+            let body_addr = body.as_ref() as *const Expr as usize;
+            if reachable.contains(&body_addr) {
+                check(body, scope, errors, reachable);
+            }
             scope.truncate(with_self);
 
-            check(then, scope, errors);
+            check(then, scope, errors, reachable);
             scope.truncate(outer);
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope, errors);
+            check(expr, scope, errors, reachable);
             if let Some(c) = catch.as_deref_mut() {
-                check(c, scope, errors);
+                check(c, scope, errors, reachable);
             }
         }
 
@@ -675,21 +1101,21 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             then_branch,
             else_branch,
         } => {
-            check(cond, scope, errors);
-            check(then_branch, scope, errors);
-            check(else_branch, scope, errors);
+            check(cond, scope, errors, reachable);
+            check(then_branch, scope, errors, reachable);
+            check(else_branch, scope, errors, reachable);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope, errors);
-            check_opt(start.as_deref_mut(), scope, errors);
-            check_opt(end.as_deref_mut(), scope, errors);
+            check(target, scope, errors, reachable);
+            check_opt(start.as_deref_mut(), scope, errors, reachable);
+            check_opt(end.as_deref_mut(), scope, errors, reachable);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope, errors);
-            check_opt(to.as_deref_mut(), scope, errors);
-            check_opt(step.as_deref_mut(), scope, errors);
+            check(from, scope, errors, reachable);
+            check_opt(to.as_deref_mut(), scope, errors, reachable);
+            check_opt(step.as_deref_mut(), scope, errors, reachable);
         }
 
         Expr::Reduce {
@@ -698,9 +1124,9 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             update,
             ..
         } => {
-            check(input, scope, errors);
-            check(init, scope, errors);
-            check(update, scope, errors);
+            check(input, scope, errors, reachable);
+            check(init, scope, errors, reachable);
+            check(update, scope, errors, reachable);
         }
 
         Expr::Foreach {
@@ -710,15 +1136,15 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             extract,
             ..
         } => {
-            check(input, scope, errors);
-            check(init, scope, errors);
-            check(update, scope, errors);
-            check_opt(extract.as_deref_mut(), scope, errors);
+            check(input, scope, errors, reachable);
+            check(init, scope, errors, reachable);
+            check(update, scope, errors, reachable);
+            check_opt(extract.as_deref_mut(), scope, errors, reachable);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
-                check(e, scope, errors);
+                check(e, scope, errors, reachable);
             }
         }
 
@@ -781,16 +1207,16 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
                     *args = builtin_fallback_into_args(*fallback);
                 }
                 for a in args.iter_mut() {
-                    check(a, scope, errors);
+                    check(a, scope, errors, reachable);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
                 // one move, no cloning.
                 *expr = *fallback;
-                check(expr, scope, errors);
+                check(expr, scope, errors, reachable);
             } else if is_jq_builtin(name, arity) {
                 for a in args.iter_mut() {
-                    check(a, scope, errors);
+                    check(a, scope, errors, reachable);
                 }
             } else {
                 errors.push(UnresolvedCall {
@@ -807,23 +1233,23 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, scope, errors);
+                check(a, scope, errors, reachable);
             }
         }
 
         Expr::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, errors);
+                    check(k, scope, errors, reachable);
                 }
-                check(&mut entry.value, scope, errors);
+                check(&mut entry.value, scope, errors, reachable);
             }
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope, errors);
+                    check(e, scope, errors, reachable);
                 }
             }
         }
@@ -842,7 +1268,7 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         Expr::Builtin(builtin) => {
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut sub = sub.clone();
-                check(&mut sub, scope, errors);
+                check(&mut sub, scope, errors, reachable);
                 sub
             });
         }
@@ -850,9 +1276,14 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
 }
 
 /// [`check`] over an optional sub-expression.
-fn check_opt(expr: Option<&mut Expr>, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
+fn check_opt(
+    expr: Option<&mut Expr>,
+    scope: &mut Scope,
+    errors: &mut Vec<UnresolvedCall>,
+    reachable: &BTreeSet<usize>,
+) {
     if let Some(e) = expr {
-        check(e, scope, errors);
+        check(e, scope, errors, reachable);
     }
 }
 
@@ -968,6 +1399,73 @@ mod tests {
         );
     }
 
+    /// #2740: a `def` whose call never appears anywhere in the program is
+    /// never checked -- jq's own substitution-based compiler never compiles
+    /// such a body either, since it only ever compiles a `def` at the call
+    /// site referencing it. Distinct from the *unreached-branch* case above:
+    /// `if false then f(1;2;3) ...` still contains a real, textual call to
+    /// `f` (jq rejects it regardless of which branch runs at evaluation
+    /// time) -- this test's `h` has no call to it anywhere at all.
+    #[test]
+    fn accepts_a_def_whose_body_is_never_referenced_anywhere() {
+        assert_eq!(resolve("def h: nosuchfn; 1"), Ok(()));
+        // A nested, locally-scoped def that is likewise never called.
+        assert_eq!(resolve("def h: def g: nosuchfn; 1; 1"), Ok(()));
+        // Two mutually unreferenced defs.
+        assert_eq!(resolve("def a: nosuchfn; def b: nosuchfn2; 1"), Ok(()));
+    }
+
+    /// #2740: a call reached only through a genuine (non-shadowed)
+    /// `Expr::Range`'s own `to` bound still propagates reachability --
+    /// `range(1; b)` parses straight to `Expr::Range`, not a `FuncCall`,
+    /// since no `def range` exists anywhere in this program to trigger
+    /// #2036's shadowable-call wrapping.
+    #[test]
+    fn a_call_reached_through_a_range_bound_still_raises() {
+        assert_eq!(
+            resolve("def b: nosuchfn; def a: range(1; b); a"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
+    /// #2740: a def that IS referenced still gets its body checked, even
+    /// when the only reference is as a bare *argument* to another call
+    /// that never actually invokes its parameter -- confirmed live against
+    /// jq 1.7.1: the argument expression itself must still resolve/compile
+    /// at the call site, independent of whether the callee's body ever
+    /// uses the parameter it's bound to.
+    #[test]
+    fn rejects_a_def_referenced_only_as_an_unused_argument() {
+        assert_eq!(
+            resolve("def h: nosuchfn; def use(f): 1; use(h)"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
+    /// #2740: mutual recursion between two otherwise-unreferenced defs stays
+    /// unreachable as a pair -- reachability is computed over the whole
+    /// call graph, not a single def in isolation, so a cycle with no
+    /// incoming edge from outside it is still dead.
+    #[test]
+    fn a_mutually_recursive_pair_stays_unreachable_together() {
+        assert_eq!(resolve("def a: b; def b: nosuchfn; 1"), Ok(()));
+    }
+
+    /// #2740: reachability must not weaken the *existing* checks -- a call
+    /// that genuinely reaches an unresolvable name still raises, even when
+    /// discovered only via a chain of several defs.
+    #[test]
+    fn a_call_reached_through_several_defs_still_raises() {
+        // Dependency order matters here for a reason unrelated to
+        // reachability: `def a: b; ...` would be a forward reference (#1473
+        // rejects it before this pass's own reachability question is even
+        // reached), so each def below only calls one already defined.
+        assert_eq!(
+            resolve("def c: nosuchfn; def b: c; def a: b; a"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
     #[test]
     fn a_nested_def_does_not_leak_into_the_outer_scope() {
         assert_eq!(
@@ -1057,6 +1555,7 @@ mod tests {
             &mut Expr::Shared(Rc::new(unresolved())),
             &mut scope,
             &mut errors,
+            &BTreeSet::new(),
         );
         assert_eq!(
             errors,
@@ -1081,6 +1580,7 @@ mod tests {
             },
             &mut scope,
             &mut errors,
+            &BTreeSet::new(),
         );
         assert_eq!(
             errors,
@@ -1089,6 +1589,55 @@ mod tests {
                 arity: 0,
             }]
         );
+    }
+
+    /// #1371 (mirroring `check_recurses_through_shared_and_defcall` just
+    /// above, same reasoning): `build_call_graph` must also recurse into
+    /// `Shared`/`DefCall` payloads, even though neither variant survives to
+    /// reach it in practice -- this pass runs once, on the freshly parsed
+    /// program, strictly before evaluation ever builds either.
+    #[test]
+    fn build_call_graph_recurses_through_shared_and_defcall() {
+        use alloc::rc::Rc;
+
+        let call_to_f = || Expr::FuncCall {
+            name: "f".into(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+
+        let mut scope: ReachScope = alloc::vec![("f".to_string(), 0, ScopeHit::Def(42))];
+        let mut graph = BTreeMap::new();
+        let mut roots = Vec::new();
+        build_call_graph(
+            &Expr::Shared(Rc::new(call_to_f())),
+            &mut scope,
+            None,
+            &mut graph,
+            &mut roots,
+        );
+        assert_eq!(roots, alloc::vec![42]);
+
+        let mut scope: ReachScope = alloc::vec![("f".to_string(), 0, ScopeHit::Def(42))];
+        let mut graph = BTreeMap::new();
+        let mut roots = Vec::new();
+        build_call_graph(
+            &Expr::DefCall {
+                def: Rc::new(crate::jq::FuncDefData {
+                    name: "f".into(),
+                    params: Vec::new(),
+                    body: Expr::Identity,
+                }),
+                args: alloc::vec![call_to_f()],
+                frames: 0,
+                bound: crate::jq::BoundBody::default(),
+            },
+            &mut scope,
+            None,
+            &mut graph,
+            &mut roots,
+        );
+        assert_eq!(roots, alloc::vec![42]);
     }
 
     /// #2687: `break $x` desugars to a resolvable `error/0` call -- a

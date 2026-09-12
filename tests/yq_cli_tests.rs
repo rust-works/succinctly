@@ -18814,6 +18814,33 @@ fn test_yq_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
     Ok(())
 }
 
+/// #2740: `resolve_func_calls` is shared verbatim between `jq_runner.rs` and
+/// `yq_runner.rs` -- mirrors `test_undefined_name_inside_never_called_def_compiles_2740`/
+/// `test_undefined_name_inside_a_called_def_still_a_compile_error_2740`
+/// (`jq_cli_tests.rs`) on yq's own route. No oracle: `def`/`resolve_func_calls`'s
+/// compile-time checking are both succinctly extensions real yq's lexer
+/// rejects outright.
+#[test]
+fn test_yq_undefined_name_inside_a_called_def_still_a_compile_error_2740() -> Result<()> {
+    let doc = "a: 1\n";
+
+    // Never called: not a compile error.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("def h: nosuchfn; 1", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1");
+
+    // Called: still a compile error.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("def h: nosuchfn; h", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // --split-exp Tests (#715)
 // ============================================================================

@@ -24673,6 +24673,41 @@ fn test_func_def_three_way_arity_overload_1376() -> Result<()> {
     Ok(())
 }
 
+/// #2740: an undefined name inside a `def` the program never calls must not
+/// be a compile error -- jq's own substitution-based compiler only ever
+/// compiles a `def` body at the call site referencing it, so a definition
+/// nobody calls is simply never compiled, however malformed its body.
+/// Oracle-verified against jq 1.7.1: both exit 0, printing `1`.
+#[test]
+fn test_undefined_name_inside_never_called_def_compiles_2740() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def h: nosuchfn; 1"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
+    // A nested, locally-scoped def that is likewise never called.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "def h: def g: nosuchfn; 1; 1"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #2740: the fix must not weaken the *existing* checks -- a `def` that
+/// genuinely gets called still surfaces an undefined name inside it as a
+/// compile error. See `test_yq_undefined_name_inside_a_called_def_still_a_compile_error_2740`
+/// (`yq_cli_tests.rs`) for the same check on `yq`'s jq-extension route,
+/// which shares this resolution pass.
+#[test]
+fn test_undefined_name_inside_a_called_def_still_a_compile_error_2740() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def h: nosuchfn; h"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1473, the severe half: forward-referencing a not-yet-defined arity
 /// from *within a def's own body* used to silently compute a value, where
 /// real jq rejects it as a compile-time forward reference (`f/2 is not
