@@ -22425,12 +22425,17 @@ fn test_def_shadows_builtin_2036() -> Result<()> {
 /// installed straight through `h`'s body, ignoring `h`'s own parameter
 /// named `b`) and row 2 overflowed the recursion guard (the outer `def a`'s
 /// installation loop never terminated once it also got installed inside the
-/// nested nested-recursive `def a(a): a`). Oracle-verified against jq 1.7.1.
+/// nested nested-recursive `def a(a): a`). Row 3 is the same shape as row 1
+/// but with a `$`-parameter: the shadow check reads a parameter's name via
+/// `Param::name()`, which deliberately unifies `Bare`/`Dollar`, so a
+/// `$`-parameter must shadow exactly like a bare one does. Oracle-verified
+/// against jq 1.7.1.
 #[test]
 fn test_nested_def_own_param_shadows_zero_arity_def_being_installed_2738() -> Result<()> {
     for (filter, want) in [
         ("def b: 8; def h(b): b; h(6)", "6"),
         ("def a: (def a(a): a; a(4)); a", "4"),
+        ("def b: 8; def h($b): b; h(99)", "99"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
