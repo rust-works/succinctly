@@ -30697,7 +30697,18 @@ fn walk_pattern(
                     reg.is_input = false;
                 }
                 first = false;
-                let step = PatternStep::Field(&entry.key);
+                // #2677: a computed key (`{(EXPR): P}`, or an interpolated
+                // string) is not yet walked in path position -- landing
+                // separately from the parse-acceptance half so each is
+                // independently testable (see this repo's own issue #2677
+                // triage). `extract_pattern_bindings`'s value-mode arm below
+                // carries the identical stub.
+                let ObjectKey::Literal(key) = &entry.key else {
+                    return Err(EvalError::new(
+                        "computed keys in a destructuring pattern are not yet supported in path position (#2677)",
+                    ));
+                };
+                let step = PatternStep::Field(key);
                 let (child, moved) = walk_pattern_step(&step, input, &reg)?;
                 // `{$b: P}`: the bind names the node the register just moved
                 // to, so it carries that position's marker, and is pushed
@@ -49281,6 +49292,18 @@ pub(crate) fn extract_pattern_bindings(
             }
             let mut bindings = Vec::new();
             for entry in entries {
+                // #2677: a computed key is not yet evaluated in value
+                // position either -- see `walk_pattern`'s identical stub
+                // (path position) for the shared rationale. Checked before
+                // the non-object-target check just below, matching real
+                // jq's own order (the key expression's own error, or a
+                // `Cannot index ... with ...` naming its actual type, would
+                // otherwise be masked by a generic non-object refusal here).
+                let ObjectKey::Literal(key) = &entry.key else {
+                    return Err(EvalError::new(
+                        "computed keys in a destructuring pattern are not yet supported (#2677)",
+                    ));
+                };
                 // jq destructures by indexing once per key, so a non-object
                 // reports exactly what `.<key>` would — and a pattern with no
                 // keys never indexes, so it cannot fail.
@@ -49289,11 +49312,11 @@ pub(crate) fn extract_pattern_bindings(
                     _ => {
                         return Err(EvalError::cannot_index_with_field(
                             owned_type_name(value),
-                            &entry.key,
+                            key,
                         ))
                     }
                 };
-                let field_value = obj.get(&entry.key).cloned().unwrap_or(OwnedValue::Null);
+                let field_value = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
                 // `{$b: P}` binds `$b` to the matched value *before* running
                 // `P` against that same value (one `INDEX` step in jq's own
                 // compilation, #2649) -- pushed ahead of the sub-pattern's
@@ -88342,7 +88365,7 @@ mod tests {
     fn test_fold_pattern_admitted_gate_2676() {
         let bare = [Pattern::Var("x".to_string())];
         let object = [Pattern::Object(vec![crate::jq::PatternEntry {
-            key: "c".to_string(),
+            key: ObjectKey::Literal("c".to_string()),
             bind: None,
             pattern: Pattern::Var("x".to_string()),
         }])];
