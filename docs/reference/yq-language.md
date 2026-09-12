@@ -636,7 +636,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 ### Intentionally Not Implemented
 
 1. **XML/TOML input/output** - Out of scope (separate tools)
-2. **Comment preservation on the DOM route** - trailing (`# c`) comments, anchors and style survive every YAML route; standalone head/foot comment lines print on the streaming route (`.`, `select(...)`, any cursor-forwarded result -- #2795) but not yet through `-P` or a write (`.a = 5`, `del(.b)`), and `--header-preprocess=false` is not implemented (the default header slurping is)
+2. **Comment preservation** - trailing (`# c`) comments, anchors, style and standalone head/foot comment lines all survive every YAML route now (the streaming route, `-P`, and a write like `.a = 5`/`del(.b)` -- #2795 PR A/B); `--header-preprocess=false` is not implemented (the default header slurping is), and the DOM route's verbatim header reproduction has known gaps -- see [limitations.md](../compliance/yq/limitations.md)
 3. **Merge keys** (`<<: *alias`) - Rarely used, complex semantics
 4. **Schema validation** - Separate tool concern
 

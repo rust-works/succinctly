@@ -3814,24 +3814,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // YAML output, which already went through the cursor-aware path.
     let owned_with_comments = |c: &YamlCursor<'_, W>| {
         if need_comments {
-            // A bare scalar result's standalone head/foot only survives
-            // when `c` is the document's own content node (#2795 PR B) --
-            // real yq drops both for a navigated-away scalar (`.a`,
-            // `.items[0]` when item 0 is a scalar) even though a navigated
-            // *container* keeps its own (`.items[0]` when item 0 is a
-            // mapping still prints its head). `to_owned_with_comments`
-            // can't see this by itself: a sequence item's head/foot keys off
-            // its own cursor the same way whether or not that cursor is
-            // ever reached via navigation, so this clears it right after,
-            // before the later unconditional style/anchor-clearing pass
-            // (#852) decides what to keep for a bare scalar.
-            let is_document_root = DocumentCursor::is_document_content(c);
-            to_owned_with_comments(&c.value(), Some(c)).map(|(v, mut comments)| {
-                if !is_document_root && !matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_)) {
-                    *comments.meta_mut() = comments.meta().with_head_foot(Vec::new(), Vec::new());
-                }
-                (v, comments)
-            })
+            // The document-root/first-document/scalar-vs-collection gating
+            // for a bare result's standalone head/foot now lives in
+            // `to_owned_with_comments` itself (#2795 PR B review), since
+            // the write path's pristine snapshot (`presentation_sync_ctx`
+            // above) needs the exact same rule and was missing it.
+            to_owned_with_comments(&c.value(), Some(c))
         } else {
             generic_to_owned_cursor(c).map(&no_comments)
         }

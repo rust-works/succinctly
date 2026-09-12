@@ -629,6 +629,27 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         false
     }
 
+    /// Whether this cursor's *document* has any standalone head/foot
+    /// comment at all.
+    ///
+    /// A whole-document property, not a property of this node, and O(1) --
+    /// `YamlIndex::has_standalone_comments` is an emptiness check on an
+    /// already-built map, mirroring [`Self::document_has_aliases`]'s own
+    /// shape. `false` for formats with no standalone-comment concept
+    /// (JSON), where it monomorphizes away entirely.
+    ///
+    /// Lets a DOM materializer skip a per-node comment lookup on a document
+    /// that has none at all (#2795 PR B review): the streaming route
+    /// already gates its own per-node head/foot reads on this exact check
+    /// (`write_head_comments_at`/`write_foot_comments_at`,
+    /// `src/yaml/light.rs`) after measuring a real regression from paying
+    /// two `BTreeMap` probes per node on comment-free input; the DOM route
+    /// (`to_owned_with_comments_at_depth`, `src/jq/eval_generic.rs`) reads
+    /// the same two maps per node with no equivalent short-circuit.
+    fn document_has_standalone_comments(&self) -> bool {
+        false
+    }
+
     /// Get the explicit YAML tag at this node, if any (e.g. `"!!str"`).
     ///
     /// Returns `None` when the node has no explicit tag, and for formats

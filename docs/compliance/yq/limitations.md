@@ -3801,6 +3801,19 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   which yq cannot read back); succinctly prints `---` and drops the marker's comment. A
   whitespace-only line ahead of the first comment makes yq print a bare `#   ` line;
   succinctly ends the header there and prints nothing for it.
+- **A genuinely blank CRLF line near a standalone comment, in the header or not,** is
+  turned by yq into a literal `# \r\n` comment line, or a spurious extra blank line is
+  inserted after the comment that the CRLF source never had at all (go-yaml's scanner
+  appears to special-case a blank line only for `\n`, not `\r\n`, in more than one place)
+  -- confirmed round-trips through yq itself, so this is accepted as an unreplicated
+  fidelity gap rather than a data-loss exception (#2795 review), in the header
+  (`# lead\r\n\r\na: 1\r\n` prints `# lead\r\n\r\na: 1\n` in succinctly, not yq's
+  `# lead\r\n# \r\na: 1\n`) and mid-document alike (`a: 1\r\n# mid\r\nb: 2\r\n` prints
+  `a: 1\n# mid\nb: 2\n` in succinctly, where yq inserts a blank line it never had:
+  `a: 1\n# mid\n\nb: 2\n` -- pinned by the CRLF/CR exemptions in
+  `tests/yq_golden_tests.rs`'s `KNOWN_CRLF_DIVERGENCES`, not the usual known-failures
+  manifest, since these cases pass under LF). The header's line breaks are otherwise reproduced
+  verbatim (not normalized to `\n` like the rest of a document's content), matching yq.
 
 [#2811](https://github.com/rust-works/succinctly/issues/2811) closed the placement gap
 this section used to record here: a comment above a compact `- k: v` item or a nested

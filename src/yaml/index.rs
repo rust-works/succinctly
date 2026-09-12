@@ -1425,18 +1425,6 @@ mod tests {
         panic!("nested key {outer}.{inner} not found"); // omni-dev: coverage tolerate-line reason="unreachable: every call to nested_key_head_foot in this test module passes an outer.inner pair that the fixture actually has (#798)"
     }
 
-    /// `head`/`foot` of the virtual root sequence itself — where a
-    /// comment-only document's block lands, since such a document opens no
-    /// content node of its own.
-    fn virtual_root_head_foot(yaml: &[u8]) -> (Vec<String>, Vec<String>) {
-        let index = YamlIndex::build(yaml).expect("valid YAML");
-        let bp = index.root(yaml).bp_position();
-        (
-            raw_lines(yaml, index.get_head_comments(bp)),
-            raw_lines(yaml, index.get_foot_comments(bp)),
-        )
-    }
-
     /// A block sticks to whatever it is *not* separated from by a blank
     /// line, preferring forward. Every expectation here was captured from
     /// pinned `yq` v4.53.3 before being written down; the triage note that
@@ -1677,9 +1665,13 @@ mod tests {
 
     #[test]
     fn a_comment_only_document_keeps_its_block_as_a_head_798() {
-        // Measured: `. | head_comment` == "only", foot empty. succinctly has
-        // no document content node here, so it lands on the virtual root.
-        let (head, foot) = virtual_root_head_foot(b"# only\n");
+        // Measured: `. | head_comment` == "only", foot empty. A comment-only
+        // (or whitespace-only) input still synthesizes one null document, the
+        // same way an explicit `---`/`...` boundary with nothing before it
+        // does (#2795 review) -- real yq answers `1` for a literal `1`
+        // filter here, not zero results, so the comment attaches to that
+        // document's own content node rather than the virtual root.
+        let (head, foot) = doc_head_foot(b"# only\n");
         assert_eq!(head, ["# only"]);
         assert!(foot.is_empty(), "{foot:?}");
     }
