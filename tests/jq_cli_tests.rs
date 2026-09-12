@@ -48763,19 +48763,19 @@ fn test_pattern_computed_key_review_fixes_2873() -> Result<()> {
         // is generic, not object-only. The original implementation
         // unconditionally required a string key, wrongly raising "Cannot
         // index array with number" here.
-        (r#"[10,20,30]"#, "def one: 1; . as {(one):$q} | $q", "20\n"),
+        (r"[10,20,30]", "def one: 1; . as {(one):$q} | $q", "20\n"),
         (
-            r#"[10,20,30]"#,
+            r"[10,20,30]",
             "def one: 1; path(. as {(one):$q} | $q)",
             "[1]\n",
         ),
         (
-            r#"[10,20,30]"#,
+            r"[10,20,30]",
             "def negone: -1; path(. as {(negone):$q} | $q)",
             "[-1]\n",
         ),
         (
-            r#"[10,20,30]"#,
+            r"[10,20,30]",
             "def one: 1; reduce . as {(one):$q} (0; .+$q)",
             "20\n",
         ),
