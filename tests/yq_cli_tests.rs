@@ -35522,6 +35522,75 @@ fn test_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351() -> Result
     Ok(())
 }
 
+/// #2546 yq-mode gate: jq mode now rules on a non-numeric slice bound at
+/// the slice step, after the target's kind and under the slice's own `?`
+/// (`null | .["x":]` is `null`, `{"a":1} | .["x":]` is `Cannot index object
+/// with object`, `.["x":]?` prints nothing -- jq 1.7.1). Real yq parses
+/// every bound before it looks at the target: `.["x":]` is `Error:
+/// strconv.ParseInt: parsing "x": invalid syntax` on an array, a mapping,
+/// a scalar *and* `null` alike, and `.["x":]?` raises the same (yq
+/// v4.53.3). So yq mode keeps its eager, unsuppressed check for every
+/// target kind, on both the CLI route and the `--slurp` bridge route; only
+/// the message text differs from real yq's (recorded in
+/// `docs/compliance/yq/limitations.md`).
+#[test]
+fn test_slice_bound_type_error_stays_eager_and_unsuppressed_in_yq_mode_2546() -> Result<()> {
+    for input in ["[1, 2]\n", "null\n", "a: 1\n", "5\n", "\"ab\"\n"] {
+        for filter in [".[\"x\":]", ".[\"x\":]?", ".[0:\"x\"]"] {
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, input, &["-o", "json"])?;
+            assert_eq!(
+                code, 1,
+                "{input:?} | {filter}: out: {out:?} stderr: {stderr:?}"
+            );
+            assert_eq!(out, "", "{input:?} | {filter}");
+            assert_eq!(
+                stderr.trim(),
+                "Error: Array/string slice indices must be integers",
+                "{input:?} | {filter}"
+            );
+            let slurped = format!(".[0] | {filter}");
+            let (out, stderr, code) =
+                run_yq_stdin_with_stderr(&slurped, input, &["--slurp", "-o", "json"])?;
+            assert_eq!(
+                code, 1,
+                "{input:?} | {slurped}: out: {out:?} stderr: {stderr:?}"
+            );
+            assert_eq!(out, "", "{input:?} | {slurped}");
+            assert_eq!(
+                stderr.trim(),
+                "Error: Array/string slice indices must be integers",
+                "{input:?} | {slurped}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #2546 yq-mode gate, generator order: real yq evaluates a bound
+/// expression in full before it slices, so yq mode keeps the pre-#2546
+/// eager collection -- a bound generator's later `error(...)` still
+/// outranks an earlier non-numeric value (`.[(0,"x",error("y")):3]` is
+/// `Error: y`), and `end` is never reached when `start` escapes
+/// (`.[(0,1,error("x")):(2,3,error("y"))]` is `Error: x`). jq mode, now
+/// lazy, answers the slice-indices error for the first and `y` for the
+/// second (both jq 1.7.1); yq's answers are the ones `main` gave before
+/// #2546, live-verified against yq v4.53.3 for #2351/#2372.
+#[test]
+fn test_slice_bound_generator_stays_eager_in_yq_mode_2546() -> Result<()> {
+    for (filter, expected) in [
+        (".[(0,\"x\",error(\"y\")):3]", "Error: y"),
+        (".[(0,1,error(\"x\")):(2,3,error(\"y\"))]", "Error: x"),
+        (".[0:(2,\"x\",error(\"y\"))]", "Error: y"),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "[10, 20, 30]\n", &["-o", "json"])?;
+        assert_eq!(code, 1, "{filter}: out: {out:?} stderr: {stderr:?}");
+        assert_eq!(out, "", "{filter}");
+        assert_eq!(stderr.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2351 review (Gap 1): `resolve_slice_bound` (the path-mode resolver
 /// behind `path()`/`=`/`del()`, via `resolve_dynamic_indexes`) had no
 /// yq-mode gate at all -- through the real CLI binary via `del(...)` (real

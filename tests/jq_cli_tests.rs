@@ -42722,6 +42722,353 @@ fn test_slice_expr_end_bound_reevaluated_under_null_input_2225() -> Result<()> {
     Ok(())
 }
 
+/// #2546: the bound generator is pulled lazily, so a pair's slice-step
+/// error stops it before its next value -- and that value's side effect --
+/// is ever produced. Captured live from jq 1.7.1: `.[("x",(1|debug)):]` on
+/// `[1,2,3,4]` raises "Array/string slice indices must be integers" with
+/// no DEBUG line at all; before the fix the eager `Vec` collection ran
+/// `1|debug` first and printed `["DEBUG:",1]` ahead of the error.
+#[test]
+fn test_slice_bound_generator_not_pulled_past_slice_error_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(\"x\",(1|debug)):]"], Some("[1,2,3,4]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("DEBUG"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2546: `end` is pulled per start value, interleaved with it -- jq's own
+/// `S as $s | T as $t | ...` nesting. Captured live from jq 1.7.1:
+/// `.[(0,1|debug):(2,3|debug)]` on `[1,2,3,4]` writes DEBUG `0 2 3 1 2 3`
+/// (start, then that start's ends, then the next start); the eager
+/// collection wrote `0 1 2 3 2 3`. The slices themselves are identical
+/// either way, which is why the order is pinned through `debug`.
+#[test]
+fn test_slice_end_bound_pulled_per_start_value_2546() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[(0,1|debug):(2,3|debug)]"], Some("[1,2,3,4]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2]\n[1,2,3]\n[2]\n[2,3]\n");
+    assert_eq!(
+        stderr,
+        "[\"DEBUG:\",0]\n[\"DEBUG:\",2]\n[\"DEBUG:\",3]\n[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n[\"DEBUG:\",3]\n"
+    );
+    Ok(())
+}
+
+/// #2546: an `end` bound's slice-step error stops *both* generators --
+/// `end`'s remaining values for this start, and `start`'s remaining values.
+/// Captured live from jq 1.7.1: `.[(0|debug),("y"|debug):(1|debug),
+/// ("x"|debug)]` on `[1,2,3,4]` prints `[1]` (the `0:1` pair) and DEBUG
+/// `0`, `1`, `"x"`, then raises -- `"y"` is never evaluated. A string
+/// target takes the same route: `"abcd" | .[(0,(1|debug)):(2,(3|debug))]`
+/// writes DEBUG `3 1 3` and prints `"ab" "abc" "b" "bc"`.
+#[test]
+fn test_slice_end_bound_error_stops_start_generator_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".[(0|debug),(\"y\"|debug):(1|debug),(\"x\"|debug)]"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1]\n");
+    assert!(
+        stderr.starts_with("[\"DEBUG:\",0]\n[\"DEBUG:\",1]\n[\"DEBUG:\",\"x\"]\n"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("\"y\""), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[(0,(1|debug)):(2,(3|debug))]"], Some("\"abcd\""))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"ab\"\n\"abc\"\n\"b\"\n\"bc\"\n");
+    assert_eq!(stderr, "[\"DEBUG:\",3]\n[\"DEBUG:\",1]\n[\"DEBUG:\",3]\n");
+    Ok(())
+}
+
+/// #2546: an `end` generator that errors before its first value ends the
+/// whole slice at the first start value -- `start`'s next value is never
+/// pulled. Captured live from jq 1.7.1: `.[(0,(1|debug)):(error("e"))]`
+/// raises `e` with no DEBUG line.
+#[test]
+fn test_slice_end_bound_error_before_first_value_stops_start_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".[(0,(1|debug)):(error(\"e\"))]"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.trim_end().ends_with(": e"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("DEBUG"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2546: the postfix `?` is jq's `INDEX_OPT` opcode -- it suppresses the
+/// slice step of *one* `(s, e, target)` triple and the generators resume
+/// with the next, unlike `try`, which ends the whole term at the first
+/// error. All four rows captured live from jq 1.7.1 on `[1,2]`:
+/// `.["x":]?` prints nothing; `[.[(0,"x",1):]?]` is `[[1,2],[2]]` where
+/// `[try .[(0,"x",1):]]` is `[[1,2]]`; `[(.,"ab")[(0,"x",1):]?]` is
+/// `[[1,2],"ab",[2],"b"]`; and with both bounds computed,
+/// `[.[(0,"x",1):(1,"y",2)]?]` is `[[1],[1,2],[],[2]]` -- every pair with a
+/// non-numeric side skipped, every other pair kept. Before the fix all
+/// four raised "Array/string slice indices must be integers": the bound
+/// was classified at the pull site, outside the per-pair `optional` gate.
+#[test]
+fn test_slice_optional_suppresses_bound_error_per_pair_and_resumes_2546() -> Result<()> {
+    for (filter, expected) in [
+        (".[\"x\":]?", ""),
+        ("[.[(0,\"x\",1):]?]", "[[1,2],[2]]\n"),
+        ("[try .[(0,\"x\",1):]]", "[[1,2]]\n"),
+        ("[(.,\"ab\")[(0,\"x\",1):]?]", "[[1,2],\"ab\",[2],\"b\"]\n"),
+        ("[.[(0,\"x\",1):(1,\"y\",2)]?]", "[[1],[1,2],[],[2]]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, expected, "{filter}");
+        assert_eq!(stderr, "", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2546 (plan's own over-suppression check): `?` covers the slice step
+/// only, never an error raised while *computing* a bound. Captured live
+/// from jq 1.7.1: `[.[(0,error("e"),1):]?]` on `[1,2]` still raises `e`.
+#[test]
+fn test_slice_optional_does_not_suppress_bound_expression_error_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.[(0,error(\"e\"),1):]?]"], Some("[1,2]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.trim_end().ends_with(": e"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2546: the target's kind is checked before the bound's type, jq's
+/// `jv_get` order. Captured live from jq 1.7.1 with `.["x":]`: `null`
+/// answers `null` (the bound is never parsed); `{"a":1}` and `5` raise
+/// `Cannot index object with object` / `Cannot index number with object`,
+/// not the slice-indices message; only an array/string target reaches the
+/// bound check. Under `?`, the null answer stays `null` and the two
+/// kind errors are suppressed. Before the fix every row raised
+/// "Array/string slice indices must be integers".
+#[test]
+fn test_slice_target_kind_checked_before_bound_type_2546() -> Result<()> {
+    for (input, filter, expected_stdout, expected_code, expected_stderr) in [
+        ("null", ".[\"x\":]", "null\n", 0, ""),
+        (
+            "{\"a\":1}",
+            ".[\"x\":]",
+            "",
+            5,
+            "Cannot index object with object",
+        ),
+        ("5", ".[\"x\":]", "", 5, "Cannot index number with object"),
+        (
+            "[1,2]",
+            ".[\"x\":]",
+            "",
+            5,
+            "Array/string slice indices must be integers",
+        ),
+        (
+            "\"ab\"",
+            ".[\"x\":]",
+            "",
+            5,
+            "Array/string slice indices must be integers",
+        ),
+        ("null", ".[\"x\":]?", "null\n", 0, ""),
+        ("{\"a\":1}", ".[\"x\":]?", "", 0, ""),
+        ("5", ".[\"x\":]?", "", 0, ""),
+        ("5", ".[0:1]?", "", 0, ""),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, expected_code,
+            "{input} | {filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, expected_stdout, "{input} | {filter}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "{input} | {filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2546: because a bound is only ruled on when it meets a target that
+/// would use it, a non-numeric bound over a `null` target does not stop the
+/// generator either. Captured live from jq 1.7.1: `null |
+/// .[(0,"x",(1|debug)):3]` prints `null` three times and DEBUG `1`; and a
+/// target that produces nothing never looks at its bounds at all --
+/// `[1,2] | empty[("x",(1|debug)):]` prints only DEBUG `1`, exit 0.
+#[test]
+fn test_slice_bound_not_ruled_on_without_a_sliceable_target_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(0,\"x\",(1|debug)):3]"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "null\nnull\nnull\n");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "empty[(\"x\",(1|debug)):]"], Some("[1,2]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n");
+    Ok(())
+}
+
+/// #2546 on the bridge route: `--slurp` forces `eval::eval_slice_expr`
+/// (the CLI's ordinary cursor path hits `eval_generic::eval_slice_expr`
+/// instead), so the same rewrite is confirmed on both twins -- laziness,
+/// per-start `end` interleaving, `?` resume and the target-kind order, each
+/// against the same jq-1.7.1 capture as its cursor-path sibling above.
+#[test]
+fn test_slice_expr_eval_rs_dispatch_lazy_bounds_and_optional_2546() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--slurp", "-c", ".[0] | .[(\"x\",(1|debug)):]"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("DEBUG"), "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["--slurp", "-c", ".[0] | .[(0,1|debug):(2,3|debug)]"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2]\n[1,2,3]\n[2]\n[2,3]\n");
+    assert_eq!(
+        stderr,
+        "[\"DEBUG:\",0]\n[\"DEBUG:\",2]\n[\"DEBUG:\",3]\n[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n[\"DEBUG:\",3]\n"
+    );
+
+    for (input, filter, expected_stdout, expected_code, expected_stderr) in [
+        ("[1,2]", ".[0] | .[\"x\":]?", "", 0, ""),
+        ("[1,2]", ".[0] | [.[(0,\"x\",1):]?]", "[[1,2],[2]]\n", 0, ""),
+        (
+            "[1,2]",
+            ".[0] | [(.,\"ab\")[(0,\"x\",1):]?]",
+            "[[1,2],\"ab\",[2],\"b\"]\n",
+            0,
+            "",
+        ),
+        (
+            "[1,2]",
+            ".[0] | [.[(0,\"x\",1):(1,\"y\",2)]?]",
+            "[[1],[1,2],[],[2]]\n",
+            0,
+            "",
+        ),
+        ("null", ".[0] | .[\"x\":]", "null\n", 0, ""),
+        (
+            "{\"a\":1}",
+            ".[0] | .[\"x\":]",
+            "",
+            5,
+            "Cannot index object with object",
+        ),
+        ("{\"a\":1}", ".[0] | .[\"x\":]?", "", 0, ""),
+        ("[1,2]", ".[0] | [.[(0,error(\"e\"),1):]?]", "", 5, ": e\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["--slurp", "-c", filter], Some(input))?;
+        assert_eq!(
+            code, expected_code,
+            "{input} | {filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, expected_stdout, "{input} | {filter}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "{input} | {filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2546 in path mode (`resolve_slice_expr`, behind `path()`/`=`/`|=`/
+/// `del()`): the bound is ruled on per branch, after the target's kind and
+/// under the slice's own `?`, so a non-numeric bound prunes just its pair
+/// and the generator resumes. Captured live from jq 1.7.1:
+/// `[path(.[(0,"x",1):]?)]` on `[1,2]` is the `0` and `1` descriptors;
+/// `{"a":1} | path(.["x":])` is `Cannot index object with object` (and
+/// nothing under `?`); the writes `.a[(0,"x",1):]? = ["z"]`, `|=` and
+/// `del()` skip the `"x"` pair (`{"a":["z","z"]}` / `{"a":[]}`); and
+/// `.a["x":]? = ["z"]` is a no-op on both an array and an object `.a`.
+/// Before the fix every row raised "Array/string slice indices must be
+/// integers" from the pull site.
+#[test]
+fn test_resolve_slice_expr_bound_ruled_on_per_branch_under_optional_2546() -> Result<()> {
+    for (input, filter, expected_stdout, expected_code, expected_stderr) in [
+        (
+            "[1,2]",
+            "[path(.[(0,\"x\",1):]?)]",
+            "[[{\"start\":0,\"end\":null}],[{\"start\":1,\"end\":null}]]\n",
+            0,
+            "",
+        ),
+        (
+            "[1,2]",
+            "[path(.[(0,\"x\",1):(1,\"y\",2)]?)]",
+            "[[{\"start\":0,\"end\":1}],[{\"start\":0,\"end\":2}],[{\"start\":1,\"end\":1}],[{\"start\":1,\"end\":2}]]\n",
+            0,
+            "",
+        ),
+        ("[1,2]", "path(.[\"x\":])", "", 5, "Array/string slice indices must be integers"),
+        ("[1,2]", "path(.[\"x\":]?)", "", 0, ""),
+        ("{\"a\":1}", "path(.[\"x\":])", "", 5, "Cannot index object with object"),
+        ("{\"a\":1}", "path(.[\"x\":]?)", "", 0, ""),
+        ("{\"a\":[1,2]}", ".a[(0,\"x\",1):]? = [\"z\"]", "{\"a\":[\"z\",\"z\"]}\n", 0, ""),
+        ("{\"a\":[1,2]}", ".a[(0,\"x\",1):]? |= [\"z\"]", "{\"a\":[\"z\",\"z\"]}\n", 0, ""),
+        ("{\"a\":[1,2]}", "del(.a[(0,\"x\",1):]?)", "{\"a\":[]}\n", 0, ""),
+        ("{\"a\":[1,2]}", ".a[\"x\":]? = [\"z\"]", "{\"a\":[1,2]}\n", 0, ""),
+        ("{\"a\":{\"b\":1}}", ".a[\"x\":]? = [\"z\"]", "{\"a\":{\"b\":1}}\n", 0, ""),
+        ("{\"a\":{\"b\":1}}", ".a[\"x\":] = [\"z\"]", "", 5, "Cannot index object with object"),
+        ("[1,2,3,4]", ".[(0,\"x\"):2]? = [\"z\"]", "[\"z\",3,4]\n", 0, ""),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, expected_code, "{input} | {filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, expected_stdout, "{input} | {filter}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "{input} | {filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2546 in path mode: an untrackable target is refused *before* the
+/// bound is ruled on (jq checks the path register ahead of `jv_get`), and
+/// the refusal still names the descriptor the failed bound sits in.
+/// Captured live from jq 1.7.1: `path((1,2)["x":])` on `[1,2]` is
+/// `Invalid path expression near attempt to access element
+/// {"start":"x","end":null} of 1` (both elide the descriptor to
+/// `{"start":"x...` in the message; that prefix is what is pinned), and `?`
+/// does not change that.
+#[test]
+fn test_resolve_slice_expr_untrackable_target_refused_before_bound_2546() -> Result<()> {
+    for filter in ["path((1,2)[\"x\":])", "path((5)[\"x\":]?)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert!(
+            stderr
+                .contains("Invalid path expression near attempt to access element {\"start\":\"x"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
 /// expression, so real jq's single shared path register moves onto `.a`'s
 /// own position as a side effect of evaluating it -- and UPDATE's own
