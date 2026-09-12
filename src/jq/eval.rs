@@ -27712,6 +27712,17 @@ fn resolve_node<'a, S: EvalSemantics>(
 /// ordinary `Cannot index array with string "b"`, not a `#843` message),
 /// so that arm never reads `trackable` at all.
 ///
+/// Whether `resolve_node_sink`'s `Expr::Reduce`/`Expr::Foreach` dispatch arm
+/// routes into `resolve_reduce`/`resolve_foreach` for this pattern list, or
+/// falls through to `resolve_leaf`'s catch-all — a single bare `$var` in any
+/// mode, or (jq mode only, #2676) a single destructuring
+/// `Pattern::Object`/`Pattern::Array`. Named and shared by both dispatch
+/// arms rather than spelled out twice so the two can't drift apart, and
+/// independently testable — see `test_fold_pattern_admitted_gate_2676`.
+fn fold_pattern_admitted<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
+    matches!(patterns, [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq)
+}
+
 /// Emits each branch to `sink` as it is produced (#1952), so a bounded
 /// consumer answers [`Demand::Stop`] and the generator underneath is
 /// never asked for the branch after it — the path-mode twin of
@@ -28174,41 +28185,37 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             patterns,
             init,
             update,
-        } if matches!(patterns.as_slice(), [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq) => {
-            resolve_reduce::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-                sink,
-            )
-        }
+        } if fold_pattern_admitted::<S>(patterns) => resolve_reduce::<S>(
+            input,
+            &patterns[0],
+            init,
+            update,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
         Expr::Foreach {
             input,
             patterns,
             init,
             update,
             extract,
-        } if matches!(patterns.as_slice(), [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq) => {
-            resolve_foreach::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                extract.as_deref(),
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-                sink,
-            )
-        }
+        } if fold_pattern_admitted::<S>(patterns) => resolve_foreach::<S>(
+            input,
+            &patterns[0],
+            init,
+            update,
+            extract.as_deref(),
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
         // A `?//`-alternatives list (either fold kind), or a destructuring
         // pattern in yq mode, falls back to the ordinary eager evaluator —
         // see the guarded arms' own doc comment above `Expr::Reduce` for
@@ -30495,6 +30502,38 @@ struct PatternRegister {
     is_input: bool,
 }
 
+/// The [`PatternRegister`] a fold's own destructuring pattern (#2676) walks
+/// `elem.value` from, shared by `resolve_reduce` and `resolve_foreach` so the
+/// two seeding rules can't drift apart:
+///
+/// - `elem.register_path.is_some()`: the source element's own position *is*
+///   the register (confirmed live: `path(foreach .b as {c:$x} (.; .; $x))`
+///   is `["b","c"]`).
+/// - `None` (a computed element): jq's register is untouched by this
+///   element, so `path_intact` is checked against wherever it already was —
+///   the fold's own persistent `reg` — which only ever admits the walk
+///   through `walk_pattern_step`'s `null`/`bool` identity exception, never
+///   through `reg.value == elem.value` (a structural coincidence, not a real
+///   `jv_identical`). Confirmed live: `path(foreach (null) as {a:$x} (.; .;
+///   $x))` is `["a"]` on a `null` document (the ambient register is `null`
+///   too), but `path(foreach (5) as {a:$x} (.; .; .))` refuses on any
+///   document ("near attempt to access element \"a\" of 5") even though `$x`
+///   goes unused.
+fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegister {
+    match &elem.register_path {
+        Some(path) => PatternRegister {
+            path: Rc::clone(path),
+            value: elem.value.clone(),
+            is_input: true,
+        },
+        None => PatternRegister {
+            path: Rc::clone(&reg.path),
+            value: reg.value.clone(),
+            is_input: false,
+        },
+    }
+}
+
 /// One binding produced by [`walk_pattern`]: the variable, its value, and --
 /// when the value is provably the register's node at that point -- the
 /// [`Origin::At`] marker that lets a `$var` reference in the body
@@ -31447,30 +31486,34 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // nothing beyond what this same structural check already
             // refuses, so the plain, untracked substitution stays the
             // simpler, equally-correct choice.
-            if matches!(pattern, Pattern::Object(_) | Pattern::Array(_)) {
-                let seed = match &elem.register_path {
-                    Some(path) => PatternRegister {
-                        path: Rc::clone(path),
-                        value: elem.value.clone(),
-                        is_input: true,
-                    },
-                    None => PatternRegister {
-                        path: Rc::clone(&reg.path),
-                        value: reg.value.clone(),
-                        is_input: false,
-                    },
-                };
-                let mut bindings = Vec::new();
-                if let Err(e) = walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
-                    return stop_with_escape(&mut aborted, Control::Error(e));
+            let substituted = match pattern {
+                Pattern::Object(_) | Pattern::Array(_) => {
+                    let seed = fold_pattern_seed(&elem, &reg);
+                    let mut bindings = Vec::new();
+                    match walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
+                        // `reduce` substitutes every binding *untracked*
+                        // (`origin` cleared) regardless of what the walk
+                        // computed — see this arm's own doc comment above:
+                        // a destructured `$var` is only ever recognised
+                        // through `reg`'s structural `register_identical`
+                        // check, never through a position-based marker.
+                        Ok(_) => {
+                            let mut bindings = dedup_pattern_bindings(pattern, bindings, false);
+                            for b in &mut bindings {
+                                b.origin = None;
+                            }
+                            apply_pattern_bindings(update, &bindings)
+                        }
+                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                    }
                 }
-            }
-            let substituted = match extract_pattern_bindings(pattern, &elem.value, false) {
-                Ok(b) if elem.register_path.is_some() && matches!(pattern, Pattern::Var(_)) => {
-                    substitute_var_tracked(update, &b[0].0, &b[0].1)
-                }
-                Ok(b) => substitute_vars(update, as_var_refs(&b)),
-                Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                Pattern::Var(_) => match extract_pattern_bindings(pattern, &elem.value, false) {
+                    Ok(b) if elem.register_path.is_some() => {
+                        substitute_var_tracked(update, &b[0].0, &b[0].1)
+                    }
+                    Ok(b) => substitute_vars(update, as_var_refs(&b)),
+                    Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                },
             };
             // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
             // (#2161) — `acc_at_register` alone is the previous step's
@@ -31749,18 +31792,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // UPDATE/EXTRACT failure.
             let walked = match pattern {
                 Pattern::Object(_) | Pattern::Array(_) => {
-                    let seed = match &elem.register_path {
-                        Some(path) => PatternRegister {
-                            path: Rc::clone(path),
-                            value: elem.value.clone(),
-                            is_input: true,
-                        },
-                        None => PatternRegister {
-                            path: Rc::clone(&reg.path),
-                            value: reg.value.clone(),
-                            is_input: false,
-                        },
-                    };
+                    let seed = fold_pattern_seed(&elem, &reg);
                     let mut bindings = Vec::new();
                     match walk_pattern(pattern, &elem.value, seed, frame, &mut bindings) {
                         Ok(w) => Some((w, dedup_pattern_bindings(pattern, bindings, false))),
@@ -88147,6 +88179,11 @@ mod tests {
             outputs(doc, "path(foreach .a as [$x] (.; .; $x))"),
             [r#"["a",0]"#]
         );
+        // UPDATE itself (not just EXTRACT) reads the destructured var.
+        assert_eq!(
+            outputs(doc, "path(foreach .b as {c:$x} (.; $x; .))"),
+            [r#"["b","c"]"#]
+        );
         assert_eq!(outputs(doc, "path(reduce .b as {c:$x} (.; .))"), [r"[]"]);
         assert_eq!(
             outputs(
@@ -88214,7 +88251,7 @@ mod tests {
         // own value, not just the element's, to be null/bool).
         match eval::<Vec<u64>, JqSemantics>(
             &parse("path(foreach (null) as {a:$x} (.; .; $x))").unwrap(),
-            JsonIndex::build(br#"{}"#).root(br#"{}"#),
+            JsonIndex::build(br"{}").root(br"{}"),
         ) {
             QueryResult::Error(e) => {
                 assert!(
@@ -88242,26 +88279,31 @@ mod tests {
             }
         );
 
+        // `reduce`'s own accumulator is checked against the fold's
+        // persistent register regardless of pattern shape (see this
+        // function's own doc comment above `walk_pattern`'s reuse in
+        // `resolve_reduce`), so a destructured var referenced *directly* in
+        // UPDATE always refuses there -- confirmed live: `path(reduce . as
+        // {b:{c:$x}} (.; $x))` raises "Invalid path expression with result
+        // 5" in jq 1.7.1, even with a nested object pattern and a SOURCE
+        // that is trivially the register (`.`).
+        match eval::<Vec<u64>, JqSemantics>(
+            &parse("path(reduce . as {b:{c:$x}} (.; $x))").unwrap(),
+            JsonIndex::build(doc).root(doc),
+        ) {
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.starts_with("Invalid path expression"),
+                    "{}",
+                    e.message
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
         // yq mode's dispatch guard stays `[Pattern::Var(_)]`-only (#2676's
-        // widening is jq-mode-only): a destructuring fold pattern falls
-        // through to the exact same `resolve_leaf` catch-all under
-        // `YqSemantics` whether or not the source is register-derived,
-        // matching the bare-`$var` spelling's own (unrelated, pre-existing)
-        // yq-mode result byte-for-byte -- there is no separate widening
-        // path here for the guard to have accidentally taken.
-        let yq_result = |src: &str| {
-            format!(
-                "{:?}",
-                eval::<Vec<u64>, YqSemantics>(
-                    &parse(src).unwrap(),
-                    JsonIndex::build(doc).root(doc)
-                )
-            )
-        };
-        assert_eq!(
-            yq_result("path(foreach .b as {c:$x} (.; .; $x))"),
-            yq_result("path(foreach .b as $x (.; .; $x))"),
-        );
+        // widening is jq-mode-only) -- see `test_fold_pattern_admitted_gate_2676`
+        // for the direct check on the guard function itself.
     }
 
     /// #2676 step 1: `may_bind_navigated`'s syntactic gate widens to admit a
@@ -88282,6 +88324,34 @@ mod tests {
         // pattern, not on the guard `resolve_node_sink` later applies to
         // `patterns.len()`.
         assert!(gated("path(reduce .b as {c:$x} ?// $z (0; $x))"));
+    }
+
+    /// #2676: `resolve_node_sink`'s `Expr::Reduce`/`Expr::Foreach` dispatch
+    /// guard, checked directly rather than through `eval()`'s own output --
+    /// `path(foreach ...)` collapses to `QueryResult::None` under
+    /// `YqSemantics` regardless of pattern shape (yq has no `path`/`reduce`/
+    /// `foreach` syntax at all, confirmed live against yq v4.53.3), so
+    /// comparing two `eval()` results can never actually observe whether
+    /// this gate ran -- only a direct call on the gate function itself can.
+    #[test]
+    fn test_fold_pattern_admitted_gate_2676() {
+        let bare = [Pattern::Var("x".to_string())];
+        let object = [Pattern::Object(vec![crate::jq::PatternEntry {
+            key: "c".to_string(),
+            bind: None,
+            pattern: Pattern::Var("x".to_string()),
+        }])];
+        let array = [Pattern::Array(vec![Pattern::Var("x".to_string())])];
+        let alternatives = [Pattern::Var("x".to_string()), Pattern::Var("y".to_string())];
+
+        assert!(fold_pattern_admitted::<JqSemantics>(&bare));
+        assert!(fold_pattern_admitted::<YqSemantics>(&bare));
+        assert!(fold_pattern_admitted::<JqSemantics>(&object));
+        assert!(fold_pattern_admitted::<JqSemantics>(&array));
+        assert!(!fold_pattern_admitted::<YqSemantics>(&object));
+        assert!(!fold_pattern_admitted::<YqSemantics>(&array));
+        assert!(!fold_pattern_admitted::<JqSemantics>(&alternatives));
+        assert!(!fold_pattern_admitted::<YqSemantics>(&alternatives));
     }
 
     // =========================================================================
