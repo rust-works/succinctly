@@ -48614,47 +48614,112 @@ fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
     Ok(())
 }
 
-/// #2677 step 1/2 (parser + type-change only, per the issue's own suggested
-/// landing order): an object destructuring pattern now *parses* a computed
-/// key (`{(EXPR): P}`) or an interpolated-string key (`{"\(EXPR)": P}`) the
-/// same way object *construction* already does -- real jq accepts every row
-/// below, where succinctly previously raised a *compile* error (exit 3).
-/// Evaluation of the computed key itself is not implemented yet (the rest of
-/// #2677's plan: `extract_pattern_bindings`/`walk_pattern` growing real
-/// generator/path-tracking logic, the `?//` fallthrough rules, and the
-/// walker-invariant audit) -- every row here now parses and then raises a
-/// dedicated, clearly-worded runtime error (exit 5) instead, which is
-/// intentional, incremental, and independently testable from the parser fix
-/// alone. This test pins that intermediate state; once evaluation lands,
-/// these rows move to a `_2677` accept-matrix test with jq's own values.
+/// #2677 step 3 (first increment): an object destructuring pattern's own
+/// computed key (`{(EXPR): P}`, or an interpolated-string key `{"\(EXPR)":
+/// P}`) now *evaluates* -- in both value position and inside `path()`/
+/// `del()`/an assignment target -- exactly the way real jq's own `Exp`
+/// production does, for the common case: a key expression that yields
+/// exactly one string. `extract_pattern_bindings` (value mode) and
+/// `walk_pattern` (path mode) both resolve the key expression against the
+/// pattern's own current node -- `Cannot index <type> with <type>` for a
+/// non-string key value, `Cannot index <type> with string "..."` for a
+/// non-object target, both the *same* wording jq's own `INDEX` bytecode
+/// gives, confirmed live against jq 1.7.1 for every row below (2026-09-13).
+/// A computed key that is itself a multi-output *generator*
+/// (`{("a","b"):$q}`) is not yet supported and refuses clearly instead
+/// (`test_pattern_computed_key_multi_output_refuses_cleanly_2677`, below) --
+/// real jq fans out one full pattern-match per key output there.
 #[test]
-fn test_pattern_computed_key_parses_but_not_yet_evaluated_2677() -> Result<()> {
+fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
     // Control: a plain literal key is completely unaffected.
     let (stdout, stderr, code) =
         run_jq_full(&["-c", ". as {\"a\":$q} | $q"], Some(r#"{"a":[1,2,3]}"#))?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(stdout, "[1,2,3]\n");
 
-    for (input, filter) in [
-        (r#"{"a":[1,2,3]}"#, ". as {(\"a\"):$q} | $q"),
-        (r#"{"a":[1,2,3]}"#, ". as {(\"a\",\"b\"):$q} | $q"),
-        (r#"{"a":1,"b":2}"#, ". as {(\"a\",\"b\"):$q} | $q"),
-        (r#"{"a":[1,2,3],"k":"a"}"#, r#". as {"\(.k)":$q} | $q"#),
+    for (input, filter, expected) in [
+        (r#"{"a":[1,2,3]}"#, ". as {(\"a\"):$q} | $q", "[1,2,3]\n"),
+        (
+            r#"{"a":[1,2,3]}"#,
+            "path(. as {(\"a\"):$q} | $q)",
+            "[\"a\"]\n",
+        ),
+        (
+            r#"{"a":[1,2,3],"k":"a"}"#,
+            r#". as {"\(.k)":$q} | $q"#,
+            "[1,2,3]\n",
+        ),
+        (
+            r#"{"a":{"b":5}}"#,
+            ". as {(\"a\"):{(\"b\"):$q}} | $q",
+            "5\n",
+        ),
+        (
+            r#"{"a":[1,2,3]}"#,
+            "(. as {(\"a\"):$q} | $q) |= (.+[4])",
+            "{\"a\":[1,2,3,4]}\n",
+        ),
+        (r#"{"a":[1,2,3]}"#, "del(. as {(\"a\"):$q} | $q)", "{}\n"),
     ] {
-        // Real jq accepts every one of these (confirmed live, jq 1.7.1) --
-        // not asserted here since this intermediate state doesn't match it
-        // yet; only that succinctly now *parses* (no longer exit 3) and
-        // fails with this issue's own dedicated error, not a generic one.
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // Refuses exactly where real jq does: a non-string key value, or a
+    // computed key indexing a non-object target -- both the same "Cannot
+    // index" wording jq's own `INDEX` bytecode gives for any key, computed
+    // or literal.
+    for (input, filter, expected_stderr) in [
+        (
+            r#"{"a":1,"n":1}"#,
+            ". as {(.n):$q} | $q",
+            "Cannot index object with number",
+        ),
+        (
+            "[1,2,3]",
+            ". as {(\"a\"):$q} | $q",
+            "Cannot index array with string \"a\"",
+        ),
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
         assert!(
-            stderr.contains("computed keys in a destructuring pattern are not yet supported"),
+            stderr.contains(expected_stderr),
             "`{filter}` -- stderr: {stderr}"
         );
+    }
+
+    Ok(())
+}
+
+/// #2677: a computed key that is itself a multi-output *generator*
+/// (`{("a","b"):$q}` -- real jq fans out one full pattern-match, and one
+/// full run of `body`, per key it yields: `{"a":1,"b":2} | . as
+/// {("a","b"):$q} | $q` is `1` then `2`, confirmed live) is not yet
+/// supported -- `extract_single_pattern_binding`'s own doc comment has the
+/// full rationale (every one of `extract_pattern_bindings`'s eight call
+/// sites would need its own alternative-retry/fold-matrix machinery
+/// threaded through to fan out correctly, not just the core function).
+/// Refuses clearly (a dedicated, distinctive message) in both value and
+/// path position, in every shape that can reach it -- zero key outputs
+/// (`empty`) and multi-key outputs alike -- never silently keeping just the
+/// first output or dropping the rest.
+#[test]
+fn test_pattern_computed_key_multi_output_refuses_cleanly_2677() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":[1,2,3]}"#, ". as {(\"a\",\"b\"):$q} | $q"),
+        (r#"{"a":1,"b":2}"#, ". as {(\"a\",\"b\"):$q} | $q"),
+        (r#"{"a":1,"b":2}"#, "path(. as {(\"a\",\"b\"):$q} | $q)"),
+        (r#"{"a":1}"#, ". as {(empty):$q} | $q"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
         assert!(
-            !stderr.contains("parse error") && !stderr.contains("compile error"),
-            "`{filter}` must parse, not compile-error -- stderr: {stderr}"
+            stderr.contains("yet supported"),
+            "`{filter}` -- stderr: {stderr}"
         );
     }
 
