@@ -417,17 +417,30 @@ have to be recorded here.
 |--------------------|---------|-------------------------------------|-----------------------------------|
 | `@uri`             | `[1,2]` | `"%5B1%2C2%5D"`                     | `expected string, got array`      |
 | `@base64`          | `5`     | `"NQ=="`                            | `expected string, got number`     |
-| `flatten("x")`     | `[1,2]` | `[1,2]` (ignores non-integer depth) | `expected number, got non-number` |
 
-[#929](https://github.com/rust-works/succinctly/issues/929) found these while auditing
-`EvalError::type_error` wording: real jq's `@uri`/`@base64` (and every other format string
-except `@csv`/`@tsv`/`@sh`) auto-`tostring`s a non-string argument before formatting rather
-than refusing it outright, and `flatten`'s depth argument is silently ignored if it isn't a
-number rather than validated. `@base64d` is a related but distinct case — jq *does* still
-error on `5 | @base64d` (`string ("5") trailing base64 byte found`), just from attempting to
-base64-decode the auto-stringified `"5"` rather than refusing the number up front, so it
-isn't purely a "jq doesn't error" gap; matching it needs the same underlying
-auto-`tostring`-first change `@uri`/`@base64` do, not just a different error message.
+[#929](https://github.com/rust-works/succinctly/issues/929) found these (a third row,
+`flatten("x")` on `[1,2]`, is below) while auditing `EvalError::type_error` wording: real
+jq's `@uri`/`@base64` (and every other format string except `@csv`/`@tsv`/`@sh`)
+auto-`tostring`s a non-string argument before formatting rather than refusing it outright.
+`@base64d` is a related but distinct case — jq *does* still error on `5 | @base64d`
+(`string ("5") trailing base64 byte found`), just from attempting to base64-decode the
+auto-stringified `"5"` rather than refusing the number up front, so it isn't purely a "jq
+doesn't error" gap; matching it needs the same underlying auto-`tostring`-first change
+`@uri`/`@base64` do, not just a different error message.
+
+`flatten("x")` on `[1,2]` (`[1,2]` in jq, `expected number, got non-number` here) was the
+third #929 row: jq's own `flatten` never validates its depth argument up front, only ever
+inspecting it lazily (`!= 0`, `- 1`) once per recursion level, so a non-numeric depth is
+silent whenever the input has no nesting deep enough to actually reach a real `- 1`
+attempt. [#2755](https://github.com/rust-works/succinctly/issues/2755) closed it:
+`flatten`'s depth argument now threads through as the raw value (`OwnedValue`) rather than
+an eagerly-converted count, reusing the same `compare_values`/`arith_sub` machinery real
+subtraction and comparison already use, so it only ever errors — with jq's own
+subtraction-type wording, not a generic message — once nesting deep enough to reach it is
+actually present. jq mode only; real yq's own grammar accepts nothing but a bare
+non-negative integer literal for `flatten`'s argument, so there is no reachable yq
+behaviour for this widening to match, and yq mode keeps its exact pre-#2755 eager
+rejection.
 
 Both rows are a slice write walking a path *in place*, and the gap is the same
 auto-vivification jq performs everywhere else it writes through a path: `null` grows into
