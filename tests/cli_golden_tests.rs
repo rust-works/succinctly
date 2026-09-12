@@ -303,6 +303,41 @@ fn test_json_generate_wide() -> Result<()> {
 }
 
 #[test]
+fn test_json_generate_wide_escaped_keys() -> Result<()> {
+    let output = run_cli(&[
+        "json",
+        "generate",
+        "500",
+        "--pattern",
+        "wide-escaped-keys",
+        "--seed",
+        "42",
+        "--escape-density",
+        "0.5",
+    ])?;
+
+    // Same shape guarantee as `wide` (see generators.rs), plus: at least one
+    // top-level key must actually carry a raw JSON escape sequence, or this
+    // pattern has silently degenerated into a duplicate of `wide` (#2637).
+    let value: serde_json::Value = serde_json::from_str(&output)?;
+    let obj = value
+        .as_object()
+        .expect("wide-escaped-keys pattern must be an object");
+    assert!(
+        obj.len() > 1,
+        "wide-escaped-keys pattern should have multiple top-level keys, got {}",
+        obj.len()
+    );
+    assert!(
+        output.contains('\\'),
+        "wide-escaped-keys pattern at density 0.5 should have escaped at least one key"
+    );
+
+    insta::assert_snapshot!("json_generate_wide_escaped_keys_500b_seed42", output);
+    Ok(())
+}
+
+#[test]
 fn test_json_generate_escape_density() -> Result<()> {
     // Test with higher escape density
     let output = run_cli(&[

@@ -17,6 +17,7 @@ pub enum Pattern {
     Pathological,
     Pretty,
     Wide,
+    WideEscapedKeys,
 }
 
 /// Generate JSON of approximately target_size bytes
@@ -42,6 +43,9 @@ pub fn generate_json(
         Pattern::Pathological => generate_pathological_json(target_size, seed),
         Pattern::Pretty => generate_pretty_json(target_size, seed),
         Pattern::Wide => generate_wide_json(target_size, seed),
+        Pattern::WideEscapedKeys => {
+            generate_wide_escaped_keys_json(target_size, seed, escape_density)
+        }
     }
 }
 
@@ -506,6 +510,68 @@ pub fn generate_wide_json(target_size: usize, seed: Option<u64>) -> String {
     json
 }
 
+/// Like [`generate_wide_json`], but a fraction of keys (per `escape_density`)
+/// carry a JSON escape sequence (#2637). Every other pattern here that varies
+/// `escape_density` applies it to string *values* only
+/// (`add_string_variations`, `add_realistic_records`'s `name` field) -- no
+/// generator could put an escape in an object *key*, which left half of
+/// #965 item 10's "escaped keys reallocate via `decode_escapes` twice" claim
+/// unmeasurable (no shape existed to run it against). Each key keeps its
+/// index appended regardless of which escape pattern it drew, so escaped and
+/// plain keys both stay distinct -- collapsing keys would shrink the actual
+/// field count this pattern exists to exercise.
+pub fn generate_wide_escaped_keys_json(
+    target_size: usize,
+    seed: Option<u64>,
+    escape_density: f64,
+) -> String {
+    let mut rng = seed.map(ChaCha8Rng::seed_from_u64);
+    let mut json = String::with_capacity(target_size);
+    json.push('{');
+
+    // One of each JSON escape class (quote, backslash, control chars via
+    // both short escapes and \u, solidus): `\/` is legal but rare in
+    // practice, `é` exercises the 4-hex-digit form specifically.
+    let escape_patterns = [
+        r#"k\"quoted\""#,
+        r"k\\backslash",
+        r"k\nnewline",
+        r"k\ttab",
+        r"k\/solidus",
+        r"k\u00e9unicode",
+    ];
+
+    let mut i = 0usize;
+    loop {
+        if i > 0 {
+            json.push(',');
+        }
+
+        let val = rng.as_mut().map_or(i, |r| r.random_range(0..1000));
+        let use_escape = rng
+            .as_mut()
+            .map_or(i % 10 < (escape_density * 10.0) as usize, |r| {
+                r.random::<f64>() < escape_density
+            });
+
+        if use_escape {
+            let pattern = escape_patterns[i % escape_patterns.len()];
+            json.push_str(&format!(r#""{pattern}_{i}":{val}"#));
+        } else {
+            json.push_str(&format!(r#""k{i}":{val}"#));
+        }
+
+        i += 1;
+
+        if json.len() >= target_size.saturating_sub(10) {
+            break;
+        }
+    }
+
+    json.push('}');
+    json
+}
+
 /// Generate deeply nested objects
 pub fn generate_nested_json(target_size: usize, _seed: Option<u64>, depth: usize) -> String {
     let mut json = String::with_capacity(target_size);
@@ -881,5 +947,128 @@ mod tests {
         let a = generate_json(4096, Pattern::Wide, Some(42), 5, 0.1);
         let b = generate_json(4096, Pattern::Wide, Some(42), 5, 0.1);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_generate_wide_escaped_keys_is_valid_json() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+            serde_json::from_str::<serde_json::Value>(&json)
+                .unwrap_or_else(|e| panic!("wide-escaped-keys/{size} generated invalid JSON: {e}"));
+            succinctly::json::validate::validate(json.as_bytes()).unwrap_or_else(|e| {
+                panic!("wide-escaped-keys/{size} failed strict validation: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn test_generate_wide_escaped_keys_has_many_top_level_keys() {
+        let json = generate_json(100 * 1024, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value
+            .as_object()
+            .expect("wide-escaped-keys pattern must be an object");
+        assert!(
+            obj.len() > 1000,
+            "wide-escaped-keys/100kb should have >1000 top-level keys, got {}",
+            obj.len()
+        );
+    }
+
+    #[test]
+    fn test_generate_wide_escaped_keys_hits_target_size() {
+        for size in [1024, 10 * 1024, 100 * 1024] {
+            let json = generate_json(size, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+            let ratio = json.len() as f64 / size as f64;
+            assert!(
+                (0.95..1.15).contains(&ratio),
+                "wide-escaped-keys/{size}: generated {} bytes ({:.2}x target)",
+                json.len(),
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_wide_escaped_keys_is_deterministic() {
+        let a = generate_json(4096, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+        let b = generate_json(4096, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+        assert_eq!(a, b);
+    }
+
+    /// The whole point of this pattern over plain `Wide` (#2637): at
+    /// density 0.0 no key contains a JSON escape at all (identical shape to
+    /// `Wide`'s always-plain `k{i}` keys); at density 1.0 every key does.
+    /// Without this the pattern could silently degenerate into `Wide` with
+    /// zero escaped keys and no test would catch it.
+    #[test]
+    fn test_generate_wide_escaped_keys_density_controls_escape_fraction() {
+        // Checked against the *raw* JSON key literals, not a decoded
+        // `Value` -- every escape sequence this pattern writes (`\"`, `\\`,
+        // `\n`, `\t`, `\/`, `é`) decodes away to a plain character with
+        // no backslash left except `\\` itself, so a decoded-value check
+        // would only ever see one of the six patterns as "escaped".
+        let none = generate_json(50 * 1024, Pattern::WideEscapedKeys, Some(7), 5, 0.0);
+        let none_keys = raw_top_level_key_literals(&none);
+        assert!(!none_keys.is_empty(), "sanity: should have generated keys");
+        assert!(
+            none_keys.iter().all(|k| !k.contains('\\')),
+            "density 0.0 should produce zero escaped keys"
+        );
+
+        let all = generate_json(50 * 1024, Pattern::WideEscapedKeys, Some(7), 5, 1.0);
+        let all_keys = raw_top_level_key_literals(&all);
+        assert!(!all_keys.is_empty(), "sanity: should have generated keys");
+        assert!(
+            all_keys.iter().all(|k| k.contains('\\')),
+            "density 1.0 should produce all escaped keys"
+        );
+    }
+
+    /// Scans a flat `{"key":val,...}` object's raw source for each
+    /// top-level key's literal text (quotes included, escapes
+    /// unresolved) -- unlike parsing into a `serde_json::Value`, which
+    /// decodes every escape away before the caller ever sees it.
+    fn raw_top_level_key_literals(json: &str) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let mut keys = Vec::new();
+        let mut i = 1; // skip leading '{'
+        while i < bytes.len() && bytes[i] != b'}' {
+            assert_eq!(bytes[i], b'"', "expected a key to start here");
+            let start = i;
+            i += 1;
+            while bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1; // include the closing quote
+            keys.push(json[start..i].to_string());
+            while i < bytes.len() && bytes[i] != b',' && bytes[i] != b'}' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b',' {
+                i += 1;
+            }
+        }
+        keys
+    }
+
+    /// A collapsed duplicate key would silently shrink the field count this
+    /// pattern exists to exercise -- every key (escaped or not) keeps its
+    /// index for exactly this reason (#2637).
+    #[test]
+    fn test_generate_wide_escaped_keys_keys_stay_distinct() {
+        let json = generate_json(50 * 1024, Pattern::WideEscapedKeys, Some(42), 5, 0.5);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = value.as_object().unwrap();
+        let raw_key_count = json.matches("\":").count();
+        assert_eq!(
+            obj.len(),
+            raw_key_count,
+            "decoded key count should match the number of key:value pairs written -- \
+             a collision would make it smaller"
+        );
     }
 }

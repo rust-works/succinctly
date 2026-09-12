@@ -1,0 +1,5 @@
+---
+source: tests/cli_golden_tests.rs
+expression: output
+---
+{"k\"quoted\"_0":224,"k\\backslash_1":950,"k2":344,"k\ttab_3":288,"k\/solidus_4":314,"k5":803,"k6":825,"k7":506,"k8":585,"k9":592,"k10":308,"k\u00e9unicode_11":575,"k\"quoted\"_12":198,"k\\backslash_13":76,"k\nnewline_14":610,"k\ttab_15":699,"k\/solidus_16":370,"k17":261,"k18":337,"k19":672,"k20":512,"k\ttab_21":99,"k\/solidus_22":854,"k23":765,"k\"quoted\"_24":737,"k25":65,"k\nnewline_26":29,"k27":771,"k\/solidus_28":753,"k29":832,"k30":631,"k31":453,"k32":821,"k\ttab_33":964,"k\/solidus_34":43}
