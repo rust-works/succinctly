@@ -23401,17 +23401,21 @@ fn test_include_appends_jq_suffix_unconditionally_2702() -> Result<()> {
         "def length: \"s-length\";\n",
     )?;
 
-    let (output, code) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command
-                .args(["jq", "-L"])
-                .arg(temp_dir.path())
-                .args(["-nc", r#"include "mod.jq"; length"#]);
-            command
-        },
-        None,
-    )?;
+    let run = || {
+        spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc", r#"include "mod.jq"; length"#]);
+                command
+            },
+            None,
+        )
+    };
+
+    let (output, code) = run()?;
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
     assert!(
@@ -23423,17 +23427,7 @@ fn test_include_appends_jq_suffix_unconditionally_2702() -> Result<()> {
         temp_dir.path().join("mod.jq.jq"),
         "def length: \"double-suffix\";\n",
     )?;
-    let (output, code) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command
-                .args(["jq", "-L"])
-                .arg(temp_dir.path())
-                .args(["-nc", r#"include "mod.jq"; length"#]);
-            command
-        },
-        None,
-    )?;
+    let (output, code) = run()?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
