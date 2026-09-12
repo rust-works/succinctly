@@ -1009,13 +1009,15 @@ over preserving that accidental top-level agreement; the resulting divergence fr
 the DOM bridge's other flow-mapping delimiter gaps in #2777 below, not carved out as a
 special case here.
 
-Scope is flow **sequence delimiters** only, and never mapping delimiters, because that is
-where real yq (v4.53.3, captured live) actually draws the line — the asymmetry this section
-already describes above. Tightening mappings would refuse `{"a":1,}`/`{,}`, all of which
-real yq accepts. The remaining divergences on this route are tracked separately: the
-flow-mapping *delimiter* grammar in
-[#2777](https://github.com/rust-works/succinctly/issues/2777) (including one silent wrong
-value, `{"a":1 "b":2}`), and genuine-YAML `[,]`/`{,}` in
+Scope was originally flow **sequence delimiters** only, and never mapping delimiters,
+because that is where real yq (v4.53.3, captured live) actually draws the line — the
+asymmetry this section already describes above: tightening mappings toward JSON would
+refuse `{"a":1,}`/`{,}`, both of which real yq accepts. The flow-**mapping** side (real yq's
+own, quite different, token-*pairing* leniency — including the one silent wrong value this
+issue originally found, `{"a":1 "b":2}`) is closed separately below by
+[#2777](https://github.com/rust-works/succinctly/issues/2777), on the plain route only —
+see that section for what it does and does not cover. Genuine-YAML `[,]`/`{,}` (unrelated to
+JSON-sourced input at all) is tracked separately as
 [#2779](https://github.com/rust-works/succinctly/issues/2779). (Scalar grammar, `[01]` vs
 `.5`, was the other half of #2279's original scope note — closed separately below by
 [#2778](https://github.com/rust-works/succinctly/issues/2778).)
@@ -1080,15 +1082,81 @@ An implicit single-pair mapping inside a JSON *array* (`[a: 1]`, `["a":1]`) is r
 same way, in `parse_flow_sequence_inner` — a JSON array element is a value, never a `key:
 value` pair, so the whole construct errors before the key's own text is even examined.
 
-**Mapping *keys* are exempt — deliberately, not an oversight.** Real yq's own JSON decoder
-*panics* (does not cleanly error) on a non-string key — `{1:1}`, `{true:1}` both crash with
-`interface conversion: json.Token is float64, not string` (exit 2, confirmed live). Per
-ADR-0018 rule 4(c), succinctly does not reproduce a reference panic; `{"1":1}` (succinctly's
-existing behavior for a numeric-looking key) is unchanged. Key *delimiter* and *quoting*
-rules (e.g. real yq also rejects an unquoted or single-quoted key, `{a:1}`/`{'a':1}`, which
-succinctly still accepts) are the mapping-key half of #2777, not this issue — #2778 only
-ever touches what a scalar *value* token may spell, plus the four structural, key-agnostic
-rejections above.
+**Mapping *keys* were exempt from this issue — deliberately, not an oversight — and are now
+closed by #2777, below.** Real yq's own JSON decoder *panics* (does not cleanly error) on a
+non-string key — `{1:1}`, `{true:1}` both crash with `interface conversion: json.Token is
+float64, not string` (exit 2, confirmed live). Per ADR-0018 rule 4(c), succinctly does not
+reproduce a reference panic; `{"1":1}` (a *string* `"1"` as key, succinctly's existing
+behavior) is unchanged and unrelated. #2778 itself only ever touched what a scalar *value*
+token may spell, plus the four structural, key-agnostic rejections above; key delimiter and
+quoting rules (`{a:1}`, `{'a':1}`) were left to #2777, which now rejects both — a key must be
+a double-quoted string, so anything else that isn't even a well-formed non-string JSON
+literal (a bareword, a single-quoted string, `?`/`&`/`!`/`*`) is an ordinary "invalid
+character as JSON object key" error, distinct from the rule-4(c) panic-class rejection a
+well-formed non-string literal (`1`, `true`, `null`) gets instead.
+
+**Closed by [#2777](https://github.com/rust-works/succinctly/issues/2777): flow-mapping
+token-pairing grammar, on the plain route.** Real yq's own object grammar is not a stricter
+or looser version of JSON's or YAML's flow-mapping grammar — it isn't a grammar for `{...}`
+at all. Traced from `goccy/go-json`'s own source (`Stream.Token()`/`PrepareForDecode`, the
+machinery `CandidateNode.UnmarshalJSON` actually calls for an object body): the decoder reads
+a flat stream of tokens and pairs them up (key, value, key, value, ...), where punctuation is
+just noise to skip, not structure to validate:
+
+- Before each key, whitespace and *any* run of `,`/`:` is skipped — both are pure separators,
+  so `{,}` → `{}`, `{,"a":1}` → `{"a":1}`, `{"a":1,,"b":2}` → `{"a":1,"b":2}`, and even `{:1}`
+  (the leading `:` is skipped the same as a `,` would be, leaving a bare numeric "key" that
+  then hits the panic-class rejection below).
+- A key must be a JSON string; anything else that scans as a well-formed *non-string* JSON
+  literal (`{1:1}`, `{true:1}`, `{null:1}`) is the reference's own interface-conversion panic
+  (exit 2) — reproduced as a clean rejection, not the crash, per ADR-0018 rule 4(c). Anything
+  that isn't even a well-formed literal at all (`{abc:1}`, `{'a':1}`) is an ordinary
+  scanner-level error in the reference too.
+- After the key, whitespace and *at most one* `,`/`:` is skipped — a stricter rule than the
+  key side, so `{"a" 1}`/`{"a":1}`/`{"a",1}` all reach the value, but `{"a"::1}`/`{"a",,1}`
+  (two separators) do not.
+- The value must then start on a genuine JSON value byte — `{`, `[`, `"`, or a number/
+  `true`/`false`/`null` token whose *boundary* stops at the first byte that cannot continue
+  it (not at the next comma/brace the way YAML's own unquoted-scalar scanner does), which is
+  what actually fixes the issue's own headline row: `{"a":1 "b":2}` used to read the space and
+  the following `"b":2` as part of one long invalid scalar (a silent wrong value before #2778
+  taught the scanner to at least *notice* that and reject it cleanly; #2777 is what makes it
+  split into two entries and match value-for-value). Nested arrays are unaffected — they keep
+  their own, unrelated strict `[...]` delimiter/scalar rules (#2279/#2778): `{"a":[1 2]}`
+  still errors, matching the reference's own asymmetry (object bodies are token-paired, array
+  bodies go through `json.Unmarshal`'s ordinary strict slice decoder).
+
+`Parser::parse_json_strict_flow_mapping_entries` (`src/yaml/parser.rs`) implements this as a
+wholly separate loop from the ordinary YAML flow-mapping entry loop
+(`parse_yaml_flow_mapping_entries`), rather than more `if json_strict` branches threaded
+through it, since the grammar is different in kind, not just stricter or looser in degree.
+
+**Not reproduced: which bracket ends the loop.** The reference's token scanner treats *every*
+bracket character (`{`, `}`, `[`, `]`) as a `Delim` that ends the *current* object's
+key-reading loop the instant one is seen — including a `]` or a second `{`/`[` where a key
+was expected, with no requirement that it be *this* object's own closing brace (confirmed
+live: `{"a":1 ]}` → `{"a":1}`; `{[1]:2}` → `{}`). Whatever is left unconsumed in that case is
+then read as the *next* top-level document by yq's own stream evaluator, whose own
+trailing-content handling is itself inconsistent — some leftover shapes produce no visible
+error at all, others (differing only in which byte is left over) print a stream-decode error
+to stderr while still emitting the correct value and exiting 0. Reproducing this would mean
+modelling a second, top-level-only decoder loop with the same inconsistency, for a shape (a
+bare bracket standing in for a key, with no quotes at all) that essentially never occurs in
+real-world JSON — deferred as
+[#2883](https://github.com/rust-works/succinctly/issues/2883), and succinctly instead
+reports an ordinary parse error for a `{`/`[`/`]`
+found where a key is expected, always failing the whole document cleanly rather than
+silently producing a truncated one.
+
+**Scope: the plain route only, not `--inplace`/`--slurp`/`--eval-all`.** Those routes
+materialize through `JsonIndex`'s DOM bridge (`yq_runner::parse_input`'s `InputFormat::Json`
+arm), a separate code path from the `YamlIndex`-backed parser this fix touches, and one that
+still applies #1975's own stricter-than-real-yq grammar. `succinctly yq -p json -i '.'` on a
+file containing `{"a":1 "b":2}` still refuses and leaves the file untouched, where real yq
+rewrites it to `a: 1\nb: 2`. Unifying the two routes onto one parser (so the DOM bridge gets
+this same leniency, and so the two stop disagreeing with each other as well as with real yq)
+is a separate, larger change that touches the destructive `--inplace` write path — tracked as
+[#2883](https://github.com/rust-works/succinctly/issues/2883) rather than folded into this fix.
 
 **Cost: `-p json`/`--input-format json` parsing is measurably slower, isolated entirely to
 that path.** Every plain (unquoted) scalar under `json_strict` now costs a byte-charset scan

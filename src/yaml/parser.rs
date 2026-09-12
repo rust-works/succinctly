@@ -529,41 +529,48 @@ struct Parser<'a, const HAS_CR: bool> {
     /// `YamlCursor` method (`self.bp_pos`) keys its lookups on.
     last_open_bp_pos: usize,
 
-    /// Enforce JSON's stricter grammar for `-p json` input (#2279, #2778).
+    /// Enforce real yq's own grammar for `-p json` input, on the "plain"
+    /// route (#2279, #2778, #2777) -- not JSON's grammar, and not YAML's.
     ///
     /// Set only for input the caller already knows is JSON, i.e. exactly the
     /// callers that follow `YamlIndex::build` with
     /// [`mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
     /// JSON is a subset of YAML's flow grammar, so the YAML parser accepts
-    /// it as-is -- but it also accepts things real yq's own JSON front end
-    /// rejects: `[1,]`/`[,1]`/`[1,,2]` (delimiters, #2279) and, at every
-    /// scalar *value* position (flow-sequence item, flow-mapping value,
-    /// block/top-level value), YAML-only spellings like `True`, `'a'`,
-    /// `.5`, `+1`, `~`, or an implicit-pair inside a sequence (`[a: 1]`,
-    /// #2778). `DocumentCursor::preceding_delimiter_ok`'s doc comment names
-    /// the invariant this restores: *every format but JSON validates
-    /// delimiters while parsing*. JSON-sourced YAML was the one case that
-    /// did neither -- a YAML parse that permits what JSON forbids, feeding
-    /// cursors whose delimiter checks all default to `true`.
+    /// it as-is -- but real yq's own JSON front end (`goccy/go-json` v0.10.6
+    /// feeding `CandidateNode.UnmarshalJSON`) is neither strict JSON nor
+    /// YAML: it rejects things the YAML parser would otherwise accept
+    /// (`[1,]`/`[,1]`/`[1,,2]` delimiters, #2279; YAML-only scalar
+    /// spellings like `True`/`'a'`/`.5`/`+1`/`~` at any value position,
+    /// #2778) while *also* accepting things neither grammar does inside a
+    /// flow **mapping** specifically (#2777, below). `DocumentCursor::
+    /// preceding_delimiter_ok`'s doc comment names the invariant the
+    /// delimiter half restores: *every format but JSON validates delimiters
+    /// while parsing*. JSON-sourced YAML was the one case that did neither.
     ///
     /// Deliberately a runtime flag rather than a third const generic: it
     /// would multiply the `HAS_CR` monomorphizations (#340) for a branch
     /// that is predictable and off the scalar-scanning hot path.
     ///
-    /// **Delimiters: sequences only, never mappings.** Real yq's own object
-    /// handling is *lenient* here -- it ignores punctuation inside `{}`
-    /// entirely and pairs up tokens (`{"a":1,}`, `{,}`, `{"a" 1}` all
-    /// parse) -- so extending the delimiter checks to flow mappings would
-    /// refuse input the reference accepts.
+    /// **Flow sequences: strict delimiters, strict scalar grammar.** `[1,]`,
+    /// `[,1]`, `[1,,2]` and a YAML-only scalar spelling all error --
+    /// `parse_flow_sequence_inner` (#2279) and `check_json_strict_scalar`/
+    /// `json_strict_plain_scalar_ok` (#2778, shared with every scalar
+    /// *value* position, not just array elements).
     ///
-    /// **Scalar grammar: values only, never keys.** Mapping *keys* are
-    /// exempt (real yq panics on a non-string JSON key -- `{1:1}`,
-    /// `{true:1}` -- which succinctly does not reproduce; see
-    /// `docs/compliance/yq/limitations.md`). `json_strict_plain_scalar_ok`
-    /// is the predicate; yq accepts `[01]`/`[00]`/`[1.]` (leading zeros, a
-    /// bare trailing `.` survive) while rejecting `.5`/`+1`/`1e` -- not
-    /// "strict JSON", the boundary is
-    /// `goccy/go-json`'s own token scanner plus `strconv.ParseFloat`.
+    /// **Flow mappings: real yq's own token-pairing grammar, not stricter
+    /// delimiters (#2777).** Real yq ignores punctuation inside `{}`
+    /// entirely and pairs up tokens -- `{"a":1,}`, `{,}`, `{"a" 1}` all
+    /// parse, and `{"a":1 "b":2}` (no separator between entries at all)
+    /// does too. `parse_json_strict_flow_mapping_entries` reproduces this
+    /// (see its own doc comment for the exact skip-before-key/skip-before-
+    /// value rules and the deliberately-deferred "any bracket ends the
+    /// loop" edge). A non-string key (`{1:1}`, `{true:1}`) would panic in
+    /// the reference (Go interface-conversion panic, exit 2); per
+    /// ADR-0018 rule 4(c) this refuses cleanly instead of reproducing the
+    /// crash. Applies only to the plain (`YamlIndex`-backed) route -- the
+    /// DOM-bridge route (`--inplace`/`--slurp`/`--eval-all`, `JsonIndex`-
+    /// backed) still applies #1975's stricter grammar there, a known,
+    /// separately-tracked gap (`docs/compliance/yq/limitations.md`).
     ///
     /// **Structural, key-agnostic rejections.** `?` (explicit key), `&`/`!`
     /// (anchor/tag), `*` (alias), and `'` (single quote) have no JSON
@@ -574,7 +581,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// unvalidated. Two shapes bypass that chokepoint's own dispatch and
     /// carry their own identical gate instead: `--- |`/`--- >`
     /// (`parse_inline_document_value`'s dedicated fast path) and `?` inside
-    /// a flow mapping (`parse_flow_mapping_inner`).
+    /// a flow mapping (`parse_yaml_flow_mapping_entries` -- `json_strict`'s
+    /// own mapping-entry loop never reaches a `?` in key position, since
+    /// only a `"` starts a valid key there).
     json_strict: bool,
 }
 
@@ -5972,6 +5981,217 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.advance();
         self.skip_flow_whitespace();
 
+        // #2777: real yq's own JSON-sourced object grammar is not YAML's
+        // flow-mapping grammar at all -- see `parse_json_strict_flow_mapping_entries`'s
+        // own doc comment for the derivation and why it is a wholly separate
+        // loop rather than more `if self.json_strict` branches threaded
+        // through the one below.
+        if self.json_strict {
+            self.parse_json_strict_flow_mapping_entries()?;
+        } else {
+            self.parse_yaml_flow_mapping_entries()?;
+        }
+
+        // Skip `}`
+        if self.peek() == Some(b'}') {
+            self.set_ib();
+            self.advance();
+        }
+
+        // A trailing comment right after `}` belongs to this mapping as a
+        // whole (#710), e.g. `a: {b: 1} # comment`.
+        self.maybe_capture_line_comment(container_bp_pos);
+
+        // Close mapping
+        self.write_bp_close();
+
+        Ok(())
+    }
+
+    /// #2777: real yq's own JSON-sourced object grammar, traced from
+    /// `goccy/go-json`'s `Stream.Token()`/`PrepareForDecode` (the machinery
+    /// `CandidateNode.UnmarshalJSON` actually uses for an object body) --
+    /// not YAML's flow-mapping grammar at all, which is why this is a
+    /// wholly separate loop rather than more `if self.json_strict` branches
+    /// threaded through [`Self::parse_yaml_flow_mapping_entries`]:
+    ///
+    /// - Before each key, whitespace and *any* run of `,`/`:` is skipped --
+    ///   both are pure separators to yq's token scanner here, so `{,}`,
+    ///   `{,"a":1}`, `{"a":1,,"b":2}`, `{:1}` (the leading `:` is itself
+    ///   skipped as a separator, leaving a bare numeric "key" -- see below)
+    ///   all collapse the same way.
+    /// - A key must be a JSON string (`"..."`); yq's own code path does an
+    ///   unchecked cast of the decoded token to `string`, so a
+    ///   well-formed *non-string* JSON literal there (`{1:1}`, `{true:1}`,
+    ///   `{null:1}`) is a Go interface-conversion **panic** (exit 2) in the
+    ///   reference. Per ADR-0018 rule 4(c) ("matching would take the host
+    ///   process down"), this reproduces the *rejection*, as a clean parse
+    ///   error, not the crash. Anything that isn't even a well-formed JSON
+    ///   token at all (`{abc:1}`, `{'a':1}`) is an ordinary scanner-level
+    ///   error in the reference too (`invalid character ... as token`), so
+    ///   it gets an ordinary parse error here as well.
+    /// - After the key, whitespace and *at most one* `,`/`:` is skipped --
+    ///   `PrepareForDecode`'s own, stricter rule -- so `{"a" 1}`/`{"a":1}`/
+    ///   `{"a",1}` all reach the value, but `{"a"::1}`/`{"a",,1}` (two
+    ///   separators) do not.
+    /// - The value must then start on a genuine JSON value byte: `{`, `[`,
+    ///   `"`, or a token matched by [`Self::json_strict_token_end`]
+    ///   (number/`true`/`false`/`null`) -- reusing the exact same
+    ///   token-boundary rule the key check above uses, since both are the
+    ///   same underlying scanner in the reference. A quoted-string or
+    ///   container value goes through the ordinary flow-value machinery;
+    ///   nested arrays keep their own, unrelated strict `[...]` delimiter
+    ///   rules (#2279/#2778) unchanged -- yq's object leniency has no array
+    ///   counterpart (`json.Unmarshal`'s ordinary strict slice decoder
+    ///   parses a nested array, confirmed live: `{"a":[1 2]}` errors).
+    ///
+    /// **Deliberately not reproduced**: the reference's token scanner
+    /// treats *every* bracket character (`{`, `}`, `[`, `]`) as a `Delim`
+    /// that ends the *current* object's key-reading loop the instant one
+    /// is seen -- including a `]` or a second `{`/`[` where a key was
+    /// expected, with no requirement that it be *this* object's own closing
+    /// brace (confirmed live: `{"a":1 ]}` -> `{"a":1}`; `{[1]:2}` -> `{}`).
+    /// What (if anything) is left unconsumed in that case is then read as
+    /// the *next* top-level document by yq's own stream evaluator, whose
+    /// own trailing-content handling is itself inconsistent (some leftover
+    /// shapes silently produce no error at all; others, differing only in
+    /// which byte is left over, print a stream-decode error to stderr while
+    /// still emitting the correct value and exiting 0). Reproducing that
+    /// would mean modelling a second, top-level-only decoder loop with the
+    /// same inconsistency, for a shape (a bare bracket standing in for a
+    /// key, with no quotes at all) that essentially never occurs in
+    /// real-world JSON -- deferred, and this parser instead reports a
+    /// ordinary parse error for a `{`/`[`/`]` found where a key is expected,
+    /// always failing the whole document cleanly rather than silently
+    /// producing a truncated one.
+    fn parse_json_strict_flow_mapping_entries(&mut self) -> Result<(), YamlError> {
+        loop {
+            // Skip whitespace and any run of `,`/`:` before a key.
+            loop {
+                self.skip_flow_whitespace();
+                match self.peek() {
+                    Some(b',' | b':') => self.advance(),
+                    _ => break,
+                }
+            }
+            match self.peek() {
+                Some(b'}') => return Ok(()),
+                None => {
+                    return Err(YamlError::UnexpectedEof {
+                        context: "flow mapping",
+                    });
+                }
+                _ => {}
+            }
+
+            // Parse key: must be a JSON string.
+            self.set_ib();
+            self.write_bp_open();
+            match self.peek() {
+                Some(b'"') => {
+                    let end = self.parse_double_quoted()?;
+                    self.set_bp_text_end(end);
+                }
+                _ => {
+                    return Err(if self.json_strict_token_end().is_some() {
+                        self.err_unexpected_char(
+                            self.pos,
+                            "non-string JSON object key (would panic in real yq)",
+                        )
+                    } else {
+                        self.err_unexpected_char(self.pos, "invalid character as JSON object key")
+                    });
+                }
+            }
+            self.write_bp_close();
+
+            // Skip whitespace and at most one `,`/`:` before the value.
+            self.skip_flow_whitespace();
+            if matches!(self.peek(), Some(b',' | b':')) {
+                self.advance();
+                self.skip_flow_whitespace();
+            }
+
+            // Parse value.
+            match self.peek() {
+                Some(b'[') => {
+                    self.parse_flow_sequence()?;
+                }
+                Some(b'{') => {
+                    self.parse_flow_mapping()?;
+                }
+                Some(b'"') => {
+                    self.set_ib();
+                    self.write_bp_open();
+                    let end = self.parse_double_quoted()?;
+                    self.set_bp_text_end(end);
+                    self.write_bp_close();
+                }
+                _ => {
+                    let start = self.pos;
+                    let Some(end) = self.json_strict_token_end() else {
+                        return Err(
+                            self.err_unexpected_char(self.pos, "expected value in JSON object")
+                        );
+                    };
+                    self.check_json_strict_scalar(start, end)?;
+                    // `write_bp_open` records `self.pos` as the node's start
+                    // -- it must run before `self.pos` moves to `end`, the
+                    // same order every other scalar-value arm here follows.
+                    self.set_ib();
+                    self.write_bp_open();
+                    self.pos = end;
+                    self.set_bp_text_end(end);
+                    self.write_bp_close();
+                }
+            }
+        }
+    }
+
+    /// Where a JSON literal token (`true`/`false`/`null`/a number) would end
+    /// if scanned from the current position, without consuming it -- the
+    /// token-boundary rule real yq's own scanner uses (#2777), which stops
+    /// well short of YAML's own unquoted-scalar scanner
+    /// ([`Self::parse_flow_unquoted_value`]): at the first byte that cannot
+    /// continue the token, not at the next flow delimiter. `None` means the
+    /// current position cannot start such a token at all. The returned
+    /// range is not yet validated as a *well-formed* number (`1.2.3`,
+    /// `--5`) -- callers combine this with [`Self::check_json_strict_scalar`]
+    /// for that, the same predicate [`Self::parse_flow_scalar`] already
+    /// uses for ordinary scalar values.
+    fn json_strict_token_end(&self) -> Option<usize> {
+        let rest = self.input.get(self.pos..)?;
+        if rest.starts_with(b"true") {
+            return Some(self.pos + 4);
+        }
+        if rest.starts_with(b"false") {
+            return Some(self.pos + 5);
+        }
+        if rest.starts_with(b"null") {
+            return Some(self.pos + 4);
+        }
+        let mut end = self.pos;
+        while end < self.input.len()
+            && matches!(
+                self.input[end],
+                b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+            )
+        {
+            end += 1;
+        }
+        if end == self.pos {
+            None
+        } else {
+            Some(end)
+        }
+    }
+
+    /// The ordinary YAML flow-mapping entry loop (`parse_flow_mapping_inner`
+    /// before #2777 split it out) -- unchanged behavior, still used for
+    /// genuine YAML input and reused as-is for a JSON-sourced flow
+    /// *sequence's* nested object values are not affected since arrays
+    /// always route into [`Self::parse_flow_sequence_inner`], not here.
+    fn parse_yaml_flow_mapping_entries(&mut self) -> Result<(), YamlError> {
         // Parse key-value pairs
         let mut first = true;
         while self.peek() != Some(b'}') {
@@ -6080,19 +6300,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
             self.skip_flow_whitespace();
         }
-
-        // Skip `}`
-        if self.peek() == Some(b'}') {
-            self.set_ib();
-            self.advance();
-        }
-
-        // A trailing comment right after `}` belongs to this mapping as a
-        // whole (#710), e.g. `a: {b: 1} # comment`.
-        self.maybe_capture_line_comment(container_bp_pos);
-
-        // Close mapping
-        self.write_bp_close();
 
         Ok(())
     }
