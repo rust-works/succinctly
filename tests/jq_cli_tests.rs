@@ -48842,6 +48842,15 @@ fn test_every_arm_checkpoint_matches_jq_under_a_shadow_2807() -> Result<()> {
         ("def strenv(a;b): 1; strenv", 3, ""),
         ("def strenv(a;b): 1; strenv(1)", 3, ""),
         ("def strenv(a;b): 1; strenv(1;2)", 0, "1"),
+        // `strenv`'s trailing-`)` checkpoint: reached only with a genuine
+        // identifier argument (a non-identifier fails the arm's own
+        // `parse_ident` first and rewinds from there instead).
+        ("strenv(a;b)", 3, ""),
+        (
+            "def strenv(a;b): 1; def x: 7; def y: 8; strenv(x;y)",
+            0,
+            "1",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
         assert_eq!(
