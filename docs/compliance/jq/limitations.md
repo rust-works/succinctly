@@ -3731,7 +3731,11 @@ the three actually need it: `write_output_jq_value` already materializes just th
 *output* value being printed when `sort_keys`/`color_output`/`ascii_output` is set (reusing
 `format_json`'s existing `ascii`/`sort_keys` options, which already handled all three
 correctly for the pre-existing DOM route), so moving them onto the lazy route costs nothing
-in fidelity and validates only the value a filter actually reads, same as the default.
+in *this* fidelity concern and validates only the value a filter actually reads, same as the
+default. (A separate, pre-existing number-formatting gap in that same `format_json` call --
+`--preserve-input` silently reformatting numbers under any of `-S`/`-a`/`-C`/`-s` -- predates
+this change and is tracked independently as
+[#2852](https://github.com/rust-works/succinctly/issues/2852), not claimed fixed here.)
 `-s` (slurp) and the `-n`/`input` bridge stay materializing — `-s` needs a real
 offset-mapping redesign to slurp without building a DOM (tracked, not done), and `input`
 must hand the evaluator an owned value it can return from a builtin by construction, so
