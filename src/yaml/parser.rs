@@ -8009,4 +8009,84 @@ mod tests {
             other => panic!("expected string 'v' value, got {other:?}"),
         }
     }
+
+    /// The #106 guard for #1079's fast path: [`Parser::next_line_settles_value_is_null`]
+    /// restates part of [`Parser::following_value_is_null`]'s answer with its own
+    /// byte scan rather than calling it, for the measured performance reason on
+    /// its own doc comment. Its doc comment argues the two cannot disagree, by
+    /// inspection; this pins that claim the way `skip_line_break_agrees` pins
+    /// `skip_line_break` against `break_len_at` -- whenever the fast path
+    /// commits to an answer (`Some`), the full lookahead must agree. A `None`
+    /// makes no claim and is not checked here; the caller falls back to the
+    /// full lookahead in that case regardless.
+    #[test]
+    fn next_line_settles_value_is_null_agrees_with_following_value_is_null() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"x", 1),        // no trailing break at all (last line, EOF)
+            (b"x\n", 1),      // break then immediate EOF
+            (b"x\n  y\n", 1), // deeper indent: value continues
+            (b"x\n  y\n", 2), // same indent: value settles null
+            (b"x\n  y\n", 3), // shallower-than-content indent
+            (b"x\ny\n", 0),   // next line at indent 0
+            (b"x\ny\n", 1),   // dedent past indent 1
+            (b"x\n    deep\n", 0),
+            (b"x\n    deep\n", 4),
+            (b"x\n    deep\n", 5),
+        ];
+        for &(input, indent) in cases {
+            // `self.pos` must sit on the current line's own break, per both
+            // functions' contracts -- that's `x`'s length here in every case.
+            let pos = input
+                .iter()
+                .position(|&b| is_line_break(b))
+                .unwrap_or(input.len());
+
+            let fast = {
+                let mut p = Parser::<false>::new(input);
+                p.pos = pos;
+                p.next_line_settles_value_is_null(indent)
+            };
+            if let Some(fast) = fast {
+                let mut full = Parser::<false>::new(input);
+                full.pos = pos;
+                let slow = full.following_value_is_null(indent);
+                assert_eq!(
+                    fast, slow,
+                    "{input:?} @ pos {pos}, indent {indent}: fast path and full \
+                     lookahead disagree"
+                );
+                assert_eq!(full.pos, pos, "following_value_is_null must restore pos");
+            }
+        }
+
+        // The CRLF-carrying `HAS_CR == true` monomorphization has its own `\r`
+        // arm in the fast path (`next_line_settles_value_is_null` steps over
+        // `\r\n` as one break); pin it the same way.
+        let crlf_cases: &[(&[u8], usize)] = &[
+            (b"x\r\n  y\r\n", 1),
+            (b"x\r\n  y\r\n", 2),
+            (b"x\r\ny\r\n", 0),
+        ];
+        for &(input, indent) in crlf_cases {
+            let pos = input
+                .iter()
+                .position(|&b| is_line_break(b))
+                .unwrap_or(input.len());
+            let fast = {
+                let mut p = Parser::<true>::new(input);
+                p.pos = pos;
+                p.next_line_settles_value_is_null(indent)
+            };
+            if let Some(fast) = fast {
+                let mut full = Parser::<true>::new(input);
+                full.pos = pos;
+                let slow = full.following_value_is_null(indent);
+                assert_eq!(
+                    fast, slow,
+                    "{input:?} @ pos {pos}, indent {indent}: fast path and full \
+                     lookahead disagree (CRLF)"
+                );
+            }
+        }
+    }
 }
