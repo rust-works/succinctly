@@ -16139,13 +16139,72 @@ fn test_absent_item_comment_at_end_is_root_foot_1079_float() -> Result<()> {
     assert_yq_getter("a:\n- # c\n", ". | foot_comment", "c\n")
 }
 
-/// A document marker ends the document the same way end of input does.
+/// A document marker ends a root-level sequence's floated comment the same
+/// way end of input does -- with no owner key, there's nowhere else for it
+/// to go either way. A blank line before the marker doesn't change this,
+/// unlike the ordinary (non-floated) #798 rule for a ROOT-level float:
+/// document-boundary settling runs before the blank-line-adjacency check
+/// (see [`Parser::flush_pending_head_lines_at_boundary`]).
 #[test]
 fn test_absent_item_comment_before_document_marker_is_root_foot_1079_float() -> Result<()> {
     let (out, code) = run_yq_stdin(". | foot_comment", "- # c\n---\n- 2\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(out.lines().next(), Some("c"));
-    Ok(())
+
+    assert_yq_getter(
+        "- 1\n- # c\n\n---\n- 2\n",
+        "select(document_index==0) | foot_comment",
+        "c\n",
+    )?;
+    // Not the previous sibling item -- the whole first document's own foot.
+    assert_yq_getter(
+        "- 1\n- # c\n\n---\n- 2\n",
+        "select(document_index==0) | .[0] | foot_comment",
+        "\n",
+    )
+}
+
+/// Unlike true end of input (which collapses a floated comment's owner key
+/// onto the document *root*'s foot regardless -- see
+/// [`test_absent_item_comment_at_end_is_root_foot_1079_float`]), a document
+/// boundary still respects the owner key: measured against pinned yq
+/// v4.53.3, `a:\n  - # c\n---\nb: 2\n` puts `c` on `.a`'s foot, not the
+/// document's own root foot -- whether or not a blank line separates the
+/// comment from the `---` marker.
+#[test]
+fn test_absent_item_comment_before_document_marker_is_owner_key_foot_1079_float() -> Result<()> {
+    assert_yq_getter(
+        "a:\n  - # c\n---\nb: 2\n",
+        "select(document_index==0) | .a | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n---\nb: 2\n",
+        "select(document_index==0) | foot_comment",
+        "\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n\n---\nb: 2\n",
+        "select(document_index==0) | .a | key | foot_comment",
+        "c\n",
+    )?;
+    assert_yq_getter(
+        "a:\n  - # c\n\n---\nb: 2\n",
+        "select(document_index==0) | foot_comment",
+        "\n",
+    )
+}
+
+/// An uncommented absent item (`block_passed_absent_item`, set without ever
+/// pushing into `pending_head_lines`) must not survive past the document it
+/// was seen in: a later, unrelated comment in the *next* document is that
+/// document's own concern, not a second "everything pending is the root's
+/// foot" trigger left over from the one before it.
+#[test]
+fn test_absent_item_flag_does_not_leak_across_document_boundary_1079_float() -> Result<()> {
+    let input = "- 1\n-\n---\n# c\n";
+    assert_yq_getter(input, "select(document_index==0) | foot_comment", "c\n")?;
+    assert_yq_getter(input, "select(document_index==1) | foot_comment", "\n")
 }
 
 /// The sequence closes to a mapping key: the comment is the foot of the key
