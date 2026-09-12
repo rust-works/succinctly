@@ -33102,12 +33102,13 @@ struct PathSliceBound {
     /// The [`NumberKey`] a float-spelled bound preserves in `path()` output
     /// (#1326).
     key: Option<NumberKey>,
-    /// The value the generator produced. Only read when `bound` is `Err`:
-    /// jq still renders the descriptor a failed bound sits in -- `path((1,2)
-    /// ["x":])` is `Invalid path expression near attempt to access element
-    /// {"start":"x","end":null} of 1` (jq 1.7.1) -- and nothing else holds
-    /// the `"x"` by then.
-    raw: OwnedValue,
+    /// The value the generator produced, kept only when `bound` is `Err`
+    /// (review: a large `range(..)` bound in path mode should not hold every
+    /// value twice): jq still renders the descriptor a failed bound sits in
+    /// -- `path((1,2)["x":])` is `Invalid path expression near attempt to
+    /// access element {"start":"x","end":null} of 1` (jq 1.7.1) -- and
+    /// nothing else holds the `"x"` by then.
+    raw: Option<OwnedValue>,
 }
 
 impl PathSliceBound {
@@ -33116,18 +33117,28 @@ impl PathSliceBound {
         Self {
             bound: Ok(None),
             key: None,
-            raw: OwnedValue::Null,
+            raw: None,
         }
+    }
+
+    /// Classify one value the generator produced (#2546), keeping the value
+    /// itself only if the classification failed.
+    fn classify(raw: OwnedValue, round: fn(f64) -> f64) -> Self {
+        let bound = owned_bound_to_i64(&raw, round);
+        let key = numeric_slice_bound_key(&raw);
+        let raw = bound.is_err().then_some(raw);
+        Self { bound, key, raw }
     }
 
     /// What this bound renders as in a `{"start":s,"end":e}` descriptor
     /// (#1326's spelling-preserving rendering for a resolved number, the
     /// value itself for a failed classification).
     fn component_value(&self) -> OwnedValue {
-        match &self.bound {
-            Ok(Some(i)) => index_component_value(*i, self.key.as_ref()),
-            Ok(None) => OwnedValue::Null,
-            Err(_) => self.raw.clone(),
+        match (&self.bound, &self.raw) {
+            (Ok(Some(i)), _) => index_component_value(*i, self.key.as_ref()),
+            (Ok(None), _) => OwnedValue::Null,
+            (Err(_), Some(raw)) => raw.clone(),
+            (Err(_), None) => unreachable!("`classify` keeps the value of every failed bound"), // omni-dev: coverage tolerate-line reason="unreachable: `classify` is the only constructor of an `Err` bound and always keeps its value (#2546)"
         }
     }
 }
@@ -33193,15 +33204,11 @@ fn resolve_slice_bound<S: EvalSemantics>(
     }
     let mut resolved = vec_with_capacity(values.len());
     for raw in values {
-        let bound = owned_bound_to_i64(&raw, round);
-        if let (EvalTag::Yq, Err(e)) = (S::TAG, &bound) {
+        let bound = PathSliceBound::classify(raw, round);
+        if let (EvalTag::Yq, Err(e)) = (S::TAG, &bound.bound) {
             return Err(e.clone().into());
         }
-        resolved.push(PathSliceBound {
-            bound,
-            key: numeric_slice_bound_key(&raw),
-            raw,
-        });
+        resolved.push(bound);
     }
     Ok((resolved, escape))
 }
