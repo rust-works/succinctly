@@ -43186,20 +43186,28 @@ fn reverse_still_rejects_every_non_array_in_yq_mode_2730() -> Result<()> {
 /// #2771, yq twin of `test_literal_inside_pipe_operand_does_not_abort_2771`
 /// in `tests/jq_cli_tests.rs`: `owned_identity_step` had no arm for
 /// `Expr::Literal`, reachable through `owned_identity_operand`'s
-/// `Pipe`-wrapped case in either mode. Confirmed live against yq v4.53.3 --
-/// both rows below match it exactly.
+/// `Pipe`-wrapped case in either mode. All rows below confirmed live
+/// against yq v4.53.3 -- they match it exactly, same as the jq twin's own
+/// rows match jq 1.7.1.
 #[test]
 fn test_literal_inside_pipe_operand_does_not_abort_2771() -> Result<()> {
     let input = "a: {b: 1}\n";
     let args = &["-o=json", "-I=0"];
 
-    let (out, code) = run_yq_stdin(".a | ((.b | 1) + 2) | path", input, args)?;
-    assert_eq!(code, 0, "out={out:?}");
-    assert_eq!(out.trim_end(), "[]");
-
-    let (out, code) = run_yq_stdin(".a | ((.b | 1) + 2) | key", input, args)?;
-    assert_eq!(code, 0, "out={out:?}");
-    assert_eq!(out, "");
+    for (filter, want) in [
+        (".a | ((.b | 1) + 2) | path", "[]"),
+        (".a | ((.b | 1) + 2) | key", ""),
+        (".a | ((.b | 1) + 2) | parent", ""),
+        (".a | ((.b | 1) + 2) | file_index", "0"),
+        (
+            ".a | ((.b | 1) + 2) | [path, key, parent, file_index]",
+            "[[],0]",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, args)?;
+        assert_eq!(code, 0, "`{filter}`: out={out:?}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
 
     Ok(())
 }

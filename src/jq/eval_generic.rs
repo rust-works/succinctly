@@ -21287,6 +21287,18 @@ fn owned_identity_emits_position(stage: &Expr) -> bool {
     )
 }
 
+/// A literal's value and identity, pulled out to one definition (#2771
+/// review) rather than the two independent copies a first draft left in
+/// `owned_identity_step`'s own `Literal` arm and `owned_identity_operand`'s
+/// top-level short-circuit -- this codebase's own "duplicated predicates
+/// diverge silently" lesson (#106) applies just as much to two copies of a
+/// value/identity pairing as to two copies of a boolean check. A literal
+/// has no position of its own, so it is always detached, regardless of
+/// which of the two call sites reaches it.
+fn owned_literal_identity<V: DocumentValue>(lit: &Literal) -> (OwnedValue, OwnedIdentity<V>) {
+    (literal_to_owned(lit), OwnedIdentity::detached())
+}
+
 /// One navigation step over an owned value, naming the component taken.
 /// The *values* come from the ordinary owned evaluator, so every error
 /// message, `null` on a missing key and yq-mode indexing rule is the one the
@@ -21406,7 +21418,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
         // a literal is not navigation, and admitting it there would route a
         // pipe that no longer needs a node through the materializing path.
         Expr::Literal(lit) => {
-            out.push((literal_to_owned(lit), OwnedIdentity::detached()));
+            out.push(owned_literal_identity(lit));
             Ok(())
         }
         // Closed by the union of `owned_identity_nav_supported` and
@@ -21810,7 +21822,7 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError> {
     let expr = strip_parens(expr);
     if let Expr::Literal(lit) = expr {
-        return Ok(Some((literal_to_owned(lit), OwnedIdentity::detached())));
+        return Ok(Some(owned_literal_identity(lit)));
     }
     // A value the rewrite spelled in place (spine 2416, identity pass) is a
     // literal like any other, with no position of its own; a bound variable
