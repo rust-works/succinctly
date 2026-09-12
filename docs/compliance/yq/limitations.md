@@ -1025,6 +1025,25 @@ succinctly still accepts) are the mapping-key half of #2777, not this issue — 
 ever touches what a scalar *value* token may spell, plus the four structural, key-agnostic
 rejections above.
 
+**Cost: `-p json`/`--input-format json` parsing is measurably slower, isolated entirely to
+that path.** Every plain (unquoted) scalar under `json_strict` now costs a byte-charset scan
+plus an `f64` parse it did not pay before -- CI's `perf-guard.py` (issue #1523) measured
+`users_yq_keys_unsorted` (a `keys_unsorted` query over a 2MB `-p json`-detected fixture,
+mostly numeric fields) at +13.5% instructions (x86_64) / +12.5% (ARM64-Linux) against
+`main`, both over the 5% regression-guard threshold; every other query in that suite —
+including plain `jq`-mode queries over the identical `.json` fixture, which never reach
+`YamlIndex` at all — measured within ±0.1%, cleanly isolating the cost to `json_strict`
+itself rather than anything shared. `check_json_strict_scalar`/`json_strict_plain_scalar_ok`
+carry `#[inline]` (dispatched from a dozen call sites) as the one free win available;
+skipping the redundant `str::from_utf8` re-validation after the charset check would remove
+more, but needs `unsafe`, which this crate forbids (`-D unsafe-code`) -- so the real
+remaining cost is inherent to the validation work itself, not an implementation gap.
+Accepted per ADR-0018 (fidelity over performance is the default; a performance cost is not
+among the rule's carve-outs for declining to match the reference) -- CI's `Perf Regression
+Guard` is deliberately outside the merge queue's own required-checks subset, precisely so a
+real, understood, narrowly-scoped correctness cost like this one does not block merging the
+correctness fix that causes it.
+
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
 more lenient about a comma or colon inside a JSON *object* than #1975's own delimiter checks
