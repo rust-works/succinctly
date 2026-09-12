@@ -12051,6 +12051,19 @@ fn test_json_indent_unaffected_by_yaml_width_table_2606() -> Result<()> {
         out,
         "{\n          \"a\": {\n                    \"b\": 1\n          }\n}\n"
     );
+
+    // #2828 review: `YqCommand::indent`'s clap parser no longer caps at 7
+    // (jq's own `--indent` limit, wrongly applied to yq mode) -- a width
+    // well past that old cap must still work for JSON, unbounded above,
+    // matching real yq.
+    let (out, code) = run_yq_stdin(".", yaml, &["-I200", "-o=json"])?;
+    assert_eq!(code, 0);
+    let want = format!(
+        "{{\n{pad}\"a\": {{\n{pad2}\"b\": 1\n{pad}}}\n}}\n",
+        pad = " ".repeat(200),
+        pad2 = " ".repeat(400)
+    );
+    assert_eq!(out, want);
     Ok(())
 }
 
