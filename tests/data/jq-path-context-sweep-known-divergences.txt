@@ -73,6 +73,19 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 # `test_bound_variable_carries_node_identity_2072` and recorded in
 # `docs/compliance/yq/limitations.md`.
 
+# Real yq's `//` is not jq's either (#2817, found when #2782 added the
+# `alt_l`/`alt_r` wrappers): it maps *per left output*, and a falsy left
+# output whose right side yields nothing is emitted as itself. `(null // key)`
+# and `(null // parent)` at the document root -- where `key`/`parent` emit
+# nothing in both tools -- therefore print `null` in yq and nothing here, on
+# the `root`, `bind_root` and `descend` (whose first output is the root)
+# prefixes. Every other prefix agrees. succinctly yq follows jq's
+# collect-then-fallback rule; identical on `main` before #2782, whose change
+# is where a `//` output *stands*, not which outputs it produces.
+yq/*/alt_r/plain/root        yq_alt_empty_rhs  yq's `//` emits a falsy left value when the right side is empty; root `key`/`parent` are empty — #2817
+yq/*/alt_r/plain/bind_root   yq_alt_empty_rhs  same, through an `as`-bound root — #2817
+yq/*/alt_r/plain/descend     yq_alt_empty_rhs  same, at `..`'s first output (the root) — #2817
+
 # --- jq mode ----------------------------------------------------------------
 
 # `path(foreach (getpath(...)) as $x (null; $x))` raises "Invalid path

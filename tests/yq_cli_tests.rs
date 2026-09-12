@@ -42638,23 +42638,12 @@ fn test_alternative_keeps_the_cursor_it_hands_on_2476() -> Result<()> {
 /// | `.a \| (parent // 1)`     | `a: {b: 1, e: 2}` | `1`     |
 /// | `.a \| (.missing // key)` | `a`               | (empty) |
 ///
-/// One shape this does *not* reach, unchanged in either direction:
-/// `.a | to_entries | .[] | (key // 99)` is `0`, `1` in yq and `99`, `99`
-/// here, before and after. `needs_path_context` has no `Expr::Alternative`
-/// arm at all (it falls to that function's `_ => false`), so a pipe whose
-/// only path-context read is inside a `//` is never routed to path-context
-/// evaluation, and `to_entries` has already left the cursor domain by then.
-/// That is #715/#1405's recursion list, not this arm's, and deliberately not
-/// touched here -- #2416 pins that table.
-///
-/// A second, distinct gap: this arm's position-reading fix above is for a
-/// *present* left/ambient position. An *absent* one is still wrong in both
-/// directions -- `.a.missing | (key // 1)` is `1` here (should be `missing`,
-/// yq v4.53.3's own answer) on this branch, and identically `1` on `main`
-/// pre-#2476 (`//` still bridging there) -- so this is not a regression this
-/// arm introduced, just one it does not close. Root cause not chased down
-/// here; flagged so this table is not read as "position-reading through `//`
-/// is now generally correct."
+/// Two shapes this arm did *not* reach, both closed by #2782 and pinned in
+/// `test_alternative_is_routed_to_path_context_2782` below: `.a | to_entries
+/// | .[] | (key // 99)` (`99`, `99` here until `needs_path_context` gained
+/// its `Expr::Alternative` arm -- a pipe whose only read sat inside a `//`
+/// was never routed at all) and `.a.missing | (key // 1)` at an *absent*
+/// position (`1` here; yq's `"missing"`).
 #[test]
 fn test_alternative_operands_read_the_real_position_2476() -> Result<()> {
     let doc = "a: {b: 1, e: 2}\n";
@@ -42672,6 +42661,120 @@ fn test_alternative_operands_read_the_real_position_2476() -> Result<()> {
         assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
+    Ok(())
+}
+
+/// #2782 (#2665 item 1): `needs_path_context` has an `Expr::Alternative` arm,
+/// so a pipe whose only path-context read sits inside a `//` is routed to
+/// path-context evaluation like one whose read sits inside `and`/`or`
+/// (#1405). Every row is captured live from yq v4.53.3 on `a: {b: 1, e: 2}`
+/// and fails on `main` before #2782, where the pipe was never routed and
+/// the read answered nothing -- which is falsy, so `//` took the other side.
+///
+/// | filter                                   | yq v4.53.3          | before      |
+/// |------------------------------------------|---------------------|-------------|
+/// | `.a \| to_entries \| .[] \| (key // 99)`  | `0`, `1`            | `99`, `99`  |
+/// | `.a.missing \| (key // 1)`               | `"missing"`         | `1`         |
+/// | `.a.missing \| (path // 1)`              | `["a","missing"]`   | `[]`        |
+/// | `.a \| tostring \| (key // 9)`           | `"a"`               | `9`         |
+/// | `.a \| map_values(key // 9)`             | `{"b":"b","e":"e"}` | all `9`     |
+/// | `.a \| with_entries(.value = (key // 9))`| `{"b":0,"e":1}`     | all `9`     |
+///
+/// The `before` column is the silent-fallback class ADR-0021 exists to end:
+/// no error, a plausible value, and the wrong one.
+#[test]
+fn test_alternative_is_routed_to_path_context_2782() -> Result<()> {
+    let doc = "a: {b: 1, e: 2}\n";
+    for (filter, want) in [
+        (".a | to_entries | .[] | (key // 99)", "0\n1"),
+        (".a.missing | (key // 1)", "\"missing\""),
+        (".a.missing | (path // 1)", "[\"a\",\"missing\"]"),
+        (".a | tostring | (key // 9)", "\"a\""),
+        (".a | map_values(key // 9)", "{\"b\":\"b\",\"e\":\"e\"}"),
+        (
+            ".a | with_entries(.value = (key // 9))",
+            "{\"b\":0,\"e\":1}",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#2782: `{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "#2782: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2782's second half: an output of `//` stands where the operand that
+/// produced it stood, so a read *after* the operator answers from that
+/// position. Real yq's rule, captured live from v4.53.3 on `a: {b: 1}`, and
+/// the one the bare spellings already followed: `key`'s output is the key
+/// node (`path` is `["a"]`, `parent` the enclosing map, a second `key` is
+/// nothing), `path`/`file_index` keep the input node, `parent` stands at the
+/// ancestor, and each output of a comma stands at its own node.
+///
+/// Adding `needs_path_context`'s arm alone regressed the first block: the
+/// owned identity route's `//` arm rewrote `key`/`file_index` to *detached*
+/// literals before evaluating (so `(key // 9) | parent` printed nothing where
+/// `key | parent` is the map) and stamped every output of a multi-output
+/// left side with the identity of the side's first output, re-evaluated
+/// (`(.a, .b) // 9 | key` was `"a"`, `"a"`). `//` is a transparent construct
+/// on that route now -- each side runs as stages of the pipe, like `,` and
+/// `if` -- which is what `eval_owned_identity_alternative` documents. The
+/// rows marked `route` also fail on `main` for the yq CLI's DOM path alone,
+/// where `owned_identity_pipe_applies` had to learn that a stage with no
+/// placement rule can follow a navigational head.
+#[test]
+fn test_alternative_output_stands_where_its_operand_stood_2782() -> Result<()> {
+    let doc = "a: {b: 1}\n";
+    for (filter, want) in [
+        // The operand's position survives the operator.
+        (".a | (key // 9) | path", "[\"a\"]"),
+        (".a | (key // 9) | parent", "{\"a\":{\"b\":1}}"),
+        (".a | (key // 9) | key", ""),
+        (".a | (file_index // 9) | key", "\"a\""),
+        (".a | (file_index // 9) | path", "[\"a\"]"),
+        (".a | (file_index // 9) | parent", "{\"a\":{\"b\":1}}"),
+        (".a | (null // key) | parent", "{\"a\":{\"b\":1}}"),
+        (".a | (null // file_index) | key", "\"a\""),
+        (".a | (path // 9) | key", "\"a\""),
+        (".a | (parent // 9) | path", "[]"),
+        // route: a stage with no placement rule after a navigational head.
+        (". | (null // .b) | key", "\"b\""),
+        (". | (key // .b) | path", "[\"b\"]"),
+        (".a | . | (null // .x) | key", "\"x\""),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#2782: `{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "#2782: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+
+    // Each output of a multi-output left side keeps its own position.
+    let doc = "x: {a: 1, b: 2}\n";
+    for (filter, want) in [
+        (".x | ((.a, .b) // 9) | key", "\"a\"\n\"b\""),
+        (
+            ".x | ((.a, .b) // 9) | path",
+            "[\"x\",\"a\"]\n[\"x\",\"b\"]",
+        ),
+        // A falsy output is dropped, not replaced (jq's rule, which succinctly
+        // yq follows; real yq's per-output rule is #2817).
+        (".x | ((.a, null, .b) // 9) | key", "\"a\"\n\"b\""),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#2782: `{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "#2782: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
     Ok(())
 }
 

@@ -39,7 +39,7 @@
 # `key`/`parent`/bare `path`/`file_index` at all), and the wrappers are every
 # construct #2416 names: `limit`, `first`, `last`, `foreach`, `reduce`,
 # `getpath`, object construction, `select`, comma, `if`, `try`, `label`/`break`,
-# plus `path(...)` and `?` as outer forms. `--self-test` asserts every
+# either side of `//` (#2782), plus `path(...)` and `?` as outer forms. `--self-test` asserts every
 # combination class is present, so a future alphabet shrink fails loudly.
 #
 # **yq comma/pipe precedence (#2420).** Real yq v4.53.3 parses `a, b | c` as
@@ -148,7 +148,15 @@ YQ_LEAF_TPL=('key' 'parent' 'path' 'file_index')
 # input text"), which is itself an oracle fact worth sweeping — succinctly yq
 # accepting them is a divergence, tracked as a category below rather than
 # quietly dropped from the alphabet.
-WRAP_IDS=(bare limit first last foreach reduce getpath object select comma if try label)
+#
+# `alt_l`/`alt_r` (#2782): the leaf on either side of `//`. Real yq has `//`,
+# so both are oracle-backed in both modes. Added when `needs_path_context`
+# gained its `Expr::Alternative` arm: until then a leaf inside a `//` was never
+# routed to path-context evaluation at all, and the owned identity route's own
+# `//` arm spelled it as a detached literal -- neither of which this sweep
+# could see without the wrapper. The right-hand form uses `null // ...` so the
+# leaf is what the operator answers with, not the fallback that never runs.
+WRAP_IDS=(bare limit first last foreach reduce getpath object select comma if try label alt_l alt_r)
 WRAP_TPL=(
   '__I__'
   'limit(2; __I__)'
@@ -163,6 +171,8 @@ WRAP_TPL=(
   'if (__I__) then 1 else 2 end'
   'try (__I__) catch "e"'
   'label $o | ((__I__), break $o)'
+  '((__I__) // 9)'
+  '(null // (__I__))'
 )
 
 # Outer forms. `__W__` is the wrapped leaf.
