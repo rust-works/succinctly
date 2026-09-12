@@ -21648,6 +21648,74 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
     Ok(())
 }
 
+/// #2850: `-e`'s own exit-status materialize call (`jq_runner.rs`, separate
+/// from `write_output_jq_value`'s) used to leak Rust's raw panic backtrace
+/// to stderr ahead of the clean, correctly exit-5'd diagnostic the
+/// surrounding `catch_unwind` already produced -- confirmed live before this
+/// fix that `succinctly jq -e '.'` on 500 levels of `[...]`-nested JSON
+/// printed `thread '<unnamed>' panicked at src/jq/lazy.rs:...` before the
+/// `jq: error (at ...): nesting depth exceeds limit of 256` line. The exit
+/// code and final diagnostic were always correct; only the extra noise
+/// ahead of them was the bug (`JqValue::materialize`, not the checked
+/// `try_materialize`, #2850).
+#[test]
+fn test_exit_status_over_depth_document_reports_cleanly_not_panic_2850() -> Result<()> {
+    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-e", "."], Some(&deep_json))?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+
+    // Well-formed usage is unaffected: `-e` on a truthy last value exits 0.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-e", "."], Some("1"))?;
+    assert_eq!(stdout.trim_end(), "1");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2850: `write_output_jq_value`'s own materialize call shares the
+/// identical checked-vs-panicking split as `-e`'s above. #2662 (landed in
+/// this same tree) is what makes this a genuinely live, confirmed leak
+/// rather than a defensive-only fix: before it, `-S`/`-a`/`-C` were excluded
+/// from the lazy/`JqValue::Cursor` path entirely (`can_use_lazy_path`), so
+/// this call site was unreachable for them; #2662 moved them onto that same
+/// path, so they now hit the identical panicking `materialize()` `-e`
+/// always did. All three flags pinned here, not just `-S`.
+#[test]
+fn test_complex_output_flags_over_depth_document_report_cleanly_not_panic_2850() -> Result<()> {
+    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
+
+    for flag in ["-S", "-a", "-C"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", flag, "."], Some(&deep_json))?;
+        assert_eq!(stdout.trim_end(), "", "flag {flag}");
+        assert_eq!(
+            code, 5,
+            "flag {flag} -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "flag {flag} -- stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("nesting depth exceeds limit"),
+            "flag {flag} -- stderr: {stderr:?}"
+        );
+    }
+
+    // Well-formed usage is unaffected.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-S", "."], Some(r#"{"b":1,"a":2}"#))?;
+    assert_eq!(stdout.trim(), r#"{"a":2,"b":1}"#, "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2627: the wildcard/ambient bridge used to reach `eval_generic.rs`'s
 /// `assert_nesting_depth` `panic!` on a >256-deep *document* (not a
 /// constructed value, unlike #1371's `test_partial_result_

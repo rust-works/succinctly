@@ -2010,11 +2010,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // streaming filter panics from within the sink callback
                 // rather than before the caller's loop starts. That puts
                 // `out`, `sink`, `had_output` and `last_output` under
-                // `AssertUnwindSafe`, which is sound here for the same reason
-                // the single `sink` was already: `assert_nesting_depth`
-                // panics unconditionally *before* any `write_all`, so `out`'s
-                // writer is never mid-record when the stack unwinds, and the
-                // other three are plain data.
+                // `AssertUnwindSafe`, which stays sound: `write_output_jq_value`
+                // below can still panic on other, unrelated guards this
+                // closure doesn't control (e.g. a genuine stack-depth guard
+                // elsewhere in the write path), so `out`'s writer is not
+                // mid-record when *those* unwind either, and the other three
+                // are plain data regardless.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut on_value =
                         |sink: &mut ErrorSink, result: JqValue<'_, Vec<u64>>| -> Result<bool> {
@@ -2026,8 +2027,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                                 // becomes observable here (#1247). Report and skip
                                 // the value rather than letting an undecodable
                                 // string count as a truthiness answer; `sink`
-                                // drives the exit code.
-                                match result.materialize() {
+                                // drives the exit code. `try_materialize`, not
+                                // `materialize` (#2850): this call used to leak
+                                // Rust's raw panic backtrace to stderr past
+                                // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
+                                // levels of nesting, ahead of the clean,
+                                // correctly exit-5'd diagnostic this `match`
+                                // already produces below -- a CLI-output
+                                // boundary has no business panicking for input
+                                // depth alone.
+                                match result.try_materialize() {
                                     Ok(owned) => last_output = Some(owned),
                                     Err(e) => {
                                         sink.report(DiagStyle::Jq, &e, &at);
@@ -5699,8 +5708,17 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         // first exercises it: `printf '{invalid}' | succinctly jq -cS .`
         // used to exit 1 with a bare `Error: ...` where real jq (and this
         // crate's own default lazy route) exits 5 with `jq: error (at ...)`.
+        //
+        // `try_materialize`, not `materialize` (#2850): this is a
+        // CLI-output-boundary call site, not the evaluator's own hot
+        // recursion, so a nesting-depth violation belongs in this same
+        // `Result`/`MalformedJsonError` channel rather than as an
+        // uncaught-by-design panic. #2662's move of `-S`/`-C`/`-a` onto this
+        // branch is what makes this the confirmed, live path #2850 is filed
+        // over: `succinctly jq -cS .` on deeply-nested input used to leak
+        // Rust's raw panic backtrace to stderr the same way bare `-e` did.
         let owned = value
-            .materialize()
+            .try_materialize()
             .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
