@@ -1933,14 +1933,20 @@ pub fn container_tail_gap_ok<C: DocumentCursor>(
 ///
 /// Used by a recursive value-domain materializer (`eval::to_owned_at_depth`,
 /// `eval_generic::to_owned_at_depth`, `yq_runner::
-/// to_owned_canonicalizing_numbers_at_depth`) whose public entry point
-/// starts at `cursor: None` (no container cursor exists yet) and whose own
-/// recursive calls pass `Some` (the child cursor each already resolved for
-/// an unrelated reason, per #2358/#2403). Delegates to
+/// to_owned_canonicalizing_numbers_at_depth`). All three pass `Some` (the
+/// child cursor each recursive call already resolved for an unrelated
+/// reason, per #2358/#2403) at every nested level. `eval::to_owned_at_depth`
+/// and `eval_generic::to_owned_at_depth` still start their own public entry
+/// point at `cursor: None` (the true top level, where the gap remains open
+/// by construction -- see those two functions' own doc comments for why,
+/// and #2846 for whether that premise still holds). `yq_runner::
+/// to_owned_canonicalizing_numbers_at_depth` no longer takes `Option` at
+/// all: #2781 found its own "no cursor at the top level" premise false --
+/// its one real call site already held the root cursor -- so every call
+/// there passes `Some` unconditionally now. Delegates to
 /// [`container_tail_gap_ok`] when a cursor is available (closing #2211's
 /// `{,}`/`[,]` check) or [`child_tail_gap_ok`]'s weaker fallback when it
-/// isn't (the true top level, where the gap remains open by construction --
-/// see those two functions' own doc comments for why).
+/// isn't.
 ///
 /// Extracted (#2403 review) after the identical 4-line `match cursor { ... }`
 /// was hand-copied into three separate files -- one call this instead of a
