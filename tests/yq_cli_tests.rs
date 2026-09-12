@@ -41959,6 +41959,27 @@ fn test_flatten_depth_widening_is_jq_mode_only_2755() -> Result<()> {
     Ok(())
 }
 
+/// #2741: unlike #2667's own collection-literal postfix fix (which real yq
+/// happens to accept for the same shapes -- `[1,2][0]`, `{"a":1}.a`), real
+/// yq rejects a postfix chain applied directly to a string or number
+/// literal at parse time (`bad expression, please check expression
+/// syntax`, confirmed live against v4.53.3). Per ADR-0018 the mode
+/// decides: jq mode gets the #2741 fix
+/// (`test_postfix_applies_directly_to_a_string_or_number_literal_2741` in
+/// `tests/jq_cli_tests.rs`), yq mode keeps its pre-existing rejection
+/// unchanged.
+#[test]
+fn test_postfix_on_string_or_number_literal_is_jq_mode_only_2741() -> Result<()> {
+    for filter in [r#""abc"[0:1]"#, "1[0]", r#""abc".x"#] {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        assert_ne!(
+            code, 0,
+            "`{filter}` unexpectedly compiled: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2692, yq twin of `test_truthiness_probes_validate_nothing_2692` in
 /// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
 /// the JSON-syntax rows, through yq's own reading of them -- most of the JSON
