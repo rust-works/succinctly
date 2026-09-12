@@ -117,6 +117,36 @@ PATTERNS = [
 ]
 DESTRUCTURE_P = 0.5
 
+# #2676: a fold's own loop-variable pattern (`reduce`/`foreach`'s `as
+# PATTERN`) is compiled with the same tracked matchers `PATTERNS` above
+# already exercises for a plain `SRC as PATTERN | BODY` bind, one level up
+# -- reused verbatim here rather than duplicated, since the per-step rule
+# (`walk_pattern`) is the very same function on both sides. `FOLD_INIT`
+# gives the accumulator a genuinely varied starting shape (a literal, a
+# navigation, the fold's own source restated) so both the register's own
+# persistence rule (`reduce` never re-anchors after INIT; `foreach` does,
+# per source element) and the `null`/`bool` identity exception get real
+# coverage, not just the `INIT=.` shape the hand-written sweep leans on.
+FOLD_INIT = [".", "0", "null", ".a", ".c", "[1]"]
+
+def fold_program(rng):
+    src, _ = rng.choice(SOURCES[:9])  # top-level fold source: no `$p` needed
+    pat, use = rng.choice(PATTERNS)
+    v = "$v0"
+    pat = pat.replace("V", v).replace("W", "$w0")
+    use = use.replace("V", v).replace("W", "$w0")
+    init = rng.choice(FOLD_INIT)
+    update = rng.choice(USES).replace("$v", use)
+    if rng.random() < 0.5:
+        body = f"reduce {src} as {pat} ({init}; {update})"
+    else:
+        extract = rng.choice(USES + ["."]).replace("$v", use)
+        body = f"foreach {src} as {pat} ({init}; {update}; {extract})"
+    wrap = rng.choice(["path(%s)", "path(%s)", "del(%s)", "(%s) = 9", "(%s) |= ."])
+    return wrap % body
+
+FOLD_P = 0.2
+
 def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
@@ -198,7 +228,8 @@ def main():
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
-        d = json.dumps(doc(rng)); f = program(rng)
+        d = json.dumps(doc(rng))
+        f = fold_program(rng) if rng.random() < FOLD_P else program(rng)
         j = run([a.jq, "-c", f], d)
         s = run([a.bin, "jq", "-c", f], d)
         c = classify(j, s)
