@@ -969,6 +969,46 @@ key as a genuine, null-valued navigation — `path({} \| .foo)` is `["foo"]` —
 resolver's own carried-register fallback does not appear to model correctly), which is a
 separate, pre-existing investigation from this issue's own scope.
 
+A destructuring pattern's own **computed key** (`{(EXPR): P}`, or an interpolated string
+`{"\(EXPR)": P}`) parses and evaluates since
+[#2677](https://github.com/rust-works/succinctly/issues/2677) — `PatternEntry.key` widened from
+a plain `String` to `ObjectKey` (the same type object construction already used), and
+`extract_pattern_bindings` (value mode)/`walk_pattern` (path mode) resolve the key expression
+against the pattern's own current node, using the same "Cannot index `<type>` with `<type>`"
+wording jq's own `INDEX` bytecode gives for any key, computed or literal — confirmed live in
+both positions, including nested computed keys and through `|=`/`del()`. **Scoped to a key
+expression that yields exactly one string** — the common case (`{(.k): $q}`, a string
+interpolation, which by construction can only ever yield one value). A key expression that is
+itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out one full pattern-match,
+and one full run of the surrounding body, per key it yields: `{"a":1,"b":2} \| . as
+{("a","b"):$q} \| $q` is `1` then `2`) refuses clearly instead — `extract_pattern_bindings`
+itself models the full cartesian-fold generator semantics real jq has, but every one of its
+eight call sites (across both evaluators, plus `reduce`/`foreach`'s own pre-loop substitution-
+matrix builders) collapses back to a single result via `extract_single_pattern_binding`, since
+fanning out correctly needs each call site's own `?//`-alternative-retry/fold-matrix machinery
+threaded through, not just the core function — not yet done. The same refusal covers a key
+expression producing **zero** outputs (`{(empty): $q}`, where real jq legitimately binds
+nothing and the body never runs, `[. as {(empty):$q} \| $q]` is `[]`) and one interrupted by
+`break`/`halt`, rather than risking a silently wrong answer at any of the eight sites
+individually. `test_pattern_computed_key_evaluates_2677`/
+`test_pattern_computed_key_multi_output_refuses_cleanly_2677` (`tests/jq_cli_tests.rs`) pin both
+halves.
+
+A related, narrower gap the fix surfaced and closed along the way: `map_subexprs`
+(`src/jq/walk.rs`) — the shared tree-rewrite primitive `install_def_calls`/`bind_def` and
+`substitute_var_impl` both build on — cloned a pattern's own `patterns` field verbatim in its
+`Reduce`/`Foreach`/`AsPattern` arms rather than descending into it, a premise ("a pattern holds
+only destructuring names, never an `Expr`") that held before #2677 and silently broke once a
+computed key gave a pattern entry a real `Expr` to hold. Concretely, `def f: "a"; . as {(f):$q}
+\| $q` wrongly raised "undefined function: f/0" even though `f` *is* defined, and an outer
+`$var` referenced inside a computed key was left unsubstituted — both fixed by a new
+`map_pattern_subexprs` helper. Three siblings with the analogous gap — `any_subexpr`,
+`node_reads_ambient`, and `resolve::check` (`src/jq/resolve.rs`) not descending into a computed
+key either — are, confirmed live, in the safe direction only (a missed static-analysis
+optimization, or jq's own compile-time "undefined function" check surfacing one stage later as
+a runtime error instead of at parse time) and are left for #2677's own remaining
+walker-invariant audit.
+
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
 [#1872](https://github.com/rust-works/succinctly/issues/1872),
 [#2031](https://github.com/rust-works/succinctly/issues/2031) and
