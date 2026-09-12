@@ -5431,7 +5431,7 @@ whole document that a streaming arm never read, and the M2 path was gated to kee
 from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
 records the 19 rows that moved away from jq and the spelling rule it left in place.
 
-### `break $x` shadowed by a `def error:` observes the ambient input, not jq's own `{"__jq":N}` sentinel (#2687)
+### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
 as a primitive — its parser desugars `break $x` into a named call to `error/0`
@@ -5445,14 +5445,29 @@ succinctly reproduces this (`src/jq/parser.rs`'s `parse_break_expr` wraps `break
 shadowable `error` call the same way `error`, `limit`, `until`, ... already are, per
 `Parser::shadowable_defs`/`wrap_shadowable_call`, #2036), but does **not** carry jq's
 `{"__jq":N}` sentinel as the wrapped call's input — the shadowing def instead sees the ambient
-`.` the break itself was reached with:
+`.` the break itself was reached with. jq's sentinel is **fixed and context-independent**
+(tied only to the label's own compile-time index, never to any pipeline value), where
+succinctly's substitute is **unbounded**: whatever `.` happens to be at the break's textual
+position, however unrelated to the label:
 
 ```console
 $ jq            -nc 'def error: .; label $out | break $out'
 {"__jq":0}
 $ succinctly jq -nc 'def error: .; label $out | break $out'
 null
+
+$ jq            -nc 'def error: {seen: .}; 5 as $x | label $out | ($x | break $out)'
+{"seen":{"__jq":0}}
+$ succinctly jq -nc 'def error: {seen: .}; 5 as $x | label $out | ($x | break $out)'
+{"seen":5}
 ```
+
+The second row is not "sentinel vs. null" — it is jq's own fixed marker vs. an arbitrary,
+unrelated upstream value (`5`, bound three pipe stages earlier) leaking through a construct
+whose entire premise is "produce a value with no real connection to the input in scope."
+`test_break_shadowed_by_def_error_sees_ambient_input_not_jqs_sentinel_2687`
+(`tests/jq_cli_tests.rs`) pins this specific shape so a future change to the mechanism can't
+silently make it worse than documented here.
 
 **Why not carried.** The sentinel is observable only through a `def error:` whose body reads
 `.` — `def error: "S";` (the shape #2687 was actually filed over, and every case in its own
