@@ -2512,6 +2512,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// already-consumed text (`self.input[start..end]`) against
     /// [`json_strict_plain_scalar_ok`]. A no-op when `json_strict` is
     /// unset, so every call site stays cheap on the ordinary YAML path.
+    /// `#[inline]`: dispatched from a dozen call sites, so leaving this
+    /// out-of-line cost a real function call on every plain-scalar value
+    /// under `json_strict` even on the (common) accept path.
+    #[inline]
     fn check_json_strict_scalar(&self, start: usize, end: usize) -> Result<(), YamlError> {
         if self.json_strict && !json_strict_plain_scalar_ok(&self.input[start..end]) {
             return Err(self.err_unexpected_char(start, "YAML-only scalar in JSON input"));
@@ -7651,6 +7655,7 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
 /// of the pinned matrix (`1.`, `-.5`, `01`, `1.e5` accepted; `1e`, `1e+`,
 /// `-`, `-.`, `-e1`, `1..2`, `1e1.5` rejected) -- `is_finite()` reproduces
 /// `ErrRange` since Rust returns `inf` rather than erroring on overflow.
+#[inline]
 fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
     if matches!(bytes, b"true" | b"false" | b"null") {
         return true;
@@ -7665,6 +7670,10 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
     {
         return false;
     }
+    // Every byte just passed the charset check above, a strict subset of
+    // ASCII, so this always succeeds -- `unsafe` is disallowed crate-wide
+    // (`-D unsafe-code`), so this stays a real (cheap, ASCII-fast-pathed)
+    // check rather than a skippable one.
     let Ok(s) = core::str::from_utf8(bytes) else {
         return false;
     };
