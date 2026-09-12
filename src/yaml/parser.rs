@@ -928,14 +928,26 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // to the prior node -- `    - 1` / `  # c` / ` # d` / `z: 2` is
         // `c` on the item, `d` on `.a`'s key, not `c\nd` on either. A line
         // that only goes *deeper* still joins the block.
-        let after_split = !self.pending_head_lines.is_empty()
+        // Unlike the blank-line split, this one settles on `PREV` even
+        // across a blank line above the run (`    c: 1` / blank / `    # c2`
+        // / `# c3` still gives `c` the `c2`, measured); the segment it
+        // starts inherits the run's own blank-line detachment.
+        let mut after_split = false;
+        if !self.pending_head_lines.is_empty()
             && column != self.pending_block.column
-            && column < self.pending_block.prev_indent;
-        if after_split {
-            self.resolve_pending_block_backward();
+            && column < self.pending_block.prev_indent
+        {
+            if let Some(prev) = self.last_head_foot_bp {
+                self.drain_pending_into_foot(prev);
+                after_split = true;
+            }
         }
         if self.pending_head_lines.is_empty() {
-            let blank_before = self.blank_line_precedes(start as usize);
+            let blank_before = if after_split {
+                self.pending_block.blank_before
+            } else {
+                self.blank_line_precedes(start as usize)
+            };
             self.capture_pending_block(column, after_split, blank_before);
         }
         self.pending_head_lines.push((start, end));
@@ -1066,6 +1078,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
         let detached_forward = next.is_none() || self.blank_line_between(block_end, self.pos);
         if detached_forward {
+            if self.pending_block.after_split && next.is_some() {
+                // A segment split off an earlier one is keyed to its own
+                // position, so the node closing or opening next places it
+                // whether or not a blank line detached the run from `PREV`
+                // (`    # c2` / `  # c3` / blank / `z: 1` is `.a.b`'s key's
+                // foot either way, measured); at end of input a detached
+                // run's segment is the document's instead, below.
+                self.settle_dedented_block(next, root);
+                return;
+            }
             if let Some(prev) = self.attached_prev() {
                 // Dedented below the block `PREV` sits in, the comment is
                 // placed by its column rather than by adjacency (#2811):
@@ -1412,14 +1434,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// Settle a pending block whose forward attachment is already disproven
-    /// (a blank line follows it, or a line at another column below the
-    /// enclosing block starts a new one, #2811) onto `PREV`'s foot. A no-op
-    /// when `PREV` is unset, which means a blank line detached the block
-    /// backwards too — it stays pending and goes forward to whatever opens
-    /// next.
+    /// (a blank line follows it) onto `PREV`'s foot. A no-op when `PREV` is
+    /// unset, which means a blank line detached the block backwards too —
+    /// it stays pending and goes forward to whatever opens next.
     fn resolve_pending_block_backward(&mut self) {
         if self.pending_head_lines.is_empty() {
-            return; // omni-dev: coverage tolerate-line reason="unreachable: both callers in record_standalone_comment only invoke this while pending_head_lines is known non-empty (#798)"
+            return; // omni-dev: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
         }
         if let Some(prev) = self.attached_prev() {
             self.drain_pending_into_foot(prev);

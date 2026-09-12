@@ -14602,6 +14602,65 @@ mod standalone_comment_attribution_2811 {
         )
     }
 
+    /// The split settles on `PREV` even when a blank line detached the run
+    /// from it, and the segment it starts keeps that detachment: placed by
+    /// column at the next node, but at end of input the document's (the
+    /// text `c3\n` yq keeps for the blank is a getter-text difference, see
+    /// above).
+    #[test]
+    fn a_split_run_detached_by_a_blank_line_above_2811() -> Result<()> {
+        // The #2795 session's repro: a deeper foot, then a column-0 run
+        // that heads the next outer item as one block.
+        assert_slots(
+            "- -\n    - 1.5\n    - a: null\n      c: 2\n\n    #c2\n# c3 tail\n\n# c4\n\n#c5\n- - \"q\"\n",
+            &[
+                (".[0][0][1].c | key | foot_comment", "#c2"),
+                (".[1] | head_comment", "c3 tail\nc4\n#c5"),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n    # c2\n# c3\n\n# c4\nz: 1\n",
+            &[
+                (".a.b.c | key | foot_comment", "c2"),
+                (".z | key | head_comment", "c3\nc4"),
+            ],
+        )?;
+        for input in [
+            "a:\n  b:\n    c: 1\n\n    # c2\n  # c3\n\nz: 1\n",
+            "a:\n  b:\n    c: 1\n\n    # c2\n  # c3\nz: 1\n",
+        ] {
+            assert_slots(
+                input,
+                &[
+                    (".a.b.c | key | foot_comment", "c2"),
+                    (".a.b | key | foot_comment", "c3"),
+                ],
+            )?;
+        }
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n    # c2\n # c3\nz: 1\n",
+            &[(".a | key | foot_comment", "c3")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n    # c2\n  # c3\n  d: 2\n",
+            &[(".a.d | key | head_comment", "c3")],
+        )?;
+        for input in [
+            "a:\n  b:\n    c: 1\n\n  # c2\n# c3\n",
+            "a:\n  b:\n    c: 1\n\n    # c2\n  # c3\n",
+        ] {
+            assert_slots(
+                input,
+                &[
+                    (".a.b.c | key | foot_comment", "c2"),
+                    (". | foot_comment", "c3"),
+                    (".a.b | key | foot_comment", ""),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     // --- 2. at a document boundary
 
     #[test]
