@@ -30,6 +30,7 @@ use succinctly::jq::{
     YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
+use succinctly::json::validate;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
     format_float_yq_yaml, format_float_yq_yaml_nested, resolve_plain, resolve_tagged,
@@ -5481,103 +5482,45 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
 
 /// Parse a `--argjson` value into an `OwnedValue`.
 ///
-/// Validates strictly (RFC 8259) via `serde_json`, matching jq's own
-/// `--argjson` validation *strategy* (see `jq_runner::parse_json_value`).
-/// The lenient JSON semi-index would otherwise silently coerce malformed
-/// input (e.g. `42 garbage` → `42`) instead of surfacing an error (#284).
+/// #2052: validated by [`validate::validate_jq_lenient`] -- this crate's own
+/// RFC 8259 validator in jq's accept-set -- then materialized through the
+/// *same* `JsonIndex` + `to_owned_canonicalizing_numbers_at_depth` pair
+/// `parse_input`'s own `--input-format json` arm uses. Before that it was
+/// `serde_json::from_str` with a retry against `jq_runner`'s text-rewriting
+/// normalizer chain; see `jq_runner::parse_json_value` for why the chain
+/// went away.
 ///
-/// Unlike `jq_runner::parse_json_value`, this does *not* preserve a number
-/// literal's exact source spelling (#1058 fixed that for `succinctly jq`,
-/// deliberately not for `succinctly yq`) -- real mikefarah/yq has no
-/// `--argjson` flag at all, so there's no oracle to match on fidelity
-/// specifically, and yq's own `--input-format json` path already discards
-/// JSON-sourced number fidelity on purpose (#978,
-/// `to_owned_canonicalizing_numbers`). Adding fidelity only here would make
-/// `--argjson` *inconsistent* with that established convention rather than
-/// fix a real divergence.
+/// Materializing the way yq's own JSON input already does, rather than
+/// through `serde_json::Value`, is what keeps this function's #978
+/// convention intact now that the normalized copy it used to reparse no
+/// longer exists: `--argjson` still discards a number literal's source
+/// spelling (`1.500` -> `1.5`, `1.0` -> `1`) exactly as `-p json` does, and
+/// still does *not* preserve it the way `succinctly jq`'s own `--argjson`
+/// does (#1058 fixed fidelity for jq mode deliberately, not for yq -- real
+/// mikefarah/yq has no `--argjson` flag at all, so there is no oracle to
+/// match on fidelity, and yq's `--input-format json` path discards it on
+/// purpose). It also brings the stray-comma rejection that materializer
+/// already carries (`[1,]`, `[,]`, #2262/#2781) to this flag for free,
+/// where `serde_json` was previously the only thing refusing them.
 ///
-/// On the initial strict parse's failure, retries against
-/// `jq_runner::normalize_json_leniently`'s output (#1094's leading zero,
-/// #2012's lone low surrogate, #2240's leading/trailing decimal point) --
-/// the same leniencies `succinctly jq`'s own `--argjson` already accepts
-/// (yq mode has no `--jsonargs` at all, see `build_args_var` below), shared
-/// from one definition rather than a second, independently-maintained copy
-/// (#2051: before this, the two modes had silently drifted apart on this
-/// exact input). Reparsing the *normalized* text directly (not the
-/// original, unlike `jq_runner`'s own retry) is sufficient here precisely
-/// because this function already discards number fidelity -- there is no
-/// original spelling left to preserve. This is also exactly what made this
-/// function the one place #2240's own composition-order bug was reachable:
-/// `normalize_json_leniently` composing `normalize_dot_leniency` after,
-/// rather than before, `normalize_leading_zero_numbers` corrupted `.05`
-/// into `.5` before this function ever saw it, silently materializing
-/// `0.5` -- ten times too large -- since this function reparses that
-/// corrupted copy directly. `jq_runner::parse_json_value` never observed
-/// the same corruption, since it always materializes the *original* `s`
-/// regardless of what the normalized copy says. That includes *magnitude*, not just cosmetic spelling, for an
-/// integer too large for `f64` to represent exactly: stripping a leading
-/// zero from `0099999999999999999999999` now reaches the same lossy
-/// `serde_json_to_owned` path a plain `99999999999999999999999` (no
-/// leading zero) already went through before this fix, and already
-/// materializes as `1e+23` there too (#978's own established, deliberate
-/// convention) -- this leniency retry does not introduce a new precision
-/// class, it makes a leading-zero-prefixed integer behave exactly as if
-/// the leading zero were never there, consistent with every other digit
-/// string this function accepts.
+/// One behaviour deliberately changes with the serde gate's removal: a
+/// magnitude-overflowing literal (`--argjson x 1e400`) was
+/// `invalid JSON: 1e400` and is now `.inf` -- the same value yq already
+/// answers for an overflow it computes itself (`--argjson x 1e308 '$x * 10'`
+/// is `.inf` today) and consistent with jq mode's own new answer for the
+/// same input (`1E+400`, matching jq 1.7.1). Recorded in
+/// `docs/compliance/yq/limitations.md`.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
-    // A no-op normalization reparses byte-identical text and fails
-    // identically -- no `normalized != s` guard needed before retrying.
-    let e = match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(value) => return Ok(serde_json_to_owned(&value)),
-        Err(e) => e,
-    };
-    let normalized = crate::jq_runner::normalize_json_leniently(s);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
-        return Ok(serde_json_to_owned(&value));
-    }
-    Err(e).with_context(|| format!("invalid JSON: {s}"))
-}
-
-/// Convert a `serde_json::Value` into an `OwnedValue`.
-fn serde_json_to_owned(value: &serde_json::Value) -> OwnedValue {
-    serde_json_to_owned_at_depth(value, 0)
-}
-
-/// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
-/// (#1017). `serde_json::from_str`'s own `Deserializer` already enforces
-/// an independent ~128-deep parse-time limit before `value` can exist at
-/// all, so this is defense-in-depth against that upstream limit changing,
-/// not a currently-live independent crash path.
-fn serde_json_to_owned_at_depth(value: &serde_json::Value, depth: usize) -> OwnedValue {
-    assert_value_tree_depth(depth);
-    match value {
-        serde_json::Value::Null => OwnedValue::Null,
-        serde_json::Value::Bool(b) => OwnedValue::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                OwnedValue::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                OwnedValue::Float(f)
-            } else {
-                OwnedValue::Null
-            }
-        }
-        serde_json::Value::String(s) => OwnedValue::String(s.clone()),
-        serde_json::Value::Array(arr) => OwnedValue::Array(
-            arr.iter()
-                .map(|v| serde_json_to_owned_at_depth(v, depth + 1))
-                .collect(),
-        ),
-        serde_json::Value::Object(obj) => OwnedValue::Object(
-            obj.iter()
-                .map(|(k, v)| (k.clone(), serde_json_to_owned_at_depth(v, depth + 1)))
-                .collect(),
-        ),
-    }
+    validate::validate_jq_lenient(s.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))?;
+    let index = JsonIndex::build(s.as_bytes());
+    let cursor = index.root(s.as_bytes());
+    to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0)
+        .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))
 }
 
 /// Parse variables from command line arguments.
@@ -9286,36 +9229,6 @@ mod tests {
         assert!(
             result.is_err(),
             "strip_presentation_style should panic at MAX_VALUE_TREE_DEPTH"
-        );
-    }
-
-    /// `depth` levels of single-element array nesting in a `serde_json::Value`.
-    fn linear_serde_json_nest(depth: usize) -> serde_json::Value {
-        let mut v = serde_json::Value::Null;
-        for _ in 0..depth {
-            v = serde_json::Value::Array(vec![v]);
-        }
-        v
-    }
-
-    /// #1017: `serde_json_to_owned` (used by `--argjson`/`--args`-style CLI
-    /// value parsing) had no guard of its own, unlike the `serde_json`
-    /// parse step feeding it, which enforces an independent ~128-deep
-    /// limit before this conversion ever runs.
-    #[test]
-    fn serde_json_to_owned_panics_past_nesting_depth_limit_1017() {
-        use succinctly::jq::MAX_VALUE_TREE_DEPTH;
-
-        let under = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let owned = serde_json_to_owned(&under);
-        assert!(matches!(owned, OwnedValue::Array(_)));
-
-        let over = linear_serde_json_nest(MAX_VALUE_TREE_DEPTH);
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serde_json_to_owned(&over)));
-        assert!(
-            result.is_err(),
-            "serde_json_to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 

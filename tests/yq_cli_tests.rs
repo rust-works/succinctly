@@ -9968,6 +9968,86 @@ fn test_argjson_variable() -> Result<()> {
     Ok(())
 }
 
+/// #2052: yq's `--argjson` moved off `serde_json` (plus `jq_runner`'s
+/// text-rewriting normalizer chain) onto `validate::validate_jq_lenient`
+/// followed by the *same* `JsonIndex` + `to_owned_canonicalizing_numbers_at_depth`
+/// materializer `-p json` already uses.
+///
+/// The point of these rows is that the move is output-preserving: yq's
+/// `--argjson` still discards a number literal's source spelling (#978's
+/// convention -- `1.500` is `1.5`, `1.0` is `1`, `0099…` is `1e+23`), which
+/// is exactly what `serde_json::Value` did, and still differs from
+/// `succinctly jq`'s own fidelity-preserving `--argjson` (#1058, jq mode
+/// only, deliberately). Real mikefarah/yq has no `--argjson` flag at all
+/// (v4.53.3: `Error: unknown flag: --argjson`), so there is no oracle here
+/// -- these pin the established convention against drift, not a reference.
+#[test]
+fn test_argjson_materialization_is_unchanged_by_2052() -> Result<()> {
+    for (value, expected) in [
+        // The four leniencies, previously reached through the normalizer
+        // chain and now from the validator's own accept-set.
+        ("007", "7"),
+        (".5", "0.5"),
+        ("1.e5", "100000.0"),
+        ("[007,.5]", "[7,0.5]"),
+        // #978's spelling-discarding convention, unchanged (`-o=json`
+        // renders a float with its own `.0` where YAML output does not, so
+        // these are the JSON spellings, captured from the pre-#2052 binary).
+        ("1.500", "1.5"),
+        ("1.0", "1.0"),
+        ("1e100", "1e+100"),
+        ("99999999999999999", "99999999999999999"),
+        ("0099999999999999999999999", "1e+23"),
+        ("123", "123"),
+    ] {
+        let (output, code) =
+            run_yq_stdin("$x", "a: 1", &["--argjson", "x", value, "-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "--argjson {value}: {output:?}");
+        assert_eq!(output.trim(), expected, "--argjson {value}");
+    }
+    Ok(())
+}
+
+/// #2052: what yq's `--argjson` still refuses, and the one thing it no
+/// longer does.
+///
+/// The stray-comma rows are new coverage rather than new behaviour --
+/// `serde_json` refused them before, and the materializer this now shares
+/// with `-p json` refuses them too (#2262/#2781), so the guarantee survived
+/// the swap.
+///
+/// `1e400` is the one deliberate change: it was `invalid JSON: 1e400`
+/// (`serde_json`'s "number out of range") and is now `.inf` -- the same
+/// value yq already answers for an overflow it computes itself
+/// (`--argjson x 1e308 '$x * 10'`), and the counterpart of jq mode's own
+/// new answer for the same input (`1E+400`, matching jq 1.7.1). Recorded in
+/// `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
+    for value in [
+        r#""\ud800""#,
+        "[1,]",
+        "{,}",
+        "5.",
+        "1 2",
+        "0x10",
+        "1.2.3",
+        "+1",
+        "nan",
+    ] {
+        let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", value, "-o=json"])?;
+        assert_ne!(code, 0, "--argjson {value} must be rejected: {output:?}");
+        assert_eq!(output, "", "--argjson {value}");
+    }
+
+    for (value, expected) in [("1e400", ".inf"), ("-1e400", "-.inf")] {
+        let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", value])?;
+        assert_eq!(code, 0, "--argjson {value}: {output:?}");
+        assert_eq!(output.trim(), expected, "--argjson {value}");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_multiple_variables() -> Result<()> {
     // Multiple --arg pairs all resolve.

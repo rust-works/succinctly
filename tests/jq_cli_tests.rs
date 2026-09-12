@@ -662,6 +662,168 @@ fn test_argjson_preserves_number_literal_fidelity_1058() -> Result<()> {
 }
 
 // =============================================================================
+// #2052: `--argjson`/`--jsonargs` validate through the crate's own RFC 8259
+// validator in jq's accept-set (`json::validate::validate_jq_lenient`),
+// replacing `serde_json` plus a chain of one text-rewriting normalizer per
+// leniency. Every expectation below captured live from `/usr/bin/jq` 1.7.1.
+// =============================================================================
+
+/// The whole accept-set, end to end: what the validator admits, the decoder
+/// must materialize, and the pair must answer exactly what jq answers.
+///
+/// This is the guard the design turns on -- a spelling admitted by the
+/// validator that the decoder then refuses, or reads differently from jq, is
+/// the #1247 "validated, then failed to decode" shape, and the two live in
+/// different modules with no compiler-enforced link between them.
+///
+/// The three `1e400` rows are the behaviour that *changes* with #2052:
+/// `serde_json::Value` rejected a magnitude-overflowing literal ("number out
+/// of range") and #1095 kept that deliberately, reasoning the value would
+/// otherwise materialize as `null`. Neither half still holds -- the decoder
+/// preserves the literal, and jq 1.7.1 accepts it -- so the rejection was a
+/// divergence carried only by these two flags.
+#[test]
+fn test_argjson_accept_set_matches_jq_2052() -> Result<()> {
+    for (value, expected) in [
+        ("007", "7"),
+        ("00", "0"),
+        ("00.5", "0.5"),
+        ("01", "1"),
+        ("-01", "-1"),
+        ("007e5", "7E+5"),
+        ("00e5", "0E+5"),
+        (".5", "0.5"),
+        ("-.5", "-0.5"),
+        (".05", "0.05"),
+        (".0", "0.0"),
+        (".5e3", "5E+2"),
+        ("1.e5", "1E+5"),
+        ("1.E5", "1E+5"),
+        ("\"\\udc00\"", "\"�\""),
+        ("[007,\"\\udc00\",.5,1.e5]", "[7,\"�\",0.5,1E+5]"),
+        ("1e400", "1E+400"),
+        ("-1e400", "-1E+400"),
+        ("1e400000000000", "1.7976931348623157e+308"),
+        ("123", "123"),
+        ("1.500", "1.500"),
+        ("1e100", "1E+100"),
+        ("99999999999999999", "99999999999999999"),
+        ("0099999999999999999999999", "99999999999999999999999"),
+        ("1.0", "1.0"),
+        ("[1,2]", "[1,2]"),
+        ("{\"a\":[1,{\"b\":.5}]}", "{\"a\":[1,{\"b\":0.5}]}"),
+        ("null", "null"),
+        ("true", "true"),
+        ("\"x\"", "\"x\""),
+        ("[]", "[]"),
+        ("{}", "{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
+        assert_eq!(
+            code, 0,
+            "--argjson {value}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), expected, "--argjson {value}");
+
+        // `--jsonargs` shares `parse_json_value`, so the same spelling must
+        // reach the same value through the positional-argument route.
+        let wrapped = format!("[{expected}]");
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "$ARGS.positional", "--jsonargs", value], None)?;
+        assert_eq!(
+            code, 0,
+            "--jsonargs {value}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), wrapped, "--jsonargs {value}");
+    }
+    Ok(())
+}
+
+/// The reject-set, in three groups with three different reasons.
+#[test]
+fn test_argjson_reject_set_2052() -> Result<()> {
+    // 1. jq rejects these too -- the base grammar is unmoved.
+    for value in [
+        "\"\\ud800\"",
+        "{\"a\":1,}",
+        "[1,]",
+        "1 2",
+        "1e",
+        "0x10",
+        "'a'",
+        "1.2.3",
+        "1_000",
+        "[,]",
+        "{,}",
+        "[1 2]",
+        "\"abc",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
+        assert_ne!(
+            code, 0,
+            "--argjson {value}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "--argjson {value}");
+    }
+
+    // 2. The recorded rule-4c divergence (#2240): jq answers `5`/`7`/`0`, and
+    //    this validator refuses on purpose -- admitting a bare trailing dot
+    //    would route `99999999999999999.` through `from_number_bytes`'s
+    //    large-integer gap. See `docs/compliance/jq/limitations.md`.
+    for value in ["5.", "-5.", "[5.]", "{\"a\":5.}", "1.", "0.", "007."] {
+        let (stdout, _stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
+        assert_ne!(code, 0, "rule-4c row must stay rejected: {value}");
+        assert_eq!(stdout, "", "{value}");
+    }
+
+    // 3. #2877: jq accepts all five; the decoder behind this validator cannot
+    //    represent them yet, so lenient mode deliberately does not admit them.
+    for value in ["+1", "nan", "NaN", "Infinity", "-Infinity"] {
+        let (stdout, _stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
+        assert_ne!(
+            code, 0,
+            "#2877 row must stay rejected until the decoder can read it: {value}"
+        );
+        assert_eq!(stdout, "", "{value}");
+    }
+    Ok(())
+}
+
+/// `--seq`'s own gate (`seq_value_is_valid`) shares the same validator, so a
+/// record spelling jq accepts is accepted here too -- previously via the same
+/// normalizer chain, now from the accept-set directly.
+#[test]
+fn test_seq_record_leniencies_after_2052() -> Result<()> {
+    for (record, expected) in [
+        ("007", "7"),
+        (".5", "0.5"),
+        ("1.e5", "1E+5"),
+        ("1e400", "1E+400"),
+    ] {
+        let input = format!("\u{1e}{record}\n");
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(&input))?;
+        assert_eq!(
+            code, 0,
+            "--seq {record}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        // `--seq` output carries RFC 7464's own leading RS byte.
+        assert_eq!(
+            stdout.trim_end(),
+            format!("\u{1e}{expected}"),
+            "--seq {record}"
+        );
+    }
+
+    // The lone low surrogate, kept separate so the expectation can be the
+    // real replacement character rather than an escape inside an escape.
+    let input = "\u{1e}\"\\udc00\"\n";
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "\u{1e}\"\u{fffd}\"");
+    Ok(())
+}
+
+// =============================================================================
 // #1094: `--argjson` tolerates a leading-zero number the way real jq's own
 // number parser does, instead of rejecting it outright via strict RFC 8259
 // validation. All cases live-verified against jq 1.7.1.

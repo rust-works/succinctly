@@ -4155,6 +4155,41 @@ Getting this backwards is worse than it looks: rule 5 exempts extensions from ru
 labelling reference surface an "extension" silently retires a fidelity obligation. Check
 `yq --help` before adding to the list above.
 
+### `--argjson` accepts a magnitude-overflowing literal as `.inf` (#2052)
+
+`--argjson` is a jq-inherited extension: real mikefarah/yq v4.53.3 has no such flag
+(`Error: unknown flag: --argjson`), so nothing here is measured against an oracle -- it is
+recorded because the behaviour changed.
+
+Until #2052 the flag validated through `serde_json::Value` and materialized through it too.
+#2052 replaced the validation gate crate-wide with `json::validate::validate_jq_lenient`
+(see the jq-mode limitations doc for why), and moved yq's own materialization onto the
+`JsonIndex` + `to_owned_canonicalizing_numbers_at_depth` pair its `--input-format json` path
+already uses. Number rendering is unchanged by that swap -- `--argjson` still discards a
+literal's source spelling per #978's convention (`1.500` is `1.5`, `1.0` is `1`,
+`0099999999999999999999999` is `1e+23`), and still does not preserve it the way
+`succinctly jq`'s own `--argjson` does (#1058 was deliberately jq-mode-only).
+
+One value moves. A literal too large for `f64` was `invalid JSON: 1e400` (serde's "number
+out of range") and is now `.inf`:
+
+```console
+$ printf 'a: 1' | succinctly yq --argjson x 1e400 '$x'      # before #2052
+Error: invalid JSON for --argjson x
+$ printf 'a: 1' | succinctly yq --argjson x 1e400 '$x'      # after
+.inf
+```
+
+That is the value yq mode already answers for an overflow it computes itself
+(`--argjson x 1e308 '$x * 10'` is `.inf` on both sides of this change), and the counterpart
+of jq mode's own new answer for the same input (`1E+400`, which is what jq 1.7.1 says).
+Pinned in `test_argjson_reject_set_and_overflow_after_2052` (`tests/yq_cli_tests.rs`).
+
+The swap also brings the stray-comma rejection that materializer already carries
+(`--argjson x '[1,]'`, `'{,}'`, #2262/#2781) to this flag -- previously `serde_json` was the
+only thing refusing them, so this is the same guarantee from a different place, not a new
+one.
+
 ## Provenance
 
 | Artifact | Path |

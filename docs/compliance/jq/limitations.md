@@ -5446,6 +5446,15 @@ $ succinctly jq -c '.' <<< '99999999999999999.'
 100000000000000000
 ```
 
+#2052 later replaced the whole validation gate behind these flags -- `serde_json` plus one
+text-rewriting normalizer per leniency became one lenient mode on this crate's own RFC 8259
+validator (`json::validate::validate_jq_lenient`) -- and this rejection moved with it,
+unchanged and for the same reason: the lenient mode admits the other three spellings and
+refuses a bare trailing dot explicitly, with `validate_number`'s own comment pointing back
+at this row. The accept-set is pinned against jq 1.7.1 in
+`test_argjson_accept_set_matches_jq_2052`/`test_argjson_reject_set_2052`
+(`tests/jq_cli_tests.rs`).
+
 `from_number_bytes`'s own doc comment already documents this trade-off for the *general*
 (non-`--argjson`) case as deliberate, reasoning that real jq doesn't preserve this exact
 spelling either (`[1.] -> [1]` on both sides) — true only for a small value where the lossy
@@ -5458,6 +5467,29 @@ covers — so `--argjson x '1.'` stays a clean, catchable error rather than a si
 magnitude error, a narrower divergence from real jq than #2240's own issue text first
 scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
 be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
+
+### A magnitude-overflowing literal is no longer rejected by `--argjson`/`--jsonargs` (#2052) — divergence closed
+
+Until #2052 these two flags validated through `serde_json::Value`, whose "number out of
+range" refused a literal too large for `f64`. That was never a jq behaviour:
+
+```console
+$ jq -nc --argjson x 1e400 '$x'
+1E+400
+$ succinctly jq -nc --argjson x 1e400 '$x'     # before #2052
+Error: Invalid JSON for --argjson x
+$ succinctly jq -nc --argjson x 1e400 '$x'     # after
+1E+400
+```
+
+#1095 adopted `serde_json::Value` over the cheaper `IgnoredAny` specifically to keep that
+rejection, reasoning the value would otherwise materialize as `null`. Both halves have since
+stopped holding — the materializer preserves the literal spelling (the `--slurpfile` and
+primary-input paths already answered `1E+400`), and the oracle accepts it — so dropping the
+serde gate closed a divergence rather than opening one. `+1`, `nan`/`NaN` and
+`Infinity`/`-Infinity`, which jq also accepts, remain rejected on every input path and are
+tracked as [#2877](https://github.com/rust-works/succinctly/issues/2877): the decoder cannot
+represent them yet, and admitting a spelling it then refuses is the #1247 shape.
 
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 
