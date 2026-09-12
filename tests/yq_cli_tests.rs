@@ -16439,6 +16439,23 @@ fn test_explicit_key_owns_head_and_foot_comments_1079_float() -> Result<()> {
     assert_yq_getter("? a\n: 1\n# h\nb: 2\n", ".b | key | head_comment", "h\n")
 }
 
+/// A sequence used as an explicit key is nobody's *value* -- but a comment
+/// floated off one of its own absent items still lands on this key's own
+/// foot when the sequence closes past a dedent, the same as it would for
+/// an ordinary mapping value's sequence (measured against pinned yq
+/// v4.53.3: `to_entries` shows `c` right after the entry's `value: v`, not
+/// floating forward onto the next key's head the way a truly keyless
+/// sequence's float would, #1079). Read via `keys | .[0]` rather than
+/// `.[""]`: addressing a non-scalar mapping key by its JSON-collapsed `""`
+/// form is a separate, pre-existing gap in succinctly's complex-key path
+/// resolution, unrelated to comment placement.
+#[test]
+fn test_sequence_as_explicit_key_owns_its_own_foot_1079_float() -> Result<()> {
+    let input = "? - a\n  - # c\n: v\nb: 2\n";
+    assert_yq_getter(input, ". | keys | .[0] | foot_comment", "c\n")?;
+    assert_yq_getter(input, ".b | key | head_comment", "\n")
+}
+
 // ============================================================================
 // Explicit-key (`? k ... : v`) trailing comment (#795)
 // ============================================================================

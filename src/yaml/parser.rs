@@ -4167,8 +4167,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_ty(true); // sequence
                 self.indent_stack.push(indent + 2); // Indent for sequence content
                 self.push_type(NodeType::Sequence);
-                // A key is nobody's value, so no owner key (#1079).
-                self.register_seq_frame(indent + 2, None, false);
+                // This sequence *is* the key, not any key's value -- but a
+                // comment floated off one of its own absent items still
+                // lands on the key's own foot when the sequence closes past
+                // a dedent, the same as an ordinary mapping value's would
+                // (measured against pinned yq v4.53.3: `? - a\n  - # c\n:
+                // v\nb: 2\n` puts `c` on the explicit key's own foot, not
+                // `.b`'s head). `last_head_foot_bp` still holds this key's
+                // own bp, set by `attach_head_foot_at` above, unchanged
+                // since (#1079).
+                self.register_seq_frame(indent + 2, self.last_head_foot_bp, true);
 
                 // Parse first sequence item inline
                 self.write_bp_open_seq_item(); // item node
