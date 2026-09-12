@@ -117,6 +117,22 @@ pub struct NodeComments {
 }
 
 /// An open block sequence, as [`Parser::seq_frames`] tracks it (#1079).
+///
+/// This is a second stack, parallel to (not folded into) `indent_stack`/
+/// `type_stack` -- tempting to simplify by widening `NodeType::Sequence`
+/// into a payload-carrying variant and dropping `serial`/`frame_len`
+/// instead, reading a sequence's identity straight off those two. That
+/// simplification is unsound: `serial` is load-bearing, not redundant with
+/// depth. Two sibling items nested inline (`- - # c1\n- - # c2\n`) each open
+/// an inner sequence at the *same* stack depth with no settle checkpoint in
+/// between -- an inline `- - x` item never calls `attach_head_foot_at` for
+/// its own dash, it recurses straight into the nested sequence -- so by the
+/// time item 1's inner sequence registers, it has already replaced item 0's
+/// at that identical depth. A depth-only check reads that as "still open"
+/// and never settles item 0's floated comment at all
+/// (`test_seq_frame_serial_distinguishes_sibling_frames_at_the_same_depth_1079_float`
+/// pins the diverging case this produces against real yq; confirmed by a
+/// throwaway experimental patch during #1079's review).
 #[derive(Debug, Clone, Copy)]
 struct SeqFrame {
     /// Identity that survives the frame's depth being reused by a later
