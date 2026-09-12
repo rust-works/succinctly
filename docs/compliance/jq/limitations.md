@@ -2752,7 +2752,13 @@ Three differences remain, all in the direction of erroring rather than aborting:
 - **A non-terminating `def` errors; jq dies.** `def deep: [deep]; deep` and `def f: [f, f];
   f` exceed `MAX_EVAL_FRAMES` and raise a catchable error, exit 5. Real jq aborts on both
   with `cannot allocate memory` and exit 134 (confirmed live). Divergence in the only
-  direction ADR-0018 permits: matching would take the process down.
+  direction ADR-0018 permits: matching would take the process down. [#2737](https://github.com/rust-works/succinctly/issues/2737)
+  fixed a shadow bug (a nested zero-arg `def` sharing a name with an enclosing
+  parameter wasn't in scope inside its own body, so it silently resolved to the
+  stale parameter instead of recursing) that had been keeping some of these shapes
+  terminating with a wrong answer instead of reaching this same divergence:
+  `def f(a): def a: a+1; a; f(1)` now hits `MAX_EVAL_FRAMES` where it used to answer
+  `2`.
 - **A heavy body runs out of depth sooner than jq's does.** jq evaluates on a
   heap-allocated VM stack (confirmed against jq 1.7.1's source: `exec_stack.h`'s
   `struct stack` grows via `realloc` through `jv_mem_realloc`, and `execute.c`'s

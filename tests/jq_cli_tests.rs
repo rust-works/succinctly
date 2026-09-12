@@ -21153,6 +21153,47 @@ fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()
     Ok(())
 }
 
+/// #2737: `substitute_func_param_impl`'s `Expr::FuncDef` arm cleared the
+/// bare namespace for a nested zero-argument `def` of the enclosing
+/// parameter's own name in that def's `then` but not in its `body` -- so a
+/// self-recursive reference inside the nested def's own body resolved to
+/// the outer parameter's substituted argument instead of recursing. Oracle-
+/// verified against jq 1.7.1: `100` (recursing `3 -> 2 -> 1 -> 0`), not `1`.
+#[test]
+fn test_nested_zero_arg_def_of_params_own_name_recurses_in_its_own_body_2737() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "def f(a): def a: if . > 0 then (.-1|a) else 100 end; (3|a); f(1)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "100");
+    Ok(())
+}
+
+/// #2737 control: closing the body-scope gap above can turn a terminating
+/// (wrong) answer into jq's own non-terminating one -- `def f(a): def a:
+/// a+1; a; f(1)` used to answer `2` (one substitution, no recursion); it now
+/// recurses for real and hits `MAX_EVAL_FRAMES`, erroring cleanly (exit 5)
+/// rather than hanging or overflowing the native stack, matching the
+/// documented "non-terminating def" divergence in
+/// docs/compliance/jq/limitations.md -- real jq aborts the process with
+/// `cannot allocate memory` on this same program (confirmed live).
+#[test]
+fn test_nested_zero_arg_def_self_recursion_hits_the_frame_guard_not_a_wrong_answer_2737(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a): def a: a+1; a; f(1)"], None)?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1371 follow-up code-review: end-to-end companion to
 /// `jq::eval::tests::test_bind_def_seeds_defcall_frames_from_ambient_depth_1371`
 /// (a fast, white-box pin of the same mechanism -- see its own doc comment
