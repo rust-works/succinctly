@@ -14407,16 +14407,24 @@ mod standalone_comment_attribution_2811 {
                 (".[1] | head_comment", ""),
             ],
         )?;
-        // The comment's own column (1) matches no open block's indent
-        // (0, 2 or 4), so the column-match walk in
-        // `Parser::positional_foot_target` finds nothing and defers to the
-        // sequence item opening now -- #1079's own hook for a bare item's
-        // value deferred to a later line reclaims it right there as that
-        // item's own foot, one recursion short of the deeper `k` key that
-        // the exact-column case below reaches.
+        // The comment's own column (1) matches no open block's indent, so
+        // the foot waits for the item's first key -- also when that item is
+        // a bare `-` whose mapping starts on the next line: #1079's hook for
+        // that value opens the mapping, and the foot is still `k`'s (yq).
         assert_slots(
             "- a:\n    - 1\n # c\n\n-\n  k: v\n",
+            &[
+                (".[1].k | key | foot_comment", "c"),
+                (".[1] | foot_comment", ""),
+            ],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n-\n  x\n",
             &[(".[1] | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n-\n  - 3\n",
+            &[(".[1][0] | foot_comment", "c")],
         )?;
         assert_slots(
             "- a:\n    - 1\n # c\n\n- - 3\n",

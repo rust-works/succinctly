@@ -1475,10 +1475,33 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `column` is the column the node's line starts at: the `-` for an
     /// item, not its content (#2811).
     fn attach_head_foot_at(&mut self, bp: usize, column: usize) {
-        self.flush_pending_head_lines(Some((bp, column)));
+        self.attach_head_foot_at_with(bp, column, true);
+    }
+
+    /// [`Self::attach_head_foot_at`] for a bare `-` item's value deferred
+    /// to a later line (#1079's hook), whose bp may turn out to be a
+    /// mapping or sequence: a foot deferred to "the item's first key or
+    /// scalar" (#2811) is not claimed here but by that node -- the first
+    /// key's own hook, or [`Self::claim_deferred_foot`] in
+    /// `parse_block_node`'s scalar arms (`- a:` / `    - 1` / ` # c` /
+    /// blank / `-` / `  k: v` is `.[1].k`'s key's foot, measured).
+    fn attach_deferred_item_value_at(&mut self, bp: usize, column: usize) {
+        self.attach_head_foot_at_with(bp, column, false);
+    }
+
+    /// A foot deferred by [`Self::settle_dedented_block`] to the sequence
+    /// item's first key/scalar lands on `bp` (#2811).
+    fn claim_deferred_foot(&mut self, bp: usize) {
         if !self.deferred_foot_lines.is_empty() {
             let deferred = &mut self.deferred_foot_lines;
             self.comments.entry(bp).or_default().foot.append(deferred);
+        }
+    }
+
+    fn attach_head_foot_at_with(&mut self, bp: usize, column: usize, claim_deferred: bool) {
+        self.flush_pending_head_lines(Some((bp, column)));
+        if claim_deferred {
+            self.claim_deferred_foot(bp);
         }
         self.last_head_foot_bp = Some(bp);
         self.block_passed_absent_item = false;
@@ -1541,6 +1564,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn attach_document_root_node(&mut self, column: usize) {
         if self.type_stack.len() <= 1 {
             self.attach_head_foot_at(self.bp_pos, column);
+        } else if self.current_type == Some(NodeType::SequenceItem) {
+            // A bare `-` item's scalar value on its own line: the node a
+            // foot deferred to "the item's first key/scalar" was waiting
+            // for (#2811; the item's own hook left it unclaimed).
+            self.claim_deferred_foot(self.bp_pos);
         }
     }
 
@@ -3711,7 +3739,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // blank line after it resolves it backwards), so clamp.
                     let above_dash = above_dash.min(self.pending_head_lines.len());
                     let below_dash = self.pending_head_lines.split_off(above_dash);
-                    self.attach_head_foot_at(self.bp_pos, indent);
+                    self.attach_deferred_item_value_at(self.bp_pos, indent);
                     self.pending_head_lines = below_dash;
                     if let Some(range) = trailing {
                         self.push_line_comment(wrapper_bp, range);
