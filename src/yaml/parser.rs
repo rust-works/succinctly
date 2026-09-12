@@ -467,8 +467,12 @@ struct Parser<'a, const HAS_CR: bool> {
     /// node itself for a sequence item or document root, the inline value
     /// for a mapping key (#2811).
     first_node_value_idx: usize,
-    /// Where the line that node starts on ends (#2811).
-    first_node_line_end: usize,
+    /// Where that node's hook ran: the start of its own text, or of its
+    /// line (#2811). Only the bytes between here and the value's start are
+    /// ever scanned, and only by the quirk check itself -- scanning to the
+    /// end of the line at hook time cost 4 instructions per byte of a
+    /// single-line JSON document, +10% on the perf guard's `yq` row.
+    first_node_pos: usize,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -607,7 +611,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             first_head_foot_bp: None,
             first_node_has_line_comment: false,
             first_node_value_idx: 0,
-            first_node_line_end: 0,
+            first_node_pos: 0,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -1244,11 +1248,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // `# f` are both `. | foot_comment`); a plain, anchored, tagged or
         // block scalar, a quoted *key*, or a value deferred to the next
         // line does not.
-        self.bp_to_text
-            .get(self.first_node_value_idx)
-            .map(|&pos| pos as usize)
-            .filter(|&pos| pos < self.first_node_line_end)
-            .is_some_and(|pos| matches!(self.input[pos], b'"' | b'\'' | b'[' | b'{'))
+        let Some(&value_pos) = self.bp_to_text.get(self.first_node_value_idx) else {
+            return false;
+        };
+        let value_pos = value_pos as usize;
+        let same_line = value_pos >= self.first_node_pos
+            && !self.input[self.first_node_pos..value_pos]
+                .iter()
+                .any(|&b| is_line_break(b));
+        same_line && matches!(self.input[value_pos], b'"' | b'\'' | b'[' | b'{')
     }
 
     /// `PREV` for the pending block, unless a blank line detached the block
@@ -1512,10 +1520,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // and its value is the next one; an item's content or a
             // document root is hooked before its own.
             self.first_node_value_idx = self.bp_to_text.len();
-            self.first_node_line_end = self.input[self.pos..]
-                .iter()
-                .position(|&b| is_line_break(b))
-                .map_or(self.input.len(), |n| self.pos + n);
+            self.first_node_pos = self.pos;
         }
         // A real node has now opened in this document, so a later blank
         // line detaching *its own* `PREV` must fall forward as usual, not
