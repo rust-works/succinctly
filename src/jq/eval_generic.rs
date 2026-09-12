@@ -9462,15 +9462,25 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                 Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
             }
         }
+        // #2873 review: `key_control` was computed eagerly, before any
+        // binding-set's body ran -- see `eval::each_pattern_alternatives`'s
+        // identical fix and doc comment for why a `Halt`/uncatchable
+        // `Error` it carries must win regardless of whatever an *earlier*
+        // binding-set's body already decided about retrying.
+        match &key_control {
+            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(*code)),
+            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+                return Flow::Escaped(Control::Error(e.clone()));
+            }
+            _ => {}
+        }
+
         if retry_next_alternative {
             continue;
         }
 
         match key_control {
             None => return Flow::Exhausted,
-            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-                return Flow::Escaped(Control::Error(e));
-            }
             Some(Control::Error(e)) => {
                 if is_last {
                     return Flow::Escaped(Control::Error(e));
@@ -9483,7 +9493,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
                 }
                 continue;
             }
-            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+            Some(Control::Halt(_)) => unreachable!("handled above"),
         }
     }
 

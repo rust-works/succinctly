@@ -974,24 +974,36 @@ A destructuring pattern's own **computed key** (`{(EXPR): P}`, or an interpolate
 [#2677](https://github.com/rust-works/succinctly/issues/2677) — `PatternEntry.key` widened from
 a plain `String` to `ObjectKey` (the same type object construction already used), and
 `extract_pattern_bindings` (value mode)/`walk_pattern` (path mode) resolve the key expression
-against the pattern's own current node, using the same "Cannot index `<type>` with `<type>`"
-wording jq's own `INDEX` bytecode gives for any key, computed or literal — confirmed live in
-both positions, including nested computed keys and through `|=`/`del()`. A key expression that
-is itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out one full pattern-
-match, and one full run of the surrounding body, per key it yields: `{"a":1,"b":2} \| . as
-{("a","b"):$q} \| $q` is `1` then `2`) or a **zero**-output one (`{(empty): $q}`, where real jq
-legitimately binds nothing and the body never runs, `[. as {(empty):$q} \| $q]` is `[]`) now
-**fans out correctly in value position**: `each_pattern_alternatives`/
-`each_pattern_alternatives_generic` (the `?//`-alternative loops both evaluators route a bare,
-non-`?//` pattern through too) run `body` once per binding-set `extract_pattern_bindings`
-yields, applying the pre-#2677 match-failure retry rule only to the key generator's own
-trailing error/break/halt once every binding-set's body has run — including the two hardest
-interaction cases: a body error partway through a fan-out abandons the *remaining* key outputs
-and retries the next `?//` alternative, keeping whatever already ran (`[. as {("a","b"):$q} ?//
-$z \| if $q==2 then error("boom") else $q end]` on `{"a":1,"b":2}` is `[1,null]`), and a
-zero-output key still *wins* inside a `?//` chain (no fallthrough) even though it contributes
-nothing. `test_pattern_computed_key_fans_out_in_value_position_2677` (`tests/jq_cli_tests.rs`)
-pins both.
+against the pattern's own current node via `index_one_owned`, the same generic `.[EXPR]`
+operator used elsewhere (`nth`, `(.a\|tostring)[$k]`) — so a computed key can resolve to a
+*string* (indexing an object) or a *number* (indexing an array, with jq's own float-truncation
+and negative-index wraparound, `path(.arr as {(-1):$q}\|$q)` on an array giving `[-1]`, the raw
+key, matching `path(.arr[-1])`) exactly like `.[EXPR]` does, in both value and path position,
+using the same "Cannot index `<type>` with `<type>`" wording jq's own `INDEX` bytecode gives for
+any key, computed or literal — confirmed live in both positions, including nested computed keys
+and through `\|=`/`del()`. (PR #2873 review caught and fixed an initial version of this that
+unconditionally required a string key, wrongly rejecting a numeric key against an array.)
+
+A key expression that is itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out
+one full pattern-match, and one full run of the surrounding body, per key it yields:
+`{"a":1,"b":2} \| . as {("a","b"):$q} \| $q` is `1` then `2`) or a **zero**-output one
+(`{(empty): $q}`, where real jq legitimately binds nothing and the body never runs, `[. as
+{(empty):$q} \| $q]` is `[]`) now **fans out correctly in value position**:
+`each_pattern_alternatives`/`each_pattern_alternatives_generic` (the `?//`-alternative loops both
+evaluators route a bare, non-`?//` pattern through too) run `body` once per binding-set
+`extract_pattern_bindings` yields, applying the pre-#2677 match-failure retry rule only to the
+key generator's own trailing error/break/halt once every binding-set's body has run — including
+the two hardest interaction cases: a body error partway through a fan-out abandons the
+*remaining* key outputs and retries the next `?//` alternative, keeping whatever already ran
+(`[. as {("a","b"):$q} ?// $z \| if $q==2 then error("boom") else $q end]` on `{"a":1,"b":2}` is
+`[1,null]`), and a zero-output key still *wins* inside a `?//` chain (no fallthrough) even though
+it contributes nothing. `test_pattern_computed_key_fans_out_in_value_position_2677`
+(`tests/jq_cli_tests.rs`) pins both. A third interaction case PR #2873 review found and fixed:
+`key_control` (the key generator's own trailing control, e.g. a `Halt` its *last*, never-bound
+output raised) is computed eagerly, before any binding-set's body runs — an earlier binding-set's
+body already deciding to retry the next `?//` alternative must not silently drop a pending
+`Halt`/uncatchable `Error` that trailing control carries; both evaluators now check it first,
+with priority over any retry decision (`test_pattern_computed_key_review_fixes_2873`).
 
 **Path position does not fan out yet** — `walk_pattern`/`resolve_as_pattern`/
 `try_pattern_alternatives` still collapse to a single result via
@@ -1001,7 +1013,14 @@ that motivated `extract_single_pattern_binding` in the first place: fanning out 
 each call site's own retry/register machinery threaded through, not just the core function.
 `reduce`/`foreach`'s own pattern (`eval_reduce_with_values`/`substitute_foreach_steps`'s
 pre-loop substitution-matrix builders) is unaffected either way — a multi-output computed key
-there still refuses in both value and path position.
+there still refuses in both value and path position. Tracked as follow-up
+[#2872](https://github.com/rust-works/succinctly/issues/2872), alongside `walk_pattern`'s own
+narrower gap that a `Halt`/`Break` interrupting a computed key's generator in path position (or
+in `reduce`/`foreach`'s own pattern) currently downgrades to an ordinary, catchable refusal
+rather than true uncatchable/unwind semantics — a real, but bounded, fidelity gap (still a clean
+refusal, never a wrong value), left for that same follow-up rather than the deeper
+`Result<_, EvalError>` → `Result<_, EvalEscape>` signature change `walk_pattern` would need to
+carry a real `Halt`/`Break` through path-tracking's register machinery.
 
 A related, narrower gap the fix surfaced and closed along the way: `map_subexprs`
 (`src/jq/walk.rs`) — the shared tree-rewrite primitive `install_def_calls`/`bind_def` and
@@ -1011,12 +1030,20 @@ only destructuring names, never an `Expr`") that held before #2677 and silently 
 computed key gave a pattern entry a real `Expr` to hold. Concretely, `def f: "a"; . as {(f):$q}
 \| $q` wrongly raised "undefined function: f/0" even though `f` *is* defined, and an outer
 `$var` referenced inside a computed key was left unsubstituted — both fixed by a new
-`map_pattern_subexprs` helper. Three siblings with the analogous gap — `any_subexpr`,
-`node_reads_ambient`, and `resolve::check` (`src/jq/resolve.rs`) not descending into a computed
-key either — are, confirmed live, in the safe direction only (a missed static-analysis
-optimization, or jq's own compile-time "undefined function" check surfacing one stage later as
-a runtime error instead of at parse time) and are left for #2677's own remaining
-walker-invariant audit.
+`map_pattern_subexprs` helper. PR #2873 review found the identical gap in two more,
+separate hand-written traversals `map_subexprs` does not cover: `substitute_func_param_impl`
+(a `$`-style `def` parameter referenced inside a computed key was never substituted, `def
+f($x): . as {($x): $y} \| $y; f("a")` wrongly raised "undefined variable: $x") and
+`substitute_var_impl`'s own shadow-guarded `Reduce`/`Foreach`/`AsPattern` arms (when the
+pattern's *own* binding shadows the outer variable for its body, the computed key — which
+resolves *before* that shadow takes effect — must still see the outer value, `"a" as $x \| (.
+as {($x): $x} \| $x)` wrongly raised the same "undefined variable" error). Both fixed the same
+way, with `map_pattern_subexprs` wired into their own `Reduce`/`Foreach`/`AsPattern` arms.
+Three siblings with the analogous gap — `any_subexpr`, `node_reads_ambient`, and
+`resolve::check` (`src/jq/resolve.rs`) not descending into a computed key either — are,
+confirmed live, in the safe direction only (a missed static-analysis optimization, or jq's own
+compile-time "undefined function" check surfacing one stage later as a runtime error instead of
+at parse time) and are left for the same #2872 follow-up's walker-invariant audit.
 
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
 [#1872](https://github.com/rust-works/succinctly/issues/1872),

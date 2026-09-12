@@ -48859,6 +48859,75 @@ fn test_pattern_computed_key_fans_out_in_value_position_2677() -> Result<()> {
     Ok(())
 }
 
+/// #2873 (PR #2677 review): four bugs found and fixed in code review, each
+/// confirmed live against jq 1.7.1 before the fix and pinned here after.
+#[test]
+fn test_pattern_computed_key_review_fixes_2873() -> Result<()> {
+    for (input, filter, expected) in [
+        // A computed key can resolve to a *number* and index an *array*
+        // target exactly like `.[EXPR]` does -- real jq's `INDEX` bytecode
+        // is generic, not object-only. The original implementation
+        // unconditionally required a string key, wrongly raising "Cannot
+        // index array with number" here.
+        (r#"[10,20,30]"#, "def one: 1; . as {(one):$q} | $q", "20\n"),
+        (
+            r#"[10,20,30]"#,
+            "def one: 1; path(. as {(one):$q} | $q)",
+            "[1]\n",
+        ),
+        (
+            r#"[10,20,30]"#,
+            "def negone: -1; path(. as {(negone):$q} | $q)",
+            "[-1]\n",
+        ),
+        (
+            r#"[10,20,30]"#,
+            "def one: 1; reduce . as {(one):$q} (0; .+$q)",
+            "20\n",
+        ),
+        // `map_subexprs`'s #2677 fix (`c15aa1287`) covered the ordinary
+        // `install_def_calls`/`substitute_var_impl` catch-all path, but two
+        // separate, hand-written traversals had the identical gap:
+        // `substitute_func_param_impl` (a `$`-style def parameter) and
+        // `substitute_var_impl`'s own shadow-guarded arms (an outer
+        // variable the pattern's binding shadows for its body, but not for
+        // its own computed key, which runs before the shadow takes
+        // effect).
+        (
+            r#"{"a":1}"#,
+            "def f($x): . as {($x): $y} | $y; f(\"a\")",
+            "1\n",
+        ),
+        (
+            r#"{"a":42}"#,
+            "\"a\" as $x | (. as {($x): $x} | $x)",
+            "42\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // `each_pattern_alternatives`/`each_pattern_alternatives_generic`
+    // compute `key_control` eagerly, before any binding-set's body runs --
+    // an earlier binding-set's body triggering a `?//` retry must not drop
+    // a `Halt` (or uncatchable `Error`) the key generator's own later,
+    // never-processed output already raised. Confirmed live: real jq is
+    // lazy and never reaches `halt_error(7)` at all here (retries `$z`
+    // before pulling the key generator's second output), so its own exit
+    // code (0) is not what this pins -- succinctly's eager design already
+    // executes `halt_error(7)` (its stderr dump proves that), so the
+    // process must actually halt with its exit code once that happened,
+    // not silently swallow it into an ordinary alternative fallthrough.
+    let filter = ". as {(\"a\", halt_error(7)):$q} ?// $z | \
+                  if $q==1 then error(\"boom\") else ($q // $z) end";
+    let (_, _, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 7, "`{filter}` must actually halt, not retry `?//`");
+
+    Ok(())
+}
+
 /// #2677: path position (`walk_pattern`/`resolve_as_pattern`) does not yet
 /// fan out over a multi-output or zero-output computed key the way value
 /// position now does -- refuses clearly (a dedicated, distinctive message)
