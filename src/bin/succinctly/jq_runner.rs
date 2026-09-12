@@ -260,19 +260,28 @@ impl ModuleLoader {
     pub fn process_program(&mut self, program: &Program) -> Result<Expr, ModuleLoadError> {
         let mut expr = program.expr.clone();
 
-        // First, prepend auto-loaded ~/.jq definitions (lowest priority, can be overridden)
-        for (name, params, body) in self.auto_loaded_defs.clone().into_iter().rev() {
-            expr = Expr::FuncDef {
-                name,
-                params,
-                body: Box::new(body),
-                then: Box::new(expr),
-                bound: FuncDefBound::default(),
-            };
-        }
-
-        // Process includes (definitions merged into current scope)
-        for include in &program.includes {
+        // #2682: each `expr = FuncDef { .., then: expr }` wraps the *previous*
+        // `expr` one layer further in, so whichever source is processed
+        // FIRST ends up nearest the original body -- the innermost def, and
+        // therefore the one jq's own innermost-first scoping resolves a
+        // name to. The two facts this loop order has to get right, both
+        // confirmed live against jq 1.7.1:
+        //
+        // - `include` outranks `~/.jq`: a name defined in both resolves to
+        //   the `include`d one (`~/.jq`'s own def is still visible, and
+        //   still outranks the same name in a module that was never
+        //   included -- just not one that was).
+        // - among multiple `include`s defining the same name, the *last*
+        //   declared one wins, not the first -- `include "pa"; include
+        //   "pb"; foo` answers `pb`'s `foo`, and reversing the two
+        //   `include`s reverses the answer.
+        //
+        // So `program.includes` is walked in reverse (declaration order
+        // last-to-first) so the last-declared include is processed first
+        // and ends up innermost, and the whole includes block runs before
+        // the `~/.jq` block below so every include ends up nested inside
+        // `~/.jq`'s own defs, not the other way around.
+        for include in program.includes.iter().rev() {
             let defs = self.load_module(&include.path)?;
             // Wrap expression with function definitions from the included module
             for (name, params, body) in defs.into_iter().rev() {
@@ -284,6 +293,19 @@ impl ModuleLoader {
                     bound: FuncDefBound::default(),
                 };
             }
+        }
+
+        // `~/.jq`'s own defs: lowest priority of the two unqualified
+        // sources (loses to any `include`d module of the same name, but
+        // still beats a name that was never `include`d at all).
+        for (name, params, body) in self.auto_loaded_defs.clone().into_iter().rev() {
+            expr = Expr::FuncDef {
+                name,
+                params,
+                body: Box::new(body),
+                then: Box::new(expr),
+                bound: FuncDefBound::default(),
+            };
         }
 
         // Process imports (definitions available under namespace::)
