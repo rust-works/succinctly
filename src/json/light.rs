@@ -4117,6 +4117,40 @@ mod tests {
         assert_eq!(DocumentCursor::line_comment(&root), None);
     }
 
+    /// `DocumentCursor::is_document_content`'s default (`document.rs`,
+    /// unconditionally `false`) is what every JSON cursor uses -- JSON has no
+    /// document-stream concept (no `---`/`...` boundaries), so `JsonCursor`
+    /// never overrides it. Its only production caller
+    /// (`to_owned_with_comments`, #2795 PR B) is only ever invoked with a
+    /// `YamlCursor` in practice (`yq_runner.rs`), so this pins the default
+    /// directly, mirroring `test_document_cursor_line_comment_default_is_none_for_json`
+    /// just above.
+    #[test]
+    fn test_document_cursor_is_document_content_default_is_false_for_json() {
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        assert!(!DocumentCursor::is_document_content(&root));
+    }
+
+    /// `DocumentCursor::head_comment_raw`/`foot_comment_raw`'s defaults
+    /// (`document.rs`, unconditionally empty) are what every JSON cursor
+    /// uses -- JSON has no standalone-comment concept, so `JsonCursor` never
+    /// overrides either. Both production call sites
+    /// (`to_owned_with_comments_at_depth`, #2795 PR B review) gate on
+    /// `document_has_standalone_comments`, whose own JSON default is
+    /// `false`, so neither is ever reached for JSON in practice -- this pins
+    /// both defaults directly, same rationale as the `is_document_content`
+    /// test just above.
+    #[test]
+    fn test_document_cursor_head_and_foot_comment_raw_defaults_are_empty_for_json() {
+        let json = br#"{"a": 1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        assert!(DocumentCursor::head_comment_raw(&root).is_empty());
+        assert!(DocumentCursor::foot_comment_raw(&root).is_empty());
+    }
+
     /// `key_raw_source_span`'s non-`String` arm is unreachable via any real
     /// evaluation path -- `key_display_string_kind` only calls it once
     /// `string_decode_error()` is `Some`, which for this type is itself

@@ -1761,6 +1761,29 @@ mod tests {
         assert!(doc0_foot.is_empty(), "{doc0_foot:?}");
     }
 
+    /// A *second* blank-detached block after the boundary, before the new
+    /// document's first key opens, splits from the first instead of merging
+    /// onto it: the earlier block (`c1`) still reaches back across the
+    /// boundary onto the closing document's root foot the moment the second
+    /// block (`c2`) is recorded, and only `c2` goes forward -- exercising
+    /// `resolve_pending_block_backward`'s own boundary-fallback arm
+    /// (`src/yaml/parser.rs`), distinct from the single-block case above
+    /// which never calls it (the block settles once `.b`'s key opens, not
+    /// when a second comment line is recorded). Measured against pinned yq
+    /// v4.53.3: `select(di==0) | . | foot_comment` == "c1", document 1's own
+    /// root head is empty, and `.b | key | head_comment` == "c2".
+    #[test]
+    fn two_blank_separated_blocks_after_a_boundary_split_between_the_closing_document_and_the_next_key_2795(
+    ) {
+        let yaml = b"a: 1\n---\n# c1\n\n# c2\nb: 2\n";
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert_eq!(doc0_foot, ["# c1"]);
+        let (doc1_head, _) = doc_head_foot_at(yaml, 1);
+        assert!(doc1_head.is_empty(), "{doc1_head:?}");
+        let (b_head, _) = field_key_head_foot_in_doc(yaml, 1, "b");
+        assert_eq!(b_head, ["# c2"]);
+    }
+
     /// A leading block before the very first document's own `---` has no
     /// closing document to reach back to, so it must take the ordinary path
     /// (document 0's own head) rather than being silently dropped by the
