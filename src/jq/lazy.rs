@@ -548,22 +548,22 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// For a **CLI-output-boundary** call site (`write_output_jq_value`'s
     /// materialize arm and `-e`'s exit-status check, `jq_runner.rs`) rather
     /// than the evaluator's own hot recursion, where a panic stays deliberate
-    /// -- the identical split [`eval_generic::check_nesting_depth`] already
-    /// draws from [`eval_generic::assert_nesting_depth`] (#1818). Confirmed
-    /// live: `-e` alone on 500 levels of `[...]`-nested JSON used to leak
-    /// Rust's raw panic backtrace to stderr ahead of the clean, correctly
-    /// exit-5'd diagnostic `write_output`'s own `catch_unwind` already
-    /// produced -- the exit code and final message were always right, only
-    /// the extra noise ahead of them was the bug.
+    /// -- the identical split [`super::eval_generic::check_nesting_depth`]
+    /// already draws from [`super::eval_generic::assert_nesting_depth`]
+    /// (#1818). Confirmed live: `-e` alone on 500 levels of `[...]`-nested
+    /// JSON used to leak Rust's raw panic backtrace to stderr ahead of the
+    /// clean, correctly exit-5'd diagnostic `write_output`'s own
+    /// `catch_unwind` already produced -- the exit code and final message
+    /// were always right, only the extra noise ahead of them was the bug.
     ///
-    /// Delegates to [`try_cursor_to_owned`] for the `Cursor` arm rather than
-    /// the panicking [`cursor_to_owned`] -- the two nested depth budgets
+    /// Delegates to `try_cursor_to_owned` for the `Cursor` arm rather than
+    /// the panicking `cursor_to_owned` -- the two nested depth budgets
     /// (this one, `MAX_VALUE_TREE_DEPTH`-bounded; that one,
     /// `MAX_NESTING_DEPTH`-bounded, restarting from 0 whenever a `Cursor` is
     /// reached) mirror `materialize_at_depth`'s own split exactly, just with
     /// both sides checked instead of both sides panicking. Preserves
-    /// [`cursor_to_owned`]'s raw-number-byte semantics via
-    /// [`try_cursor_to_owned`] rather than switching to
+    /// `cursor_to_owned`'s raw-number-byte semantics via
+    /// `try_cursor_to_owned` rather than switching to
     /// `eval_generic::to_owned_cursor`'s canonicalizing twin, which would
     /// silently reformat a JSON-sourced number's spelling on every
     /// `-S`/`-a`/`-C`/`-e` run -- exactly the risk that made a plain
