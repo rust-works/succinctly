@@ -1,0 +1,1 @@
+[[.[] | key], keys, (to_entries | map(.key)), [.[] | key | tag], [.[] | select(key == 1)], [.[] | select(key == "1")]]

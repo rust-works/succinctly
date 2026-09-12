@@ -3766,26 +3766,107 @@ Two rendering divergences, both readable back and both pinned:
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
 
-### A typed mapping key is not emitted as a node by `key` (#2763 residual)
+### Scalar `==`/`!=` compare by text with a wildcard -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); containers, the dedup builtins and lost spellings remain
+
+Real yq's `==`/`!=` is not typed equality. `isEquals` (`pkg/yqlib/operator_equals.go`,
+v4.53.3) answers `rhs is !!null` for a `!!null` left operand and otherwise, for two scalar
+nodes, `matchKey(lhs.Value, rhs.Value)` -- the node *texts*, with the right operand read
+as a wildcard pattern (`pkg/yqlib/matchKeyString.go`: `*` is zero or more bytes, `?`
+exactly one byte, nothing else is special, and the same matcher serves `.["a*"]`
+traversal). succinctly answered jq's typed equality for every one of these before #2785.
+Captured live (`-o=json -I0`):
+
+| filter                            | real yq | why                                        |
+|-----------------------------------|---------|--------------------------------------------|
+| `1 == "1"`, `"1" == 1`            | `true`  | text `1` both sides                        |
+| `true == "true"`                  | `true`  | text                                       |
+| `!!str 1 == 1`                    | `true`  | the tag does not reach `matchKey`          |
+| `1 == 1.0`, `1e3 == 1000`         | `false` | text (`STRICT_NUMERIC_EQUALITY`, #950, agrees) |
+| `"abc" == "a*"`, `1 == "*"`       | `true`  | the right operand is a pattern             |
+| `"a*" == "abc"`                   | `false` | the left never is                          |
+| `null == "null"`, `null == "*"`   | `false` | a `!!null` left operand needs a `!!null` right |
+| `"null" == null`                  | `true`  | a `!!null` *right* operand is the text `null` |
+| `"~" == null`, `0 == null`        | `false` | that text is its spelling                  |
+| `.[] \| select(key == "ab*")`     | matches `abc`, `abd` | the everyday use              |
+
+Fixed as `eval::yq_scalar_text_eq`, consulted from `eval::apply_compare_op` beside
+#2483's `yq_null_ordering_is_false`, so all three evaluators take it; the matcher is
+`glob::yq_match_key` (`src/jq/glob.rs`), a byte-for-byte port. String-against-string
+stays a plain byte compare unless the pattern holds a wildcard; only a number allocates
+its text (`numeric_display_string`, so `==` and `tostring` agree about a computed value).
+
+**Not reproduced**, each its own issue:
+
+- **A container pairing is never equal in yq** ([#2799](https://github.com/rust-works/succinctly/issues/2799)):
+  `[1] == [1]`, `{} == {}` and even `. == .` are `false` there; succinctly keeps
+  structural equality (`true`). The dedup builtins are the other half of the same issue:
+  yq's `unique`/`unique_by`/`group_by` key on the scalar text *without* the wildcard
+  (`[1, "1"] | unique` is `[1]`), which is exactly why the text rule lives beside
+  `owned_value_eq` rather than inside it -- a glob is neither symmetric nor transitive
+  and cannot key a map -- so `unique`/`group_by`/`contains`/array `-` still use typed
+  equality here.
+- **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
+  `True == "true"` and `!!bool "yes" == true` are `true` here (yq `false`, its text is
+  `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or
+  underscored integer compares by its resolved decimal text (`1 == 01` is `true` here,
+  `false` in yq). Every one of these already shows in `tostring`.
+- **The reindex bridge re-spells a computed float**: `[(0.5+0.5)] | .[0] == 1` is `true`
+  in yq and `false` here, because the bridge serializes the computed `Float(1.0)` as
+  `1.0` and the text rule then sees `1.0` -- the same pre-existing artefact behind
+  `[(0.5+0.5)] | .[0] | tostring` printing `"1.0"` (yq `"1"`). `(0.5+0.5) == 1` itself,
+  which never crosses the bridge, is `true` in both.
+
+Pinned by the `yq_text_equality_2785` module (`tests/yq_cli_tests.rs`), the
+`scalar_text_equality_2785`/`scalar_wildcard_equality_2785` goldens, and the
+`glob` unit tests.
+
+### A typed mapping key is a node -- resolved ([#2785](https://github.com/rust-works/succinctly/issues/2785)); its spelling, the path register and an owned rebuild remain
 
 `key` emits the key **node** of a string-keyed member since #2763, so `line_comment`,
 `head_comment`, `foot_comment`, `line`, `column`, `style` and `anchor` after it read the
-key's own metadata, matching yq v4.53.3. A *typed* (non-string) key does not: `1: x`,
-`true: y` and `null: z` keep the display string `key` always emitted, so their metadata
-still reads the no-cursor default (`.["1"] | key | line` is `0`; yq answers `1`), and
-`[.[] | key]` prints `["1", "true", "null"]` where yq prints `[1, true, null]`.
+key's own metadata, matching yq v4.53.3. #2785 extends that to a *typed* key: `1: x`,
+`true: y`, `null: z` and `1.5: w` are `!!int`/`!!bool`/`!!null`/`!!float` nodes through
+`key`, `keys`, `to_entries` and `with_entries`, as in yq -- `[.[] | key]` prints
+`[1, true, null, 1.5]`, `key | tag` answers `!!int`, `.["1"] | key | line` answers `1`,
+`to_entries | .[0].key + 1` is `2`, and `with_entries(.key |= . + 1)` on `1: x` is `2: x`.
+`select(key == 1)` and `select(key == "1")` both match it, because yq-mode `==` compares
+scalars by text (the entry above) -- the divergence #2763 had stopped at.
 
-Deliberate, and blocked on a different divergence rather than on this mechanism: real yq's
-scalar `==` is stringly (`1 == "1"` is `true` there, `false` here), so it can emit an
-`!!int` key node and still answer `select(key == "1")`. succinctly's `==` is typed, so
-emitting one would break `select(key == "1")` — which matches yq today — to fix a metadata
-read that nothing else depends on. The key-node hop therefore takes the string case only
-(`key_node_spells`, `src/jq/eval_generic.rs`), and every other key falls back to the
-display string byte-for-byte: a complex `? [a, b]` key, an explicitly tagged key, a key
-whose bytes do not decode, and a node that is not the raw member value.
+The type is decided where a key is materialized (`key_owned_value` and the walk's
+`path_context_item_to_owned`, `src/jq/eval_generic.rs`), behind #2763's
+`key_spelling_may_retype` prefilter, so the `as_i64`/`as_f64` parse attempts are still
+paid only by a key spelled like a number, bool or null. A complex `? [a, b]` key, an
+explicitly tagged key and a key whose bytes do not decode keep the display-string route,
+unchanged from #2763.
 
-Pinned by `key_node_metadata_2763::a_typed_key_keeps_its_display_string_2763`
-(`tests/yq_cli_tests.rs`), so closing the typing gap has to update this together.
+Three residuals, each captured live from v4.53.3:
+
+- **The spelling is gone** ([#2802](https://github.com/rust-works/succinctly/issues/2802)).
+  `OwnedValue` keeps no text for a null, a bool or a non-canonical integer, so a `~` key
+  prints `null` where yq prints `~` (`keys`, `[.[] | key | tostring]`), a `01` key compares
+  and prints as `1` (`select(key == 1)` on a document with both `1:` and `01:` matches
+  both; yq only the first), and `to_entries | from_entries` on a mapping holding both a
+  `null:` and a `~:` key collapses them into one member -- the same class as `~ | tostring`
+  printing `"null"` for a value.
+- **The path register stays a string** ([#2801](https://github.com/rust-works/succinctly/issues/2801)).
+  yq's `path` types an `!!int` key as an integer component -- `[.[] | path]` on `1: x` is
+  `[[1]]` there and `[["1"]]` here -- and nothing else; `getpath`/`setpath`/`del` read the
+  register's `String`-vs-`Int` as object-key-vs-array-index, so the component is left alone.
+- **An owned object has string keys again.** After a DOM write (`.["1"] = "X" | .[] | key
+  | tag` is `!!int` in yq, `!!str` here) or through `with_entries`'s own result
+  (`with_entries(.key |= . + 1) | keys | .[0] | tag`), the keys live in an
+  `IndexMap<String, _>` and their type is not recoverable. `entries_to_object`
+  stringifies a typed key on reassembly in both tools (#2521), so `with_entries(.)` itself
+  agrees.
+- **Traversal does not match a key by text** ([#2800](https://github.com/rust-works/succinctly/issues/2800)).
+  yq's `.[1]` and `has(1)` find the `1:` member (its `matchKey` compares texts), and
+  `.["ab*"]`/`.ab*` fan out over every key the pattern matches; succinctly's lookups are
+  exact and string-only. Not a key-node question, but the same `matchKey` -- listed here
+  because `.[] | select(key == 1)` now matches while `.[1]` still does not.
+
+Pinned by `key_node_metadata_2763::a_typed_key_is_a_node_too_2785` and the
+`typed_key_node_2785` module (`tests/yq_cli_tests.rs`), plus the `typed_key_*_2785`
+goldens.
 
 Three narrower residuals of the same fix, each captured live from v4.53.3:
 

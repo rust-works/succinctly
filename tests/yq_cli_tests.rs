@@ -6679,9 +6679,14 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(eq_str.trim(), "true");
 
+    // `true`, not `false`: the tag resolves the node to the string `"1"`,
+    // and yq's `==` then compares that text against `1`'s text (#2785,
+    // captured live from v4.53.3 -- the earlier `false` pin here was never
+    // captured). `tag` still answers `!!str`, so the tag *is* honoured; it
+    // just cannot make two identical texts unequal.
     let (eq_num, code) = run_yq_stdin(".a == 1", "a: !!str 1\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(eq_num.trim(), "false");
+    assert_eq!(eq_num.trim(), "true");
 
     let (add, code) = run_yq_stdin(".a + 1", "a: !!int \"5\"\n", &[])?;
     assert_eq!(code, 0);
@@ -6697,11 +6702,24 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(eq_null.trim(), "true");
 
+    // Real yq answers `false` here (captured, v4.53.3): its `==` compares
+    // the node's *text* `yes` against `true` (#2785). The tag resolves the
+    // value to `Bool(true)` on the way to `OwnedValue`, and that spelling is
+    // gone by the time `==` runs -- the same spelling class as `.a |
+    // tostring` printing `"true"` where yq prints `"yes"`. A recorded
+    // residual, not a target.
     let (eq_bool, code) = run_yq_stdin(".a == true", "a: !!bool \"yes\"\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(eq_bool.trim(), "true");
 
+    // `false`, as in real yq (captured): text `5` against `5.0`. The tag
+    // still makes the node a float -- `.a == 5` is `true` in both, and the
+    // materialized value is what `tagged_scalar_to_owned`'s Float arm built.
     let (eq_float, code) = run_yq_stdin(".a == 5.0", "a: !!float \"5\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq_float.trim(), "false");
+
+    let (eq_float, code) = run_yq_stdin(".a == 5", "a: !!float \"5\"\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(eq_float.trim(), "true");
 
@@ -22602,12 +22620,18 @@ fn test_yq_ordering_still_widens_int_and_float_950() -> Result<()> {
     Ok(())
 }
 
-/// Sanity: a strict numeric-vs-non-numeric comparison is unaffected --
-/// `2 == "2"` is `false` in both jq and yq, and #950's gate only fires
-/// when *both* operands are already numeric.
+/// Sanity: #950's gate only fires when *both* operands are numeric. A
+/// numeric-vs-string comparison is decided by yq's text rule instead
+/// (#2785): `2 == "2"` is `true` in real yq (captured live from v4.53.3 --
+/// this test pinned `false` from memory before #2785 captured it), and
+/// `false` in jq.
 #[test]
 fn test_yq_equality_numeric_vs_string_unaffected_950() -> Result<()> {
     let (out, code) = run_yq_stdin(r#". == "2""#, "2", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(r#". == "2.0""#, "2", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
     Ok(())
@@ -44887,26 +44911,23 @@ mod key_node_metadata_2763 {
         ])
     }
 
-    /// A *typed* (non-string) mapping key keeps the display string real yq
-    /// renders as an `!!int`/`!!bool`/`!!null` node, so its metadata still
-    /// reads the no-cursor default. Deliberate and recorded in
-    /// `docs/compliance/yq/limitations.md`: yq's scalar `==` is stringly
-    /// (`1 == "1"` is `true`) where succinctly's is typed, so emitting a
-    /// typed key node would break `select(key == "1")`, which matches yq
-    /// today. Pinned so closing that gap has to update this together.
+    /// A *typed* (non-string) mapping key is a node too (#2785): its
+    /// metadata answers from the key, and `select(key == "1")` still matches
+    /// because yq-mode `==` compares scalars by text (the divergence #2763
+    /// stopped at). The type side of it is `typed_key_node_2785` below.
     #[test]
-    fn a_typed_key_keeps_its_display_string_2763() -> Result<()> {
+    fn a_typed_key_is_a_node_too_2785() -> Result<()> {
         const TYPED: &str = "1: x\ntrue: y\n";
         check(&[
-            (".[\"1\"] | key | line", TYPED, "0\n"),
+            (".[\"1\"] | key | line", TYPED, "1\n"),
             // Same through a `tostring` detour into the owned domain first.
-            (".[\"1\"] | tostring | key | line", TYPED, "0\n"),
-            ("[.[] | key | select(. == \"1\")]", TYPED, "- \"1\"\n"),
+            (".[\"1\"] | tostring | key | line", TYPED, "1\n"),
+            ("[.[] | key | select(. == \"1\")]", TYPED, "- 1\n"),
             (".[] | select(key == \"1\")", TYPED, "x\n"),
-            // A string key beside a typed one still answers, on both the
-            // sink route and the collecting one.
-            (".[] | key | line", "a: 1\n1: 2\n", "1\n0\n"),
-            ("[.[] | key | line]", "a: 1\n1: 2\n", "- 1\n- 0\n"),
+            // A string key beside a typed one answers on both the sink
+            // route and the collecting one, and so does the typed one now.
+            (".[] | key | line", "a: 1\n1: 2\n", "1\n2\n"),
+            ("[.[] | key | line]", "a: 1\n1: 2\n", "- 1\n- 2\n"),
         ])
     }
 
@@ -45319,4 +45340,468 @@ fn test_yq_sort_keys_vivifies_past_a_fanout_known_gap_2870() -> Result<()> {
         "a:\n  - b: 2\n    q: 1\n  - q: 3\n    b: null"
     );
     Ok(())
+}
+
+/// #2785: real yq's `==`/`!=` between two scalars compares their *text*, with
+/// its wildcard matcher applied to the right-hand operand -- not jq's typed
+/// equality. See `eval::yq_scalar_text_eq`. Every expectation below was
+/// captured live from yq v4.53.3 with `-o=json -I0`.
+mod yq_text_equality_2785 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    /// One member per (type, spelling) pairing the rule has to tell apart.
+    const VALS: &str = "a: 1\nb: \"1\"\nc: true\nd: \"true\"\ne: null\nf: \"null\"\n\
+                        g: 1.0\nh: \"1.0\"\ni: ~\nj: \"~\"\nl: !!str 1\nm: abc\n";
+
+    fn check(rows: &[(&str, &str)]) -> Result<()> {
+        for (filter, want) in rows {
+            let (out, code) = run_yq_stdin(filter, VALS, &["-o=json", "-I=0"])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out, format!("{want}\n"), "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// Type is irrelevant: a number, a bool and a string with the same text
+    /// are equal, and the same number spelled two ways is not.
+    #[test]
+    fn scalars_compare_by_text_2785() -> Result<()> {
+        check(&[
+            (".a == .b", "true"),
+            (".b == .a", "true"),
+            ("1 == \"1\"", "true"),
+            ("\"1\" == 1", "true"),
+            (".c == .d", "true"),
+            ("true == \"true\"", "true"),
+            (".l == 1", "true"),
+            (".l == .a", "true"),
+            (".a == .g", "false"),
+            ("1 == 1.0", "false"),
+            (".g == .h", "true"),
+            ("1.0 == \"1.0\"", "true"),
+            (".a != .b", "false"),
+            (".a != .g", "true"),
+            ("\"a\" == \"A\"", "false"),
+            ("(1 + 1) == \"2\"", "true"),
+            ("(0.5 + 0.5) == 1", "true"),
+            ("(0.5 + 0.5) == \"1\"", "true"),
+            (".a == (.b | tonumber)", "true"),
+        ])
+    }
+
+    /// `null` is the one type the rule keeps: a `!!null` left operand equals
+    /// only another `!!null`, while a `!!null` *right* operand is just the
+    /// text `null` to a scalar on the left.
+    #[test]
+    fn null_is_typed_on_the_left_and_text_on_the_right_2785() -> Result<()> {
+        check(&[
+            (".e == .i", "true"),
+            ("null == \"null\"", "false"),
+            (".e == .f", "false"),
+            ("null == \"*\"", "false"),
+            ("null == 0", "false"),
+            ("null != \"null\"", "true"),
+            ("\"null\" == null", "true"),
+            (".f == .e", "true"),
+            ("\"null\" != null", "false"),
+            ("0 == null", "false"),
+            ("\"nul?\" == null", "false"),
+            (".e == .j", "false"),
+            (".i == \"~\"", "false"),
+        ])
+    }
+
+    /// The right-hand operand is a pattern: `*` is zero or more bytes, `?`
+    /// exactly one byte, nothing else is special. The left never is.
+    #[test]
+    fn the_right_operand_is_a_wildcard_pattern_2785() -> Result<()> {
+        check(&[
+            (".m == \"a*\"", "true"),
+            ("\"abc\" == \"a*\"", "true"),
+            ("\"a*\" == \"abc\"", "false"),
+            ("\"abc\" == \"a?c\"", "true"),
+            ("\"abc\" != \"a*\"", "false"),
+            ("1 == \"*\"", "true"),
+            (".a == \"*\"", "true"),
+            ("true == \"t*\"", "true"),
+            ("\"Abc\" == \"a*\"", "false"),
+            ("\"a\" == \"[a]\"", "false"),
+            ("\"\" == \"\"", "true"),
+            ("\"\" == \"*\"", "true"),
+            ("\"a\" == \"\"", "false"),
+            ("\"é\" == \"?\"", "false"),
+            ("\"é\" == \"??\"", "true"),
+            ("[.[] | select(. == \"1*\")] | length", "5"),
+            (".[] | select(. == \"a*\")", "\"abc\""),
+        ])
+    }
+
+    /// Only `==`/`!=` take the text rule; the rest of the equality family
+    /// keeps its typed answer, and containers keep structural equality.
+    /// The first five rows differ from real yq (`[1]`, `[[1,"1"]]`, `1`,
+    /// `false`, `false`) and are recorded divergences in
+    /// `docs/compliance/yq/limitations.md`, pinned here so a change to any
+    /// of them is a deliberate one; the rest already agree with yq and
+    /// guard that the text rule stops at the scalar boundary.
+    #[test]
+    fn the_rest_of_the_equality_family_is_unchanged_2785() -> Result<()> {
+        check(&[
+            ("[.a, .b] | unique", "[1,\"1\"]"),
+            ("[.a, .b] | group_by(.)", "[[1],[\"1\"]]"),
+            ("[.a, .b] | group_by(.) | length", "2"),
+            ("[1] == [1]", "true"),
+            (". == .", "true"),
+            // Agree with yq already.
+            ("{\"x\": .a} == {\"x\": .b}", "false"),
+            ("[.a] == [.b]", "false"),
+            ("[.a] | contains([\"1\"])", "false"),
+            ("[.a, .g] | unique", "[1,1.0]"),
+            ("[1] == null", "false"),
+            ("null == [1]", "false"),
+        ])
+    }
+
+    /// jq mode is untouched: `1 == "1"` is `false` there, as in jq 1.7.1.
+    #[test]
+    fn jq_mode_keeps_typed_equality_2785() -> Result<()> {
+        for (filter, want) in [
+            ("1 == \"1\"", "false\n"),
+            ("\"abc\" == \"a*\"", "false\n"),
+            ("1 == 1.0", "true\n"),
+            ("\"null\" == null", "false\n"),
+        ] {
+            let (out, code) = super::run_jq_stdin(filter, "{}", &[])?;
+            assert_eq!(code, 0, "`{filter}`");
+            assert_eq!(out, want, "`{filter}`");
+        }
+        Ok(())
+    }
+}
+
+/// #2785: a typed mapping key (`1: x`, `true: y`, `null: z`, `1.5: w`,
+/// `~: u`) is an `!!int`/`!!bool`/`!!null`/`!!float` node through `key`,
+/// `keys` and `to_entries`, as in real yq -- not the display string those
+/// used to flatten it to. Every expectation was captured live from yq
+/// v4.53.3; the rows where it prints `~` for the null key are the one
+/// recorded spelling residual (`OwnedValue::Null` has no spelling, the same
+/// class as `~ | tostring`), so those pin `null`.
+mod typed_key_node_2785 {
+    use super::{run_jq_stdin, run_yq_stdin};
+    use anyhow::Result;
+
+    /// The issue's own document: one key per scalar type, a quoted `"2"`
+    /// that must stay a string, and `~` beside `null`.
+    const TYPED: &str = "1: x\ntrue: y\nnull: z\n1.5: w\n\"2\": v\n~: u\n";
+
+    fn check(rows: &[(&str, &str, &[&str], &str)]) -> Result<()> {
+        for (filter, input, args, want) in rows {
+            let (out, code) = run_yq_stdin(filter, input, args)?;
+            assert_eq!(code, 0, "`{filter}` {args:?} exited {code}: {out:?}");
+            assert_eq!(out, *want, "`{filter}` {args:?}");
+        }
+        Ok(())
+    }
+
+    const JSON: &[&str] = &["-o=json", "-I=0"];
+    const YAML: &[&str] = &[];
+
+    /// The issue's table: the three readers agree with each other and with
+    /// yq about every key's type.
+    #[test]
+    fn key_keys_and_to_entries_keep_the_type_2785() -> Result<()> {
+        const TAGS: &str = "[\"!!int\",\"!!bool\",\"!!null\",\"!!float\",\"!!str\",\"!!null\"]\n";
+        check(&[
+            ("[.[] | key]", TYPED, JSON, "[1,true,null,1.5,\"2\",null]\n"),
+            ("keys", TYPED, JSON, "[1,true,null,1.5,\"2\",null]\n"),
+            (
+                "to_entries | map(.key)",
+                TYPED,
+                JSON,
+                "[1,true,null,1.5,\"2\",null]\n",
+            ),
+            ("[.[] | key | tag]", TYPED, JSON, TAGS),
+            ("keys | map(tag)", TYPED, JSON, TAGS),
+            ("[keys[] | tag]", TYPED, JSON, TAGS),
+            ("to_entries | map(.key | tag)", TYPED, JSON, TAGS),
+            // YAML output, both the streaming `keys` writer and the
+            // collected array: the quoted key keeps its quotes, the typed
+            // ones print bare.
+            (
+                "[.[] | key]",
+                TYPED,
+                YAML,
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+            ),
+            (
+                "keys",
+                TYPED,
+                YAML,
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+            ),
+            (
+                "keys",
+                TYPED,
+                &["-I=0"],
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+            ),
+            (
+                "to_entries",
+                TYPED,
+                &["-I=0"],
+                "- key: 1\n  value: x\n- key: true\n  value: y\n- key: null\n  value: z\n\
+                 - key: 1.5\n  value: w\n- key: \"2\"\n  value: v\n- key: null\n  value: u\n",
+            ),
+            // The metadata getters answer from the typed key node (#2763's
+            // own table, which stopped at string keys).
+            ("[.[] | key | line]", TYPED, JSON, "[1,2,3,4,5,6]\n"),
+            (".[\"1\"] | key | line", TYPED, JSON, "1\n"),
+            (".[\"2\"] | key | style", TYPED, JSON, "\"double\"\n"),
+        ])
+    }
+
+    /// The discriminating rows: type and spelling disagree, and the typed
+    /// key matches both because yq-mode `==` compares scalars by text.
+    #[test]
+    fn a_typed_key_matches_both_spellings_2785() -> Result<()> {
+        check(&[
+            (".[] | select(key == 1)", TYPED, JSON, "\"x\"\n"),
+            (".[] | select(key == \"1\")", TYPED, JSON, "\"x\"\n"),
+            (".[] | select(key == true)", TYPED, JSON, "\"y\"\n"),
+            (".[] | select(key == \"true\")", TYPED, JSON, "\"y\"\n"),
+            (".[] | select(key == null)", TYPED, JSON, "\"z\"\n\"u\"\n"),
+            (".[] | select(key == 1.5)", TYPED, JSON, "\"w\"\n"),
+            (".[] | select(key == \"1.5\")", TYPED, JSON, "\"w\"\n"),
+            (".[] | select(key == 2)", TYPED, JSON, "\"v\"\n"),
+            (".[] | select(key == \"2\")", TYPED, JSON, "\"v\"\n"),
+            (
+                "[.[] | key | . == \"1\"]",
+                TYPED,
+                JSON,
+                "[true,false,false,false,false,false]\n",
+            ),
+            ("[.[] | key] | .[2] == null", TYPED, JSON, "true\n"),
+            (
+                "[.[] | key | select(. == null)] | length",
+                TYPED,
+                JSON,
+                "2\n",
+            ),
+            ("keys[] | select(. == 1)", TYPED, JSON, "1\n"),
+            (
+                "to_entries | map(select(.key == 1)) | length",
+                TYPED,
+                JSON,
+                "1\n",
+            ),
+            (
+                "to_entries | map(select(.key == true)) | length",
+                TYPED,
+                JSON,
+                "1\n",
+            ),
+            (
+                "with_entries(select(.key == 1))",
+                TYPED,
+                JSON,
+                "{\"1\":\"x\"}\n",
+            ),
+            (
+                "with_entries(select(.key == \"true\"))",
+                TYPED,
+                JSON,
+                "{\"true\":\"y\"}\n",
+            ),
+            (".[] | select(key == 1) | key | line", TYPED, JSON, "1\n"),
+        ])
+    }
+
+    /// A typed key is a number to arithmetic and sorts as its type --
+    /// `sort` puts nulls, then bools, then numbers, then strings, as yq does.
+    #[test]
+    fn a_typed_key_computes_and_sorts_as_its_type_2785() -> Result<()> {
+        check(&[
+            ("[.[] | key] | .[0] + 1", TYPED, JSON, "2\n"),
+            ("keys | .[0] + 1", TYPED, JSON, "2\n"),
+            ("to_entries | .[0].key + 1", TYPED, JSON, "2\n"),
+            (
+                "[.[] | key] | sort",
+                TYPED,
+                JSON,
+                "[null,null,true,1,1.5,\"2\"]\n",
+            ),
+            (
+                "[.[] | key] | map(tostring)",
+                TYPED,
+                JSON,
+                "[\"1\",\"true\",\"null\",\"1.5\",\"2\",\"null\"]\n",
+            ),
+        ])
+    }
+
+    /// Rebuilding an object from typed keys stringifies them, as yq does
+    /// (#2521's rule; `~` comes back as `null`, the spelling residual).
+    #[test]
+    fn a_typed_key_stringifies_on_reassembly_2785() -> Result<()> {
+        const NO_TILDE: &str = "1: x\ntrue: y\n1.5: w\n\"2\": v\n";
+        check(&[
+            (
+                "with_entries(.)",
+                NO_TILDE,
+                JSON,
+                "{\"1\":\"x\",\"true\":\"y\",\"1.5\":\"w\",\"2\":\"v\"}\n",
+            ),
+            (
+                "to_entries | from_entries",
+                NO_TILDE,
+                JSON,
+                "{\"1\":\"x\",\"true\":\"y\",\"1.5\":\"w\",\"2\":\"v\"}\n",
+            ),
+            (
+                "with_entries(.key |= . + 1)",
+                "1: x\n2: y\n",
+                JSON,
+                "{\"2\":\"x\",\"3\":\"y\"}\n",
+            ),
+            (
+                "with_entries(select(.key == 2))",
+                "1: x\n2: y\n",
+                JSON,
+                "{\"2\":\"y\"}\n",
+            ),
+            (
+                "with_entries(.key |= tostring)",
+                "1: x\n2: y\n",
+                JSON,
+                "{\"1\":\"x\",\"2\":\"y\"}\n",
+            ),
+            // The body reads path context (`key` is the entry's index), so
+            // it runs on the positioned route; the entry's own `.key` is
+            // still the typed key.
+            (
+                "with_entries(.value = key | .key |= . + 1)",
+                "1: x\n2: y\n",
+                JSON,
+                "{\"2\":0,\"3\":1}\n",
+            ),
+            // A string key is untouched on both routes.
+            (
+                "with_entries(.key |= \"k_\" + .)",
+                "a: 1\nb: 2\n",
+                JSON,
+                "{\"k_a\":1,\"k_b\":2}\n",
+            ),
+            (
+                "with_entries(.value = key)",
+                "a: 1\nb: 2\n",
+                JSON,
+                "{\"a\":0,\"b\":1}\n",
+            ),
+        ])
+    }
+
+    /// The native `with_entries` arm keeps `?`'s suppression and the
+    /// reassembly error exactly as the composed `to_entries | map(f) |
+    /// from_entries` had them: a body that raises, and a rebuilt key that
+    /// cannot be an object key, both raise without `?` and vanish under it.
+    #[test]
+    fn with_entries_raises_and_suppresses_as_before_2785() -> Result<()> {
+        const AB: &str = "a: 1\nb: 2\n";
+        for filter in [
+            "with_entries(.key = [1])",
+            "with_entries(.value |= error(\"boom\"))",
+        ] {
+            let (out, code) = run_yq_stdin(filter, AB, JSON)?;
+            assert_eq!(code, 1, "`{filter}`: {out:?}");
+        }
+        check(&[
+            ("[with_entries(.key = [1])?]", AB, JSON, "[]\n"),
+            (
+                "[with_entries(.value |= error(\"boom\"))?]",
+                AB,
+                JSON,
+                "[]\n",
+            ),
+            (
+                "with_entries(.key = [1])? // \"fallback\"",
+                AB,
+                JSON,
+                "\"fallback\"\n",
+            ),
+        ])
+    }
+
+    /// The keys that must *not* retype: a quoted spelling, an explicitly
+    /// tagged key, a JSON-sourced key (always a string), a string key
+    /// beside a typed one, and the key of a JSON document in jq mode.
+    #[test]
+    fn a_string_key_stays_a_string_2785() -> Result<()> {
+        check(&[
+            (".[\"2\"] | key | tag", TYPED, JSON, "\"!!str\"\n"),
+            (
+                "[.[] | key]",
+                "\"1\": a\n'true': b\n",
+                JSON,
+                "[\"1\",\"true\"]\n",
+            ),
+            ("keys", "\"1\": a\n'true': b\n", JSON, "[\"1\",\"true\"]\n"),
+            ("[.[] | key | tag]", "!!str 1: a\n", JSON, "[\"!!str\"]\n"),
+            ("keys", "!!str 1: a\n", JSON, "[\"1\"]\n"),
+            ("[.[] | key]", "a: 1\n1: 2\n", JSON, "[\"a\",1]\n"),
+            ("keys", "a: 1\n1: 2\n", JSON, "[\"a\",1]\n"),
+            (".[] | select(key == \"a\")", "a: 1\n1: 2\n", JSON, "1\n"),
+            (
+                "[.[] | key | tag]",
+                "{\"1\": \"a\", \"true\": \"b\"}",
+                &["-p=json", "-o=json", "-I=0"],
+                "[\"!!str\",\"!!str\"]\n",
+            ),
+            (
+                "keys",
+                "{\"1\": \"a\", \"true\": \"b\"}",
+                &["-p=json", "-o=json", "-I=0"],
+                "[\"1\",\"true\"]\n",
+            ),
+        ])?;
+        for filter in ["keys", "[.[] | key]", "to_entries | map(.key)"] {
+            let (out, code) = run_jq_stdin(filter, "{\"1\": \"a\", \"true\": \"b\"}", &["-c"])?;
+            assert_eq!(code, 0, "`{filter}`");
+            assert_eq!(out, "[\"1\",\"true\"]\n", "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// The DOM-forcing flags take a different output route and must answer
+    /// the same (`-P` and `--arg` both build a `CommentTree`).
+    #[test]
+    fn the_dom_forcing_flags_answer_the_same_2785() -> Result<()> {
+        for args in [vec!["-P"], vec!["--arg", "x", "1"], vec!["--sort-keys"]] {
+            let (out, code) = run_yq_stdin("[.[] | key | tag]", TYPED, &args)?;
+            assert_eq!(code, 0, "{args:?}");
+            assert_eq!(
+                out,
+                "- \"!!int\"\n- \"!!bool\"\n- \"!!null\"\n- \"!!float\"\n- \"!!str\"\n- \"!!null\"\n",
+                "{args:?}"
+            );
+            let (out, code) = run_yq_stdin(".[] | select(key == 1)", TYPED, &args)?;
+            assert_eq!(code, 0, "{args:?}");
+            assert_eq!(out, "x\n", "{args:?}");
+        }
+        Ok(())
+    }
+
+    /// An undecodable key keeps echoing its raw-byte fallback (#1247/#1642)
+    /// rather than being retyped or raised on.
+    #[test]
+    fn an_undecodable_key_keeps_its_fallback_2785() -> Result<()> {
+        // `\q` is not a YAML escape, so the key's bytes do not decode and
+        // it displays as `""` on every route, exactly as before #2785; the
+        // typed key beside it is unaffected.
+        const BAD: &str = "\"a\\q\": 1\n1: 2\n";
+        check(&[
+            ("keys", BAD, JSON, "[\"\",1]\n"),
+            ("[.[] | key]", BAD, JSON, "[\"\",1]\n"),
+            ("to_entries | map(.key)", BAD, JSON, "[\"\",1]\n"),
+        ])
+    }
 }
