@@ -6313,7 +6313,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         report_stream_decode_failure(&mut sink, &e);
                         stream_truncated.set(true);
                     } else {
-                        terminator.write_io($writer)?;
+                        // #2795 review: a header-only document's own
+                        // verbatim header already ends in its own captured
+                        // line break -- see `is_header_only_document`'s doc
+                        // comment -- so adding this terminator on top would
+                        // double-terminate it, printing a spurious blank
+                        // line real yq never has.
+                        if !$cursor.is_header_only_document() {
+                            terminator.write_io($writer)?;
+                        }
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
