@@ -6452,13 +6452,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
                 return Ok(code);
             }
-            let index = if fmt == InputFormat::Json {
+            let mut index = if fmt == InputFormat::Json {
                 // #2279: see `evaluate_yaml_direct_filtered`'s own call.
                 YamlIndex::build_json_sourced(&yaml_bytes)
             } else {
                 YamlIndex::build(&yaml_bytes)
             }
             .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+            // #2795: `-N` also drops the `---` lines of the first
+            // document's verbatim header, as real yq does.
+            if args.no_doc {
+                index.suppress_header_doc_markers();
+            }
 
             // #1350/#2486: `--sort-keys` has no soundness pass on the M2
             // fast path below -- fall back to the DOM evaluator (via
@@ -6640,13 +6645,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 } else {
                     YamlIndex::build(&yaml_bytes)
                 };
-                let index = match built {
+                let mut index = match built {
                     Ok(index) => index,
                     Err(e) => {
                         let e = anyhow::anyhow!("YAML parse error in {file_path}: {e}");
                         return flush_then_err(&mut writer, e);
                     }
                 };
+                if args.no_doc {
+                    index.suppress_header_doc_markers(); // #2795, see the stdin site
+                }
 
                 // #1350/#2486: see the stdin branch's identical check above
                 // for the full rationale.
@@ -7170,6 +7178,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // branch is genuine YAML; `_format` is unused here for that
                 // reason (still threaded through so the loop's tuple shape
                 // matches `input_sources`'s own type unchanged).
+                // No `suppress_header_doc_markers` here (#2795): a slurped
+                // array streams its documents as elements, never as
+                // documents, so no header is ever printed on this path.
                 let index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
                 parsed_sources.push((bytes, index));
@@ -7417,8 +7428,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // `can_inplace_fast_path` now requires `!any_input_is_json`
                 // (see its own doc comment), so `format` is never `Json`
                 // for any file reaching this branch.
-                let index = YamlIndex::build(&input_bytes)
+                let mut index = YamlIndex::build(&input_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
+                if args.no_doc {
+                    index.suppress_header_doc_markers(); // #2795, see the stdin site
+                }
                 let root = index.root(&input_bytes);
 
                 {

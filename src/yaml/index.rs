@@ -98,6 +98,24 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// struct already in scope everywhere it's needed avoids a much
     /// larger, cross-crate signature change for the same effect.
     canonicalize_numbers: bool,
+    /// Whether the leading header the first document re-emits verbatim
+    /// (#2795; `YamlCursor::stream_yaml_as_document`) keeps its `---`
+    /// lines. On by default; real yq's `-N` drops them along with every
+    /// other document separator, so the CLI clears this once after `build`.
+    /// Carried here for the same reason as `canonicalize_numbers` above.
+    header_doc_markers: bool,
+    /// Whether any node carries a standalone head/foot comment (#2795).
+    /// The streaming emitter consults this once per node before looking up
+    /// either list, so a comment-free document -- the common case, and the
+    /// one where the lookups would be pure overhead -- pays one predictable
+    /// branch per node instead of two map probes (measured +2% median,
+    /// +5% on sequences, before this gate).
+    has_standalone_comments: bool,
+    /// The leading header's byte length (#2795; see
+    /// `light.rs`'s `yq_header_len`), measured once on first use since every
+    /// standalone-comment write site consults it to keep a comment the
+    /// header already printed from printing a second time.
+    yq_header: OnceCell<(usize, bool)>,
 }
 
 /// Build cumulative popcount index for IB.
@@ -179,9 +197,15 @@ impl YamlIndex<Vec<u64>> {
             bp_to_anchor: semi.bp_to_anchor,
             aliases: semi.aliases,
             tags: semi.tags,
+            has_standalone_comments: semi
+                .comments
+                .values()
+                .any(|c| !c.head.is_empty() || !c.foot.is_empty()),
             comments: semi.comments,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
+            header_doc_markers: true,
+            yq_header: OnceCell::new(),
         };
         index.validate_alias_acyclicity()?;
         Ok(index)
@@ -243,8 +267,11 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             // in this codebase today; a future caller that needs it can be
             // given an explicit parameter then.
             comments: BTreeMap::new(),
+            has_standalone_comments: false,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
+            header_doc_markers: true,
+            yq_header: OnceCell::new(),
         }
     }
 
@@ -312,6 +339,36 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     #[inline]
     pub(crate) fn canonicalize_numbers(&self) -> bool {
         self.canonicalize_numbers
+    }
+
+    /// Drop the `---` lines from the verbatim header the first document
+    /// re-emits (#2795) -- real yq's `-N`. Like [`Self::mark_json_sourced`],
+    /// call once right after `build`, before streaming through any cursor.
+    pub fn suppress_header_doc_markers(&mut self) {
+        self.header_doc_markers = false;
+    }
+
+    /// Whether [`Self::suppress_header_doc_markers`] was *not* called.
+    #[inline]
+    pub(crate) fn header_doc_markers(&self) -> bool {
+        self.header_doc_markers
+    }
+
+    /// Whether any node carries a standalone head/foot comment (#2795).
+    #[inline]
+    pub(crate) fn has_standalone_comments(&self) -> bool {
+        self.has_standalone_comments
+    }
+
+    /// `measure(text)` once, cached: the first document's verbatim header
+    /// (#2795). `(0, false)` for a JSON-sourced index, which has none --
+    /// real yq only preprocesses a header for its YAML decoder.
+    #[inline]
+    pub(crate) fn yq_header(&self, measure: impl FnOnce() -> (usize, bool)) -> (usize, bool) {
+        if self.canonicalize_numbers {
+            return (0, false);
+        }
+        *self.yq_header.get_or_init(measure)
     }
 
     /// Get a reference to the interest bits words.
