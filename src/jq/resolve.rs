@@ -405,6 +405,11 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
         Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }) => 1,
         Expr::Range { to, step, .. } => 1 + usize::from(to.is_some()) + usize::from(step.is_some()),
         Expr::Error(msg) => usize::from(msg.is_some()),
+        // #2687: `break $x` desugars to a call to `error/0` -- see
+        // `parser.rs`'s `parse_break_expr`. The label name is not an
+        // argument (it's not even in scope as a call argument would be),
+        // so this is arity 0, same as a bare `error`.
+        Expr::Break(_) => 0,
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
             BuiltinKids::None => 0,
             BuiltinKids::One(_) => 1,
@@ -464,6 +469,13 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
             args
         }
         Expr::Error(msg) => msg.into_iter().map(|b| *b).collect(),
+        // #2687: `break $x`'s label name is not surfaced as an `error/0`
+        // argument -- see `builtin_fallback_arity`'s matching arm. Once this
+        // arm is reached, the shadowing `def error:` has already won (`check`
+        // only calls this after confirming `in_scope`), so the original
+        // `Expr::Break` -- label name included -- is simply discarded; it was
+        // never going to reach the label-catching machinery either way.
+        Expr::Break(_) => Vec::new(),
         // `builtin_kids` only ever borrows -- there is no by-value
         // counterpart, so this one case clones rather than moves. Bounded
         // even so: it can only fire once per node that check() has just
@@ -1076,6 +1088,86 @@ mod tests {
                 name: "nosuchfn".into(),
                 arity: 0,
             }]
+        );
+    }
+
+    /// #2687: `break $x` desugars to a resolvable `error/0` call -- a
+    /// same-name, same-arity `def error:` in scope at the break's own
+    /// position shadows it, same as any other call. Oracle: `jq-1.7.1`
+    /// answers `1`, `"S"`, `3` for
+    /// `def error: "S"; label $out | (1, break $out, 3)`.
+    #[test]
+    fn break_with_a_shadowing_arity_0_def_error_resolves_clean() {
+        assert_eq!(
+            resolve("def error: \"S\"; label $out | (1, break $out, 3)"),
+            Ok(())
+        );
+    }
+
+    /// #2687: an arity-1 `def error(m):` does not shadow a bare `break $x`
+    /// (arity 0) -- real jq's own `is_jq_builtin`-style arity distinction
+    /// applies here exactly as it does to a plain `error` call. Confirmed
+    /// live: `def error(m): "S1"; label $out | 1, break $out` still answers
+    /// `1` in jq 1.7.1.
+    #[test]
+    fn break_is_not_shadowed_by_a_different_arity_def_error() {
+        assert_eq!(
+            resolve("def error(m): \"S1\"; label $out | 1, break $out"),
+            Ok(())
+        );
+    }
+
+    /// #2687: with no `def error` anywhere in the program, `break $x` must
+    /// parse to the exact same `Expr::Break` node it always has -- not a
+    /// `FuncCall` that then falls back at resolve time. This is what keeps
+    /// every existing break/label test byte-for-byte unaffected by this
+    /// fix's parser change (`Parser::shadowable_defs`'s fast-reject, the
+    /// same one every other shadowable special form already relies on).
+    #[test]
+    fn break_with_no_def_error_anywhere_stays_a_bare_break_node() {
+        let mut expr = parse("label $out | break $out").expect("filter must parse");
+        assert!(
+            resolve_func_calls(&mut expr).is_ok(),
+            "must resolve with no unresolved calls"
+        );
+        assert!(
+            crate::jq::walk::any_subexpr(
+                &expr,
+                &mut |e| matches!(e, Expr::Break(name) if name == "out")
+            ),
+            "expected a bare Expr::Break(\"out\") node, found: {expr:?}"
+        );
+        assert!(
+            !crate::jq::walk::any_subexpr(&expr, &mut |e| matches!(
+                e,
+                Expr::FuncCall { name, .. } if name == "error"
+            )),
+            "must not have been wrapped as a FuncCall when nothing shadows it: {expr:?}"
+        );
+    }
+
+    /// #2687: the flip side of the above -- once a shadowing `def error:` is
+    /// genuinely in scope, the break site must resolve to a real call
+    /// (`DefCall`, after `eval::install_def_calls` runs) rather than staying
+    /// an `Expr::Break`. `resolve_func_calls` alone leaves a shadowed site as
+    /// an ordinary zero-arg `Expr::FuncCall { name: "error", .. }` -- the
+    /// `DefCall` rewrite is a separate, later eval-time pass -- so this
+    /// checks that intermediate shape directly.
+    #[test]
+    fn break_with_a_shadowing_def_error_becomes_an_error_call_node() {
+        let mut expr =
+            parse("def error: \"S\"; label $out | break $out").expect("filter must parse");
+        assert!(resolve_func_calls(&mut expr).is_ok());
+        assert!(
+            crate::jq::walk::any_subexpr(&expr, &mut |e| matches!(
+                e,
+                Expr::FuncCall { name, args, .. } if name == "error" && args.is_empty()
+            )),
+            "expected a resolved zero-arg `error` FuncCall node, found: {expr:?}"
+        );
+        assert!(
+            !crate::jq::walk::any_subexpr(&expr, &mut |e| matches!(e, Expr::Break(_))),
+            "the original Expr::Break must not survive once shadowed: {expr:?}"
         );
     }
 }

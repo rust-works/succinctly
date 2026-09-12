@@ -2878,6 +2878,39 @@ impl<'a> Parser<'a> {
 
     /// Parse a break expression.
     /// Syntax: break $name
+    /// #2687: real jq does not treat `break` as a primitive -- its parser
+    /// desugars `break $x` into a *named call* to `error/0` (`gen_call("error",
+    /// gen_noop())` in `parser.y`), resolved through ordinary lexical scope
+    /// exactly like any other call. That means a `def error:` in scope at the
+    /// break's own position intercepts it: the label stops catching it, the
+    /// def's value becomes an ordinary extra output, and evaluation continues
+    /// past the break instead of unwinding. succinctly's own `Expr::Break` is
+    /// evaluated directly with no name lookup, so a shadowing `def error:` had
+    /// no effect on it -- a silently wrong *number* of outputs, not just a
+    /// wrong value, per ADR-0018 (real jq's own inconsistency, reproduced
+    /// bug-for-bug).
+    ///
+    /// Mirrors `parse_shadowable_special_form`'s wrap step directly rather
+    /// than going through it: that helper's failure path
+    /// (`retry_shadow_candidate_as_generic_call`) re-parses the fallback as an
+    /// ordinary call *named after the keyword itself* (`break(...)`), which is
+    /// not the shape being desugared to here -- `break $x` never fails to
+    /// parse once the `$name` is read, so there is no failure path to share.
+    /// `shadowable_defs.contains("error")` is the same fast-reject the other
+    /// special forms use: on a program with no `def error` anywhere, this
+    /// parses to the exact `Expr::Break` node it always has, byte-identical
+    /// AST, zero evaluator cost.
+    ///
+    /// Deliberately does not carry jq's own `{"__jq":N}` sentinel value as the
+    /// wrapped call's (nonexistent) input -- a genuinely shadowing `def
+    /// error: .;` observes the ambient `.` here instead of that sentinel.
+    /// Recorded as a divergence in `docs/compliance/jq/limitations.md` rather
+    /// than chased: carrying it would mean *not* falling back to a bare
+    /// `Expr::Break` when nothing shadows it (the overwhelmingly common case),
+    /// widening the shape every break-aware evaluator arm
+    /// (`needs_path_context`, `owned_identity_step`, `path_context_step_generic`,
+    /// ...) has to recognize for no observable benefit outside that one
+    /// `def error: .;` construction.
     fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
         self.consume_keyword("break");
         self.skip_ws();
@@ -2889,7 +2922,12 @@ impl<'a> Parser<'a> {
         self.next();
         let name = self.parse_ident()?;
 
-        Ok(Expr::Break(name))
+        let node = Expr::Break(name);
+        if self.shadowable_defs.contains("error") {
+            Ok(Self::wrap_shadowable_call("error", node))
+        } else {
+            Ok(node)
+        }
     }
 
     /// Parse a `def`'s optional `(PARAMS)` parameter list, one [`Param`]
@@ -3607,6 +3645,7 @@ impl<'a> Parser<'a> {
                 | Expr::Range { .. }
                 | Expr::Error(_)
                 | Expr::Builtin(_)
+                | Expr::Break(_)
         ) || matches!(&original, Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }));
         if !is_recognized_special_form_shape {
             return original;

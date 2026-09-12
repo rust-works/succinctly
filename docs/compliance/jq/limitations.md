@@ -5431,6 +5431,64 @@ whole document that a streaming arm never read, and the M2 path was gated to kee
 from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
 records the 19 rows that moved away from jq and the spelling rule it left in place.
 
+### `break $x` shadowed by a `def error:` observes the ambient input, not jq's own `{"__jq":N}` sentinel (#2687)
+
+[#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
+as a primitive — its parser desugars `break $x` into a named call to `error/0`
+(`gen_call("error", gen_noop())` in `parser.y`), applied to a synthetic sentinel value
+(`{"__jq":N}`, `N` the label's compile-time index) as `.`. Name resolution then runs as it
+would for any other call, so a `def error:` (arity 0) in scope at the break's own position
+shadows it: the label stops catching it, the def's own value becomes an ordinary output, and
+evaluation continues past the break instead of unwinding.
+
+succinctly reproduces this (`src/jq/parser.rs`'s `parse_break_expr` wraps `break $x` as a
+shadowable `error` call the same way `error`, `limit`, `until`, ... already are, per
+`Parser::shadowable_defs`/`wrap_shadowable_call`, #2036), but does **not** carry jq's
+`{"__jq":N}` sentinel as the wrapped call's input — the shadowing def instead sees the ambient
+`.` the break itself was reached with:
+
+```console
+$ jq            -nc 'def error: .; label $out | break $out'
+{"__jq":0}
+$ succinctly jq -nc 'def error: .; label $out | break $out'
+null
+```
+
+**Why not carried.** The sentinel is observable only through a `def error:` whose body reads
+`.` — `def error: "S";` (the shape #2687 was actually filed over, and every case in its own
+repro table) is unaffected, since a literal body never looks at its input. Carrying it would
+mean the break can no longer fall back to a bare `Expr::Break` node when nothing shadows it —
+the overwhelmingly common case, and the one this fix's whole design (`Parser::shadowable_defs`'s
+text-only fast-reject) keeps at zero cost and byte-identical AST. It would instead need
+`Expr::Pipe(vec![Expr::Literal(<sentinel>), <the wrapped call>])`, widening the shape every
+break-aware evaluator arm has to recognize (`needs_path_context`, `owned_identity_step`,
+`path_context_step_generic`, `step_can_yield_absent`, `path_context_stage_preserves_node`, …)
+for a construction with no purpose outside probing this one divergence. Per ADR-0018's decision
+order: the reference behavior here is readable and nothing is corrupted, discarded, or takes the
+process down (no rule-4 condition), so the order reaches step 2 (closer match) — but the cost
+this row would add to every break site, shadowed or not, makes the narrower fix (#2687 itself,
+closing the *shadowing* gap) the one taken, with this payload detail recorded rather than chased.
+
+A second, related gap is **not** covered by #2687 or this entry: `label`'s own error re-raise
+(when a caught escape isn't a matching `Control::Break`) is *also* `gen_call("error",
+gen_noop())` in jq, resolved at the **label's** lexical position — so a shadowing `def error:`
+also intercepts an uncaught `error(...)`/division-by-zero/etc. escaping through a `label` block,
+which succinctly does not reproduce at all:
+
+```console
+$ jq            -nc 'def error: "S"; label $out | (1, error("x"), 2)'
+1
+"S"
+$ succinctly jq -nc 'def error: "S"; label $out | (1, error("x"), 2)'
+1
+jq: error (at <unknown>): x
+```
+
+Filed as [#2840](https://github.com/rust-works/succinctly/issues/2840) — a materially larger
+change (`eval_label`/`each_label`/`each_label_generic` and both owned-identity/path-context
+`Label` arms would each need their non-matching-escape fallthrough routed through a resolvable
+call), out of #2687's stated scope.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
