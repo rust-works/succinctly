@@ -4629,19 +4629,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.parse_double_quoted()?;
                             self.pos
                         }
+                        // No `json_strict` check needed on either arm here: this
+                        // "value deferred to the next line" scalar is reached only
+                        // through `parse_mapping_entry`, whose own call sites are
+                        // all gated by `parse_block_node`'s value-start chokepoint
+                        // (`&`/`!`/`*`) or its bare-mapping-entry rejection --
+                        // never reachable at all once `json_strict` is set (#2778
+                        // review; confirmed empirically, no path reaches this arm
+                        // with json_strict=true across the full suite plus a
+                        // targeted adversarial sweep).
                         Some(b'\'') => {
-                            if self.json_strict {
-                                return Err(self.err_json_strict_single_quote());
-                            }
                             self.parse_single_quoted()?;
                             self.pos
                         }
-                        _ => {
-                            let start = self.pos;
-                            let end = self.parse_unquoted_value_with_indent(indent);
-                            self.check_json_strict_scalar(start, end)?;
-                            end
-                        }
+                        _ => self.parse_unquoted_value_with_indent(indent),
                     };
                     self.set_bp_text_end(end_pos);
                     self.write_bp_close();
@@ -5160,10 +5161,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
+            // No `json_strict` check needed in this match: `parse_explicit_value`
+            // has exactly one caller, `parse_block_node`'s `:` explicit-value-
+            // indicator arm, which the chokepoint above already refuses
+            // unconditionally under `json_strict` (`:` has no JSON spelling) --
+            // this function is never entered at all once `json_strict` is set
+            // (#2778 review; confirmed empirically).
             Some(b'\'') => {
-                if self.json_strict {
-                    return Err(self.err_json_strict_single_quote());
-                }
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
@@ -5177,9 +5181,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 self.set_ib();
                 self.write_bp_open();
-                let start = self.pos;
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
-                self.check_json_strict_scalar(start, end_pos)?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -5190,6 +5192,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
     /// Parse an inline scalar value (on the same line as the key).
     /// Returns the end position of the scalar content.
+    /// No `json_strict` check needed anywhere in this match: both callers
+    /// (`parse_compact_mapping_entry`, `parse_mapping_entry`) are themselves
+    /// reachable only through `parse_block_node` arms the chokepoint above
+    /// already refuses under `json_strict` (`-`/`&`/`!`/`*`/bare-mapping-entry)
+    /// -- this function is never entered at all once `json_strict` is set
+    /// (#2778 review; confirmed empirically).
     fn parse_inline_value(&mut self, min_indent: usize) -> Result<usize, YamlError> {
         let end = match self.peek() {
             Some(b'"') => {
@@ -5197,18 +5205,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pos
             }
             Some(b'\'') => {
-                if self.json_strict {
-                    return Err(self.err_json_strict_single_quote());
-                }
                 self.parse_single_quoted()?;
                 self.pos
             }
-            _ => {
-                let start = self.pos;
-                let end = self.parse_unquoted_value_with_indent(min_indent);
-                self.check_json_strict_scalar(start, end)?;
-                end
-            }
+            _ => self.parse_unquoted_value_with_indent(min_indent),
         };
         Ok(end)
     }
@@ -5242,10 +5242,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.set_bp_text_end(self.pos);
                 self.write_bp_close();
             }
+            // No `json_strict` check needed anywhere in this match: every
+            // caller of `parse_value` that's reachable under `json_strict`
+            // (`parse_block_node`'s `{`/`[` arm, always) passes a `{`/`[`
+            // peek, which `try_dispatch_flow_or_block_value` above already
+            // handles and returns from -- this match's own arms are reached
+            // only via the anchor/dash edge cases and callers the chokepoint
+            // and dash-rejection above already exclude under `json_strict`
+            // (#2778 review; confirmed empirically, including the `- &a &b`
+            // double-anchor path below).
             Some(b'\'') => {
-                if self.json_strict {
-                    return Err(self.err_json_strict_single_quote());
-                }
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
@@ -5280,9 +5286,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 self.set_ib();
                 self.write_bp_open();
-                let start = self.pos;
                 let end_pos = self.parse_unquoted_value_with_indent(min_indent);
-                self.check_json_strict_scalar(start, end_pos)?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -7538,10 +7542,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.parse_double_quoted()?;
                             self.pos
                         }
+                        // No `json_strict` check needed on this quote arm: the
+                        // chokepoint at the top of this function already
+                        // refuses `'` as a value-start byte, so `self.peek()`
+                        // can never be `'` here once `json_strict` is set
+                        // (#2778 review; confirmed empirically). The unquoted
+                        // arm below still needs its own check -- `t`/`f`/`n`/
+                        // digit/`-` all pass the chokepoint but still need
+                        // full scalar-grammar validation (`True` vs `true`).
                         Some(b'\'') => {
-                            if self.json_strict {
-                                return Err(self.err_json_strict_single_quote());
-                            }
                             self.parse_single_quoted()?;
                             self.pos
                         }
