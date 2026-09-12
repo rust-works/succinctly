@@ -404,9 +404,41 @@ struct Parser<'a> {
     /// reparse can fire across this whole parse, so a deeply nested,
     /// arity-mismatched shadow candidate degrades to "stops shadowing past
     /// this depth" instead of the `O(2^depth)` blowup that function's own
-    /// doc comment describes. An ordinary, non-adversarial program never
-    /// comes close to this; the exact constant is not load-bearing.
+    /// doc comment describes.
+    ///
+    /// **"An ordinary, non-adversarial program never comes close to this"
+    /// was false until #2807.** Every one of `try_parse_builtin`'s 27
+    /// multi-argument and optional-arity arms used to reach that fallback
+    /// for a wrong-arity call under a shadowing `def`, so 65 flat
+    /// `def test(a;b;c): a; test(1;2;3)` calls -- or 7 nested ones,
+    /// the budget being spent `2^depth` times -- exhausted it and turned a
+    /// program jq 1.7.1 accepts into a raw `expected ')', found ';'` parse
+    /// error. Those arms now resolve the call in place
+    /// ([`Self::builtin_wrong_arity_or_expect`]) and draw nothing from this
+    /// budget, which is what makes the claim true again rather than a
+    /// larger constant would have: the nested shape is exponential, so
+    /// every constant is reachable at some small depth.
+    ///
+    /// What can still draw on it: a shadow candidate whose *dedicated*
+    /// parser fails for a reason that is not an argument boundary -- a
+    /// genuine syntax error inside an argument, which the generic reparse
+    /// rejects too. The constant is not load-bearing for those.
     shadow_retry_budget: usize,
+    /// #2807: the wrong-arity call a [`Self::try_parse_builtin`] arm
+    /// resolved in place, handed to its one caller alongside `Ok(None)`.
+    ///
+    /// That function answers `Result<Option<Builtin>, ParseError>`, and a
+    /// wrong-arity call is an `Expr::FuncCall` -- no `Builtin` at all -- so
+    /// an arm that has already parsed its arguments and then finds the
+    /// boundary wrong ([`Self::builtin_wrong_arity_or_expect`]) has nowhere
+    /// to return it. It parks it here and answers `Ok(None)`, the same "not
+    /// this builtin after all" signal [`Self::parse_required_single_arg`]'s
+    /// rewind already uses; `parse_primary_inner`'s `Ok(None)` arm takes it
+    /// instead of re-parsing the call from source.
+    ///
+    /// Always `None` between calls: the arm returns immediately after
+    /// parking, and the sole caller takes it as the first thing it does.
+    wrong_arity_call: Option<Expr>,
 }
 
 /// Where one ordinary function call's identifier begins in the filter source
@@ -531,6 +563,7 @@ impl<'a> Parser<'a> {
             call_sites: Vec::new(),
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
+            wrong_arity_call: None,
         }
     }
 
@@ -2057,6 +2090,14 @@ impl<'a> Parser<'a> {
                         // only fails later at name resolution), so jq mode
                         // keeps the postfix fix.
                         Ok(None) => {
+                            // #2807: an arm that had already parsed its
+                            // arguments when it found the boundary wrong
+                            // resolved the call itself (postfix included)
+                            // and parked it -- take it rather than
+                            // re-parsing the same text.
+                            if let Some(call) = self.wrong_arity_call.take() {
+                                return Ok(call);
+                            }
                             let call = self.parse_func_call_or_error()?;
                             if self.mode == ParserMode::Jq {
                                 self.parse_postfix(call)
@@ -3215,6 +3256,45 @@ impl<'a> Parser<'a> {
         self.expect(expected).map(|()| unreachable!())
     }
 
+    /// [`Self::wrong_arity_or_expect`] for a [`Self::try_parse_builtin`]
+    /// arm, whose answer is a `Builtin` rather than an `Expr` (#2807).
+    ///
+    /// The 27 multi-argument and optional-arity arms in that function
+    /// checked their argument boundaries with a bare `self.expect(';')?` /
+    /// `self.expect(')')?`, so a wrong-arity call under a shadowing `def`
+    /// reached `parse_primary_inner`'s `Err` arm and was recovered only by
+    /// [`Self::retry_shadow_candidate_as_generic_call`]'s re-parse -- which
+    /// re-scans the whole argument text from the keyword (`O(2^depth)` when
+    /// nested, #2686's shape) and spends one unit of the process-wide
+    /// [`SHADOW_RETRY_BUDGET`]. 65 flat `def test(a;b;c): a; test(1;2;3)`
+    /// calls, or 7 nested ones, exhausted that budget and turned a program
+    /// jq 1.7.1 accepts into a raw `expected ')', found ';'` parse error.
+    /// Handing the already-parsed arguments over instead reaches the same
+    /// generic call with no re-parse and no budget draw -- and, for an
+    /// *unshadowed* spelling, replaces that parse error with jq's own
+    /// `test/3 is not defined` (#2573's MULTI-ARG remainder).
+    ///
+    /// The parked `Expr` is collected by `parse_primary_inner`; see
+    /// [`Self::wrong_arity_call`] for why it travels in a field. Shaped as
+    /// "check, else return" like its sibling, so `args` moves only on the
+    /// diverging branch and the caller keeps using its own bindings on the
+    /// success path. yq mode raises `expect`'s own natural error, the same
+    /// carve-out every member of this family applies.
+    fn builtin_wrong_arity_or_expect(
+        &mut self,
+        start_pos: usize,
+        expected: char,
+        args: Vec<Expr>,
+    ) -> Result<Option<Builtin>, ParseError> {
+        let call = self.wrong_arity_or_expect(start_pos, expected, args)?;
+        debug_assert!(
+            self.wrong_arity_call.is_none(),
+            "a parked wrong-arity call was not collected by parse_primary_inner (#2807)"
+        );
+        self.wrong_arity_call = Some(call);
+        Ok(None)
+    }
+
     /// One shared definition of the 7-line argument-boundary checkpoint
     /// hand-copied at ~15 sites (#2391) across the eight dedicated
     /// special-form parsers that resolve a mismatch via
@@ -3555,8 +3635,22 @@ impl<'a> Parser<'a> {
     ///   reparses across the whole program to a small constant, keeping the
     ///   worst case linear instead of exponential -- past the budget,
     ///   `original_err` is propagated instead, the same as if `name` had
-    ///   never been a shadow candidate at all. Ordinary, non-adversarial
-    ///   programs never come close to exhausting it.
+    ///   never been a shadow candidate at all.
+    ///
+    ///   **#2807 corrected "ordinary, non-adversarial programs never come
+    ///   close to exhausting it."** They did: every wrong-arity call to one
+    ///   of `try_parse_builtin`'s 27 multi-argument and optional-arity
+    ///   builtins under a shadowing `def` arrived here, so 65 flat
+    ///   `def test(a;b;c): a; test(1;2;3)` calls, or 7 nested ones, spent
+    ///   the whole budget and rejected a program jq 1.7.1 accepts. Those
+    ///   arms resolve their own wrong-arity calls now
+    ///   ([`Self::builtin_wrong_arity_or_expect`]) and never reach this
+    ///   function; what is left here is a shadow candidate whose dedicated
+    ///   parser failed for a reason that is *not* an argument boundary --
+    ///   a genuine syntax error inside an argument, which this fallback's
+    ///   own reparse rejects as well. For those the retry only re-reports
+    ///   the same error, so exhausting the budget cannot change a
+    ///   program's verdict, only which error text it carries.
     fn retry_shadow_candidate_as_generic_call(
         &mut self,
         start_pos: usize,
@@ -3805,6 +3899,7 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("halt_error") {
             // Check halt_error before halt so "halt_error" isn't parsed as
             // "halt" followed by a stray "_error".
+            let keyword_start = self.pos;
             self.consume_keyword("halt_error");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -3812,7 +3907,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let code = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![code]);
+                }
+                self.next();
                 return Ok(Some(Builtin::HaltErrorCode(Box::new(code))));
             }
             return Ok(Some(Builtin::HaltError));
@@ -3852,6 +3950,7 @@ impl<'a> Parser<'a> {
         }
         // any, any(cond), any(gen; cond)
         if self.matches_keyword("any") {
+            let keyword_start = self.pos;
             self.consume_keyword("any");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -3864,16 +3963,27 @@ impl<'a> Parser<'a> {
                     self.skip_ws();
                     let cond = self.parse_expr()?;
                     self.skip_ws();
-                    self.expect(')')?;
+                    if self.peek() != Some(')') {
+                        return self.builtin_wrong_arity_or_expect(
+                            keyword_start,
+                            ')',
+                            vec![f, cond],
+                        );
+                    }
+                    self.next();
                     return Ok(Some(Builtin::AnyCond(Box::new(f), Box::new(cond))));
                 }
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
+                }
+                self.next();
                 return Ok(Some(Builtin::AnyF(Box::new(f))));
             }
             return Ok(Some(Builtin::Any));
         }
         // all, all(cond), all(gen; cond)
         if self.matches_keyword("all") {
+            let keyword_start = self.pos;
             self.consume_keyword("all");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -3886,10 +3996,20 @@ impl<'a> Parser<'a> {
                     self.skip_ws();
                     let cond = self.parse_expr()?;
                     self.skip_ws();
-                    self.expect(')')?;
+                    if self.peek() != Some(')') {
+                        return self.builtin_wrong_arity_or_expect(
+                            keyword_start,
+                            ')',
+                            vec![f, cond],
+                        );
+                    }
+                    self.next();
                     return Ok(Some(Builtin::AllCond(Box::new(f), Box::new(cond))));
                 }
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
+                }
+                self.next();
                 return Ok(Some(Builtin::AllF(Box::new(f))));
             }
             return Ok(Some(Builtin::All));
@@ -3935,9 +4055,19 @@ impl<'a> Parser<'a> {
         // IN(src; s) - true if any output of src equals any output of s
         if self.matches_keyword("IN") {
             self.reject_unless_jq_extensions("IN")?;
+            let keyword_start = self.pos;
             self.consume_keyword("IN");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`IN` alone is `IN/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let first = self.parse_expr()?;
             self.skip_ws();
@@ -3946,10 +4076,16 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let s = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![first, s]);
+                }
+                self.next();
                 return Ok(Some(Builtin::UpperInSrc(Box::new(first), Box::new(s))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![first]);
+            }
+            self.next();
             return Ok(Some(Builtin::UpperIn(Box::new(first))));
         }
 
@@ -4015,9 +4151,19 @@ impl<'a> Parser<'a> {
         // Check splits before split since split is a prefix of splits
         if self.matches_keyword("splits") {
             self.reject_unless_jq_extensions("splits")?;
+            let keyword_start = self.pos;
             self.consume_keyword("splits");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`splits` alone is `splits/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
@@ -4026,16 +4172,32 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::SplitsFlags(Box::new(re), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re]);
+            }
+            self.next();
             return Ok(Some(Builtin::Splits(Box::new(re))));
         }
         if self.matches_keyword("split") {
+            let keyword_start = self.pos;
             self.consume_keyword("split");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`split` alone is `split/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let s = self.parse_expr()?;
             self.skip_ws();
@@ -4052,17 +4214,33 @@ impl<'a> Parser<'a> {
                 // this is shared with `sub` below rather than a second
                 // hand-copied loop.
                 self.parse_yq_arity_leniency_tail()?;
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![s, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![s]);
+            }
+            self.next();
             return Ok(Some(Builtin::Split(Box::new(s))));
         }
         // match function - regex matching
         if self.matches_keyword("match") {
+            let keyword_start = self.pos;
             self.consume_keyword("match");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`match` alone is `match/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
@@ -4071,17 +4249,33 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::MatchFlags(Box::new(re), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re]);
+            }
+            self.next();
             return Ok(Some(Builtin::Match(Box::new(re))));
         }
         // capture function - named capture groups
         if self.matches_keyword("capture") {
+            let keyword_start = self.pos;
             self.consume_keyword("capture");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`capture` alone is `capture/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
@@ -4090,21 +4284,40 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::CaptureFlags(Box::new(re), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re]);
+            }
+            self.next();
             return Ok(Some(Builtin::Capture(Box::new(re))));
         }
         // sub function - replace first match
         if self.matches_keyword("sub") {
+            let keyword_start = self.pos;
             self.consume_keyword("sub");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`sub` alone is `sub/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![re]);
+            }
+            self.next();
             self.skip_ws();
             let replacement = self.parse_expr()?;
             self.skip_ws();
@@ -4121,26 +4334,53 @@ impl<'a> Parser<'a> {
                 // why this is shared with `split` above rather than a
                 // second hand-copied loop (#1439 review).
                 self.parse_yq_arity_leniency_tail()?;
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(
+                        keyword_start,
+                        ')',
+                        vec![re, replacement, flags],
+                    );
+                }
+                self.next();
                 return Ok(Some(Builtin::SubFlags(
                     Box::new(re),
                     Box::new(replacement),
                     Box::new(flags),
                 )));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(
+                    keyword_start,
+                    ')',
+                    vec![re, replacement],
+                );
+            }
+            self.next();
             return Ok(Some(Builtin::Sub(Box::new(re), Box::new(replacement))));
         }
         // gsub function - replace all matches
         if self.matches_keyword("gsub") {
             self.reject_unless_jq_extensions("gsub")?;
+            let keyword_start = self.pos;
             self.consume_keyword("gsub");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`gsub` alone is `gsub/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![re]);
+            }
+            self.next();
             self.skip_ws();
             let replacement = self.parse_expr()?;
             self.skip_ws();
@@ -4149,22 +4389,46 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(
+                        keyword_start,
+                        ')',
+                        vec![re, replacement, flags],
+                    );
+                }
+                self.next();
                 return Ok(Some(Builtin::GsubFlags(
                     Box::new(re),
                     Box::new(replacement),
                     Box::new(flags),
                 )));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(
+                    keyword_start,
+                    ')',
+                    vec![re, replacement],
+                );
+            }
+            self.next();
             return Ok(Some(Builtin::Gsub(Box::new(re), Box::new(replacement))));
         }
         // scan function - find all matches
         if self.matches_keyword("scan") {
             self.reject_unless_jq_extensions("scan")?;
+            let keyword_start = self.pos;
             self.consume_keyword("scan");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`scan` alone is `scan/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
@@ -4173,10 +4437,16 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::ScanFlags(Box::new(re), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re]);
+            }
+            self.next();
             return Ok(Some(Builtin::Scan(Box::new(re))));
         }
         if self.matches_keyword("join") {
@@ -4212,6 +4482,7 @@ impl<'a> Parser<'a> {
         }
         // Check flatten with depth before plain flatten
         if self.matches_keyword("flatten") {
+            let keyword_start = self.pos;
             self.consume_keyword("flatten");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -4219,7 +4490,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let depth = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![depth]);
+                }
+                self.next();
                 return Ok(Some(Builtin::FlattenDepth(Box::new(depth))));
             }
             return Ok(Some(Builtin::Flatten));
@@ -4302,9 +4576,19 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Implode));
         }
         if self.matches_keyword("test") {
+            let keyword_start = self.pos;
             self.consume_keyword("test");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`test` alone is `test/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let re = self.parse_expr()?;
             self.skip_ws();
@@ -4313,10 +4597,16 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re, flags]);
+                }
+                self.next();
                 return Ok(Some(Builtin::TestFlags(Box::new(re), Box::new(flags))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![re]);
+            }
+            self.next();
             return Ok(Some(Builtin::Test(Box::new(re))));
         }
         if self.matches_keyword("indices") {
@@ -4348,9 +4638,19 @@ impl<'a> Parser<'a> {
         // INDEX(stream; idx_expr) - build an object keyed by idx_expr from stream
         if self.matches_keyword("INDEX") {
             self.reject_unless_jq_extensions("INDEX")?;
+            let keyword_start = self.pos;
             self.consume_keyword("INDEX");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`INDEX` alone is `INDEX/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let first = self.parse_expr()?;
             self.skip_ws();
@@ -4359,13 +4659,23 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let idx_expr = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(
+                        keyword_start,
+                        ')',
+                        vec![first, idx_expr],
+                    );
+                }
+                self.next();
                 return Ok(Some(Builtin::UpperIndexStream(
                     Box::new(first),
                     Box::new(idx_expr),
                 )));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![first]);
+            }
+            self.next();
             return Ok(Some(Builtin::UpperIndex(Box::new(first))));
         }
         if self.matches_keyword("tojsonstream") {
@@ -4409,6 +4719,7 @@ impl<'a> Parser<'a> {
         // Phase 8: Advanced Control Flow Builtins
         // recurse, recurse(f), recurse(f; cond)
         if self.matches_keyword("recurse") {
+            let keyword_start = self.pos;
             self.consume_keyword("recurse");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -4421,10 +4732,20 @@ impl<'a> Parser<'a> {
                     self.skip_ws();
                     let cond = self.parse_expr()?;
                     self.skip_ws();
-                    self.expect(')')?;
+                    if self.peek() != Some(')') {
+                        return self.builtin_wrong_arity_or_expect(
+                            keyword_start,
+                            ')',
+                            vec![f, cond],
+                        );
+                    }
+                    self.next();
                     return Ok(Some(Builtin::RecurseCond(Box::new(f), Box::new(cond))));
                 }
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![f]);
+                }
+                self.next();
                 return Ok(Some(Builtin::RecurseF(Box::new(f))));
             }
             return Ok(Some(Builtin::Recurse));
@@ -4466,7 +4787,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let expr = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![expr]);
+                }
+                self.next();
                 return Ok(Some(Builtin::Path(Box::new(expr))));
             }
             // path (no-arg) - yq style
@@ -4475,6 +4799,7 @@ impl<'a> Parser<'a> {
         // parent (no-arg, yq) - return the parent node
         // parent(n) (yq) - return the nth parent node
         if self.matches_keyword("parent") {
+            let keyword_start = self.pos;
             self.consume_keyword("parent");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -4483,7 +4808,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let n = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n]);
+                }
+                self.next();
                 return Ok(Some(Builtin::ParentN(Box::new(n))));
             }
             // parent (no-arg) - immediate parent
@@ -4498,6 +4826,7 @@ impl<'a> Parser<'a> {
         // paths or paths(filter)
         if self.matches_keyword("paths") {
             self.reject_unless_jq_extensions("paths")?;
+            let keyword_start = self.pos;
             self.consume_keyword("paths");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -4505,24 +4834,43 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let filter = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![filter]);
+                }
+                self.next();
                 return Ok(Some(Builtin::PathsFilter(Box::new(filter))));
             }
             return Ok(Some(Builtin::Paths));
         }
         // setpath(path; value)
         if self.matches_keyword("setpath") {
+            let keyword_start = self.pos;
             self.consume_keyword("setpath");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`setpath` alone is `setpath/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let path = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![path]);
+            }
+            self.next();
             self.skip_ws();
             let value = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![path, value]);
+            }
+            self.next();
             return Ok(Some(Builtin::SetPath(Box::new(path), Box::new(value))));
         }
         // delpaths(paths)
@@ -4603,17 +4951,33 @@ impl<'a> Parser<'a> {
         // pow(base; exp)
         if self.matches_keyword("pow") {
             self.reject_unless_jq_extensions("pow")?;
+            let keyword_start = self.pos;
             self.consume_keyword("pow");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`pow` alone is `pow/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let base = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![base]);
+            }
+            self.next();
             self.skip_ws();
             let exp = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![base, exp]);
+            }
+            self.next();
             return Ok(Some(Builtin::Pow(Box::new(base), Box::new(exp))));
         }
         // Trigonometric functions - check longer names first
@@ -4650,17 +5014,33 @@ impl<'a> Parser<'a> {
         // atan2(y; x) - must check before atan
         if self.matches_keyword("atan2") {
             self.reject_unless_jq_extensions("atan2")?;
+            let keyword_start = self.pos;
             self.consume_keyword("atan2");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`atan2` alone is `atan2/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let y = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![y]);
+            }
+            self.next();
             self.skip_ws();
             let x = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![y, x]);
+            }
+            self.next();
             return Ok(Some(Builtin::Atan2(Box::new(y), Box::new(x))));
         }
         if self.matches_keyword("asin") {
@@ -4730,6 +5110,7 @@ impl<'a> Parser<'a> {
         // Phase 10: Debug
         if self.matches_keyword("debug") {
             self.reject_unless_jq_extensions("debug")?;
+            let keyword_start = self.pos;
             self.consume_keyword("debug");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -4737,7 +5118,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let msg = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![msg]);
+                }
+                self.next();
                 return Ok(Some(Builtin::DebugMsg(Box::new(msg))));
             }
             return Ok(Some(Builtin::Debug));
@@ -4806,13 +5190,45 @@ impl<'a> Parser<'a> {
 
         // strenv(VAR) - get environment variable as string (yq specific)
         if self.matches_keyword("strenv") {
+            let keyword_start = self.pos;
             self.consume_keyword("strenv");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`strenv` alone is `strenv/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
-            let var_name = self.parse_ident()?;
+            // #2807: `strenv`'s argument is a bare identifier, not an
+            // `Expr`, so there is nothing to hand
+            // `builtin_wrong_arity_or_expect` at either checkpoint --
+            // rewind instead and let the generic fallback re-parse the
+            // call. That covers both an argument that is not an identifier
+            // at all (`strenv(1)`) and a second one (`strenv(a;b)`), which
+            // jq 1.7.1 reports as `strenv/1 is not defined` and
+            // `strenv/2 is not defined`. No exponential exposure: the
+            // re-scanned text is one identifier, never a nested expression.
+            // yq mode keeps the raw parse error, as everywhere else in this
+            // family -- `strenv` is a real yq builtin there, and real yq's
+            // own leniency for these shapes (both answer `""` in v4.53.3)
+            // is a separate, pre-existing divergence.
+            let Ok(var_name) = self.parse_ident() else {
+                if self.mode == ParserMode::Jq {
+                    self.pos = keyword_start;
+                    return Ok(None);
+                }
+                return self.parse_ident().map(|_| unreachable!());
+            };
             self.skip_ws();
-            self.expect(')')?;
+            if let Err(early) = self.expect_or_none(')', keyword_start) {
+                return early;
+            }
+            self.next();
             return Ok(Some(Builtin::StrEnv(var_name)));
         }
 
@@ -5030,20 +5446,36 @@ impl<'a> Parser<'a> {
         // skip(n; expr) - skip first n outputs from expr
         if self.matches_keyword("skip") {
             self.reject_unless_jq_extensions("skip")?;
+            let keyword_start = self.pos;
             self.consume_keyword("skip");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`skip` alone is `skip/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `parse_limit_expr`'s own `n`: real jq's `$n` parameter
             // convention isn't implemented here.
             let n = self.parse_pipe_no_comma_with_booleans()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![n]);
+            }
+            self.next();
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n, expr]);
+            }
+            self.next();
             return Ok(Some(Builtin::Skip(Box::new(n), Box::new(expr))));
         }
 
@@ -5051,9 +5483,19 @@ impl<'a> Parser<'a> {
         // nth(n) without second arg is already handled by Phase 5 Builtin::Nth
         if self.matches_keyword("nth") {
             self.reject_unless_jq_extensions("nth")?;
+            let keyword_start = self.pos;
             self.consume_keyword("nth");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`nth` alone is `nth/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `parse_limit_expr`'s own `n` above: real jq's `$n` parameter
@@ -5065,10 +5507,16 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let expr = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n, expr]);
+                }
+                self.next();
                 return Ok(Some(Builtin::NthStream(Box::new(n), Box::new(expr))));
             }
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n]);
+            }
+            self.next();
             // No-arg nth(n) is already handled by Phase 5 Builtin::Nth
             return Ok(Some(Builtin::Nth(Box::new(n))));
         }
@@ -5176,6 +5624,7 @@ impl<'a> Parser<'a> {
         // Phase 17: Combinations
         if self.matches_keyword("combinations") {
             self.reject_unless_jq_extensions("combinations")?;
+            let keyword_start = self.pos;
             self.consume_keyword("combinations");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -5183,7 +5632,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let n = self.parse_expr()?;
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n]);
+                }
+                self.next();
                 return Ok(Some(Builtin::CombinationsN(Box::new(n))));
             }
             return Ok(Some(Builtin::Combinations));
@@ -5223,17 +5675,37 @@ impl<'a> Parser<'a> {
 
         // at_position(line; col) - jump to node at line/column (1-indexed)
         if self.matches_keyword("at_position") {
+            let keyword_start = self.pos;
             self.consume_keyword("at_position");
             self.skip_ws();
-            self.expect('(')?;
+            // #2807: no `(` at all is a wrong-arity call before any
+            // argument exists -- rewind and let the generic fallback
+            // resolve it (`at_position` alone is `at_position/0 is not defined` in jq
+            // 1.7.1, not a syntax error). The reparse is arity-0, so the
+            // #2686 exponent this function's other checkpoints avoid does
+            // not arise here.
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
             self.skip_ws();
             let line_expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(';')?;
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![line_expr]);
+            }
+            self.next();
             self.skip_ws();
             let col_expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(
+                    keyword_start,
+                    ')',
+                    vec![line_expr, col_expr],
+                );
+            }
+            self.next();
             return Ok(Some(Builtin::AtPosition(
                 Box::new(line_expr),
                 Box::new(col_expr),
