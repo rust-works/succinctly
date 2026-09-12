@@ -461,13 +461,14 @@ pub enum Expr {
     TrackedVar(Rc<Tracked>),
 
     /// Location reference: `$__loc__`
-    /// Returns `{"file": "<top-level>", "line": N}` where N is the 1-based line
-    /// number in the jq filter source where `$__loc__` appears (#2688). A def
-    /// sourced from an `include`d module or `~/.jq` carries that source's own
-    /// canonical file path in `file` instead (#2774) -- stamped onto every
-    /// `Loc` in a module's parsed body by `ModuleLoader::ensure_module_loaded`
-    /// and `ModuleLoader::new` (`src/bin/succinctly/jq_runner.rs`), since the
-    /// parser itself has no notion of which file it is reading.
+    /// Returns `{"file": F, "line": N}`, where `N` is the 1-based line number
+    /// in the jq source where `$__loc__` appears, and `F` is `"<top-level>"`
+    /// for the main filter (#2688) or a module's own canonical file path for
+    /// a def sourced from an `include`d module or `~/.jq` (#2774) -- stamped
+    /// onto every `Loc` in a module's parsed body by
+    /// `ModuleLoader::ensure_module_loaded` and `ModuleLoader::new`
+    /// (`src/bin/succinctly/jq_runner.rs`), since the parser itself has no
+    /// notion of which file it is reading.
     Loc {
         /// 1-based line number in the jq source
         line: usize,
