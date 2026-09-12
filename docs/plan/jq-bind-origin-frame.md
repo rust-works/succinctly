@@ -244,11 +244,14 @@ Three findings, in order of what they cost:
   artefact guard declines to retry (`path(. as {a:$q} ?// {b:$r} | $r)`, jq `["b"]`), since
   retrying on one of *this* resolver's own refusals lands on the wrong alternative and a
   `del` would write through it.
-- [#2676](https://github.com/rust-works/succinctly/issues/2676) — the same mechanism for a
-  `reduce`/`foreach` loop variable, which lives in `FoldRegister`'s per-element model rather
-  than in `resolve_seq`'s stages and needs its own oracle round for reduce's persistence
-  rule (`path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` in jq,
-  `path(reduce .b as {c:$x} (.; .))` is `[]`; both refuse here).
+- [#2676](https://github.com/rust-works/succinctly/issues/2676) — **closed.** The same
+  mechanism for a `reduce`/`foreach` loop variable, landed in `FoldRegister`'s per-element
+  model rather than in `resolve_seq`'s stages: `walk_pattern` (above) is reused, seeded at the
+  fold's own per-element register instead of at `. as PATTERN`'s bind source, and its final
+  position becomes `resolve_foreach`'s active register for UPDATE/EXTRACT (`resolve_reduce`
+  needed no analogous change — its own accumulator is checked against the fold's persistent,
+  INIT-seeded register regardless of pattern shape, a pre-existing rule). See
+  `docs/compliance/jq/limitations.md`'s fold paragraph for the residual refuse-only gaps.
 - [#2678](https://github.com/rust-works/succinctly/issues/2678) — a computed-key pattern
   (`. as {("a"): $q}`, jq `["a"]`) is a parse error here, so path mode never sees it; the
   gap predates this design note entirely.
