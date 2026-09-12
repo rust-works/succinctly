@@ -1031,7 +1031,9 @@ pub enum MetaValue {
 /// Import directive: `import "path" as name;` or `import "path" as name { meta };`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
-    /// The module path (relative, without .jq extension)
+    /// The module path, exactly as written -- `.jq` is appended
+    /// unconditionally when resolving it to a file (#2702), so a path that
+    /// already ends in `.jq` is not stripped or treated specially here.
     pub path: String,
     /// The namespace alias
     pub alias: String,
@@ -1042,7 +1044,9 @@ pub struct Import {
 /// Include directive: `include "path";` or `include "path" { meta };`
 #[derive(Debug, Clone, PartialEq)]
 pub struct Include {
-    /// The module path (relative, without .jq extension)
+    /// The module path, exactly as written -- `.jq` is appended
+    /// unconditionally when resolving it to a file (#2702), so a path that
+    /// already ends in `.jq` is not stripped or treated specially here.
     pub path: String,
     /// Optional metadata overrides
     pub metadata: Option<BTreeMap<String, MetaValue>>,
