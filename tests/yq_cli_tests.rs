@@ -44218,6 +44218,66 @@ fn json_sourced_structural_rejections_2778() -> Result<()> {
     Ok(())
 }
 
+/// #2778: real yq's `-p json` without `--slurp` reads a *stream* of
+/// concatenated top-level values (jq-style), not one document -- so a bare
+/// `key: value` at the top level is not automatically invalid the way
+/// `#[test] json_sourced_structural_rejections_2778`'s bare `-`/`?`/`&` rows
+/// are; it's two independently-valid streamed values (confirmed live:
+/// `true: 1` prints `true` then `1`, exit 0). succinctly doesn't implement
+/// multi-value streaming at all (tracked separately as #2839) so it parses
+/// these as one YAML mapping instead of two streamed values -- a
+/// *pre-existing*, unrelated divergence -- but the accept/reject decision
+/// must still match: an early version of this fix rejected every bare
+/// `key: value` outright, which over-rejected exactly this shape and was
+/// reverted before merge. (Space-separated `true 1`, with no colon at all,
+/// is deliberately not a row here: with no mapping syntax to route through,
+/// succinctly reads it as one plain scalar spanning the embedded space --
+/// "true 1" -- which correctly fails scalar-grammar validation on its own
+/// terms; that divergence traces entirely to #2839, not to anything this
+/// fix could special-case without reimplementing streaming.)
+#[test]
+fn json_sourced_stream_like_bare_mapping_still_accepted_2778() -> Result<()> {
+    for input in ["true: 1", "\"a\": 1", "true:\n  1"] {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 0,
+            "#2778: {input:?} must be accepted (real yq v4.53.3 streams it as \
+             two values), got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2778: a streamed value's grammar is still validated the same as any
+/// other value, even though the *stream* itself isn't rejected (previous
+/// test) -- confirmed live: `true: 'v'`/`true: True`/`true: .5` all error
+/// on the second value in real yq. Two of these three reach the "value
+/// deferred to the next line" arm in `parse_mapping_entry` and the third
+/// reaches `parse_inline_value` -- both had their `json_strict` checks
+/// briefly (incorrectly) removed as "dead code" before the bare-mapping
+/// rejection above was found to be wrong and reverted, which reopened
+/// these paths; restored and pinned here.
+#[test]
+fn json_sourced_stream_like_value_grammar_still_checked_2778() -> Result<()> {
+    for input in [
+        "true: 'v'",
+        "true: True",
+        "true: .5",
+        "true:\n  'v'",
+        "true:\n  True",
+    ] {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 1,
+            "#2778: {input:?} must be rejected with exit 1 (real yq v4.53.3 \
+             rejects the second streamed value), got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The tightening is gated on JSON-sourced input; genuine YAML keeps its
 /// own grammar, where every one of these is ordinary and legal.
 #[test]

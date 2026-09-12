@@ -997,9 +997,19 @@ same way, because none of them have a JSON spelling at all regardless of what te
 them — real yq's token scanner refuses the byte itself, never reaching a "value" to
 validate:
 
-- A bare top-level `key: value` (no enclosing `{}`) or `- item` (no enclosing `[]`) —
-  rejected at `parse_block_node`'s single chokepoint for every illegal value-start byte,
-  which also covers `?`/`&`/`!`/`*`/`'` uniformly rather than each needing its own arm.
+- A bare top-level `- item` (no enclosing `[]`) — rejected at `parse_block_node`'s single
+  chokepoint for every illegal value-start byte, which also covers `?`/`&`/`!`/`*`/`'`
+  uniformly rather than each needing its own arm. A bare top-level `key: value` (no
+  enclosing `{}`) is rejected only when the *key* itself starts illegally (`a: 1`, since
+  bare `a` was never a legal token) — **not** as a blanket "no bare mapping" rule: `-p json`
+  without `--slurp` turns out to read a *stream* of concatenated top-level values (`"a": 1`
+  and `true: 1` both parse as two complete values in real yq, confirmed live against
+  v4.53.3, not a mapping and not an error), so an earlier version of this fix that rejected
+  every bare `key: value` outright was reverted before merge -- it over-rejected input real
+  yq accepts. The streaming behavior itself is unimplemented and tracked separately as
+  [#2839](https://github.com/rust-works/succinctly/issues/2839); succinctly still parses a
+  quoted/keyword-keyed bare `key: value` as one YAML mapping rather than two streamed
+  values, a pre-existing divergence this fix does not widen.
 - `?` (the explicit-key indicator), in *both* the block-context and flow-mapping (`{? "a":
   1}`) spellings — a structural rejection of the marker itself, not a key-grammar check, so
   it stays in scope even though mapping-key *text* grammar (#2777) does not.

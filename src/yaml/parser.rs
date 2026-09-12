@@ -4629,20 +4629,27 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.parse_double_quoted()?;
                             self.pos
                         }
-                        // No `json_strict` check needed on either arm here: this
-                        // "value deferred to the next line" scalar is reached only
-                        // through `parse_mapping_entry`, whose own call sites are
-                        // all gated by `parse_block_node`'s value-start chokepoint
-                        // (`&`/`!`/`*`) or its bare-mapping-entry rejection --
-                        // never reachable at all once `json_strict` is set (#2778
-                        // review; confirmed empirically, no path reaches this arm
-                        // with json_strict=true across the full suite plus a
-                        // targeted adversarial sweep).
+                        // `json_strict` still applies here: reachable via a
+                        // streamed key like `true` whose value continues on the
+                        // next line (`true:\n  'v'`) -- real yq's `-p json`
+                        // reads this as two independent values in a stream
+                        // (#2839, not a bare-mapping rejection), but each
+                        // streamed value is still validated the same way any
+                        // JSON value is; confirmed live, `true:\n  'v'` and
+                        // `true:\n  True` both error in real yq too.
                         Some(b'\'') => {
+                            if self.json_strict {
+                                return Err(self.err_json_strict_single_quote());
+                            }
                             self.parse_single_quoted()?;
                             self.pos
                         }
-                        _ => self.parse_unquoted_value_with_indent(indent),
+                        _ => {
+                            let start = self.pos;
+                            let end = self.parse_unquoted_value_with_indent(indent);
+                            self.check_json_strict_scalar(start, end)?;
+                            end
+                        }
                     };
                     self.set_bp_text_end(end_pos);
                     self.write_bp_close();
@@ -5193,11 +5200,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an inline scalar value (on the same line as the key).
     /// Returns the end position of the scalar content.
     /// No `json_strict` check needed anywhere in this match: both callers
-    /// (`parse_compact_mapping_entry`, `parse_mapping_entry`) are themselves
-    /// reachable only through `parse_block_node` arms the chokepoint above
-    /// already refuses under `json_strict` (`-`/`&`/`!`/`*`/bare-mapping-entry)
-    /// -- this function is never entered at all once `json_strict` is set
-    /// (#2778 review; confirmed empirically).
+    /// `json_strict` still applies here: `parse_compact_mapping_entry`'s own
+    /// caller is dead under `json_strict` (behind the dash-rejection above),
+    /// but `parse_mapping_entry`'s `key: value` form is not -- real yq's
+    /// `-p json` (no `--slurp`) reads a *stream* of top-level values, so
+    /// `true: 1`/`"a": 1` are two valid, independent streamed values rather
+    /// than an invalid bare mapping (#2778, reverted the opposite
+    /// assumption after checking live; full streaming is unimplemented,
+    /// tracked separately as #2839) -- but each such value is still subject
+    /// to the same grammar `goccy/go-json` enforces on any value, confirmed
+    /// live: `true: 'v'`/`true: True`/`true: .5` all error on the second
+    /// value in real yq too.
     fn parse_inline_value(&mut self, min_indent: usize) -> Result<usize, YamlError> {
         let end = match self.peek() {
             Some(b'"') => {
@@ -5205,10 +5218,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pos
             }
             Some(b'\'') => {
+                if self.json_strict {
+                    return Err(self.err_json_strict_single_quote());
+                }
                 self.parse_single_quoted()?;
                 self.pos
             }
-            _ => self.parse_unquoted_value_with_indent(min_indent),
+            _ => {
+                let start = self.pos;
+                let end = self.parse_unquoted_value_with_indent(min_indent);
+                self.check_json_strict_scalar(start, end)?;
+                end
+            }
         };
         Ok(end)
     }
@@ -7510,18 +7531,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             Some(_) => {
                 // Check if this looks like a mapping entry (has `: ` on this line)
                 // This handles both quoted keys ("foo": bar) and unquoted keys (foo: bar)
-                if self.json_strict && self.looks_like_mapping_entry() {
-                    // #2778: a bare `key: value` (no enclosing `{}`) is not
-                    // a JSON value at all -- real yq's front end never
-                    // reads block-mapping syntax, so it errors on `a: 1`
-                    // the same way it does on any other non-`{[`t f n-digit`
-                    // token start. Checked ahead of `looks_like_mapping_entry`'s
-                    // own dispatch so the key's text is never even examined
-                    // (matching rule 4(c): key grammar stays out of scope).
-                    return Err(
-                        self.err_unexpected_char(self.pos, "YAML mapping entry in JSON input")
-                    );
-                }
+                //
+                // #2778 considered rejecting this outright under `json_strict`
+                // (bare `key: value`, no enclosing `{}`, looks like it should
+                // have no JSON spelling) -- reverted (confirmed live against
+                // yq v4.53.3): `-p json` without `--slurp` reads a *stream* of
+                // concatenated top-level JSON values the way `jq` does
+                // (`printf 'true: 1' | yq -p json '.'` prints `true` then `1`,
+                // exit 0 -- the colon is simply not a value's own problem, since
+                // the decoder reads `true` as a complete value and starts a new
+                // read afterward). A leading token that itself starts a value
+                // (`"..."`, `true`/`false`/`null`, a digit/`-`) is not something
+                // this single-document parser can rightly refuse just because a
+                // `:` follows; the chokepoint above still refuses a token that
+                // is not a legal value start regardless (`a: 1` still errors,
+                // since bare `a` was never a valid token). Full multi-value
+                // streaming without `--slurp` is a real, separate gap this
+                // parser doesn't support at all -- tracked as #2839, out of
+                // scope here.
                 if self.looks_like_mapping_entry() {
                     self.parse_mapping_entry(indent)?;
                 } else {
