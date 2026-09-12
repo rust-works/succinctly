@@ -1531,6 +1531,20 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(',') => {
                     self.next();
+                    self.skip_ws();
+                    // #2788: jq's object-construction production alone
+                    // accepts a trailing comma (`{a:1,}`) -- array
+                    // construction and destructuring patterns don't, and
+                    // neither does real yq (`',' expects 2 args but there
+                    // is 1`), so this is jq-mode only. A doubled comma
+                    // (`{a:1,,}`) still re-enters key parsing below and
+                    // hits its existing "expected identifier" error --
+                    // this only short-circuits the single-trailing-comma
+                    // shape.
+                    if self.mode == ParserMode::Jq && self.peek() == Some('}') {
+                        self.next();
+                        break;
+                    }
                     continue;
                 }
                 Some('}') => {
@@ -7270,6 +7284,47 @@ mod tests {
             }
             _ => panic!("expected Object"),
         }
+    }
+
+    /// #2788: real jq's object-construction production alone accepts a
+    /// single trailing comma before the closing `}` -- `{a:1,}` parses
+    /// identically to `{a:1}`. Every trailing-comma shape here must parse
+    /// to the exact same `Expr` its comma-free equivalent does (jq mode
+    /// only; confirmed live that real yq rejects every one of them, `','
+    /// expects 2 args but there is 1`).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_object_construction_trailing_comma_2788() {
+        for (with_comma, without_comma) in [
+            ("{a:1,}", "{a:1}"),
+            ("{a,}", "{a}"),
+            (r#"{"a":1,}"#, r#"{"a":1}"#),
+            ("{(.x):1,}", "{(.x):1}"),
+            ("{a:1, }", "{a:1}"),
+            ("{a:1,\n}", "{a:1}"),
+        ] {
+            assert_eq!(
+                parse(with_comma).unwrap(),
+                parse(without_comma).unwrap(),
+                "`{with_comma}` should parse identically to `{without_comma}`"
+            );
+        }
+
+        // A doubled comma still re-enters key parsing and hits the
+        // existing error unchanged -- this fix only short-circuits a
+        // single trailing comma, not "skip any run of commas".
+        for src in ["{,}", "{a:1,,}", "{,a:1}"] {
+            let err = parse(src).unwrap_err();
+            assert!(
+                err.to_string().contains("expected identifier"),
+                "`{src}`: {err}"
+            );
+        }
+
+        // yq mode: the same trailing comma stays rejected, matching real
+        // yq (`',' expects 2 args but there is 1`) -- this extension is
+        // jq-mode only.
+        assert!(parse_with_mode(r#"{"a":1,}"#, ParserMode::Yq).is_err());
     }
 
     #[test]

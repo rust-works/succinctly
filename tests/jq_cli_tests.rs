@@ -19054,6 +19054,52 @@ fn test_object_construction_dollar_loc_key_is_a_parse_error_2724() -> Result<()>
 // tests/yq_cli_tests.rs, not here -- see
 // test_object_construction_var_shorthand_is_jq_mode_only_2724.)
 
+/// #2788: real jq's object-construction production alone accepts a single
+/// trailing comma before the closing `}` -- confirmed live against jq
+/// 1.7.1. `{$a,}` is the shape that surfaced this during #2724's own
+/// review; the rest round-trip through the evaluator too, not just the
+/// parser.
+#[test]
+fn test_object_construction_trailing_comma_2788() -> Result<()> {
+    for (filter, input, want) in [
+        ("{a:1,}", "null", "{\"a\":1}"),
+        ("{a,}", "{\"a\":2}", "{\"a\":2}"),
+        ("1 as $a | {$a,}", "null", "{\"a\":1}"),
+        ("{a:1,} | keys", "null", "[\"a\"]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2788 review: a doubled or leading comma stays rejected exactly as
+/// before -- this fix only short-circuits a *single* trailing comma, not
+/// "skip any run of commas". A future "trailing comma everywhere" change
+/// has to consciously break these two rows, not accidentally widen into
+/// them.
+#[test]
+fn test_object_construction_trailing_comma_does_not_widen_2788() -> Result<()> {
+    for filter in ["{a:1,,}", "{,}"] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 3, "`{filter}`: stderr {stderr:?}");
+        assert!(
+            stderr.contains("expected identifier"),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+
+    // Array construction and destructuring patterns don't share this
+    // allowance in real jq either -- confirmed live, both are syntax
+    // errors there too.
+    for filter in ["[1,2,]", ". as {$a,} | $a"] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 3, "`{filter}`: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // #1204: object destructuring pattern entry `{$x: Pattern}` (bind and
 // further destructure). Real jq's `$IDENT: Pattern` entry binds the
