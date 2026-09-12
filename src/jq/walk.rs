@@ -25,7 +25,10 @@ use alloc::rc::Rc;
 #[cfg(test)]
 use std::rc::Rc;
 
-use super::{BoundBody, Builtin, Expr, FuncDefBound, ObjectEntry, ObjectKey, StringPart};
+use super::{
+    BoundBody, Builtin, Expr, FuncDefBound, ObjectEntry, ObjectKey, Pattern, PatternEntry,
+    StringPart,
+};
 #[cfg(test)]
 use super::{FuncDefData, Param};
 
@@ -689,6 +692,38 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 /// `&mut dyn FnMut`, not a generic `F`, for the same reason
 /// [`map_builtin_subexprs`] and [`any_subexpr`] both give: this recurses, so
 /// a generic parameter would monomorphise the whole traversal per call site.
+/// Apply `f` to every computed-key expression inside `pattern` (#2677),
+/// rebuilding it with the same shape otherwise -- the `Pattern`-specific
+/// half of [`map_subexprs`]'s own recursion, needed because `PatternEntry`
+/// holds a real `Expr` since #2677's `ObjectKey::Expr` computed-key support
+/// (`{(EXPR): P}`, `{"\(EXPR)": P}`); a bare/string-literal key or a `$name`
+/// shorthand's own key carries no `Expr` and passes through unchanged, as
+/// does everything about the pattern's own shape (`bind`, nesting).
+pub fn map_pattern_subexprs(pattern: &Pattern, f: &mut dyn FnMut(&Expr) -> Expr) -> Pattern {
+    match pattern {
+        Pattern::Var(name) => Pattern::Var(name.clone()),
+        Pattern::Object(entries) => Pattern::Object(
+            entries
+                .iter()
+                .map(|entry| PatternEntry {
+                    key: match &entry.key {
+                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(f(e))),
+                    },
+                    bind: entry.bind.clone(),
+                    pattern: map_pattern_subexprs(&entry.pattern, f),
+                })
+                .collect(),
+        ),
+        Pattern::Array(patterns) => Pattern::Array(
+            patterns
+                .iter()
+                .map(|p| map_pattern_subexprs(p, f))
+                .collect(),
+        ),
+    }
+}
+
 pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
     match expr {
         // --- Leaves: no `Expr` child, nothing for `f` to see -----------------
@@ -911,7 +946,10 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             update,
         } => Expr::Reduce {
             input: Box::new(f(input)),
-            patterns: patterns.clone(),
+            patterns: patterns
+                .iter()
+                .map(|p| map_pattern_subexprs(p, f))
+                .collect(),
             init: Box::new(f(init)),
             update: Box::new(f(update)),
         },
@@ -923,7 +961,10 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             extract,
         } => Expr::Foreach {
             input: Box::new(f(input)),
-            patterns: patterns.clone(),
+            patterns: patterns
+                .iter()
+                .map(|p| map_pattern_subexprs(p, f))
+                .collect(),
             init: Box::new(f(init)),
             update: Box::new(f(update)),
             extract: extract.as_deref().map(|e| Box::new(f(e))),
@@ -934,7 +975,10 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             body,
         } => Expr::AsPattern {
             expr: Box::new(f(expr)),
-            patterns: patterns.clone(),
+            patterns: patterns
+                .iter()
+                .map(|p| map_pattern_subexprs(p, f))
+                .collect(),
             body: Box::new(f(body)),
         },
         Expr::Label { name, body } => Expr::Label {
@@ -2026,8 +2070,10 @@ mod tests {
     /// The generic (unconditional-recursion) binder arms -- `As`/`Reduce`/
     /// `Foreach`/`AsPattern`/`Label` -- as reached directly through
     /// `map_subexprs` itself (no shadow check, since that lives in the three
-    /// `eval.rs` callers, not here). `patterns.clone()`/`var.clone()`/
-    /// `name.clone()` fields must also survive the round trip untouched.
+    /// `eval.rs` callers, not here). `var.clone()`/`name.clone()` fields
+    /// must also survive the round trip untouched; `patterns` itself now
+    /// recurses too (#2677), tested separately below since none of these
+    /// filters' own patterns carry a computed key to descend into.
     #[test]
     fn map_subexprs_binders_recurse_unconditionally() {
         for (filter, expected_calls) in [
@@ -2045,6 +2091,48 @@ mod tests {
             });
             assert_eq!(calls, expected_calls, "call count mismatch for {filter:?}");
             assert_eq!(result, expr, "identity round-trip failed for {filter:?}");
+        }
+    }
+
+    /// #2677 review: `Reduce`/`Foreach`/`AsPattern`'s own `patterns` field
+    /// now recurses into a computed key's `Expr` (`{(EXPR): P}`) too, not
+    /// just `expr`/`body`/`init`/`update`/`extract` -- confirmed via a
+    /// non-identity rewrite (uppercasing every `Expr::Field` name) so a
+    /// no-op `f` couldn't hide a missed visit, and via the call count
+    /// including the key expressions. Before this fix `patterns` was cloned
+    /// verbatim, so a `def`-bound call or an outer `$var` reference inside
+    /// a computed key was invisible to every caller built on `map_subexprs`
+    /// (`install_def_calls`/`bind_def`, `substitute_var_impl`) -- a `def`'d
+    /// function used as a pattern's own key wrongly reported "undefined
+    /// function" even though it *was* defined (`tests/jq_cli_tests.rs`'s
+    /// own CLI-level pin has the live-jq-confirmed accept case).
+    #[test]
+    fn map_subexprs_descends_into_pattern_computed_keys_2677() {
+        for (filter, expected_calls) in [
+            (". as {(.k):$q} | $q", 3),             // AsPattern: expr + key + body
+            ("reduce .a as {(.k):$q} (.b; .c)", 4), // Reduce: input + key + init + update
+            ("foreach .a as {(.k):$q} (.b; .c; .d)", 5), // Foreach: + extract
+            (". as {a:{(.k):$q}} | $q", 3),         // expr + nested key + body
+            (". as [{(.k):$q}] | $q", 3),           // expr + key-in-array-element + body
+        ] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let uppercased = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                match e {
+                    Expr::Field(name) => Expr::Field(name.to_uppercase()),
+                    other => other.clone(),
+                }
+            });
+            assert_eq!(calls, expected_calls, "call count mismatch for {filter:?}");
+            // The rewrite actually reached inside the pattern: re-rendering
+            // the rewritten tree's own Debug output names the uppercased
+            // field, proving `f` was applied to the key expression itself
+            // and the result was kept, not discarded.
+            assert!(
+                format!("{uppercased:?}").contains("\"K\""),
+                "computed key's own .k field was not rewritten for {filter:?}: {uppercased:?}"
+            );
         }
     }
 
