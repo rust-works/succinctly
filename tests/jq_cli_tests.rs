@@ -48660,6 +48660,78 @@ fn test_shadowed_wrong_arity_calls_do_not_exhaust_the_retry_budget_2807() -> Res
     Ok(())
 }
 
+/// #2807: every converted arm, in the shape the issue is actually about --
+/// a wrong-arity call to a builtin name that a `def` in scope shadows at
+/// that arity. Each row must resolve to the `def` and answer `1`, which is
+/// what jq 1.7.1 answers for all of them; before the fix each one failed its
+/// arm and was recovered only by the budget-consuming reparse, so the answer
+/// was right only while the budget lasted.
+///
+/// One row per arm rather than a spot check: the arms differ in shape (fixed
+/// multi-arg, optional-arity, `;`-checkpoint, `parse_pipe_no_comma_with_booleans`
+/// first argument), and #2389 records two earlier regressions from
+/// conversions that "looked like a copy but weren't".
+#[test]
+fn test_every_converted_arm_resolves_a_shadowed_wrong_arity_call_2807() -> Result<()> {
+    // (keyword, the `def`'s parameter list, the call's arguments)
+    for (kw, params, args) in [
+        ("test", "a;b;c", "1;2;3"),
+        ("match", "a;b;c", "1;2;3"),
+        ("capture", "a;b;c", "1;2;3"),
+        ("scan", "a;b;c", "1;2;3"),
+        ("splits", "a;b;c", "1;2;3"),
+        ("split", "a;b;c", "1;2;3"),
+        ("sub", "a;b;c;d", "1;2;3;4"),
+        ("gsub", "a;b;c;d", "1;2;3;4"),
+        ("IN", "a;b;c", "1;2;3"),
+        ("INDEX", "a;b;c", "1;2;3"),
+        ("any", "a;b;c", "1;2;3"),
+        ("all", "a;b;c", "1;2;3"),
+        ("recurse", "a;b;c", "1;2;3"),
+        ("nth", "a;b;c", "1;2;3"),
+        ("skip", "a;b;c", "1;2;3"),
+        ("flatten", "a;b", "1;2"),
+        ("path", "a;b", "1;2"),
+        ("paths", "a;b", "1;2"),
+        ("debug", "a;b", "1;2"),
+        ("parent", "a;b", "1;2"),
+        ("combinations", "a;b", "1;2"),
+        ("halt_error", "a;b", "1;2"),
+        // `1` rather than an identifier: `strenv`'s own argument parse
+        // wants an identifier, but a bare `x` there is an undefined
+        // *function* call to both parsers (jq 1.7.1 says `x/0 is not
+        // defined` too), which would test name resolution rather than this
+        // arm's rewind.
+        ("strenv", "a;b", "1;2"),
+        // The `;`-checkpoint arms, reached by giving one argument where the
+        // builtin's own parser requires two.
+        ("setpath", "a", "1"),
+        ("pow", "a", "1"),
+        ("atan2", "a", "1"),
+        ("at_position", "a", "1"),
+        // The before-any-argument checkpoint: no parentheses at all.
+        ("test", "", ""),
+        ("split", "", ""),
+        ("setpath", "", ""),
+    ] {
+        let call = if args.is_empty() {
+            kw.to_string()
+        } else {
+            format!("{kw}({args})")
+        };
+        let def = if params.is_empty() {
+            format!("def {kw}: 1;")
+        } else {
+            format!("def {kw}({params}): 1;")
+        };
+        let filter = format!("{def} {call}");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "1", "{filter}");
+    }
+    Ok(())
+}
+
 /// #2807 (review): empty parens stay a syntax error, even for the one arm
 /// whose recovery is a rewind rather than a hand-over.
 ///
