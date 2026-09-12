@@ -1961,6 +1961,7 @@ const SUITE_PATTERNS: &[(&str, generators::Pattern)] = &[
     ("pathological", generators::Pattern::Pathological),
     ("pretty", generators::Pattern::Pretty),
     ("wide", generators::Pattern::Wide),
+    ("wide-escaped-keys", generators::Pattern::WideEscapedKeys),
 ];
 
 /// Sizes to generate for each pattern (name, bytes)
