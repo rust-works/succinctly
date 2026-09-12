@@ -976,23 +976,32 @@ a plain `String` to `ObjectKey` (the same type object construction already used)
 `extract_pattern_bindings` (value mode)/`walk_pattern` (path mode) resolve the key expression
 against the pattern's own current node, using the same "Cannot index `<type>` with `<type>`"
 wording jq's own `INDEX` bytecode gives for any key, computed or literal — confirmed live in
-both positions, including nested computed keys and through `|=`/`del()`. **Scoped to a key
-expression that yields exactly one string** — the common case (`{(.k): $q}`, a string
-interpolation, which by construction can only ever yield one value). A key expression that is
-itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out one full pattern-match,
-and one full run of the surrounding body, per key it yields: `{"a":1,"b":2} \| . as
-{("a","b"):$q} \| $q` is `1` then `2`) refuses clearly instead — `extract_pattern_bindings`
-itself models the full cartesian-fold generator semantics real jq has, but every one of its
-eight call sites (across both evaluators, plus `reduce`/`foreach`'s own pre-loop substitution-
-matrix builders) collapses back to a single result via `extract_single_pattern_binding`, since
-fanning out correctly needs each call site's own `?//`-alternative-retry/fold-matrix machinery
-threaded through, not just the core function — not yet done. The same refusal covers a key
-expression producing **zero** outputs (`{(empty): $q}`, where real jq legitimately binds
-nothing and the body never runs, `[. as {(empty):$q} \| $q]` is `[]`) and one interrupted by
-`break`/`halt`, rather than risking a silently wrong answer at any of the eight sites
-individually. `test_pattern_computed_key_evaluates_2677`/
-`test_pattern_computed_key_multi_output_refuses_cleanly_2677` (`tests/jq_cli_tests.rs`) pin both
-halves.
+both positions, including nested computed keys and through `|=`/`del()`. A key expression that
+is itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out one full pattern-
+match, and one full run of the surrounding body, per key it yields: `{"a":1,"b":2} \| . as
+{("a","b"):$q} \| $q` is `1` then `2`) or a **zero**-output one (`{(empty): $q}`, where real jq
+legitimately binds nothing and the body never runs, `[. as {(empty):$q} \| $q]` is `[]`) now
+**fans out correctly in value position**: `each_pattern_alternatives`/
+`each_pattern_alternatives_generic` (the `?//`-alternative loops both evaluators route a bare,
+non-`?//` pattern through too) run `body` once per binding-set `extract_pattern_bindings`
+yields, applying the pre-#2677 match-failure retry rule only to the key generator's own
+trailing error/break/halt once every binding-set's body has run — including the two hardest
+interaction cases: a body error partway through a fan-out abandons the *remaining* key outputs
+and retries the next `?//` alternative, keeping whatever already ran (`[. as {("a","b"):$q} ?//
+$z \| if $q==2 then error("boom") else $q end]` on `{"a":1,"b":2}` is `[1,null]`), and a
+zero-output key still *wins* inside a `?//` chain (no fallthrough) even though it contributes
+nothing. `test_pattern_computed_key_fans_out_in_value_position_2677` (`tests/jq_cli_tests.rs`)
+pins both.
+
+**Path position does not fan out yet** — `walk_pattern`/`resolve_as_pattern`/
+`try_pattern_alternatives` still collapse to a single result via
+`extract_single_pattern_binding` and refuse a multi- or zero-output computed key cleanly
+(`test_pattern_computed_key_multi_output_refuses_in_path_position_2677`), the same reasoning
+that motivated `extract_single_pattern_binding` in the first place: fanning out correctly needs
+each call site's own retry/register machinery threaded through, not just the core function.
+`reduce`/`foreach`'s own pattern (`eval_reduce_with_values`/`substitute_foreach_steps`'s
+pre-loop substitution-matrix builders) is unaffected either way — a multi-output computed key
+there still refuses in both value and path position.
 
 A related, narrower gap the fix surfaced and closed along the way: `map_subexprs`
 (`src/jq/walk.rs`) — the shared tree-rewrite primitive `install_def_calls`/`bind_def` and
