@@ -3720,20 +3720,47 @@ The context that makes the loss survivable is the one #2168's entry states: succ
 already diverges on this whole class of document through `.` itself, deliberately, and a
 user who wants jq's rejection has `--validate` and `succinctly json validate`.
 
-**The materializing flag routes still validate whatever the filter.** `-S`, `-a`, `-s`, `-C`
-and the `-n`/`input` bridge do not take the M2 route at all: `evaluate_input_streaming`
-materializes the whole input into an `OwnedValue` *before* evaluating, so on those routes
-`1+1` on `{123:1,"b":2}` still exits 5, exactly as it did before #2103, while the default
-route answers `2`. `-e` streams like the default but materializes each *output* to decide the
-exit status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where
-`-c '.,.'` echoes. Both are the rule applied to a route that materializes — the flag routes
-materialize the input, `-e` the outputs — not an exception to it, but they make the answer
-depend on a flag in the way this entry's point 2 objects to for filters, and by the same
-accident: those routes materialize the input because they always did, not because `-S '1+1'`
-needs it. Recorded here so the dependence is stated rather than discovered; moving those
-routes onto cursors so they too validate only what they read is
-[#2662](https://github.com/rust-works/succinctly/issues/2662).
-Pinned by `test_materializing_flag_routes_still_validate_2103`.
+**The materializing flag routes still validate whatever the filter — down to `-s` and
+`-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)
+for `-S`/`-a`/`-C`.** `-S` (sort keys), `-a` (ASCII output) and `-C` (color) used to force
+`evaluate_input_streaming`, which materializes the whole input into an `OwnedValue` *before*
+evaluating — so `1+1` on `{123:1,"b":2}` exited 5 under any of them where the default route
+already answered `2`, purely because those routes materialized the input for historical
+reasons, not because sorting/escaping/coloring *output* needs the *input* validated. None of
+the three actually need it: `write_output_jq_value` already materializes just the one
+*output* value being printed when `sort_keys`/`color_output`/`ascii_output` is set (reusing
+`format_json`'s existing `ascii`/`sort_keys` options, which already handled all three
+correctly for the pre-existing DOM route), so moving them onto the lazy route costs nothing
+in fidelity and validates only the value a filter actually reads, same as the default.
+`-s` (slurp) and the `-n`/`input` bridge stay materializing — `-s` needs a real
+offset-mapping redesign to slurp without building a DOM (tracked, not done), and `input`
+must hand the evaluator an owned value it can return from a builtin by construction, so
+validating what it materializes there is the rule working as intended, not an accident left
+to close. `-e` streams like the default but materializes each *output* to decide the exit
+status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where `-c
+'.,.'` echoes — unaffected by this change, `-e` was never one of the routes being moved.
+Pinned by `test_materializing_flag_routes_still_validate_2103` (rewritten for the new
+`-S`/`-a`/`-C` behavior, `-s`/`-n` rows unchanged).
+
+**`-a` wins over `-r`/`-j` for a *string* value — a real jq quirk, reproduced exactly.**
+Confirmed live against jq 1.7.1: `-acr '"café"'` prints `"café"`, quoted and ASCII-escaped,
+not the unquoted raw string `-r` alone would give (`-ar '42'` on a non-string value is
+unaffected: `42` either way). Both `write_output_jq_value` (the route #2662 moved) and
+`write_output` (the still-materializing `-s`/`-n` route) had the same latent gap — `-a -r`
+printed the raw, unescaped string bytes on either, before this fix — closed the same way on
+both: skip the raw-string branch entirely when `ascii_output` is set, falling through to the
+ordinary quoted/escaped write exactly as if `-r` had never been passed.
+
+**A malformed-document failure reached during `write_output_jq_value`'s own materialize
+step used to skip jq's diagnostic channel entirely.** Its `sort_keys`/`color_output`
+materialize arm converted a decode failure straight to a bare `anyhow::anyhow!`, not a
+`MalformedJsonError` — before #2662, unreachable in practice, since `sort_keys`/
+`color_output` were the only two flags that could reach that branch at all, and both were
+already excluded from the lazy path entirely. Moving `-S`/`-C`/`-a` onto the lazy path here
+is what first exercises it: `printf '{invalid}' | succinctly jq -cS .` exited 1 with a bare
+`Error: ...` where real jq (and this crate's own default lazy route) exits 5 with `jq: error
+(at ...)`. Fixed by wrapping the decode failure in `MalformedJsonError`, the same type
+`route_write_error`'s downcast already looks for everywhere else.
 
 **Two `first`/`limit` value spellings moved too, and belong to this same divergence.** On
 `[{"x":"\ud800"}]` — an element whose `.x` is a lone high surrogate, which jq rejects at
