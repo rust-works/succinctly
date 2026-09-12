@@ -50054,19 +50054,20 @@ struct SubstScope {
     /// Bare `param` (`Expr::FuncCall { args: [] }`) still resolves to this
     /// call's own argument. Only a *filter*-namespace binder clears it: a
     /// nested `def`'s matching parameter (of either spelling, since both
-    /// bind the bare name), or -- in that def's `then` -- a nested
-    /// zero-argument `def` of the name. An `as`/`reduce`/`foreach` binder
-    /// never does, however it is spelled: confirmed live against jq 1.7.1,
-    /// `def f(g): 1 as $g | $g + g; 10 as $g | f($g)` is `11` -- the inner
-    /// `1 as $g` shadows the inner `$g` (evaluating to `1`) and never the
-    /// bare `g` (still the caller's `$g`, `10`).
+    /// bind the bare name), or a nested zero-argument `def` of the name --
+    /// in **both** its `body` and its `then` (#2737: `def` is recursive in
+    /// jq, so a zero-argument `def` of `param`'s own name is in scope inside
+    /// its own body too, not just after it). An `as`/`reduce`/`foreach`
+    /// binder never clears this, however it is spelled: confirmed live
+    /// against jq 1.7.1, `def f(g): 1 as $g | $g + g; 10 as $g | f($g)` is
+    /// `11` -- the inner `1 as $g` shadows the inner `$g` (evaluating to `1`)
+    /// and never the bare `g` (still the caller's `$g`, `10`).
     ///
-    /// A nested zero-argument `def` does **not** clear this inside its own
-    /// `body`, where jq also has it in scope (`def` is recursive there).
-    /// That gap predates #2555 and is deliberately left alone: closing it
-    /// makes `def f(a): def a: a+1; a; f(1)` recurse forever, as jq does,
-    /// so it is a behaviour change that needs its own oracle matrix rather
-    /// than a drive-by. Tracked as #2737.
+    /// Closing the `body` gap (#2737) can turn a terminating program into a
+    /// non-terminating one, matching jq: `def f(a): def a: a+1; a; f(1)` now
+    /// hits `MAX_EVAL_FRAMES` and errors cleanly (exit 5) where jq itself
+    /// aborts with `cannot allocate memory` -- see the "non-terminating def"
+    /// divergence in `docs/compliance/jq/limitations.md`.
     bare: bool,
 }
 
@@ -50292,7 +50293,19 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // here. So the bare namespace is shadowed by a matching
             // parameter of *either* spelling, while the `$` namespace is
             // shadowed only when the binding one is `$`-style.
-            let mut body_scope = scope;
+            // #2737: `def` is recursive in jq -- a nested zero-argument
+            // `def` of `param`'s own name is in scope inside its *own*
+            // `body` too, exactly as it is in `then` above, so the same
+            // `name == param && params.is_empty()` condition applies here.
+            // Before this fix only `then_scope` cleared it, so a bare
+            // self-reference inside the nested def's own body kept
+            // resolving to the outer parameter's substituted argument
+            // instead of recursing.
+            let mut body_scope = if name == param && params.is_empty() {
+                scope.without_bare()
+            } else {
+                scope
+            };
             if params.iter().any(|p| p.name() == param) {
                 body_scope = body_scope.without_bare();
             }
@@ -70087,6 +70100,25 @@ mod tests {
         // `body` (the pre-existing `body_shadowed` check) -- confirmed
         // against jq 1.7.1: `1` (h's own g=1), not `2` (f's outer g).
         assert_eq!(outputs(b"null", "def f(g): def h(g): g; h(1); f(2)"), ["1"]);
+    }
+
+    #[test]
+    fn test_func_arg_nested_zero_arg_def_of_params_own_name_is_in_scope_in_its_own_body_2737() {
+        // #2737: `def` is recursive in jq -- a nested zero-argument `def` of
+        // the enclosing parameter's own name is in scope inside its own
+        // `body`, not just in `then` (the pre-existing `then_scope` check
+        // from #2077). Before this fix `body_scope` never cleared `bare` for
+        // this case, so the recursive self-reference resolved to `f`'s own
+        // substituted argument (`1`) on the very first step instead of
+        // recursing -- confirmed against jq 1.7.1: `100` (recursing
+        // `3 -> 2 -> 1 -> 0`), not `1`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(a): def a: if . > 0 then (.-1|a) else 100 end; (3|a); f(1)"
+            ),
+            ["100"]
+        );
     }
 
     #[test]
