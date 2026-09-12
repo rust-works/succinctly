@@ -462,12 +462,21 @@ pub enum Expr {
 
     /// Location reference: `$__loc__`
     /// Returns `{"file": "<top-level>", "line": N}` where N is the 1-based line
-    /// number in the jq filter source where `$__loc__` appears (#2688; a def
-    /// sourced from an `include`d module reports that module's own file path
-    /// in real jq instead -- not modeled here, tracked as #2774).
+    /// number in the jq filter source where `$__loc__` appears (#2688). A def
+    /// sourced from an `include`d module or `~/.jq` carries that source's own
+    /// canonical file path in `file` instead (#2774) -- stamped onto every
+    /// `Loc` in a module's parsed body by `ModuleLoader::ensure_module_loaded`
+    /// and `ModuleLoader::new` (`src/bin/succinctly/jq_runner.rs`), since the
+    /// parser itself has no notion of which file it is reading.
     Loc {
         /// 1-based line number in the jq source
         line: usize,
+        /// The source file's canonical path, for a `Loc` sourced from an
+        /// `include`d module or `~/.jq`. `None` for the top-level filter
+        /// (`Rc<str>` rather than `String`: bodies are cloned per inlining
+        /// site, and every clone should share one allocation rather than
+        /// deep-copy the path each time).
+        file: Option<Rc<str>>,
     },
 
     /// Environment variables: `$ENV`

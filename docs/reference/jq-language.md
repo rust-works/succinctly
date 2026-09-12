@@ -179,6 +179,9 @@ below and [ADR-0019](../adrs/adr-0019.md).
 ### I/O & Debug
 - [x] `debug` / `debug(msg)`
 - [x] `$__loc__` - Current source location `{file, line}` where `$__loc__` appears
+      (`file` is `"<top-level>"` for the main filter, #2688; the canonical path of the
+      `include`d module, `import`ed module, or `~/.jq` the enclosing `def` came from
+      otherwise, #2774)
 - [x] Comments in jq expressions (`#` to end of line)
 - [x] `env`, `$ENV.VAR`, `env(VAR)`, `strenv(VAR)`
 - [x] `now` - Current Unix timestamp

@@ -728,7 +728,10 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         // of the frozen snapshot, so re-inlining a `def` that closes over a
         // large passthrough-bound value on every call stays cheap (#844).
         Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
-        Expr::Loc { line } => Expr::Loc { line: *line },
+        Expr::Loc { line, file } => Expr::Loc {
+            line: *line,
+            file: file.clone(),
+        },
         Expr::Env => Expr::Env,
         Expr::Break(name) => Expr::Break(name.clone()),
 
@@ -984,6 +987,28 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             then: Box::new(f(then)),
             bound: FuncDefBound::default(),
         },
+    }
+}
+
+/// Stamp every `Expr::Loc` reachable inside `expr` with `file`.
+///
+/// For a def body sourced from an `include`d module or `~/.jq` (#2774) --
+/// the parser itself has no notion of which file it is reading, so every
+/// `Loc` it builds starts with `file: None`, and `ModuleLoader` (in
+/// `src/bin/succinctly/jq_runner.rs`) calls this once per module-sourced def
+/// body after parsing, with that module's own canonical path.
+///
+/// Built on [`map_subexprs`] rather than a dedicated match, so a future
+/// `Expr` variant needs no update here: `map_subexprs`'s own exhaustive
+/// match already knows how to reach every nested `Expr`, including one
+/// inside a variant that doesn't exist yet.
+pub fn stamp_loc_file(expr: &Expr, file: &Rc<str>) -> Expr {
+    match expr {
+        Expr::Loc { line, .. } => Expr::Loc {
+            line: *line,
+            file: Some(Rc::clone(file)),
+        },
+        _ => map_subexprs(expr, &mut |child| stamp_loc_file(child, file)),
     }
 }
 
@@ -2166,5 +2191,38 @@ mod tests {
         });
         assert_eq!(calls, 2, "expected exactly one call each for body and then");
         assert_eq!(result, expr);
+    }
+
+    /// #2774: `stamp_loc_file` must reach every `Expr::Loc` no matter how
+    /// deeply nested, including through `map_subexprs`'s own `FuncDef`
+    /// clone arm -- the one arm the issue itself flagged as the likeliest
+    /// place to silently drop the new field, since it would still compile
+    /// fine (`{ .. }` covers a new field with no error) while quietly
+    /// losing it.
+    #[test]
+    fn stamp_loc_file_reaches_every_loc_including_through_a_nested_funcdef() {
+        let expr = parse_program("def f: [$__loc__, (def g: $__loc__; g)]; f")
+            .expect("filter should parse")
+            .expr;
+        let file: Rc<str> = Rc::from("/mod/path.jq");
+        let stamped = stamp_loc_file(&expr, &file);
+
+        let mut locs_seen = 0usize;
+        any_subexpr(&stamped, &mut |e| {
+            if let Expr::Loc { file: f, .. } = e {
+                locs_seen += 1;
+                assert_eq!(f.as_deref(), Some("/mod/path.jq"));
+            }
+            false
+        });
+        assert_eq!(locs_seen, 2, "expected both $__loc__ occurrences stamped");
+
+        // The un-stamped original is untouched (stamp_loc_file takes &Expr).
+        any_subexpr(&expr, &mut |e| {
+            if let Expr::Loc { file: f, .. } = e {
+                assert_eq!(f, &None);
+            }
+            false
+        });
     }
 }

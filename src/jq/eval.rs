@@ -2676,7 +2676,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ordinary bound value -- `resolve_node`'s own `Expr::TrackedVar`
         // arm is what actually decides path-trackability.
         Expr::TrackedVar(v) => QueryResult::Owned(v.value.clone()),
-        Expr::Loc { line } => {
+        Expr::Loc { line, file } => {
             // #2688: `$__loc__` names the *program text*, not the input --
             // jq's own `locfile` uses the literal string `<top-level>` for
             // a filter that didn't come from a module (confirmed live
@@ -2685,11 +2685,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `"<stdin>"`: that's jq's distinct *runtime* error prefix
             // (`jq: error (at <stdin>:1): ...`), naming the input, not the
             // filter -- two different strings for two different things.
-            // A def sourced from an `include`d module or `~/.jq` should
-            // report that module's own path instead, per jq 1.7.1
-            // (confirmed live) -- tracked separately, #2774.
+            // #2774: a def sourced from an `include`d module or `~/.jq`
+            // carries that source's own canonical path in `file`, stamped
+            // on by `ModuleLoader` after parsing (the parser itself has no
+            // notion of which file it's reading) -- reported here instead
+            // of `<top-level>` when present.
             let mut obj = IndexMap::new();
-            obj.insert("file".into(), OwnedValue::String("<top-level>".into()));
+            obj.insert(
+                "file".into(),
+                OwnedValue::String(file.as_deref().unwrap_or("<top-level>").into()),
+            );
             obj.insert("line".into(), OwnedValue::Int(*line as i64));
             QueryResult::Owned(OwnedValue::Object(obj))
         }
