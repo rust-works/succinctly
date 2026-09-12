@@ -4566,7 +4566,10 @@ fn test_doc_select_first() -> Result<()> {
     let input = "---\na: 1\n---\nb: 2\n---\nc: 3";
     let (output, exit_code) = run_yq_stdin(".", input, &["--doc", "0"])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "a: 1\n");
+    // Real yq's own equivalent (`eval-all 'select(di==0)'`) keeps the first
+    // document's leading `---` too, since #2795's verbatim header re-emission
+    // now reproduces it here rather than suppressing it.
+    assert_eq!(output, "---\na: 1\n");
     Ok(())
 }
 
@@ -15861,10 +15864,10 @@ fn test_assignment_preserves_comments_739() -> Result<()> {
 /// `self.pos`, which by the time block-scalar content parsing finishes has
 /// already advanced past the block region (see
 /// `set_bp_text_end_position`'s doc comment); this stole `b`'s comment and
-/// attached it to `a`. Real `yq` drops this comment entirely (it's not a
-/// same-line trailing comment for anything in this document, and
-/// `head_comment` isn't implemented), so this pins the correct "drop, don't
-/// steal" behavior rather than replicating misattribution.
+/// attached it to `a`. Real `yq` attaches it to `b`'s head instead, and
+/// #2795/#2811 now print it there too, so this pins "goes to `b`, not `a`"
+/// rather than the old "drop, don't steal" workaround from before
+/// `head_comment` was emitted.
 #[test]
 fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: |\n  line one\n# comment for b\nb: 2\n", &[])?;
@@ -15872,7 +15875,7 @@ fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
     // `a`'s own scalar re-emits as `|` block style, not a quoted string
     // with `\n` escapes, since #836 - unrelated to what this test itself
     // pins (that the comment isn't misattributed to `a`'s value).
-    assert_eq!(out, "a: |\n  line one\nb: 2\n");
+    assert_eq!(out, "a: |\n  line one\n# comment for b\nb: 2\n");
     Ok(())
 }
 
@@ -15883,7 +15886,7 @@ fn test_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
 fn test_empty_block_scalar_does_not_steal_following_comment_710() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "a: |\n# comment for b\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a: \"\"\nb: 2\n");
+    assert_eq!(out, "a: \"\"\n# comment for b\nb: 2\n");
     Ok(())
 }
 
