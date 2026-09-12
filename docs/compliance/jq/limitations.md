@@ -2742,6 +2742,40 @@ yq has no `def` at all — its lexer rejects `def f: 42; f` outright — so succ
 support there is an extension (ADR-0018 rule 5) rather than a behaviour with a reference to
 match.
 
+### The other three compile-error paths — one closed, two still open (#2703)
+
+[#2703](https://github.com/rust-works/succinctly/issues/2703) found that the shape above
+(`jq: error: … at <top-level>, line N:`, the echoed source, and the `jq: N compile error(s)`
+trailer) was reproduced only on the undefined-name/arity path this section describes — three
+sibling compile-error paths used a flat `jq: compile error: {e}` or `jq: module error: {e}`
+instead, disagreeing with the runner's own correct sibling.
+
+**Closed: an unresolvable `include`/`import` (`module not found`).** Fully deterministic —
+no source position to compute, so nothing blocks matching jq byte for byte:
+`jq: error: module not found: {name}`, a blank line (jq's own stand-in for the missing source
+echo), then the trailer. `ModuleLoader::ensure_module_loaded`'s not-found case now reports
+this exactly; verified against jq 1.7.1 for both `include` and `import`.
+
+**Still open: a syntax error in the main filter, and a syntax error inside an `include`d
+module.** Unlike the deterministic not-found case, jq's trailing padding for a *syntax*
+error is not the same fixed rule as the undefined-name case above — probing several shapes
+(`1 +`, `.foo[`, `{a:`, `1,,`, `.foo | 1,, | .bar`) all echoed the line plus `len - 1` trailing
+spaces, but `if 1 then` breaks that pattern: it produces *two* separate compile errors from
+one parse, one padded per the `len - 1` rule and the second with none at all. jq's real rule
+depends on the specific diagnostic's own token span, which is bison/lexer internals this
+codebase has no access to; reproducing it needs either reading jq's C parser source
+(`parser.y`/`scanner.l`) or a much wider oracle sweep than #2703 did. Also unresolved: jq's
+parser can report *multiple* compile errors from a single malformed filter (again, `if 1 then`
+→ 2 errors); succinctly's parser returns a single `Result<_, ParseError>` and has no
+architecture for accumulating more than one, which is a separate, larger gap than the message
+wording alone.
+
+Until that lands, these two paths keep their pre-#2703 shape: `jq: compile error: parse error
+at position N: …` for the main filter, `jq: module error: parse error in module '{path}': …`
+for a module (naming the path as given on the command line, not jq's resolved absolute path).
+Both still exit 3, matching jq, and neither corrupts output or crashes — the two conditions
+that would otherwise make this an accepted ADR-0018 divergence rather than an open gap.
+
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
 
 > The `MAX_EVAL_FRAMES` raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.

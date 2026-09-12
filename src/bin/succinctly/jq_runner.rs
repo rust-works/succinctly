@@ -46,15 +46,59 @@ pub struct EvalContext {
     pub positional: Vec<OwnedValue>,
 }
 
+/// A module or filter's function definitions, as extracted from its parsed
+/// `Expr`: name, parameters, body. Named (#2703) so the two-parameter
+/// `Result<_, ModuleLoadError>` signatures this module needs don't also
+/// spell out this tuple-of-a-tuple inline, which clippy's `type_complexity`
+/// lint flags once it stops being folded into `anyhow::Result`'s single-
+/// parameter alias.
+type FuncDefList = Vec<(String, Vec<Param>, Expr)>;
+
 /// Module loader for resolving and loading jq modules.
 #[derive(Debug)]
 pub struct ModuleLoader {
     /// Search path for modules (in order of priority)
     search_path: Vec<PathBuf>,
     /// Loaded modules (path -> function definitions: name, params, body)
-    loaded_modules: BTreeMap<String, Vec<(String, Vec<Param>, Expr)>>,
+    loaded_modules: BTreeMap<String, FuncDefList>,
     /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
-    auto_loaded_defs: Vec<(String, Vec<Param>, Expr)>,
+    auto_loaded_defs: FuncDefList,
+}
+
+/// A [`ModuleLoader`] failure, structured enough to report in jq's own
+/// per-case shape (#2703) -- unlike a flattened `anyhow::Error`, which loses
+/// the distinction [`report_module_load_error`] needs.
+pub(crate) enum ModuleLoadError {
+    /// No `{module_path}.jq` was found anywhere in the search path. jq's own
+    /// shape has no source location to show for this case: `module not
+    /// found: {module_path}`, a blank line standing in for the missing echo,
+    /// then the usual `jq: 1 compile error` trailer. Confirmed live against
+    /// jq 1.7.1, byte-for-byte.
+    NotFound { module_path: String },
+    /// The module could not be read, or its own contents failed to parse.
+    /// jq's shape for this case additionally names the resolved *absolute*
+    /// path and echoes the module's own source line -- #2703's fix does not
+    /// yet extend this far (see the issue's own follow-up note on the
+    /// syntax-error padding rule, which isn't a fixed formula), so this
+    /// stays an opaque `anyhow::Error`, reported the same way as before.
+    Other(anyhow::Error),
+}
+
+/// Print a [`ModuleLoadError`] the way `run_jq`'s two call sites both need
+/// to (#2703): one shared place so the not-found case's jq-matching shape
+/// can't drift between them the way the two `eprintln!("jq: module error:
+/// {e}")` sites used to have to be kept in step by hand.
+fn report_module_load_error(e: &ModuleLoadError) {
+    match e {
+        ModuleLoadError::NotFound { module_path } => {
+            eprintln!("jq: error: module not found: {module_path}");
+            eprintln!();
+            eprintln!("jq: 1 compile error");
+        }
+        ModuleLoadError::Other(inner) => {
+            eprintln!("jq: module error: {inner}");
+        }
+    }
 }
 
 /// Resolve a module path to a file path within `search_path`.
@@ -136,7 +180,7 @@ impl ModuleLoader {
     fn ensure_module_loaded(
         &mut self,
         module_path: &str,
-    ) -> Result<&Vec<(String, Vec<Param>, Expr)>> {
+    ) -> Result<&FuncDefList, ModuleLoadError> {
         // `entry` rather than `get`-then-insert: the borrow checker cannot
         // see that an early `return` of `get`'s borrow ends it, so the
         // `contains_key` spelling would need an unreachable `expect` on the
@@ -148,16 +192,21 @@ impl ModuleLoader {
                 // Resolve the module path
                 let file_path =
                     resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
-                        anyhow::anyhow!("module '{module_path}' not found in search path")
+                        ModuleLoadError::NotFound {
+                            module_path: module_path.to_string(),
+                        }
                     })?;
 
                 // Read and parse the module
                 let contents = std::fs::read_to_string(&file_path)
-                    .with_context(|| format!("failed to read module: {}", file_path.display()))?;
+                    .with_context(|| format!("failed to read module: {}", file_path.display()))
+                    .map_err(ModuleLoadError::Other)?;
 
-                let program = jq::parse_program(&contents).map_err(|e| {
-                    anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
-                })?;
+                let program = jq::parse_program(&contents)
+                    .map_err(|e| {
+                        anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+                    })
+                    .map_err(ModuleLoadError::Other)?;
 
                 // Extract function definitions from the expression
                 Ok(entry.insert(extract_func_defs(&program.expr)))
@@ -167,7 +216,10 @@ impl ModuleLoader {
 
     /// Load a module and return an owned copy of its function definitions
     /// (name, params, body).
-    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Vec<Param>, Expr)>> {
+    pub fn load_module(
+        &mut self,
+        module_path: &str,
+    ) -> Result<FuncDefList, ModuleLoadError> {
         self.ensure_module_loaded(module_path).cloned()
     }
 
@@ -188,7 +240,10 @@ impl ModuleLoader {
     /// re-reads and re-parses nothing. A module that cannot be resolved fails
     /// here instead of there, one step earlier but still after the main filter
     /// has parsed, so the caller's error and exit code are unchanged.
-    pub fn unqualified_def_names(&mut self, program: &Program) -> Result<BTreeSet<String>> {
+    pub fn unqualified_def_names(
+        &mut self,
+        program: &Program,
+    ) -> Result<BTreeSet<String>, ModuleLoadError> {
         let mut names: BTreeSet<String> = self
             .auto_loaded_defs
             .iter()
@@ -204,7 +259,7 @@ impl ModuleLoader {
     }
 
     /// Process imports and includes, returning the modified expression with all functions defined.
-    pub fn process_program(&mut self, program: &Program) -> Result<Expr> {
+    pub fn process_program(&mut self, program: &Program) -> Result<Expr, ModuleLoadError> {
         let mut expr = program.expr.clone();
 
         // First, prepend auto-loaded ~/.jq definitions (lowest priority, can be overridden)
@@ -551,10 +606,10 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
 }
 
 /// Extract function definitions from an expression, preserving parameters.
-fn extract_func_defs(expr: &Expr) -> Vec<(String, Vec<Param>, Expr)> {
+fn extract_func_defs(expr: &Expr) -> FuncDefList {
     let mut defs = Vec::new();
 
-    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Vec<Param>, Expr)>) {
+    fn extract_inner(expr: &Expr, defs: &mut FuncDefList) {
         if let Expr::FuncDef {
             name,
             params,
@@ -1413,7 +1468,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let module_def_names = match module_loader.unqualified_def_names(&program) {
         Ok(names) => names,
         Err(e) => {
-            eprintln!("jq: module error: {e}");
+            report_module_load_error(&e);
             return Ok(exit_codes::COMPILE_ERROR);
         }
     };
@@ -1445,7 +1500,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let expr = match module_loader.process_program(&program) {
         Ok(expr) => expr,
         Err(e) => {
-            eprintln!("jq: module error: {e}");
+            report_module_load_error(&e);
             return Ok(exit_codes::COMPILE_ERROR);
         }
     };
