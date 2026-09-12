@@ -1075,16 +1075,33 @@ generally, for every construct that reaches the DOM path, by
 now clamps `-I0`'s YAML indent width to 2 (the same convention the M2 streaming path already
 used for its own `-I0`) instead of collapsing to an empty string.
 
-**Residual divergence, deliberately not chased by #1575**: real yq's own `-I0` is not width
-2 — it's empirically identical to its own `-I4` output (verified live against v4.53.3),
-plus an irregular per-level quirk beyond even that (a compact block-sequence item's inlined
-mapping doesn't increment its own indent depth for the purpose of computing its fields'
-children, so the jump from the mapping's own line to its first nested level is narrower
-than every jump after it). Neither succinctly output route models this — both settle for a
-uniform width-2 step, matching each other but not the oracle. Widening to width 4 alone
-would still not close the gap (the irregular per-level part is unmodeled by both routes at
-every non-default `-I` width, not just `-I0`), so this remains open rather than folded into
-#1575's fix.
+**Closed by #2606** (previously recorded here as a residual divergence #1575 deliberately
+didn't chase): real yq's own `-I0` is not width 2 — it's byte-identical to its own `-I4`
+output at every level (verified live against v4.53.3, and swept across all 150
+`tests/data/yq-golden` inputs with zero divergences). The "irregular per-level quirk"
+this entry used to describe (a compact block-sequence item's inlined mapping not
+incrementing its own indent depth for its fields' children) turned out not to be an
+unmodeled oracle behavior at all — it's go-yaml's ordinary
+`indent = BestIndent * ((indent + BestIndent) / BestIndent)` rounding, which both
+succinctly output routes already reproduce correctly at every width once the width itself
+is right. Only the `0 -> 4` mapping was ever missing; the width table is now pinned
+directly from real yq's own dependency source (`go.yaml.in/yaml/v4`,
+`internal/libyaml/representer.go`'s `Representer.init` composed with
+`internal/libyaml/emitter.go`'s own clamp) in
+[`IndentSpec::for_yaml`](../../../src/jq/document.rs): `0 -> 4`, `1 -> 2`, `2..=9 -> n`
+unchanged, `>= 10 -> 2`.
+
+Two related bugs surfaced and closed alongside the width table itself: `-I0`'s own
+(then-"compact") status satisfied `can_yaml_fast_path`'s gate on its own regardless of
+`-P`, so `-P -I0` on flow-style input wrongly stayed flow instead of expanding to block
+style the way `-P` does at every other `-I` value; and `YqCommand::indent`'s CLI parser
+capped every value at 7 (jq's own `--indent` limit, wrongly applied to yq mode), where
+real yq accepts any non-negative width for JSON output, unbounded above (only YAML is
+clamped, per the table above). A negative `-I` value still cannot reach real yq's own
+panic path here (`yaml: cannot indent to a negative number of spaces`, exit 2) — clap's
+own unsigned-integer rejection is the ADR-0018 rule-4(c) answer (matching would take the
+host process down), so succinctly's own clean parse-error rejection for `-I -1` remains a
+deliberate divergence, not something #2606 changed.
 
 **One more deliberate divergence, this time between two `succinctly`-internal walks rather
 than against real yq**: `path(f)`

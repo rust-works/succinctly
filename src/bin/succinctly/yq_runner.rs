@@ -5989,8 +5989,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && split_expr.is_none()
         && !args.eval_all
         && context.named.is_empty();
+    // #2606: unlike the JSON gate above, this one never OR's in
+    // `output_config.compact` -- `-I0` no longer means "compact" for YAML
+    // (it means 4-space indent, matching real yq's own go-yaml dependency),
+    // so `can_stream_pretty_or_colored` (`!args.pretty_print`) alone
+    // decides: `-P` always forces the DOM/style-clearing path regardless of
+    // `-I`, and everything else still takes the fast path. Before this,
+    // `-I0 -P` wrongly stayed on the fast path (`compact` was true), so
+    // `-P` never reached its own style-clearing DOM route when combined
+    // with `-I0` -- confirmed live, `-I0 -P` on flow-style input left it
+    // as flow instead of expanding to block style the way real yq does.
     let can_yaml_fast_path = is_m2_streamable
-        && (output_config.compact || can_stream_pretty_or_colored)
+        && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input
@@ -6033,9 +6043,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.inplace
         && args.front_matter.is_none()
         && context.named.is_empty();
+    // #2606: same reasoning as `can_yaml_fast_path` above -- `-I0` no
+    // longer implies "compact" for YAML.
     let can_inplace_yaml_fast_path = is_m2_streamable
         && fast_path_json_comma_safe
-        && (output_config.compact || can_stream_pretty_or_colored)
+        && can_stream_pretty_or_colored
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
         && !args.raw_input

@@ -43,14 +43,21 @@ impl IndentSpec {
     }
 
     /// The `-I`/`--tab` CLI flags' shared YAML-output rule (#1486, #1575,
-    /// #1685): `--tab` means exactly one tab per level regardless of
-    /// `indent`'s value; otherwise `-I0`/`-I1` both clamp to width 2 --
-    /// real yq's YAML output at `-I1` is byte-identical to its own `-I2`
-    /// output at every level (live-verified against v4.53.3), and `-I0`
-    /// reuses that same clamp rather than modeling real yq's own irregular
-    /// `-I0`-behaves-like-`-I4` quirk (out of scope, see
-    /// `docs/compliance/yq/limitations.md`). `-I2` and above thread through
-    /// unchanged.
+    /// #1685, #2606): `--tab` means exactly one tab per level regardless of
+    /// `indent`'s value; otherwise the width table is pinned straight from
+    /// real yq's own dependency source (`go.yaml.in/yaml/v4`,
+    /// v4.53.3) -- `internal/libyaml/representer.go`'s
+    /// `Representer.init` (`if r.Indent == 0 { r.Indent = 4 }`) composed
+    /// with `internal/libyaml/emitter.go`'s own clamp
+    /// (`if emitter.BestIndent < 2 || emitter.BestIndent > 9 {
+    /// emitter.BestIndent = 2 }`): `0 -> 4`, `1 -> 2`, `2..=9 -> n`,
+    /// `>= 10 -> 2`. Swept all 150 `tests/data/yq-golden` inputs against
+    /// this table with zero divergences (#2606) -- the "irregular
+    /// per-level quirk" this doc comment used to describe as an unmodeled,
+    /// out-of-scope residual was go-yaml's ordinary
+    /// `indent = BestIndent * ((indent + BestIndent) / BestIndent)`
+    /// rounding, which succinctly's own YAML emitter already reproduces at
+    /// every width; only the `0 -> 4` mapping itself was ever missing.
     ///
     /// Takes primitive `indent`/`tab` rather than a whole CLI-args struct:
     /// this is a library-crate (`src/jq/`) type, and the parsed args live in
@@ -61,10 +68,10 @@ impl IndentSpec {
     /// hand-encoded copies of this exact rule (#1685), the third recurrence
     /// of the same duplication in that file's history.
     ///
-    /// JSON has no such clamp (`-I1 -o=json` genuinely indents 1 space per
-    /// level in real yq, and `-I0 -o=json` means compact/flow, handled
-    /// separately) -- this constructor is YAML-specific, not a general
-    /// `-I`-flag-to-`IndentSpec` conversion.
+    /// JSON has no such table (`-I1 -o=json` genuinely indents 1 space per
+    /// level in real yq, unbounded above, and `-I0 -o=json` means
+    /// compact/flow, handled separately) -- this constructor is
+    /// YAML-specific, not a general `-I`-flag-to-`IndentSpec` conversion.
     pub fn for_yaml(indent: u8, tab: bool) -> Self {
         if tab {
             return Self {
@@ -72,7 +79,13 @@ impl IndentSpec {
                 unit: '\t',
             };
         }
-        Self::spaces((indent as usize).max(2))
+        let width = match indent {
+            0 => 4,
+            1 => 2,
+            2..=9 => indent as usize,
+            _ => 2,
+        };
+        Self::spaces(width)
     }
 
     /// Whether this spec requests compact/flow-style output (no newlines).
@@ -160,20 +173,30 @@ impl JsonConvention {
 mod indent_spec_tests {
     use super::IndentSpec;
 
-    /// #1685: `-I0`/`-I1` both clamp to width 2, `-I2` and above thread
-    /// through unchanged -- the rule the DOM path's `compute_indent_str`
-    /// and the M2 fast path's indent setup previously hand-encoded twice.
+    /// #2606: the width table pinned straight from real yq's own
+    /// dependency source (go-yaml v4.0.0-rc.4) -- `0 -> 4`, `1 -> 2`,
+    /// `2..=9 -> n` unchanged, `>= 10 -> 2`. `-I0` used to clamp to 2 like
+    /// `-I1` (the #1685 rule this test used to pin); real yq's own `-I0`
+    /// is byte-identical to its `-I4`, confirmed live and swept across all
+    /// 150 `tests/data/yq-golden` inputs with zero divergences.
     #[test]
-    fn for_yaml_clamps_zero_and_one_to_two_1685() {
-        for indent in [0u8, 1, 2] {
+    fn for_yaml_width_table_2606() {
+        assert_eq!(IndentSpec::for_yaml(0, false), IndentSpec::spaces(4));
+        assert_eq!(IndentSpec::for_yaml(1, false), IndentSpec::spaces(2));
+        for indent in 2u8..=9 {
+            assert_eq!(
+                IndentSpec::for_yaml(indent, false),
+                IndentSpec::spaces(indent as usize),
+                "indent={indent}"
+            );
+        }
+        for indent in [10u8, 11, 100, 255] {
             assert_eq!(
                 IndentSpec::for_yaml(indent, false),
                 IndentSpec::spaces(2),
                 "indent={indent}"
             );
         }
-        assert_eq!(IndentSpec::for_yaml(4, false), IndentSpec::spaces(4));
-        assert_eq!(IndentSpec::for_yaml(6, false), IndentSpec::spaces(6));
     }
 
     /// `--tab` means exactly one tab per level regardless of `-I`'s value,
