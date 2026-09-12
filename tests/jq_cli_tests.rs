@@ -23337,6 +23337,127 @@ fn test_home_jq_def_shadows_builtin_2395() -> Result<()> {
     Ok(())
 }
 
+/// #2682: `process_program` wraps `~/.jq`'s defs before an `include`d
+/// module's, which makes `~/.jq` the *innermost* `Expr::FuncDef` and
+/// therefore the one that wins a same-name collision -- the reverse of what
+/// jq actually does. Confirmed live against jq 1.7.1: an `include`d module's
+/// def always outranks a same-named `~/.jq` def.
+#[test]
+fn test_include_outranks_home_jq_on_a_name_collision_2682() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    std::fs::write(temp_home.path().join(".jq"), "def myfn: \"dotjq-myfn\";\n")?;
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(
+        lib_dir.path().join("pfn.jq"),
+        "def myfn: \"include-myfn\";\n",
+    )?;
+
+    let lib_arg = lib_dir.path().to_string_lossy().into_owned();
+    let (output, code) = spawn_jq_with_env(
+        &["-L", &lib_arg, "-nc", r#"include "pfn"; myfn"#],
+        "HOME",
+        temp_home.path(),
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""include-myfn""#);
+    Ok(())
+}
+
+/// #2682 control: `~/.jq` still wins when nothing `include`d defines the
+/// same name -- the bug is specifically about `include` vs `~/.jq`
+/// priority on a genuine collision, not about `~/.jq` losing outright.
+#[test]
+fn test_home_jq_still_wins_without_a_colliding_include_2682() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    std::fs::write(temp_home.path().join(".jq"), "def myfn: \"dotjq-myfn\";\n")?;
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(lib_dir.path().join("pfn.jq"), "def other: 1;\n")?;
+
+    let lib_arg = lib_dir.path().to_string_lossy().into_owned();
+    let (output, code) = spawn_jq_with_env(
+        &["-L", &lib_arg, "-nc", r#"include "pfn"; myfn"#],
+        "HOME",
+        temp_home.path(),
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""dotjq-myfn""#);
+    Ok(())
+}
+
+/// #2682 (filed via a comment on the issue by the repo owner): among
+/// multiple `include`s defining the same name, the *last*-declared one
+/// wins, not the first -- `program.includes` was walked in declaration
+/// order, making the first-declared include the innermost `Expr::FuncDef`
+/// and therefore the winner, backwards from jq's own rule. Both directions
+/// confirmed live against jq 1.7.1.
+#[test]
+fn test_last_declared_include_wins_on_a_name_collision_2682() -> Result<()> {
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(lib_dir.path().join("pa.jq"), "def foo: \"from-A\";\n")?;
+    std::fs::write(lib_dir.path().join("pb.jq"), "def foo: \"from-B\";\n")?;
+
+    for (filter, want) in [
+        (r#"include "pa"; include "pb"; foo"#, r#""from-B""#),
+        (r#"include "pb"; include "pa"; foo"#, r#""from-A""#),
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(lib_dir.path())
+                    .args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2682, the three-way case the issue's own author flagged worth checking:
+/// a main-filter `def` still outranks both an `include`d module's and
+/// `~/.jq`'s same-named def, since it's the innermost of all three (jq
+/// agrees: confirmed live).
+#[test]
+fn test_main_filter_def_outranks_both_include_and_home_jq_2682() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    std::fs::write(temp_home.path().join(".jq"), "def myfn: \"dotjq-myfn\";\n")?;
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(
+        lib_dir.path().join("pfn.jq"),
+        "def myfn: \"include-myfn\";\n",
+    )?;
+
+    let lib_arg = lib_dir.path().to_string_lossy().into_owned();
+    let (output, code) = spawn_jq_with_env(
+        &[
+            "-L",
+            &lib_arg,
+            "-nc",
+            r#"include "pfn"; def myfn: "main-filter"; myfn"#,
+        ],
+        "HOME",
+        temp_home.path(),
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""main-filter""#);
+    Ok(())
+}
+
 /// #2395: `import "m" as ns` must *not* shadow, and the exclusion is
 /// deliberate rather than an oversight -- jq puts an imported module's defs in
 /// scope only as `ns::name`, so a bare `length` there is still the builtin
