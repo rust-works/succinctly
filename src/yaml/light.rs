@@ -49,6 +49,10 @@ pub struct YamlCursor<'a, W = Vec<u64>> {
     bp_pos: usize,
 }
 
+/// The bp position of the first document's content node: the virtual root
+/// sequence opens at 0 and its first child follows immediately (#2795).
+const FIRST_DOCUMENT_BP: usize = 1;
+
 impl<W> Clone for YamlCursor<'_, W> {
     fn clone(&self) -> Self {
         *self
@@ -133,6 +137,61 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             index: self.index,
             bp_pos: new_pos,
         })
+    }
+
+    /// Write the standalone head comment of the node at `bp` (#2795) --
+    /// see [`write_head_comment_lines`] for the layout. One branch and no
+    /// lookup at all on a document without standalone comments, which is
+    /// what keeps this off the comment-free streaming path's profile.
+    #[inline]
+    fn write_head_comments_at<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: &str,
+        bp: usize,
+    ) -> core::fmt::Result {
+        if !self.index.has_standalone_comments() {
+            return Ok(());
+        }
+        write_head_comment_lines(
+            out,
+            indent,
+            self.text,
+            self.index.get_head_comments(bp),
+            self.header_end(),
+        )
+    }
+
+    /// [`Self::write_head_comments_at`]'s foot counterpart -- see
+    /// [`write_foot_comment_lines`], whose "did it write anything" answer
+    /// this forwards.
+    #[inline]
+    fn write_foot_comments_at<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: &str,
+        bp: usize,
+    ) -> Result<bool, core::fmt::Error> {
+        if !self.index.has_standalone_comments() {
+            return Ok(false);
+        }
+        write_foot_comment_lines(out, indent, self.text, self.index.get_foot_comments(bp))
+    }
+
+    /// Where the first document's verbatim header ends (#2795): standalone
+    /// comment lines starting before this offset were printed by
+    /// [`write_yq_header`] and must not print again as any node's head.
+    #[inline]
+    fn header_end(&self) -> usize {
+        self.index.yq_header(|| yq_header_len(self.text)).0
+    }
+
+    /// Whether this cursor is a document's content node -- a direct child
+    /// of the virtual root sequence (#2795). The node the parser keys a
+    /// document's own head/foot comments on.
+    #[inline]
+    fn is_document_content(&self) -> bool {
+        self.bp_pos != 0 && self.index.bp().parent(self.bp_pos) == Some(0)
     }
 
     /// Navigate to the parent.
@@ -1431,6 +1490,28 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // than relying on each downstream read to notice a bare-dash
         // wrapper on its own.
         let self_ = self.resolve_bare_seq_item();
+        // Standalone comments around a *document* (#2795): its leading
+        // block prints above it and its foot (below) prints after it, but
+        // only when the result is a document's own content node -- a
+        // navigated child (`yq '.a'` on `# h\na: 1`) prints without its
+        // head or foot, measured against real yq. The *first* document
+        // additionally re-emits the verbatim header real yq's default
+        // `--header-preprocess` slurps (blank lines and an explicit `---`
+        // included, see `yq_header_len`), which covers its leading comment
+        // block too -- the returned offset keeps the block from printing
+        // twice -- for *every* document, since the header runs past a
+        // leading `---` and can swallow a second document's own leading
+        // block (`#c1\n---\n# c2\nb: 2` is one header in real yq; #2795's
+        // fuzz caught `# c2` printing twice). A JSON-sourced index
+        // (`-p json`) never has a header: real yq only preprocesses one
+        // for its YAML decoder.
+        let is_document = self_.is_document_content();
+        if is_document {
+            if self_.bp_pos == FIRST_DOCUMENT_BP {
+                write_yq_header(out, self_.text, self_.index)?;
+            }
+            self_.write_head_comments_at(out, "", self_.bp_pos)?;
+        }
         // #1350 code review: `write_leading_anchor` must run *before*
         // resolving a root alias below, not after -- the target's own
         // `&anchor` belongs to the target's own identity, not to this
@@ -1501,6 +1582,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         }
         if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
             write_line_comment(out, self_.line_comment_raw())?;
+            // The document's own foot comment (#2795): a block at the end
+            // of the document that a blank line detached from its last
+            // key/item. Real yq prints it after a collection root only --
+            // a scalar root's foot is silently dropped (`# lead\n42\n# foot`
+            // prints `# lead\n42`, measured), so it is inside this guard.
+            if is_document {
+                self_.write_foot_comments_at(out, "", self_.bp_pos)?;
+            }
         }
         Ok(())
     }
@@ -1895,12 +1984,24 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         keyed.sort_by(|a, b| a.0.cmp(&b.0));
                         items = keyed.into_iter().map(|(_, field)| field).collect();
                     }
+                    // Standalone comments live on the *key* of a mapping
+                    // entry (#798): its head prints above the key line at
+                    // this mapping's indent, its foot below the whole
+                    // entry, and a foot is followed by one blank line when
+                    // another entry follows it (#2795; see
+                    // `write_foot_comment_lines`).
+                    let mut prev_had_foot = false;
                     for field in items {
                         if !first {
+                            if prev_had_foot {
+                                out.write_char('\n')?;
+                            }
                             out.write_char('\n')?;
                             out.write_str(indent)?;
                         }
                         first = false;
+                        let key_cursor = field.key_cursor();
+                        self.write_head_comments_at(out, indent, key_cursor.bp_pos)?;
                         write_yaml_field_key(out, field)?;
                         out.write_char(':')?;
                         // Check if value needs newline
@@ -1938,7 +2039,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // via `write_extra_line_comments`, before the
                             // anchor/tag -- matching the oracle
                             // (`b: # floated\n  # own\n    c: 1`).
-                            let key_cursor = field.key_cursor();
                             let mut key_comments = key_cursor.line_comments_raw();
                             if let Some(first) = key_comments.next() {
                                 write_line_comment(out, Some(first))?;
@@ -1976,6 +2076,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 &child_indent,
                             )?;
                             write_line_comment(out, value.line_comment_raw())?;
+                            prev_had_foot =
+                                self.write_foot_comments_at(out, indent, key_cursor.bp_pos)?;
                         } else {
                             // #1077: a deferred value that materializes as
                             // nothing at all writes no value token here,
@@ -2032,7 +2134,6 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // value, any further entries as their own `#`
                             // lines at this key's own indent (matching
                             // `b: 1 # floated\n  # own`).
-                            let key_cursor = field.key_cursor();
                             match value.line_comment_raw() {
                                 Some(comment) => write_line_comment(out, Some(comment))?,
                                 None => {
@@ -2043,6 +2144,8 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     }
                                 }
                             }
+                            prev_had_foot =
+                                self.write_foot_comments_at(out, indent, key_cursor.bp_pos)?;
                         }
                     }
                     Ok(())
@@ -2089,13 +2192,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // `is_yaml_cursor_container`/`first_child`-shaped
                     // properties it already read here before (#835). Same
                     // one resolve per element either way.
+                    // Standalone comments on a sequence item (#798) live on
+                    // the item's content node (or on a bare `-` wrapper's
+                    // own node when the value deferred to the next line --
+                    // read both when they differ); head above the `- `,
+                    // foot below the item, one blank line after a foot when
+                    // another item follows (#2795; see the mapping loop).
+                    let mut prev_had_foot = false;
                     while let Some((raw, rest)) = elems.uncons_raw_cursor() {
                         let cursor = raw.resolve_bare_seq_item();
                         if !first {
+                            if prev_had_foot {
+                                out.write_char('\n')?;
+                            }
                             out.write_char('\n')?;
                             out.write_str(indent)?;
                         }
                         first = false;
+                        self.write_head_comments_at(out, indent, cursor.bp_position())?;
+                        if raw.bp_position() != cursor.bp_position() {
+                            self.write_head_comments_at(out, indent, raw.bp_position())?;
+                        }
                         // A comment captured on a bare `-` wrapper itself
                         // (#1079) -- only present when this item really was
                         // a bare wrapper whose value deferred to the next
@@ -2225,6 +2342,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 )?;
                             }
                             write_line_comment(out, cursor.line_comment_raw())?;
+                            prev_had_foot =
+                                self.write_foot_comments_at(out, indent, cursor.bp_position())?;
+                            if raw.bp_position() != cursor.bp_position() {
+                                prev_had_foot |=
+                                    self.write_foot_comments_at(out, indent, raw.bp_position())?;
+                            }
                         } else {
                             // #1077: mirrors the mapping-field branch above
                             // -- see `write_deferred_value`'s own doc
@@ -2292,6 +2415,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 own_comment
                             };
                             write_line_comment(out, own_comment)?;
+                            prev_had_foot =
+                                self.write_foot_comments_at(out, indent, cursor.bp_position())?;
+                            if raw.bp_position() != cursor.bp_position() {
+                                prev_had_foot |=
+                                    self.write_foot_comments_at(out, indent, raw.bp_position())?;
+                            }
                         }
                         elems = rest;
                     }
@@ -7933,6 +8062,200 @@ fn write_extra_line_comments<'t, Out: core::fmt::Write>(
         out.write_char('\n')?;
         out.write_str(indent)?;
         out.write_str(extra)?;
+    }
+    Ok(())
+}
+
+/// Whether a wholly blank line lies in `text[from..to)` -- two or more line
+/// breaks, `\r\n` counting once (#2795). The cursor-side twin of the
+/// parser's `blank_line_between`, used to *derive* the blank line real yq
+/// keeps between two lines of one standalone comment block
+/// (`a:\n  # h1\n\n  # h2\n  b: 1` round-trips with the blank intact): the
+/// parser records only the `#` lines, so the blank is read back off the
+/// text between them rather than stored.
+fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
+    let mut breaks = 0usize;
+    let mut p = from;
+    let end = to.min(text.len());
+    while p < end {
+        if is_line_break(text[p]) {
+            breaks += 1;
+            if breaks >= 2 {
+                return true;
+            }
+            p += line_break_len(text, p);
+        } else {
+            p += 1;
+        }
+    }
+    false
+}
+
+/// Write a node's standalone *head* comment lines (#2795) so that the node
+/// itself can follow at `indent` -- the caller must already be positioned
+/// at `indent` (a fresh line's indentation written, nothing else). Each
+/// line is written raw (`#` and all), followed by a line break and
+/// `indent` again, so the caller writes the node exactly as it would have
+/// with no head comment at all. A blank line between two lines of the
+/// block is reproduced as a genuinely empty line (no trailing indent),
+/// matching real yq's own output; see [`blank_line_between`].
+///
+/// `skip_before` drops lines starting before that byte offset -- the first
+/// document's leading block is written verbatim by [`write_yq_header`]
+/// instead, and must not print twice. Lines that aren't valid UTF-8 are
+/// skipped, as [`YamlCursor::head_comment_raw`] does.
+fn write_head_comment_lines<Out: core::fmt::Write>(
+    out: &mut Out,
+    indent: &str,
+    text: &[u8],
+    ranges: &[(u32, u32)],
+    skip_before: usize,
+) -> core::fmt::Result {
+    let mut prev_end: Option<usize> = None;
+    for &(start, end) in ranges {
+        let (start, end) = (start as usize, end as usize);
+        if start < skip_before {
+            continue;
+        }
+        let Ok(line) = core::str::from_utf8(&text[start..end]) else {
+            continue;
+        };
+        if let Some(prev_end) = prev_end {
+            if blank_line_between(text, prev_end, start) {
+                out.write_char('\n')?;
+            }
+            out.write_str(indent)?;
+        }
+        out.write_str(line)?;
+        out.write_char('\n')?;
+        prev_end = Some(end);
+    }
+    if prev_end.is_some() {
+        out.write_str(indent)?;
+    }
+    Ok(())
+}
+
+/// Write a node's standalone *foot* comment lines (#2795), each on its own
+/// line at `indent`, after the node (and its trailing comment) has been
+/// written. Returns whether anything was written: real yq separates a foot
+/// comment from the *next* sibling in the same collection with one blank
+/// line (`a: 1\n# f\n\nb: 2` round-trips as-is, while a foot that ends its
+/// collection gets none), so the caller inserts that blank when it moves on
+/// to a following sibling. A foot block never spans a blank line (the parser
+/// ends a foot at one), so unlike [`write_head_comment_lines`] there is
+/// nothing to derive here.
+fn write_foot_comment_lines<Out: core::fmt::Write>(
+    out: &mut Out,
+    indent: &str,
+    text: &[u8],
+    ranges: &[(u32, u32)],
+) -> Result<bool, core::fmt::Error> {
+    let mut wrote = false;
+    for &(start, end) in ranges {
+        let Ok(line) = core::str::from_utf8(&text[start as usize..end as usize]) else {
+            continue;
+        };
+        out.write_char('\n')?;
+        out.write_str(indent)?;
+        out.write_str(line)?;
+        wrote = true;
+    }
+    Ok(wrote)
+}
+
+/// The byte length of the leading *header* real yq's default
+/// `--header-preprocess` slurps off the front of an input and re-emits
+/// verbatim before the first document whenever the result is that document
+/// itself (#2795): every leading line that is empty, a `#` comment (at any
+/// indent), a `%YA..` directive, or a `---` marker, up to the first line
+/// that is none of those. Blank lines are kept exactly where they were
+/// (`# lead\n\na: 1` round-trips with its blank, unlike a blank after any
+/// other head comment) and so is an explicit leading `---` -- both of which
+/// nothing in the comment index records, which is why this reads the text
+/// directly.
+///
+/// The second value is `true` when the header ends on a `---` marker that
+/// has content after it on the same line (`--- 42`): the marker is part of
+/// the header, the content is the document's, and the two must part with a
+/// line break the text doesn't have (`--- # c` is the same shape; real yq
+/// glues the comment onto the next line there and cannot read its own
+/// output back, which succinctly does not reproduce -- the marker's
+/// trailing comment is dropped instead).
+fn yq_header_len(text: &[u8]) -> (usize, bool) {
+    let mut pos = 0;
+    while pos < text.len() {
+        let rest = &text[pos..];
+        let line_end = rest
+            .iter()
+            .position(|&b| is_line_break(b))
+            .unwrap_or(rest.len());
+        let line = &rest[..line_end];
+        let next = if line_end < rest.len() {
+            pos + line_end + line_break_len(rest, line_end)
+        } else {
+            text.len()
+        };
+        let trimmed_start = line.iter().position(|&b| b != b' ' && b != b'\t');
+        let is_header_line = match trimmed_start {
+            None => line.is_empty(),
+            Some(i) => {
+                line[i] == b'#'
+                    || (i == 0 && (line.starts_with(b"%YA") || line.starts_with(b"---")))
+            }
+        };
+        if !is_header_line {
+            return (pos, false);
+        }
+        if line.starts_with(b"---") {
+            match line.get(3) {
+                None => {}
+                Some(b' ' | b'\t') => return (pos + 3, true),
+                Some(_) => return (pos, false),
+            }
+        }
+        pos = next;
+    }
+    (pos, false)
+}
+
+/// Write the leading header [`yq_header_len`] measures, verbatim (#2795),
+/// dropping its `---` lines when the index's `header_doc_markers` is off
+/// (real yq's `-N` suppresses those along with every other document
+/// separator). A header that isn't valid UTF-8 is not written at all.
+fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
+    out: &mut Out,
+    text: &[u8],
+    index: &YamlIndex<W>,
+) -> core::fmt::Result {
+    let (end, cut_marker) = index.yq_header(|| yq_header_len(text));
+    let doc_markers = index.header_doc_markers();
+    let Ok(header) = core::str::from_utf8(&text[..end]) else {
+        return Ok(());
+    };
+    let mut pos = 0;
+    while pos < end {
+        let rest = &header[pos..];
+        let line_end = rest.bytes().position(is_line_break).unwrap_or(rest.len());
+        let brk = if line_end < rest.len() {
+            line_break_len(rest.as_bytes(), line_end)
+        } else {
+            0
+        };
+        let line = &rest[..line_end];
+        if doc_markers || !line.starts_with("---") {
+            out.write_str(line)?;
+            // The break itself is normalized to `\n`, as every other line
+            // break in the output is (#324): a CRLF/CR source header prints
+            // the same as its LF spelling, matching yq.
+            if brk > 0 {
+                out.write_char('\n')?;
+            }
+        }
+        pos += line_end + brk;
+    }
+    if cut_marker && doc_markers {
+        out.write_char('\n')?;
     }
     Ok(())
 }
@@ -15021,5 +15344,226 @@ plain: hello
             other.root(same_bytes.as_bytes()).document_token(),
             "two live indices over equal bytes are still two documents"
         );
+    }
+
+    /// #2795: standalone (head/foot) comments and the verbatim header the
+    /// streaming emitter prints. Every expected string here was captured
+    /// from pinned yq v4.53.3 (`yq '.'` on the input), never typed from
+    /// memory; the shapes whose *attribution* the parser still gets wrong
+    /// (#2811) are deliberately absent -- those belong to that fix.
+    mod standalone_comments_2795 {
+        use super::*;
+
+        fn stream(yaml: &[u8]) -> String {
+            let index = YamlIndex::build(yaml).unwrap();
+            let mut out = String::new();
+            index
+                .root(yaml)
+                .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+                .unwrap();
+            out
+        }
+
+        #[test]
+        fn issue_example_round_trips() {
+            // The issue's own document: head, mid, and a blank-detached
+            // trailing block. yq drops the blank before the trailing foot.
+            assert_eq!(
+                stream(b"# lead\na: 1\n# mid\nb: 2\n\n# trail\n"),
+                "# lead\na: 1\n# mid\nb: 2\n# trail"
+            );
+        }
+
+        #[test]
+        fn nested_head_and_foot_print_at_the_key_indent() {
+            assert_eq!(
+                stream(b"a:\n  # inner\n  b: 1\n  c: 2\nd: 3\n"),
+                "a:\n  # inner\n  b: 1\n  c: 2\nd: 3"
+            );
+            // A head on a compact mapping's first key rides the `- ` line.
+            assert_eq!(stream(b"-\n  # h\n  a: 1\n- 2\n"), "- # h\n  a: 1\n- 2");
+        }
+
+        #[test]
+        fn foot_followed_by_a_sibling_gets_one_blank_line() {
+            assert_eq!(stream(b"a: 1\n# mid\n\nb: 2\n"), "a: 1\n# mid\n\nb: 2");
+            assert_eq!(stream(b"- 1\n# f\n\n- 2\n"), "- 1\n# f\n\n- 2");
+            // ...but not when the foot ends its collection.
+            assert_eq!(
+                stream(b"- 1\n# mid\n- 2\n# foot\n"),
+                "- 1\n# mid\n- 2\n# foot"
+            );
+            assert_eq!(stream(b"a: 1 # line\n# foot\n"), "a: 1 # line\n# foot");
+        }
+
+        #[test]
+        fn foot_then_head_between_siblings() {
+            // `f` is a's foot (blank after), `g` is b's head (blank before
+            // and after); the head's trailing blank is not reproduced.
+            assert_eq!(
+                stream(b"a: 1\n# f\n\n# g\n\nb: 2\n"),
+                "a: 1\n# f\n\n# g\nb: 2"
+            );
+        }
+
+        #[test]
+        fn head_precedes_anchor_style_and_trailing_comment() {
+            assert_eq!(
+                stream(b"# h\na: &x \"q\" # line\n"),
+                "# h\na: &x \"q\" # line"
+            );
+            assert_eq!(stream(b"# h\na: &x\n  b: 1\n"), "# h\na: &x\n  b: 1");
+        }
+
+        #[test]
+        fn foot_follows_a_block_scalar_or_flow_value() {
+            assert_eq!(
+                stream(b"a: |\n  text\n# f\nb: 1\n"),
+                "a: |\n  text\n# f\nb: 1"
+            );
+            assert_eq!(stream(b"a: [1, 2]\n# f\nb: 1\n"), "a: [1, 2]\n# f\nb: 1");
+        }
+
+        #[test]
+        fn document_foot_prints_after_a_collection_root_only() {
+            // A blank-detached block at the end is the document's own foot.
+            assert_eq!(stream(b"a: 1\nb: 2\n\n# trail\n"), "a: 1\nb: 2\n# trail");
+            // Real yq prints a flow root's foot but silently drops a
+            // scalar root's (`# lead\n42\n# foot` prints `# lead\n42`);
+            // exercised end-to-end in `tests/yq_cli_tests.rs`, since the
+            // parser's attribution for those roots is #2811's to settle.
+        }
+
+        #[test]
+        fn header_is_verbatim_blank_lines_directives_and_markers_included() {
+            // yq's default `--header-preprocess` re-emits everything before
+            // the first content line as-is -- blank lines that no other
+            // head comment keeps, and an explicit leading `---`.
+            assert_eq!(stream(b"# lead\n\na: 1\n"), "# lead\n\na: 1");
+            assert_eq!(
+                stream(b"# lead\n# lead2\n\n# head\na: 1\n"),
+                "# lead\n# lead2\n\n# head\na: 1"
+            );
+            assert_eq!(stream(b"\n\na: 1\n"), "\n\na: 1");
+            assert_eq!(stream(b"---\na: 1\n"), "---\na: 1");
+            assert_eq!(stream(b"%YAML 1.2\n---\na: 1\n"), "%YAML 1.2\n---\na: 1");
+            assert_eq!(
+                stream(b"# lead\n---\n# lead2\na: 1\n"),
+                "# lead\n---\n# lead2\na: 1"
+            );
+            assert_eq!(stream(b"    # c\na: 1\n"), "    # c\na: 1");
+            // A marker with content after it: the marker is header, the
+            // content is the document's, and they part with a line break.
+            assert_eq!(stream(b"# lead\n--- 42\n"), "# lead\n---\n42");
+        }
+
+        #[test]
+        fn header_covers_a_later_documents_leading_block_exactly_once() {
+            // The header runs past `---`, so a second document's own
+            // leading block is already printed by it -- the fuzz caught
+            // `# c2` printing twice here.
+            let yaml = b"#c1\n---\n\n# c2\n\n- null\n";
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            let mut out = String::new();
+            let mut docs = match root.value() {
+                YamlValue::Sequence(docs) => docs,
+                other => panic!("{other:?}"),
+            };
+            while let Some((doc, rest)) = docs.uncons_cursor() {
+                doc.stream_yaml_as_document(&mut out, IndentSpec::spaces(2), false)
+                    .unwrap();
+                out.push('\n');
+                docs = rest;
+            }
+            assert_eq!(out.matches("# c2").count(), 1, "{out:?}");
+            assert!(out.starts_with("#c1\n---\n\n# c2\n\n"), "{out:?}");
+        }
+
+        #[test]
+        fn header_doc_markers_can_be_suppressed() {
+            let yaml = b"# lead\n---\na: 1\n";
+            let mut index = YamlIndex::build(yaml).unwrap();
+            index.suppress_header_doc_markers();
+            let mut out = String::new();
+            index
+                .root(yaml)
+                .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
+                .unwrap();
+            assert_eq!(out, "# lead\na: 1");
+        }
+
+        #[test]
+        fn navigated_children_print_no_head_or_foot() {
+            // `yq '.a'` on a commented document prints the bare value.
+            let yaml = b"# lead\na: 1\n# foot\n";
+            let index = YamlIndex::build(yaml).unwrap();
+            let doc = index.root(yaml).first_child().unwrap();
+            let a = match doc.value() {
+                YamlValue::Mapping(fields) => fields.uncons().unwrap().0.value_cursor(),
+                other => panic!("{other:?}"),
+            };
+            let mut out = String::new();
+            a.stream_yaml_as_document(&mut out, IndentSpec::spaces(2), false)
+                .unwrap();
+            assert_eq!(out, "1");
+        }
+
+        #[test]
+        fn yq_header_len_stops_at_the_first_content_line() {
+            assert_eq!(yq_header_len(b"a: 1\n"), (0, false));
+            assert_eq!(yq_header_len(b"# c\n\na: 1\n"), (5, false));
+            assert_eq!(yq_header_len(b"---\na: 1\n"), (4, false));
+            assert_eq!(yq_header_len(b"--- 42\n"), (3, true));
+            assert_eq!(yq_header_len(b"---x\n"), (0, false));
+            assert_eq!(yq_header_len(b"%YAML 1.2\n---\n"), (14, false));
+            assert_eq!(yq_header_len(b"  \na: 1\n"), (0, false));
+            assert_eq!(yq_header_len(b"# only\n"), (7, false));
+            assert_eq!(yq_header_len(b"# only"), (6, false));
+            assert_eq!(yq_header_len(b"# c\r\na: 1\r\n"), (5, false));
+        }
+
+        #[test]
+        fn header_line_breaks_are_normalized() {
+            assert_eq!(
+                stream(b"# lead\r\n\r\n---\r\na: 1\r\n"),
+                "# lead\n\n---\na: 1"
+            );
+            assert_eq!(stream(b"# lead\r\ra: 1\r"), "# lead\n\na: 1");
+        }
+
+        #[test]
+        fn blank_line_between_counts_crlf_once() {
+            assert!(!blank_line_between(b"# a\r\n# b\r\n", 3, 5));
+            assert!(blank_line_between(b"# a\r\n\r\n# b\r\n", 3, 7));
+            assert!(blank_line_between(b"# a\n\n# b\n", 3, 5));
+            assert!(!blank_line_between(b"# a\n# b\n", 3, 4));
+        }
+
+        #[test]
+        fn invalid_utf8_comment_lines_are_skipped_not_fatal() {
+            let yaml = b"# \xff\na: 1\n# \xfe\nb: 2\n# \xfd\n\nc: 3\n";
+            // The header covers the first line verbatim only when valid
+            // UTF-8; here it is not, so nothing leads. `# \xfe` is b's
+            // head and `# \xfd` is b's foot; both are skipped the way
+            // `line_comment_raw` skips one, and a skipped foot leaves no
+            // blank line behind either.
+            assert_eq!(stream(yaml), "a: 1\nb: 2\nc: 3");
+        }
+
+        #[test]
+        fn a_multi_line_head_block_prints_every_line_at_the_key_indent() {
+            // Two adjacent lines are one block; the indentation between
+            // the first line's end and the second's start is not a blank
+            // line (`blank_line_between` steps over it).
+            assert_eq!(
+                stream(b"a:\n  b: 1\n  # m1\n  # m2\n  c: 2\n"),
+                "a:\n  b: 1\n  # m1\n  # m2\n  c: 2"
+            );
+            assert_eq!(
+                stream(b"a: 1\n# m1\n# m2\nb: 2\n"),
+                "a: 1\n# m1\n# m2\nb: 2"
+            );
+        }
     }
 }

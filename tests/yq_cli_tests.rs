@@ -14632,6 +14632,152 @@ mod standalone_comment_attribution_2811 {
     }
 }
 
+/// #2795: standalone (head/foot) comments print on the streaming YAML
+/// route. Every expected string was captured from pinned yq v4.53.3 on the
+/// same input and arguments. Shapes whose *attribution* the parser still
+/// diverges on (#2811) are left to that fix; the DOM route (`-P`, writes)
+/// is the second half of #2795 and not asserted here.
+mod standalone_comments_2795 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    fn yq(filter: &str, input: &str, args: &[&str]) -> Result<String> {
+        let (out, code) = run_yq_stdin(filter, input, args)?;
+        assert_eq!(code, 0, "{out}");
+        Ok(out)
+    }
+
+    const ISSUE_DOC: &str = "# lead\na: 1\n# mid\nb: 2\n\n# trail\n";
+
+    #[test]
+    fn identity_keeps_every_standalone_comment_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", ISSUE_DOC, &[])?,
+            "# lead\na: 1\n# mid\nb: 2\n# trail\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_cursor_result_keeps_them_too_2795() -> Result<()> {
+        assert_eq!(
+            yq("select(true)", ISSUE_DOC, &[])?,
+            "# lead\na: 1\n# mid\nb: 2\n# trail\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_output_still_drops_them_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", ISSUE_DOC, &["-o=json", "-I=0"])?,
+            "{\"a\":1,\"b\":2}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_navigated_child_prints_bare_2795() -> Result<()> {
+        assert_eq!(yq(".a", "# lead\na: 1\n# foot\n", &[])?, "1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn multi_document_foot_before_and_head_after_the_separator_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", "a: 1\n# f\n---\n# h\nb: 2\n", &[])?,
+            "a: 1\n# f\n---\n# h\nb: 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn header_keeps_blank_lines_and_a_leading_marker_2795() -> Result<()> {
+        assert_eq!(yq(".", "# lead\n\na: 1\n", &[])?, "# lead\n\na: 1\n");
+        assert_eq!(yq(".", "---\na: 1\n", &[])?, "---\na: 1\n");
+        assert_eq!(
+            yq(".", "# lead\n---\na: 1\n---\nb: 2\n", &[])?,
+            "# lead\n---\na: 1\n---\nb: 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_doc_drops_the_headers_marker_too_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", "# lead\n---\na: 1\n---\nb: 2\n", &["-N"])?,
+            "# lead\na: 1\nb: 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_doc_applies_to_a_file_argument_too_2795() -> Result<()> {
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new()?;
+        write!(file, "# lead\n---\na: 1\n---\nb: 2\n")?;
+        let (out, code) = super::run_yq_file(".", file.path().to_str().unwrap(), &["-N"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "# lead\na: 1\nb: 2\n");
+        Ok(())
+    }
+
+    #[test]
+    fn json_input_has_no_header_2795() -> Result<()> {
+        // Real yq preprocesses a header for its YAML decoder only.
+        assert_eq!(yq(".", "\n\n[1, 2]\n", &["-p", "json"])?, "- 1\n- 2\n");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_and_sequence_placement_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", "a:\n  # inner\n  b: 1\n  c: 2\nd: 3\n", &[])?,
+            "a:\n  # inner\n  b: 1\n  c: 2\nd: 3\n"
+        );
+        assert_eq!(
+            yq(".", "- 1\n# mid\n- 2\n# foot\n", &[])?,
+            "- 1\n# mid\n- 2\n# foot\n"
+        );
+        assert_eq!(
+            yq(".", "-\n  # h\n  a: 1\n- 2\n", &[])?,
+            "- # h\n  a: 1\n- 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_foot_followed_by_a_sibling_gets_one_blank_line_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", "a: 1\n# mid\n\nb: 2\n", &[])?,
+            "a: 1\n# mid\n\nb: 2\n"
+        );
+        assert_eq!(
+            yq(".", "a: 1\n# f\n\n# g\n\nb: 2\n", &[])?,
+            "a: 1\n# f\n\n# g\nb: 2\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_lines_precede_anchor_style_and_line_comment_2795() -> Result<()> {
+        assert_eq!(
+            yq(".", "# h\na: &x \"q\" # line\n", &[])?,
+            "# h\na: &x \"q\" # line\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scalar_root_prints_its_head_and_drops_its_foot_2795() -> Result<()> {
+        // Measured: real yq keeps `# lead` and silently drops `# foot` for
+        // a scalar root, but prints both around a flow-collection root.
+        assert_eq!(yq(".", "# lead\n42\n", &[])?, "# lead\n42\n");
+        assert_eq!(yq(".", "# lead\n[1]\n", &[])?, "# lead\n[1]\n");
+        Ok(())
+    }
+}
+
 /// `line_comment` getter: strips `# ` (hash + one space) when present.
 #[test]
 fn test_line_comment_builtin_710() -> Result<()> {

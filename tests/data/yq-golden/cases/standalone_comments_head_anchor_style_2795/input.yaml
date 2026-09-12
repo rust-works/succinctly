@@ -1,0 +1,8 @@
+# h
+a: &x "q" # line
+b: |
+  text
+# f
+c: [1, 2]
+# g
+d: 1

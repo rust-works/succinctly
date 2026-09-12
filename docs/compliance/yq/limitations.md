@@ -3528,8 +3528,9 @@ ruled out), even though real yq supports every one of them:
   `NodeComments { head, line, foot }` (#2690), which the parser populates (#2704, #2718)
   and the `head_comment`/`foot_comment` getters read (#2758). What is still missing on the
   write side is the other half of that pipeline: `NodeMeta.head_foot_comment` is `None` at
-  every construction site, and neither emitter renders head/foot lines at all, so a write
-  would have nowhere to land and nothing to print it. See the identity-round-trip gap below.
+  every construction site and the DOM emitter renders no head/foot lines (the streaming
+  emitter does since #2795), so a write would have nowhere to land and nothing to print
+  it. See the identity-round-trip entry below.
   Remaining: the write forms (`comments =`/`comments |=`) and `...` recursive descent in yq
   mode; cross-link #1079/#1080/#1085 above.
 - **`style = "literal"`/`"folded"`/`"tagged"`** raise `style = "<name>" is not yet
@@ -3602,19 +3603,50 @@ Three narrower residuals of the same fix, each captured live from v4.53.3:
   itself stands on) and `0` here. Only the key-node case is answered, because only it is
   what `key` emits.
 
-### Standalone comments are dropped from every YAML output route (#798)
+### Standalone comments print on the streaming route only, so far (#2795, #798)
 
-The parser captures head/foot comments and the getters read them, but no emitter prints
-them, so a round trip loses them — data loss, not just a missing getter. On
-`# lead\na: 1\n# mid\nb: 2\n\n# trail\n`, real yq keeps all three comments through `.`,
-`-P '.'`, `.a = 5`, `del(.b)` (minus `# mid`, which belongs to the deleted key) and
-`select(true)`; succinctly drops all of them on every one. `-o=json` drops them in both,
-which is correct.
+The parser captures head/foot comments and the getters read them (#2758); since #2795 the
+*streaming* emitter (`stream_yaml_value_at`/`stream_yaml_as_document`, `src/yaml/light.rs`)
+prints them too — the route plain `yq '.'`, `select(true)` and every other cursor-forwarded
+result take. On `# lead\na: 1\n# mid\nb: 2\n\n# trail\n`, real yq and succinctly now
+agree byte-for-byte on `.` and `select(true)`; `-o=json` drops them in both, correctly.
+The **DOM** emitter (`emit_yaml_value_at_depth`, `yq_runner.rs`) is the other half and is
+still never given head/foot to print, so `-P '.'`, `.a = 5` and `del(.b)` keep dropping
+every standalone comment (real yq keeps them, minus `# mid`, which belongs to the deleted
+key). `NodeMeta.head_foot_comment` is `None` at every construction site until that lands.
 
-Two independent halves: the streaming emitter (`stream_yaml_value_at`, `src/yaml/light.rs`)
-reads comments straight off the live cursor at ~9 sites and never consults `NodeMeta` —
-plain `yq '.'` goes through here — while the DOM emitter (`emit_yaml_value_at_depth`,
-`yq_runner.rs`) does consult `NodeMeta` but is never given head/foot to print.
+What the streaming route reproduces, all measured against pinned v4.53.3:
+
+- a head prints above its node at the node's own indent, a foot below it; a foot followed
+  by a sibling in the same collection is followed by one blank line (`a: 1\n# mid\n\nb: 2`
+  round-trips as-is), a foot that ends its collection by none (`b: 2\n\n# trail` loses
+  its blank); a blank line *inside* a head block is reproduced, a blank *after* one is not
+  (`a: 1\n# f\n\n# g\n\nb: 2` prints `# f`, blank, `# g`, `b: 2`);
+- the leading **header** real yq's default `--header-preprocess` slurps — every line before
+  the first content line that is blank, a `#` comment at any indent, a `%YA..` directive or
+  a `---` marker — is re-emitted verbatim in front of the first document whenever the
+  result is that document itself (`# lead\n\na: 1` keeps its blank; `---\na: 1` and
+  `%YAML 1.2\n---\na: 1` keep their markers; `-N` drops the markers, as in yq; `.a` prints
+  no header). `--header-preprocess=false` itself is not implemented;
+- a scalar root prints its head and *drops* its foot, a flow or block collection root
+  prints both (`# lead\n42\n# foot` is `# lead\n42` in yq; the getter still answers
+  `foot`).
+
+Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
+
+- **Comments real yq loses are kept** (`yq-drops-we-keep`): a blank-detached block at the
+  very end of a document after nested content (`- c: x\n  f g: 2\n#\n\n# c5`), and a block
+  right after `---` that a run of blank lines separates from the next block, are dropped by
+  yq's own printer and printed by succinctly, where they attach as the document's foot or
+  head. Refusing to reproduce that loss is ADR-0018 rule 4 (matching would discard data).
+- **A `--- # c` header line** is glued by yq onto the following line (`---\n# ca: 1`,
+  which yq cannot read back); succinctly prints `---` and drops the marker's comment. A
+  whitespace-only line ahead of the first comment makes yq print a bare `#   ` line;
+  succinctly ends the header there and prints nothing for it.
+- **Placement inherits the parser's attribution**, so every shape #2811 tracks (a comment
+  above a compact `- k: v` item; a column-0 or dedented comment after nested content; a
+  quoted/flow/line-commented value that yq does not let own a foot; the scalar-root foot
+  above) prints where the parser put it, at that node's indent, until #2811 lands.
 
 Four known gaps this write shares with every other write form, none specific to #798:
 
