@@ -514,6 +514,19 @@ pub struct JsonFormatOpts<'a> {
     /// mode (yq's own compact/pretty JSON output always agree with each
     /// other on float formatting; see [`format_float_yq`]'s doc comment).
     pub json_sourced: bool,
+    /// Whether a jq-mode `NumberLiteral` reformats to jq's own number
+    /// spelling (`true`) or echoes its source spelling verbatim (`false`,
+    /// `--preserve-input`) — only meaningful alongside `control_escape:
+    /// Jq`, mirroring how `json_sourced` above is only meaningful
+    /// alongside `control_escape: Yq`. yq mode has its own, independent
+    /// preserve-vs-reformat split on `NumberLiteral` (gated by
+    /// `json_sourced`) and ignores this field entirely.
+    ///
+    /// Before #2852, `format_json`/`JsonFormatOpts` had no such split at
+    /// all — every `NumberLiteral` in jq mode reformatted unconditionally,
+    /// disagreeing with `print_json`'s own `JqCompatFormatter`/
+    /// `PreserveFormatter` split for the default `-c` route.
+    pub jq_compat: bool,
 }
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
@@ -663,7 +676,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                     // real yq too).
                     _ => literal.to_string(),
                 }
-            } else {
+            } else if opts.jq_compat {
                 // jq mode keeps `format_number_jq_compat`'s reformatting
                 // unchanged, which itself already reformats a non-finite
                 // literal's mantissa correctly (#1083/#1087) rather than
@@ -674,6 +687,13 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 // real jq, unrelated and left alone here, e.g. `0.1e1` ->
                 // `1E+0` here vs real jq's `1`.
                 format_number_jq_compat(literal.as_bytes())
+            } else {
+                // `--preserve-input`: echo the source spelling verbatim,
+                // the same rule `PreserveFormatter::format_raw_number`
+                // already applies on the default `-c` `print_json` route
+                // (#2852) -- this `format_json` route (`-S`/`-a`/`-C`/`-s`)
+                // had no such split until this fix.
+                literal.to_string()
             }
         }
         OwnedValue::String(s) => {
@@ -1308,6 +1328,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
     }
@@ -1322,6 +1343,7 @@ mod tests {
             float_style,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(format_json(&value, &opts(FloatStyle::Shortest)), "1");
         assert_eq!(
@@ -1370,6 +1392,7 @@ mod tests {
             float_style,
             control_escape: ControlEscape::Yq,
             json_sourced: false,
+            jq_compat: true,
         };
         let huge = OwnedValue::Float(1e100);
         assert_eq!(format_json(&huge, &opts(FloatStyle::Shortest)), "1e+100");
@@ -1476,6 +1499,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Yq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(
             format_json(&OwnedValue::Object(obj), &opts),
@@ -1497,6 +1521,7 @@ mod tests {
             float_style: FloatStyle::PreserveWholeFloat,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
         assert_eq!(
@@ -1536,6 +1561,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         let overflowed = OwnedValue::NumberLiteral(
             succinctly::jq::NumberRepr::Float(f64::INFINITY),
@@ -1568,6 +1594,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
         assert_eq!(
@@ -1591,6 +1618,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
         assert_eq!(
             format_json(&value, &opts),
@@ -1658,6 +1686,7 @@ mod tests {
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
             json_sourced: false,
+            jq_compat: true,
         };
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
