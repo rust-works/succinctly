@@ -27189,6 +27189,28 @@ mod tests {
         assert_eq!(comments.field("a").own(), None);
     }
 
+    /// `to_owned_with_comments`'s #2795 PR B document-root/first-document
+    /// gate (the `if let Some(c) = cursor { .. }` block) only ever runs with
+    /// a cursor -- every production caller (`yq_runner.rs`) and every other
+    /// test in this module passes `Some(&cursor)`. But the parameter is a
+    /// genuine `Option`, and a cursorless call is a real, reachable shape
+    /// (mirrors `to_owned`'s own cursor-optional contract): with no cursor
+    /// there is nothing to gate on, so the whole block is skipped and a bare
+    /// scalar keeps whatever `to_owned_with_comments_at_depth` already
+    /// produced -- this is the only test in the module that ever passes
+    /// `None` here.
+    #[test]
+    fn test_to_owned_with_comments_with_no_cursor_skips_the_document_root_gate() {
+        let json = b"42";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let (owned, comments) = to_owned_with_comments(&value, None).unwrap();
+        assert_eq!(owned, OwnedValue::Int(42));
+        assert_eq!(comments.own(), None);
+    }
+
     /// #2405: `to_owned_with_comments`'s object arm now runs the same
     /// #1677 key/value delimiter check `to_owned_at_depth` does, via
     /// `DocumentField::checked_key` -- a missing `:` between key and value
