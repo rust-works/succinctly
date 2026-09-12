@@ -64,12 +64,9 @@ pub struct ModuleLoader {
 /// the module cache across the call, which an `&self` method could not
 /// coexist with. It reads nothing but the search path either way.
 fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathBuf> {
-    // Add .jq extension if not present
-    let module_file = if module_path.ends_with(".jq") {
-        module_path.to_string()
-    } else {
-        format!("{module_path}.jq")
-    };
+    // #2702: real jq appends `.jq` unconditionally -- `include "m.jq"` looks
+    // for `m.jq.jq`, never `m.jq` itself. Confirmed live against jq 1.7.1.
+    let module_file = format!("{module_path}.jq");
 
     // Search in each path
     for base in search_path {
