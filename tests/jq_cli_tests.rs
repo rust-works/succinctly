@@ -48749,6 +48749,130 @@ fn test_wrong_arity_deep_nesting_does_not_blow_up_2686() -> Result<()> {
     Ok(())
 }
 
+/// #2807: the two programs the shared `SHADOW_RETRY_BUDGET` used to reject.
+///
+/// Every wrong-arity call to one of `try_parse_builtin`'s multi-argument or
+/// optional-arity builtins under a shadowing `def` used to reach
+/// `retry_shadow_candidate_as_generic_call`, which re-parses the call and
+/// spends one unit of a single process-wide 64-unit budget. 65 flat calls
+/// exhaust it outright; nested, each level's reparse walks every level below
+/// it, so depth 7 spends 128. Past the budget the raw `expected ')', found
+/// ';'` parse error propagates and the program is rejected. Both of these are
+/// accepted by jq 1.7.1 (`65` and `1`), and both are legitimate, non-
+/// adversarial code -- a `def` that shadows a builtin name at its own arity.
+#[test]
+fn test_shadowed_wrong_arity_calls_do_not_exhaust_the_retry_budget_2807() -> Result<()> {
+    let flat = format!(
+        "def test(a;b;c): a; [{}] | length",
+        vec!["test(1;2;3)"; 65].join(",")
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &flat], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "65");
+
+    let mut nested = String::from("1");
+    for _ in 0..7 {
+        nested = format!("test({nested};2;3)");
+    }
+    let nested = format!("def test(a;b;c): a; {nested}");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &nested], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #2807: an *unshadowed* wrong-arity call to one of the converted builtins
+/// now reaches jq's own name/arity resolver instead of stopping at the
+/// parser's argument-boundary check -- #2573's MULTI-ARG remainder, the same
+/// direction #2110/#2237/#2686 already took for the zero-arity,
+/// single-argument and special-form families.
+///
+/// Every expectation captured from `/usr/bin/jq` 1.7.1. The `strenv` rows
+/// cover the one arm whose argument is a bare identifier rather than an
+/// expression, so it rewinds rather than handing parsed arguments over; the
+/// `test`/`split` no-parens rows cover the before-any-argument checkpoint.
+#[test]
+fn test_wrong_arity_multi_arg_builtins_resolve_by_name_and_arity_2807() -> Result<()> {
+    for (filter, expected) in [
+        ("test(1;2;3)", "test/3 is not defined"),
+        ("match(1;2;3)", "match/3 is not defined"),
+        ("capture(1;2;3)", "capture/3 is not defined"),
+        ("sub(1;2;3;4)", "sub/4 is not defined"),
+        ("gsub(1;2;3;4)", "gsub/4 is not defined"),
+        ("scan(1;2;3)", "scan/3 is not defined"),
+        ("splits(1;2;3)", "splits/3 is not defined"),
+        ("split(1;2;3)", "split/3 is not defined"),
+        ("IN(1;2;3)", "IN/3 is not defined"),
+        ("INDEX(1;2;3)", "INDEX/3 is not defined"),
+        ("setpath(1)", "setpath/1 is not defined"),
+        ("pow(1)", "pow/1 is not defined"),
+        ("atan2(1)", "atan2/1 is not defined"),
+        ("skip(1)", "skip/1 is not defined"),
+        ("nth(1;2;3)", "nth/3 is not defined"),
+        ("at_position(1)", "at_position/1 is not defined"),
+        ("strenv(1;2)", "strenv/2 is not defined"),
+        ("strenv(1)", "strenv/1 is not defined"),
+        ("all(1;2;3)", "all/3 is not defined"),
+        ("any(1;2;3)", "any/3 is not defined"),
+        ("flatten(1;2)", "flatten/2 is not defined"),
+        ("path(1;2)", "path/2 is not defined"),
+        ("paths(1;2)", "paths/2 is not defined"),
+        ("recurse(1;2;3)", "recurse/3 is not defined"),
+        ("combinations(1;2)", "combinations/2 is not defined"),
+        ("debug(1;2)", "debug/2 is not defined"),
+        ("halt_error(1;2)", "halt_error/2 is not defined"),
+        ("parent(1;2)", "parent/2 is not defined"),
+        ("test", "test/0 is not defined"),
+        ("split", "split/0 is not defined"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(stderr.contains(expected), "{filter}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2807: a shadowed wrong-arity call nested to depth 30 must stay flat.
+///
+/// The budget bounded the `O(2^depth)` reparse rather than removing it, so
+/// before this fix these rejected the program once the budget ran out
+/// instead of taking exponential time; with the arms resolving their calls
+/// in place there is no reparse to bound and every row answers jq's own `1`.
+/// Same generous margin and reasoning as
+/// `test_wrong_arity_deep_nesting_does_not_blow_up_2686`'s table.
+#[test]
+fn test_shadowed_multi_arg_deep_nesting_stays_flat_2807() -> Result<()> {
+    for (kw, params, tail) in [
+        ("test", "a;b;c", ";2;3"),
+        ("match", "a;b;c", ";2;3"),
+        ("setpath", "a;b;c", ";2;3"),
+        ("any", "a;b;c", ";2;3"),
+        ("sub", "a;b;c;d", ";2;3;4"),
+        ("nth", "a;b;c", ";2;3"),
+        ("recurse", "a;b;c", ";2;3"),
+    ] {
+        let depth = 30;
+        let mut nested = String::from("1");
+        for _ in 0..depth {
+            nested = format!("{kw}({nested}{tail})");
+        }
+        let filter = format!("def {kw}({params}): a; {nested}");
+        let start = std::time::Instant::now();
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            code, 0,
+            "`{kw}` at {depth} levels: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "1", "`{kw}` at {depth} levels");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "`{kw}` at {depth} levels took {elapsed:?} -- exponential parse blowup regressed"
+        );
+    }
+    Ok(())
+}
+
 /// #2686: the no-re-parse path must resolve a wrong-arity call to exactly
 /// what the rewinding path did — same message, same shadow resolution, same
 /// postfix handling.
