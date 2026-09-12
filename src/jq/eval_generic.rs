@@ -21247,10 +21247,20 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
         // entry-stage door takes it. This is the non-sink route's gate, so
         // without this arm the yq CLI's DOM path answered nothing where the
         // jq CLI's sink pipeline answered `"b"`.
+        //
+        // Delegates to `owned_identity_pipe_enters_at_first` on the suffix
+        // rather than hand-spelling `owned_identity_pipe_entry_stage(stage)
+        // && owned_identity_pipe_supported(&exprs[i..])`, so this door and
+        // `eval_each_pipe_generic`'s own runtime dispatch cannot silently
+        // diverge about where such a pipe runs -- the exact drift #2782
+        // fixed for the sink-vs-DOM disagreement above. Sound to add the
+        // helper's `alternative_stays_cursor_native` exclusion here: this
+        // arm is reached only when `rest.iter().any(needs_path_context)`
+        // (the early return two lines up), which is precisely the negation
+        // of that exclusion's own trailing condition.
         return (owned_identity_leaving_stage_supported(stage)
             && owned_identity_pipe_supported(rest))
-            || (owned_identity_pipe_entry_stage(stage)
-                && owned_identity_pipe_supported(&exprs[i..]));
+            || owned_identity_pipe_enters_at_first(&exprs[i..]);
     }
     false
 }

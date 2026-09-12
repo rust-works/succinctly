@@ -36815,12 +36815,14 @@ pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> 
 ///
 /// [`stop_with_escape`], [`stop_with_escape_cell`] and
 /// [`stop_with_downstream`] cover every driver whose slot holds a `Control`
-/// or a whole `Flow`; four drivers keep a shape none of those fit -- a
-/// [`Flow`] in [`foreach_forks`], and `eval_generic.rs`'s three
-/// owned-identity stages, which answer `Flow::Stopped` directly rather than
-/// `Demand::Stop` -- and call this beside their own store instead of growing
-/// an adapter each. The *rule* is still in one place, which is what drifted
-/// twice before (#1313, #1457).
+/// or a whole `Flow`; five drivers keep a shape none of those fit -- a
+/// [`Flow`] in [`foreach_forks`], and `eval_generic.rs`'s four
+/// owned-identity stages (`eval_owned_identity_scoped`,
+/// `eval_owned_identity_try`, `eval_owned_identity_bounded`, and
+/// `eval_owned_identity_alternative` since #2782), which answer
+/// `Flow::Stopped` directly rather than `Demand::Stop` -- and call this
+/// beside their own store instead of growing an adapter each. The *rule* is
+/// still in one place, which is what drifted twice before (#1313, #1457).
 pub(crate) fn mark_nonretryable_escape(control: &Control) {
     if !is_retryable_control(control, false) {
         nonretryable_stop::set();

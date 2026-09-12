@@ -41774,6 +41774,51 @@ fn test_alternative_output_stands_where_its_operand_stood_2782() -> Result<()> {
     Ok(())
 }
 
+/// #2782 review: two shapes verified correct during review but left
+/// untested by the sweep and the tests above.
+///
+/// `needs_path_context`'s new `Expr::Alternative` arm also tightens
+/// `owned_identity_operand_resolvable`'s `//`-nested-inside-another-operator
+/// gate (`src/jq/eval_generic.rs`'s `Expr::Alternative` arm in
+/// `path_context_resolvable`, unchanged by this PR): before the arm existed,
+/// `needs_path_context(a // b)` was unconditionally `false`, so a `//`
+/// nested inside an arithmetic/and/or operand was silently treated as
+/// contentless. `(path // ["x"]) + ["z"]` pins the fix: `path` must resolve
+/// to `["a"]` before `+` runs, matching real yq v4.53.3.
+///
+/// The second row pins that a `rest`-side error after a truthy `//` output
+/// is correctly attributed to `rest`, not swallowed or misreported as the
+/// left operand's own failure (`eval_owned_identity_alternative`'s
+/// `rest_escape` split, mirroring `eval_owned_identity_scoped`'s existing
+/// pattern): `key` resolves truthy (`"a"`), then `rest` (`error(...)`)
+/// raises -- the escape must survive, not be swallowed as if the left
+/// operand itself had failed.
+#[test]
+fn test_alternative_review_gaps_2782() -> Result<()> {
+    let doc = "a: {b: 1, e: 2}\n";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | (path // [\"x\"]) + [\"z\"]",
+        doc,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "[\"a\",\"z\"]", "stderr: {stderr:?}");
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | (key // 9) | error(\"boom-\" + .)",
+        doc,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("boom-a"),
+        "stdout: {stdout:?} stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2476's `//` sibling of
 /// `test_not_no_longer_raises_through_a_container_alias_2476` just above.
 /// The native arm's `ambient_validation_error` call is
