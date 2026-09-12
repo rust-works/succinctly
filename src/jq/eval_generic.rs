@@ -13743,7 +13743,11 @@ fn each_slice_bound_generic<S: EvalSemantics, V: DocumentValue>(
             Demand::Stop => Flow::Stopped { pending: None },
         };
     };
-    if S::TAG == EvalTag::Yq {
+    // #2374: the mode test is `streams_escaped_generator_prefix`, the
+    // family's one definition of "does this mode stream an escaped
+    // sub-generator's prefix" -- the eager collection below is what
+    // *discarding* it looks like once the pushes are the prefix.
+    if !streams_escaped_generator_prefix::<S>() {
         let mut collected: Vec<ComputedSliceBound> = Vec::new();
         match pull_slice_bound_generic::<S, V>(expr, value, cursor, round, &mut |b| {
             collected.push(b);
