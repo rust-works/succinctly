@@ -1131,6 +1131,23 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `old_root_bp` is `None` for the very first document (nothing to
     /// reach back to), in which case this always defers to the ordinary
     /// path.
+    ///
+    /// #1079 state (a floated comment, or the plain "an absent item was
+    /// seen" flag) is settled first, against the *closing* document, and
+    /// takes priority over the ordinary blank-line-adjacency rule above --
+    /// measured against pinned yq v4.53.3, a document boundary always fully
+    /// closes any open block sequence, so unlike an in-document dedent
+    /// there is no "still at the sequence's own column" case for
+    /// [`Self::settle_float_if_sequence_closed`]'s column check to apply to
+    /// the node opening in the *next* document; passing `next: None` skips
+    /// straight to its `owner_key_bp` fallback. A floated comment still
+    /// becomes that key's foot when there is one (`a:\n  - # c\n---\nb: 2\n`
+    /// puts `c` on `.a`'s foot, whether or not a blank line separates it
+    /// from the marker -- unlike true end of input, which collapses this
+    /// same shape onto the *root*'s foot instead, `a:\n  - # c\n` measured
+    /// against `.a | key | foot_comment` empty vs. `. | foot_comment` = `c`).
+    /// With no owner key, or after an absent item with no comment of its
+    /// own, whatever is left is the closing document's own root foot.
     fn flush_pending_head_lines_at_boundary(
         &mut self,
         next: Option<(usize, usize)>,
@@ -1140,6 +1157,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return;
         }
         if let Some(old_root) = old_root_bp {
+            if let Some(floated) = self.floated_item_comment.take() {
+                self.settle_float_if_sequence_closed(floated, None);
+            }
+            if core::mem::take(&mut self.block_passed_absent_item) {
+                if !self.pending_head_lines.is_empty() {
+                    self.drain_pending_into_foot(old_root);
+                }
+                return;
+            }
+            if self.pending_head_lines.is_empty() {
+                return;
+            }
             let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
             let adjacent_to_marker = !self.blank_line_between(block_end, self.pos);
             if adjacent_to_marker {
@@ -2097,6 +2126,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let root_bp = self.document_start_bp_pos;
         self.flush_pending_head_lines_at_boundary(Some((root_bp, 0)), old_root_bp);
         self.last_head_foot_bp = None;
+        // #1079: `block_passed_absent_item` belongs to whichever document set
+        // it. `flush_pending_head_lines_at_boundary` above already clears it
+        // when it drains a pending block, but it early-returns without
+        // touching any state when nothing is pending -- which is exactly the
+        // case an absent bare item with no comment of its own leaves behind
+        // (`end_float` sets the flag without ever pushing into
+        // `pending_head_lines`). Left set, it would wrongly force a later,
+        // unrelated comment in *this* document onto its own root foot at end
+        // of input, the same way it correctly does for the document that
+        // actually saw the absent item.
+        self.block_passed_absent_item = false;
         // Primes the no-`PREV` fallback for whatever comes next in the new
         // document -- see [`Self::document_boundary_fallback_bp`].
         self.document_boundary_fallback_bp = old_root_bp;
