@@ -874,9 +874,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     ///   the space arm then walks straight onto the `#`).
     ///
     /// Attachment follows the rule measured against pinned yq v4.53.3 (and
-    /// read off go-yaml's scanner, whose `scanComments` splits a comment run
-    /// and `unrollIndent` repositions a block's end token before a comment
-    /// sitting at that block's own column, #2811). A block of consecutive
+    /// read off the scanner in mikefarah's go-yaml fork yq embeds, whose
+    /// `yaml_parser_scan_comments` splits a comment run into foot/head
+    /// pieces and `yaml_parser_unroll_indent` repositions a block's
+    /// BLOCK-END token before a comment sitting at that block's own column
+    /// — confirmed live against `scannerc.go` on the `v3` branch of
+    /// `github.com/mikefarah/yaml`, #2811). A block of consecutive
     /// comment lines sticks to whatever it is *not* separated from by a
     /// blank line, preferring forward -- except that a block *dedented*
     /// below the innermost open block (`col < prev_indent`, with `PREV` in
@@ -958,9 +961,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// Record where the block starting now sits relative to the open blocks
-    /// (#2811): see [`PendingBlock`]. The frame snapshot is only taken for a
-    /// dedented block, the one case [`Self::flush_pending_head_lines`]
-    /// consults it in.
+    /// (#2811): see [`PendingBlock`]. The frame snapshot used to be taken
+    /// only for a genuinely dedented block (`column < prev_indent`), the one
+    /// case [`Self::flush_pending_head_lines`] consulted it in -- widened to
+    /// `column <= prev_indent` (#2811 review) so
+    /// [`Self::positional_boundary_foot_target`] also has frames to search
+    /// when a block sits flush against the innermost open block's own
+    /// column at a document boundary (`a:\n  b: 1\n  # c\n---\nc: 2\n`,
+    /// where the comment never dedents below `b`'s own indent). Every
+    /// existing consumer of `pending_block.frames`
+    /// ([`Self::positional_foot_target`], called only from
+    /// [`Self::settle_dedented_block`]) is reached only from call sites that
+    /// independently re-check `column < prev_indent` before calling, so
+    /// this widening changes nothing for them.
     fn capture_pending_block(&mut self, column: usize, after_split: bool, blank_before: bool) {
         let prev_indent = self.innermost_block_indent();
         self.pending_block.column = column;
@@ -968,7 +981,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.pending_block.after_split = after_split;
         self.pending_block.blank_before = blank_before;
         self.pending_block.frames.clear();
-        if column >= prev_indent {
+        if column > prev_indent {
             return;
         }
         // `indent_stack[0]` is the virtual root (sentinel indent), never a
@@ -1101,7 +1114,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.settle_dedented_block(next, root);
                     return;
                 }
-                if !self.first_node_takes_no_foot_quirk(prev, prev_indent) {
+                if !self.first_node_takes_no_foot_quirk(prev, prev_indent, next.is_some()) {
                     self.drain_pending_into_foot(prev);
                     return;
                 }
@@ -1208,7 +1221,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 .rev()
                 .take_while(|frame| closing(frame))
                 .find(|frame| frame.is_mapping)
-                .and_then(|frame| frame.last_key_bp);
+                .and_then(|frame| frame.last_key_bp)
+                // A mapping frame with no key yet records the
+                // `open_frame_key_slot` sentinel rather than `None` (its
+                // `last_key_bp` is only ever cleared to `None` for a
+                // non-mapping frame); filter it out here the same way the
+                // fallback arm below already does, so a mapping that opened
+                // without ever yet completing a key doesn't hand a dedented
+                // comment to a bp no cursor resolves to (#2811 review).
+                .filter(|&bp| bp != usize::MAX);
             if claimed.is_some() {
                 return claimed;
             }
@@ -1227,6 +1248,52 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Where a block sitting flush against a `---`/`...` marker (no blank
+    /// line in between) lands, when it isn't handled by the #1079
+    /// floated-comment/absent-item pre-check
+    /// [`Self::flush_pending_head_lines_at_boundary`] already runs first
+    /// (#2811 review). By the time this runs, `end_document` has already
+    /// unwound `self.indent_stack` for the *closing* document, so -- like
+    /// [`Self::positional_foot_target`] -- this reads the frame snapshot
+    /// [`Self::capture_pending_block`] took while those containers were
+    /// still open, not live parser state.
+    ///
+    /// Unlike an in-document dedent, real yq never lets a document boundary
+    /// hand the block to the *outermost* container's own last key -- that
+    /// specific shape is #798's older, still-correct "closing document's
+    /// root foot" rule (`a: 1\n# mid\n---\nb: 2\n` stays document 0's root
+    /// foot, not `.a`'s key's) -- but a container genuinely nested inside
+    /// it still claims the block by column, exactly as
+    /// [`Self::positional_foot_target`] already does in-document/at EOF
+    /// (`a:\n  b: 1\n  # c\n---\nc: 2\n` is `.a.b`'s key foot, measured).
+    /// `frames[0]` is always that outermost container, so a match there, or
+    /// no match at all, both return `None` (the caller's cue to fall back
+    /// to the closing document's root as before).
+    ///
+    /// A matching frame that is a sequence rather than a mapping (nothing
+    /// in `frames` ever names a sequence *item*, only a mapping's last
+    /// *key*) falls back to `PREV` instead, which already names that exact
+    /// item when the block never left the sequence's own column
+    /// (`a:\n  - 1\n  # c\n---\nb: 2\n` is `.a[0]`'s foot, measured) --
+    /// coincides with the same frame's `last_key_bp` for a mapping match
+    /// too, so this fallback is safe to apply uniformly rather than only
+    /// for the sequence case.
+    fn positional_boundary_foot_target(&self) -> Option<usize> {
+        let frames = &self.pending_block.frames;
+        let column = self.pending_block.column;
+        let start = frames.iter().rposition(|frame| frame.indent == column)?;
+        if start == 0 {
+            return None;
+        }
+        frames[1..=start]
+            .iter()
+            .rev()
+            .find(|frame| frame.is_mapping)
+            .and_then(|frame| frame.last_key_bp)
+            .filter(|&bp| bp != usize::MAX)
+            .or_else(|| self.attached_prev())
+    }
+
     /// Real yq never makes a detached block the foot of the stream's very
     /// first top-level node when that node's line ends in a trailing
     /// comment, a quoted scalar or a flow collection (#2811): `- 1 # c1` /
@@ -1236,8 +1303,40 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// the node's foot as usual, and a first node nested in a top-level
     /// item (`- k: v # c1` / `  # c3`) is too. Measured, not explained:
     /// go-yaml's comment scanner special-cases the first fetch of a stream.
-    fn first_node_takes_no_foot_quirk(&self, prev: usize, prev_indent: usize) -> bool {
-        if prev_indent != 0 || self.first_head_foot_bp != Some(prev) {
+    ///
+    /// Gated on `prev` being [`Self::first_head_foot_bp`] -- "the stream's
+    /// first head/foot-bearing node" -- not on that node's own column
+    /// (#2811 review). An earlier `prev_indent != 0` guard narrowed this to
+    /// a *top-level* first node only, contradicting this doc comment's own
+    /// stated `- k: v # c1` / `  # c3` case: that shape's first head/foot
+    /// node is `.[0].k`'s key, at column 2 (nested under the top-level `-`
+    /// item), not column 0, so the guard wrongly excluded exactly the
+    /// nested-first-node shape the comment already described -- confirmed
+    /// live: `- k: v # c1\n  # c3\n` (nothing else follows) is
+    /// `. | foot_comment`, not `.[0].k | key | foot_comment`, in real yq.
+    ///
+    /// `next_is_some` keeps one part of the old guard for a nested first
+    /// node specifically (measured, not derived, like the rest of this
+    /// function): a *top-level* first node's block still forwards onto a
+    /// following node's head across a blank line as before
+    /// (`- 1 # c1\n# c3\n\n- 2\n` is `.[1] | head_comment`), but a *nested*
+    /// one does not -- it stays this node's own foot instead
+    /// (`- k: v # c1\n  # c3\n\n- 2\n` keeps `.[0].k`'s key foot `c3`,
+    /// `.[1]`'s head empty, both confirmed live). Within this function's
+    /// sole call site (guarded by `detached_forward`), `next.is_some()`
+    /// only holds when a blank line -- not true end of input -- is why the
+    /// block detached forward, so this only distinguishes those two cases,
+    /// not "was there a next node" in general.
+    fn first_node_takes_no_foot_quirk(
+        &self,
+        prev: usize,
+        prev_indent: usize,
+        next_is_some: bool,
+    ) -> bool {
+        if self.first_head_foot_bp != Some(prev) {
+            return false;
+        }
+        if prev_indent != 0 && next_is_some {
             return false;
         }
         if self.first_node_has_line_comment {
@@ -1476,6 +1575,26 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// [`Self::attach_head_foot_to_key`] for a key whose bp is known but has
+    /// not opened yet (#2811 review): `? key` dispatches to many different
+    /// value kinds (sequence, flow collection, block scalar, alias, compact
+    /// mapping, plain scalar), each opening the key's own bp at a different
+    /// point below the dispatch, so `self.last_open_bp_pos` is not yet the
+    /// key's bp when the standalone-comment hook must run, ahead of
+    /// dispatch, at `self.bp_pos`. Without this, `parse_explicit_key` called
+    /// [`Self::attach_head_foot_at`] directly and never wrote
+    /// [`Self::frame_key_bp`], so a dedented comment after an explicit key's
+    /// only entry in a mapping resolved [`Self::positional_foot_target`]'s
+    /// `frame_key_bp` lookup to the `usize::MAX` sentinel and was silently
+    /// dropped instead of landing on the key's foot.
+    fn attach_head_foot_to_key_at(&mut self, bp: usize, column: usize) {
+        let depth = self.indent_stack.len() - 1;
+        self.attach_head_foot_at(bp, column);
+        if let Some(slot) = self.frame_key_bp.get_mut(depth) {
+            *slot = bp;
+        }
+    }
+
     /// [`Self::attach_head_foot_to_key`] for a node whose bp is known but
     /// which has not opened yet — a sequence item's content, flushed *before*
     /// `parse_value` runs so [`Self::flush_pending_head_lines`] still sees
@@ -1554,6 +1673,32 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// own frame and reaches a genuine content node.
     fn attach_item_head_at(&mut self, bp: usize, column: usize) {
         if self.floated_item_comment.is_some() {
+            return;
+        }
+        // A block trailing an item whose value turned out absent, closed by
+        // this very stem's own recursion (#2811 review): the sequence that
+        // absent item belonged to (`.k[0]` in `k:\n  - -\n    # c1\n  - -
+        // x\n`) has already closed with nothing to give the block to, so
+        // real yq defers it forward the same way a genuine dedent's
+        // unclaimed block already defers to "the item opening now's first
+        // key/scalar" (`Self::settle_dedented_block`'s own `next.is_some()`
+        // arm) -- as that node's *foot*, not this stem's head. Confirmed
+        // live: `.k[1][0]` (the scalar `x`, resolved by the sequence this
+        // stem is about to recurse into) gets `c1` as its foot, not head.
+        // Without this, `flush_pending_head_lines` ran normally here and
+        // (since the block sits at the same column the absent item's own
+        // nested sequence had, not shallower) placed it by the ordinary
+        // adjacent-node rule instead -- `.k[1][0]`'s *head*, still wrong.
+        //
+        // Guarded on `pending_head_lines` actually holding something: an
+        // absent item with no comment of its own reaches every later stem
+        // in the same sequence with the flag still set (nothing has cleared
+        // it), and must fall through to the ordinary no-op flush below
+        // rather than resetting the flag on an empty deferral.
+        if self.block_passed_absent_item && !self.pending_head_lines.is_empty() {
+            self.block_passed_absent_item = false;
+            let pending = &mut self.pending_head_lines;
+            self.deferred_foot_lines.append(pending);
             return;
         }
         self.flush_pending_head_lines(Some((bp, column)));
@@ -1653,7 +1798,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
             let adjacent_to_marker = !self.blank_line_between(block_end, self.pos);
             if adjacent_to_marker {
-                self.drain_pending_into_foot(old_root);
+                // A block that never actually left the closing document's
+                // outermost container keeps #798's flat rule (the closing
+                // document's own root foot); one that sits inside a
+                // container nested *within* that outermost one is instead
+                // placed by column, the same dedent-aware rule
+                // `flush_pending_head_lines_with_root`'s own dedent branch
+                // already applies in-document/at EOF (#2811 review).
+                let target = self.positional_boundary_foot_target().unwrap_or(old_root);
+                self.drain_pending_into_foot(target);
                 return;
             }
             if self.attached_prev().is_some() {
@@ -1676,6 +1829,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// itself, and counting its line break as a blank line sent the block
     /// backwards onto `PREV`'s foot (`- 1\n# h\n-\n- 3\n` is `.[2]`'s head
     /// in real yq, #1079).
+    ///
+    /// Deliberately not the same algorithm as `light.rs`'s cursor-side twin
+    /// of the same name (#2811 review): that one only needs a total break
+    /// *count* because its caller already guarantees nothing but
+    /// whitespace in the range, while this one must tell "two adjacent
+    /// breaks" apart from "a break, real (non-blank) content, another
+    /// break" -- exactly the `- 1\n# h\n-\n- 3\n` case above, which a
+    /// count-only check cannot distinguish from a genuine blank line.
     fn blank_line_between(&self, from: usize, to: usize) -> bool {
         let mut seen_content = true;
         let mut p = from;
@@ -1687,8 +1848,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     return true;
                 }
                 seen_content = false;
-                // CRLF is one break.
-                if byte == b'\r' && p + 1 < end && self.input[p + 1] == b'\n' {
+                // CRLF is one break -- via the shared `line_break_len` rule
+                // (`crate::text::line_break`'s module doc: "there is still
+                // exactly one definition") rather than a second hand-rolled
+                // copy of the same check (#2811 review). The `p + 1 < end`
+                // guard is still needed on top: `line_break_len` reads
+                // `self.input` unbounded by `end`, and `end` can fall
+                // between a CRLF pair's two bytes.
+                if line_break_len(self.input, p) == 2 && p + 1 < end {
                     p += 1;
                 }
             } else if !Self::is_inline_whitespace(byte) {
@@ -2595,6 +2762,28 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // `seen_any_document` is the only way to tell "no previous document"
         // apart from "its root happens to be bp 0" (#798).
         let old_root_bp = self.seen_any_document.then_some(self.document_start_bp_pos);
+        // A foot deferred to a sequence item's first key/scalar (#2811) has
+        // no such node left to claim it once the document that deferred it
+        // closes at this `---`/`...` boundary with nothing having claimed
+        // it in between (`end_document`, called just above by every caller
+        // of `start_document` past the first, doesn't touch this field
+        // either) -- left alone, it survived untouched into the new
+        // document and was wrongly claimed there by whatever node opened
+        // first via `claim_deferred_foot` (#2811 review). Mirrors the
+        // end-of-parse flush in `parse` (just above its own `end_document`
+        // call), but targets the *closing* document's root (`old_root_bp`)
+        // rather than `document_start_bp_pos`, which the overwrite below
+        // is about to repoint at the new document.
+        if let Some(old_root) = old_root_bp {
+            if !self.deferred_foot_lines.is_empty() {
+                let deferred = &mut self.deferred_foot_lines;
+                self.comments
+                    .entry(old_root)
+                    .or_default()
+                    .foot
+                    .append(deferred);
+            }
+        }
         self.seen_any_document = true;
         self.document_start_bp_pos = self.bp_pos;
         // A standalone comment block seen before this document's content
@@ -4585,7 +4774,14 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // `parse_mapping_entry` does at its key open. Also makes this key
         // the owner of a same-indent sequence value's floated item comment
         // (`? a\n:\n  - # c\nb: 2\n` is `.a`'s key's foot, #1079).
-        self.attach_head_foot_at(self.bp_pos, indent);
+        //
+        // Goes through `attach_head_foot_to_key_at` (not `attach_head_foot_
+        // at` directly) so `frame_key_bp` records this key like every other
+        // key form does -- otherwise a dedented comment after this key's
+        // only entry in its mapping resolves `positional_foot_target`'s
+        // `frame_key_bp` lookup to the `usize::MAX` sentinel and is silently
+        // dropped (#2811 review: `? a\n:\n  - 1\n# c\n`).
+        self.attach_head_foot_to_key_at(self.bp_pos, indent);
 
         // Check what the key is
         if self.at_line_end() {
@@ -7090,6 +7286,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         }
                         Some(b'{' | b'[') => {
                             // Property before flow collection
+                            self.attach_document_root_node(indent);
                             self.parse_value(indent)?;
                         }
                         Some(b'*') => {
@@ -7105,6 +7302,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         }
                         _ => {
                             // Scalar value - only doc_root if not inside a container
+                            self.attach_document_root_node(indent);
                             self.set_ib();
                             self.write_bp_open();
                             // type_stack.len() == 1 means we're inside only the virtual root sequence
@@ -7153,6 +7351,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.check_mapping_under_mapping_gap(indent, false)?;
                     // Standalone alias value
                     self.close_deeper_indents(indent);
+                    self.attach_document_root_node(indent);
                     self.parse_alias()?;
                 }
             }
