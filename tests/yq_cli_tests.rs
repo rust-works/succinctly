@@ -14148,19 +14148,19 @@ mod standalone_comment_attribution_2811 {
         assert_slots("- - 1\n  # f\n\n- 2\n", &[(".[0][0] | foot_comment", "f")])
     }
 
-    /// Measured asymmetry the fix must keep: the block above a
-    /// property-prefixed item whose mapping starts on the *next* line goes
-    /// to that mapping's first key. Pinned at its current (pre-#2814) slot:
-    /// the deferred-value arm has no head hook yet and the block falls back
-    /// onto `.[0]`'s foot; PR #2814's `blank_line_between` fix moves it to
-    /// `.[1].b | key | head_comment` = `h`, which is yq's answer.
+    /// The block above a property-prefixed item whose mapping starts on the
+    /// *next* line goes to that mapping's first key, matching yq: `#1079`'s
+    /// own key-node hook in `parse_explicit_key`/the deferred-value arms
+    /// gives the deferred-value arm a head hook after all, so the block
+    /// reaches `.[1].b`'s key rather than falling back onto `.[0]`'s foot as
+    /// it did with `#2811` alone.
     #[test]
-    fn deferred_anchored_mapping_item_residual_2811() -> Result<()> {
+    fn deferred_anchored_mapping_item_2811() -> Result<()> {
         assert_slots(
             "- 1\n# h\n- &x\n  b: 1\n",
             &[
-                (".[1].b | key | head_comment", ""),
-                (".[0] | foot_comment", "h"),
+                (".[1].b | key | head_comment", "h"),
+                (".[0] | foot_comment", ""),
             ],
         )
     }
@@ -14423,18 +14423,18 @@ mod standalone_comment_attribution_2811 {
         )
     }
 
-    /// Pinned residual: the same shape with the comment at the compact
-    /// mapping's own column. yq closes that mapping at the bare `-` and
-    /// gives `.[0].a | key | foot_comment` = `c`; here the bare `-` has no
-    /// hook yet (PR #2814 adds it), so the block is only seen at `k`, by
-    /// which time a fresh mapping at column 2 is open and takes it.
+    /// The same shape with the comment at the compact mapping's own column:
+    /// `positional_foot_target` finds the exact-column frame directly, so
+    /// the dedent settles the block onto that mapping's last key without
+    /// ever reaching the bare `-`'s own (head-only, #1079/#2811) stem hook,
+    /// matching yq.
     #[test]
-    fn bare_dash_after_a_dedented_block_residual_2811() -> Result<()> {
+    fn bare_dash_after_a_dedented_block_2811() -> Result<()> {
         assert_slots(
             "- a:\n    - 1\n  # c\n\n-\n  k: v\n",
             &[
-                (".[1].k | key | foot_comment", "c"),
-                (".[0].a | key | foot_comment", ""),
+                (".[0].a | key | foot_comment", "c"),
+                (".[1].k | key | foot_comment", ""),
             ],
         )
     }
@@ -14682,14 +14682,15 @@ mod standalone_comment_attribution_2811 {
         Ok(())
     }
 
-    /// Pinned residual (outside the issue's alphabet): `- ? k` has no key
-    /// hook yet (PR #2814 adds it), so the block above it still lands on
-    /// `.[0]`'s foot where yq answers `.[1] | head_comment` = `h`.
+    /// `- ? k` is a fourth "compact item" shape alongside `- k: v` and
+    /// `- - x`: its own stem head-hook, mirroring theirs, gives the whole
+    /// explicit-key mapping the block, matching yq's own `.[1] | head_comment`
+    /// = `h` -- not `.[1].k`'s key, and not `.[0]`'s foot.
     #[test]
-    fn explicit_key_item_head_residual_2811() -> Result<()> {
+    fn explicit_key_item_head_2811() -> Result<()> {
         assert_slots(
             "- 1\n# h\n- ? k\n  : v\n",
-            &[(".[1] | head_comment", ""), (".[0] | foot_comment", "h")],
+            &[(".[1] | head_comment", "h"), (".[0] | foot_comment", "")],
         )
     }
 }
@@ -16839,20 +16840,19 @@ fn assert_yq_getter(input: &str, filter: &str, expected: &str) -> Result<()> {
 }
 
 /// The absent family's identity output: the comment is attributed (see the
-/// getter tests below) but not yet printed, because no emitter renders a
-/// head/foot comment at all (#2795). Real yq prints `-\n# comment\n- 2\n`.
-/// Pinned as still-dropped -- not the corrupted `- # c` inline rendering an
-/// earlier version of the A/B/C fix produced -- so #2795 has to update this
-/// deliberately rather than drift.
+/// getter tests below) and, now that #2795 prints head/foot comments, that
+/// attribution renders too -- matching real yq's own `-\n# comment\n- 2\n`,
+/// not the corrupted `- # c` inline rendering an earlier version of the
+/// A/B/C fix produced.
 #[test]
-fn test_bare_item_comment_still_dropped_when_value_absent_1079() -> Result<()> {
+fn test_bare_item_comment_prints_when_value_absent_1079() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- # comment\n- 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "-\n- 2\n");
+    assert_eq!(out, "-\n# comment\n- 2\n");
 
     let (out, code) = run_yq_stdin(".", "a:\n  - # c\n  - # d\nb: 2\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "a:\n  -\n  -\nb: 2\n");
+    assert_eq!(out, "a:\n  -\n  -\n# d\n\n# c\nb: 2\n");
     Ok(())
 }
 
@@ -16885,17 +16885,17 @@ fn test_absent_item_comments_accumulate_forward_1079_float() -> Result<()> {
     assert_yq_getter("- # c\n-\n- 3\n", ".[2] | head_comment", "c\n")
 }
 
-/// The next item's own deferred scalar (case C above) keeps its comment in
-/// the item wrapper's slot, so the head getter answers only the floated
-/// one -- real yq joins both (`c1\nc2`). Once #2795 prints heads the
-/// rendering is identical (`-\n# c1\n# c2\n- x`), so this is pinned rather
-/// than fixed.
+/// The next item's own deferred scalar (case C above) keeps its own
+/// trailing comment in the item wrapper's slot, distinct from the floated
+/// one the head getter answers with -- real yq joins both in its rendering
+/// (`c1\nc2`), and so does this getter split, once #2795 prints both slots:
+/// `head_comment` (`c1`) above the wrapper's own line comment (`c2`).
 #[test]
 fn test_absent_item_comment_before_deferred_scalar_item_1079_float() -> Result<()> {
     assert_yq_getter("- # c1\n- # c2\n  x\n", ".[1] | head_comment", "c1\n")?;
     let (out, code) = run_yq_stdin(".", "- # c1\n- # c2\n  x\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "-\n# c2\n- x\n");
+    assert_eq!(out, "-\n# c1\n# c2\n- x\n");
     Ok(())
 }
 
@@ -17157,10 +17157,6 @@ fn test_nested_double_float_keeps_the_comment_yq_drops_1079_float() -> Result<()
 /// Known residuals, pinned with real yq's answer in the comment so a change
 /// is deliberate:
 ///
-/// - a sibling item that is a compact mapping or a nested sequence -- real
-///   yq answers `.[1] | head_comment` directly; here the comment attaches
-///   to the first key / inner item instead, the same attribution #798's
-///   standalone-line capture already has for `- 1\n# h\n- b: 1\n` (#2811);
 /// - a tag with no value on the item's next line (`- # c\n  !!str`) --
 ///   real yq keeps the tag and floats the comment (`- !!str\n# c\n- 2`);
 ///   here the tag is dropped (a pre-existing gap) and the comment with it;
@@ -17168,12 +17164,19 @@ fn test_nested_double_float_keeps_the_comment_yq_drops_1079_float() -> Result<()
 ///   or to end of input: real yq keeps only the last (`- k:\n  - # c\n
 ///   - # d\n- 2\n` has `d` on `.[0].k`'s foot and `c` nowhere); here the
 ///   rest go forward as the next node's head, per ADR-0018 rule 4.
+///
+/// A sibling item that is a compact mapping or a nested sequence used to be
+/// a third residual here too (the comment landing on the first key / inner
+/// item instead of `.[1]` directly, the same attribution #798's
+/// standalone-line capture had for `- 1\n# h\n- b: 1\n` before #2811): fixed
+/// by #2811's own stem-comment hook, which a floated comment now reaches
+/// the same way an ordinary standalone block does.
 #[test]
 fn test_absent_item_comment_residuals_1079_float() -> Result<()> {
-    assert_yq_getter("- # c\n- b: 1\n", ".[1] | head_comment", "\n")?;
-    assert_yq_getter("- # c\n- b: 1\n", ".[1].b | key | head_comment", "c\n")?;
-    assert_yq_getter("- # c\n- - 1\n", ".[1] | head_comment", "\n")?;
-    assert_yq_getter("- # c\n- - 1\n", ".[1][0] | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- b: 1\n", ".[1] | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- b: 1\n", ".[1].b | key | head_comment", "\n")?;
+    assert_yq_getter("- # c\n- - 1\n", ".[1] | head_comment", "c\n")?;
+    assert_yq_getter("- # c\n- - 1\n", ".[1][0] | head_comment", "\n")?;
 
     assert_yq_getter("- # c\n  !!str\n- 2\n", ".[1] | head_comment", "\n")?;
     let (out, code) = run_yq_stdin(".", "- # c\n  !!str\n- 2\n", &[])?;
@@ -17223,12 +17226,15 @@ fn test_standalone_block_above_bare_deferred_item_is_its_head_1079_float() -> Re
 /// still there (this panicked with `split index should be <= len` when
 /// found by differential fuzzing). Blank-line placement itself is a
 /// residual (real yq: `.[2] | head_comment` is `c\n\nh`, blank preserved
-/// inside the value); only the exit code and shape are pinned.
+/// inside the value; here the blank instead detaches `c` backwards onto
+/// `.[0]`'s foot, and `h` reaches `.[2]`'s head on its own); only the exit
+/// code and shape are pinned. Now that #2795 prints head/foot comments,
+/// that shape includes them.
 #[test]
 fn test_blank_line_in_absence_lookahead_gap_does_not_panic_1079_float() -> Result<()> {
     let (out, code) = run_yq_stdin(".", "- 1\n- # c\n\n-\n  # h\n  x\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- 1\n-\n- x\n");
+    assert_eq!(out, "- 1\n# c\n\n-\n# h\n- x\n");
     Ok(())
 }
 

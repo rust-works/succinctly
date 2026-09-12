@@ -469,6 +469,15 @@ struct Parser<'a, const HAS_CR: bool> {
     first_node_value_idx: usize,
     /// Where the line that node starts on ends (#2811).
     first_node_line_end: usize,
+    /// Whether a bare sequence item deferred its value to a later line and
+    /// got only the head-only stem hook (#1079/#2811 interaction): set by
+    /// that stem, consumed by [`Self::attach_deferred_item_stem`] if the
+    /// value turns out to be a plain scalar/flow collection -- the one shape
+    /// with no more specific hook of its own to finalize `PREV`/
+    /// `deferred_foot_lines` against the stem's bp. Cleared by any
+    /// [`Self::attach_head_foot_at`] call in between (a mapping key or a
+    /// nested sequence's own item claimed it instead).
+    sequence_item_stem_pending: bool,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -608,6 +617,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             first_node_has_line_comment: false,
             first_node_value_idx: 0,
             first_node_line_end: 0,
+            sequence_item_stem_pending: false,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -1476,6 +1486,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// `column` is the column the node's line starts at: the `-` for an
     /// item, not its content (#2811).
     fn attach_head_foot_at(&mut self, bp: usize, column: usize) {
+        // Any real hook firing means a stem set by an earlier bare item's
+        // deferred-value hook (#1079/#2811) has been superseded by a more
+        // specific node of its own (a mapping key, a nested sequence's own
+        // item) -- or is about to be finalized by this very call, via
+        // [`Self::attach_deferred_item_stem`]. Either way it is spent.
+        self.sequence_item_stem_pending = false;
         self.flush_pending_head_lines(Some((bp, column)));
         if !self.deferred_foot_lines.is_empty() {
             let deferred = &mut self.deferred_foot_lines;
@@ -1509,8 +1525,41 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// head_comment` is empty. Only the head: the key/item that opens right
     /// after is still `PREV` for a later foot, and claims any deferred foot,
     /// via its own [`Self::attach_head_foot_at`].
+    ///
+    /// A no-op while a comment is floated off an earlier absent item whose
+    /// *own* sequence has already closed (#1079/#2811 interaction): `bp`
+    /// here is a stand-in for this same item's not-yet-open child, not a
+    /// sibling item, so [`Self::settle_float_if_sequence_closed`]'s "outer
+    /// item opening now" arm would wrongly claim the float onto this stem
+    /// instead of leaving it pending for the float's real resolution (a
+    /// later sibling absent item's own registration settling it via
+    /// `owner_key_bp`, or this nested sequence's later, real hooks). A float
+    /// still off its *own*, still-open sequence is unaffected -- `next` here
+    /// genuinely is the next sibling item in that case, and
+    /// `settle_float_if_sequence_closed` already leaves it pending on its
+    /// own (its `sequence_still_open` check), falling through to the
+    /// ordinary rule so the float still reaches this item's head.
     fn attach_item_head_at(&mut self, bp: usize, column: usize) {
+        if let Some(floated) = self.floated_item_comment {
+            if !self.sequence_still_open(floated.seq_serial) {
+                return;
+            }
+        }
         self.flush_pending_head_lines(Some((bp, column)));
+    }
+
+    /// Finalize a bare sequence item's deferred-value stem
+    /// ([`Self::sequence_item_stem_pending`]) once `bp` -- about to open as
+    /// a plain scalar or flow collection at `parse_block_node`'s generic
+    /// dispatch -- turns out to be that item's *actual* content, with no
+    /// more specific hook of its own (unlike a deferred mapping's key, or a
+    /// nested sequence's own item, both of which clear the flag themselves
+    /// via their own [`Self::attach_head_foot_at`] before this ever runs).
+    /// A no-op otherwise.
+    fn attach_deferred_item_stem(&mut self, bp: usize, column: usize) {
+        if core::mem::take(&mut self.sequence_item_stem_pending) {
+            self.attach_head_foot_at(bp, column);
+        }
     }
 
     /// A scalar or flow collection about to open as a document's own
@@ -3693,7 +3742,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     // blank line after it resolves it backwards), so clamp.
                     let above_dash = above_dash.min(self.pending_head_lines.len());
                     let below_dash = self.pending_head_lines.split_off(above_dash);
-                    self.attach_head_foot_at(self.bp_pos, indent);
+                    // Head-only (#2811's stem-comment primitive), not the
+                    // full hook: `self.bp_pos` stands in for whatever node
+                    // opens next, which for a mapping/nested-sequence value
+                    // gets its own, more specific hook a moment later (the
+                    // key, or the nested sequence's own item) that must be
+                    // the one to claim `deferred_foot_lines` and become
+                    // `PREV` -- claiming here as well double-attaches a
+                    // dedented block onto this stand-in bp instead of the
+                    // real target (measured: a bare item deferring to a
+                    // mapping must give the *key* the foot, not the mapping
+                    // as a whole, which has no foot slot of its own).
+                    self.attach_item_head_at(self.bp_pos, indent);
+                    // Unlike a deferred mapping/nested-sequence, a deferred
+                    // *scalar* value gets no more specific hook of its own
+                    // once parsed -- this stem's bp stays its final content,
+                    // so `PREV`/`deferred_foot_lines` still need finalizing
+                    // once `parse_block_node` discovers that (#1079/#2811).
+                    self.sequence_item_stem_pending = true;
                     self.pending_head_lines = below_dash;
                     if let Some(range) = trailing {
                         self.push_line_comment(wrapper_bp, range);
@@ -3764,6 +3830,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // always >= `indent + 2`, which is why `parse_explicit_key`'s
             // opening `close_deeper_indents` cannot close the item we just
             // pushed at virtual indent `indent + 1`.
+            //
+            // A block above this item heads the explicit-key mapping itself,
+            // the node `.[i]` resolves to, not its key (#2811/#1079
+            // interaction: `parse_explicit_key`'s own key-node hook makes
+            // this reachable at all -- without this call the block stayed
+            // pending past it, same as the other two compact arms above).
+            // `parse_explicit_key`'s first bp write is that mapping's open,
+            // so it opens at the current `bp_pos`.
+            self.attach_item_head_at(self.bp_pos, indent);
             self.parse_explicit_key(self.current_column())?;
             // Don't close anything - mapping and item are closed by
             // close_deeper_indents when we see content at lower indent.
@@ -6993,6 +7068,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // Same ambiguous-gap error as parse_mapping_entry (#901, #959).
                 self.check_mapping_under_mapping_gap(indent, false)?;
                 self.close_deeper_indents(indent);
+                self.attach_deferred_item_stem(self.bp_pos, indent);
                 self.attach_document_root_node(indent);
                 self.parse_value(indent)?;
             }
@@ -7117,6 +7193,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.check_mapping_under_mapping_gap(indent, false)?;
                     // Scalar value - either bare document scalar or value in a container
                     self.close_deeper_indents(indent);
+                    self.attach_deferred_item_stem(self.bp_pos, indent);
                     self.attach_document_root_node(indent);
                     self.set_ib();
                     self.write_bp_open();
