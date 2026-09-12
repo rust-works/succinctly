@@ -1538,12 +1538,19 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // (also excluded, conservatively), a later result's failure could
     // follow already-written earlier ones, and falling back would
     // duplicate them.
+    // #2662: `evaluate_m2_fast_path` takes `sort_keys` directly (already
+    // correct on this path), but has no `color`/`ascii` handling of its
+    // own -- `color_output` and `ascii_output` route to the general lazy
+    // path below instead, which applies both (the latter via
+    // `AsciiEscapeWriter` at its own call site).
     let can_json_fast_path = can_use_m2_streaming(&expr)
         && m2_json_fallback_safe(&expr)
         && !output_config.raw_output
         && !output_config.join_output
         && !output_config.raw_output0
         && !output_config.unbuffered
+        && !output_config.color_output
+        && !output_config.ascii_output
         && context.named.is_empty();
 
     // Indent width/unit for the fast path's streamer -- built directly from
@@ -1700,19 +1707,26 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // The lazy path preserves number formatting and uses less memory.
     // It's available when:
     // - Not using features that require serde_json parsing (slurp, raw_input, seq input, dsv)
-    // - Not using output transformations that need full access to values (sort_keys, color, ascii)
     // - Not using input/inputs/input_line_number (#723): those need the
     //   "original" path's own already-materialized Vec<OwnedValue> to share
     //   with the shared input queue below; the lazy path never builds one.
     // Both jq_compat (reformatting numbers) and preserve mode (keeping original formatting)
     // use the lazy path for correctness.
+    //
+    // #2662: `sort_keys`/`color_output`/`ascii_output` used to be excluded
+    // here too, sending every `-S`/`-C`/`-a` invocation to the
+    // materializing path below (which validates the whole document before
+    // the filter runs, #2103's own divergence from the default route).
+    // None of the three actually need materialization: `write_output_jq_value`
+    // already handles `sort_keys`/`color_output` itself (materializing just
+    // the *output* value, not the input), and `ascii_output` is applied by
+    // wrapping its writer in `AsciiEscapeWriter` at the one lazy-path call
+    // site below, the way `yq_runner.rs` already does for its own streaming
+    // routes (#1700).
     let can_use_lazy_path = !args.slurp
         && !args.raw_input
         && args.input_dsv.is_none()
         && !args.seq // seq input mode parses differently
-        && !output_config.sort_keys
-        && !output_config.color_output
-        && !output_config.ascii_output // ASCII output requires escaping
         && !uses_input_builtins;
 
     if can_use_lazy_path && !args.null_input {
@@ -5483,7 +5497,16 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // rejected record under `--seq --raw-output0`). A single RS write
     // below then covers both the raw and non-raw cases, rather than one
     // copy per branch.
-    let raw_str = if config.raw_output {
+    //
+    // #2662: `--ascii-output` wins over `-r`/`-j` for a *string* value --
+    // confirmed live against jq 1.7.1: `-acr '"café"'` prints `"café"`,
+    // quoted and escaped, not the unquoted raw string `-r` alone would give.
+    // `-a` on a non-string value (`-ar '42'` -> `42`) is unaffected, since
+    // `raw_str` is `None` there regardless. Skipping the raw branch here
+    // (rather than escaping its content in place) reproduces that exactly:
+    // falls through to the quoted/escaped write below, the same as if `-r`
+    // had never been passed.
+    let raw_str = if config.raw_output && !config.ascii_output {
         value.as_str()
     } else {
         None
@@ -5513,7 +5536,18 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 
     // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
     // For preserve mode (!jq_compat), use the preserve formatter (keeps original number format)
-    if !config.sort_keys && !config.color_output {
+    //
+    // #2662: `ascii_output` joins `sort_keys`/`color_output` on the
+    // materialize side here -- `print_json` streams structural + scalar
+    // bytes directly with no escaping hook of its own, where `format_json`
+    // (used by the `else` arm below) already threads `ascii: config.
+    // ascii_output` through `JsonFormatOpts`. Materializing *this one
+    // value* to reuse that existing, already-correct escaping is far
+    // cheaper than teaching `print_json`'s recursive walk a second escaping
+    // mode, and still validates only the value being printed, not the rest
+    // of the document -- the same "materializes what it reads" rule this
+    // issue is generalizing to `-S`/`-C` above.
+    if !config.sort_keys && !config.color_output && !config.ascii_output {
         if config.jq_compat {
             print_json(
                 out,
@@ -5538,13 +5572,25 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
             )?;
         }
     } else {
-        // For complex output (pretty-print, sort_keys, colors), materialize
-        // first -- and surface a decode failure rather than printing the
-        // empty string it used to become (#1247). `anyhow` is the only error
-        // channel this writer has; the message is preserved verbatim.
+        // For complex output (pretty-print, sort_keys, colors, ascii),
+        // materialize first -- and surface a decode failure rather than
+        // printing the empty string it used to become (#1247).
+        //
+        // #2662: wrapped in `MalformedJsonError`, not a bare `anyhow::anyhow!`
+        // -- this function's only caller (`route_write_error`) downcasts for
+        // that exact type to route a malformed-document failure into jq's
+        // own diagnostic channel (exit 5) rather than `anyhow`'s (exit 1).
+        // Before this issue, `sort_keys`/`color_output` were the only two
+        // flags that could reach this branch at all, and both were already
+        // excluded from the lazy path entirely (`can_use_lazy_path`), so
+        // this branch -- and the bare-anyhow bug in it -- was unreachable
+        // in practice. Moving `-S`/`-C`/`-a` onto the lazy path here is what
+        // first exercises it: `printf '{invalid}' | succinctly jq -cS .`
+        // used to exit 1 with a bare `Error: ...` where real jq (and this
+        // crate's own default lazy route) exits 5 with `jq: error (at ...)`.
         let owned = value
             .materialize()
-            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+            .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
 
@@ -5591,7 +5637,11 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     // separator below (same reasoning as `write_output_jq_value`'s
     // sibling fix). A single RS write below then covers both the raw and
     // non-raw cases, rather than one copy per branch.
-    let raw_str = if config.raw_output {
+    //
+    // #2662: `--ascii-output` wins over `-r`/`-j` for a *string* value, the
+    // same as `write_output_jq_value`'s sibling fix above -- see that
+    // comment for the live jq 1.7.1 confirmation.
+    let raw_str = if config.raw_output && !config.ascii_output {
         match value {
             OwnedValue::String(s) => Some(s.as_str()),
             _ => None,
