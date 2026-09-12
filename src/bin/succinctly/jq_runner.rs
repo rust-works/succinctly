@@ -1757,7 +1757,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         &context,
                         &at,
                         &mut sink,
-                        output_config.jq_compat,
+                        &output_config,
                         &mut |sink, result| {
                             had_output = true;
                             if args.exit_status {
@@ -2246,7 +2246,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     &context,
                     &ErrorAt::Live(&locations),
                     &mut sink,
-                    output_config.jq_compat,
+                    &output_config,
                     &mut |sink, result| {
                         had_output = true;
                         last_output = Some(result.clone());
@@ -2284,7 +2284,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         &context,
                         &ErrorAt::Live(&locations),
                         &mut sink,
-                        output_config.jq_compat,
+                        &output_config,
                         &mut |sink, result| {
                             had_output = true;
                             last_output = Some(result.clone());
@@ -2318,7 +2318,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     &context,
                     &at,
                     &mut sink,
-                    output_config.jq_compat,
+                    &output_config,
                     &mut |sink, result| {
                         had_output = true;
                         last_output = Some(result.clone());
@@ -4737,21 +4737,22 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 ///
 /// A per-item materialization failure (`materialize_stream_item`'s
 /// `sink.materialize` calls) is defense-in-depth rather than reachable in
-/// practice: `cursor` is always rooted in `input.to_json()`, a fresh
-/// serialization of an already-decoded `OwnedValue` -- a Rust `String`, which
-/// by construction cannot hold an undecodable byte sequence, and whose
-/// escapes this crate's own serializer writes. Same argument
-/// `eval_generic.rs`'s textually-similar bridge relies on (search
-/// "defense-in-depth" there). Kept as a reported diagnostic rather than an
-/// `unwrap()` so a real failure, if that invariant is ever violated,
-/// surfaces as an ordinary `EvalError` instead of a panic.
+/// practice: `cursor` is always rooted in `input.to_json()`/
+/// `input.to_json_jq_preserve()` (#2852), a fresh serialization of an
+/// already-decoded `OwnedValue` -- a Rust `String`, which by construction
+/// cannot hold an undecodable byte sequence, and whose escapes this crate's
+/// own serializer writes. Same argument `eval_generic.rs`'s
+/// textually-similar bridge relies on (search "defense-in-depth" there).
+/// Kept as a reported diagnostic rather than an `unwrap()` so a real
+/// failure, if that invariant is ever violated, surfaces as an ordinary
+/// `EvalError` instead of a panic.
 fn evaluate_input_streaming(
     input: &OwnedValue,
     expr: &jq::Expr,
     _context: &EvalContext,
     at: &ErrorAt<'_>,
     sink: &mut ErrorSink,
-    jq_compat: bool,
+    output_config: &OutputConfig,
     on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
 ) -> Result<()> {
     // #2852: `to_json()` always reformats a `NumberLiteral` to jq's own
@@ -4761,7 +4762,7 @@ fn evaluate_input_streaming(
     // `input`/`inputs` builtin themselves was unaffected, since those
     // resolve from an already-materialized queue that never reaches this
     // function or either `to_json` variant).
-    let json_str = if jq_compat {
+    let json_str = if output_config.jq_compat {
         input.to_json()
     } else {
         input.to_json_jq_preserve()
@@ -5148,10 +5149,10 @@ fn evaluate_m2_fast_path<W: Write>(
 ///
 /// The M2 counterpart of [`evaluate_input_streaming`], and deliberately not a
 /// call into it: that one takes an already-materialized `OwnedValue` and
-/// re-indexes `input.to_json()`, where this streams from the `JsonIndex` the
-/// caller already built and keeps the lazy [`write_output_jq_value`] writer,
-/// so a transparent filter still writes raw source spans rather than
-/// materializing every output.
+/// re-indexes it through `to_json()`/`to_json_jq_preserve()` (#2852), where
+/// this streams from the `JsonIndex` the caller already built and keeps the
+/// lazy [`write_output_jq_value`] writer, so a transparent filter still
+/// writes raw source spans rather than materializing every output.
 ///
 /// `on_value` returns `false` to stop the generator. `sink` is passed *into*
 /// it rather than captured, so this function can keep its own `&mut` for the
