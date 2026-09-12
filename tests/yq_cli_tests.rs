@@ -14932,7 +14932,15 @@ mod standalone_comment_attribution_2811_review {
         let input = "---\n---\n# c\nb: 2\n";
         let (out, code) = run_yq_stdin(".", input, &["--doc", "0"])?;
         assert_eq!(code, 0);
-        assert_eq!(out, "---\nnull\n");
+        // Was `"---\nnull\n"` before the #2795 review fix to
+        // `is_header_only_document`: document 0 here is a bare `---` with
+        // nothing before the next marker, the same synthesized-absent shape
+        // as a lone `---\n` file, which real yq always prints as just
+        // `---\n` -- confirmed live in isolation (`printf -- '---\n' | yq
+        // '.'`) and by real yq's own combined rendering of this exact input
+        // (`yq '.'` with no `--doc` filter prints `---\n---\n# c\nb: 2\n`,
+        // whose first line is this document's whole contribution).
+        assert_eq!(out, "---\n");
         let (out, code) = run_yq_stdin(".", input, &["--doc", "1"])?;
         assert_eq!(code, 0);
         assert_eq!(out, "# c\nb: 2\n");
@@ -15078,6 +15086,31 @@ mod standalone_comments_2795 {
             yq(".", "# lead\n---\na: 1\n---\nb: 2\n", &[])?,
             "# lead\n---\na: 1\n---\nb: 2\n"
         );
+        Ok(())
+    }
+
+    /// A document whose whole identity output is its own verbatim header
+    /// (comment-only or blank-only input, or a bare `---`/`...` marker with
+    /// nothing after it) prints no `null` for its synthesized-absent value
+    /// -- `YamlCursor::is_header_only_document` (#2795 review) gates the
+    /// identity path's own per-document terminator so it doesn't
+    /// double-terminate a header that already ends in its own captured line
+    /// break. Live-verified against pinned yq v4.53.3; a later document's
+    /// own empty `---` is unaffected (still gets the ordinary terminator,
+    /// same as real yq).
+    #[test]
+    fn a_header_only_document_prints_no_synthesized_null_2795() -> Result<()> {
+        assert_eq!(yq(".", "# c\n", &[])?, "# c\n");
+        assert_eq!(yq(".", "\n\n\n", &[])?, "\n\n\n");
+        assert_eq!(yq(".", "---\n", &[])?, "---\n");
+        // Sanity: an explicit `null`/`~` keyword, and a `null` nested inside
+        // a container, are unaffected -- only a whole-result synthesized
+        // absence is ever suppressed.
+        assert_eq!(yq(".", "null\n", &[])?, "null\n");
+        assert_eq!(yq(".", "a: [null, 1]\n", &[])?, "a: [null, 1]\n");
+        // A later document's own empty `---` keeps the ordinary terminator
+        // (no header to fold into).
+        assert_eq!(yq(".", "a: 1\n---\n", &[])?, "a: 1\n---\n\n");
         Ok(())
     }
 
@@ -15312,6 +15345,28 @@ mod dom_standalone_comments_2795 {
         // Real yq: "# lead\n\na: 1\n" (keeps the blank line and the marker).
         assert_eq!(yq_p(".", "# lead\n\na: 1\n", &[])?, "# lead\na: 1\n");
         assert_eq!(yq_p(".", "---\na: 1\n", &[])?, "a: 1\n");
+        Ok(())
+    }
+
+    /// A blank line *inside* an ordinary (non-header) head-comment block --
+    /// distinct from the header-verbatim residual just above, which is about
+    /// the *first document's leading* block only -- is now reproduced on the
+    /// DOM route too (#2795 review): `DocumentCursor::head_comment_raw`'s
+    /// `YamlCursor` impl used to just decode the stored `#` ranges with no
+    /// way to represent a blank between them, silently dropping it under
+    /// `-P`/a write while the streaming route already kept it. Live-verified
+    /// against pinned yq v4.53.3.
+    #[test]
+    fn interior_blank_line_in_a_head_block_survives_the_dom_route_2795() -> Result<()> {
+        assert_eq!(
+            yq_p(".", "a:\n  # h1\n\n  # h2\n  b: 1\n", &[])?,
+            "a:\n  # h1\n\n  # h2\n  b: 1\n"
+        );
+        // A write forcing the DOM route keeps it too, not just plain `-P`.
+        assert_eq!(
+            yq_p(".c = 2", "a:\n  # h1\n\n  # h2\n  b: 1\n", &[])?,
+            "a:\n  # h1\n\n  # h2\n  b: 1\nc: 2\n"
+        );
         Ok(())
     }
 }

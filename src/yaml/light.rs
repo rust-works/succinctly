@@ -1637,7 +1637,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 }
             }
             out.write_str(&str_val)?;
-        } else {
+        } else if !matches!(value, YamlValue::Null) {
+            // #2795 review: a `Null` reaching this point is never an
+            // explicit `null`/`~` keyword (those decode as `YamlValue::String`
+            // and take the arm above, preserving their raw spelling) -- per
+            // `YamlCursor::value`'s own doc comment, `Null` is produced only
+            // when there is genuinely no source text at this position
+            // (`text_pos >= self.text.len()`), i.e. a synthesized-absent
+            // document root: `end_document`'s null for a bare `---`/comment-
+            // only stream with nothing after it. Real yq's printer omits the
+            // value line entirely for that document (`# c\n` under `.` prints
+            // just `# c`, `---\n` prints just `---`), never the literal text
+            // `null` -- confirmed live against v4.53.3. A `Null` nested
+            // *inside* a container (`a: [null, 1]`) never reaches this
+            // function at all (it streams through `stream_yaml_value`'s own
+            // block/flow loops), so this only ever suppresses a whole-result
+            // synthesized absence, not a real nested null.
             self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false, "")?;
         }
         if is_collection_root {
@@ -1652,6 +1667,33 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
         }
         Ok(())
+    }
+
+    /// True when [`Self::stream_yaml_as_document`]'s entire identity output
+    /// for this cursor is exactly its verbatim-header reproduction, with no
+    /// value line following it: the first document's own root has genuinely
+    /// no source text (comment-only/blank-only input, or a bare `---`/`...`
+    /// marker with nothing after it, both of which parse to a synthesized
+    /// `YamlValue::Null`, per `value`'s own doc comment). The header's own
+    /// captured line break already supplies this document's trailing
+    /// newline in that case, so the identity streaming path's own
+    /// per-document terminator (`stream_cursor!` in `yq_runner.rs`) must be
+    /// skipped -- adding it on top double-terminates, printing a spurious
+    /// blank line real yq never has (confirmed live: `# c\n` and `---\n`
+    /// both round-trip through `.` byte-for-byte only when the terminator is
+    /// skipped here). A later document's own empty `---` has no such header
+    /// to fold into and keeps the ordinary terminator (verified: `a: 1\n---\n`
+    /// prints `a: 1\n---\n\n` in real yq, the blank line coming from the
+    /// terminator alone) -- `bp_pos == FIRST_DOCUMENT_BP` is what tells the
+    /// two apart.
+    pub fn is_header_only_document(&self) -> bool {
+        let self_ = self.resolve_bare_seq_item();
+        self_.is_document_content()
+            && self_.bp_pos == FIRST_DOCUMENT_BP
+            && matches!(
+                self_.resolve_alias_target_cursor().unwrap_or(self_).value(),
+                YamlValue::Null
+            )
     }
 
     /// Stream YAML, unwrapping single documents (matches yq behavior).
@@ -7060,9 +7102,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
 
     #[inline]
     fn head_comment_raw(&self) -> Vec<String> {
-        YamlCursor::head_comment_raw(self)
-            .map(ToString::to_string)
-            .collect()
+        // Not a plain `YamlCursor::head_comment_raw(self).collect()` (unlike
+        // `foot_comment_raw` just below): that inherent iterator only ever
+        // yields the stored `#` lines themselves, with no way to tell the
+        // DOM route's `NodeMeta` seed (`to_owned_with_comments_at_depth`)
+        // about an interior blank line the block also had -- see
+        // `head_comment_lines_with_blanks`'s own doc comment for the bug
+        // this closes.
+        head_comment_lines_with_blanks(self.text, self.index.get_head_comments(self.bp_pos))
     }
 
     #[inline]
@@ -8174,6 +8221,51 @@ fn blank_line_between(text: &[u8], from: usize, to: usize) -> bool {
         }
     }
     false
+}
+
+/// Build a node's standalone head comment lines as owned strings, inserting
+/// an empty (`""`) entry wherever [`blank_line_between`] finds a blank line
+/// separating two lines of the block -- the DOM route's own analogue of
+/// [`write_head_comment_lines`]'s live text scan (#2795 review). Consumed by
+/// `DocumentCursor::head_comment_raw`'s `YamlCursor` impl, which is what
+/// actually seeds `NodeMeta::head_comment` in `to_owned_with_comments_at_depth`
+/// (`eval_generic.rs`); `yq_runner.rs`'s `prepend_head_comment_lines` already
+/// treats an empty entry as a bare blank line (matching
+/// `append_own_comment_line`'s same convention), so without this the DOM
+/// route silently dropped every interior blank line a head block had
+/// (`a:\n  # h1\n\n  # h2\n  b: 1` lost the blank under `-P`, kept it under
+/// plain streaming -- confirmed live against pinned yq v4.53.3, undocumented
+/// until this fix).
+///
+/// No `skip_before` parameter, unlike [`write_head_comment_lines`]: the DOM
+/// route never reproduces the verbatim header (`write_yq_header` is
+/// streaming-only, a separate documented gap), so it has nothing to skip --
+/// every head line, including the first document's leading block, goes
+/// through this same structured path.
+fn head_comment_lines_with_blanks(text: &[u8], ranges: &[(u32, u32)]) -> Vec<String> {
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut prev_end: Option<usize> = None;
+    for &(start, end) in ranges {
+        let (start, end) = (start as usize, end as usize);
+        let Ok(line) = core::str::from_utf8(&text[start..end]) else {
+            // Same rationale as `write_head_comment_lines`'s identical
+            // guard: still advance `prev_end` past this skipped line's own
+            // break, or the next real line's blank-line check would count
+            // both the gap before and after this line as one combined span.
+            if prev_end.is_some() {
+                prev_end = Some(end + line_break_len(text, end));
+            }
+            continue;
+        };
+        if let Some(pe) = prev_end {
+            if blank_line_between(text, pe, start) {
+                out.push(String::new());
+            }
+        }
+        out.push(line.to_string());
+        prev_end = Some(end);
+    }
+    out
 }
 
 /// Write a node's standalone *head* comment lines (#2795) so that the node

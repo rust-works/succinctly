@@ -1389,7 +1389,8 @@ pub fn to_owned_with_comments<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    let (v, mut comments) = to_owned_with_comments_at_depth(value, cursor, 0, false, false)?;
+    let (v, mut comments) =
+        to_owned_with_comments_at_depth(value, cursor, 0, false, HeadFootRead::Own)?;
     if let Some(c) = cursor {
         let is_collection = matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
         if !is_collection {
@@ -1401,6 +1402,29 @@ pub fn to_owned_with_comments<V: DocumentValue>(
         }
     }
     Ok((v, comments))
+}
+
+/// Whether [`to_owned_with_comments_at_depth`] should read this node's own
+/// standalone head/foot off its own cursor, or skip that read outright
+/// because the caller already knows it will be discarded -- a mapping
+/// field's value cursor is never the node the parser attaches head/foot to
+/// (see `DocumentCursor::head_comment`'s own doc comment), so the object arm
+/// always overwrites this generic read with `field.key_cursor`'s own once it
+/// has one. A two-variant enum rather than a second `bool` parameter next to
+/// `under_alias` (#2795 PR B review): both are same-typed and adjacent in
+/// the signature, so a transposed call-site argument order would still
+/// compile silently with a plain `bool` -- this makes a mis-ordered call a
+/// type error instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadFootRead {
+    /// Read this node's own head/foot normally (the top-level and array-
+    /// element callers).
+    Own,
+    /// Skip the read: a mapping field's value cursor never carries its own
+    /// head/foot (the key cursor does), so reading here would only be
+    /// immediately overwritten -- skipping it saves two wasted `BTreeMap`
+    /// probes per field, comment or not.
+    SkippedForMappingValue,
 }
 
 /// `under_alias`: whether some ancestor on the path from the root is itself
@@ -1423,7 +1447,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     cursor: Option<&V::Cursor>,
     depth: usize,
     under_alias: bool,
-    skip_own_head_foot: bool,
+    head_foot_read: HeadFootRead,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     assert_nesting_depth(depth);
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
@@ -1462,14 +1486,15 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     // for a mapping field, whose head/foot instead lives on the *key* node
     // (see `head_comment`'s own doc comment) -- the object arm below
     // overrides this empty read with `field.key_cursor`'s once it has one,
-    // so it passes `skip_own_head_foot` rather than pay for a read it will
-    // discard on every field of every object, comment or not (#2795 PR B
-    // review). Also skipped, via `document_has_standalone_comments`, when
-    // the whole document has no standalone comment at all -- mirrors the
-    // streaming route's own `write_head_comments_at`/`write_foot_comments_at`
-    // gate (`src/yaml/light.rs`), added there after measuring a real
-    // regression from these same two lookups on comment-free input.
-    let (own_head, own_foot) = if !skip_own_head_foot
+    // so it passes `HeadFootRead::SkippedForMappingValue` rather than pay
+    // for a read it will discard on every field of every object, comment or
+    // not (#2795 PR B review). Also skipped, via
+    // `document_has_standalone_comments`, when the whole document has no
+    // standalone comment at all -- mirrors the streaming route's own
+    // `write_head_comments_at`/`write_foot_comments_at` gate
+    // (`src/yaml/light.rs`), added there after measuring a real regression
+    // from these same two lookups on comment-free input.
+    let (own_head, own_foot) = if head_foot_read == HeadFootRead::Own
         && cursor.is_some_and(DocumentCursor::document_has_standalone_comments)
     {
         (
@@ -1523,7 +1548,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                 Some(&field.value_cursor),
                 depth + 1,
                 child_under_alias,
-                true,
+                HeadFootRead::SkippedForMappingValue,
             )?;
             if field.key_cursor.document_has_standalone_comments() {
                 let field_head = field.key_cursor.head_comment_raw();
@@ -1588,7 +1613,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                 Some(&elem_cursor),
                 depth + 1,
                 child_under_alias,
-                false,
+                HeadFootRead::Own,
             )?;
             items.push(v);
             comment_items.push(c);

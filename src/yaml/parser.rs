@@ -7112,18 +7112,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // all, which this branch's `peek().is_none()` guard already
             // rules out.
             //
-            // Known residual, confirmed live and unfixed here: real yq's
-            // YAML-target printer suppresses the value line entirely for a
-            // document with no explicit content (`# c\n` under `.` prints
-            // just `# c`, no `null`), where succinctly still prints the
-            // synthesized `null` (`# c\nnull`) -- both tools agree it's
-            // `!!null` under `. | type`, and JSON output already agrees
-            // (`null` on both). This is not new here: an explicit `---`
-            // alone with nothing after it has the identical gap already
-            // (`---\n` under `.` prints `---` in yq, `---\nnull` here),
-            // unrelated to comments -- this synthesis just reaches the same
-            // pre-existing emitter gap from a new angle, not a regression
-            // this change introduces.
+            // Real yq's YAML-target printer suppresses the value line
+            // entirely for a document with no explicit content (`# c\n`
+            // under `.` prints just `# c`, no `null`) -- both tools agree
+            // it's `!!null` under `. | type`, and JSON output already
+            // agrees (`null` on both). This was a pre-existing emitter gap,
+            // not new here (an explicit `---` alone with nothing after it
+            // had the identical `---\nnull` bug already, unrelated to
+            // comments), now closed on the streaming route by
+            // `YamlCursor::is_header_only_document` (`src/yaml/light.rs`)
+            // gating the identity path's own per-document terminator in
+            // `yq_runner.rs`'s `stream_cursor!` macro (#2795 review) --
+            // `# c\n`/`---\n` now round-trip through `.` byte-for-byte.
+            // Still open on the DOM route (`-P`/a write): `OwnedValue` has
+            // no signal distinguishing this synthesized absence from a
+            // genuine `null`/`~` keyword or a literal `null` filter result
+            // once evaluation has materialized it, so the same fix can't
+            // safely land there without new plumbing -- tracked, not
+            // fixed, as of this comment.
             self.start_document();
             self.end_document();
         }

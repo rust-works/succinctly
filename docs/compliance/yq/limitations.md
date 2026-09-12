@@ -3756,12 +3756,15 @@ navigated distinction for a bare *scalar* result (a container keeps its head/foo
 regardless of navigation, matching the streaming route's rule below, but a navigated-away
 scalar drops both even though its own cursor may still carry them structurally — e.g. a
 sequence item's scalar value keys head/foot off its own position the same way whether or
-not it's ever reached by navigation). `evaluate_yaml_cursor`'s `owned_with_comments`
-clears them immediately for a non-root scalar cursor (new `DocumentCursor::is_document_content`,
-mirroring `light.rs`'s private method of the same name), and the pre-existing #852
-style/anchor-clearing pass for a bare scalar result now preserves whatever head survives
-that gate while always dropping foot (matching the streaming route's own root-only
-asymmetry below). Pinned by `dom_standalone_comments_2795`
+not it's ever reached by navigation). The document-root/first-document/scalar-vs-collection
+gating for a bare result's standalone head/foot lives in `to_owned_with_comments` itself
+(`src/jq/eval_generic.rs`, #2795 PR B review) — not in `evaluate_yaml_cursor`'s
+`owned_with_comments` closure (`yq_runner.rs`), which only consumes the already-gated
+result — clearing them immediately for a non-root or non-first-document scalar cursor (new
+`DocumentCursor::is_document_content`, mirroring `light.rs`'s private method of the same
+name), and the pre-existing #852 style/anchor-clearing pass for a bare scalar result now
+preserves whatever head survives that gate while always dropping foot (matching the
+streaming route's own root-only asymmetry below). Pinned by `dom_standalone_comments_2795`
 (`tests/yq_cli_tests.rs`).
 
 What the streaming route reproduces, all measured against pinned v4.53.3:
@@ -3770,7 +3773,14 @@ What the streaming route reproduces, all measured against pinned v4.53.3:
   by a sibling in the same collection is followed by one blank line (`a: 1\n# mid\n\nb: 2`
   round-trips as-is), a foot that ends its collection by none (`b: 2\n\n# trail` loses
   its blank); a blank line *inside* a head block is reproduced, a blank *after* one is not
-  (`a: 1\n# f\n\n# g\n\nb: 2` prints `# f`, blank, `# g`, `b: 2`);
+  (`a: 1\n# f\n\n# g\n\nb: 2` prints `# f`, blank, `# g`, `b: 2`). The DOM route reproduces
+  the interior-blank-line half of this too (#2795 review): `head_comment_raw`'s `YamlCursor`
+  impl derives it from the raw text the same way `write_head_comment_lines` does
+  (`head_comment_lines_with_blanks`, `src/yaml/light.rs`), rather than the plain decoded-line
+  iterator it started with, which had no way to represent a blank at all
+  (`a:\n  # h1\n\n  # h2\n  b: 1` lost the blank under `-P '.'` until this fix, live-verified
+  against pinned v4.53.3). The **header**'s own blank-line handling remains streaming-only —
+  see the next bullet;
 - the leading **header** real yq's default `--header-preprocess` slurps — every line before
   the first content line that is blank, a `#` comment at any indent, a `%YA..` directive or
   a `---` marker — is re-emitted verbatim in front of the first document whenever the
