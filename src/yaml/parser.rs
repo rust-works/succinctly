@@ -7711,7 +7711,7 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
     // (`-D unsafe-code`), so this stays a real (cheap, ASCII-fast-pathed)
     // check rather than a skippable one.
     let Ok(s) = core::str::from_utf8(bytes) else {
-        return false;
+        return false; // omni-dev: coverage tolerate-line reason="unreachable: every byte here already passed the `[0-9.eE+-]` charset check above, a strict subset of ASCII, so `str::from_utf8` can never fail (#2778)"
     };
     // The finite-`f64`-parse primitive, not the core-schema dispatch around
     // it -- see `parse_float`'s doc comment for why only this much is
