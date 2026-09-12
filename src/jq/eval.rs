@@ -22959,6 +22959,20 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// ever runs -- an empty survivor set just makes that loop run zero times,
 /// so `builtin_sort_keys` needs no special-case for "every path was
 /// filtered out" beyond calling this instead of [`eval_update`].
+///
+/// **Known gap (#2870):** the existence check below only covers a
+/// resolved path's prefix up to its first `Iterate`/`Slice` component --
+/// `navigate_read_only` has no arm for either, so requiring the whole path
+/// to pre-exist would wrongly drop a genuinely-existing target like
+/// `sort_keys(.a[])` itself. A static field *after* that fan-out point
+/// still reaches `update_path`'s ordinary per-element vivification with no
+/// "skip absent" gate of its own: `sort_keys(.a[].b)` wrongly creates
+/// `b: null` on an array element that never had `.b`, confirmed live.
+/// Fixing this needs either threading a skip-absent flag through
+/// `update_path`/`update_path_steps` (shared by every `|=`-family
+/// operator, too high a blast radius to risk here) or a dedicated
+/// post-fan-out pre-filter in `builtin_sort_keys` itself -- tracked, not
+/// fixed, in #2870.
 fn eval_update_no_vivify<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     filter_expr: &Expr,
