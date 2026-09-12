@@ -2264,9 +2264,9 @@ fn assert_jq_answers(
 /// (`push_generic_document_validation_error` -- since #2692 `select` no
 /// longer reaches that gate at all and is asserted on the answering side
 /// below, but it stays in the list because agreement is what this test is
-/// for), `-Sc .bad` (`to_owned_at_depth`,
-/// confirmed live via temporary tracing -- `-S` does *not* route through the
-/// cursor-aware sibling despite the name resemblance), and `-e .bad`
+/// for), `-Sc .bad` (at #1803's time, `to_owned_at_depth` -- confirmed live
+/// via temporary tracing that `-S` did *not* route through the cursor-aware
+/// sibling despite the name resemblance), and `-e .bad`
 /// (`cursor_to_owned_at_depth`, `lazy.rs` -- a JSON-only fourth
 /// implementation with no `DocumentValue`/`DocumentCursor` generic bound,
 /// reached only via `--exit-status`'s `JqValue::materialize()` path, #1098's
@@ -2274,6 +2274,20 @@ fn assert_jq_answers(
 /// for a genuine cross-site divergence and found none here -- the real bug
 /// that investigation surfaced (#1960) turned out to be an unrelated YAML
 /// flow-scalar parser bug, not a traversal-function disagreement.
+///
+/// **#2662 update**: `-S` moved onto the lazy route, so `-Sc .bad`'s
+/// materialize call (`write_output_jq_value`'s `sort_keys` branch) now goes
+/// through `JqValue::materialize()` -> `cursor_to_owned_at_depth` --
+/// `-e .bad`'s own implementation, not the `to_owned_at_depth` sibling
+/// #1803 traced. The `-Sc .bad`/`-e .bad` pair no longer differentially
+/// covers two independent implementations the way #1803 designed it to;
+/// `push_generic_document_validation_error` is still a genuine third one.
+/// Left as-is rather than swapped for a still-independent fourth row: no
+/// such row currently exists in this file, and the loss is a coverage
+/// *reduction*, not a wrong assertion -- every case below still passes and
+/// still catches a regression in whichever implementation each row
+/// actually reaches, just with less cross-checking than before between
+/// these two specifically.
 ///
 /// **Known scope limit** (#1803 code review): this is example-based
 /// coverage over a hand-picked case list, not an exhaustive or randomized
@@ -4267,19 +4281,22 @@ fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
             // default -- `1+1` reads nothing from the document, so all
             // three now answer the same way the default route does,
             // malformed document and all. `-c` prefix keeps output
-            // comparable across rows; `-C`'s own ANSI wrapping around a
-            // bare number is exercised separately elsewhere.
-            for flags in [&["-Sc"][..], &["-ac"], &["-Cc"]] {
+            // comparable across rows. Exact matches, not a substring check
+            // -- `doc` itself contains the digit `2` (`"b":2`), so a
+            // substring check couldn't distinguish the filter's own answer
+            // from a leaked fragment of the unread document.
+            for (flags, want) in [
+                (&["-Sc"][..], "2\n"),
+                (&["-ac"], "2\n"),
+                (&["-Cc"], "\u{1b}[0;39m2\u{1b}[0m\n"),
+            ] {
                 let mut args = flags.to_vec();
                 args.push(filter);
                 let (out, err, code) = run_jq_full(&args, Some(doc))?;
                 assert_eq!(
-                    code, 0,
-                    "{flags:?} {filter} on {doc}: out {out:?} stderr {err}"
-                );
-                assert!(
-                    out.contains('2'),
-                    "{flags:?} {filter} on {doc}: out {out:?}"
+                    (out.as_str(), code),
+                    (want, 0),
+                    "{flags:?} {filter} on {doc}: stderr {err}"
                 );
             }
 
@@ -4368,6 +4385,41 @@ fn test_ascii_output_wins_over_raw_for_strings_2662() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-acr", "."], Some("42"))?;
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(out.trim(), "42");
+
+    Ok(())
+}
+
+/// #2662 (a second bug found by review, on top of the quoting fix above):
+/// `--seq`'s RS-separator byte must key on whether `-r` alone would have
+/// made this value raw -- a string, full stop -- not on whether `-a` later
+/// overrode that shaping back to quoted+escaped. Confirmed live against jq
+/// 1.7.1: `--seq -acr` on a string suppresses the RS byte exactly as plain
+/// `--seq -r` does, even though the printed bytes end up quoted+escaped
+/// either way; `--seq -r` on a *non-string* value (where `-r` has no effect
+/// on shape at all) keeps the RS byte. An earlier revision of the quoting
+/// fix above keyed the RS decision off the post-override write instead,
+/// which emitted a spurious RS byte under `--seq -acr` on a string.
+#[test]
+fn test_seq_separator_keys_on_pre_ascii_override_raw_shape_2662() -> Result<()> {
+    // `\u{1e}` (RS) prefix on stdin: `--seq`'s own input-framing convention.
+    for (args, input, want) in [
+        (
+            &["--seq", "-acr", "."][..],
+            "\u{1e}\"café\"\n",
+            "\"caf\\u00e9\"\n",
+        ),
+        (&["--seq", "-r", "."][..], "\u{1e}42\n", "\u{1e}42\n"),
+        (&["--seq", "-r", "."][..], "\u{1e}\"hello\"\n", "hello\n"),
+        (
+            &["--seq", "."][..],
+            "\u{1e}\"hello\"\n",
+            "\u{1e}\"hello\"\n",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(code, 0, "{args:?} on {input:?}: stderr {err}");
+        assert_eq!(out, want, "{args:?} on {input:?}");
+    }
 
     Ok(())
 }
@@ -7344,8 +7396,8 @@ fn test_uncaught_error_locations_across_input_modes() -> Result<()> {
     assert_eq!(code, 5);
     assert_eq!(stderr.trim_end(), format!("jq: error (at {path}:2): x"));
 
-    // --sort-keys routes through the materializing path, but per-value lines
-    // must survive it.
+    // --sort-keys takes the lazy path since #2662 (previously the
+    // materializing path) -- per-value lines must survive either way.
     let (_, stderr, code) = run_jq_full(&["-S", "-c", r#"error("x")"#, &path], None)?;
     assert_eq!(code, 5);
     assert_eq!(
