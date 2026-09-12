@@ -41790,9 +41790,12 @@ fn test_alternative_output_stands_where_its_operand_stood_2782() -> Result<()> {
 /// is correctly attributed to `rest`, not swallowed or misreported as the
 /// left operand's own failure (`eval_owned_identity_alternative`'s
 /// `rest_escape` split, mirroring `eval_owned_identity_scoped`'s existing
-/// pattern): `key` resolves truthy (`"a"`), then `rest` (`error(...)`)
-/// raises -- the escape must survive, not be swallowed as if the left
-/// operand itself had failed.
+/// pattern). `rest` must itself need path context (`(path, error(...))`,
+/// not a bare `error(...)`) to force the materializing identity route at
+/// all -- a `rest` with no path-context read stays on `eval_single`'s
+/// cursor-native `//` arm instead (`alternative_stays_cursor_native`),
+/// which never reaches `eval_owned_identity_alternative`'s escape-stash
+/// path and would leave this row not actually exercising it.
 #[test]
 fn test_alternative_review_gaps_2782() -> Result<()> {
     let doc = "a: {b: 1, e: 2}\n";
@@ -41806,13 +41809,13 @@ fn test_alternative_review_gaps_2782() -> Result<()> {
     assert_eq!(stdout.trim(), "[\"a\",\"z\"]", "stderr: {stderr:?}");
 
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(
-        ".a | (key // 9) | error(\"boom-\" + .)",
+        ".a | (key // 9) | (path, error(\"boom\"))",
         doc,
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("boom-a"),
+        stderr.contains("boom"),
         "stdout: {stdout:?} stderr: {stderr:?}"
     );
 
