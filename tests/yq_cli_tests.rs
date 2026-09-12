@@ -45219,6 +45219,34 @@ fn test_yq_sort_keys_missing_arg_2855() -> Result<()> {
     Ok(())
 }
 
+/// #2855: an unclosed `sort_keys(f` is a parse error in both tools, exit 1
+/// -- succinctly's own generic parse-error wording, not real yq's exact
+/// bison message ("bad expression - probably missing close bracket on
+/// SORT_KEYS", confirmed live), matching this codebase's established
+/// convention of not chasing yq's grammar-specific syntax-error text.
+#[test]
+fn test_yq_sort_keys_unclosed_paren_is_a_parse_error_2855() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("sort_keys(.", "a: 1\n", &[])?;
+    assert_ne!(code, 0, "stderr={stderr:?}");
+    assert!(stderr.contains("Error:"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// #2855: a decode failure at the target reaches `sort_keys(.)` the same
+/// way it reaches any other write (`test_select_and_write_agree_on_corruption_1803`'s
+/// own `"a\\qb"` invalid-escape trigger).
+#[test]
+fn test_yq_sort_keys_raises_on_decode_failure_2855() -> Result<()> {
+    let input = "bad: \"a\\qb\"\nkeep: 5\n";
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("sort_keys(.)", input, &[])?;
+    assert_ne!(code, 0, "stderr={stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr={stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2855: comments and style survive `sort_keys(.)`, matching real yq --
 /// this is a write (goes through the DOM route), so `CommentTree`/
 /// `NodeMeta` carry them through only once `is_alias_sensitive_assign`/
