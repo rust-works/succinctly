@@ -44300,6 +44300,33 @@ fn test_wrong_arity_special_form_keeps_yq_parse_error_2686() -> Result<()> {
     Ok(())
 }
 
+/// #2749 (yq half): `parse_required_single_arg`'s trailing-`)` checkpoint
+/// keeps yq mode's identical carve-out after being routed through
+/// `builtin_wrong_arity_or_expect` instead of a rewind -- `wrong_arity_or_expect`
+/// (the shared non-jq arm both checkpoints use) raises `expect`'s own raw
+/// error there exactly as it always did, never jq's "X/N is not defined".
+#[test]
+fn test_wrong_arity_single_arg_keeps_yq_parse_error_2749() -> Result<()> {
+    for (filter, want_fragment) in [
+        ("has(1;2)", "expected ')', found ';'"),
+        ("select(1;2)", "expected ')', found ';'"),
+        ("join(1;2)", "expected ')', found ';'"),
+    ] {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_ne!(code, 0, "`{filter}`: expected a rejection");
+        assert!(
+            stderr.contains(want_fragment),
+            "`{filter}`: stderr {stderr:?} lacks {want_fragment:?}"
+        );
+        assert!(
+            !stderr.contains("is not defined"),
+            "`{filter}`: yq mode must not borrow jq's name/arity wording: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2132 (yq half): the evaluator's resource caps are uncatchable in yq
 /// mode too -- they are not a reference behaviour in either mode, so the
 /// `ErrorKind::ResourceLimit` tag is mode-independent.

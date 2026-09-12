@@ -49290,16 +49290,15 @@ fn test_collection_literal_postfix_does_not_capture_destructuring_2667() -> Resu
 /// Hence the table below covers all eight forms rather than the two named.
 ///
 /// **Scope: the eight dedicated special-form parsers only.** The same shape
-/// still exists behind `parse_required_single_arg`, which rewinds *after*
-/// parsing its argument and signals "not a match" so its caller re-parses --
-/// so the ~30 single-argument builtins in `try_parse_builtin` (`has`,
-/// `select`, ...) keep it. Measured on this branch: `"has(" * d + "1" +
-/// ";2)" * d` costs 2.4 s at depth 18, identical to the merge base, where
-/// the forms below are flat. That is a different protocol
-/// (`Result<Option<_>>`, resolved by the caller's own shadow fallback rather
-/// than in place), so it is tracked separately rather than folded in here --
-/// this test deliberately does not cover it, and should not be read as
-/// saying the wider surface is fixed.
+/// used to exist behind `parse_required_single_arg` too, which rewound
+/// *after* parsing its argument and signalled "not a match" so its caller
+/// re-parsed -- the ~30 single-argument builtins in `try_parse_builtin`
+/// (`has`, `select`, ...). Fixed separately in #2749 by routing that
+/// checkpoint through this same `wrong_arity_call`-parking mechanism (via
+/// `builtin_wrong_arity_or_expect`, generalized from #2807's `Builtin`-only
+/// form) instead of adding a second copy here --
+/// `test_wrong_arity_single_arg_deep_nesting_does_not_blow_up_2749` is that
+/// family's own timing guard.
 ///
 /// Same timing-guard shape and generous margin as
 /// `test_def_shadow_deep_nesting_does_not_blow_up_2036` and
@@ -49817,6 +49816,126 @@ fn test_wrong_arity_resolution_is_unchanged_2686() -> Result<()> {
         ("1 | until(. > 3; . + 1)", "4"),
         ("[first(1,2)]", "[1]"),
         ("[last(1,2)]", "[2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
+
+/// #2749: `parse_required_single_arg`'s trailing-`)` checkpoint had the
+/// identical `O(2^depth)` shape #2686 fixed for the eight dedicated
+/// special-form parsers, surviving here because this checkpoint's
+/// `Result<Option<Expr>, ParseError>` contract had no slot for an
+/// already-parsed argument until #2807's `wrong_arity_call` parking field
+/// existed for `try_parse_builtin`'s `Builtin`-returning arms.
+/// `builtin_wrong_arity_or_expect` is now generic over that answer type, so
+/// this checkpoint parks an `Expr` in the same field instead of rewinding.
+///
+/// A representative spread of the 37 call sites rather than all of them --
+/// enough to cover a #2389-converted site (`has`, an original #2237
+/// conversion) and a #2750-converted one (`bsearch`), plus a mix of arities
+/// and postfix-bearing names. Same generous margin and reasoning as
+/// `test_wrong_arity_deep_nesting_does_not_blow_up_2686`.
+#[test]
+fn test_wrong_arity_single_arg_deep_nesting_does_not_blow_up_2749() -> Result<()> {
+    for kw in [
+        "has",
+        "select",
+        "map",
+        "getpath",
+        "join",
+        "bsearch",
+        "ltrimstr",
+        "startswith",
+    ] {
+        let depth = 40;
+        let filter = format!("{kw}(").repeat(depth) + "1" + &";2)".repeat(depth);
+        let start = std::time::Instant::now();
+        let (_stdout, _stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        let elapsed = start.elapsed();
+        assert_ne!(code, 0, "`{kw}` {depth} levels: expected a rejection");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "`{kw}` at {depth} levels took {elapsed:?} -- exponential parse blowup regressed"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2749: the parked-`Expr` path must resolve a wrong-arity call to exactly
+/// what the rewinding path did -- same message, same shadow resolution, same
+/// postfix handling. Every expectation captured live from `/usr/bin/jq`
+/// 1.7.1. Verified in bulk while making the change: 666 programs (37 names
+/// x 9 shapes x both modes) produced byte-identical stdout, stderr and exit
+/// code against a binary built from the merge base; these rows are the
+/// load-bearing ones from that sweep, kept so the parity is pinned rather
+/// than only having been measured once.
+#[test]
+fn test_wrong_arity_single_arg_resolution_is_unchanged_2749() -> Result<()> {
+    for (filter, want_code, want_fragment) in [
+        // The resolver's own name/arity diagnostic, not a raw parse error.
+        ("has(1;2)", 3, "has/2 is not defined"),
+        ("select(1;2)", 3, "select/2 is not defined"),
+        ("getpath(1;2)", 3, "getpath/2 is not defined"),
+        ("bsearch(1;2)", 3, "bsearch/2 is not defined"),
+        // No parentheses at all -- the first (unaffected) checkpoint, still
+        // a cheap arity-0 rewind.
+        ("has", 3, "has/0 is not defined"),
+        // Postfix tail after the wrong-arity call still reaches the
+        // resolver rather than becoming a raw syntax error.
+        ("has(1;2).foo", 3, "has/2 is not defined"),
+        ("has(1;2)[0]", 3, "has/2 is not defined"),
+        // A malformed separator inside the *continued* argument list --
+        // the part this fix now parses itself rather than re-parsing --
+        // keeps `wrong_arity_call_from_parsed`'s own wording.
+        ("has(1;2 3)", 3, "expected ';' or ')' in function arguments"),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, want_code, "`{filter}`: stderr {stderr:?}");
+        assert!(
+            stderr.contains(want_fragment),
+            "`{filter}`: stderr {stderr:?} lacks {want_fragment:?}"
+        );
+    }
+
+    // A `def` of the same name and arity still shadows, including through
+    // the resolved call's own postfix tail.
+    for (filter, want) in [
+        ("def has(a;b): a; has(1;2)", "1"),
+        ("def has(a;b): [a,b]; has(1;2)[0]", "1"),
+        ("def bsearch(a;b): [a,b]; bsearch(1;2)", "[1,2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    // A shadowing `def` at a *different* arity does not shadow -- the call
+    // still resolves to the builtin's own wrong-arity diagnostic.
+    for (filter, want_fragment) in [
+        ("def has(a;b;c): a; has(1;2)", "has/2 is not defined"),
+        (
+            "def select(a;b;c): a; select(1;2)",
+            "select/2 is not defined",
+        ),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 3, "`{filter}`: stderr {stderr:?}");
+        assert!(
+            stderr.contains(want_fragment),
+            "`{filter}`: stderr {stderr:?} lacks {want_fragment:?}"
+        );
+    }
+
+    // Correct-arity calls are untouched.
+    for (filter, want) in [
+        ("has(\"a\")", "false"),
+        ("[(1,2,3) | select(. > 1)]", "[2,3]"),
+        ("getpath([\"a\"])", "null"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");

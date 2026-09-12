@@ -3281,13 +3281,20 @@ impl<'a> Parser<'a> {
         self.expect(expected).map(|()| unreachable!())
     }
 
-    /// [`Self::wrong_arity_or_expect`] for a [`Self::try_parse_builtin`]
-    /// arm, whose answer is a `Builtin` rather than an `Expr` (#2807).
+    /// [`Self::wrong_arity_or_expect`] for a checkpoint whose caller's own
+    /// return type has no slot for an already-resolved `Expr` -- originally
+    /// every [`Self::try_parse_builtin`] arm answering a `Builtin` (#2807),
+    /// now also [`Self::parse_required_single_arg`] answering an `Expr`
+    /// directly (#2749). Generic over that answer type `T` purely so both
+    /// callers can return their own `Ok(None)`; the body never touches `T`
+    /// itself -- every real value travels through [`Self::wrong_arity_call`]
+    /// instead, exactly as it always did.
     ///
-    /// The 27 multi-argument and optional-arity arms in that function
-    /// checked their argument boundaries with a bare `self.expect(';')?` /
-    /// `self.expect(')')?`, so a wrong-arity call under a shadowing `def`
-    /// reached `parse_primary_inner`'s `Err` arm and was recovered only by
+    /// #2807's original motivation: the 27 multi-argument and
+    /// optional-arity arms in `try_parse_builtin` checked their argument
+    /// boundaries with a bare `self.expect(';')?` / `self.expect(')')?`, so
+    /// a wrong-arity call under a shadowing `def` reached
+    /// `parse_primary_inner`'s `Err` arm and was recovered only by
     /// [`Self::retry_shadow_candidate_as_generic_call`]'s re-parse -- which
     /// re-scans the whole argument text from the keyword (`O(2^depth)` when
     /// nested, #2686's shape) and spends one unit of the process-wide
@@ -3299,18 +3306,25 @@ impl<'a> Parser<'a> {
     /// *unshadowed* spelling, replaces that parse error with jq's own
     /// `test/3 is not defined` (#2573's MULTI-ARG remainder).
     ///
-    /// The parked `Expr` is collected by `parse_primary_inner`; see
+    /// #2749 reuses the identical mechanism for
+    /// [`Self::parse_required_single_arg`]'s own trailing-`)` checkpoint,
+    /// which had the same `O(2^depth)` shape via a plain rewind-and-reparse
+    /// (`has(1;2)` nested to depth *d* cost `2^d` re-parses of the same
+    /// text) -- that site answers an `Expr` rather than a `Builtin`, which
+    /// is why this helper is generic rather than staying `Builtin`-only.
+    ///
+    /// The parked value is collected by `parse_primary_inner`; see
     /// [`Self::wrong_arity_call`] for why it travels in a field. Shaped as
     /// "check, else return" like its sibling, so `args` moves only on the
     /// diverging branch and the caller keeps using its own bindings on the
     /// success path. yq mode raises `expect`'s own natural error, the same
     /// carve-out every member of this family applies.
-    fn builtin_wrong_arity_or_expect(
+    fn builtin_wrong_arity_or_expect<T>(
         &mut self,
         start_pos: usize,
         expected: char,
         args: Vec<Expr>,
-    ) -> Result<Option<Builtin>, ParseError> {
+    ) -> Result<Option<T>, ParseError> {
         let call = self.wrong_arity_or_expect(start_pos, expected, args)?;
         debug_assert!(
             self.wrong_arity_call.is_none(),
@@ -3554,24 +3568,40 @@ impl<'a> Parser<'a> {
     /// resolver the way #2110 already routes a *zero*-arity builtin's own
     /// wrong-arity call.
     ///
-    /// On the correct shape, returns `Ok(Some(expr))`. On either wrong-arity
-    /// shape, **in jq mode**, rewinds to `start_pos` (the position before
-    /// the keyword was consumed) and returns `Ok(None)` -- deliberately
-    /// reusing [`Self::try_parse_builtin`]'s own "not this builtin after
-    /// all" contract, so the caller's existing `else { self
+    /// On the correct shape, returns `Ok(Some(expr))`. On a wrong-arity
+    /// shape at the **first** checkpoint (no `(` at all, e.g. bare `has`) --
+    /// no argument has been parsed yet, so **in jq mode** this still rewinds
+    /// to `start_pos` and returns `Ok(None)`, deliberately reusing
+    /// [`Self::try_parse_builtin`]'s own "not this builtin after all"
+    /// contract so the caller's existing `else { self
     /// .parse_func_call_or_error() }` fallback (already present at every
-    /// call site through [`Self::parse_primary_inner`]) does the delegation,
-    /// with no `Builtin`-vs-`Expr` type mismatch to bridge. A genuine syntax
-    /// error *inside* the argument expression itself (`has(1 +)`) still
-    /// propagates as a raw ParseError unchanged -- only the two structural
-    /// checkpoints below ever trigger a rewind, mirroring
-    /// [`Self::zero_arity_or_wrong_arity_call`]'s own peek-based precision
-    /// rather than a blanket catch-and-retry.
+    /// call site through [`Self::parse_primary_inner`]) does the
+    /// delegation; the rewind is a cheap arity-0 reparse here since nothing
+    /// was parsed to discard.
     ///
-    /// yq mode never rewinds, matching that function's identical carve-out:
-    /// real yq has no name/arity resolution vocabulary at all, so jq's own
-    /// "X/N is not defined" wording would be a new divergence there, not a
-    /// fix -- yq mode keeps the pre-#2237 raw ParseError unchanged.
+    /// On a wrong-arity shape at the **second** checkpoint (`has(1;2)`,
+    /// `has(1 2)`, ...) an argument *has* already been parsed, so **in jq
+    /// mode** this instead routes it through
+    /// [`Self::builtin_wrong_arity_or_expect`] rather than rewinding and
+    /// discarding it (#2749): rewinding here re-scanned the same argument
+    /// text from `start_pos` on every enclosing failure, `O(2^depth)` when
+    /// nested (`"has(".repeat(d) + "1" + ";2)".repeat(d)` cost `2^d`
+    /// re-parses) -- the identical shape #2686 already fixed for the eight
+    /// dedicated special-form parsers, surviving here only because this
+    /// checkpoint's `Result<Option<Expr>, ParseError>` contract had no slot
+    /// for an already-parsed argument until #2807's parking field existed.
+    ///
+    /// A genuine syntax error *inside* the argument expression itself
+    /// (`has(1 +)`) still propagates as a raw ParseError unchanged from
+    /// either checkpoint -- only the two structural checkpoints below ever
+    /// divert, mirroring [`Self::zero_arity_or_wrong_arity_call`]'s own
+    /// peek-based precision rather than a blanket catch-and-retry.
+    ///
+    /// yq mode never rewinds or parks at either checkpoint, matching every
+    /// member of this family's identical carve-out: real yq has no
+    /// name/arity resolution vocabulary at all, so jq's own "X/N is not
+    /// defined" wording would be a new divergence there, not a fix -- yq
+    /// mode keeps the pre-#2237 raw ParseError unchanged.
     fn parse_required_single_arg(&mut self, start_pos: usize) -> Result<Option<Expr>, ParseError> {
         self.skip_ws();
         // #2391: `expect_or_none` -- yq mode's own not-a-rewind-case raises
@@ -3584,8 +3614,8 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let arg = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_none(')', start_pos) {
-            return early;
+        if self.peek() != Some(')') {
+            return self.builtin_wrong_arity_or_expect(start_pos, ')', vec![arg]);
         }
         self.next();
         Ok(Some(arg))
