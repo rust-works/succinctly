@@ -529,29 +529,42 @@ struct Parser<'a, const HAS_CR: bool> {
     /// `YamlCursor` method (`self.bp_pos`) keys its lookups on.
     last_open_bp_pos: usize,
 
-    /// Enforce JSON's stricter flow-*sequence* delimiter rules (#2279).
+    /// Enforce JSON's stricter grammar for `-p json` input (#2279, #2778).
     ///
     /// Set only for input the caller already knows is JSON, i.e. exactly the
     /// callers that follow `YamlIndex::build` with
     /// [`mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
     /// JSON is a subset of YAML's flow grammar, so the YAML parser accepts
-    /// it as-is -- but it also accepts `[1,]`/`[,1]`/`[1,,2]`, which real yq
-    /// rejects for `-p json` input, because its own JSON front end validates
-    /// array delimiters. `DocumentCursor::preceding_delimiter_ok`'s doc
-    /// comment names the invariant this restores: *every format but JSON
-    /// validates delimiters while parsing*. JSON-sourced YAML was the one
-    /// case that did neither -- a YAML parse that permits what JSON forbids,
-    /// feeding cursors whose delimiter checks all default to `true`.
+    /// it as-is -- but it also accepts things real yq's own JSON front end
+    /// rejects: `[1,]`/`[,1]`/`[1,,2]` (delimiters, #2279) and, at every
+    /// scalar *value* position (flow-sequence item, flow-mapping value,
+    /// block/top-level value), YAML-only spellings like `True`, `'a'`,
+    /// `.5`, `+1`, `~`, or an implicit-pair inside a sequence (`[a: 1]`,
+    /// #2778). `DocumentCursor::preceding_delimiter_ok`'s doc comment names
+    /// the invariant this restores: *every format but JSON validates
+    /// delimiters while parsing*. JSON-sourced YAML was the one case that
+    /// did neither -- a YAML parse that permits what JSON forbids, feeding
+    /// cursors whose delimiter checks all default to `true`.
     ///
     /// Deliberately a runtime flag rather than a third const generic: it
     /// would multiply the `HAS_CR` monomorphizations (#340) for a branch
     /// that is predictable and off the scalar-scanning hot path.
     ///
-    /// **Sequences only.** Real yq's own object handling is *lenient* here
-    /// -- it ignores punctuation inside `{}` entirely and pairs up tokens
-    /// (`{"a":1,}`, `{,}`, `{"a" 1}` all parse) -- so extending this to flow
-    /// mappings would refuse input the reference accepts. Scalar grammar is
-    /// untouched for the same reason: yq accepts `[01]`/`[00]`/`[1.]`.
+    /// **Delimiters: sequences only, never mappings.** Real yq's own object
+    /// handling is *lenient* here -- it ignores punctuation inside `{}`
+    /// entirely and pairs up tokens (`{"a":1,}`, `{,}`, `{"a" 1}` all
+    /// parse) -- so extending the delimiter checks to flow mappings would
+    /// refuse input the reference accepts.
+    ///
+    /// **Scalar grammar: values only, never keys.** Mapping *keys* are
+    /// exempt (real yq panics on a non-string JSON key -- `{1:1}`,
+    /// `{true:1}` -- which succinctly does not reproduce; see
+    /// `docs/compliance/yq/limitations.md`) and so is anything reached only
+    /// through an `&anchor`/`!tag` prefix, which JSON has no spelling for
+    /// at all. `json_strict_plain_scalar_ok` is the predicate; yq accepts
+    /// `[01]`/`[00]`/`[1.]` (leading zeros, a bare trailing `.` survive)
+    /// while rejecting `.5`/`+1`/`1e` -- not "strict JSON", the boundary is
+    /// `goccy/go-json`'s own token scanner plus `strconv.ParseFloat`.
     json_strict: bool,
 }
 
@@ -2475,6 +2488,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             char: text::utf8::decode_char_at(self.input, offset),
             context,
         }
+    }
+
+    /// Under `json_strict` (#2778), a scalar *value* position (never a key
+    /// -- see `json_strict`'s doc comment) may not start with `'`: JSON has
+    /// no single-quoted string spelling, so this applies unconditionally,
+    /// with no leniency to reproduce.
+    fn err_json_strict_single_quote(&self) -> YamlError {
+        self.err_unexpected_char(self.pos, "single-quoted scalar in JSON input")
+    }
+
+    /// Under `json_strict` (#2778), validate a plain scalar *value*'s
+    /// already-consumed text (`self.input[start..end]`) against
+    /// [`json_strict_plain_scalar_ok`]. A no-op when `json_strict` is
+    /// unset, so every call site stays cheap on the ordinary YAML path.
+    fn check_json_strict_scalar(&self, start: usize, end: usize) -> Result<(), YamlError> {
+        if self.json_strict && !json_strict_plain_scalar_ok(&self.input[start..end]) {
+            return Err(self.err_unexpected_char(start, "YAML-only scalar in JSON input"));
+        }
+        Ok(())
     }
 
     /// Check if at end of meaningful content on this line.
@@ -4575,10 +4607,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.pos
                         }
                         Some(b'\'') => {
+                            if self.json_strict {
+                                return Err(self.err_json_strict_single_quote());
+                            }
                             self.parse_single_quoted()?;
                             self.pos
                         }
-                        _ => self.parse_unquoted_value_with_indent(indent),
+                        _ => {
+                            let start = self.pos;
+                            let end = self.parse_unquoted_value_with_indent(indent);
+                            self.check_json_strict_scalar(start, end)?;
+                            end
+                        }
                     };
                     self.set_bp_text_end(end_pos);
                     self.write_bp_close();
@@ -5098,6 +5138,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_close();
             }
             Some(b'\'') => {
+                if self.json_strict {
+                    return Err(self.err_json_strict_single_quote());
+                }
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
@@ -5111,7 +5154,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 self.set_ib();
                 self.write_bp_open();
+                let start = self.pos;
                 let end_pos = self.parse_unquoted_value_with_indent(indent);
+                self.check_json_strict_scalar(start, end_pos)?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -5129,10 +5174,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pos
             }
             Some(b'\'') => {
+                if self.json_strict {
+                    return Err(self.err_json_strict_single_quote());
+                }
                 self.parse_single_quoted()?;
                 self.pos
             }
-            _ => self.parse_unquoted_value_with_indent(min_indent),
+            _ => {
+                let start = self.pos;
+                let end = self.parse_unquoted_value_with_indent(min_indent);
+                self.check_json_strict_scalar(start, end)?;
+                end
+            }
         };
         Ok(end)
     }
@@ -5167,6 +5220,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.write_bp_close();
             }
             Some(b'\'') => {
+                if self.json_strict {
+                    return Err(self.err_json_strict_single_quote());
+                }
                 self.set_ib();
                 self.write_bp_open();
                 self.parse_single_quoted()?;
@@ -5201,7 +5257,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             _ => {
                 self.set_ib();
                 self.write_bp_open();
+                let start = self.pos;
                 let end_pos = self.parse_unquoted_value_with_indent(min_indent);
+                self.check_json_strict_scalar(start, end_pos)?;
                 self.set_bp_text_end(end_pos);
                 self.write_bp_close();
             }
@@ -5753,6 +5811,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             first = false;
 
             // Check for explicit key `? key : value` in flow context
+            if self.json_strict
+                && (self.looks_like_explicit_flow_key() || self.looks_like_flow_mapping_entry())
+            {
+                // #2778: a JSON array element is a value, never a `key:
+                // value` pair -- real yq's front end has no concept of an
+                // implicit single-pair mapping inside `[...]` at all, so
+                // `[a: 1]`/`["a":1]` error before the key's own text is even
+                // examined. Reported at the element's start, matching every
+                // other json_strict rejection in this loop.
+                return Err(self.err_unexpected_char(self.pos, "mapping entry inside JSON array"));
+            }
             if self.looks_like_explicit_flow_key() {
                 self.parse_explicit_flow_mapping_entry()?;
             } else if self.looks_like_flow_mapping_entry() {
@@ -6136,10 +6205,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.pos
             }
             Some(b'\'') => {
+                if self.json_strict {
+                    return Err(self.err_json_strict_single_quote());
+                }
                 self.parse_single_quoted()?;
                 self.pos
             }
-            _ => self.parse_flow_unquoted_value(),
+            _ => {
+                let start = self.pos;
+                let end = self.parse_flow_unquoted_value();
+                self.check_json_strict_scalar(start, end)?;
+                end
+            }
         };
         Ok(end)
     }
@@ -7196,6 +7273,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Check what kind of content this is
         match self.peek() {
             Some(b'-') if Self::is_ws_break_or_eoi(self.peek_at(1)) => {
+                // #2778: a JSON value never starts with `- ` (a block
+                // sequence dash followed by whitespace/break/EOF) -- real
+                // yq's token scanner only accepts `{ [ " t f n -` or a
+                // digit as a value start, and a bare `-1` (no space) is a
+                // negative-number token that never reaches this arm at all
+                // (it falls to the catch-all scalar arm below instead).
+                if self.json_strict {
+                    return Err(
+                        self.err_unexpected_char(self.pos, "YAML block sequence in JSON input")
+                    );
+                }
                 // Same ambiguous-gap error as parse_mapping_entry (#901,
                 // #959) - a sequence item has no unambiguous owner here
                 // either, distinct from #900's SequenceItem-under-Mapping
@@ -7358,6 +7446,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             Some(_) => {
                 // Check if this looks like a mapping entry (has `: ` on this line)
                 // This handles both quoted keys ("foo": bar) and unquoted keys (foo: bar)
+                if self.json_strict && self.looks_like_mapping_entry() {
+                    // #2778: a bare `key: value` (no enclosing `{}`) is not
+                    // a JSON value at all -- real yq's front end never
+                    // reads block-mapping syntax, so it errors on `a: 1`
+                    // the same way it does on any other non-`{[`t f n-digit`
+                    // token start. Checked ahead of `looks_like_mapping_entry`'s
+                    // own dispatch so the key's text is never even examined
+                    // (matching rule 4(c): key grammar stays out of scope).
+                    return Err(
+                        self.err_unexpected_char(self.pos, "YAML mapping entry in JSON input")
+                    );
+                }
                 if self.looks_like_mapping_entry() {
                     self.parse_mapping_entry(indent)?;
                 } else {
@@ -7379,15 +7479,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                             self.pos
                         }
                         Some(b'\'') => {
+                            if self.json_strict {
+                                return Err(self.err_json_strict_single_quote());
+                            }
                             self.parse_single_quoted()?;
                             self.pos
                         }
                         _ => {
-                            if is_truly_doc_root {
+                            let start = self.pos;
+                            let end = if is_truly_doc_root {
                                 self.parse_unquoted_value_doc_root(indent)
                             } else {
                                 self.parse_unquoted_value_with_indent(indent)
-                            }
+                            };
+                            self.check_json_strict_scalar(start, end)?;
+                            end
                         }
                     };
                     self.set_bp_text_end(end_pos);
@@ -7474,6 +7580,41 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
     (i, true)
 }
 
+/// Whether `bytes` is a plain scalar token real yq's `-p json` front end
+/// (`goccy/go-json` v0.10.6) would accept, per its two-layer boundary
+/// (#2778's triage plan derives this from the reference's own source):
+///
+/// 1. **Token scanner**: a value token may start only with a digit or `-`
+///    (`.5`, `+1`, `~` never reach the parse step at all).
+/// 2. **Number parse** (`strconv.ParseFloat`): optional `-`, `digits ['.'
+///    digits*] | '.' digits`, optional `[eE][+-]?digits`, at least one
+///    mantissa digit, leading zeros allowed, `ErrRange` on overflow.
+///
+/// `true`/`false`/`null` are the only non-numeric plain scalars this
+/// accepts. Rust's `f64::from_str` matches Go's `ParseFloat` on every row
+/// of the pinned matrix (`1.`, `-.5`, `01`, `1.e5` accepted; `1e`, `1e+`,
+/// `-`, `-.`, `-e1`, `1..2`, `1e1.5` rejected) -- `is_finite()` reproduces
+/// `ErrRange` since Rust returns `inf` rather than erroring on overflow.
+fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
+    if matches!(bytes, b"true" | b"false" | b"null") {
+        return true;
+    }
+    match bytes.first() {
+        Some(b'-' | b'0'..=b'9') => {}
+        _ => return false,
+    }
+    if !bytes
+        .iter()
+        .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return false;
+    }
+    core::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .is_some_and(f64::is_finite)
+}
+
 /// Build a semi-index from YAML input.
 ///
 /// # Errors
@@ -7487,17 +7628,18 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
     build_semi_index_impl(input, false)
 }
 
-/// [`build_semi_index`], enforcing JSON's flow-sequence delimiter rules
-/// (#2279) -- for callers that already know the bytes are JSON and pair this
-/// with [`YamlIndex::mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
+/// [`build_semi_index`], enforcing JSON's stricter grammar (#2279, #2778)
+/// -- for callers that already know the bytes are JSON and pair this with
+/// [`YamlIndex::mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
 ///
-/// See `Parser::json_strict` for what this does and does not tighten (flow
-/// sequences only; never flow mappings, never scalar grammar).
+/// See `Parser::json_strict` for exactly what this does and does not
+/// tighten (delimiters: sequences only, never mappings; scalar grammar:
+/// values only, never keys, never anchor/tag-prefixed content).
 ///
 /// # Errors
 ///
-/// As [`build_semi_index`], plus the JSON flow-sequence delimiter violations
-/// above, which that function accepts.
+/// As [`build_semi_index`], plus the JSON delimiter and scalar-grammar
+/// violations above, which that function accepts.
 pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError> {
     build_semi_index_impl(input, true)
 }
@@ -7567,6 +7709,100 @@ mod tests {
         let yaml = b"name: 'Alice'";
         let result = build_semi_index(yaml);
         assert!(result.is_ok());
+    }
+
+    /// #2778: `json_strict_plain_scalar_ok`'s accept/reject boundary, copied
+    /// from the issue's pinned matrix (live against Homebrew `yq` v4.53.3 /
+    /// `goccy/go-json` v0.10.6). Both columns matter equally -- the accepted
+    /// non-RFC-8259 rows (`01`, `00`, `1.`, `-.5`, `1.e5`, `00e1`) are what
+    /// makes this "not strict JSON", and every rejected row is a case where
+    /// real yq's token scanner never reaches `ParseFloat` at all.
+    #[test]
+    fn test_json_strict_plain_scalar_ok_matrix() {
+        const ACCEPT: &[&str] = &[
+            "true",
+            "false",
+            "null",
+            "0",
+            "1",
+            "01",
+            "00",
+            "1.",
+            "0.",
+            "00.5",
+            "-01",
+            "-.5",
+            "-01.50e+01",
+            "1.e5",
+            "00e1",
+            "1e-999",
+            "-0",
+        ];
+        const REJECT: &[&str] = &[
+            "a",
+            "True",
+            "TRUE",
+            "Null",
+            "NULL",
+            "yes",
+            "no",
+            ".5",
+            ".",
+            ".e1",
+            "+1",
+            "1e",
+            "0e",
+            "1.e",
+            "1.5e+",
+            "1e+",
+            "-",
+            "-.",
+            "--1",
+            "-e1",
+            "1-2",
+            "1+2",
+            "1..2",
+            "1e1.5",
+            "1e5e5",
+            "1.2.3",
+            "0x1A",
+            "1_000",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            ".inf",
+            "~",
+            "nul",
+            "tru",
+            "",
+            " ",
+            "1 2",
+        ];
+        for s in ACCEPT {
+            assert!(
+                json_strict_plain_scalar_ok(s.as_bytes()),
+                "{s:?} must be accepted (real yq accepts it)"
+            );
+        }
+        for s in REJECT {
+            assert!(
+                !json_strict_plain_scalar_ok(s.as_bytes()),
+                "{s:?} must be rejected (real yq rejects it)"
+            );
+        }
+    }
+
+    /// `1e999`/`2e308` overflow to `f64::INFINITY` in Rust rather than
+    /// erroring the way Go's `strconv.ParseFloat` does with `ErrRange` --
+    /// `is_finite()` is what turns that back into a rejection. A plain
+    /// `.parse::<f64>().is_ok()` predicate would wrongly accept both.
+    #[test]
+    fn test_json_strict_plain_scalar_ok_rejects_overflow() {
+        assert!(!json_strict_plain_scalar_ok(b"1e999"));
+        assert!(!json_strict_plain_scalar_ok(b"2e308"));
+        // Underflow to zero is a real, finite value in both Go and Rust --
+        // accepted by real yq (`[1e-999] -> [0]`), not a rejection case.
+        assert!(json_strict_plain_scalar_ok(b"1e-999"));
     }
 
     #[test]
