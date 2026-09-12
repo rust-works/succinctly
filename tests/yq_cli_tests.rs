@@ -14058,6 +14058,602 @@ mod head_foot_comment_798 {
     }
 }
 
+/// #2811: where a standalone comment block lands once its column, and the
+/// blocks open around it, are taken into account. Every expectation here
+/// was captured from pinned `yq` v4.53.3 (and the rule read off go-yaml's
+/// scanner: `scanComments` splits a run at a dedented column change and
+/// `unrollIndent` moves a closing block's end token before a comment at
+/// that block's own column). Each row is one document with every slot
+/// that yq populates, plus the slot the old attribution used.
+mod standalone_comment_attribution_2811 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    /// Run every `(filter, expected)` pair against `input`; an absent
+    /// comment prints as an empty line, as it does in yq.
+    fn assert_slots(input: &str, rows: &[(&str, &str)]) -> Result<()> {
+        for (filter, expected) in rows {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}] on {input:?}");
+            assert_eq!(out, format!("{expected}\n"), "[{filter}] on {input:?}");
+        }
+        Ok(())
+    }
+
+    // --- 1. a same-line compact item's head is the item's, not its first key's
+
+    #[test]
+    fn compact_mapping_item_owns_its_head_2811() -> Result<()> {
+        // The issue's own repro: `.[1] | head_comment` answers directly.
+        assert_slots(
+            "- 1\n# h\n- b: 1\n",
+            &[
+                (".[1] | head_comment", "h"),
+                (".[1].b | key | head_comment", ""),
+                (".[0] | foot_comment", ""),
+            ],
+        )?;
+        // Extra dash spacing, a quoted key, a same-line property, more
+        // keys below: all still the mapping's.
+        for input in [
+            "- 1\n# h\n-   b: 1\n",
+            "- 1\n# h\n- \"q\": 1\n",
+            "- 1\n# h\n- &x b: 1\n",
+            "- 1\n# h\n- b: 1\n  c: 2\n",
+        ] {
+            assert_slots(input, &[(".[1] | head_comment", "h")])?;
+        }
+        // A block between two compact items heads the second one.
+        assert_slots(
+            "- b: 1\n# f\n- c: 2\n",
+            &[
+                (".[1] | head_comment", "f"),
+                (".[0].b | key | foot_comment", ""),
+            ],
+        )
+    }
+
+    #[test]
+    fn nested_sequence_item_owns_its_head_2811() -> Result<()> {
+        assert_slots(
+            "- 1\n# h\n- - 1\n",
+            &[(".[1] | head_comment", "h"), (".[1][0] | head_comment", "")],
+        )?;
+        assert_slots("- 1\n# h\n- - 1\n  - 2\n", &[(".[1] | head_comment", "h")])
+    }
+
+    /// A compact item's *foot* is still its key's (the key is `PREV`), and
+    /// a nested sequence's is its inner item's -- the fix only moves heads.
+    #[test]
+    fn compact_and_nested_items_keep_their_feet_2811() -> Result<()> {
+        assert_slots(
+            "- b: 1\n  # f\n- c: 2\n",
+            &[
+                (".[0].b | key | foot_comment", "f"),
+                (".[1] | head_comment", ""),
+            ],
+        )?;
+        assert_slots(
+            "- b: 1\n  # f\n\n- c: 2\n",
+            &[(".[0].b | key | foot_comment", "f")],
+        )?;
+        assert_slots(
+            "- b: 1\n  # f\n  c: 2\n",
+            &[(".[0].c | key | head_comment", "f")],
+        )?;
+        assert_slots("- - 1\n  # f\n- 2\n", &[(".[0][0] | foot_comment", "f")])?;
+        assert_slots("- - 1\n  # f\n\n- 2\n", &[(".[0][0] | foot_comment", "f")])
+    }
+
+    /// Measured asymmetry the fix must keep: the block above a
+    /// property-prefixed item whose mapping starts on the *next* line goes
+    /// to that mapping's first key -- `.[1].b | key | head_comment` = `h`,
+    /// yq's own answer. Formerly pinned here as a residual (the
+    /// deferred-value arm had no head hook, so the block fell back onto
+    /// `.[0]`'s foot instead); #1079's own `attach_head_foot_at` hook for a
+    /// bare item's value deferred to a later line closed this gap as a
+    /// side effect, ahead of and independent from #2814.
+    #[test]
+    fn deferred_anchored_mapping_item_head_2811() -> Result<()> {
+        assert_slots(
+            "- 1\n# h\n- &x\n  b: 1\n",
+            &[
+                (".[1].b | key | head_comment", "h"),
+                (".[0] | foot_comment", ""),
+            ],
+        )
+    }
+
+    // --- 2. a comment placed by column: end of document
+
+    #[test]
+    fn eof_block_goes_to_the_block_at_its_column_2811() -> Result<()> {
+        // Three open blocks (columns 0, 2, 4) and a trailing comment at
+        // each column; the item at column 4 is `PREV`.
+        assert_slots(
+            "a:\n  b:\n    - 1\n# c\n",
+            &[
+                (".a | key | foot_comment", "c"),
+                (".a.b | key | foot_comment", ""),
+                (".a.b[0] | foot_comment", ""),
+                (". | foot_comment", ""),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n",
+            &[(".a.b | key | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n    # c\n",
+            &[(".a.b[0] | foot_comment", "c")],
+        )?;
+        // Deeper than `PREV`'s block: still `PREV`'s.
+        assert_slots(
+            "a:\n  b:\n    - 1\n      # c\n",
+            &[(".a.b[0] | foot_comment", "c")],
+        )?;
+        // Between blocks, no exact match: the outermost block claims it at
+        // end of document.
+        assert_slots(
+            "a:\n  b:\n    - 1\n # c\n",
+            &[(".a | key | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n   # c\n",
+            &[(".a | key | foot_comment", "c")],
+        )?;
+        // Four levels: the exact match wins at any depth, and a miss still
+        // goes to the outermost.
+        assert_slots(
+            "a:\n  b:\n    c:\n      - 1\n    # c\n",
+            &[(".a.b.c | key | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c:\n      - 1\n     # c\n",
+            &[(".a | key | foot_comment", "c")],
+        )?;
+        // The outermost mapping's last key, not its first.
+        assert_slots(
+            "x: 0\na:\n  b:\n    - 1\n   # c\n",
+            &[(".a | key | foot_comment", "c")],
+        )
+    }
+
+    /// A closing block sequence hands the comment on to the next enclosing
+    /// mapping's last key; a root sequence hands it to the document.
+    #[test]
+    fn eof_block_at_a_sequences_column_passes_to_the_enclosing_mapping_2811() -> Result<()> {
+        assert_slots(
+            "x:\n  a:\n    - k: 1\n    # c\n",
+            &[
+                (".x.a | key | foot_comment", "c"),
+                (".x.a[0].k | key | foot_comment", ""),
+            ],
+        )?;
+        assert_slots("a:\n  - b: 1\n  # f\n", &[(".a | key | foot_comment", "f")])?;
+        for input in [
+            "- b: 1\n# f\n",
+            "- - 1\n  - 2\n# f\n",
+            "- b: 1\n- c: 2\n# f\n",
+            "- b: 1\n  c: 2\n# f\n",
+            "- x\n- b:\n    - 1\n   # c\n",
+        ] {
+            let (out, code) = run_yq_stdin(". | foot_comment", input, &[])?;
+            assert_eq!(code, 0, "{input:?}");
+            assert!(out == "f\n" || out == "c\n", "{input:?}: {out:?}");
+        }
+        // A plain scalar item at the sequence's own column stays the
+        // item's (#798, unchanged).
+        assert_slots("- 1\n- 2\n# trail\n", &[(".[1] | foot_comment", "trail")])
+    }
+
+    // --- 2. a comment placed by column: adjacent to a dedent
+
+    #[test]
+    fn adjacent_dedent_block_is_prevs_foot_unless_at_nexts_column_2811() -> Result<()> {
+        // At the next key's column: its head (#798, unchanged).
+        assert_slots(
+            "a:\n  b:\n    - 1\n# c\nd: 2\n",
+            &[
+                (".d | key | head_comment", "c"),
+                (".a.b[0] | foot_comment", ""),
+            ],
+        )?;
+        // Anywhere else: `PREV`'s foot, whether above or below its column.
+        for input in [
+            "a:\n  b:\n    - 1\n  # c\nd: 2\n",
+            "a:\n  b:\n    - 1\n # c\nd: 2\n",
+            "a:\n  b:\n    - 1\n    # c\nd: 2\n",
+            "a:\n  b:\n    - 1\n      # c\nd: 2\n",
+            "a:\n  b:\n    - 1\n# c\n  e: 3\n",
+            "a:\n  b:\n    - 1\n # c\n  e: 3\n",
+        ] {
+            assert_slots(input, &[(".a.b[0] | foot_comment", "c")])?;
+        }
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n  e: 3\n",
+            &[(".a.e | key | head_comment", "c")],
+        )?;
+        // An inline value's foot is its key's.
+        assert_slots(
+            "a:\n  b: 1\n    # after\nc: 2\n",
+            &[(".a.b | key | foot_comment", "after")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c: 1\n  # x\nd: 2\n",
+            &[(".a.b.c | key | foot_comment", "x")],
+        )?;
+        // A blank line above the block changes nothing here: still
+        // `PREV`'s foot, where every other placement would detach it.
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n # c\n  d: 2\n",
+            &[
+                (".a.b.c | key | foot_comment", "c"),
+                (".a.d | key | head_comment", ""),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n # c\nz: 2\n",
+            &[(".a.b.c | key | foot_comment", "c")],
+        )?;
+        // ...but a sibling item is not a dedent, so this one goes forward.
+        assert_slots(
+            "a:\n  - 1\n\n # c\n  - 2\n",
+            &[(".a[1] | head_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    c: 1\n\n  # c\n  d: 2\n",
+            &[(".a.d | key | head_comment", "c")],
+        )?;
+        // Not a dedent: still forward (#798, unchanged).
+        assert_slots(
+            "a: 1\n  # deep\nb: 2\n",
+            &[(".b | key | head_comment", "deep")],
+        )?;
+        // The item's column is its `-`, not its content.
+        assert_slots("- a:\n    - 1\n# c\n- 2\n", &[(".[1] | head_comment", "c")])?;
+        assert_slots(
+            "a:\n  - b:\n      c: 1\n  # x\n  - 2\n",
+            &[(".a[1] | head_comment", "x")],
+        )
+    }
+
+    // --- 2. a comment placed by column: detached by a blank line
+
+    #[test]
+    fn blank_detached_dedented_block_goes_to_the_closing_block_at_its_column_2811() -> Result<()> {
+        assert_slots(
+            "a:\n  b:\n    - 1\n# c\n\nd: 2\n",
+            &[
+                (".a | key | foot_comment", "c"),
+                (".a.b[0] | foot_comment", ""),
+                (".d | key | head_comment", ""),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n\nd: 2\n",
+            &[(".a.b | key | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n    # c\n\nd: 2\n",
+            &[(".a.b[0] | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n  # c\n\n- 2\n",
+            &[(".[0].a | key | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "a:\n  - 1\n  # c\n\nz: 2\n",
+            &[(".a[0] | foot_comment", "c")],
+        )?;
+        // A closing sequence at that column hands on to the enclosing
+        // closing mapping...
+        assert_slots(
+            "x:\n  a:\n    - k: 1\n    # c\n\nz: 1\n",
+            &[(".x.a | key | foot_comment", "c")],
+        )?;
+        // ...or, with none, to the key before the one opening next.
+        assert_slots(
+            "- a:\n    - k: 1\n    # c\n\n  z: 1\n",
+            &[(".[0].a | key | foot_comment", "c")],
+        )
+    }
+
+    #[test]
+    fn blank_detached_dedented_block_with_no_match_reaches_the_next_node_2811() -> Result<()> {
+        // Next is a key: the key before it in that mapping.
+        for input in [
+            "a:\n  b:\n    - 1\n # c\n\n  e: 3\n",
+            "a:\n  b:\n    - 1\n  # c\n\n  e: 3\n",
+        ] {
+            assert_slots(
+                input,
+                &[
+                    (".a.b | key | foot_comment", "c"),
+                    (".a.e | key | head_comment", ""),
+                ],
+            )?;
+        }
+        for input in [
+            "a:\n  b: 1\n # after\n\nc: 2\n",
+            "a:\n  b:\n    c: 1\n # x\n\nd: 2\n",
+            "a:\n  - 1\n# c\n\nz: 2\n",
+            "a:\n  - 1\n # c\n\nz: 2\n",
+        ] {
+            let (out, code) = run_yq_stdin(".a | key | foot_comment", input, &[])?;
+            assert_eq!(code, 0, "{input:?}");
+            assert!(
+                out == "after\n" || out == "x\n" || out == "c\n",
+                "{input:?}: {out:?}"
+            );
+        }
+        // Next is a sequence item: the item's own first scalar / key /
+        // inner item, whichever shape it takes.
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n- 2\n",
+            &[(".[1] | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n# c\n\n- 2\n",
+            &[(".[1] | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n- k: v\n",
+            &[
+                (".[1].k | key | foot_comment", "c"),
+                (".[1] | head_comment", ""),
+            ],
+        )?;
+        // The comment's own column (1) matches no open block's indent
+        // (0, 2 or 4), so the column-match walk in
+        // `Parser::positional_foot_target` finds nothing and defers to the
+        // sequence item opening now -- #1079's own hook for a bare item's
+        // value deferred to a later line reclaims it right there as that
+        // item's own foot, one recursion short of the deeper `k` key that
+        // the exact-column case below reaches.
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n-\n  k: v\n",
+            &[(".[1] | foot_comment", "c")],
+        )?;
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n- - 3\n",
+            &[(".[1][0] | foot_comment", "c")],
+        )?;
+        // An item that turns out empty has no such node: the document's.
+        assert_slots(
+            "- a:\n    - 1\n # c\n\n- -\n",
+            &[
+                (". | foot_comment", "c"),
+                (".[0].a | key | foot_comment", ""),
+            ],
+        )
+    }
+
+    /// The same shape with the comment at the compact mapping's own
+    /// column (2): yq closes that mapping at the bare `-` and gives
+    /// `.[0].a | key | foot_comment` = `c`. Formerly pinned here as a
+    /// residual -- the bare `-` had no hook of its own, so the block was
+    /// only ever seen once `k` opened, by which time a fresh mapping at
+    /// the same column 2 was open and wrongly took it as `.[1].k`'s foot;
+    /// #1079's own `attach_head_foot_at` hook for a bare item's value
+    /// deferred to a later line closed this gap too, matching yq exactly.
+    #[test]
+    fn bare_dash_after_a_dedented_block_column_match_2811() -> Result<()> {
+        assert_slots(
+            "- a:\n    - 1\n  # c\n\n-\n  k: v\n",
+            &[
+                (".[0].a | key | foot_comment", "c"),
+                (".[1].k | key | foot_comment", ""),
+                (".[1] | head_comment", ""),
+            ],
+        )
+    }
+
+    // --- 2. a run that changes column is two blocks
+
+    #[test]
+    fn a_dedented_column_change_splits_the_run_2811() -> Result<()> {
+        // Before a dedent: the first segment is `PREV`'s foot, the second
+        // is placed by its own column even though it is adjacent.
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n # d\nz: 2\n",
+            &[
+                (".a.b[0] | foot_comment", "c"),
+                (".a | key | foot_comment", "d"),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n # c\n  # d\nz: 2\n",
+            &[
+                (".a.b[0] | foot_comment", "c"),
+                (".a.b | key | foot_comment", "d"),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n# d\nz: 2\n",
+            &[
+                (".a.b[0] | foot_comment", "c"),
+                (".z | key | head_comment", "d"),
+            ],
+        )?;
+        // At end of document.
+        assert_slots(
+            "a:\n  b:\n    - 1\n    # c\n  # d\n",
+            &[
+                (".a.b[0] | foot_comment", "c"),
+                (".a.b | key | foot_comment", "d"),
+            ],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n# d\n",
+            &[
+                (".a.b[0] | foot_comment", "c"),
+                (".a | key | foot_comment", "d"),
+            ],
+        )?;
+        // A line that only goes deeper joins the block.
+        assert_slots(
+            "a:\n  b:\n    - 1\n# c\n    # d\n",
+            &[(".a | key | foot_comment", "c\nd")],
+        )?;
+        assert_slots(
+            "a:\n  b:\n    - 1\n  # c\n  # d\nz: 2\n",
+            &[(".a.b[0] | foot_comment", "c\nd")],
+        )
+    }
+
+    // --- 2. at a document boundary
+
+    #[test]
+    fn dedented_block_before_a_boundary_is_placed_by_column_2811() -> Result<()> {
+        // Two documents: only the first one's answer is of interest.
+        let doc0 = |filter: &str, input: &str| -> Result<String> {
+            let (out, code) = run_yq_stdin(filter, input, &["--doc", "0"])?;
+            assert_eq!(code, 0, "[{filter}] on {input:?}");
+            Ok(out)
+        };
+        let input = "a:\n  b: 1\n# c\n\n---\nx: 1\n";
+        assert_eq!(doc0(".a | key | foot_comment", input)?, "c\n");
+        assert_eq!(doc0(".a.b | key | foot_comment", input)?, "\n");
+        let input = "a:\n  b: 1\n  # c\n\n---\nx: 1\n";
+        assert_eq!(doc0(".a.b | key | foot_comment", input)?, "c\n");
+        assert_eq!(doc0(".a | key | foot_comment", input)?, "\n");
+        // Adjacent to the marker: the closing document's own (#798,
+        // unchanged).
+        assert_eq!(
+            doc0(". | foot_comment", "a:\n  b: 1\n# c\n---\nx: 1\n")?,
+            "c\n"
+        );
+        // A root sequence with nothing to claim it: the document's.
+        assert_eq!(
+            doc0(". | foot_comment", "- a:\n    b: 1\n# c\n\n---\nx: 1\n")?,
+            "c\n"
+        );
+        Ok(())
+    }
+
+    // --- the stream's first top-level node
+
+    /// Measured, not explained (go-yaml's comment scanner special-cases the
+    /// first fetch of a stream): a detached block is never the foot of the
+    /// stream's first top-level node when that node's line ends in a
+    /// trailing comment, a quoted scalar or a flow collection -- it goes
+    /// forward, or to the document at end of input. A plain, anchored,
+    /// tagged or block scalar, a quoted *key*, a deferred value, a later
+    /// node, or the first node of a later document all take the foot as
+    /// usual.
+    #[test]
+    fn first_top_level_node_with_a_comment_or_quoted_value_takes_no_foot_2811() -> Result<()> {
+        for input in [
+            "- 1 # c1\n# c3\n",
+            "k: v # c1\n# c3\n",
+            "k: v # c1\n  # c3\n",
+            "- \"q\"\n# f\n",
+            "- 'q'\n# f\n",
+            "- [1]\n# f\n",
+            "- {}\n# f\n",
+            "- &x \"q\"\n# f\n",
+            "k: \"v\"\n# f\n",
+            "k: [1]\n# f\n",
+            "42 # c\n# f\n",
+            "\"s\"\n# f\n",
+            "{a: 1}\n# f\n",
+        ] {
+            let (out, code) = run_yq_stdin(". | foot_comment", input, &[])?;
+            assert_eq!(code, 0, "{input:?}");
+            assert!(out == "c3\n" || out == "f\n", "{input:?}: {out:?}");
+            let (out, code) = run_yq_stdin("[.. | select(kind != \"map\")] | map(foot_comment) | .[1:] | map(select(. != \"\")) | length", input, &[])?;
+            assert_eq!(code, 0, "{input:?}");
+            assert_eq!(out, "0\n", "{input:?}: some non-root node took the foot");
+        }
+        // Forward past a blank line: yq's *text* for these three keeps the
+        // blank as a trailing `\n` (`c3\n`) -- a getter-text difference
+        // outside this issue, tracked with #2795's emitter work; the slot
+        // is what is pinned here.
+        assert_slots(
+            "- 1 # c1\n# c3\n\n- 2\n",
+            &[(".[1] | head_comment", "c3"), (".[0] | foot_comment", "")],
+        )?;
+        assert_slots(
+            "a: \"x\"\n# f\n\nb: 2\n",
+            &[
+                (".b | key | head_comment", "f"),
+                (".a | key | foot_comment", ""),
+            ],
+        )?;
+        assert_slots("- 1 # c1\n# c3\n- 2\n", &[(".[1] | head_comment", "c3")])?;
+        // Still eligible:
+        assert_slots("- 1\n# f\n", &[(".[0] | foot_comment", "f")])?;
+        assert_slots("- &x 1\n# f\n", &[(".[0] | foot_comment", "f")])?;
+        assert_slots("- !!str 1\n# f\n", &[(".[0] | foot_comment", "f")])?;
+        assert_slots("- |\n  t\n# f\n", &[(".[0] | foot_comment", "f")])?;
+        assert_slots("\"k\": v\n# f\n", &[(".k | key | foot_comment", "f")])?;
+        assert_slots("k:\n  \"v\"\n# f\n", &[(".k | key | foot_comment", "f")])?;
+        assert_slots("- 1\n- \"q\"\n# f\n", &[(".[1] | foot_comment", "f")])?;
+        assert_slots(
+            "a: 1\nb: \"x\"\n# f\n\nc: 2\n",
+            &[(".b | key | foot_comment", "f")],
+        )?;
+        let (out, code) = run_yq_stdin(".[0] | foot_comment", "a: 1\n---\n- \"q\"\n# f\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n---\nf\n");
+        // Nested in a top-level item, the first node is not top-level.
+        assert_slots(
+            "- k: v # c1\n  # c3\n\n- 2\n",
+            &[(".[0].k | key | foot_comment", "c3")],
+        )
+    }
+
+    /// A scalar or flow document root owns its head and foot like any
+    /// other node: `# lead` / `42` / `# foot` used to fold both into the
+    /// head.
+    #[test]
+    fn scalar_and_flow_document_roots_own_head_and_foot_2811() -> Result<()> {
+        for input in [
+            "# lead\n42\n# foot\n",
+            "# lead\n\"s\"\n# foot\n",
+            "# lead\n[1]\n# foot\n",
+            "# lead\n{a: 1}\n# foot\n",
+            "# lead\n|\n  text\n# foot\n",
+        ] {
+            assert_slots(
+                input,
+                &[(". | head_comment", "lead"), (". | foot_comment", "foot")],
+            )?;
+        }
+        assert_slots("---\n# c\n42\n", &[(". | head_comment", "c")])?;
+        assert_slots("42\n\n# foot\n", &[(". | foot_comment", "foot")])?;
+        assert_slots("[1, 2]\n  # foot\n", &[(". | foot_comment", "foot")])?;
+        let (out, code) = run_yq_stdin(". | foot_comment", "42\n# f1\n---\n# h\n43\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "f1\n---\n\n");
+        let (out, code) = run_yq_stdin(". | head_comment", "42\n# f1\n---\n# h\n43\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n---\nh\n");
+        Ok(())
+    }
+
+    /// Pinned residual (outside the issue's alphabet): yq answers
+    /// `.[1] | head_comment` = `h` for a `- ? k` item, the container as a
+    /// whole (go-yaml's stem comment, same as a compact `- k: v`/`- - x`
+    /// item). `- ? k` has no *stem* hook of its own -- only #1079's own
+    /// `parse_explicit_key` hook, which attaches straight to the key node
+    /// -- so the block now reaches `.[1].k`'s own head instead of falling
+    /// all the way back to `.[0]`'s foot as it used to; still short of
+    /// yq's answer until #2814 gives this shape a stem hook too.
+    #[test]
+    fn explicit_key_item_head_residual_2811() -> Result<()> {
+        assert_slots(
+            "- 1\n# h\n- ? k\n  : v\n",
+            &[
+                (".[1] | head_comment", ""),
+                (".[1].k | key | head_comment", "h"),
+                (".[0] | foot_comment", ""),
+            ],
+        )
+    }
+}
+
 /// `line_comment` getter: strips `# ` (hash + one space) when present.
 #[test]
 fn test_line_comment_builtin_710() -> Result<()> {
