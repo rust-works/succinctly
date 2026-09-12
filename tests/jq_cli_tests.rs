@@ -48709,23 +48709,59 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
 
 /// #2677: a computed key that is itself a multi-output *generator*
 /// (`{("a","b"):$q}` -- real jq fans out one full pattern-match, and one
-/// full run of `body`, per key it yields: `{"a":1,"b":2} | . as
-/// {("a","b"):$q} | $q` is `1` then `2`, confirmed live) is not yet
-/// supported -- `extract_single_pattern_binding`'s own doc comment has the
-/// full rationale (every one of `extract_pattern_bindings`'s eight call
-/// sites would need its own alternative-retry/fold-matrix machinery
-/// threaded through to fan out correctly, not just the core function).
-/// Refuses clearly (a dedicated, distinctive message) in both value and
-/// path position, in every shape that can reach it -- zero key outputs
-/// (`empty`) and multi-key outputs alike -- never silently keeping just the
-/// first output or dropping the rest.
+/// full run of `body`, per key it yields) or a zero-output one
+/// (`{(empty):$q}`, which legitimately binds nothing) now evaluates
+/// correctly in **value position** -- `each_pattern_alternatives`/
+/// `each_pattern_alternatives_generic` (the two `?//`-alternative loops,
+/// value mode's own evaluators) fan out over every binding-set
+/// `extract_pattern_bindings` yields, running `body` once per one, and only
+/// treat the key generator's own trailing error/break/halt the way a
+/// pre-#2677 match failure already was (retry the next `?//` alternative
+/// unless this is the last one). Every row below confirmed live against jq
+/// 1.7.1, including the two hardest interaction cases: a body error
+/// partway through a fan-out abandons the *remaining* key outputs and
+/// retries the next alternative, keeping whatever the fan-out already
+/// emitted (jq's own single-threaded generator model), and a zero-output
+/// key inside a `?//` chain still *wins* (no fallthrough to the next
+/// alternative) even though it contributes nothing.
+///
+/// **Path position** (`walk_pattern`/`resolve_as_pattern`) does not fan out
+/// yet -- see `test_pattern_computed_key_multi_output_refuses_in_path_position_2677`.
 #[test]
-fn test_pattern_computed_key_multi_output_refuses_cleanly_2677() -> Result<()> {
+fn test_pattern_computed_key_fans_out_in_value_position_2677() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":1,"b":2}"#, ". as {(\"a\",\"b\"):$q} | $q", "1\n2\n"),
+        (r#"{"a":1}"#, ". as {(empty):$q} | $q", ""),
+        (r#"{"a":1}"#, "[. as {(empty):$q} | $q]", "[]\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[. as {(\"a\",1,\"b\"):$q} ?// $q | $q]",
+            "[1,{\"a\":1,\"b\":2}]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[. as {(\"a\",\"b\"):$q} ?// $z | if $q==2 then error(\"boom\") else $q end]",
+            "[1,null]\n",
+        ),
+        (r#"{"a":1}"#, "[. as {(empty):$q} ?// $z | $q]", "[]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    Ok(())
+}
+
+/// #2677: path position (`walk_pattern`/`resolve_as_pattern`) does not yet
+/// fan out over a multi-output or zero-output computed key the way value
+/// position now does -- refuses clearly (a dedicated, distinctive message)
+/// rather than keeping only the first output or dropping the rest.
+#[test]
+fn test_pattern_computed_key_multi_output_refuses_in_path_position_2677() -> Result<()> {
     for (input, filter) in [
-        (r#"{"a":[1,2,3]}"#, ". as {(\"a\",\"b\"):$q} | $q"),
-        (r#"{"a":1,"b":2}"#, ". as {(\"a\",\"b\"):$q} | $q"),
         (r#"{"a":1,"b":2}"#, "path(. as {(\"a\",\"b\"):$q} | $q)"),
-        (r#"{"a":1}"#, ". as {(empty):$q} | $q"),
+        (r#"{"a":1}"#, "path(. as {(empty):$q} | $q)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
