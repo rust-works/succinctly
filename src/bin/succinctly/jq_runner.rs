@@ -68,6 +68,7 @@ pub struct ModuleLoader {
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
 /// per-case shape (#2703) -- unlike a flattened `anyhow::Error`, which loses
 /// the distinction [`report_module_load_error`] needs.
+#[derive(Debug)]
 pub(crate) enum ModuleLoadError {
     /// No `{module_path}.jq` was found anywhere in the search path. jq's own
     /// shape has no source location to show for this case: `module not
@@ -82,6 +83,12 @@ pub(crate) enum ModuleLoadError {
     /// syntax-error padding rule, which isn't a fixed formula), so this
     /// stays an opaque `anyhow::Error`, reported the same way as before.
     Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ModuleLoadError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
 }
 
 /// Print a [`ModuleLoadError`] the way `run_jq`'s two call sites both need
@@ -177,10 +184,7 @@ impl ModuleLoader {
     /// does not pay for a deep clone of every def body it is about to drop
     /// (#2395). [`Self::load_module`] is this plus that clone, for callers
     /// that need an owned copy.
-    fn ensure_module_loaded(
-        &mut self,
-        module_path: &str,
-    ) -> Result<&FuncDefList, ModuleLoadError> {
+    fn ensure_module_loaded(&mut self, module_path: &str) -> Result<&FuncDefList, ModuleLoadError> {
         // `entry` rather than `get`-then-insert: the borrow checker cannot
         // see that an early `return` of `get`'s borrow ends it, so the
         // `contains_key` spelling would need an unreachable `expect` on the
@@ -199,14 +203,11 @@ impl ModuleLoader {
 
                 // Read and parse the module
                 let contents = std::fs::read_to_string(&file_path)
-                    .with_context(|| format!("failed to read module: {}", file_path.display()))
-                    .map_err(ModuleLoadError::Other)?;
+                    .with_context(|| format!("failed to read module: {}", file_path.display()))?;
 
-                let program = jq::parse_program(&contents)
-                    .map_err(|e| {
-                        anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
-                    })
-                    .map_err(ModuleLoadError::Other)?;
+                let program = jq::parse_program(&contents).map_err(|e| {
+                    anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+                })?;
 
                 // Extract function definitions from the expression
                 Ok(entry.insert(extract_func_defs(&program.expr)))
@@ -216,10 +217,7 @@ impl ModuleLoader {
 
     /// Load a module and return an owned copy of its function definitions
     /// (name, params, body).
-    pub fn load_module(
-        &mut self,
-        module_path: &str,
-    ) -> Result<FuncDefList, ModuleLoadError> {
+    pub fn load_module(&mut self, module_path: &str) -> Result<FuncDefList, ModuleLoadError> {
         self.ensure_module_loaded(module_path).cloned()
     }
 

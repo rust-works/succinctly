@@ -2750,11 +2750,31 @@ trailer) was reproduced only on the undefined-name/arity path this section descr
 sibling compile-error paths used a flat `jq: compile error: {e}` or `jq: module error: {e}`
 instead, disagreeing with the runner's own correct sibling.
 
-**Closed: an unresolvable `include`/`import` (`module not found`).** Fully deterministic —
-no source position to compute, so nothing blocks matching jq byte for byte:
-`jq: error: module not found: {name}`, a blank line (jq's own stand-in for the missing source
-echo), then the trailer. `ModuleLoader::ensure_module_loaded`'s not-found case now reports
-this exactly; verified against jq 1.7.1 for both `include` and `import`.
+**Closed for a single unresolvable `include`/`import` (`module not found`).** Fully
+deterministic when only one module fails to resolve — no source position to compute, so
+nothing blocks matching jq byte for byte: `jq: error: module not found: {name}`, a blank
+line (jq's own stand-in for the missing source echo), then the trailer.
+`ModuleLoader::ensure_module_loaded`'s not-found case now reports this exactly; verified
+against jq 1.7.1 for both `include` and `import`.
+
+**Residual gap: which module is named when *more than one* is unresolvable.** jq reports
+the last failing declaration in true source order, regardless of `include`/`import` kind
+or how many resolvable declarations sit between the failures (confirmed live: `include
+"AAA"; include "BBB"; include "CCC"; 1` names `CCC`; interleaving kinds --
+`include "CCC"; import "AAA" as a; 1` names `AAA`, and reversing the two names `CCC` --
+always whichever comes last in the source, not last within its own directive kind). Two
+architectural reasons this codebase can't reproduce that: `Program` stores `includes` and
+`imports` as two separate `Vec`s with no shared position or interleaving order between
+them (unlike `Expr::FuncCall`'s own well-known missing-position problem elsewhere in this
+document, extending `Import`/`Include` the same way is unexplored, not deliberately
+declined); and `ModuleLoader::unqualified_def_names` (#2395) resolves every `include`
+*before* `process_program` ever looks at an `import`, so a failing `import` is never even
+reached when an earlier-declared `include` also fails, regardless of which one jq itself
+would report. Succinctly instead reports the first `include` failure it encounters, or (if
+every `include` resolves) the first failing declaration in whichever of the two
+`process_program` loops runs into one -- includes, then imports, each in their own list
+order. This is a gap #2703's own single-module repro never exercised; tracked separately
+as [#2857](https://github.com/rust-works/succinctly/issues/2857).
 
 **Still open: a syntax error in the main filter, and a syntax error inside an `include`d
 module.** Unlike the deterministic not-found case, jq's trailing padding for a *syntax*
