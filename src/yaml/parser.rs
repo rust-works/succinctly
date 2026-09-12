@@ -3220,11 +3220,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     self.attach_head_foot_at(self.bp_pos, indent);
                     self.pending_head_lines = below_dash;
                     if let Some(range) = trailing {
-                        self.comments
-                            .entry(wrapper_bp)
-                            .or_default()
-                            .line
-                            .get_or_insert(range);
+                        self.push_line_comment(wrapper_bp, range);
                     }
                 }
             }
