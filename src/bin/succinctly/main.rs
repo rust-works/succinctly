@@ -1178,8 +1178,12 @@ pub struct YqCommand {
 
     /// Sets indent level for output (default 2). 0 means compact/flow for
     /// JSON output, but for YAML (whose block style can't go flow-compact
-    /// the same way) means "use a small default width" instead (#1575).
-    #[arg(short = 'I', long, value_name = "N", default_value = "2", value_parser = clap::value_parser!(u8).range(0..=7))]
+    /// the same way) means 4 instead, matching real yq's own go-yaml
+    /// dependency (#1575, #2606). Unlike jq's own `--indent` (capped at 7,
+    /// jq's own real limit), real yq accepts any non-negative width for
+    /// JSON output -- unbounded above, only clamped for YAML (see
+    /// `IndentSpec::for_yaml`) -- so this has no upper-bound range.
+    #[arg(short = 'I', long, value_name = "N", default_value = "2")]
     pub indent: u8,
 
     /// Update the file in place

@@ -11914,20 +11914,21 @@ fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
 /// `-I=0` on the DOM output path (any filter `can_use_m2_streaming` rejects,
 /// e.g. `to_entries`) used to thread an empty indent string into the nested
 /// emitter, collapsing every nesting level onto the same column and losing
-/// the nested value entirely on read-back (#1575). Expected output matches
-/// the M2 streaming fast path's own pre-existing, documented `-I0` choice of
-/// width 2 (`yaml_indent_spaces` in `yq_runner.rs`), which this fix mirrors.
+/// the nested value entirely on read-back (#1575). Expected output width is
+/// now 4 (#2606: real yq's own go-yaml dependency treats `-I0` as `-I4` for
+/// YAML output, not the width-2 clamp this test used to pin), confirmed live
+/// against yq v4.53.3 for both the initial output and the read-back.
 #[test]
 fn test_dom_path_indent_zero_preserves_nested_container_1575() -> Result<()> {
     let yaml = "a:\n  b:\n    c: 1\n";
     let (out, code) = run_yq_stdin("to_entries", yaml, &["-o=yaml", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out, "- key: a\n  value:\n    b:\n      c: 1\n");
+    assert_eq!(out, "- key: a\n  value:\n    b:\n        c: 1\n");
 
     // Read back the nested value — must not be empty.
     let (readback, code) = run_yq_stdin(".[0].value", &out, &["-o=yaml", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(readback, "b:\n  c: 1\n");
+    assert_eq!(readback, "b:\n    c: 1\n");
     Ok(())
 }
 
@@ -11971,6 +11972,84 @@ fn test_dom_path_indent_zero_tab_is_pinned_not_fixed_1575() -> Result<()> {
     assert!(
         stderr.contains("tab character used for indentation"),
         "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #2606: `-I0`'s YAML width table, pinned straight from real yq's own
+/// go-yaml dependency source and confirmed live against v4.53.3 --
+/// `0 -> 4`, `1 -> 2`, `2..=9 -> n` unchanged, `>= 10 -> 2`. Exercised on
+/// both the M2 streaming route (`.`, identity) and the DOM route
+/// (`to_entries`, which `can_use_m2_streaming` rejects), since #1575 fixed
+/// a bug specific to the DOM route threading an empty indent string.
+#[test]
+fn test_yaml_indent_width_table_2606() -> Result<()> {
+    let yaml = "a:\n  b:\n    c: 1\n";
+    for (indent, want, want_dom) in [
+        (
+            "0",
+            "a:\n    b:\n        c: 1\n",
+            "- key: a\n  value:\n    b:\n        c: 1\n",
+        ),
+        (
+            "1",
+            "a:\n  b:\n    c: 1\n",
+            "- key: a\n  value:\n    b:\n      c: 1\n",
+        ),
+        (
+            "2",
+            "a:\n  b:\n    c: 1\n",
+            "- key: a\n  value:\n    b:\n      c: 1\n",
+        ),
+        (
+            "8",
+            "a:\n        b:\n                c: 1\n",
+            "- key: a\n  value:\n        b:\n                c: 1\n",
+        ),
+        (
+            "9",
+            "a:\n         b:\n                  c: 1\n",
+            "- key: a\n  value:\n         b:\n                  c: 1\n",
+        ),
+        (
+            "10",
+            "a:\n  b:\n    c: 1\n",
+            "- key: a\n  value:\n    b:\n      c: 1\n",
+        ),
+        (
+            "100",
+            "a:\n  b:\n    c: 1\n",
+            "- key: a\n  value:\n    b:\n      c: 1\n",
+        ),
+    ] {
+        let flag = format!("-I{indent}");
+        let (out, code) = run_yq_stdin(".", yaml, &[&flag])?;
+        assert_eq!(code, 0, "-I{indent}");
+        assert_eq!(out, want, "-I{indent} (streaming route)");
+
+        let (dom_out, code) = run_yq_stdin("to_entries", yaml, &[&flag])?;
+        assert_eq!(code, 0, "-I{indent} to_entries");
+        assert_eq!(dom_out, want_dom, "-I{indent} (DOM route)");
+    }
+    Ok(())
+}
+
+/// #2606: JSON output has no such table -- `-I0` still means compact/flow
+/// (unaffected, unbounded above at every other width), confirmed live
+/// against yq v4.53.3 including a width past jq's own 7-space cap (which
+/// does not apply to yq mode).
+#[test]
+fn test_json_indent_unaffected_by_yaml_width_table_2606() -> Result<()> {
+    let yaml = "a:\n  b: 1\n";
+    let (out, code) = run_yq_stdin(".", yaml, &["-I0", "-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"{"a":{"b":1}}"#);
+
+    let (out, code) = run_yq_stdin(".", yaml, &["-I10", "-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out,
+        "{\n          \"a\": {\n                    \"b\": 1\n          }\n}\n"
     );
     Ok(())
 }
@@ -13603,15 +13682,23 @@ fn test_pretty_print_flag_forces_block_style_705() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(default_json, pretty_json);
 
-    // -I0 (compact) satisfies the fast-path gate on its own
-    // (`output_config.compact || ...`), so -P alone does *not* force DOM in
-    // compact mode — mirroring --sort-keys' documented compact-mode
-    // exemption above. Still must produce identical output either way.
+    // #2606: `-I0` no longer means "compact" for YAML (real yq's own `-I0`
+    // is 4-space block indent, not flow), so `-P` still forces the DOM
+    // path and expands flow style to block exactly as it does at every
+    // other `-I` value -- confirmed live against yq v4.53.3. This is the
+    // opposite of what this test used to assert before #2606: `-I0 -P`
+    // used to wrongly stay flow-style, since `-I0`'s own (then-compact)
+    // status satisfied the fast-path gate on its own regardless of `-P`.
     let (default_compact, code) = run_yq_stdin(".", input, &["-I0"])?;
     assert_eq!(code, 0);
+    assert_eq!(default_compact, "a: [1, 2, 3]\nb: {c: 1, d: 2}\n");
     let (pretty_compact, code) = run_yq_stdin(".", input, &["-I0", "-P"])?;
     assert_eq!(code, 0);
-    assert_eq!(default_compact, pretty_compact);
+    assert_eq!(
+        pretty_compact,
+        "a:\n    - 1\n    - 2\n    - 3\nb:\n    c: 1\n    d: 2\n"
+    );
+    assert_ne!(default_compact, pretty_compact);
 
     Ok(())
 }

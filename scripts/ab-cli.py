@@ -58,9 +58,12 @@ def parse_args(argv=None):
                    help="extra flags passed to the tool before the query, as one "
                         "shell-quoted string. Must use the '=' form, since argparse reads a "
                         "leading '-' as a flag: --extra-args='-I2 -P'. Defaults to '-I0' for "
-                        "--tool yq and nothing otherwise. yq's -I0 drives every value down "
-                        "the flow-style branches, so a change that only affects block-style "
-                        "rendering measures as neutral unless this is set (#1448)")
+                        "--tool yq and nothing otherwise. For JSON output (this script's own "
+                        "default), yq's -I0 drives every value down the flow-style/compact "
+                        "branches, so a change that only affects block-style rendering "
+                        "measures as neutral unless this is set (#1448). For YAML output "
+                        "(--output yaml), -I0 is an ordinary 4-space block width (#2606), not "
+                        "compact/flow, so it has no equivalent effect there")
     p.add_argument("--reps", type=int, default=7, help="repetitions per configuration")
     p.add_argument("--control", action="store_true",
                    help="time --before against a copy of itself (noise floor)")
