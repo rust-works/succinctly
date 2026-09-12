@@ -48853,6 +48853,127 @@ fn test_every_converted_arm_resolves_a_shadowed_wrong_arity_call_2807() -> Resul
     Ok(())
 }
 
+/// #2807: every argument-boundary checkpoint of every converted arm, under a
+/// shadowing `def`, against jq 1.7.1's own `(exit code, stdout)`.
+///
+/// One row per checkpoint rather than one per keyword: an arm has up to four
+/// -- no parentheses at all (the `expect_or_none` rewind), a mismatch after
+/// the first argument (`kw(1 2)`), after the second (`kw(1;2 3)`), and the
+/// wrong-arity call that is otherwise well formed (`kw(1;2;3)`) -- and they
+/// take different branches. #2389 records two earlier regressions from
+/// conversions that "looked like a copy but weren't", so each is pinned
+/// rather than sampled.
+///
+/// Every expectation was captured live from `/usr/bin/jq` 1.7.1; all 91 rows
+/// agreed with it when this test was written, which is the property being
+/// pinned -- a future change that makes one of these a parse error again is
+/// the #2807 regression.
+#[test]
+fn test_every_arm_checkpoint_matches_jq_under_a_shadow_2807() -> Result<()> {
+    // (program, jq's exit code, jq's stdout)
+    for (filter, expected_code, expected_stdout) in [
+        ("def test(a;b;c): 1; test", 3, ""),
+        ("def test(a;b;c): 1; test(1 2)", 3, ""),
+        ("def test(a;b;c): 1; test(1;2 3)", 3, ""),
+        ("def test(a;b;c): 1; test(1;2;3)", 0, "1"),
+        ("def match(a;b;c): 1; match", 3, ""),
+        ("def match(a;b;c): 1; match(1 2)", 3, ""),
+        ("def match(a;b;c): 1; match(1;2 3)", 3, ""),
+        ("def match(a;b;c): 1; match(1;2;3)", 0, "1"),
+        ("def capture(a;b;c): 1; capture", 3, ""),
+        ("def capture(a;b;c): 1; capture(1 2)", 3, ""),
+        ("def capture(a;b;c): 1; capture(1;2 3)", 3, ""),
+        ("def capture(a;b;c): 1; capture(1;2;3)", 0, "1"),
+        ("def scan(a;b;c): 1; scan", 3, ""),
+        ("def scan(a;b;c): 1; scan(1 2)", 3, ""),
+        ("def scan(a;b;c): 1; scan(1;2 3)", 3, ""),
+        ("def scan(a;b;c): 1; scan(1;2;3)", 0, "1"),
+        ("def splits(a;b;c): 1; splits", 3, ""),
+        ("def splits(a;b;c): 1; splits(1 2)", 3, ""),
+        ("def splits(a;b;c): 1; splits(1;2 3)", 3, ""),
+        ("def splits(a;b;c): 1; splits(1;2;3)", 0, "1"),
+        ("def split(a;b;c): 1; split", 3, ""),
+        ("def split(a;b;c): 1; split(1 2)", 3, ""),
+        ("def split(a;b;c): 1; split(1;2 3)", 3, ""),
+        ("def split(a;b;c): 1; split(1;2;3)", 0, "1"),
+        ("def sub(a;b;c;d): 1; sub", 3, ""),
+        ("def sub(a;b;c;d): 1; sub(1)", 3, ""),
+        ("def sub(a;b;c;d): 1; sub(1;2 3)", 3, ""),
+        ("def sub(a;b;c;d): 1; sub(1;2;3 4)", 3, ""),
+        ("def sub(a;b;c;d): 1; sub(1;2;3;4)", 0, "1"),
+        ("def gsub(a;b;c;d): 1; gsub", 3, ""),
+        ("def gsub(a;b;c;d): 1; gsub(1)", 3, ""),
+        ("def gsub(a;b;c;d): 1; gsub(1;2 3)", 3, ""),
+        ("def gsub(a;b;c;d): 1; gsub(1;2;3 4)", 3, ""),
+        ("def gsub(a;b;c;d): 1; gsub(1;2;3;4)", 0, "1"),
+        ("def IN(a;b;c): 1; IN", 3, ""),
+        ("def IN(a;b;c): 1; IN(1 2)", 3, ""),
+        ("def IN(a;b;c): 1; IN(1;2 3)", 3, ""),
+        ("def IN(a;b;c): 1; IN(1;2;3)", 0, "1"),
+        ("def INDEX(a;b;c): 1; INDEX", 3, ""),
+        ("def INDEX(a;b;c): 1; INDEX(1 2)", 3, ""),
+        ("def INDEX(a;b;c): 1; INDEX(1;2 3)", 3, ""),
+        ("def INDEX(a;b;c): 1; INDEX(1;2;3)", 0, "1"),
+        ("def any(a;b;c): 1; any(1 2)", 3, ""),
+        ("def any(a;b;c): 1; any(1;2 3)", 3, ""),
+        ("def any(a;b;c): 1; any(1;2;3)", 0, "1"),
+        ("def all(a;b;c): 1; all(1 2)", 3, ""),
+        ("def all(a;b;c): 1; all(1;2 3)", 3, ""),
+        ("def all(a;b;c): 1; all(1;2;3)", 0, "1"),
+        ("def recurse(a;b;c): 1; recurse(1 2)", 3, ""),
+        ("def recurse(a;b;c): 1; recurse(1;2 3)", 3, ""),
+        ("def recurse(a;b;c): 1; recurse(1;2;3)", 0, "1"),
+        ("def nth(a;b;c): 1; nth", 3, ""),
+        ("def nth(a;b;c): 1; nth(1;2 3)", 3, ""),
+        ("def nth(a;b;c): 1; nth(1;2;3)", 0, "1"),
+        ("def skip(a;b;c): 1; skip", 3, ""),
+        ("def skip(a;b;c): 1; skip(1)", 3, ""),
+        ("def skip(a;b;c): 1; skip(1;2 3)", 3, ""),
+        ("def skip(a;b;c): 1; skip(1;2;3)", 0, "1"),
+        ("def setpath(a;b;c): 1; setpath", 3, ""),
+        ("def setpath(a;b;c): 1; setpath(1)", 3, ""),
+        ("def setpath(a;b;c): 1; setpath(1;2 3)", 3, ""),
+        ("def setpath(a;b;c): 1; setpath(1;2;3)", 0, "1"),
+        ("def pow(a;b;c): 1; pow", 3, ""),
+        ("def pow(a;b;c): 1; pow(1)", 3, ""),
+        ("def pow(a;b;c): 1; pow(1;2 3)", 3, ""),
+        ("def pow(a;b;c): 1; pow(1;2;3)", 0, "1"),
+        ("def atan2(a;b;c): 1; atan2", 3, ""),
+        ("def atan2(a;b;c): 1; atan2(1)", 3, ""),
+        ("def atan2(a;b;c): 1; atan2(1;2 3)", 3, ""),
+        ("def atan2(a;b;c): 1; atan2(1;2;3)", 0, "1"),
+        ("def at_position(a;b;c): 1; at_position", 3, ""),
+        ("def at_position(a;b;c): 1; at_position(1)", 3, ""),
+        ("def at_position(a;b;c): 1; at_position(1;2 3)", 3, ""),
+        ("def at_position(a;b;c): 1; at_position(1;2;3)", 0, "1"),
+        ("def flatten(a;b): 1; flatten(1 2)", 3, ""),
+        ("def flatten(a;b): 1; flatten(1;2)", 0, "1"),
+        ("def path(a;b): 1; path(1 2)", 3, ""),
+        ("def path(a;b): 1; path(1;2)", 0, "1"),
+        ("def paths(a;b): 1; paths(1 2)", 3, ""),
+        ("def paths(a;b): 1; paths(1;2)", 0, "1"),
+        ("def debug(a;b): 1; debug(1 2)", 3, ""),
+        ("def debug(a;b): 1; debug(1;2)", 0, "1"),
+        ("def parent(a;b): 1; parent(1 2)", 3, ""),
+        ("def parent(a;b): 1; parent(1;2)", 0, "1"),
+        ("def combinations(a;b): 1; combinations(1 2)", 3, ""),
+        ("def combinations(a;b): 1; combinations(1;2)", 0, "1"),
+        ("def halt_error(a;b): 1; halt_error(1 2)", 3, ""),
+        ("def halt_error(a;b): 1; halt_error(1;2)", 0, "1"),
+        ("def strenv(a;b): 1; strenv", 3, ""),
+        ("def strenv(a;b): 1; strenv(1)", 3, ""),
+        ("def strenv(a;b): 1; strenv(1;2)", 0, "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(
+            code, expected_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), expected_stdout, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2807 (review): empty parens stay a syntax error, even for the one arm
 /// whose recovery is a rewind rather than a hand-over.
 ///
