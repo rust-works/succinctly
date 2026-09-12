@@ -1372,11 +1372,16 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
 
         // `input` and `init` are evaluated against the document; `update`
         // (and `foreach`'s `extract`) against the accumulator.
-        // `patterns` is not consulted: `PatternEntry::key` is a `String`,
-        // so a pattern holds no `Expr` to reach the document with. #2677
-        // would change that by widening it to a computed key -- if it lands,
-        // the new key expression is evaluated against the *document* and
-        // belongs on the `reads_ambient_value` side of these arms.
+        // `patterns` is not consulted: since #2677/#2873, `PatternEntry::key`
+        // can be an `ObjectKey::Expr`, a computed key evaluated against the
+        // *document* -- so this arm is a known, deliberately deferred gap
+        // (tracked in the #2873 follow-up, #2872), not an oversight. Missing
+        // it here is safe-direction-only: this function's callers use `true`
+        // to justify an optimization/early check, so a false `false` from an
+        // unconsulted computed key can only lose that optimization or defer
+        // a check to run later (as an ordinary runtime error instead), never
+        // produce a wrong value -- see `docs/compliance/jq/limitations.md`'s
+        // "three residual walker gaps" entry.
         Expr::Reduce {
             input,
             init,

@@ -44,7 +44,7 @@ use super::document::{
     DocumentElements, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
-use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
+use super::walk::{any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
 ///
@@ -5949,6 +5949,25 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
             }
         }
+        // #2873 review: `key_control` was computed eagerly, before any
+        // binding-set's body ran, so a `Halt` (or an uncatchable `Error`) it
+        // carries already happened -- real jq's own uncatchability rule
+        // (`Control`'s own doc comment) means it must win regardless of
+        // whatever an *earlier* binding-set's body already decided about
+        // retrying the next `?//` alternative. Dropping it here (behind the
+        // `retry_next_alternative` check below) silently turned a real
+        // `halt`/`halt_error` into an ordinary alternative fallthrough --
+        // confirmed live: `. as {("a", halt_error(7)):$q} ?// $z | if
+        // $q==1 then error("boom") else ($q // $z) end` on `{"a":1}` must
+        // halt (exit 7), not fall through to `$z`.
+        match &key_control {
+            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(*code)),
+            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+                return Flow::Escaped(Control::Error(e.clone()));
+            }
+            _ => {}
+        }
+
         if retry_next_alternative {
             continue;
         }
@@ -5956,12 +5975,10 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Every binding-set's own body ran to completion. Now the key
         // generator's *own* trailing control (if it stopped early rather
         // than exhausting) gets the same is_last/continue treatment a
-        // pre-#2677 match failure already had.
+        // pre-#2677 match failure already had. `Halt` and an uncatchable
+        // `Error` were already handled above.
         match key_control {
             None => return Flow::Exhausted,
-            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-                return Flow::Escaped(Control::Error(e));
-            }
             Some(Control::Error(e)) => {
                 if is_last {
                     return Flow::Escaped(Control::Error(e));
@@ -5974,7 +5991,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 continue;
             }
-            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+            Some(Control::Halt(_)) => unreachable!("handled above"),
         }
     }
 
@@ -30601,7 +30618,16 @@ struct PatternBinding {
 /// [`walk_pattern_step`]).
 enum PatternStep<'a> {
     Field(&'a str),
-    Index(usize),
+    /// A signed array index, matching `.[EXPR]`'s own path-recording rule:
+    /// `path(.[-1])` on real jq is `[-1]`, the *raw* key, not the
+    /// wraparound-resolved position -- `child()` below resolves the
+    /// wraparound only when actually reading the element, same as
+    /// `index_one_owned`. Every pre-#2873 call site (array-pattern
+    /// positional matching, `[$a,$b]`) only ever builds this from a small
+    /// non-negative `usize` position, so widening from `usize` to `i64`
+    /// (#2873, to carry a computed key's own possibly-negative/out-of-range
+    /// numeric value) changes nothing for that existing caller.
+    Index(i64),
 }
 
 impl PatternStep<'_> {
@@ -30609,10 +30635,7 @@ impl PatternStep<'_> {
     fn component(&self) -> Expr {
         match self {
             Self::Field(key) => Expr::Field((*key).to_string()),
-            Self::Index(i) => Expr::Index {
-                idx: *i as i64,
-                key: None,
-            },
+            Self::Index(i) => Expr::Index { idx: *i, key: None },
         }
     }
 
@@ -30635,7 +30658,16 @@ impl PatternStep<'_> {
                 key,
             )),
             (Self::Index(i), OwnedValue::Array(arr)) => {
-                Ok(arr.get(*i).cloned().unwrap_or(OwnedValue::Null))
+                // #2873: wraparound-resolve a negative index the same way
+                // `index_one_owned` does -- a pre-#2873 caller always passes
+                // a non-negative position, so this is a no-op there.
+                let resolved = if *i < 0 { arr.len() as i64 + *i } else { *i };
+                let element = usize::try_from(resolved)
+                    .ok()
+                    .and_then(|idx| arr.get(idx))
+                    .cloned()
+                    .unwrap_or(OwnedValue::Null);
+                Ok(element)
             }
             (Self::Index(_), _) => Err(EvalError::cannot_index_with_type(
                 owned_type_name(input),
@@ -30643,6 +30675,19 @@ impl PatternStep<'_> {
             )),
         }
     }
+}
+
+/// A computed key's resolved value, ahead of building the [`PatternStep`]
+/// it drives (#2873): a string indexes an object by field, a number indexes
+/// an array by position -- jq's generic `INDEX` bytecode, not an
+/// object-only special case. Kept separate from `PatternStep` itself
+/// because the two live at different points in `walk_pattern`'s Object
+/// arm: this is resolved once per entry (from either a literal or a
+/// computed key expression), `PatternStep` is built from it fresh right
+/// before each step.
+enum ResolvedPatternKey<'a> {
+    Field(Cow<'a, str>),
+    Index(i64),
 }
 
 /// Perform one tracked pattern step from `input`, returning the child value
@@ -30755,14 +30800,32 @@ fn walk_pattern<S: EvalSemantics>(
                 // -- see `extract_single_pattern_binding`'s own doc comment
                 // for why 0/2+/break/halt refuse clearly here too rather
                 // than being modelled.
-                let key: Cow<'_, str> = match &entry.key {
-                    ObjectKey::Literal(key) => Cow::Borrowed(key.as_str()),
+                let key: ResolvedPatternKey = match &entry.key {
+                    ObjectKey::Literal(key) => {
+                        ResolvedPatternKey::Field(Cow::Borrowed(key.as_str()))
+                    }
                     ObjectKey::Expr(key_expr) => {
                         let (mut key_values, control) =
                             eval_owned_expr_fork::<S>(key_expr, input, false);
                         match (key_values.len(), control) {
                             (1, None) => match key_values.pop().unwrap() {
-                                OwnedValue::String(s) => Cow::Owned(s),
+                                OwnedValue::String(s) => ResolvedPatternKey::Field(Cow::Owned(s)),
+                                // #2873 review: real jq's `INDEX` bytecode is
+                                // generic, not object-only -- a numeric
+                                // computed key indexes an array target
+                                // exactly like `.[EXPR]` does in value mode
+                                // (`fold_object_pattern_entry`'s identical
+                                // fix and doc comment). A NaN key has no
+                                // index, matching `numeric_key_to_index`'s
+                                // own contract -- `i64::MAX` is a plain
+                                // guaranteed-out-of-range sentinel `child()`
+                                // resolves to `null`, not a real path
+                                // position.
+                                v @ (OwnedValue::Int(_)
+                                | OwnedValue::Float(_)
+                                | OwnedValue::NumberLiteral(..)) => ResolvedPatternKey::Index(
+                                    numeric_key_to_index(&v).unwrap_or(i64::MAX),
+                                ),
                                 other => {
                                     return Err(EvalError::cannot_index_with_type(
                                         owned_type_name(input),
@@ -30782,7 +30845,10 @@ fn walk_pattern<S: EvalSemantics>(
                         }
                     }
                 };
-                let step = PatternStep::Field(&key);
+                let step = match &key {
+                    ResolvedPatternKey::Field(s) => PatternStep::Field(s),
+                    ResolvedPatternKey::Index(i) => PatternStep::Index(*i),
+                };
                 let (child, moved) = walk_pattern_step(&step, input, &reg)?;
                 // `{$b: P}`: the bind names the node the register just moved
                 // to, so it carries that position's marker, and is pushed
@@ -30809,7 +30875,7 @@ fn walk_pattern<S: EvalSemantics>(
                     reg.is_input = false;
                 }
                 first = false;
-                let step = PatternStep::Index(i);
+                let step = PatternStep::Index(i as i64);
                 let (child, moved) = walk_pattern_step(&step, input, &reg)?;
                 reg = walk_pattern::<S>(pat, &child, moved, frame, out)?;
             }
@@ -35443,7 +35509,23 @@ fn substitute_var_impl(
             update,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Reduce {
             input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
-            patterns: patterns.clone(),
+            // #2873 review: the pattern's *own* binding shadows `var_name`
+            // for `update`, which stays unsubstituted below -- but a
+            // computed key inside the pattern resolves against the
+            // pattern's current node *before* that shadow takes effect
+            // (jq evaluates the key ahead of binding), so an outer
+            // `var_name` reference inside it must still be substituted.
+            // Same gap class `map_subexprs` itself fixed (#2677's own
+            // `c15aa1287`), missed here because this is a separate,
+            // hand-written traversal.
+            patterns: patterns
+                .iter()
+                .map(|p| {
+                    map_pattern_subexprs(p, &mut |e| {
+                        substitute_var_impl(e, var_name, replacement, mark)
+                    })
+                })
+                .collect(),
             init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
             update: update.clone(), // shadowed
         },
@@ -35455,7 +35537,16 @@ fn substitute_var_impl(
             extract,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Foreach {
             input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
-            patterns: patterns.clone(),
+            // #2873 review: see the identical `Expr::Reduce` arm's comment
+            // just above.
+            patterns: patterns
+                .iter()
+                .map(|p| {
+                    map_pattern_subexprs(p, &mut |e| {
+                        substitute_var_impl(e, var_name, replacement, mark)
+                    })
+                })
+                .collect(),
             init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
             update: update.clone(),
             extract: extract.clone(),
@@ -35470,7 +35561,15 @@ fn substitute_var_impl(
             body,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::AsPattern {
             expr: Box::new(substitute_var_impl(expr, var_name, replacement, mark)),
-            patterns: patterns.clone(),
+            // #2873 review: see `Expr::Reduce`'s identical comment above.
+            patterns: patterns
+                .iter()
+                .map(|p| {
+                    map_pattern_subexprs(p, &mut |e| {
+                        substitute_var_impl(e, var_name, replacement, mark)
+                    })
+                })
+                .collect(),
             body: body.clone(),
         },
         Expr::FuncDef {
@@ -49526,40 +49625,83 @@ fn fold_object_pattern_entry<S: EvalSemantics>(
         ObjectKey::Expr(key_expr) => eval_owned_expr_fork::<S>(key_expr, value, false),
     };
 
-    let mut new_frontier = Vec::new();
-    for key_value in &key_values {
-        let key = match key_value {
-            OwnedValue::String(s) => s,
-            other => {
-                // #2677: a computed key evaluating to a non-string is the
-                // pattern's own `INDEX`-shaped refusal, not construction's
-                // "Cannot use ... as object key" (that's a different jq
-                // bytecode op) -- confirmed live: `. as {(.n):$q} | $q` on
-                // `{"a":1,"n":1}` raises "Cannot index object with number".
-                // A bare non-string *literal* key (`{(1):$q}`) is a
-                // compile-time check in real jq, not modelled here --
-                // matching object construction's own pre-existing,
-                // out-of-scope gap for the identical shape (`{(1): 1}`,
-                // #2677's own triage explicitly scopes this out).
-                let err = EvalError::cannot_index_with_type(
-                    owned_type_name(value),
-                    owned_type_name(other),
-                );
-                return (new_frontier, Some(Control::Error(err)));
-            }
+    // #2873 perf review: the overwhelmingly common pattern -- literal keys
+    // only, nowhere in this entry or its sub-pattern -- always keeps
+    // `key_values`/`frontier`/`sub_results` at length 1, so the general
+    // `frontier × key_values × sub_results` cartesian fold below (needed
+    // once a computed key can fan out to 2+ outputs) would still pay an
+    // extra `partial.clone()` per pattern entry, turning what used to be an
+    // O(1)-amortized `Vec::extend` per entry back into an O(entries) clone
+    // per entry -- on the hot `.[] as {...}` path. `key_values.len() == 1`
+    // is known up front and guarantees the loop below runs exactly once,
+    // so this fast path is handled entirely outside it (letting the
+    // borrow checker see `frontier` is moved at most once), consuming
+    // `frontier`/`sub_results` in place instead of cloning.
+    if key_values.len() == 1 {
+        let key_value = &key_values[0];
+        let field_value = match index_one_owned(value, key_value, false) {
+            Ok(Some(v)) => v,
+            Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"),
+            Err(err) => return (Vec::new(), Some(Control::Error(err))),
         };
-        // jq destructures by indexing once per key, so a non-object target
-        // reports exactly what `.<key>` would.
-        let obj = match value {
-            OwnedValue::Object(o) => o,
-            _ => {
-                let err = EvalError::cannot_index_with_field(owned_type_name(value), key);
-                return (new_frontier, Some(Control::Error(err)));
-            }
-        };
-        let field_value = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
         let (sub_results, sub_control) =
             extract_pattern_bindings::<S>(&entry.pattern, &field_value, invert);
+        // `sub_control` (the sub-pattern's own trailing control) takes
+        // priority when present, matching the general loop's immediate
+        // `return` on a `Some(control)`; when it's `None`, the single
+        // key_value's processing has run to completion, so this is exactly
+        // the "loop finished normally" case the general path falls through
+        // to `(new_frontier, key_control)` for -- `key_control` is the
+        // *key generator's own* trailing control (e.g. `Some(Halt(_))` from
+        // `{("a", halt_error(7)):$q}`'s second output) and must not be
+        // dropped here (#2873 review: an earlier version of this fast path
+        // did exactly that).
+        if frontier.len() == 1 && sub_results.len() == 1 {
+            let mut combined = frontier.into_iter().next().unwrap();
+            if let Some(bind) = &entry.bind {
+                combined.push((bind.clone(), field_value.clone()));
+            }
+            combined.extend(sub_results.into_iter().next().unwrap());
+            return (vec![combined], sub_control.or(key_control));
+        }
+        let mut new_frontier = Vec::new();
+        for partial in &frontier {
+            for sub in &sub_results {
+                let mut combined = partial.clone();
+                if let Some(bind) = &entry.bind {
+                    combined.push((bind.clone(), field_value.clone()));
+                }
+                combined.extend(sub.iter().cloned());
+                new_frontier.push(combined);
+            }
+        }
+        return (new_frontier, sub_control.or(key_control));
+    }
+
+    let mut new_frontier = Vec::new();
+    for key_value in &key_values {
+        // real jq's `INDEX` bytecode is generic, not object-only -- a
+        // computed key can resolve to a *number* and index into an *array*
+        // target exactly like `.[EXPR]` does (confirmed live: `def one: 1;
+        // [10,20,30] as {(one):$q} | $q` is `20` in real jq; a bare
+        // non-string *literal* key like `{(1):$q}` is instead a
+        // compile-time check in real jq, not modelled here, matching object
+        // construction's own pre-existing, out-of-scope gap for the
+        // identical shape). [`index_one_owned`] is the same generic
+        // `.[EXPR]` operator's owned-value implementation used elsewhere
+        // (`nth`, `(.a|tostring)[$k]`), so reusing it here gets jq's own
+        // object/array/null dispatch, key-type errors ("Cannot index
+        // <type> with <type>"/"Cannot index <type> with string \"...\""),
+        // float truncation and negative-index wraparound for free instead
+        // of a narrower, string-only special case.
+        let field_value = match index_one_owned(value, key_value, false) {
+            Ok(Some(v)) => v,
+            Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"),
+            Err(err) => return (new_frontier, Some(Control::Error(err))),
+        };
+        let (sub_results, sub_control) =
+            extract_pattern_bindings::<S>(&entry.pattern, &field_value, invert);
+
         for partial in &frontier {
             for sub in &sub_results {
                 let mut combined = partial.clone();
@@ -50828,7 +50970,21 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             };
             Expr::Reduce {
                 input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
-                patterns: patterns.clone(),
+                // #2873 review: a computed key runs against the pattern's
+                // own current node *before* the pattern's bindings take
+                // effect, so it sees `scope` (the outer, unbound scope),
+                // same as `input`/`init` above -- not `bound_scope`. Same
+                // gap class `map_subexprs` itself fixed for def/`$var`
+                // resolution (#2677's own `c15aa1287`), missed here because
+                // this is a separate, hand-written traversal.
+                patterns: patterns
+                    .iter()
+                    .map(|p| {
+                        map_pattern_subexprs(p, &mut |e| {
+                            substitute_func_param_impl(e, param, arg, scope)
+                        })
+                    })
+                    .collect(),
                 init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
                 update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
             }
@@ -50847,7 +51003,16 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             };
             Expr::Foreach {
                 input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
-                patterns: patterns.clone(),
+                // #2873 review: see the identical `Expr::Reduce` arm's
+                // comment just above.
+                patterns: patterns
+                    .iter()
+                    .map(|p| {
+                        map_pattern_subexprs(p, &mut |e| {
+                            substitute_func_param_impl(e, param, arg, scope)
+                        })
+                    })
+                    .collect(),
                 init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
                 update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
                 extract: extract
@@ -50867,7 +51032,15 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             };
             Expr::AsPattern {
                 expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
-                patterns: patterns.clone(),
+                // #2873 review: see `Expr::Reduce`'s identical comment above.
+                patterns: patterns
+                    .iter()
+                    .map(|p| {
+                        map_pattern_subexprs(p, &mut |e| {
+                            substitute_func_param_impl(e, param, arg, scope)
+                        })
+                    })
+                    .collect(),
                 body: Box::new(substitute_func_param_impl(body, param, arg, bound_scope)),
             }
         }
