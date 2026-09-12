@@ -22416,6 +22416,52 @@ fn test_def_shadows_builtin_2036() -> Result<()> {
     Ok(())
 }
 
+/// #2738: `install_def_calls`'s `Expr::FuncDef` arm only checked whether a
+/// nested `def` was a full name+arity *redefinition* of the def being
+/// installed -- it never checked whether a nested def's own *parameter*
+/// list shadows a zero-arity def being installed (a parameter is referenced
+/// as a bare zero-argument call, the same namespace slot a zero-arity def
+/// occupies). Before this fix, row 1 answered `8` (the outer `def b`
+/// installed straight through `h`'s body, ignoring `h`'s own parameter
+/// named `b`) and row 2 overflowed the recursion guard (the outer `def a`'s
+/// installation loop never terminated once it also got installed inside the
+/// nested nested-recursive `def a(a): a`). Oracle-verified against jq 1.7.1.
+#[test]
+fn test_nested_def_own_param_shadows_zero_arity_def_being_installed_2738() -> Result<()> {
+    for (filter, want) in [
+        ("def b: 8; def h(b): b; h(6)", "6"),
+        ("def a: (def a(a): a; a(4)); a", "4"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2738 controls: the shadowing above must stay scoped to the nested def's
+/// own `body` only, per jq's parameter-scope rules -- it must not leak into
+/// `then` (row 1: the outer `def b` is still installed after `h`'s
+/// definition ends), and a nested def's parameter must not shadow an
+/// installed def of a *different* name (row 2), nor must this new check
+/// disturb the pre-existing same-name-and-arity redefinition guard (row 3:
+/// a nested `def b: 99` with the *same* zero arity as the outer `def b`
+/// still shadows it for the rest of that def's body, unrelated to this fix).
+/// Oracle-verified against jq 1.7.1.
+#[test]
+fn test_nested_def_param_shadow_scoped_to_body_only_2738() -> Result<()> {
+    for (filter, want) in [
+        ("def b: 8; def h(x): x; h(1), b", "1\n8"),
+        ("def b: 8; def h(x): x + b; h(1)", "9"),
+        ("def b: 8; def h: (def b: 99; b); h", "99"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2237 sibling: the same fix for the "dedicated parse function" family
 /// (`range`/`limit`/`until`/`while`/`repeat`/`first`/`last`), which returns
 /// `Expr` directly rather than going through `try_parse_builtin`'s
