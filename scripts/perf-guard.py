@@ -159,8 +159,24 @@ DEFAULT_THRESHOLD = 5.0
 # comment for the +16%-to-noise fix that predates this). 10% leaves headroom
 # above the observed ARM64 number while still catching a *further*
 # regression on top of this one.
+#
+# `users_yq_keys_unsorted` absorbs #2811's column-aware standalone-comment
+# attribution: `attach_head_foot_to_key`/`attach_head_foot_at` (parser.rs)
+# now run on every mapping-key and sequence-item open to track each frame's
+# indent column and a `frame_key_bp` slot, so a later comment's `PREV`/`NEXT`
+# attachment can be resolved -- unconditionally, since the parser can't know
+# in advance whether a standalone comment will ever appear nearby. Measured
+# on this repo's own ARM64-Linux CI runner (`--baseline-binary` merge-base
+# comparison, same rationale as `wide_keys_unsorted` above): +11.6%, present
+# even on a comment-free copy of the same fixture (this repo's own generated
+# `users` fixture also carries one leading `# User records` line, which
+# widens it further in a local A/B, but the bulk of the cost is the
+# unconditional per-node bookkeeping itself, not the comment lookup). 15%
+# leaves headroom above the observed number while still catching a further
+# regression on top of this one.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_yq_keys_unsorted": 15.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
