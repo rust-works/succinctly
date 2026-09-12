@@ -19,6 +19,7 @@ use std::borrow::Cow;
 
 use indexmap::IndexMap;
 
+use super::error::EvalError;
 use super::escape::{escape_json_body, write_json_body_jq};
 use super::eval::{EvalSemantics, EvalTag};
 #[cfg(test)]
@@ -111,6 +112,22 @@ pub fn nesting_depth_exceeded_message(max: usize) -> String {
 #[track_caller]
 pub fn assert_value_tree_depth(depth: usize) {
     assert_depth(depth, MAX_VALUE_TREE_DEPTH);
+}
+
+/// [`assert_value_tree_depth`]'s checked twin (#2850), the same relationship
+/// [`eval_generic::check_nesting_depth`](super::eval_generic::check_nesting_depth)
+/// already has to [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth)
+/// -- for `lazy.rs`'s `JqValue::try_materialize`, a CLI-output-boundary
+/// caller rather than the evaluator's own hot recursion, where a panic stays
+/// deliberate.
+pub fn check_value_tree_depth(depth: usize) -> Result<(), EvalError> {
+    if depth < MAX_VALUE_TREE_DEPTH {
+        Ok(())
+    } else {
+        Err(EvalError::new(nesting_depth_exceeded_message(
+            MAX_VALUE_TREE_DEPTH,
+        )))
+    }
 }
 
 /// The parsed value backing a [`OwnedValue::NumberLiteral`], kept separate

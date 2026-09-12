@@ -21679,6 +21679,37 @@ fn test_exit_status_over_depth_document_reports_cleanly_not_panic_2850() -> Resu
     Ok(())
 }
 
+/// #2850 review: pins a real, observable behavior change beyond just
+/// removing panic noise, specific to `-e`'s exit-status call site. Before
+/// this fix, a nesting-depth violation panicked and unwound through the
+/// whole per-document `catch_unwind`, silently dropping every remaining
+/// sibling result for a multi-result filter (`.[]`) -- the checked
+/// `try_materialize` instead reports and continues, the same
+/// report-then-continue path a decode failure (#1247) already took at this
+/// exact call site. This makes the two failure classes consistent with each
+/// other rather than introducing new behavior: `["\ud800", 1] | .[]` under
+/// `-e` already reported the decode failure and printed the well-formed
+/// sibling `1` before this fix; a deeply-nested sibling now does the same
+/// instead of dropping it.
+#[test]
+fn test_exit_status_multi_result_over_depth_element_still_emits_siblings_2850() -> Result<()> {
+    let deep_json = format!("{}{}{}", "[".repeat(500), "1", "]".repeat(500));
+    let input = format!("[{deep_json}, 1]");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-e", ".[]"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    // The well-formed sibling still reaches stdout -- consistent with the
+    // pre-existing decode-failure granularity at this same call site.
+    assert_eq!(stdout.trim_end(), "1", "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2850: `write_output_jq_value`'s own materialize call shares the
 /// identical checked-vs-panicking split as `-e`'s above. #2662 (landed in
 /// this same tree) is what makes this a genuinely live, confirmed leak
