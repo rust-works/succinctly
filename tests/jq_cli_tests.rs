@@ -48781,6 +48781,74 @@ fn test_shadowed_wrong_arity_calls_do_not_exhaust_the_retry_budget_2807() -> Res
     Ok(())
 }
 
+/// #2807 (review): empty parens stay a syntax error, even for the one arm
+/// whose recovery is a rewind rather than a hand-over.
+///
+/// `retry_shadow_candidate_as_generic_call` guards its own reparse with
+/// `peek_after_keyword_at_is_empty_parens` precisely so `def f: 1; f()`
+/// cannot be re-read as a legitimate arity-0 call; `strenv`'s rewind bypasses
+/// that function, so it repeats the check. Without it
+/// `def strenv: 1; strenv()` answered `1`, where jq 1.7.1 (and the pre-#2807
+/// parser) both reject it. `strenv(1)`/`strenv(1;2)` -- the shapes the rewind
+/// exists for -- must still reach the resolver.
+#[test]
+fn test_strenv_rewind_keeps_empty_parens_a_syntax_error_2807() -> Result<()> {
+    for filter in [
+        "def strenv: 1; strenv()",
+        "def strenv: 1; strenv( )",
+        "strenv()",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_ne!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def strenv(a): a; strenv(1)"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #2807 (review): the residual this fix does **not** close -- `limit`, `nth`
+/// and `skip` parse their first argument with the comma-restricted
+/// `parse_pipe_no_comma_with_booleans`, so a comma there leaves the
+/// already-parsed prefix out of step with the real argument text and nothing
+/// can be handed over. Those calls still reach
+/// `retry_shadow_candidate_as_generic_call` and still spend the budget, so 65
+/// of them are still rejected where jq 1.7.1 answers `130`.
+///
+/// Characterization, not an endorsement: this is a residual of #2807's class,
+/// not a regression -- the pre-#2807 parser rejected these at every count, and
+/// 64 still pass here. Tracked as #2863; when that lands these rows flip to
+/// jq's answers.
+#[test]
+fn test_comma_restricted_first_arg_still_spends_the_retry_budget_2807() -> Result<()> {
+    for kw in ["nth", "limit", "skip"] {
+        let within = format!(
+            "def {kw}(a;b): a; [{}] | length",
+            vec![format!("{kw}(1,2;3)"); 64].join(",")
+        );
+        let (stdout, stderr, code) = run_jq_full(&["-c", &within], Some("null"))?;
+        assert_eq!(code, 0, "{kw} x64: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "128", "{kw} x64");
+
+        let past = format!(
+            "def {kw}(a;b): a; [{}] | length",
+            vec![format!("{kw}(1,2;3)"); 65].join(",")
+        );
+        let (stdout, stderr, code) = run_jq_full(&["-c", &past], Some("null"))?;
+        assert_eq!(code, 3, "{kw} x65: stdout: {stdout:?} stderr: {stderr:?}");
+        // `nth`/`skip` report the hand-over helper's own separator
+        // complaint, `limit` its dedicated parser's -- both are the raw
+        // `original_err` the exhausted budget lets through, which is the
+        // property under test, not the wording.
+        assert!(
+            stderr.contains("parse error"),
+            "{kw} x65: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2807: an *unshadowed* wrong-arity call to one of the converted builtins
 /// now reaches jq's own name/arity resolver instead of stopping at the
 /// parser's argument-boundary check -- #2573's MULTI-ARG remainder, the same

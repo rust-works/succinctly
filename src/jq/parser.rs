@@ -420,9 +420,17 @@ struct Parser<'a> {
     /// every constant is reachable at some small depth.
     ///
     /// What can still draw on it: a shadow candidate whose *dedicated*
-    /// parser fails for a reason that is not an argument boundary -- a
-    /// genuine syntax error inside an argument, which the generic reparse
-    /// rejects too. The constant is not load-bearing for those.
+    /// parser fails for a reason that is not an argument boundary it can
+    /// resolve in place. Two shapes reach that today -- a genuine syntax
+    /// error inside an argument, which the generic reparse rejects too, and
+    /// the comma-restricted first argument of `limit`/`nth`/`skip`
+    /// (`parse_pipe_no_comma_with_booleans` stops at the comma, so the
+    /// already-parsed prefix no longer lines up with the real argument
+    /// text and cannot be handed over). Only the second can still change a
+    /// program's verdict: `def nth(a;b): a; nth(1,2;3)` x65 is `130` in jq
+    /// 1.7.1 and a parse error here once the budget runs out. Tracked
+    /// separately; it is a residual of this class, not a regression -- the
+    /// pre-#2807 parser rejected it at every count. Tracked as #2863.
     shadow_retry_budget: usize,
     /// #2807: the wrong-arity call a [`Self::try_parse_builtin`] arm
     /// resolved in place, handed to its one caller alongside `Ok(None)`.
@@ -3645,12 +3653,15 @@ impl<'a> Parser<'a> {
     ///   the whole budget and rejected a program jq 1.7.1 accepts. Those
     ///   arms resolve their own wrong-arity calls now
     ///   ([`Self::builtin_wrong_arity_or_expect`]) and never reach this
-    ///   function; what is left here is a shadow candidate whose dedicated
-    ///   parser failed for a reason that is *not* an argument boundary --
-    ///   a genuine syntax error inside an argument, which this fallback's
-    ///   own reparse rejects as well. For those the retry only re-reports
-    ///   the same error, so exhausting the budget cannot change a
-    ///   program's verdict, only which error text it carries.
+    ///   function unless their own argument parse fails first. What is
+    ///   left here is a shadow candidate whose dedicated parser failed for
+    ///   a reason that is *not* an argument boundary it can resolve in
+    ///   place: a genuine syntax error inside an argument, where the retry
+    ///   only re-reports the same error and exhausting the budget changes
+    ///   nothing but the error text -- and the comma-restricted first
+    ///   argument of `limit`/`nth`/`skip`, where it still changes the
+    ///   verdict (#2863). See [`Self::shadow_retry_budget`]'s own doc
+    ///   comment for that residual.
     fn retry_shadow_candidate_as_generic_call(
         &mut self,
         start_pos: usize,
@@ -5211,14 +5222,24 @@ impl<'a> Parser<'a> {
             // call. That covers both an argument that is not an identifier
             // at all (`strenv(1)`) and a second one (`strenv(a;b)`), which
             // jq 1.7.1 reports as `strenv/1 is not defined` and
-            // `strenv/2 is not defined`. No exponential exposure: the
-            // re-scanned text is one identifier, never a nested expression.
-            // yq mode keeps the raw parse error, as everywhere else in this
-            // family -- `strenv` is a real yq builtin there, and real yq's
-            // own leniency for these shapes (both answer `""` in v4.53.3)
-            // is a separate, pre-existing divergence.
+            // `strenv/2 is not defined`. yq mode keeps the raw parse error,
+            // as everywhere else in this family -- `strenv` is a real yq
+            // builtin there, and real yq's own leniency for these shapes
+            // (both answer `""` in v4.53.3) is a separate, pre-existing
+            // divergence.
+            //
+            // **Empty parens are excluded** (review): a rewind hands
+            // `strenv()` to `parse_func_call_or_error`, which reads it as a
+            // legitimate arity-0 call, so `def strenv: 1; strenv()` would
+            // answer `1` where jq 1.7.1 -- and every other builtin here --
+            // rejects empty parens as a syntax error. That is exactly the
+            // guard [`Self::retry_shadow_candidate_as_generic_call`] applies
+            // with `peek_after_keyword_at_is_empty_parens` before its own
+            // reparse; this rewind bypasses that function, so it repeats the
+            // check itself rather than inheriting it.
+            let empty_parens = self.peek_after_keyword_at_is_empty_parens(keyword_start);
             let Ok(var_name) = self.parse_ident() else {
-                if self.mode == ParserMode::Jq {
+                if self.mode == ParserMode::Jq && !empty_parens {
                     self.pos = keyword_start;
                     return Ok(None);
                 }
@@ -5517,7 +5538,9 @@ impl<'a> Parser<'a> {
                 return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![n]);
             }
             self.next();
-            // No-arg nth(n) is already handled by Phase 5 Builtin::Nth
+            // The single-argument form. (A "Phase 5 `Builtin::Nth`" arm this
+            // comment used to defer to no longer exists -- this is the only
+            // `nth` arm in the function; review, #2807.)
             return Ok(Some(Builtin::Nth(Box::new(n))));
         }
 
