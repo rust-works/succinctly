@@ -1547,11 +1547,29 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // (`-p json`) never has a header: real yq only preprocesses one
         // for its YAML decoder.
         let is_document = self_.is_document_content();
+        let is_first_document = self_.bp_pos == FIRST_DOCUMENT_BP;
+        // A scalar/null/alias root's head is only kept on the *first*
+        // document -- the `--header-preprocess` header covers that case
+        // regardless of kind. A later document's scalar root drops its
+        // head entirely, not just its foot (verified against pinned yq:
+        // `1\n---\n# lead\n42\n# foot\n` prints `1\n---\n42`, dropping
+        // `# lead` too, where a first-document scalar root keeps its head
+        // -- `# lead\n1\n# foot\n` prints `# lead\n1`). A collection root
+        // keeps both on every document (see the `is_collection_root` guard
+        // on the foot below). Resolving the alias target here (rather than
+        // after printing the value, as before) just moves an existing,
+        // side-effect-free computation earlier so its kind is known before
+        // deciding whether to print the head at all.
+        let resolved = self_.resolve_alias_target_cursor().unwrap_or(self_);
+        let value = resolved.value();
+        let is_collection_root = matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_));
         if is_document {
-            if self_.bp_pos == FIRST_DOCUMENT_BP {
+            if is_first_document {
                 write_yq_header(out, self_.text, self_.index)?;
             }
-            self_.write_head_comments_at(out, "", self_.bp_pos)?;
+            if is_first_document || is_collection_root {
+                self_.write_head_comments_at(out, "", self_.bp_pos)?;
+            }
         }
         // #1350 code review: `write_leading_anchor` must run *before*
         // resolving a root alias below, not after -- the target's own
@@ -1577,13 +1595,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // target instead of printing the mark, and this streaming path
         // should too. `resolve_alias_target_cursor` is a no-op (single
         // `.value()` check, no chain walk) when `self_` isn't an alias.
+        // Already resolved above (`resolved`/`value`) to decide whether to
+        // print the head comment; reused here rather than resolved twice.
         //
         // Known gap, not a new regression (confirmed against pre-#1350
         // `main`, which dropped it too): the alias's *own* trailing comment
         // (e.g. `b: *x # kept`) is not carried over here, only the target's.
         // Same family as #1085 (a node can carry only one comment slot).
-        let self_ = self_.resolve_alias_target_cursor().unwrap_or(self_);
-        let value = self_.value();
+        let self_ = resolved;
         if let YamlValue::String(s) = &value {
             // #1615: this root-scalar shortcut bypasses `stream_yaml_value`/
             // `stream_yaml_string_value` entirely (see this function's own doc
@@ -1621,7 +1640,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         } else {
             self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false, "")?;
         }
-        if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
+        if is_collection_root {
             write_line_comment(out, self_.line_comment_raw())?;
             // The document's own foot comment (#2795): a block at the end
             // of the document that a blank line detached from its last
@@ -6984,6 +7003,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn document_has_standalone_comments(&self) -> bool {
+        self.index.has_standalone_comments()
+    }
+
+    #[inline]
     fn explicit_tag(&self) -> Option<&str> {
         YamlCursor::explicit_tag(self)
     }
@@ -8353,11 +8377,17 @@ fn write_yq_header<W: AsRef<[u64]>, Out: core::fmt::Write>(
         let line = &rest[..line_end];
         if doc_markers || !line.starts_with("---") {
             out.write_str(line)?;
-            // The break itself is normalized to `\n`, as every other line
-            // break in the output is (#324): a CRLF/CR source header prints
-            // the same as its LF spelling, matching yq.
+            // The break itself is reproduced verbatim, unlike every other
+            // line break in the output, which is normalized to `\n` (#324):
+            // measured against pinned yq, a CRLF/CR source header keeps its
+            // own spelling (`# lead\r\n# lead2\r\na: 1\r\n` prints back with
+            // `\r\n` intact), not normalized like a document's ordinary
+            // content lines are. `rest[line_end..line_end + brk]` is always
+            // a valid `str` slice boundary: `brk` bytes are CR/LF, one byte
+            // each, so slicing there can never land inside a multi-byte
+            // UTF-8 sequence.
             if brk > 0 {
-                out.write_char('\n')?;
+                out.write_str(&rest[line_end..line_end + brk])?;
             }
         }
         pos += line_end + brk;
@@ -15649,12 +15679,15 @@ plain: hello
         }
 
         #[test]
-        fn header_line_breaks_are_normalized() {
+        fn header_line_breaks_are_reproduced_verbatim() {
+            // Measured against pinned yq (#2795 review): a CRLF/CR source
+            // header keeps its own break spelling, unlike every other line
+            // break in the output, which is normalized to `\n` (#324).
             assert_eq!(
                 stream(b"# lead\r\n\r\n---\r\na: 1\r\n"),
-                "# lead\n\n---\na: 1"
+                "# lead\r\n\r\n---\r\na: 1"
             );
-            assert_eq!(stream(b"# lead\r\ra: 1\r"), "# lead\n\na: 1");
+            assert_eq!(stream(b"# lead\r\ra: 1\r"), "# lead\r\ra: 1");
         }
 
         #[test]

@@ -41,7 +41,9 @@
 2SXE      structure         document/block structure differs from spec
 4JVG      lax:anchors       anchor/alias rules not validated — #223
 5LLU      lax:indentation   indentation not validated — #223
+8G76      structure         comment-only stream: spec wants zero documents, succinctly now synthesizes one null document to match real yq's CLI decode loop (`yq '1'` on `# c` answers `1`, not zero) — deliberate #2795 review fidelity choice (ADR-0018), not a regression
 8XDJ      lax:comments      comment placement not validated — #223
+98YD      structure         same shape and reason as 8G76 — #2795 review
 9C9N      lax:indentation   indentation not validated — #223
 9HCY      lax:documents     mid-stream `%TAG` directive (no `...` footer before it) absorbed as scalar text rather than rejected — #223 (surfaced by #224: previously masked by tags erroring at column 0 before the directive was ever reached)
 9KBC      lax:mapping       mapping/key rules not validated — #223

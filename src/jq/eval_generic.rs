@@ -1368,11 +1368,39 @@ static EMPTY_COMMENT_TREE: CommentTree = CommentTree::Leaf(NodeMeta::empty());
 /// See [`to_owned`] for the value-only conversion this mirrors and
 /// delegates scalar handling to. Panics past [`MAX_NESTING_DEPTH`] levels of
 /// nesting (#998), same as `to_owned`.
+///
+/// A bare scalar result's standalone head/foot only survives at the root
+/// (`depth` 0, this function's own level -- nested nodes are untouched)
+/// when `cursor` is the document's own content node *and* that document is
+/// the first in the stream (#2795 PR B): real yq drops both for a
+/// navigated-away scalar (`.a`, `.items[0]` when item 0 is a scalar) even
+/// though a navigated *container* keeps its own (`.items[0]` when item 0 is
+/// a mapping still prints its head), and a *later* document's scalar root
+/// drops its head too, not just its foot -- verified against pinned yq:
+/// `1\n---\n# lead\n42\n# foot\n` prints `1\n---\n42` under both `.` and
+/// `-P '.'`/a write. `to_owned_with_comments_at_depth` can't see any of this
+/// by itself: a node's head/foot keys off its own cursor the same way
+/// whether or not that cursor is ever reached via navigation or which
+/// document it belongs to, so this clears it right after, before the later
+/// unconditional style/anchor-clearing pass (#852) decides what to keep for
+/// a bare scalar. A no-op for JSON, where `is_document_content`/
+/// `document_index` monomorphize to `false`/`None`.
 pub fn to_owned_with_comments<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    to_owned_with_comments_at_depth(value, cursor, 0, false)
+    let (v, mut comments) = to_owned_with_comments_at_depth(value, cursor, 0, false, false)?;
+    if let Some(c) = cursor {
+        let is_collection = matches!(v, OwnedValue::Object(_) | OwnedValue::Array(_));
+        if !is_collection {
+            let is_document_root = DocumentCursor::is_document_content(c);
+            let is_first_document = DocumentCursor::document_index(c) == Some(0);
+            if !is_document_root || !is_first_document {
+                *comments.meta_mut() = comments.meta().with_head_foot(Vec::new(), Vec::new());
+            }
+        }
+    }
+    Ok((v, comments))
 }
 
 /// `under_alias`: whether some ancestor on the path from the root is itself
@@ -1395,6 +1423,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     cursor: Option<&V::Cursor>,
     depth: usize,
     under_alias: bool,
+    skip_own_head_foot: bool,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     assert_nesting_depth(depth);
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
@@ -1432,13 +1461,28 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
     // cursor is exactly the node the parser attaches head/foot to. Wrong
     // for a mapping field, whose head/foot instead lives on the *key* node
     // (see `head_comment`'s own doc comment) -- the object arm below
-    // overrides this empty read with `field.key_cursor`'s once it has one.
-    let own_head = cursor
-        .map(DocumentCursor::head_comment_raw)
-        .unwrap_or_default();
-    let own_foot = cursor
-        .map(DocumentCursor::foot_comment_raw)
-        .unwrap_or_default();
+    // overrides this empty read with `field.key_cursor`'s once it has one,
+    // so it passes `skip_own_head_foot` rather than pay for a read it will
+    // discard on every field of every object, comment or not (#2795 PR B
+    // review). Also skipped, via `document_has_standalone_comments`, when
+    // the whole document has no standalone comment at all -- mirrors the
+    // streaming route's own `write_head_comments_at`/`write_foot_comments_at`
+    // gate (`src/yaml/light.rs`), added there after measuring a real
+    // regression from these same two lookups on comment-free input.
+    let (own_head, own_foot) = if !skip_own_head_foot
+        && cursor.is_some_and(DocumentCursor::document_has_standalone_comments)
+    {
+        (
+            cursor
+                .map(DocumentCursor::head_comment_raw)
+                .unwrap_or_default(),
+            cursor
+                .map(DocumentCursor::foot_comment_raw)
+                .unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let own_meta = NodeMeta {
         comment: own_comment,
         style: own_style,
@@ -1467,21 +1511,26 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             // is `pub`, so a future JSON-typed caller silently inherited a
             // walk that accepted `{"a" 1}` -- closing that latent gap.
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+            // `skip_own_head_foot: true` -- standalone head/foot comments on
+            // a mapping entry live on its *key* node, not its value (#798
+            // PR2, #2795 PR B review) -- see `DocumentCursor::head_comment`'s
+            // own doc comment. The generic read the recursive call would
+            // otherwise do against `field.value_cursor` is guaranteed empty
+            // here and immediately overwritten by the key's own read below,
+            // so skipping it saves two wasted `BTreeMap` probes per field.
             let (v, mut c) = to_owned_with_comments_at_depth(
                 &field.value,
                 Some(&field.value_cursor),
                 depth + 1,
                 child_under_alias,
+                true,
             )?;
-            // Standalone head/foot comments on a mapping entry live on its
-            // *key* node, not its value (#798 PR2, #2795 PR B) -- see
-            // `DocumentCursor::head_comment`'s own doc comment. The generic
-            // read above used `field.value_cursor`, which has none, so this
-            // replaces that (already-empty) read with the key's.
-            let field_head = field.key_cursor.head_comment_raw();
-            let field_foot = field.key_cursor.foot_comment_raw();
-            if !field_head.is_empty() || !field_foot.is_empty() {
-                *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
+            if field.key_cursor.document_has_standalone_comments() {
+                let field_head = field.key_cursor.head_comment_raw();
+                let field_foot = field.key_cursor.foot_comment_raw();
+                if !field_head.is_empty() || !field_foot.is_empty() {
+                    *c.meta_mut() = c.meta().with_head_foot(field_head, field_foot);
+                }
             }
             map.insert(key.clone(), v);
             comment_map.insert(key.clone(), c);
@@ -1539,6 +1588,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                 Some(&elem_cursor),
                 depth + 1,
                 child_under_alias,
+                false,
             )?;
             items.push(v);
             comment_items.push(c);

@@ -948,8 +948,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // before starting a new one. Without this, `a: 1 / # m1 / <blank> /
         // # m2 / b: 2` would merge both blocks onto `b`, where real yq
         // splits them `m1` -> `.a`'s foot, `m2` -> `.b`'s head.
+        //
+        // Only when the pending block is not *deeper* than `PREV`'s own
+        // block, though (`pending_block.column <= pending_block.prev_indent`,
+        // the same signal the column-change split below gates on): a block
+        // already sitting inside a not-yet-opened nested block (`a:` /
+        // `  # h1` / blank / `  # h2` / `  b: 1`) is still working out which
+        // forward node will own it, so an internal blank line does not yet
+        // mean "settle onto `PREV`" -- real yq keeps `h1`/`h2` together as
+        // one block (blank line preserved) attached to `.a.b`'s key, not
+        // split with `h1` misrouted onto `.a`'s own foot (measured; #2795
+        // review).
         if let Some(&(_, last_end)) = self.pending_head_lines.last() {
-            if self.blank_line_between(last_end as usize, start as usize) {
+            if self.blank_line_between(last_end as usize, start as usize)
+                && self.pending_block.column <= self.pending_block.prev_indent
+            {
                 self.resolve_pending_block_backward();
             }
         }
@@ -1239,20 +1252,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             .rposition(|frame| frame.indent == column && closing(frame))
             .or_else(|| next_column.is_none().then_some(0));
         if let Some(start) = start {
-            let claimed = frames[..=start]
-                .iter()
-                .rev()
-                .take_while(|frame| closing(frame))
-                .find(|frame| frame.is_mapping)
-                .and_then(|frame| frame.last_key_bp)
-                // A mapping frame with no key yet records the
-                // `open_frame_key_slot` sentinel rather than `None` (its
-                // `last_key_bp` is only ever cleared to `None` for a
-                // non-mapping frame); filter it out here the same way the
-                // fallback arm below already does, so a mapping that opened
-                // without ever yet completing a key doesn't hand a dedented
-                // comment to a bp no cursor resolves to (#2811 review).
-                .filter(|&bp| bp != usize::MAX);
+            let claimed =
+                Self::last_mapping_key(frames[..=start].iter().rev().take_while(|f| closing(f)));
             if claimed.is_some() {
                 return claimed;
             }
@@ -1308,13 +1309,26 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if start == 0 {
             return None;
         }
-        frames[1..=start]
-            .iter()
-            .rev()
+        Self::last_mapping_key(frames[1..=start].iter().rev()).or_else(|| self.attached_prev())
+    }
+
+    /// The last mapping frame's key bp among `frames`, filtering the
+    /// `open_frame_key_slot` sentinel (#2811 review) -- shared by
+    /// [`Self::positional_foot_target`] and
+    /// [`Self::positional_boundary_foot_target`], whose own backward scans
+    /// differ only in which frames are in range to begin with (one takes
+    /// `closing` into account and starts at index 0, the other doesn't and
+    /// starts past index 0) -- everything after that range is picked is this
+    /// one rule in both. A mapping frame with no key yet records the
+    /// `open_frame_key_slot` sentinel rather than `None` (`last_key_bp` is
+    /// only ever cleared to `None` for a non-mapping frame); filtering it out
+    /// here keeps a mapping that opened without ever completing a key from
+    /// handing a dedented comment to a bp no cursor resolves to.
+    fn last_mapping_key<'f>(mut frames: impl Iterator<Item = &'f CommentFrame>) -> Option<usize> {
+        frames
             .find(|frame| frame.is_mapping)
             .and_then(|frame| frame.last_key_bp)
             .filter(|&bp| bp != usize::MAX)
-            .or_else(|| self.attached_prev())
     }
 
     /// Real yq never makes a detached block the foot of the stream's very
@@ -1564,15 +1578,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     }
 
     /// Settle a pending block whose forward attachment is already disproven
-    /// (a blank line follows it) onto `PREV`'s foot. A no-op when `PREV` is
-    /// unset, which means a blank line detached the block backwards too —
-    /// it stays pending and goes forward to whatever opens next.
+    /// (a blank line follows it) onto `PREV`'s foot -- or, with no `PREV` in
+    /// the *current* document yet, onto the document that just closed
+    /// across a `---`/`...` boundary (mirrors
+    /// [`Self::flush_pending_head_lines_with_root`]'s own no-`PREV`
+    /// fallback, #2795 review): `a: 1\n---\n# c1\n\n# c2\nb: 2\n` gives `c1`
+    /// to the first document's foot and only `c2` goes forward to `.b`'s
+    /// head, not both merged onto `.b` (measured against pinned yq). A
+    /// genuine no-op only when neither is set, which means a blank line
+    /// detached the block backwards *and* this is still the very first
+    /// document -- it stays pending and goes forward to whatever opens
+    /// next.
     fn resolve_pending_block_backward(&mut self) {
         if self.pending_head_lines.is_empty() {
             return; // omni-dev: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
         }
         if let Some(prev) = self.attached_prev() {
             self.drain_pending_into_foot(prev);
+        } else if let Some(old_root) = self.document_boundary_fallback_bp {
+            self.drain_pending_into_foot(old_root);
         }
     }
 
@@ -7069,6 +7093,39 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // Parse all documents (may be empty for comment-only files)
         if self.peek().is_some() {
             self.parse_documents()?;
+        } else {
+            // The whole input is comments and/or blank lines, with no
+            // `---`/`...` marker anywhere (#2795 review): real yq still
+            // yields exactly one (null) document for this, e.g. a lone
+            // `# c1` line prints back verbatim under `.` and answers `1`
+            // under a literal filter, rather than the stream producing no
+            // documents at all (verified against pinned yq). Synthesizing
+            // one here, rather than leaving `pending_head_lines` to attach
+            // to the virtual root sequence itself, gives the comment(s) a
+            // real document node to be this document's own head -- exactly
+            // `start_document`'s own "a leading `# lead` belongs to the
+            // document's own node" rule, and `end_document` synthesizes the
+            // null value since nothing gets written for it. Distinct from
+            // the genuinely-zero-document case `parse_documents` still
+            // handles on its own (#225's HWV9/QT73: an explicit marker with
+            // nothing before it) -- that case requires a marker to exist at
+            // all, which this branch's `peek().is_none()` guard already
+            // rules out.
+            //
+            // Known residual, confirmed live and unfixed here: real yq's
+            // YAML-target printer suppresses the value line entirely for a
+            // document with no explicit content (`# c\n` under `.` prints
+            // just `# c`, no `null`), where succinctly still prints the
+            // synthesized `null` (`# c\nnull`) -- both tools agree it's
+            // `!!null` under `. | type`, and JSON output already agrees
+            // (`null` on both). This is not new here: an explicit `---`
+            // alone with nothing after it has the identical gap already
+            // (`---\n` under `.` prints `---` in yq, `---\nnull` here),
+            // unrelated to comments -- this synthesis just reaches the same
+            // pre-existing emitter gap from a new angle, not a regression
+            // this change introduces.
+            self.start_document();
+            self.end_document();
         }
 
         // A standalone comment block still pending at EOF has no following

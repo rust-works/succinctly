@@ -272,6 +272,33 @@ fn yq_golden_conformance() {
     assert!(report.is_empty(), "{report}");
 }
 
+/// Golden cases whose *input* carries a standalone comment and which real yq
+/// itself does not render output-invariantly across line-break forms for —
+/// confirmed live against pinned yq v4.53.3, not assumed (#2795 review).
+///
+/// Two distinct, unreplicated go-yaml quirks are responsible, both pre-existing
+/// and unrelated to comment *placement* — see
+/// `docs/compliance/yq/limitations.md`'s "genuinely blank CRLF line" entry:
+///
+/// - Under CRLF, a comment's header is reproduced verbatim (`\r\n` kept, matching
+///   this branch's own header fix) but yq additionally inserts a blank line after
+///   a standalone comment, or a blank CRLF line turns into a literal `# ` comment
+///   line, that the source never had at all.
+/// - Under a lone CR, yq preserves `\r` as the output's own line break through
+///   the *entire* document (not just a header) whenever a standalone comment is
+///   present anywhere in it — a much larger, separately-confirmed gap neither
+///   succinctly's old nor new behavior replicates.
+///
+/// Neither quirk is triggered by ordinary (comment-free) content, which is why
+/// every other golden case still passes this test's invariance check unmodified.
+const KNOWN_CRLF_DIVERGENCES: &[&str] = &[
+    "standalone_comments_cursor_result_2795",
+    "standalone_comments_head_anchor_style_2795",
+    "standalone_comments_header_2795",
+    "standalone_comments_header_no_doc_2795",
+    "standalone_comments_identity_2795",
+];
+
 /// The same goldens, with the input's line breaks rewritten to CRLF and to a
 /// lone CR (#324).
 ///
@@ -281,6 +308,12 @@ fn yq_golden_conformance() {
 /// oracle for every variant. Rewriting `\n` is sound because a raw LF in YAML is
 /// always a line break; the `\n` inside a double-quoted scalar is the two
 /// characters `\` and `n`, which `str::replace` leaves alone.
+///
+/// That premise turns out false for a comment-bearing document specifically
+/// (real yq is not fully line-break-invariant there either — see
+/// [`KNOWN_CRLF_DIVERGENCES`]), so those cases are exempted from the invariance
+/// assertion below rather than silently asserted against; every other case
+/// keeps the original, tighter guarantee this test's doc comment describes.
 ///
 /// The assertion is invariance: each variant must fail on exactly the cases the
 /// LF run fails on, so this stays honest without a second manifest.
@@ -303,7 +336,10 @@ fn yq_golden_conformance_under_crlf_and_lone_cr() {
         }
 
         let actual: BTreeSet<String> = failures.keys().cloned().collect();
-        let regressed: Vec<_> = actual.difference(&baseline).collect();
+        let regressed: Vec<_> = actual
+            .difference(&baseline)
+            .filter(|name| !KNOWN_CRLF_DIVERGENCES.contains(&name.as_str()))
+            .collect();
         let inverted: Vec<_> = baseline.difference(&actual).collect();
 
         let mut report = String::new();
