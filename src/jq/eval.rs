@@ -32992,7 +32992,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                     // every write jq refuses, and wrong only for `path()`
                     // (jq reports the descriptor) and `del()` (jq no-ops
                     // on null). Recorded in
-                    // `docs/compliance/jq/limitations.md`.
+                    // `docs/compliance/jq/limitations.md`; tracked as #2853.
                     SliceTargetKind::Null => match (&s.bound, &e.bound) {
                         (Ok(start), Ok(end)) => (*start, *end),
                         (Err(err), _) | (_, Err(err)) => escape!(err.clone().into()),

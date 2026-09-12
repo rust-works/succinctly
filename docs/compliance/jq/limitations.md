@@ -2617,7 +2617,8 @@ leaves it to the write to refuse it — `= 5` and `|= 5` raise `Array/string sli
 be integers`, `del()` no-ops to `null`. succinctly's `Expr::Slice` path component holds only
 integer bounds, so the resolver raises that same error at resolution instead, unsuppressed by
 `?`: identical for every write jq refuses, wrong only for `path()` (jq reports the descriptor)
-and `del()` (jq answers `null`). Tracked as a follow-up to #2546. The path-mode resolver also
+and `del()` (jq answers `null`). Tracked as
+[#2853](https://github.com/rust-works/succinctly/issues/2853). The path-mode resolver also
 still drains each bound generator eagerly before slicing — the same gap
 [#2267](https://github.com/rust-works/succinctly/issues/2267) records for `resolve_index_expr`
 — so `path(.[("x",(1|debug)):])` still prints the DEBUG line jq never reaches.
