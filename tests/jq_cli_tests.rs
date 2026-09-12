@@ -1517,6 +1517,164 @@ fn test_loc_top_level_2688() -> Result<()> {
     Ok(())
 }
 
+/// #2774: `$__loc__` inside a def sourced from an `include`d module reports
+/// that module's own canonical (symlink-resolved) file path, not
+/// `"<top-level>"`. Line stays module-relative -- already correct before
+/// this fix, since each module is parsed on its own -- so a multi-line def
+/// pins that only `file` was wrong, not `line`.
+///
+/// Expected `file` is computed via `std::fs::canonicalize`, not a literal:
+/// the test's own temp directory differs every run, and on macOS `/tmp` is
+/// itself a symlink to `/private/tmp` -- exactly the realpath case jq
+/// applies, so comparing against the raw `tempdir()` path would spuriously
+/// fail there.
+#[test]
+fn test_loc_include_names_the_modules_own_canonical_file_2774() -> Result<()> {
+    let lib_dir = tempfile::tempdir()?;
+    let module_path = lib_dir.path().join("loc_module.jq");
+    std::fs::write(&module_path, "def f: $__loc__;\ndef g:\n  $__loc__;\n")?;
+    let canonical = std::fs::canonicalize(&module_path)?;
+    let canonical_str = canonical.to_string_lossy();
+
+    for (call, line) in [("f", 1), ("g", 3)] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(lib_dir.path())
+                    .args(["-nc", &format!(r#"include "loc_module"; {call}"#)]);
+                command
+            },
+            None,
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 0, "{call}: stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            format!(r#"{{"file":"{canonical_str}","line":{line}}}"#),
+            "{call}"
+        );
+    }
+    Ok(())
+}
+
+/// #2774 control: the *main filter's* own `$__loc__` still reports
+/// `"<top-level>"` even while a module is loaded alongside it -- the fix
+/// only stamps a module-sourced def's own body, never the filter that
+/// `include`s it.
+#[test]
+fn test_loc_main_filter_stays_top_level_alongside_an_include_2774() -> Result<()> {
+    let lib_dir = tempfile::tempdir()?;
+    std::fs::write(lib_dir.path().join("mod.jq"), "def f: 1;\n")?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(lib_dir.path())
+                .args(["-nc", r#"include "mod"; $__loc__"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"{"file":"<top-level>","line":1}"#);
+    Ok(())
+}
+
+/// #2774: `import "m" as m; m::f` -- a namespaced call into an imported
+/// module -- reports the module's own file too, the same as `include`.
+#[test]
+fn test_loc_import_names_the_modules_own_canonical_file_2774() -> Result<()> {
+    let lib_dir = tempfile::tempdir()?;
+    let module_path = lib_dir.path().join("loc_module.jq");
+    std::fs::write(&module_path, "def f: $__loc__;\n")?;
+    let canonical = std::fs::canonicalize(&module_path)?;
+    let canonical_str = canonical.to_string_lossy();
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(lib_dir.path())
+                .args(["-nc", r#"import "loc_module" as m; m::f"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(r#"{{"file":"{canonical_str}","line":1}}"#)
+    );
+    Ok(())
+}
+
+/// #2774: `~/.jq` gets the same treatment as an `include`d module -- its
+/// own defs' `$__loc__` names `~/.jq`'s own canonical path, not
+/// `"<top-level>"`.
+#[test]
+fn test_loc_home_jq_names_home_jqs_own_canonical_file_2774() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    let jq_path = temp_home.path().join(".jq");
+    std::fs::write(&jq_path, "def g:\n  $__loc__;\n")?;
+    let canonical = std::fs::canonicalize(&jq_path)?;
+    let canonical_str = canonical.to_string_lossy();
+
+    let (output, code) = spawn_jq_with_env(&["-nc", "g"], "HOME", temp_home.path(), None)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(r#"{{"file":"{canonical_str}","line":2}}"#)
+    );
+    Ok(())
+}
+
+/// #2774: a module reached through a symlink reports the symlink's
+/// *target* path (jq's own realpath behavior), not the symlink path it was
+/// `-L`'d through.
+#[test]
+#[cfg(unix)]
+fn test_loc_symlinked_module_names_the_canonical_target_2774() -> Result<()> {
+    let real_dir = tempfile::tempdir()?;
+    let real_path = real_dir.path().join("real.jq");
+    std::fs::write(&real_path, "def real_target_fn: $__loc__;\n")?;
+    let canonical = std::fs::canonicalize(&real_path)?;
+    let canonical_str = canonical.to_string_lossy();
+
+    let symlink_dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink(&real_path, symlink_dir.path().join("real.jq"))?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(symlink_dir.path())
+                .args(["-nc", r#"include "real"; real_target_fn"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(r#"{{"file":"{canonical_str}","line":1}}"#)
+    );
+    Ok(())
+}
+
 // =============================================================================
 // Exit Status Tests
 // =============================================================================

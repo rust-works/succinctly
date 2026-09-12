@@ -200,7 +200,11 @@ fn is_ident_start_char(c: char) -> bool {
 /// rules, per CLAUDE.md's #106 note.
 fn dollar_var_expr(name: String, line: usize) -> Expr {
     if name == "__loc__" {
-        Expr::Loc { line }
+        // #2774: the parser has no notion of which file it is reading (a
+        // module's text arrives here identically to the main filter's), so
+        // `file` always starts `None` -- `ModuleLoader` stamps it in after
+        // the fact for a def sourced from an `include`d module or `~/.jq`.
+        Expr::Loc { line, file: None }
     } else if name == "ENV" {
         Expr::Env
     } else {
