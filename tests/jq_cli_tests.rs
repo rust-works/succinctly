@@ -23425,18 +23425,44 @@ fn test_module_shadow_scope_boundaries_unchanged_2395() -> Result<()> {
     Ok(())
 }
 
-/// #2395 regression guard: an unresolvable module is still the same compile
-/// error with the same exit code, now that the loader runs one step earlier
-/// (the shadow-name collection resolves every `include` before the re-parse,
-/// where previously `process_program` was the first to touch them).
+/// #2395 regression guard, updated for #2703: an unresolvable module is
+/// still the same compile error with the same exit code, now that the
+/// loader runs one step earlier (the shadow-name collection resolves every
+/// `include` before the re-parse, where previously `process_program` was
+/// the first to touch them).
+///
+/// #2703 fixed this specific case's *wording* to match jq exactly -- see
+/// `test_module_not_found_matches_jq_exactly_2703` below for the full
+/// byte-for-byte pin; this test only re-asserts the exit code and message
+/// content the #2395 guard originally existed to protect.
 #[test]
 fn test_module_not_found_still_reports_module_error_2395() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", r#"include "nosuchmod"; 1"#], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("module error") && stderr.contains("nosuchmod"),
-        "stderr: {stderr:?}"
-    );
+    assert!(stderr.contains("nosuchmod"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2703: `include`/`import`'s module-not-found error now matches jq 1.7.1
+/// byte-for-byte, not just in exit code -- `jq: error: module not found:
+/// {name}`, a blank line standing in for the missing source echo (jq has no
+/// location to show for a module it never found), then the usual `jq: 1
+/// compile error` trailer. Both directives share the same underlying
+/// `ModuleLoader::ensure_module_loaded`, so both are pinned here. Oracle-
+/// verified against jq 1.7.1.
+///
+/// Before this fix: `jq: module error: module 'nosuchmod' not found in
+/// search path\n` -- wrong prefix, wrong wording, no trailer.
+#[test]
+fn test_module_not_found_matches_jq_exactly_2703() -> Result<()> {
+    for filter in [r#"include "nosuchmod"; 1"#, r#"import "nosuchmod" as m; 1"#] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 3, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(
+            stderr, "jq: error: module not found: nosuchmod\n\njq: 1 compile error\n",
+            "{filter}"
+        );
+    }
     Ok(())
 }
 
@@ -23506,9 +23532,13 @@ fn test_module_search_path_falls_through_to_a_later_dir_2395() -> Result<()> {
 
 /// #2395: a module whose own text does not parse is a compile error, exit 3 --
 /// not a panic, and not a silently ignored module. jq 1.7.1 also exits 3 here
-/// (its wording names the file and line, where succinctly reports the module
-/// path and a byte position -- the same pre-existing wording gap already
-/// recorded for `module not found`).
+/// (its wording names the file by *absolute* resolved path and reports a
+/// line + echoed source, where succinctly reports the module path as given
+/// on the command line and a byte position -- unlike the sibling
+/// `module not found` wording gap, #2703 does not close this one: jq's own
+/// source-echo padding for a syntax error is not a fixed formula -- see
+/// #2703's own follow-up note -- so it stays a documented, unfixed
+/// divergence for now).
 #[test]
 fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
