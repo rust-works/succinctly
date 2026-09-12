@@ -4230,22 +4230,24 @@ fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
     Ok(())
 }
 
-/// #2103 (code review): the decision that a filter validates only what it
-/// reads is a property of the M2 route, and the M2 route is not the only
-/// one. `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge go through
-/// `evaluate_input_streaming`, which materializes the whole input into an
-/// `OwnedValue` *before* evaluating -- so on those routes `1+1` on a
-/// malformed document still exits 5, exactly as every route did before
-/// #2103, while the default route answers `2`. `-e` streams like the
-/// default but materializes each *output* to decide the exit status, so
-/// `-e '.,.'` on the colliding-key document still raises where `-c '.,.'`
-/// echoes. All of that is the recorded rule applied to a route that
-/// materializes; what this test pins is that the dependence on the flag
-/// exists and is stated (`docs/compliance/jq/limitations.md`, "The
-/// materializing flag routes still validate whatever the filter"), so a
-/// change to it -- in either direction -- is a deliberate one. Every
-/// exit-5 row here matches jq 1.7.1's own parse-time rejection; the
-/// exit-0 rows are the #2103 divergence. Tracked for a real fix by #2662.
+/// #2103 (code review) / #2662: the decision that a filter validates only
+/// what it reads is a property of the M2 route, and the M2 route was not
+/// the only one -- `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge all
+/// went through `evaluate_input_streaming`, which materialized the whole
+/// input into an `OwnedValue` *before* evaluating, so `1+1` on a malformed
+/// document exited 5 on every one of them where the default route already
+/// answered `2`. #2662 closed that gap for `-S`/`-a`/`-C` (moved onto the
+/// same lazy route the default already used) but deliberately left `-s`
+/// and `-n`/`input` materializing -- `-s` needs a real offset-mapping
+/// redesign (tracked, not yet done) and `input` must hand the evaluator a
+/// value it can return from a builtin, which requires materializing by
+/// construction (#2662's own triage, not an oversight). `-e` streams like
+/// the default but materializes each *output* to decide the exit status,
+/// so `-e '.,.'` on the colliding-key document still raises where `-c
+/// '.,.'` echoes -- unchanged by #2662, `-e` was never one of the flags
+/// moved. Every exit-5 row here matches jq 1.7.1's own parse-time
+/// rejection; the exit-0 rows for `-s`/`-n` are the recorded, still-open
+/// #2103 divergence for those two routes specifically now.
 #[test]
 fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
     let structural = r#"{123:1,"b":2}"#;
@@ -4261,17 +4263,36 @@ fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
                 "{filter} on {doc}: stderr {err}"
             );
 
-            // The flag routes that materialize the input first still refuse.
-            for flags in [&["-Sc"][..], &["-ac"], &["-sc"], &["-Cc"]] {
+            // #2662: `-S`/`-a`/`-C` moved onto the same lazy route as the
+            // default -- `1+1` reads nothing from the document, so all
+            // three now answer the same way the default route does,
+            // malformed document and all. `-c` prefix keeps output
+            // comparable across rows; `-C`'s own ANSI wrapping around a
+            // bare number is exercised separately elsewhere.
+            for flags in [&["-Sc"][..], &["-ac"], &["-Cc"]] {
                 let mut args = flags.to_vec();
                 args.push(filter);
                 let (out, err, code) = run_jq_full(&args, Some(doc))?;
                 assert_eq!(
-                    code, 5,
+                    code, 0,
                     "{flags:?} {filter} on {doc}: out {out:?} stderr {err}"
                 );
-                assert!(out.is_empty(), "{flags:?} {filter} on {doc}: out {out:?}");
+                assert!(
+                    out.contains('2'),
+                    "{flags:?} {filter} on {doc}: out {out:?}"
+                );
             }
+
+            // `-s` still materializes -- unmoved by #2662, see this test's
+            // own doc comment.
+            let (out, err, code) = run_jq_full(&["-sc", filter], Some(doc))?;
+            assert_eq!(code, 5, "-s {filter} on {doc}: out {out:?} stderr {err}");
+            assert!(out.is_empty(), "-s {filter} on {doc}: out {out:?}");
+
+            // `-n`/`input` still materializes what it reads -- also
+            // unmoved, and correctly so per #2662's own analysis (`input`
+            // must hand the evaluator an owned value it can return from a
+            // builtin).
             let bridged = format!("input | {filter}");
             let (out, err, code) = run_jq_full(&["-nc", &bridged], Some(doc))?;
             assert_eq!(code, 5, "-n {bridged} on {doc}: out {out:?} stderr {err}");
@@ -4288,6 +4309,87 @@ fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
     assert!(err.contains("ambiguous"), "stderr: {err}");
     let (out, _, code) = run_jq_full(&["-c", ".,."], Some(colliding))?;
     assert_eq!(code, 0, "control: the default route echoes, out {out:?}");
+
+    Ok(())
+}
+
+/// #2662: well-formed output for `-S`/`-a`/`-C` is unaffected by moving
+/// them onto the lazy route -- each still produces the exact same bytes
+/// as before (and as real jq), just without materializing the whole
+/// document first. Confirmed live against jq 1.7.1 for every row.
+#[test]
+fn test_sort_ascii_color_output_unaffected_by_lazy_route_move_2662() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-Sc", "."], Some(r#"{"b":1,"a":2,"c":3}"#))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), r#"{"a":2,"b":1,"c":3}"#);
+
+    let (out, err, code) = run_jq_full(&["-ac", "."], Some(r#"{"a":"café"}"#))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    // `é` (U+00E9) escaped as `é`, not the literal UTF-8 byte -- that
+    // is the point of `-a`. Confirmed live against jq 1.7.1.
+    assert_eq!(out.trim(), "{\"a\":\"caf\\u00e9\"}");
+
+    let (out, err, code) = run_jq_full(&["-Cc", "."], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("\x1b["),
+        "-C must still emit ANSI codes: {out:?}"
+    );
+    assert!(out.contains('1'), "out: {out:?}");
+
+    Ok(())
+}
+
+/// #2662: `-a` wins over `-r` for a *string* value -- confirmed live
+/// against jq 1.7.1 (`-acr '"café"'` prints `"café"`, quoted and escaped,
+/// not the unquoted raw string `-r` alone gives). A non-string value is
+/// unaffected either way. Pinned on both the lazy route (`-S`/`-a`/`-C`,
+/// moved by this issue) and the still-materializing `-s` route, since both
+/// `write_output_jq_value` and `write_output` had the identical gap before
+/// this fix.
+#[test]
+fn test_ascii_output_wins_over_raw_for_strings_2662() -> Result<()> {
+    // `-acr`: the lazy route (`write_output_jq_value`, moved by this issue).
+    let (out, err, code) = run_jq_full(&["-acr", "."], Some(r#""café""#))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        out.trim(),
+        "\"caf\\u00e9\"",
+        "-a must still quote+escape a string even under -r"
+    );
+
+    // `-acsr`: the still-materializing `-s` route (`write_output`), wrapped
+    // in slurp's own array -- same escaping fix, different writer.
+    let (out, err, code) = run_jq_full(&["-acsr", "."], Some(r#""café""#))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "[\"caf\\u00e9\"]");
+
+    // A non-string value is unaffected by `-a`/`-r` either way.
+    let (out, err, code) = run_jq_full(&["-acr", "."], Some("42"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), "42");
+
+    Ok(())
+}
+
+/// #2662: a malformed document reached during `-S`/`-a`/`-C`'s own
+/// materialize-the-output step must still report through jq's diagnostic
+/// channel (exit 5, `jq: error (at ...)`), not fall through to a bare
+/// `anyhow` failure (exit 1, `Error: ...`) the way it did before this fix
+/// -- the gap was in `write_output_jq_value` itself, only ever exercised
+/// once `-S`/`-a`/`-C` could reach the lazy path at all.
+#[test]
+fn test_malformed_document_error_channel_under_lazy_sort_ascii_color_2662() -> Result<()> {
+    for flags in [&["-Sc"][..], &["-ac"], &["-Cc"]] {
+        let mut args = flags.to_vec();
+        args.push(".");
+        let (out, stderr, code) = run_jq_full(&args, Some("{invalid}"))?;
+        assert_eq!(code, 5, "{flags:?}: out {out:?} stderr {stderr:?}");
+        assert!(
+            stderr.starts_with("jq: error"),
+            "{flags:?} must report in jq's channel, not anyhow's: {stderr:?}"
+        );
+    }
 
     Ok(())
 }
@@ -27378,15 +27480,24 @@ fn test_jq_wellformed_trailing_gap_survives_leniency_fallback_1676() -> Result<(
     Ok(())
 }
 
-/// #1643 follow-up: a malformed value elsewhere in a multi-value stream
-/// (not just the first) is still caught under `-S`, since
-/// `parse_json_stream`'s fallback validates every span it materializes,
-/// not just the one `serde_json` first stumbled on.
+/// #1643 follow-up, #2662 revision: a malformed value elsewhere in a
+/// multi-value stream (not just the first) is still caught under `-S` --
+/// but `-S` moved onto the lazy/streaming path in #2662, so the *first*,
+/// well-formed value is now printed before the parser ever reaches the
+/// second, malformed one, rather than the whole stream being validated
+/// up front and nothing printed on failure. This is a fidelity
+/// improvement, not a regression: confirmed live against jq 1.7.1, which
+/// does the same on this exact input -- prints `{"x": 1}` and exits 5 on
+/// the second value's own parse error, not an empty stdout.
 #[test]
 fn test_jq_missing_delimiter_raises_under_sort_keys_mid_stream_1643() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-S", "."], Some("{\"x\":1}\n{\"a\" 1}"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert_eq!(
+        out.trim(),
+        "{\n  \"x\": 1\n}",
+        "the first, well-formed value must still print: {out:?}"
+    );
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     Ok(())
