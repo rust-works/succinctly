@@ -14724,6 +14724,192 @@ mod standalone_comment_attribution_2811 {
     }
 }
 
+/// Follow-up fixes from an 8-way differential code review of the
+/// #2795/#2811 work above, each confirmed against pinned yq v4.53.3 (never
+/// stated from memory) before being fixed. One test per finding, in the
+/// review's own priority order.
+mod standalone_comment_attribution_2811_review {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    fn assert_slots(input: &str, rows: &[(&str, &str)]) -> Result<()> {
+        for (filter, expected) in rows {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}] on {input:?}");
+            assert_eq!(out, format!("{expected}\n"), "[{filter}] on {input:?}");
+        }
+        Ok(())
+    }
+
+    /// Finding 1: An explicit `? key` mapping entry used to bypass
+    /// `attach_head_foot_to_key`, so `frame_key_bp` never recorded it --
+    /// `positional_foot_target`'s frame lookup then resolved to the
+    /// `usize::MAX` sentinel and the comment was silently dropped from
+    /// output entirely, not merely misattributed. The ordinary `key:` form
+    /// two lines up (`a:\n  - 1\n# c\n`) already answers `c` here, and an
+    /// explicit key must match it.
+    #[test]
+    fn explicit_key_dedented_foot_is_not_dropped_2811_review() -> Result<()> {
+        assert_slots(
+            "? a\n:\n  - 1\n# c\n",
+            &[(".a | key | foot_comment", "c"), (". | foot_comment", "")],
+        )
+    }
+
+    /// Finding 2: `attach_document_root_node` was missing from three document-root
+    /// dispatch arms: a property-prefixed (`&anchor`/`!tag`) flow
+    /// collection, that same dispatch's plain-scalar fallback, and a
+    /// standalone `*alias` value. All three merged the root's head and foot
+    /// into one head block instead of keeping them separate.
+    #[test]
+    fn anchored_and_aliased_document_roots_keep_separate_head_and_foot_2811_review() -> Result<()> {
+        assert_slots(
+            "# lead\n&a 42\n# foot\n",
+            &[(". | head_comment", "lead"), (". | foot_comment", "foot")],
+        )?;
+        let input = "&a 1\n---\n# lead\n*a\n# foot\n";
+        let (out, code) = run_yq_stdin(". | head_comment", input, &["--doc", "1"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "lead\n");
+        let (out, code) = run_yq_stdin(". | foot_comment", input, &["--doc", "1"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "foot\n");
+        Ok(())
+    }
+
+    /// Finding 3: `deferred_foot_lines` -- a foot deferred to a sequence item's
+    /// first key/scalar that never materializes -- was drained only mid-
+    /// document (a real node claims it) or once at true end of parse.
+    /// Neither `start_document` nor `end_document` touched it at a
+    /// `---`/`...` boundary, so it survived untouched into the *next*
+    /// document and was wrongly claimed there by whatever node opened
+    /// first, instead of becoming the *closing* document's own root foot.
+    #[test]
+    fn deferred_foot_does_not_leak_across_a_document_boundary_2811_review() -> Result<()> {
+        let input = "- a:\n    - 1\n # c\n\n- -\n---\nb: 2\n";
+        let (out, code) = run_yq_stdin(". | foot_comment", input, &["--doc", "0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "c\n");
+        let (out, code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "b: 2\n");
+        Ok(())
+    }
+
+    /// Finding 4: `flush_pending_head_lines_at_boundary`'s "no blank line before the
+    /// marker" branch applied #798's flat "always the closing document's
+    /// root foot" rule unconditionally, even when the block was actually
+    /// still inside a mapping nested *within* the closing document's
+    /// outermost container -- bypassing this same PR's own column-aware
+    /// placement that the in-document/EOF paths already apply.
+    #[test]
+    fn boundary_adjacent_block_still_respects_nesting_2811_review() -> Result<()> {
+        let input = "a:\n  b: 1\n  # c\n---\nc: 2\n";
+        let (out, code) = run_yq_stdin(".a.b | key | foot_comment", input, &["--doc", "0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "c\n");
+        let (out, code) = run_yq_stdin(". | foot_comment", input, &["--doc", "0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n");
+        Ok(())
+    }
+
+    /// Finding 5: `yq_header_len`'s scan had no document-boundary awareness: a
+    /// second `---` marker never stopped it, so when document 0 was itself
+    /// empty (two adjacent markers with nothing between), the scan ran
+    /// straight through the second marker and absorbed document 1's own
+    /// leading comment into "the header" -- material `write_yq_header` only
+    /// ever prints once, for document 0, silently dropping document 1's
+    /// comment from output entirely. This is an internal-consistency fix
+    /// for succinctly's own `--doc` addressing, not an oracle comparison:
+    /// live-tested, real yq collapses two bare adjacent `---` markers with
+    /// no real content before the first one into a *single* document
+    /// (`# c1\n---\n---\n# c2\nb: 2\n` is one document with combined head
+    /// `c1`/`c2` in real yq, not two) -- a separate, larger document-count
+    /// divergence outside this fix's scope.
+    #[test]
+    fn header_scan_stops_before_a_second_document_marker_2811_review() -> Result<()> {
+        let input = "---\n---\n# c\nb: 2\n";
+        let (out, code) = run_yq_stdin(".", input, &["--doc", "0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "---\nnull\n");
+        let (out, code) = run_yq_stdin(".", input, &["--doc", "1"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "# c\nb: 2\n");
+        Ok(())
+    }
+
+    /// Finding 6: `first_node_takes_no_foot_quirk`'s `prev_indent != 0` guard
+    /// narrowed the quirk to a column-0 first node, but the function's own
+    /// doc comment already claimed a *nested* first node (a compact-mapping
+    /// key under a top-level `-` item) qualifies too. A blank-line-detached
+    /// nested first node is a separate, already-correct case (kept as a
+    /// negative check here) -- the fix only widens the true-EOF/adjacent
+    /// case.
+    #[test]
+    fn nested_first_node_also_takes_no_foot_quirk_2811_review() -> Result<()> {
+        assert_slots(
+            "- k: v # c1\n  # c3\n",
+            &[
+                (".[0].k | key | foot_comment", ""),
+                (". | foot_comment", "c3"),
+            ],
+        )?;
+        // Negative check: a blank line before a following sibling still
+        // keeps the block on the nested first node's own foot, unlike a
+        // true top-level first node (which forwards it onto the sibling's
+        // head instead) -- both measured, unaffected by this fix.
+        assert_slots(
+            "- k: v # c1\n  # c3\n\n- 2\n",
+            &[
+                (".[0].k | key | foot_comment", "c3"),
+                (".[1] | head_comment", ""),
+            ],
+        )
+    }
+
+    /// Finding 7: `attach_item_head_at`'s `floated_item_comment` guard fixed one
+    /// regression (`k:\n  - - # c1\n  - - # c2\n`, kept passing here as a
+    /// negative check) but misrouted a structurally similar shape where the
+    /// absent item's own sequence closed *without* ever floating a comment
+    /// (no trailing comment on the bare `- -` line, just a following
+    /// standalone one): the block landed on `.k`'s mapping-key foot instead
+    /// of the next real node's own foot.
+    #[test]
+    fn doubly_nested_absent_item_comment_reaches_the_next_real_node_2811_review() -> Result<()> {
+        assert_slots(
+            "k:\n  - -\n    # c1\n  - - x\n",
+            &[
+                (".k[1][0] | foot_comment", "c1"),
+                (".k | key | foot_comment", ""),
+            ],
+        )?;
+        // Negative check: the original guarded shape must keep working.
+        assert_slots(
+            "k:\n  - - # c1\n  - - # c2\n",
+            &[(".k | key | foot_comment", "c1")],
+        )
+    }
+
+    // 8. `write_head_comment_lines`'s `continue` on a skipped invalid-UTF-8
+    // comment line didn't advance `prev_end` past that line's own line
+    // break, so the next real line's `blank_line_between` check double-
+    // counted the gap (once as "the gap before the skipped line", once
+    // folded into "the gap after it") and inserted a spurious blank line
+    // between two real lines that have none between them. Not reachable
+    // through this CLI test module: `succinctly yq` pre-validates a whole
+    // document's UTF-8 up front regardless of output format or flags (see
+    // `test_yq_rejects_invalid_utf8_document_1242`) and rejects invalid
+    // input before `write_head_comment_lines` ever runs, so this fix's
+    // regression test lives with `write_head_comment_lines` itself in
+    // `src/yaml/light.rs`'s own test module (alongside the pre-existing
+    // `invalid_utf8_comment_lines_are_skipped_not_fatal`, which reaches this
+    // tolerant path the same way -- `YamlIndex::build` +
+    // `stream_yaml_document` directly, bypassing the CLI's own front-door
+    // validation), as
+    // `invalid_utf8_comment_line_sandwiched_by_real_ones_inserts_no_blank_2811_review`.
+}
+
 /// #2795: standalone (head/foot) comments print on the streaming YAML
 /// route. Every expected string was captured from pinned yq v4.53.3 on the
 /// same input and arguments. Shapes whose *attribution* the parser still

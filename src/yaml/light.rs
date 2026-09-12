@@ -178,6 +178,47 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         write_foot_comment_lines(out, indent, self.text, self.index.get_foot_comments(bp))
     }
 
+    /// [`Self::write_head_comments_at`] for a sequence item, reading both
+    /// the resolved content node's own bp and, when it differs, the bare
+    /// `-` wrapper's (#2811 review, factored out of three near-identical
+    /// call sites in the sequence-streaming loop below): a sequence item's
+    /// standalone comments live on the item's content node, or on a bare
+    /// `-` wrapper's own node when the value deferred to the next line --
+    /// read both when they differ, since a real `-`/deferred-value split
+    /// only shows up as two distinct bps.
+    #[inline]
+    fn write_item_head_comments_at<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: &str,
+        raw_bp: usize,
+        cursor_bp: usize,
+    ) -> core::fmt::Result {
+        self.write_head_comments_at(out, indent, cursor_bp)?;
+        if raw_bp != cursor_bp {
+            self.write_head_comments_at(out, indent, raw_bp)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::write_item_head_comments_at`]'s foot counterpart -- ORs
+    /// together the two "did it write anything" answers, matching how each
+    /// original call site combined them with `|=`.
+    #[inline]
+    fn write_item_foot_comments_at<Out: core::fmt::Write>(
+        &self,
+        out: &mut Out,
+        indent: &str,
+        raw_bp: usize,
+        cursor_bp: usize,
+    ) -> Result<bool, core::fmt::Error> {
+        let mut wrote = self.write_foot_comments_at(out, indent, cursor_bp)?;
+        if raw_bp != cursor_bp {
+            wrote |= self.write_foot_comments_at(out, indent, raw_bp)?;
+        }
+        Ok(wrote)
+    }
+
     /// Where the first document's verbatim header ends (#2795): standalone
     /// comment lines starting before this offset were printed by
     /// [`write_yq_header`] and must not print again as any node's head.
@@ -2209,10 +2250,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             out.write_str(indent)?;
                         }
                         first = false;
-                        self.write_head_comments_at(out, indent, cursor.bp_position())?;
-                        if raw.bp_position() != cursor.bp_position() {
-                            self.write_head_comments_at(out, indent, raw.bp_position())?;
-                        }
+                        self.write_item_head_comments_at(
+                            out,
+                            indent,
+                            raw.bp_position(),
+                            cursor.bp_position(),
+                        )?;
                         // A comment captured on a bare `-` wrapper itself
                         // (#1079) -- only present when this item really was
                         // a bare wrapper whose value deferred to the next
@@ -2342,12 +2385,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 )?;
                             }
                             write_line_comment(out, cursor.line_comment_raw())?;
-                            prev_had_foot =
-                                self.write_foot_comments_at(out, indent, cursor.bp_position())?;
-                            if raw.bp_position() != cursor.bp_position() {
-                                prev_had_foot |=
-                                    self.write_foot_comments_at(out, indent, raw.bp_position())?;
-                            }
+                            prev_had_foot = self.write_item_foot_comments_at(
+                                out,
+                                indent,
+                                raw.bp_position(),
+                                cursor.bp_position(),
+                            )?;
                         } else {
                             // #1077: mirrors the mapping-field branch above
                             // -- see `write_deferred_value`'s own doc
@@ -2414,12 +2457,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 own_comment
                             };
                             write_line_comment(out, own_comment)?;
-                            prev_had_foot =
-                                self.write_foot_comments_at(out, indent, cursor.bp_position())?;
-                            if raw.bp_position() != cursor.bp_position() {
-                                prev_had_foot |=
-                                    self.write_foot_comments_at(out, indent, raw.bp_position())?;
-                            }
+                            prev_had_foot = self.write_item_foot_comments_at(
+                                out,
+                                indent,
+                                raw.bp_position(),
+                                cursor.bp_position(),
+                            )?;
                         }
                         elems = rest;
                     }
@@ -8117,6 +8160,21 @@ fn write_head_comment_lines<Out: core::fmt::Write>(
             continue;
         }
         let Ok(line) = core::str::from_utf8(&text[start..end]) else {
+            // Still advance `prev_end` past this line's own line break when
+            // something has already been written (#2811 review): left at
+            // the old value, the *next* real line's `blank_line_between`
+            // scan below would count both the gap before this skipped line
+            // and the gap after it as one combined span -- two line breaks
+            // (this line's own leading and trailing ones) where there is
+            // genuinely no blank line at all, wrongly inserting one between
+            // two real lines that sandwich a single invalid-UTF-8 comment.
+            // Guarded on `is_some()` so a skip *before* the first written
+            // line leaves `prev_end` at `None` -- the next real line is
+            // still the first one written, taking neither an indent prefix
+            // nor a blank-line check.
+            if prev_end.is_some() {
+                prev_end = Some(end + line_break_len(text, end));
+            }
             continue;
         };
         if let Some(prev_end) = prev_end {
@@ -8183,8 +8241,47 @@ fn write_foot_comment_lines<Out: core::fmt::Write>(
 /// trailing comment is dropped instead).
 fn yq_header_len(text: &[u8]) -> (usize, bool) {
     let mut pos = 0;
+    // Whether a `---` marker has already been folded into the header
+    // (#2811 review): the header concept is specifically "content before
+    // document 0's own real content", so a *second* document-start marker
+    // always ends the scan there, whether or not document 0 turned out
+    // empty (`---\n---\n# c\nb: 2\n` must not let document 1's own leading
+    // comment -- or the marker itself -- get swallowed into document 0's
+    // header and printed only once, for document 0).
+    let mut seen_doc_start = false;
     while pos < text.len() {
         let rest = &text[pos..];
+        // Whether this line is header-shaped decides in at most the length
+        // of its leading indentation -- checked before ever looking for
+        // where the line *ends*, so a document whose first real content
+        // starts at column 0 (the overwhelmingly common case, and every
+        // `yq_bench`/`dev bench yq` identity-query workload) costs one
+        // byte comparison, not a scan proportional to the line's length or,
+        // with no line break anywhere in the document, the whole document
+        // (#2811 review: the previous version always found `line_end`
+        // first via a `position` scan over `rest`, unbounded by anything
+        // shorter than the first line).
+        let mut indent_len = 0;
+        while indent_len < rest.len() && (rest[indent_len] == b' ' || rest[indent_len] == b'\t') {
+            indent_len += 1;
+        }
+        let at_break_or_eof = indent_len == rest.len() || is_line_break(rest[indent_len]);
+        if at_break_or_eof {
+            // A truly empty line (nothing, not even trailing whitespace,
+            // before the break/EOF) is header-shaped; one with only
+            // whitespace on it is not (matches real yq: "a whitespace-only
+            // line ahead of the first comment makes yq print a bare `#   `
+            // line", see this function's own doc comment).
+            if indent_len != 0 {
+                return (pos, false);
+            }
+        } else if !(rest[indent_len] == b'#'
+            || (indent_len == 0
+                && (rest[indent_len..].starts_with(b"%YA")
+                    || rest[indent_len..].starts_with(b"---"))))
+        {
+            return (pos, false);
+        }
         let line_end = rest
             .iter()
             .position(|&b| is_line_break(b))
@@ -8195,18 +8292,11 @@ fn yq_header_len(text: &[u8]) -> (usize, bool) {
         } else {
             text.len()
         };
-        let trimmed_start = line.iter().position(|&b| b != b' ' && b != b'\t');
-        let is_header_line = match trimmed_start {
-            None => line.is_empty(),
-            Some(i) => {
-                line[i] == b'#'
-                    || (i == 0 && (line.starts_with(b"%YA") || line.starts_with(b"---")))
-            }
-        };
-        if !is_header_line {
-            return (pos, false);
-        }
         if line.starts_with(b"---") {
+            if seen_doc_start {
+                return (pos, false);
+            }
+            seen_doc_start = true;
             match line.get(3) {
                 None => {}
                 Some(b' ' | b'\t') => return (pos + 3, true),
@@ -15523,6 +15613,23 @@ plain: hello
         }
 
         #[test]
+        fn yq_header_len_rejects_a_long_single_line_document_at_its_first_byte_2811_review() {
+            // A document with no header and no line break at all used to
+            // cost a full scan of the whole input (`position` looking for a
+            // line break that doesn't exist) before concluding there's no
+            // header; the rewrite rejects it at the very first byte instead
+            // (#2811 review). This only pins the *result*, not the scan
+            // bound itself, but any regression back to the old behavior
+            // would still return the same `(0, false)` here.
+            let long_line = "a".repeat(100_000);
+            assert_eq!(yq_header_len(long_line.as_bytes()), (0, false));
+            // Deeply indented non-header content also rejects promptly,
+            // exercising the `indent_len` walk's non-zero, non-comment exit.
+            let indented = format!("{}b: 1\n", " ".repeat(1000));
+            assert_eq!(yq_header_len(indented.as_bytes()), (0, false));
+        }
+
+        #[test]
         fn header_line_breaks_are_normalized() {
             assert_eq!(
                 stream(b"# lead\r\n\r\n---\r\na: 1\r\n"),
@@ -15548,6 +15655,17 @@ plain: hello
             // `line_comment_raw` skips one, and a skipped foot leaves no
             // blank line behind either.
             assert_eq!(stream(yaml), "a: 1\nb: 2\nc: 3");
+        }
+
+        #[test]
+        fn invalid_utf8_comment_line_sandwiched_by_real_ones_inserts_no_blank_2811_review() {
+            // A skipped invalid-UTF-8 line's own line break must not be
+            // double-counted: `# a` and `# b` sandwich `# \xff` with no
+            // genuine blank line anywhere, so `c`'s head block prints both
+            // real lines back to back, exactly as it would with the
+            // invalid line simply absent (#2811 review).
+            let yaml = b"a: 1\n# a\n# \xff\n# b\nc: 2\n";
+            assert_eq!(stream(yaml), "a: 1\n# a\n# b\nc: 2");
         }
 
         #[test]

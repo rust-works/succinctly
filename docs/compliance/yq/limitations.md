@@ -3643,10 +3643,17 @@ Divergences, each classified by `scripts/yq-comment-oracle-fuzz.py`:
   which yq cannot read back); succinctly prints `---` and drops the marker's comment. A
   whitespace-only line ahead of the first comment makes yq print a bare `#   ` line;
   succinctly ends the header there and prints nothing for it.
-- **Placement inherits the parser's attribution**, so every shape #2811 tracks (a comment
-  above a compact `- k: v` item; a column-0 or dedented comment after nested content; a
-  quoted/flow/line-commented value that yq does not let own a foot; the scalar-root foot
-  above) prints where the parser put it, at that node's indent, until #2811 lands.
+
+[#2811](https://github.com/rust-works/succinctly/issues/2811) closed the placement gap
+this section used to record here: a comment above a compact `- k: v` item or a nested
+`- - x` item now attaches to the item as a whole rather than its first key/inner item, a
+column-0 or dedented comment after nested content (including one flush against a
+`---`/`...` boundary) is placed by column rather than handed to the outermost node at
+that column, a quoted/flow/line-commented value's trailing block stays that node's own
+foot instead of forwarding, and a scalar document root gets a foot target of its own
+(plain, anchored, tagged or a standalone alias alike) so its head and foot no longer
+merge. All measured against pinned yq v4.53.3; see `tests/yq_cli_tests.rs`'s
+`standalone_comment_attribution_2811_review` module for the exact shapes.
 
 The same gap covers a bare sequence item's own trailing comment when its value is
 *absent* (`- # c` followed by a sibling item, a dedent, or end of input — #1079's
@@ -3665,15 +3672,15 @@ sequence holding several closes to an outer item or to end of input inside a map
 matching — the rest go forward as the next node's head instead of being discarded to
 match. Two more are separate, pre-existing gaps, not divergences licensed by that
 rule: a tag with no value on the item's next line (`- # c\n  !!str\n- 2\n`) drops both
-tag and comment here where yq keeps the tag and floats the comment; and a floated
-comment whose next sibling is a compact mapping or a nested sequence attaches to that
-item's first key / inner item rather than the item itself — the same misattribution
-#798's standalone-line capture already has for an ordinary (non-floated) comment
-(`- 1\n# h\n- b: 1\n` is `.[1] | head_comment` in real yq, `.[1].b | key |
-head_comment` here), neither introduced by nor fixable within this entry, tracked as a
-follow-up in [#2811](https://github.com/rust-works/succinctly/issues/2811). Blank
-lines in any of these shapes are unmodelled on both sides (yq keeps a `\n` inside the
-slot value and reorders).
+tag and comment here where yq keeps the tag and floats the comment; and — unlike the
+now-fixed *ordinary* (non-floated) case above — a comment *floated* off an absent bare
+item still attaches to its next sibling's first key/inner item rather than the sibling
+itself when that sibling is a compact mapping or a nested sequence (`- # c\n- b: 1\n` is
+`.[1] | head_comment` in real yq, `.[1].b | key | head_comment` here). This residual is
+specific to #1079's floating mechanism, not #2811's ordinary-comment placement it was
+originally conflated with, and has no dedicated tracking issue yet. Blank lines in any
+of these shapes are unmodelled on both sides (yq keeps a `\n` inside the slot value and
+reorders).
 
 Four known gaps this write shares with every other write form, none specific to #798:
 
