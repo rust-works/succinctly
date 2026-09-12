@@ -7369,6 +7369,32 @@ fn test_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
     Ok(())
 }
 
+/// #2687 review: the sentinel-payload divergence
+/// `docs/compliance/jq/limitations.md` records is not merely "sees null
+/// instead of `{"__jq":N}`" -- a shadowing `def error:` observes whatever
+/// `.` happens to be at the break's own textual position, however unrelated
+/// to the label, where jq's own sentinel is fixed and never depends on any
+/// pipeline value. Pinned here (not just in a doc's console block) so a
+/// future change to this mechanism can't silently make the substitute value
+/// worse without a test catching it. `succinctly`'s answer is intentionally
+/// *not* asserted to match jq's -- this row exists to keep the *shape* of
+/// the known divergence from drifting, not to claim fidelity here.
+#[test]
+fn test_break_shadowed_by_def_error_sees_ambient_input_not_jqs_sentinel_2687() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r"def error: {seen: .}; 5 as $x | label $out | ($x | break $out)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    // jq 1.7.1: {"seen":{"__jq":0}} -- the fixed, label-indexed sentinel,
+    // never the unrelated `5` bound three stages earlier.
+    assert_eq!(stdout, "{\"seen\":5}\n", "stderr: {stderr:?}");
+    Ok(())
+}
+
 #[test]
 fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
     // A `break $label` raised from inside `while`/`foreach`/`repeat`'s
