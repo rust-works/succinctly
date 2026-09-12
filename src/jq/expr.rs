@@ -1536,7 +1536,7 @@ pub enum Builtin {
     /// raised early even when the call sits in an unevaluated branch.
     SortKeys(Option<Box<Expr>>),
     /// The shallow reorder-by-key step `SortKeys` desugars its resolved
-    /// paths through via [`crate::jq::eval::eval_update`], reusing that
+    /// paths through via `crate::jq::eval::eval_update`, reusing that
     /// function's own generic path-resolution/write machinery instead of
     /// reimplementing it. Never spelled directly in source -- constructed
     /// only by `SortKeys`'s own evaluation, so it has no parser entry and no
