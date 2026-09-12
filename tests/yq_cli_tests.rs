@@ -45134,3 +45134,138 @@ fn test_literal_inside_pipe_operand_does_not_abort_2771() -> Result<()> {
 
     Ok(())
 }
+
+/// #2855: real yq has a `sort_keys(f)` builtin -- for every path `f`
+/// resolves, reorder that node's own mapping entries by key, shallow, one
+/// level (recursion, as in `sort_keys(..)`, comes entirely from `..`
+/// yielding many paths, not from anything in `sort_keys` itself). Not a jq
+/// builtin at all (`sort_keys/1 is not defined` there too, pinned
+/// separately in `tests/jq_cli_tests.rs`). Every row captured live against
+/// yq v4.53.3 on the fixed input `b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]\n`.
+#[test]
+fn test_yq_sort_keys_builtin_2855() -> Result<()> {
+    let input = "b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]\n";
+    for (filter, want) in [
+        // Shallow: only the root's own two keys move.
+        ("sort_keys(.)", "a:\n  z: 2\n  y: [3, {q: 1, p: 2}]\nb: 1"),
+        // Recursion comes from `..`, not the builtin: every node `..`
+        // visits is independently (shallow) sorted.
+        ("sort_keys(..)", "a:\n  y: [3, {p: 2, q: 1}]\n  z: 2\nb: 1"),
+        // In place: returns the whole document, not just the target.
+        ("sort_keys(.a)", "b: 1\na:\n  y: [3, {q: 1, p: 2}]\n  z: 2"),
+        // A flow mapping sorts and keeps flow style.
+        (
+            "sort_keys(.a.y[1])",
+            "b: 1\na:\n  z: 2\n  y: [3, {p: 2, q: 1}]",
+        ),
+        // Scalar target: no-op.
+        ("sort_keys(.b)", "b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]"),
+        // Absent target: no-op, no vivification (unlike plain `|=`).
+        (
+            "sort_keys(.nope)",
+            "b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]",
+        ),
+        // 2 args: silent no-op, the same leniency #1122 established for
+        // `sub`'s own extra arguments.
+        (
+            "sort_keys(.; .)",
+            "a:\n  z: 2\n  y: [3, {q: 1, p: 2}]\nb: 1",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "`{filter}`: out={out:?}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2855 control: values compose correctly with a preceding pipe stage
+/// (`.a | sort_keys(.)` correctly reorders `.a`'s own keys and returns just
+/// `.a`, matching real yq's `z: 2\ny: [3, {q: 1, p: 2}]`) -- but *not* the
+/// flow style on `y`, since `.a` (a bare navigation stage before the write)
+/// isn't in `is_shape_preserving`'s fixed operator list. That's the
+/// pre-existing, already-tracked #2679 gap ("a preceding stage outside the
+/// shapes `is_alias_sensitive_assign` admits silently drops the write"/
+/// "navigation after the write drops the presentation") applying here for
+/// the first time to a *value*, not just comments -- confirmed this isn't
+/// new or sort_keys-specific: `.a | (.z = 3)` already loses the identical
+/// `.y` flow style on plain `main`, unrelated to this issue. Documented
+/// beside the other #2679 rows in `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_yq_sort_keys_composes_with_pipe_2855() -> Result<()> {
+    let input = "b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]\n";
+    let (out, code) = run_yq_stdin(".a | sort_keys(.)", input, &[])?;
+    assert_eq!(code, 0, "out={out:?}");
+    // real yq: "z: 2\ny: [3, {q: 1, p: 2}]\n" -- flow style kept.
+    assert_eq!(out.trim_end(), "y:\n  - 3\n  - q: 1\n    p: 2\nz: 2");
+    Ok(())
+}
+
+/// #2855: a bare `sort_keys` (no parens at all) or `sort_keys()` (empty
+/// parens) is a *runtime* error in real yq, not a parse-time one --
+/// confirmed live it fires with the exact message below, exit 1 (yq's
+/// uniform error exit code, not jq's separate compile-error 3).
+#[test]
+fn test_yq_sort_keys_missing_arg_2855() -> Result<()> {
+    for filter in ["sort_keys", "sort_keys()"] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_eq!(code, 1, "`{filter}`: stderr={stderr:?}");
+        assert_eq!(
+            stderr.trim_end(),
+            "Error: 'sort_keys' expects 1 arg but received none",
+            "`{filter}`"
+        );
+    }
+    Ok(())
+}
+
+/// #2855: comments and style survive `sort_keys(.)`, matching real yq --
+/// this is a write (goes through the DOM route), so `CommentTree`/
+/// `NodeMeta` carry them through only once `is_alias_sensitive_assign`/
+/// `contains_assign_scoped` (`src/jq/eval.rs`) recognize `Builtin::SortKeys`
+/// as a write at all; before that fix this test failed by losing every
+/// comment and flow style in the whole document, not just the field this
+/// write actually reorders.
+#[test]
+fn test_yq_sort_keys_preserves_comments_and_style_2855() -> Result<()> {
+    let input = "# top\nb: 1 # bc\na: \"s\" # ac\n";
+    let (out, code) = run_yq_stdin("sort_keys(.)", input, &[])?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out.trim_end(), "# top\na: \"s\" # ac\nb: 1 # bc");
+    Ok(())
+}
+
+/// #2855: on the stream's own invariant shape, real yq emits output it
+/// cannot itself read back (an alias before its own anchor's declaration) --
+/// ADR-0018 rule 4(a) territory. `sort_keys(f)` takes the same licensed
+/// divergence `--sort-keys` already does (#1350): drop the alias mark and
+/// print the anchor's value in its place, through the same
+/// `enforce_anchor_soundness` pass, rather than reproduce yq's own unsound
+/// output. Documented in `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_yq_sort_keys_anchor_soundness_2855() -> Result<()> {
+    let input = "b: &x 1\na: *x\n";
+    let (out, code) = run_yq_stdin("sort_keys(..)", input, &[])?;
+    assert_eq!(code, 0, "out={out:?}");
+    // real yq: "a: *x\nb: &x 1\n" -- unsound, `*x` declared nowhere above it.
+    assert_eq!(out.trim_end(), "a: 1\nb: &x 1");
+    Ok(())
+}
+
+/// #2855: `sort_keys(.a[])` and `sort_keys(.a.nope[])` both no-op cleanly --
+/// the former because `.a`'s own elements (`2`, an array) are never
+/// mappings, the latter because `.a.nope` doesn't exist at all (the
+/// existence check runs on the path's prefix *before* the `[]` fan-out, so
+/// an absent container short-circuits without ever reaching `resolve
+/// each element` -- confirmed this doesn't also wrongly drop `sort_keys(.a[])`
+/// itself, which does have a container to fan out over).
+#[test]
+fn test_yq_sort_keys_absent_prefix_before_iterate_2855() -> Result<()> {
+    let input = "b: 1\na:\n  z: 2\n  y: [3, {q: 1, p: 2}]\n";
+    for filter in ["sort_keys(.a[])", "sort_keys(.a.nope[])"] {
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(code, 0, "`{filter}`: out={out:?}");
+        assert_eq!(out.trim_end(), input.trim_end(), "`{filter}`");
+    }
+    Ok(())
+}

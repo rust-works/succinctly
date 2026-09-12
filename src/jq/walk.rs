@@ -64,7 +64,8 @@ pub enum BuiltinKids<'a> {
 pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
     match builtin {
         // --- No sub-expression (126) ---------------------------------------
-        Builtin::Type
+        Builtin::SortKeysOneLevel
+        | Builtin::Type
         | Builtin::IsNull
         | Builtin::IsBoolean
         | Builtin::IsNumber
@@ -253,6 +254,13 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Tz(e)
         | Builtin::Load(e)
         | Builtin::AtOffset(e) => BuiltinKids::One(e),
+        // `Option<Box<Expr>>`, not `Box<Expr>` -- #2855's `None` case (a
+        // bare `sort_keys`/`sort_keys()` call with no usable argument) has
+        // no sub-expression at all, so it can't join the group above.
+        Builtin::SortKeys(path) => match path {
+            Some(e) => BuiltinKids::One(e),
+            None => BuiltinKids::None,
+        },
 
         // --- Two sub-expressions (20) --------------------------------------
         Builtin::UpperInSrc(a, b)
@@ -354,7 +362,8 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
         // --- No sub-expression (126) ---------------------------------------
-        Builtin::Type
+        Builtin::SortKeysOneLevel
+        | Builtin::Type
         | Builtin::IsNull
         | Builtin::IsBoolean
         | Builtin::IsNumber
@@ -530,6 +539,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::Pick(e) => Builtin::Pick(Box::new(f(e))),
         Builtin::Omit(e) => Builtin::Omit(Box::new(f(e))),
         Builtin::Del(e) => Builtin::Del(Box::new(f(e))),
+        Builtin::SortKeys(path) => Builtin::SortKeys(path.as_deref().map(|e| Box::new(f(e)))),
         Builtin::FirstStream(e) => Builtin::FirstStream(Box::new(f(e))),
         Builtin::LastStream(e) => Builtin::LastStream(Box::new(f(e))),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(f(e))),

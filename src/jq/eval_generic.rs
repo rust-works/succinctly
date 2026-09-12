@@ -20831,7 +20831,14 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Line
             | Builtin::Column
             | Builtin::Del(_)
-            | Builtin::Select(_) => Keeps,
+            | Builtin::Select(_)
+            // #2855: same class as `Del(_)` above -- a write that returns
+            // the whole document, standing where it stood.
+            | Builtin::SortKeys(_)
+            // Internal-only filter `SortKeys` desugars through (never
+            // spelled in source); a value computed from the node it's
+            // applied to, same as `AsciiDowncase`/`ToJson`/`Sort` above.
+            | Builtin::SortKeysOneLevel => Keeps,
             // spine 2416 (walk residue), captured from yq v4.53.3 (`.s | F
             // | key` is `"s"`, `.s | F | path` is `["s"]`, `.x | F | key` is
             // `"x"` where `F` accepts the value; the capture set is the

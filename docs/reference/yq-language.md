@@ -222,17 +222,18 @@ succinctly yq --eval-all '[.] | reduce .[] as $item ({}; . * $item)' f1.yaml f2.
 
 ### yq-Specific Operators
 
-| Operator      | Description                                  | Example                        |
-|---------------|----------------------------------------------|--------------------------------|
-| `pick(keys)`  | Select only specified keys                   | `pick(["a", "b"])`             |
-| `omit(keys)`  | Remove specified keys (inverse of pick)      | `omit(["temp", "debug"])`      |
-| `shuffle`     | Randomly shuffle array elements              | `[1,2,3] \| shuffle`           |
-| `pivot`       | Transpose arrays/objects (SQL-style)         | `[[1,2],[3,4]] \| pivot`       |
-| `load(file)`  | Load external YAML/JSON file                 | `load("config.yaml")`          |
-| `parent`      | Return parent node                           | `.. \| select(.name) \| parent`|
-| `parent(n)`   | Return nth parent node                       | `parent(2)`                    |
-| `downcase`    | Lowercase ASCII characters                   | `"HELLO" \| downcase`          |
-| `upcase`      | Uppercase ASCII characters                   | `"hello" \| upcase`            |
+| Operator       | Description                                  | Example                         |
+|----------------|----------------------------------------------|---------------------------------|
+| `pick(keys)`   | Select only specified keys                   | `pick(["a", "b"])`              |
+| `omit(keys)`   | Remove specified keys (inverse of pick)      | `omit(["temp", "debug"])`       |
+| `shuffle`      | Randomly shuffle array elements              | `[1,2,3] \| shuffle`            |
+| `pivot`        | Transpose arrays/objects (SQL-style)         | `[[1,2],[3,4]] \| pivot`        |
+| `load(file)`   | Load external YAML/JSON file                 | `load("config.yaml")`           |
+| `parent`       | Return parent node                           | `.. \| select(.name) \| parent` |
+| `parent(n)`    | Return nth parent node                       | `parent(2)`                     |
+| `downcase`     | Lowercase ASCII characters                   | `"HELLO" \| downcase`           |
+| `upcase`       | Uppercase ASCII characters                   | `"hello" \| upcase`             |
+| `sort_keys(f)` | Sort a mapping's own keys, shallow (yq only) | `sort_keys(.)`                  |
 
 ```bash
 # Remove keys from object

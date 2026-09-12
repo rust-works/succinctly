@@ -46013,6 +46013,21 @@ fn test_jq_mode_has_no_downcase_upcase_2462() -> Result<()> {
     Ok(())
 }
 
+/// #2855: yq's `sort_keys(f)` builtin is not a real jq name either -- jq
+/// 1.7.1 reports `sort_keys/1 is not defined` (confirmed live), the same
+/// way `downcase`/`upcase` above do. yq mode's own coverage lives in
+/// `test_yq_sort_keys_builtin_2855` (yq_cli_tests.rs).
+#[test]
+fn test_jq_mode_has_no_sort_keys_2855() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_streams("sort_keys(.)", "{\"a\":1}", &[])?;
+    assert_ne!(code, 0, "sort_keys(.) should be rejected in jq mode");
+    assert!(
+        stderr.contains("sort_keys/1 is not defined"),
+        "stderr should say sort_keys/1 is not defined, got: {stderr}"
+    );
+    Ok(())
+}
+
 /// #2459: yq mode's new "numeric index on a mapping is null" rule
 /// (`eval::yq_numeric_index_on_object_is_null`) must not leak into jq mode
 /// -- jq 1.7.1 raises `Cannot index object with number` here unconditionally,

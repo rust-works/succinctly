@@ -1311,7 +1311,17 @@ fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool 
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
         | Expr::MetaAssign { .. }
-        | Expr::Builtin(Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_)) => true,
+        // #2855: `sort_keys(f)` is a write (delegates to `eval_update`
+        // internally, `builtin_sort_keys`), so it needs the same
+        // recognition `Del`/`SetPath`/`DelPaths` already get here --
+        // otherwise `is_alias_sensitive_assign` below never sees it as a
+        // write at all, `presentation_sync_ctx` stays `None`, and the CLI
+        // falls back to an empty `CommentTree` for the whole document,
+        // losing every sibling's comments and flow style, not just the
+        // path this write actually touches.
+        | Expr::Builtin(
+            Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_) | Builtin::SortKeys(_),
+        ) => true,
         Expr::Paren(inner) | Expr::Optional(inner) => contains_assign_scoped(inner, scope),
         Expr::Shared(inner) => contains_assign_scoped(inner, scope),
         Expr::Pipe(stages) => stages
@@ -1393,6 +1403,7 @@ pub fn is_alias_sensitive_assign(expr: &Expr) -> bool {
                 Builtin::Del(_)
                 | Builtin::SetPath(..)
                 | Builtin::DelPaths(_)
+                | Builtin::SortKeys(_)
                 | Builtin::Select(_)
                 | Builtin::Empty
                 | Builtin::Debug
@@ -10185,6 +10196,21 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 11: Path manipulation
         Builtin::Del(path) => builtin_del::<W, S>(path, value, optional),
+        Builtin::SortKeys(path) => builtin_sort_keys::<W, S>(path.as_deref(), value, optional),
+        Builtin::SortKeysOneLevel => {
+            let owned = match to_owned(&value) {
+                Ok(v) => v,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
+            match owned {
+                OwnedValue::Object(obj) => {
+                    let mut sorted: Vec<(String, OwnedValue)> = obj.into_iter().collect();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    QueryResult::Owned(OwnedValue::Object(sorted.into_iter().collect()))
+                }
+                other => QueryResult::Owned(other),
+            }
+        }
 
         // Phase 12: Additional builtins
         Builtin::Now => builtin_now::<W>(),
@@ -22914,6 +22940,50 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
+    eval_update_impl::<W, S>(
+        path_expr,
+        filter_expr,
+        input,
+        optional,
+        scalar_slice_noop,
+        false,
+    )
+}
+
+/// #2855: `sort_keys(f)` is the one caller that must *not* vivify an absent
+/// target -- confirmed live against yq v4.53.3, `sort_keys(.nope)` on a
+/// document with no `.nope` leaves it completely unchanged, where every
+/// other `|=`-shaped write (including plain `.nope |= .`) does create it.
+/// `skip_absent_paths` filters `paths` down to the ones that already exist
+/// in `result` right after they're resolved, before the write loop below
+/// ever runs -- an empty survivor set just makes that loop run zero times,
+/// so `builtin_sort_keys` needs no special-case for "every path was
+/// filtered out" beyond calling this instead of [`eval_update`].
+fn eval_update_no_vivify<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    filter_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+    scalar_slice_noop: bool,
+) -> QueryResult<'a, W> {
+    eval_update_impl::<W, S>(
+        path_expr,
+        filter_expr,
+        input,
+        optional,
+        scalar_slice_noop,
+        true,
+    )
+}
+
+fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    filter_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+    scalar_slice_noop: bool,
+    skip_absent_paths: bool,
+) -> QueryResult<'a, W> {
     if S::TAG == EvalTag::Yq {
         if let Some(e) = yq_metadata_builtin_as_assign_path_error(path_expr) {
             return QueryResult::Error(e);
@@ -22946,6 +23016,31 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
         Err((_, escape)) => return escape.into(),
     };
+    // #2855: drop any resolved path that doesn't already exist, before the
+    // write loop below ever runs -- only `sort_keys(f)` sets this (see
+    // `eval_update_no_vivify`'s own doc comment for why). Checked only up
+    // to the first `Iterate`/`Slice` component: a path fans out past that
+    // point, and `navigate_read_only` has no arm for either (it always
+    // answers "doesn't exist" for one), so requiring the whole path to
+    // resolve read-only would wrongly drop `sort_keys(.a[])` outright. The
+    // *prefix* existing is enough -- `update_path`'s own native per-element
+    // fan-out below decides the rest.
+    if skip_absent_paths {
+        paths.retain(|path| {
+            let mut steps = Vec::new();
+            push_path_components(&mut steps, path);
+            let prefix_len = steps
+                .iter()
+                .position(|s| {
+                    matches!(
+                        unwrap_path_component(s).0,
+                        Expr::Iterate | Expr::Slice { .. }
+                    )
+                })
+                .unwrap_or(steps.len());
+            navigate_read_only(&result, &steps[..prefix_len])
+        });
+    }
     // #1351: redirect through aliases. `|=` is the one operator whose
     // *terminal* alias position is also redirected, and only when the filter
     // is itself a shape-preserving write (`.b |= (.p = 9)` mutates the shared
@@ -42844,6 +42939,48 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         alias_identity::mirror_after_write(pre, &mut result);
     }
     QueryResult::Owned(result)
+}
+
+/// `sort_keys(f)` (yq, #2855): for every path `f` resolves, reorder that
+/// node's own mapping entries by key -- shallow, one level. Delegates to
+/// [`eval_update_no_vivify`] with a synthetic `Builtin::SortKeysOneLevel`
+/// filter rather than reimplementing path resolution and writeback: this
+/// reuses `|=`'s own handling of multi-output paths (`sort_keys(..)`'s
+/// recursion comes entirely from `..` yielding many paths, not from
+/// anything here), scalar targets (no-op), and alias/comment/style
+/// preservation through the DOM write path (once `is_alias_sensitive_assign`/
+/// `contains_assign_scoped` know `SortKeys` is a write at all) -- all
+/// confirmed live against yq v4.53.3 to already match without any
+/// sort_keys-specific handling of those cases.
+///
+/// The one place `|=`'s own generic behavior does *not* match is an absent
+/// target: plain `|=` vivifies (`.nope |= .` creates `nope: null`, matching
+/// real yq), but `sort_keys(.nope)` on an absent `.nope` is confirmed live
+/// to leave the document completely unchanged -- hence
+/// `eval_update_no_vivify` rather than `eval_update`.
+///
+/// `path` is `None` for a call with no usable argument (bare `sort_keys` or
+/// `sort_keys()`) -- confirmed live that real yq raises this as a *runtime*
+/// error, not at parse/compile time, so it surfaces here rather than in the
+/// parser.
+fn builtin_sort_keys<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let Some(path) = path else {
+        return suppress_or_raise(
+            EvalError::new("'sort_keys' expects 1 arg but received none"),
+            optional,
+        );
+    };
+    eval_update_no_vivify::<W, S>(
+        path,
+        &Expr::Builtin(Builtin::SortKeysOneLevel),
+        value,
+        optional,
+        true,
+    )
 }
 
 /// Delete a value at a path expression.

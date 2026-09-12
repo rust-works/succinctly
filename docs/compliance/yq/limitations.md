@@ -298,6 +298,20 @@ every M2-streamable filter, not just identity (`--sort-keys '.outer'`, `--sort-k
 ...) — the fallback now evaluates the real filter expression instead of always assuming `.`,
 so any shape that can reach the M2 fast path gets the same soundness check.
 
+[#2855](https://github.com/rust-works/succinctly/issues/2855)'s `sort_keys(f)` builtin (as
+opposed to this `--sort-keys` flag) takes the identical licensed divergence on the same
+inversion shape, through the same `enforce_anchor_soundness` pass — it's a write, so it
+always takes the DOM route already:
+
+```bash
+$ printf 'b: &x 1\na: *x\n' | yq 'sort_keys(..)'              # real yq: unsound
+a: *x
+b: &x 1
+$ printf 'b: &x 1\na: *x\n' | succinctly yq 'sort_keys(..)'   # sound: value, not the mark
+a: 1
+b: &x 1
+```
+
 Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
 kind drops its `&anchor`, where real yq keeps it),
@@ -3921,6 +3935,12 @@ Four known gaps this write shares with every other write form, none specific to 
   introduced it — real yq has no `def`/user-defined-function syntax at all, so there is no
   oracle for that second case. Tracked as #2679; pinned by
   `preceding_stage_outside_the_admitted_shapes_silently_drops_the_write`.
+  [#2855](https://github.com/rust-works/succinctly/issues/2855)'s `sort_keys(f)` hits this
+  same gap through a value, not just a comment: `.a | sort_keys(.)` correctly reorders
+  `.a`'s own keys and returns just `.a` (matching real yq), but loses `.a.y`'s flow style —
+  the identical loss `.a | (.z = 3)` already had on `main`, confirmed unrelated to
+  `sort_keys` itself. Pinned by `test_yq_sort_keys_composes_with_pipe_2855`
+  (`tests/yq_cli_tests.rs`).
 
 Finally, one rule real yq decides by the target's value, reproduced rather than "fixed":
 a `line_comment` written onto a **block-rendered container** is dropped (`.a line_comment
