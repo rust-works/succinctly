@@ -2115,6 +2115,18 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::And(left, right) | Expr::Or(left, right) => {
             needs_path_context(left) || needs_path_context(right)
         }
+        // `//` (#2782, #2665 item 1): the same reasoning as `and`/`or` just
+        // above -- a `key`/`parent`/`file_index` can sit in either operand,
+        // and without this arm a pipe whose only read is inside a `//` was
+        // never routed to path-context evaluation at all: `.a | to_entries |
+        // .[] | (key // 99)` answered `99` where the bare `.[] | key` is
+        // `0` (yq v4.53.3 answers `0` for both). #2782 found that adding the
+        // arm alone traded that gap for several -- the owned identity
+        // route's own `//` arm spelled a read inside either side as a
+        // detached literal and truncated a multi-output left side to its
+        // first output -- so it lands together with that arm's rewrite
+        // (`eval_generic::eval_owned_identity_alternative`).
+        Expr::Alternative(left, right) => needs_path_context(left) || needs_path_context(right),
         // Same reasoning as `Arithmetic` above: a `key`/`file_index` can
         // hide inside unary minus's single operand too, e.g.
         // `-(file_index)` (#1100). Without this arm the whole pipe reports

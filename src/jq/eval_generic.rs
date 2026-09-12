@@ -10061,9 +10061,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         // `c: [10, 20]`), which is what the eager route answered and what
         // the staged fallback below would lose.
         if let Some(root) = cursor {
-            if exprs.first().is_some_and(owned_identity_pipe_entry_stage)
-                && owned_identity_pipe_supported(exprs)
-            {
+            if owned_identity_pipe_enters_at_first(exprs) {
                 // STYLE-0012: an undecodable node is the decode failure the
                 // whole query answers with (#1755), not something this
                 // route's ambient `?` may swallow -- the same rule the
@@ -17281,6 +17279,15 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::And(left, right) | Expr::Or(left, right) => {
             path_context_single_native(left) && path_context_single_native(right)
         }
+        // #2782: `eval_single`'s own `Expr::Alternative` arm (#2476) evaluates
+        // both sides through `eval_single` *with the cursor*, so `//` is native
+        // on the same terms as `and`/`or` just above. Until `needs_path_context`
+        // gained its `Alternative` arm this entry was moot -- a `//` was never
+        // seen as reading path context -- and the `_` arm below would now
+        // call it non-native for exactly the shapes it answers natively.
+        Expr::Alternative(left, right) => {
+            path_context_single_native(left) && path_context_single_native(right)
+        }
         Expr::Try { expr, catch } => {
             path_context_single_native(expr)
                 && catch
@@ -20470,8 +20477,6 @@ enum OwnedIdentityRule {
     /// `min`/`max`: the output *is* one of the input's children, at its own
     /// position.
     Extremum,
-    /// `a // b`: the output stands where whichever side produced it stood.
-    Alternative,
     /// A literal slice. Mode decides (ADR-0018): real yq keeps the
     /// container's position (`.a | .[0:3] | .[0] | path` is `["a",0]`,
     /// `parent | parent` the root), while jq mode follows jq's own
@@ -20515,8 +20520,7 @@ enum OwnedIdentityRule {
 
 fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
     use OwnedIdentityRule::{
-        Alternative, Bound, Detaches, DetachesContainer, Extremum, Keeps, KeyNode, LeftOperand,
-        Slice,
+        Bound, Detaches, DetachesContainer, Extremum, Keeps, KeyNode, LeftOperand, Slice,
     };
     Some(match strip_parens(stage) {
         Expr::Slice { .. } => Slice,
@@ -20568,7 +20572,16 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
         // `.a.b | (false or parent) | key` print nothing, `.a.b | (parent or
         // false) | path` is `["a"]`.
         Expr::And(..) | Expr::Or(..) => LeftOperand,
-        Expr::Alternative(..) => Alternative,
+        // #2782: `//` has no rule. Its outputs are its operands' outputs,
+        // each standing where *that* output stood, and a rule places one
+        // output at a time from the stage's input -- which is how a
+        // multi-output left side (`(.a, .b) // 9 | key`) came out stamped
+        // with the first output's position. It is a transparent construct
+        // now, like `,` and `if`: `eval_owned_identity_stages`'s own arm
+        // runs each side as stages of this pipe, and a pipe that *starts*
+        // with one enters the identity route whole
+        // (`owned_identity_pipe_entry_stage`).
+        Expr::Alternative(..) => return None,
         // The builtin match is exhaustive on purpose (spine 2416, walk
         // residue): a new builtin is a compile error here, not a silent
         // hand-over to an evaluator that no longer exists to answer it.
@@ -21027,18 +21040,15 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                     return false;
                 }
             }
-            // spine 2416 (identity pass): a read inside either side of `//`
-            // is resolved at this position before the alternative is taken
-            // (the rewrite spells it as a literal, which
-            // `owned_identity_operand` places as one).
+            // #2782: each side of `//` runs as stages of this pipe (see
+            // `eval_owned_identity_alternative`), so the gate is the one
+            // `,` and `if` apply to their branches. Until #2782 a side with
+            // a read in it was admitted only through the constant rewrite,
+            // which spelled `key`/`file_index` as detached literals -- the
+            // position `(key // 9) | parent` and `(file_index // 9) | key`
+            // then had nothing to answer from.
             Expr::Alternative(left, right) => {
-                if needs_path_context(stage) {
-                    if !owned_identity_stage_resolvable(stage) {
-                        return false;
-                    }
-                } else if !owned_identity_operand_supported(left)
-                    || !owned_identity_operand_supported(right)
-                {
+                if !body(left) || !body(right) {
                     return false;
                 }
             }
@@ -21219,10 +21229,7 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
     // sends such a pipe to `collect_each_generic`, which is what puts it on
     // `eval_each_pipe_generic`'s own entry for the same shape, so the two
     // routes share one definition instead of gaining a second.
-    if exprs.iter().any(needs_path_context)
-        && exprs.first().is_some_and(owned_identity_pipe_entry_stage)
-        && owned_identity_pipe_supported(exprs)
-    {
+    if exprs.iter().any(needs_path_context) && owned_identity_pipe_enters_at_first(exprs) {
         return true;
     }
     for (i, stage) in exprs.iter().enumerate() {
@@ -21230,9 +21237,20 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
             continue;
         }
         let rest = &exprs[i + 1..];
-        return rest.iter().any(needs_path_context)
-            && owned_identity_leaving_stage_supported(stage)
-            && owned_identity_pipe_supported(rest);
+        if !rest.iter().any(needs_path_context) {
+            return false;
+        }
+        // #2782: the leaving stage may also be an entry stage -- `//`, `as`
+        // -- reached after a navigational head (`. | (null // .b) | key`).
+        // `eval_each_pipe_generic` already runs that shape: its staged driver
+        // hands each navigated node's `rest` back to itself, where the
+        // entry-stage door takes it. This is the non-sink route's gate, so
+        // without this arm the yq CLI's DOM path answered nothing where the
+        // jq CLI's sink pipeline answered `"b"`.
+        return (owned_identity_leaving_stage_supported(stage)
+            && owned_identity_pipe_supported(rest))
+            || (owned_identity_pipe_entry_stage(stage)
+                && owned_identity_pipe_supported(&exprs[i..]));
     }
     false
 }
@@ -21257,6 +21275,41 @@ fn owned_identity_pipe_entry_stage(stage: &Expr) -> bool {
     !path_context_is_navigational(stage)
         && !path_context_stage_preserves_node(stage)
         && owned_identity_rule(stage).is_none()
+}
+
+/// Whether a pipe enters the owned identity route at its *first* stage: the
+/// stage is an [`owned_identity_pipe_entry_stage`] and the whole pipe is
+/// [`owned_identity_pipe_supported`] -- except for a `//` that nothing reads
+/// after (#2782). `eval_each_pipe_generic`'s door and
+/// [`owned_identity_pipe_applies`] (the non-sink route's gate) share it so the
+/// two routes cannot disagree about where such a pipe runs.
+///
+/// The exception: `//` became an entry stage in #2782 (it has no placement
+/// rule, see [`owned_identity_rule`]), and the identity route materializes
+/// its input. At a live cursor with no path-context read after it there is
+/// nothing for that route to answer that `eval_single`'s own cursor-native
+/// `Expr::Alternative` arm does not -- both operands run with the cursor
+/// there (#2476), so `.a | (parent // 1)` is the *node* `parent` landed on,
+/// flow style, anchor and trailing comment intact, where the identity route
+/// would print a re-rendered copy (`a: {b: 1} # c` came out as a block
+/// mapping without the comment). A read *after* the operator still enters
+/// here: its answer depends on which operand produced the output, which only
+/// the identity route tracks (`eval_owned_identity_alternative`).
+fn owned_identity_pipe_enters_at_first(exprs: &[Expr]) -> bool {
+    let Some((first, rest)) = exprs.split_first() else {
+        return false;
+    };
+    owned_identity_pipe_entry_stage(first)
+        && owned_identity_pipe_supported(exprs)
+        && !alternative_stays_cursor_native(first, rest)
+}
+
+/// A `//` stage that stays on the cursor route (#2782): cursor-native in
+/// `eval_single`, with nothing after it reading path context.
+fn alternative_stays_cursor_native(first: &Expr, rest: &[Expr]) -> bool {
+    matches!(strip_parens(first), Expr::Alternative(..))
+        && path_context_stage_native(first)
+        && !rest.iter().any(needs_path_context)
 }
 
 /// Whether `stage` can be the one a pipe leaves the cursor domain at: it
@@ -21878,8 +21931,8 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
 
 /// The identity of `output`, an output of `stage` evaluated over `value`
 /// (whose identity is `id`), per the stage's [`OwnedIdentityRule`].
-/// `Alternative` is not answered here: its output is chosen by
-/// [`eval_owned_identity_alternative`], which knows which side produced it.
+/// `//` has no rule and is not answered here: its outputs are its operands'
+/// own, placed by [`eval_owned_identity_alternative`] as it runs them.
 fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
     stage: &Expr,
     rule: OwnedIdentityRule,
@@ -22029,9 +22082,6 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             component.map(|component| id.child(&parent, component))
-        }
-        OwnedIdentityRule::Alternative => {
-            unreachable!("Alternative is evaluated by eval_owned_identity_alternative")
         }
     })
 }
@@ -22212,21 +22262,73 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// `a // b` over an owned value with identity: the left operand's value if
-/// it is truthy (errors in it suppressed, as `//` does), else the right's.
+/// `left // right` over an owned value with identity (#2782): `left` runs as
+/// stages of this pipe from `(value, id)`, every truthy output continues
+/// into `rest` standing exactly where it was produced -- a `key` at its key
+/// node, a `file_index` where the node stood, a `parent` at the ancestor,
+/// each output of a comma at its own position -- and `right` runs the same
+/// way only when nothing truthy came out. The rule is `eval_single`'s own
+/// `Expr::Alternative` arm's, captured from jq 1.7.1: a falsy output is
+/// dropped, a truthy one is kept, an error on the left propagates after the
+/// truthy outputs before it (`(1, error("x")) // 2` prints `1`, exits 5)
+/// and the right side then never runs, a `break` escapes the operator.
+/// `optional` reaches both sides unchanged, as it does on that arm and on
+/// `eval::eval_alternative`.
+///
+/// This replaces an operand-shaped arm that answered one output per side and
+/// stamped it with the identity of the side's *first* output, evaluated a
+/// second time (`(.a, .b) // 9 | key` was `"a"`, `"a"`; yq v4.53.3 answers
+/// `"a"`, `"b"`), rewrote a read inside either side to a detached literal
+/// first (`(key // 9) | parent` printed nothing where the bare `key | parent`
+/// is the enclosing map), and forced `optional = true` onto the left side
+/// (`.a | tostring | (.x // 1) | key` swallowed the `Cannot index string`
+/// that `.a | tostring | (.x // 1)` raises).
+///
+/// An escape raised in `rest` is kept apart from one raised by `left` and
+/// reported as the pipe's, the same split [`eval_owned_identity_scoped`]
+/// makes -- otherwise a downstream error would read as "the left side
+/// failed" and be indistinguishable from one that should stop the right
+/// side from running.
 fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     left: &Expr,
     right: &Expr,
-    value: &OwnedValue,
-    id: &OwnedIdentity<V>,
+    rest: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
     optional: bool,
-) -> Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError> {
-    if let Some((v, vid)) = owned_identity_operand::<S, V>(left, value, id, true)? {
-        if v.is_truthy() {
-            return Ok(Some((v, vid)));
-        }
+    mut tail: OwnedIdentityTail<'_, V>,
+) -> Flow {
+    let mut any_truthy = false;
+    let mut rest_escape: Option<Control> = None;
+    let left_flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(left),
+        value.clone(),
+        id.clone(),
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, vid| {
+            if !v.is_truthy() {
+                return Flow::Exhausted;
+            }
+            any_truthy = true;
+            match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
+                Flow::Escaped(control) => {
+                    mark_nonretryable_escape(&control);
+                    rest_escape = Some(control);
+                    Flow::Stopped { pending: None }
+                }
+                other => other,
+            }
+        }),
+    );
+    if let Some(control) = rest_escape {
+        return Flow::Escaped(control);
     }
-    owned_identity_operand::<S, V>(right, value, id, optional)
+    match left_flow {
+        Flow::Exhausted if !any_truthy => {
+            eval_owned_identity_spliced::<S, V>(right, rest, value, id, optional, tail)
+        }
+        other => other,
+    }
 }
 
 /// Which map-family builtin a stage is (#2471, gate reason 1 of spine 2416).
@@ -23086,35 +23188,11 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 None => Flow::Exhausted,
             }
         }
+        // #2782: a transparent construct, like `,` and `if` -- each side runs
+        // as stages of this pipe, so its outputs keep the positions they were
+        // produced at. See [`eval_owned_identity_alternative`].
         Expr::Alternative(left, right) => {
-            // spine 2416 (identity pass): a read inside either side is
-            // resolved at this position first; the rewrite spells it as a
-            // literal, which `owned_identity_operand` places as one.
-            let escaped = core::cell::RefCell::new(None);
-            let resolved;
-            let (left, right) = if needs_path_context(stage) {
-                resolved =
-                    match owned_identity_resolve_at::<S, V>(stage, &value, &id, optional, &escaped)
-                    {
-                        Ok(e) => e,
-                        Err(e) => return Flow::Escaped(Control::Error(e)),
-                    };
-                let Expr::Alternative(l, r) = strip_parens(&resolved) else {
-                    unreachable!("the rewrite keeps a node's own kind")
-                };
-                (&**l, &**r)
-            } else {
-                (&**left, &**right)
-            };
-            let flow =
-                match eval_owned_identity_alternative::<S, V>(left, right, &value, &id, optional) {
-                    Ok(Some((v, vid))) => {
-                        eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
-                    }
-                    Ok(None) => Flow::Exhausted,
-                    Err(e) => Flow::Escaped(Control::Error(e)),
-                };
-            owned_identity_after_prefetch(flow, escaped)
+            eval_owned_identity_alternative::<S, V>(left, right, rest, value, id, optional, tail)
         }
         // spine 2416 (#2563): the binding keeps this stage's identity for
         // its body -- see [`eval_owned_identity_as`].
@@ -23547,17 +23625,6 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
             // internal invariant it is.
             let input = to_owned_cursor(&cursor)?;
             owned_identity_after_stage::<S, V>(stage, rule, &input, &id, output, optional)
-        }
-        OwnedIdentityRule::Alternative => {
-            let Expr::Alternative(left, right) = strip_parens(stage) else {
-                unreachable!("Alternative is assigned to Expr::Alternative only")
-            };
-            // STYLE-0012: same invariant as the arm above.
-            let input = to_owned_cursor(&cursor)?;
-            Ok(
-                eval_owned_identity_alternative::<S, V>(left, right, &input, &id, optional)?
-                    .map(|(_, oid)| oid),
-            )
         }
     }
 }

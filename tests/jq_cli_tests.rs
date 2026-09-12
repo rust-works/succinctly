@@ -46799,13 +46799,19 @@ fn test_alternative_control_flow_2476() -> Result<()> {
 /// mode (real jq 1.7.1 errors on all three), so there is no jq oracle here.
 /// yq mode is the oracle-backed sibling, and the two now agree.
 ///
-/// Two shapes deliberately left alone, both unchanged by this commit and both
-/// matching what the yq test records: an *absent* position
-/// (`.a.missing | (key // 1)`) still answers the fallback rather than
-/// `"missing"`, and a `//` after `to_entries` has left the cursor domain
-/// before the `//` is reached, so `needs_path_context`'s lack of an
-/// `Expr::Alternative` arm still keeps that pipe off path-context evaluation
-/// (#715/#1405's recursion table, pinned by #2416, not this arm's).
+/// Two shapes #2692 left unreached are fixed as a side effect of #2782's
+/// rewrite (`//` became a fully transparent construct -- see
+/// `eval_owned_identity_alternative` -- rather than an operand-shaped rule
+/// evaluated at the pipe's outer position): `.a.missing | key` answers
+/// `"missing"` (a pre-existing, unrelated quirk of the bare `key` extension
+/// on a synthesized/absent node -- not this issue's concern), and `(key //
+/// 1)` now agrees with it instead of falling through to `1`; a `//` reached
+/// after `to_entries | .[]` now sees each iteration's own position instead of
+/// leaving the cursor domain beforehand, so `(key // 99)` agrees with bare
+/// `key` (`0`, `1`) instead of always answering the fallback `99`. Asserted
+/// against the bare spelling rather than a hardcoded literal, matching
+/// #2782's own acceptance rule: the `//` spelling must agree with the bare
+/// spelling, whatever that bare spelling itself answers.
 #[test]
 fn test_alternative_operands_read_the_real_position_in_jq_mode_2692() -> Result<()> {
     let doc = r#"{"a":{"b":1,"e":2}}"#;
@@ -46827,15 +46833,23 @@ fn test_alternative_operands_read_the_real_position_in_jq_mode_2692() -> Result<
         assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
-    // The two shapes this does not reach, pinned so the table above is not
-    // read as "position reading through `//` is now generally correct".
-    for (filter, want) in [
-        (".a.missing | (key // 1)", "1"),
-        (".a | to_entries | .[] | (key // 99)", "99\n99"),
+    // #2782: two shapes #2692 could not reach, now agreeing with bare `key`.
+    for (filter, bare) in [
+        (".a.missing | (key // 1)", ".a.missing | key"),
+        (
+            ".a | to_entries | .[] | (key // 99)",
+            ".a | to_entries | .[] | key",
+        ),
     ] {
+        let (want, want_stderr, want_code) = run_jq_full(&["-c", bare], Some(doc))?;
+        assert_eq!(want_code, 0, "`{bare}` -- stderr: {want_stderr:?}");
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
-        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want.trim(),
+            "`{filter}` should agree with `{bare}` -- stderr: {stderr:?}"
+        );
     }
 
     Ok(())
@@ -48556,6 +48570,72 @@ fn test_nth_result_twin_forces_skipped_elements_2666() -> Result<()> {
     assert_eq!(code, 5, "stdout: {out:?} stderr: {err:?}");
     assert!(out.trim().is_empty(), "nothing may be emitted, got {out:?}");
     assert!(err.contains("cannot be divided"), "stderr: {err:?}");
+    Ok(())
+}
+
+/// #2782: the owned identity route's `//` arm forced `optional = true` onto
+/// its left operand -- its own comment said "errors in it suppressed, as `//`
+/// does", which jq's `//` does not do: `jq -n '5 | (.a // 1)'` is `Cannot
+/// index number with "a"`, exit 5, and `(1, error("x")) // 2` prints `1`
+/// then exits 5 with the right side never run (both captured live from
+/// 1.7.1). So a pipe that reached that arm -- one with a path-context read
+/// after the `//`, here the extension builtins `key`/`parent` -- swallowed an
+/// error the same pipe without the read raised. The arm runs each side as
+/// stages of the pipe now, with `optional` passed through as `eval_single`'s
+/// and `eval.rs`'s `//` arms already do, so the two spellings agree: the
+/// oracle-checkable spelling (no read) pins the rule, the read spelling pins
+/// the route.
+#[test]
+fn test_alternative_left_error_is_not_swallowed_on_the_identity_route_2782() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":2}}"#;
+    // `.a | tostring` is a string, so `.x` on it is an error in jq -- with and
+    // without the trailing read.
+    for filter in [
+        ".a | tostring | (.x // 1)",
+        ".a | tostring | (.x // 1) | key",
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            code, 5,
+            "#2782: `{filter}` -- stdout: {out:?} stderr: {err:?}"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "#2782: `{filter}` -- stdout: {out:?}"
+        );
+        assert!(
+            err.contains(r#"Cannot index string with string "x""#),
+            "#2782: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    // A truthy output before the error survives; the right side never runs.
+    for (filter, want) in [
+        (".a | ((.b, error(\"x\")) // 2)", "1"),
+        (".a | ((.b, error(\"x\")) // 2) | key", "\"b\""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            code, 5,
+            "#2782: `{filter}` -- stdout: {out:?} stderr: {err:?}"
+        );
+        assert_eq!(out.trim(), want, "#2782: `{filter}` -- stderr: {err:?}");
+        assert!(err.contains('x'), "#2782: `{filter}` -- stderr: {err:?}");
+    }
+    // Each output of a multi-output left side stands at its own node, in jq
+    // mode as in yq mode (`(.a, .b) // 9 | key` was `"a"`, `"a"` before).
+    let (out, err, code) = run_jq_full(&["-c", ".a | ((.b, .c) // 9) | key"], Some(doc))?;
+    assert_eq!(
+        (out.trim(), code),
+        ("\"b\"\n\"c\"", 0),
+        "#2782 -- stderr: {err:?}"
+    );
+    // And the operator stays lazy under a bounded consumer: `first` pulls one
+    // output and the `error` behind it is never evaluated.
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a | first((.b, error(\"never\")) // 9) | key"],
+        Some(doc),
+    )?;
+    assert_eq!((out.trim(), code), ("\"b\"", 0), "#2782 -- stderr: {err:?}");
     Ok(())
 }
 

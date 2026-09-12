@@ -21,8 +21,8 @@
 //!    appears in the generated corpus, per mode — `key`/`parent`/`path`/
 //!    `file_index` in yq mode and the path-expression family in jq mode, each
 //!    under `limit`/`first`/`last`/`foreach`/`reduce`/`getpath`/object
-//!    construction/`select`/comma/`if`/`try`/`label`, and each of those again
-//!    under `path(...)` and `?`.
+//!    construction/`select`/comma/`if`/`try`/`label`/either side of `//`
+//!    (#2782), and each of those again under `path(...)` and `?`.
 //! 2. **yq comma/pipe precedence (#2420).** Real yq v4.53.3 groups `a, b | c`
 //!    as `a, (b | c)` where jq groups it as `(a, b) | c`. succinctly used to
 //!    apply jq's grouping in both modes; since #2420 `succinctly yq` follows
@@ -61,7 +61,7 @@ const YQ_LEAVES: &[&str] = &["key", "parent", "path", "file_index"];
 /// Every consumer construct #2416's phase-0 checklist names.
 const WRAPPERS: &[&str] = &[
     "bare", "limit", "first", "last", "foreach", "reduce", "getpath", "object", "select", "comma",
-    "if", "try", "label",
+    "if", "try", "label", "alt_l", "alt_r",
 ];
 
 /// `path(...)` over each of the above, plus `?`.

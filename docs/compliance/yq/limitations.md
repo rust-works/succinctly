@@ -2259,6 +2259,30 @@ comment for the full call-site list and `tests/yq_cli_tests.rs`'s
 unaffected (it keeps its own separate, unconditional-null rule), and a real container
 target keeps its own structural error.
 
+### `//` maps per left output and keeps a falsy left value when the right side is empty — not chased ([#2817](https://github.com/rust-works/succinctly/issues/2817) discovered by #2782, not fixed)
+
+succinctly evaluates `L // R` with jq's rule in both modes: collect `L`'s outputs, keep the
+truthy ones, run `R` only if none survived. Real yq v4.53.3 differs on two axes, captured
+live when [#2782](https://github.com/rust-works/succinctly/issues/2782) added `//` to
+`scripts/jq-path-context-oracle-sweep.sh`'s alphabet:
+
+| filter (`yq -n -o=json`)            | yq v4.53.3    | succinctly yq (= jq 1.7.1) |
+|-------------------------------------|---------------|----------------------------|
+| `(1, null) // 2`                    | `1` `2`       | `1`                        |
+| `(null, 1) // 2`                    | `2` `1`       | `1`                        |
+| `(null, 1, null) // 2`              | `2` `1` `2`   | `1`                        |
+| `(false, null) // (3, 4)`           | `3` `4` `3` `4` | `3` `4`                  |
+| `{} \| (null // .[])`               | `null`        | *(nothing)*                |
+| `{"a":1} \| (null // key)` (root)   | `null`        | *(nothing)*                |
+
+Each falsy output of `L` is replaced *in place* by `R`'s outputs, and where `R` yields
+nothing the falsy output itself is emitted. The twelve sweep rows this produces (`(null //
+key)`/`(null // parent)` at the document root, where both tools' `key`/`parent` are
+empty) are recorded in `tests/data/jq-path-context-sweep-known-divergences.txt` under
+#2817. Not a path-context question — it is *which* outputs `//` produces, an
+`EvalSemantics`-level rule for yq mode — and pre-existing: identical on `main` before
+#2782, whose change is *where* an output of `//` stands.
+
 ### An `and`/`or` operand's evaluation context — resolved for `and`/`or` (#2540); `=`'s right side remains open
 
 A literal or constructor is not really "empty" against a read-only, zero-node context in
