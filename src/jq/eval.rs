@@ -9936,7 +9936,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Last => builtin_last::<W>(value, optional),
         Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
         Builtin::Reverse => builtin_reverse::<W, S>(value, optional),
-        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, 1),
+        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, OwnedValue::Int(1)),
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
         Builtin::Unique => builtin_unique::<W, S>(value, optional),
@@ -12755,7 +12755,7 @@ pub(crate) fn reverse_length_is_empty(length: &OwnedValue) -> bool {
 fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
-    depth: usize,
+    depth: OwnedValue,
 ) -> QueryResult<'_, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently flatten in as "".
@@ -12793,13 +12793,44 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(items) => items,
         Err(e) => return suppress_or_raise(e, optional),
     };
-    let flattened = flatten_owned(items, depth);
-    QueryResult::Owned(OwnedValue::Array(flattened))
+    match flatten_owned::<S>(items, depth) {
+        Ok(flattened) => QueryResult::Owned(OwnedValue::Array(flattened)),
+        Err(e) => suppress_or_raise(e, optional),
+    }
 }
 
 /// Flatten owned values to a specific depth.
-fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
-    flatten_owned_at_depth(items, depth, 0)
+///
+/// #2755: `depth` is `$x` itself, jq's own definition's parameter --
+/// threaded through recursion and only ever inspected via `!= 0`
+/// (`compare_values`) and decremented via `- 1` (`arith_sub`), never
+/// eagerly converted to an integer count up front. This matters because
+/// jq's own reference definition is lazy about both:
+///
+/// ```jq
+/// def flatten($x): if $x < 0 then error("flatten depth must not be negative") else _flatten($x) end;
+/// def _flatten($x):
+///   reduce .[] as $i
+///     ([]; if ($i|type) == "array" and $x != 0
+///          then . + ($i | _flatten($x - 1))
+///          else . + [$i]
+///          end);
+/// ```
+///
+/// A non-numeric or non-integer `$x` is never rejected up front -- only if
+/// and when a genuinely nested array item is actually reached does `$x - 1`
+/// get attempted, and only then can it raise a type error. Confirmed live
+/// against jq 1.7.1: `[[1,[2]],3] | flatten(2.0)` is `[1,2,3]` (an
+/// integral float works fine, decrementing to exactly `0.0` which compares
+/// equal to `0`), and `[1,2,3] | flatten("a")` (no nesting to nest into)
+/// is `[1,2,3]` with no error at all, while `[[1,[2]],3] | flatten("a")`
+/// errors only once the recursion actually reaches a nested array and
+/// tries `"a" - 1`.
+fn flatten_owned<S: EvalSemantics>(
+    items: Vec<OwnedValue>,
+    depth: OwnedValue,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    flatten_owned_at_depth::<S>(items, depth, 0)
 }
 
 /// `depth` (the *remaining flatten levels* the caller asked for, e.g. from
@@ -12815,26 +12846,30 @@ fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
 /// (#1005's `to_owned_lossy`/reindex-bridge), so this is defense-in-depth
 /// against that invariant changing, not a currently-live independent
 /// crash path.
-fn flatten_owned_at_depth(
+fn flatten_owned_at_depth<S: EvalSemantics>(
     items: Vec<OwnedValue>,
-    depth: usize,
+    depth: OwnedValue,
     tree_depth: usize,
-) -> Vec<OwnedValue> {
-    if depth == 0 {
-        return items;
-    }
+) -> Result<Vec<OwnedValue>, EvalError> {
     assert_value_tree_depth(tree_depth);
 
     let mut result = Vec::new();
     for item in items {
         match item {
-            OwnedValue::Array(inner) => {
-                result.extend(flatten_owned_at_depth(inner, depth - 1, tree_depth + 1));
+            OwnedValue::Array(inner)
+                if compare_values(&depth, &OwnedValue::Int(0)) != core::cmp::Ordering::Equal =>
+            {
+                let next_depth = arith_sub::<S>(depth.clone(), OwnedValue::Int(1))?;
+                result.extend(flatten_owned_at_depth::<S>(
+                    inner,
+                    next_depth,
+                    tree_depth + 1,
+                )?);
             }
             other => result.push(other),
         }
     }
-    result
+    Ok(result)
 }
 
 /// Builtin: flatten(depth) - flatten to specific depth
@@ -12854,9 +12889,6 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ArgFanout::All,
         |depth_value| {
             let depth = match depth_value {
-                OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d >= 0 => {
-                    d as usize
-                }
                 // #2747: jq defines this as `if $x < 0 then error(...) else
                 // _flatten($x) end`, where `$x < 0` is jq's own total
                 // ordering (`compare_values`), not a plain integer sign
@@ -12865,8 +12897,6 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // and `true` all rank below every number in that ordering;
                 // `nan` orders as less than every other number, including
                 // itself -- see `compare_values`'s own doc comment).
-                // Checked *after* the non-negative-int arm above so that
-                // arm still owns the success path unchanged.
                 //
                 // jq mode only: real yq's own grammar rejects every one of
                 // those shapes at *parse* time -- `flatten(null)`,
@@ -12887,8 +12917,37 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         "flatten depth must not be negative",
                     ));
                 }
-                OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+                OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d < 0 => {
                     return QueryResult::Error(EvalError::new("depth must be non-negative"));
+                }
+                // #2755, jq mode only: everything else -- including a
+                // non-integer number, and (past the guard above) a
+                // non-number -- is passed through unconverted rather than
+                // rejected here. jq's own `_flatten($x)` never eagerly
+                // requires `$x` to be a non-negative integer; it only ever
+                // inspects `$x` via `!= 0` and `$x - 1`, both applied
+                // lazily, once per recursion level, only when a genuinely
+                // nested array item is actually reached -- see
+                // `flatten_owned`'s own doc comment for the live-verified
+                // consequences (an integral float depth succeeds; a
+                // non-numeric depth only errors if the input actually has
+                // nesting deep enough to reach a real `- 1` attempt).
+                other if S::TAG == EvalTag::Jq => other,
+                // yq mode: preserve the exact pre-#2755 eager behavior.
+                // Real yq's own grammar only ever accepts a bare
+                // non-negative integer literal token for `flatten`'s
+                // argument -- a float, `null`, `false`, a string, ... are
+                // all rejected at *parse* time (`bad expression, please
+                // check expression syntax`, live-verified against
+                // v4.53.3), so there is no reachable yq behaviour for
+                // #2755's own widening to match, mirroring #2747's
+                // identical yq-mode gate immediately above. Reusing
+                // `arith_sub`'s yq-only `null - x = x` identity (#1198)
+                // inside `flatten_owned` for a shape real yq can never
+                // even parse would be an accidental behavior change with
+                // no oracle behind it, not a fix.
+                OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) => {
+                    OwnedValue::Int(d)
                 }
                 _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
             };
@@ -84555,22 +84614,26 @@ mod tests {
 
     /// #1017: `flatten` had no guard on its own tree-recursion depth,
     /// distinct from the pre-existing `depth` parameter (remaining flatten
-    /// levels) it already threads. Passes `usize::MAX` for that parameter
-    /// so it can never be the thing that stops recursion first -- with a
+    /// levels) it already threads. Passes `i64::MAX` for that parameter so
+    /// it can never be the thing that stops recursion first -- with a
     /// flatten-level count matched to the actual nesting instead, `depth`
-    /// and the tree-depth counter reach zero on the same call, and the
-    /// early `if depth == 0` return happens *before* the assert, masking
-    /// it entirely.
+    /// and the tree-depth counter would reach zero on the same call
+    /// otherwise, masking the assert entirely.
+    ///
+    /// #2755: `depth` is now `OwnedValue`, not `usize` -- `flatten_owned`
+    /// needs a concrete `EvalSemantics` for its own `arith_sub` call, and
+    /// `JqSemantics` is as good as `YqSemantics` here since `i64::MAX - 1`
+    /// never overflows either mode's integer subtraction.
     #[test]
     fn flatten_owned_panics_past_nesting_depth_limit_1017() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
         let under = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH - 1)];
-        let _ = flatten_owned(under, usize::MAX);
+        let _ = flatten_owned::<JqSemantics>(under, OwnedValue::Int(i64::MAX));
 
         let over = vec![linear_array_nest(MAX_VALUE_TREE_DEPTH)];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            flatten_owned(over, usize::MAX)
+            flatten_owned::<JqSemantics>(over, OwnedValue::Int(i64::MAX))
         }));
         assert!(
             result.is_err(),

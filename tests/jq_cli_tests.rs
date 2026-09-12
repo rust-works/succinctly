@@ -28512,6 +28512,56 @@ fn test_flatten_negative_depth_errors_even_with_trailing_break_1164() -> Result<
     Ok(())
 }
 
+/// #2755: `flatten`'s success path used to eagerly require a literal
+/// non-negative integer depth, rejecting everything else outright with a
+/// generic "expected number, got non-number" -- but jq's own reference
+/// definition (`_flatten($x): reduce .[] as $i ([]; if ($i|type) ==
+/// "array" and $x != 0 then . + ($i | _flatten($x - 1)) else . + [$i]
+/// end)`) never converts `$x` up front. It only ever compares `$x != 0`
+/// and computes `$x - 1`, both lazily, once per recursion level, only when
+/// a genuinely nested array item is actually reached. All values below
+/// are live jq 1.7.1 captures.
+#[test]
+fn test_flatten_depth_argument_is_not_eagerly_converted_2755() -> Result<()> {
+    for (filter, input, expected) in [
+        // An integral float depth decrements to exactly `0.0`, which
+        // compares equal to `0` -- succeeds exactly like the same
+        // integer depth would.
+        ("flatten(2.0)", "[[1,[2]],3]", "[1,2,3]"),
+        // A non-numeric depth with no nesting deep enough to ever reach
+        // `$x - 1` never errors at all.
+        (r#"flatten("a")"#, "[1,2,3]", "[1,2,3]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 0,
+            "`{filter}` on {input}: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), expected, "`{filter}` on {input}");
+    }
+    Ok(())
+}
+
+/// #2755: the flip side of the test above -- a non-numeric depth errors
+/// only once the recursion actually reaches a nested array and attempts a
+/// real `$x - 1`, with the exact type-error wording real subtraction
+/// raises (not a generic "expected number" message), and that error is
+/// suppressible by `?` like any other evaluation error, matching jq.
+#[test]
+fn test_flatten_depth_argument_errors_lazily_on_real_nesting_2755() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"flatten("a")"#], Some("[[1,[2]],3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"string ("a") and number (1) cannot be subtracted"#),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"flatten("a")?"#], Some("[[1,[2]],3]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "");
+    Ok(())
+}
+
 /// `combinations(n)` uses `n` inside a nested `range(n)` that an array
 /// construction then collects, so its escape semantics differ from every
 /// other builtin in this block: a trailing break in `n`'s own generator
@@ -29168,15 +29218,22 @@ fn test_compound_assign_optional_swallowed_rhs_error_produces_no_output_1313() -
     Ok(())
 }
 
-/// #1045 coverage: `flatten(depth)`'s `Ok(Some(_)) => ...type_error("number",
-/// "non-number")` arm -- a non-number depth argument, unconditional (no
-/// `optional` gate), unlike the negative-depth arm covered by
-/// `test_flatten_negative_depth_errors_even_with_trailing_break_1164` above.
+/// #1045 coverage: a non-number depth argument, unconditional (no
+/// `optional` gate) once the input actually nests deep enough to reach a
+/// real `$x - 1` attempt, unlike the negative-depth arm covered by
+/// `test_flatten_negative_depth_errors_even_with_trailing_break_1164`
+/// above. #2755 replaced this arm's generic, eager "expected number, got
+/// non-number" with jq's own lazy subtraction-type-error wording --
+/// confirmed live against jq 1.7.1, which raises the identical message for
+/// this exact filter (`[[1]]` has one level of real nesting to reach).
 #[test]
 fn test_flatten_depth_non_number_argument_errors_1045() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-cn", r#"[[1]] | flatten("x")"#], None)?;
-    assert_ne!(code, 0);
-    assert!(err.contains("non-number"), "err={err}");
+    assert_eq!(code, 5, "err={err}");
+    assert!(
+        err.contains(r#"string ("x") and number (1) cannot be subtracted"#),
+        "err={err}"
+    );
     let _ = out;
     Ok(())
 }

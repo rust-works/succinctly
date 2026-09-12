@@ -40374,6 +40374,39 @@ fn test_flatten_negative_depth_widening_is_jq_mode_only_2747() -> Result<()> {
     Ok(())
 }
 
+/// #2755's own yq-mode gate, on the exact same terms as #2747's above: jq
+/// mode's fix widened `flatten`'s success path to accept a non-integer or
+/// non-numeric depth, threading it lazily through `arith_sub`/
+/// `compare_values` instead of eagerly requiring a non-negative integer --
+/// but real yq's own grammar only ever accepts a bare non-negative integer
+/// literal token for `flatten`'s argument, rejecting a float (or anything
+/// else) at *parse* time (live-verified against v4.53.3). So yq mode must
+/// keep the exact pre-#2755 eager rejection here too, unaffected by jq
+/// mode's own widening -- confirmed during this PR's own review, which
+/// found a first draft had reused `arith_sub`'s yq-only `null - x = x`
+/// identity (#1198) unconditionally, letting `flatten(null)` silently
+/// succeed in yq mode instead of erroring.
+#[test]
+fn test_flatten_depth_widening_is_jq_mode_only_2755() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[[1,[2]],3] | flatten(2.0)", "null\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("expected number, got non-number"),
+        "stderr: {stderr:?}"
+    );
+
+    // The ordinary, still-supported shape -- a literal non-negative
+    // integer depth -- is unaffected by #2755's jq-only widening and
+    // still succeeds exactly as before, now threaded through the same
+    // `OwnedValue`-based `flatten_owned` jq mode uses.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[[1,[2]],3] | flatten(1)", "null\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,[2],3]");
+    Ok(())
+}
+
 /// #2692, yq twin of `test_truthiness_probes_validate_nothing_2692` in
 /// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
 /// the JSON-syntax rows, through yq's own reading of them -- most of the JSON
