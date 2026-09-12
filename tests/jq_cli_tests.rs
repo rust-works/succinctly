@@ -48080,6 +48080,162 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
     Ok(())
 }
 
+/// #2676: a fold's own loop-variable pattern (`reduce SOURCE as PATTERN
+/// (INIT; UPDATE)`, `foreach SOURCE as PATTERN (INIT; UPDATE; EXTRACT)`) is
+/// compiled with the same tracked `INDEX` matchers
+/// [`test_destructuring_moves_path_register_2649`] pins for a plain `. as
+/// PATTERN` bind, one level up: when SOURCE resolves through the path
+/// register, destructuring its own element moves the register exactly the
+/// way [`walk_pattern`] already models. Every row below was captured live
+/// against `/usr/bin/jq` 1.7.1 on 2026-09-13.
+#[test]
+fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
+    let d = r#"{"a":[1,2,3],"b":{"c":5}}"#;
+
+    // Rows real jq resolves to a path (or a plain value for write forms).
+    for (input, filter, expected) in [
+        (
+            d,
+            "path(foreach .b as {c:$x} (.; .; $x))",
+            "[\"b\",\"c\"]\n",
+        ),
+        (d, "path(foreach .a as [$x] (.; .; $x))", "[\"a\",0]\n"),
+        (d, "path(reduce .b as {c:$x} (.; .))", "[]\n"),
+        (
+            r#"{"p":{"q":{"r":42}}}"#,
+            "path(foreach .p as {q:{r:$v}} (.; .; $v))",
+            "[\"p\",\"q\",\"r\"]\n",
+        ),
+        (
+            r#"{"x":[{"c":1},{"c":2}]}"#,
+            "path(foreach .x[] as {c:$v} (.; .; $v))",
+            "[\"x\",0,\"c\"]\n[\"x\",1,\"c\"]\n",
+        ),
+        (
+            d,
+            "path(foreach .b as {c:$x} (.; $x; $x))",
+            "[\"b\",\"c\"]\n",
+        ),
+        // A `null`/`bool`-valued fold register still lets a *computed*
+        // (non-register-derived) source element's own destructuring step
+        // through -- `walk_pattern_step`'s `null`/`bool` identity exception,
+        // one level up from #2649's own plain-bind rows.
+        (
+            "null",
+            "path(foreach (null) as {a:$x} (.; .; $x))",
+            "[\"a\"]\n",
+        ),
+        // Write-side: `|=`, `+=`, `del()` route through the same tracked
+        // path a bare-`$var` fold already did.
+        (
+            d,
+            "(foreach .b as {c:$x} (.; .; $x)) |= .+1",
+            "{\"a\":[1,2,3],\"b\":{\"c\":6}}\n",
+        ),
+        (
+            d,
+            "(foreach .b as {c:$x} (.; .; $x)) += 10",
+            "{\"a\":[1,2,3],\"b\":{\"c\":15}}\n",
+        ),
+        (
+            d,
+            "del(foreach .b as {c:$x} (.; .; $x))",
+            "{\"a\":[1,2,3],\"b\":{}}\n",
+        ),
+        (d, "(reduce .b as {c:$x} (.; .)) = 9", "9\n"),
+        (d, "del(reduce .b as {c:$x} (.; .))", "null\n"),
+        (
+            d,
+            "(foreach .a as [$x] (.; .; $x)) = 99",
+            "{\"a\":[99,2,3],\"b\":{\"c\":5}}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // Rows real jq refuses: the pattern's own step, or a genuine navigation
+    // on the accumulator, is not `jv_identical` to wherever `value_at_path`
+    // currently is.
+    for (input, filter, expected_stderr) in [
+        (
+            // Array patterns walk in *reverse* index order (matching
+            // #2649's own array rows) -- the second element's step runs
+            // first and moves the register off the array node, so the
+            // first element's own step then fails.
+            d,
+            "path(foreach .a as [$x,$y] (.; .; $x))",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+        ),
+        (
+            d,
+            "path(reduce (.a) as [$i] (.; $i))",
+            "Invalid path expression with result 1",
+        ),
+        (
+            // A genuine navigation on the *accumulator* refuses regardless
+            // of the pattern shape -- the same refusal a bare `$var` fold's
+            // own accumulator navigation already gets (pre-existing,
+            // orthogonal to this pattern widening).
+            d,
+            "path(reduce .b as {c:$x} (.; .b))",
+            "Invalid path expression",
+        ),
+        (
+            // A destructuring pattern whose SOURCE is *not*
+            // register-derived still refuses unconditionally, even when the
+            // bound name goes unused downstream -- the pattern's own step
+            // is checked against `value_at_path` regardless of whether any
+            // bound name is ever read.
+            "{}",
+            "path(. as $x | reduce ([1]) as [$i] (0; $x))",
+            "Invalid path expression near attempt to access element 0 of [1]",
+        ),
+        (
+            "{}",
+            "path(foreach (5) as {a:$x} (.; .; .))",
+            "Invalid path expression near attempt to access element \"a\" of 5",
+        ),
+        (
+            // The `null`/`bool` coincidence needs the *register*'s own
+            // value, not just the source element's, to be null/bool.
+            "{}",
+            "path(foreach (null) as {a:$x} (.; .; $x))",
+            "Invalid path expression",
+        ),
+        (
+            // A `?//`-alternatives chain stays refuse-only regardless of
+            // pattern shape (`patterns.len() > 1` never reaches the walk).
+            d,
+            "path(reduce .b as {c:$x} ?// $z (0; $x))",
+            "Invalid path expression",
+        ),
+        (
+            // Duplicate names inside one pattern refuse at the second step,
+            // same as #2649's own plain-bind rows.
+            d,
+            "path(foreach .b as {c:$x,c:$x} (.; .; $x))",
+            "Invalid path expression near attempt to access element \"c\" of {\"c\":5}",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // yq mode: real yq's lexer rejects `reduce`/`foreach`/`path` outright,
+    // so this construct never parses there at all -- confirmed live against
+    // yq v4.53.3 (out of scope for this test, documented in
+    // `docs/compliance/jq/limitations.md`).
+
+    Ok(())
+}
+
 /// #2103 review (coverage-diff bot, PR #2652): `eval_each_pipe_generic`'s
 /// empty-`exprs` tail fix changed the shape of item that flows out of a
 /// bare `keys_unsorted[]` (`OneCursorValue` instead of `One`), which
