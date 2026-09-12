@@ -21398,14 +21398,25 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             owned_identity_recurse_step::<S, V>(value, id, out);
             Ok(())
         }
-        // #2549 audit: `owned_identity_nav_supported`'s own `_ => false` keeps
-        // the *pipe/stages* route from reaching here. It is **not** the only
-        // gate: `owned_identity_operand` reaches this same dispatch under
-        // `owned_identity_operand_supported`, which admits `Expr::Literal` --
-        // a shape with no arm below. `.a | ((.b | 1) + 2) | key` aborts the
-        // process today; tracked as #2771, pinned by
+        // #2771: a literal has no position of its own. Reached only from
+        // `owned_identity_operand` (its top-level `strip_parens` short-circuit
+        // already handles the bare spelling; `((.b | 1) + 2)` arrives here
+        // through the `Pipe` arm above instead). `optional` is irrelevant: a
+        // literal cannot fail. Not added to `owned_identity_nav_supported` --
+        // a literal is not navigation, and admitting it there would route a
+        // pipe that no longer needs a node through the materializing path.
+        Expr::Literal(lit) => {
+            out.push((literal_to_owned(lit), OwnedIdentity::detached()));
+            Ok(())
+        }
+        // Closed by the union of `owned_identity_nav_supported` and
+        // `owned_identity_operand_supported`, both `_ => false` -- every
+        // shape either guard admits has an arm above, `Expr::Literal`
+        // (#2771) included. Pinned by
         // `expr_dispatch_catchall_guards_default_conservatively_2549`.
-        _ => unreachable!("owned_identity_nav_supported admits no other shape"),
+        _ => unreachable!(
+            "neither owned_identity_nav_supported nor owned_identity_operand_supported admits any other shape"
+        ), // omni-dev: coverage tolerate-line reason="unreachable by construction: every shape either guard admits now has an arm above (#2771), and expr_dispatch_catchall_guards_default_conservatively_2549 pins both guards' `_ => false` defaults directly"
     }
 }
 
@@ -34399,13 +34410,12 @@ mod tests {
     /// add ~60 arms per site and move where the compile error lands without
     /// changing what a *new* variant does today.
     ///
-    /// Audited at #2549 pickup. Seven of the eight are closed; the eighth is
-    /// a live process abort, filed as #2771 (see the row below and the
-    /// divergence pinned at the end of this test):
+    /// Audited at #2549 pickup, and re-closed by #2771's fix below. All
+    /// eight are now closed:
     ///
     /// | catch-all | closed by |
     /// |---|---|
-    /// | `owned_identity_step` | **NOT closed -- #2771** (two call sites, two guards) |
+    /// | `owned_identity_step` | `owned_identity_nav_supported` ∪ `owned_identity_operand_supported`, both `_ => false`, plus the `Expr::Literal` arm (#2771) |
     /// | `owned_identity_computed_step` | its caller's arm pattern, syntactic |
     /// | `path_context_step_generic` | `path_context_is_navigational`, `_ => false` |
     /// | its two `Optional(..)` let-elses | the same arm's own `matches!` guard |
@@ -34421,14 +34431,22 @@ mod tests {
     /// of aborting a user's process.
     ///
     /// **A conservative default is necessary but not sufficient**, which is
-    /// what #2771 turned out to be: a dispatch reached from *two* call sites
-    /// under *two* guards is only as closed as the weaker one, however
-    /// conservative each is on its own. `owned_identity_step` is gated on
+    /// what #2771 found: a dispatch reached from *two* call sites under *two*
+    /// guards is only as closed as the weaker one, however conservative each
+    /// is on its own. `owned_identity_step` is gated on
     /// `owned_identity_nav_supported` from the pipe/stages route and on
     /// `owned_identity_operand_supported` from `owned_identity_operand`, and
-    /// the two disagree on `Expr::Literal` -- which the dispatch has no arm
-    /// for. The first draft of this audit checked one call site, found its
-    /// guard conservative, and recorded the site as closed.
+    /// the two disagreed on `Expr::Literal` -- a shape the dispatch had no
+    /// arm for, reachable only through the *second* call site
+    /// (`.a | ((.b | 1) + 2) | key` aborted the process). The first draft of
+    /// this audit checked one call site, found its guard conservative, and
+    /// recorded the site as closed. Fixed by giving `owned_identity_step` a
+    /// `Literal` arm, matching what `owned_identity_operand`'s own top-level
+    /// short-circuit already did for the bare spelling -- the property this
+    /// test pins for that site is now positive (everything either guard
+    /// admits has an arm), not the divergence itself; see
+    /// `owned_identity_step_literal_inside_pipe_does_not_abort_2771` below
+    /// for the process-level regression guard.
     #[test]
     fn expr_dispatch_catchall_guards_default_conservatively_2549() {
         // Guards `owned_identity_step`'s catch-all.
@@ -34503,11 +34521,15 @@ mod tests {
             );
         }
 
-        // #2771, the one gap this audit found: `owned_identity_step`'s two
-        // guards disagree on `Expr::Literal`, and the dispatch has no arm
-        // for it -- so `.a | ((.b | 1) + 2) | key` aborts the process.
-        // Pinned as the divergence it is, so the day `Expr::Literal` gets an
-        // arm this fails and the row above can move back to "closed".
+        // #2771: `owned_identity_step`'s two guards disagreed on exactly one
+        // shape, `Expr::Literal` -- admitted by the operand guard (it is a
+        // legitimate operand of a ruled arithmetic/comparison stage, e.g.
+        // `.a + 1`) but not by the nav guard (a literal is not navigation).
+        // Now that the dispatch has a `Literal` arm, the positive property to
+        // pin is "everything either guard admits has an arm" -- checked here
+        // for the one shape that used to fall through the gap between them,
+        // and by `owned_identity_step_literal_inside_pipe_does_not_abort_2771`
+        // below for the process-level regression guard proper.
         let literal = parse("1").unwrap();
         assert!(
             owned_identity_operand_supported(&literal),
@@ -34517,7 +34539,34 @@ mod tests {
             !owned_identity_nav_supported(&literal),
             "a literal is not navigation"
         );
-        // The two together are the gap: admitted by one gate, unhandled by
-        // the dispatch both gates share.
+    }
+
+    /// #2771: `owned_identity_step` had no arm for `Expr::Literal`, reachable
+    /// only through `owned_identity_operand`'s `Pipe`/`Paren`-wrapped case --
+    /// its own top-level `strip_parens` short-circuit already handles the
+    /// bare spelling, so only a literal reached *through* a pipe (e.g.
+    /// `(.b | 1)` as an arithmetic operand) hit the dispatch's
+    /// `unreachable!` and aborted the process. Runs every crash spelling
+    /// found during review through the same generic-evaluator entry point
+    /// the CLI uses (`drive_each_sink`), so a regression here fails as an
+    /// ordinary test panic rather than a process abort a user hits. All
+    /// confirmed live (both this repo's own bare-literal answer and, for the
+    /// pipe spelling itself, yq v4.53.3) to answer without aborting.
+    #[test]
+    fn owned_identity_step_literal_inside_pipe_does_not_abort_2771() {
+        let json: &[u8] = br#"{"a":{"b":1}}"#;
+        for filter in [
+            ".a | ((.b | 1) + 2) | path",
+            ".a | ((.b | 1) + 2) | key",
+            ".a | ((.b | 1) + 2) | parent",
+            ".a | ((.b | 1) + 2) | file_index",
+            ".a | ((1 | .) + 2) | key",
+            ".a | ((.b | 1) == 1) | path",
+            ".a | (-(.b | 1)) | path",
+            r#".a | (("x" | .[0:1]) + "y") | path"#,
+            r#".a | (("abc" | .)[0:1] + "x") | path"#,
+        ] {
+            let _ = drive_each_sink::<JqSemantics>(json, filter);
+        }
     }
 }
