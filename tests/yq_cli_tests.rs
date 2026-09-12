@@ -44184,6 +44184,40 @@ fn json_sourced_scalar_grammar_matches_yq_2778() -> Result<()> {
     Ok(())
 }
 
+/// #2778 review: four dispatch arms the scalar-grammar checks above never
+/// reach at all, because none of them go through the ordinary "parse a
+/// scalar value" arms this fix instrumented -- `?` and `&`/`!` have no
+/// value-text to validate, they're illegal at the byte that starts them.
+/// Each row is confirmed live against yq v4.53.3 to error.
+#[test]
+fn json_sourced_structural_rejections_2778() -> Result<()> {
+    for input in [
+        // Block-context explicit key indicator (`?`), no enclosing `{}`.
+        "? true\n: 1\n",
+        // Anchor/tag prefix bypassing every other json_strict check,
+        // not just scalar-grammar validation: a bad scalar spelling...
+        "&x True\n",
+        // ...and this fix's own new structural sequence-dash rejection.
+        "&x - 1\n",
+        "!!str x\n",
+        // Flow-mapping explicit key indicator.
+        r#"{? "a": 1}"#,
+        // `--- |`/`--- >` bypass `parse_block_node` entirely via their own
+        // dedicated dispatch in `parse_inline_document_value`.
+        "--- |\n  hello\n",
+        "--- >\n  hello\n",
+    ] {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 1,
+            "#2778: {input:?} must be rejected with exit 1 (real yq v4.53.3 \
+             rejects it), got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The tightening is gated on JSON-sourced input; genuine YAML keeps its
 /// own grammar, where every one of these is ordinary and legal.
 #[test]
