@@ -27638,6 +27638,82 @@ fn test_jq_closed_terms_unaffected_by_empty_container_check_2594() -> Result<()>
     Ok(())
 }
 
+/// #2731 (#2594's own residual): a `{,}`/`[,]` reached through
+/// `collect_paths_generic`'s value-domain recursion (nested *inside* a
+/// `paths`/`leaf_paths` walk) or `getpath_walk_cursor`'s child-miss exit --
+/// neither had a cursor to check against before this fix threaded one
+/// through, unlike the arm-level dispatch sites #2594 already covers.
+///
+/// Same exit-5, uncatchable-via-`?` shape as #2594's own table (the raise
+/// carries #2286's tag), confirmed here rather than assumed.
+#[test]
+fn test_jq_nested_value_domain_walks_empty_container_now_raises_2731() -> Result<()> {
+    for (input, query) in [
+        // The issue's own repro table.
+        (r#"{"a":1,"b":{,}}"#, "[paths]"),
+        (r#"{"a":1,"b":{,}}"#, "[leaf_paths]"),
+        (r#"{"a":{"b":{,}}}"#, "[paths]"),
+        (r#"{"a":[[,]]}"#, "[leaf_paths]"),
+        (r#"{"a":1,"b":{,}}"#, r#"getpath(["b","x"])"#),
+        (r#"{"a":1,"b":[,]}"#, r#"getpath(["b",0])"#),
+        // Uncatchable via `?` -- a decode failure, not an ordinary error.
+        (r#"{"a":1,"b":{,}}"#, r#"getpath(["b","x"])?"#),
+        // Nested through an array rather than an object at the outer level.
+        ("[[,]]", "[paths]"),
+        (r#"[{"a":{,}}]"#, "[paths]"),
+        // `leaf_paths` takes its own arm, distinct from `paths`.
+        (r#"{"a":{,}}"#, "leaf_paths"),
+        // The container itself is the walk's root -- the shape #2594's own
+        // arm-level pre-check already covered, now also covered by
+        // `collect_paths_generic`/`getpath_walk_cursor`'s own internal
+        // check once the top-level pre-check was removed as redundant.
+        ("{,}", r#"getpath(["a"])"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: expected the #2211 raise, got out={out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2731: that raise fires on a *malformed* nested container only -- a
+/// genuinely empty one (`{}`/`[]`) reached the same way is unaffected,
+/// mirroring `test_jq_genuinely_empty_containers_unaffected_2594`'s own
+/// pairing for the arm-level fix.
+#[test]
+fn test_jq_nested_value_domain_walks_wellformed_unaffected_2731() -> Result<()> {
+    for (input, query, expected) in [
+        (r#"{"a":1,"b":{}}"#, "[paths]", r#"[["a"],["b"]]"#),
+        (r#"{"a":1,"b":{}}"#, "[leaf_paths]", r#"[["a"],["b"]]"#),
+        (r#"{"a":{"b":{}}}"#, "[paths]", r#"[["a"],["a","b"]]"#),
+        (r#"{"a":[[]]}"#, "[leaf_paths]", r#"[["a",0]]"#),
+        (r#"{"a":1,"b":{}}"#, r#"getpath(["b","x"])"#, "null"),
+        (r#"{"a":1,"b":[]}"#, r#"getpath(["b",0])"#, "null"),
+        ("[[]]", "[paths]", "[[0]]"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(code, 0, "input={input} query={query}: stderr {stderr:?}");
+        assert_eq!(
+            out.trim(),
+            expected,
+            "input={input} query={query}: unexpected output"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2261: well-formed documents (including empty containers, a duplicate
 /// key under jq's default collapse rule, and a multi-element/multi-field
 /// container) are unaffected by every new check above -- the same
