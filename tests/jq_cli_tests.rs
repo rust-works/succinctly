@@ -32513,6 +32513,23 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "AAB",
             0,
         ),
+        // #2668: `foreach`'s UPDATE, moved here from
+        // `test_short_circuit_side_effect_leaks_820_932_987` -- UPDATE is
+        // now driven through `fold_step_each`'s demand-forwarding sink (the
+        // same helper `reduce`'s own #2157 accumulator fold shares), so a
+        // consumer's stop reaches UPDATE's own generator before its second
+        // output (the `stderr` write) is ever produced. Matches jq 1.7.1,
+        // which also writes nothing.
+        (
+            &[
+                "-cn",
+                r#"first(foreach (1) as $x (0; (.+1, ("U"|stderr)); .))"#,
+            ],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
         // `limit(n)` pulls exactly `n` values, so a side effect sitting at
         // position `n` IS reached. Stopping at the first would suppress it.
         (
@@ -33914,34 +33931,16 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // ---- #2180 WP3's own residual: `foreach`'s UPDATE and INIT -------
-        // WP3 drove `foreach`'s *source* and its *EXTRACT* through the
-        // demand-forwarding sinks; UPDATE and INIT stay eager, so a side
-        // effect in either still fires where jq never reaches it. Both
-        // captured live against jq 1.7.1, which writes nothing in either
-        // case.
-        //
-        // UPDATE: driving it means reshaping
-        // `fold_step_via_accumulator_or_fork`, which `reduce`'s own O(n)
-        // accumulator fix (#2157) shares -- a separate change from WP3's
-        // rows, and the one remaining `?//`-visible position (see
-        // `test_nested_short_circuit_consumer_hides_the_stop_2180`'s WP3
-        // residual rows).
-        (
-            &[
-                "-cn",
-                r#"first(foreach (1) as $x (0; (.+1, ("U"|stderr)); .))"#,
-            ],
-            None,
-            "1\n",
-            "U",
-            0,
-        ),
-        // INIT: its fan-out is jq's outermost loop (#534) and it must be
-        // evaluated before the source is ever pulled (#2440), so `each_foreach`
-        // collects it exactly as `eval_foreach` does. `first` never explores
-        // the second fork, and jq never evaluates the INIT output that would
-        // have seeded it.
+        // ---- #2668's residual: `foreach`'s INIT -------------------------
+        // #2668 drove `foreach`'s UPDATE through `fold_step_each` (its own
+        // row moved to `test_short_circuit_side_effect_shapes_already_match_jq_820`);
+        // INIT stays eager, so a side effect there still fires where jq
+        // never reaches it. INIT's fan-out is jq's outermost loop (#534)
+        // and it must be evaluated before the source is ever pulled
+        // (#2440), so `each_foreach` collects it exactly as `eval_foreach`
+        // does. `first` never explores the second fork, and jq never
+        // evaluates the INIT output that would have seeded it. Captured
+        // live against jq 1.7.1, which writes nothing.
         (
             &[
                 "-cn",
@@ -35348,26 +35347,29 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             "[\"OK:null\"]",
             "matches jq",
         ),
-        // ==== WP3's residual: `foreach`'s UPDATE and INIT positions ====
-        // Still diverging, and deliberately so. Driving UPDATE means
-        // reshaping `fold_step_via_accumulator_or_fork`, which `reduce`'s own
-        // O(n) accumulator fix (#2157) shares; INIT's fan-out is jq's
-        // outermost loop (#534) and must be evaluated before the source is
-        // pulled at all (#2440), so `each_foreach` collects it exactly as
-        // `eval_foreach` does. Both are recorded in
-        // `docs/compliance/jq/limitations.md`, and their side-effect
-        // spellings are pinned in
-        // `test_short_circuit_side_effect_leaks_820_932_987`.
+        // ==== #2668: `foreach`'s UPDATE position -- CLOSED ====
+        // UPDATE is now driven through `fold_step_each`'s demand-forwarding
+        // sink (shared with `reduce`'s own #2157 accumulator fold), so a
+        // `?//` sitting there sees a wrapping consumer's stop the same way
+        // EXTRACT and the source already did. Side-effect spelling pinned in
+        // `test_short_circuit_side_effect_shapes_already_match_jq_820`.
         (
             format!("[first(foreach (1) as $v (0; . + ({G})))]"),
-            "[1]",
-            "jq: [1,1] -- the `?//` sits in UPDATE",
+            "[1,1]",
+            "matches jq -- the `?//` sits in UPDATE",
         ),
         (
             format!("[isempty(foreach (1) as $v (0; . + ({G})))]"),
-            "[false]",
-            "jq: [false,false] -- the `?//` sits in UPDATE",
+            "[false,false]",
+            "matches jq -- the `?//` sits in UPDATE",
         ),
+        // ==== #2668's residual: `foreach`'s INIT position ====
+        // Still diverging, deliberately: INIT's fan-out is jq's outermost
+        // loop (#534) and must be evaluated before the source is pulled at
+        // all (#2440), so making it demand-driven means the fork loop
+        // itself becomes a sink over INIT's own outputs -- a larger change
+        // than UPDATE's, split out. Recorded in
+        // `docs/compliance/jq/limitations.md`.
         (
             format!("[first(foreach (1) as $v (({G}); .+1; .))]"),
             "[2]",
