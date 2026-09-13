@@ -8713,6 +8713,61 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// Whether an *exact*, non-overflowing `i64` arithmetic result is small
+/// enough that keeping it as `OwnedValue::Int` is guaranteed to match jq
+/// semantics, where every number is really an `f64` (#2631).
+///
+/// `checked_add`/`checked_sub`/`checked_mul` returning `Some` only proves
+/// the result fits in `i64` -- it says nothing about whether jq's own
+/// `f64` arithmetic would print the identical spelling. Below `2^53` every
+/// integer is `f64`'s own unique, exactly-representable value (the 53-bit
+/// mantissa distinguishes every integer in `[-2^53, 2^53]`), so the exact
+/// integer trivially *is* jq's own shortest-round-trip spelling there --
+/// no other integer could produce the same double for jq's formatter to
+/// prefer instead.
+///
+/// Past `2^53`, multiple adjacent integers collapse onto the *same*
+/// double (confirmed live against `/usr/bin/jq` 1.7.1: `-33201876582270392`
+/// and `-33201876582270390` both round to the identical bit pattern), and
+/// jq's shortest-round-trip decimal formatter can pick a *different*
+/// member of that group than whichever one exact `i64` arithmetic
+/// happened to compute -- `1 * -33201876582270392` never overflows `i64`
+/// (the value is ~55 significant bits, well inside `i64`'s 63), so the
+/// exact-int fast path answers the unrounded `-33201876582270392` where
+/// jq answers `-33201876582270390`, the *shorter* of the two spellings
+/// that share the same double, not the exact integer arithmetic actually
+/// produced. There is no way to predict which member of the group jq
+/// will pick without literally running the same shortest-round-trip
+/// algorithm [`jq_bare_float_display`] already implements (including the
+/// #2542 tie-break and the scientific-notation threshold,
+/// [`jq_float_is_scientific`]), so this bound simply routes every
+/// past-`2^53` result to that existing, already-correct machinery via
+/// `OwnedValue::Float` -- the same fallback the classic `i64`-overflow
+/// arm already uses -- rather than attempting a narrower, value-specific
+/// check. No integer within the bound can trigger
+/// [`jq_float_is_scientific`] either (that threshold needs far more
+/// trailing zeros than significant digits than a ~16-digit integer can
+/// have), so nothing within the bound needs to consult it separately.
+///
+/// This deliberately does *not* attempt to correct for jq's separate,
+/// pre-existing decNumber-literal-preservation quirks (e.g. a chained
+/// `+`/`-` where one side has already been forced through unary-minus's
+/// own `0 - x` desugaring can round differently than plain
+/// `a as f64 op b as f64` double arithmetic) -- those affect ordinary,
+/// non-overflowing arithmetic on `main` today regardless of this fix and
+/// are a separate, far larger undertaking (matching jq's full
+/// arbitrary-precision decimal arithmetic model, not just its output
+/// formatting). Out of scope for #2631, which is specifically about the
+/// exact-integer-result-bypasses-the-float-formatter bug described above;
+/// tracked separately.
+///
+/// yq mode never calls this: `S::OVERFLOW_WRAPS` gates every call site to
+/// this function's own jq-only branch, since yq's wrapping arithmetic has
+/// no such precision model to match in the first place.
+fn jq_int_result_within_exact_f64_range(exact: i64) -> bool {
+    exact.unsigned_abs() <= (1u64 << 53)
+}
+
 /// Add two values (numbers, strings, arrays, objects).
 fn arith_add<S: EvalSemantics>(
     left: OwnedValue,
@@ -8788,10 +8843,15 @@ fn arith_add<S: EvalSemantics>(
                         // yq behavior: wrapping add
                         Ok(OwnedValue::Int(a.wrapping_add(b)))
                     } else {
-                        // jq behavior: convert to float on overflow
+                        // jq behavior: convert to float on overflow -- or
+                        // whenever the exact i64 result doesn't match
+                        // jq's own always-f64 arithmetic (#2631).
+                        let f64_result = a as f64 + b as f64;
                         match a.checked_add(b) {
-                            Some(result) => Ok(OwnedValue::Int(result)),
-                            None => Ok(OwnedValue::Float(a as f64 + b as f64)),
+                            Some(result) if jq_int_result_within_exact_f64_range(result) => {
+                                Ok(OwnedValue::Int(result))
+                            }
+                            _ => Ok(OwnedValue::Float(f64_result)),
                         }
                     }
                 }
@@ -8881,10 +8941,15 @@ fn arith_sub<S: EvalSemantics>(
                         // yq behavior: wrapping sub
                         Ok(OwnedValue::Int(a.wrapping_sub(b)))
                     } else {
-                        // jq behavior: convert to float on overflow
+                        // jq behavior: convert to float on overflow -- or
+                        // whenever the exact i64 result doesn't match
+                        // jq's own always-f64 arithmetic (#2631).
+                        let f64_result = a as f64 - b as f64;
                         match a.checked_sub(b) {
-                            Some(result) => Ok(OwnedValue::Int(result)),
-                            None => Ok(OwnedValue::Float(a as f64 - b as f64)),
+                            Some(result) if jq_int_result_within_exact_f64_range(result) => {
+                                Ok(OwnedValue::Int(result))
+                            }
+                            _ => Ok(OwnedValue::Float(f64_result)),
                         }
                     }
                 }
@@ -9036,10 +9101,15 @@ fn arith_mul<S: EvalSemantics>(
                         // yq behavior: wrapping mul
                         Ok(OwnedValue::Int(a.wrapping_mul(b)))
                     } else {
-                        // jq behavior: convert to float on overflow
+                        // jq behavior: convert to float on overflow -- or
+                        // whenever the exact i64 result doesn't match
+                        // jq's own always-f64 arithmetic (#2631).
+                        let f64_result = a as f64 * b as f64;
                         match a.checked_mul(b) {
-                            Some(result) => Ok(OwnedValue::Int(result)),
-                            None => Ok(OwnedValue::Float(a as f64 * b as f64)),
+                            Some(result) if jq_int_result_within_exact_f64_range(result) => {
+                                Ok(OwnedValue::Int(result))
+                            }
+                            _ => Ok(OwnedValue::Float(f64_result)),
                         }
                     }
                 }

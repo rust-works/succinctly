@@ -45707,6 +45707,30 @@ fn test_yq_sort_keys_vivifies_past_a_fanout_known_gap_2870() -> Result<()> {
     Ok(())
 }
 
+/// #2631's fix (jq mode only, see `jq_cli_tests.rs`) routes an in-range but
+/// past-`2^53` `i64` `+`/`-`/`*` result through `OwnedValue::Float` instead
+/// of keeping the exact `OwnedValue::Int` -- gated on `S::OVERFLOW_WRAPS`,
+/// which is `true` for yq. Confirms that gate actually holds: yq's own
+/// wrapping-integer semantics (untouched by #2631) still apply exactly,
+/// with none of jq mode's float-conversion path reachable in yq mode.
+#[test]
+fn test_yq_int_overflow_wraps_unaffected_by_2631() -> Result<()> {
+    let input = "a: 1\n";
+    let (out, code) = run_yq_stdin(".a * -33201876582270392", input, &["-o=json"])?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out.trim(), "-33201876582270392");
+
+    let (out, code) = run_yq_stdin("9223372036854775807 * 2", input, &["-o=json", "-n"])?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out.trim(), "-2");
+
+    let (out, code) = run_yq_stdin("9223372036854775807 + 1", input, &["-o=json", "-n"])?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out.trim(), "-9223372036854775808");
+
+    Ok(())
+}
+
 /// #2785: real yq's `==`/`!=` between two scalars compares their *text*, with
 /// its wildcard matcher applied to the right-hand operand -- not jq's typed
 /// equality. See `eval::yq_scalar_text_eq`. Every expectation below was

@@ -51868,3 +51868,55 @@ fn test_bare_recurse_bounded_consumers_match_jq_2696() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2631: an exact, non-overflowing `i64` `+`/`-`/`*` result past `2^53`
+/// used to be kept as `OwnedValue::Int` and printed via its own exact
+/// digits -- bypassing `jq_bare_float_display`'s shortest-round-trip
+/// formatting entirely, even though jq's own numbers are all `f64` and
+/// multiple adjacent integers can share one double past that magnitude.
+/// Every expectation here was captured live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_int_arith_past_exact_f64_range_matches_jq_bare_float_display_2631() -> Result<()> {
+    for (filter, want) in [
+        // The issue's own repro: `1 * <literal>` where the literal's exact
+        // value collapses onto a double shared with a shorter, adjacent
+        // integer -- jq prints the shorter spelling, not the literal's own.
+        ("1 * -33201876582270392", "-33201876582270390"),
+        // `2^53 + 1`: the smallest magnitude where `f64` can no longer
+        // represent every integer uniquely.
+        ("1 * 9007199254740993", "9007199254740992"),
+        ("3 * 3002399751580331", "9007199254740992"),
+        ("0 - 9007199254740993", "-9007199254740992"),
+        ("1 + 9007199254740993", "9007199254740992"),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2631 must-not-regress companion: every value at or below `2^53`, and
+/// every value whose exact `i64` product/sum/difference is itself a genuine
+/// `i64` overflow, must keep behaving exactly as before the fix -- the
+/// former because every integer in `[-2^53, 2^53]` has its own unique
+/// double (no adjacent-integer collision is possible to route around), the
+/// latter because it already went through `OwnedValue::Float` before #2631
+/// and is unaffected by the new, narrower in-range check. Also captured
+/// live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_int_arith_within_exact_f64_range_or_already_overflowing_unaffected_2631() -> Result<()> {
+    for (filter, want) in [
+        ("2 * 3", "6"),
+        ("100000000 * 100000000", "1e+16"),
+        ("4503599627370496 * 2", "9007199254740992"),
+        ("5000000000000000 * 1", "5000000000000000"),
+        ("9223372036854775807 * 2", "18446744073709552000"),
+        ("9223372036854775807 + 1", "9223372036854776000"),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
