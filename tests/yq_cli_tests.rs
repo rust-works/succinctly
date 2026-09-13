@@ -45852,26 +45852,43 @@ mod typed_key_node_2785 {
     const YAML: &[&str] = &[];
 
     /// The issue's table: the three readers agree with each other and with
-    /// yq about every key's type.
+    /// yq about every key's type -- for the four *canonically* spelled
+    /// typed keys. `~` (a non-canonical spelling of `null`, #2785's own
+    /// regression-guard residual, `docs/compliance/yq/limitations.md`'s
+    /// "The spelling is gone") is where the readers disagree with each
+    /// other, not just a typo: `keys` (materialized eagerly through
+    /// `key_owned_value`) answers `"~"`, but a `tag`/`line`/... read
+    /// downstream of a *lazy* key -- `.[] | key`, `keys[]` -- still
+    /// resolves straight from the live cursor (`!!null`), because the
+    /// canonical-spelling gate lives only at eager materialization, not on
+    /// the lazy cursor route these share with ordinary metadata reads.
+    /// `to_entries`'s entries are fully materialized objects with no cursor
+    /// left to fall back to, so `.key`/`.key | tag` both take the gated,
+    /// `"~"`/`!!str` answer.
     #[test]
     fn key_keys_and_to_entries_keep_the_type_2785() -> Result<()> {
         const TAGS: &str = "[\"!!int\",\"!!bool\",\"!!null\",\"!!float\",\"!!str\",\"!!null\"]\n";
         check(&[
             ("[.[] | key]", TYPED, JSON, "[1,true,null,1.5,\"2\",null]\n"),
-            ("keys", TYPED, JSON, "[1,true,null,1.5,\"2\",null]\n"),
+            ("keys", TYPED, JSON, "[1,true,null,1.5,\"2\",\"~\"]\n"),
             (
                 "to_entries | map(.key)",
                 TYPED,
                 JSON,
-                "[1,true,null,1.5,\"2\",null]\n",
+                "[1,true,null,1.5,\"2\",\"~\"]\n",
             ),
             ("[.[] | key | tag]", TYPED, JSON, TAGS),
             ("keys | map(tag)", TYPED, JSON, TAGS),
             ("[keys[] | tag]", TYPED, JSON, TAGS),
-            ("to_entries | map(.key | tag)", TYPED, JSON, TAGS),
-            // YAML output, both the streaming `keys` writer and the
-            // collected array: the quoted key keeps its quotes, the typed
-            // ones print bare.
+            (
+                "to_entries | map(.key | tag)",
+                TYPED,
+                JSON,
+                "[\"!!int\",\"!!bool\",\"!!null\",\"!!float\",\"!!str\",\"!!str\"]\n",
+            ),
+            // YAML output: `[.[] | key]` shares the composed-pipe route
+            // above (bare `null`); `keys`'s own streaming writer takes the
+            // gated route (`~` stays quoted, like the pre-existing `"2"`).
             (
                 "[.[] | key]",
                 TYPED,
@@ -45882,20 +45899,20 @@ mod typed_key_node_2785 {
                 "keys",
                 TYPED,
                 YAML,
-                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- \"~\"\n",
             ),
             (
                 "keys",
                 TYPED,
                 &["-I=0"],
-                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- null\n",
+                "- 1\n- true\n- null\n- 1.5\n- \"2\"\n- \"~\"\n",
             ),
             (
                 "to_entries",
                 TYPED,
                 &["-I=0"],
                 "- key: 1\n  value: x\n- key: true\n  value: y\n- key: null\n  value: z\n\
-                 - key: 1.5\n  value: w\n- key: \"2\"\n  value: v\n- key: null\n  value: u\n",
+                 - key: 1.5\n  value: w\n- key: \"2\"\n  value: v\n- key: \"~\"\n  value: u\n",
             ),
             // The metadata getters answer from the typed key node (#2763's
             // own table, which stopped at string keys).
@@ -45907,6 +45924,17 @@ mod typed_key_node_2785 {
 
     /// The discriminating rows: type and spelling disagree, and the typed
     /// key matches both because yq-mode `==` compares scalars by text.
+    ///
+    /// `select(key == null)` is the one row where this repo's answer is a
+    /// known, accepted divergence from yq rather than a match: real yq's
+    /// `!!null`-vs-`!!null` comparison rule is type-based, so it matches
+    /// `~:` too (`"z"`, `"u"`) regardless of spelling -- but that would
+    /// require keeping `~:`'s key typed as `Null`, which is exactly the
+    /// collision `key_owned_value`'s canonical-spelling gate exists to
+    /// avoid (a `null:`/`~:` pair would then materialize the identical key
+    /// and silently merge on `from_entries`/`with_entries`, #2785's
+    /// original regression). Recorded in
+    /// `docs/compliance/yq/limitations.md`'s "The spelling is gone".
     #[test]
     fn a_typed_key_matches_both_spellings_2785() -> Result<()> {
         check(&[
@@ -45914,7 +45942,7 @@ mod typed_key_node_2785 {
             (".[] | select(key == \"1\")", TYPED, JSON, "\"x\"\n"),
             (".[] | select(key == true)", TYPED, JSON, "\"y\"\n"),
             (".[] | select(key == \"true\")", TYPED, JSON, "\"y\"\n"),
-            (".[] | select(key == null)", TYPED, JSON, "\"z\"\n\"u\"\n"),
+            (".[] | select(key == null)", TYPED, JSON, "\"z\"\n"),
             (".[] | select(key == 1.5)", TYPED, JSON, "\"w\"\n"),
             (".[] | select(key == \"1.5\")", TYPED, JSON, "\"w\"\n"),
             (".[] | select(key == 2)", TYPED, JSON, "\"v\"\n"),
@@ -45963,6 +45991,11 @@ mod typed_key_node_2785 {
 
     /// A typed key is a number to arithmetic and sorts as its type --
     /// `sort` puts nulls, then bools, then numbers, then strings, as yq does.
+    ///
+    /// `sort`/`map(tostring)` here route `.[] | key` through the same
+    /// canonical-spelling gate `keys` does (unlike the bare `[.[] | key]`
+    /// read in `key_keys_and_to_entries_keep_the_type_2785`, above), so `~`
+    /// sorts and stringifies as the string `"~"` it fell back to, not `null`.
     #[test]
     fn a_typed_key_computes_and_sorts_as_its_type_2785() -> Result<()> {
         check(&[
@@ -45973,13 +46006,13 @@ mod typed_key_node_2785 {
                 "[.[] | key] | sort",
                 TYPED,
                 JSON,
-                "[null,null,true,1,1.5,\"2\"]\n",
+                "[null,true,1,1.5,\"2\",\"~\"]\n",
             ),
             (
                 "[.[] | key] | map(tostring)",
                 TYPED,
                 JSON,
-                "[\"1\",\"true\",\"null\",\"1.5\",\"2\",\"null\"]\n",
+                "[\"1\",\"true\",\"null\",\"1.5\",\"2\",\"~\"]\n",
             ),
         ])
     }
@@ -46147,6 +46180,71 @@ mod typed_key_node_2785 {
             ("keys", BAD, JSON, "[\"\",1]\n"),
             ("[.[] | key]", BAD, JSON, "[\"\",1]\n"),
             ("to_entries | map(.key)", BAD, JSON, "[\"\",1]\n"),
+        ])
+    }
+
+    /// #2804's own review regression: an earlier draft of #2785 retyped
+    /// *every* retypable spelling unconditionally, so two keys spelled
+    /// differently but resolving to the same scalar (`null:`/`~:`,
+    /// `1:`/`01:`, `true:`/`True:`) both materialized as the identical
+    /// `OwnedValue`, and `entries_to_object`'s `IndexMap<String, _>` then
+    /// silently dropped one member's value on `from_entries`/`with_entries`
+    /// -- real yq keeps all of them (captured live against v4.53.3).
+    /// `key_owned_value_spells_canonically`'s gate (`key_owned_value`, the
+    /// walk's `path_context_item_to_owned`, and their two duplicates in
+    /// `eval_builtin`/`eval_owned_identity_stages`) exists to keep this
+    /// from happening again -- pinned here with every collision shape the
+    /// gate has to handle, not just the one #2785's own issue named.
+    #[test]
+    fn noncanonical_spelling_keeps_its_member_2785() -> Result<()> {
+        check(&[
+            (
+                "with_entries(.)",
+                "null: a\n~: b\n",
+                JSON,
+                "{\"null\":\"a\",\"~\":\"b\"}\n",
+            ),
+            (
+                "to_entries | from_entries",
+                "null: a\n~: b\n",
+                JSON,
+                "{\"null\":\"a\",\"~\":\"b\"}\n",
+            ),
+            (
+                "with_entries(.)",
+                "1: a\n01: b\n",
+                JSON,
+                "{\"1\":\"a\",\"01\":\"b\"}\n",
+            ),
+            (
+                "to_entries | from_entries",
+                "1: a\n01: b\n",
+                JSON,
+                "{\"1\":\"a\",\"01\":\"b\"}\n",
+            ),
+            (
+                "with_entries(.)",
+                "true: a\nTrue: b\n",
+                JSON,
+                "{\"true\":\"a\",\"True\":\"b\"}\n",
+            ),
+            // The over-matching half of the same regression: `01:`'s key
+            // must not compare equal to the literal `1` just because it
+            // shares `1:`'s resolved value -- yq's text rule needs `01`'s
+            // own spelling, which only survives on the display-string
+            // route this gate keeps a non-canonical key on.
+            (
+                "[.[] | select(key == 1)]",
+                "01: a\n1: b\n",
+                JSON,
+                "[\"b\"]\n",
+            ),
+            (
+                "[.[] | select(key == 1)]",
+                "1: a\n01: b\n",
+                JSON,
+                "[\"a\"]\n",
+            ),
         ])
     }
 }

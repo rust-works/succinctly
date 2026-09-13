@@ -697,7 +697,14 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
 /// numeric arm allocates, so a string-against-string `==` stays free.
 /// `None` for a container, which has no `.Value` and is the caller's cue to
 /// leave the pairing to the structural rule.
-fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Option<Cow<'_, str>> {
+///
+/// `pub(crate)`, not private: `eval_generic.rs`'s key materialization
+/// (`key_owned_value`, `path_context_item_to_owned`'s `OneCursorValue` arm)
+/// reuses this as the canonical-spelling gate for #2785's typed key nodes --
+/// the same "what would `tostring` print" question this function already
+/// answers for `==`, not a second definition of it (CLAUDE.md's #106
+/// "duplicated predicates diverge silently" lesson).
+pub(crate) fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Option<Cow<'_, str>> {
     Some(match value {
         OwnedValue::String(s) => Cow::Borrowed(s),
         OwnedValue::Null => Cow::Borrowed("null"),
