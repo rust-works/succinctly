@@ -2541,9 +2541,9 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    collapsed_fields_checked, document_token_of, effective_fields_checked, key_is_malformed,
-    trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    collapsed_fields_checked, document_token_of, effective_fields_checked, key_hash,
+    key_is_malformed, trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention, KeyHashes,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -2552,6 +2552,7 @@ use crate::jq::{
     nonfinite_display_string, EvalError, JqSemantics, OwnedValue, YqSemantics,
     MAX_VALUE_TREE_DEPTH,
 };
+use crate::text::utf8::validate_utf8;
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
 /// *materializing* route already raises for the same scalar, so a document
@@ -2723,6 +2724,273 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
         StandardJson::Bool(false) => Some(start + 5),
         StandardJson::Null => Some(start + 4),
         StandardJson::Array(_) | StandardJson::Object(_) | StandardJson::Error(_) => None,
+    }
+}
+
+/// True iff `bytes` is *exactly* the byte-for-byte compact, unsorted-keys,
+/// jq-number-convention JSON that `stream_json_pretty` would itself produce
+/// for the value these bytes encode -- i.e. safe to echo verbatim instead of
+/// re-rendering (#2608).
+///
+/// A strict, single-pass, non-backtracking recursive-descent scanner over
+/// `value := object | array | string | number | true | false | null`, with
+/// **zero whitespace tolerated anywhere** (compact mode inserts none). It
+/// doubles as the structural validation `stream_json_pretty`'s walk
+/// otherwise supplies -- a `[1,,2]`/`{,}`/trailing-comma/missing-colon
+/// malformation has no legal token at the position the grammar above
+/// expects one, so the scan simply fails closed (`None` bubbles to
+/// `false`) the same as a genuine non-canonical span would. Bailing is
+/// always *safe*, never a correctness risk: a `false` here only costs the
+/// caller the echo and sends it back to the unchanged, already-correct
+/// `stream_json_pretty` re-render.
+///
+/// Three sub-checks, each pinned to the writer it must agree with bit for
+/// bit -- a divergence in any one is silent wrong output, not a crash, so
+/// none of them may drift from its writer (the #106 "duplicated predicates
+/// diverge silently" hazard, `CLAUDE.md`):
+/// - Numbers: the maximal `[-+.eE0-9]*` run at the current position (safe
+///   because a compact number is always immediately followed by
+///   `,`/`}`/`]`/end-of-input -- no whitespace, no other adjacent token
+///   char) is handed to [`is_jq_canonical_number`], which already answers
+///   "would `format_number_jq_compat` echo these exact bytes" (#2206).
+/// - Strings: scanned byte-by-byte between the quotes against exactly
+///   [`write_json_body_jq`]'s escape table (see `scan_json_string_span`'s
+///   own doc comment) -- **not** [`write_json_body_jq_ascii`]'s. That
+///   distinction is what keeps `-a`/`--ascii-output` out of this fast path
+///   entirely: this checker treats a raw non-ASCII byte as canonical
+///   content, which is only true under the non-ASCII-escaping writer.
+///   Nothing here gates on an ascii flag directly, because `stream_json`
+///   itself -- and every caller of it -- never has one to gate on:
+///   `JsonConvention::JqCompat` always renders through
+///   [`write_json_string_pretty`]'s `write_json_body_jq` arm, never the
+///   `_ascii` writer (see that function, `src/json/light.rs`). ASCII
+///   output is produced by an entirely separate route in
+///   `src/bin/succinctly/jq_runner.rs` (`format_json`/`write_output_jq_value`)
+///   that materializes an `OwnedValue` and never calls `stream_json` at
+///   all when `-a` is set -- confirmed at both of `stream_json`'s two
+///   callers in that file: the M2 fast path's own gate excludes
+///   `ascii_output` before it ever reaches `stream_json`
+///   (`can_json_fast_path`), and the general fallback takes the
+///   `format_json` materializing route instead precisely because `-a` is
+///   set. So this checker is exactly as `-a`-safe as the unchanged
+///   re-render branch directly below it in `stream_json` -- both are keyed
+///   on `numbers: JsonConvention` alone, and neither is ever invoked with
+///   ascii intent.
+/// - Duplicate keys: a fresh [`KeyHashes`] per object (never shared across
+///   siblings or nesting, matching one-instance-per-object semantics),
+///   fed each key's *raw source span* (the bytes strictly between its
+///   quotes, undecoded) through [`key_hash`]. That's sound without a
+///   decode step only because the string check above has *already*
+///   certified this exact span as jq's own canonical encoding of its
+///   decoded content -- a fixed, unconditional rule, so it's an injective
+///   map from decoded string to span, and span equality is decoded-string
+///   equality. `KeyHashes::insert` returning `true` covers both a genuine
+///   duplicate key and a bare 64-bit hash collision between two distinct
+///   keys; both get the same conservative answer here (bail, don't try to
+///   disambiguate by comparing bytes) since either one means "cannot
+///   certify this object's span as canonical", not "definitely not
+///   canonical" -- the type's own doc comment describes the same
+///   conservatism for its other callers.
+///
+/// The safety argument for this whole function is exactly the equivalence
+/// asserted by `is_canonical_compact_jq_span_agrees_with_stream_json_pretty`
+/// in `tests/json_canonical_echo_tests.rs`: `is_canonical_compact_jq_span(d)
+/// == (stream_json_pretty(d, compact, unsorted, JqCompat) == Ok(d))`, swept
+/// over a differential/fuzz corpus that deliberately includes non-ASCII and
+/// edge-byte content per `CLAUDE.md`'s fuzz-alphabet rule.
+#[must_use]
+pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
+    matches!(scan_canonical_value(bytes, 0, 0), Some(end) if end == bytes.len())
+}
+
+/// Scans one JSON value starting at `bytes[pos]`, returning the position
+/// just past it iff that value's span is exactly the canonical compact jq
+/// spelling of the value it encodes. `depth` mirrors `stream_json_pretty`'s
+/// own recursion counter and is checked against the same
+/// [`MAX_VALUE_TREE_DEPTH`] ceiling for the same reason: bounding the
+/// native Rust call stack this recursive-descent scan itself uses. Hitting
+/// the ceiling bails (`None`), never panics -- a pathologically deep
+/// document is exactly the case that must fall through to
+/// `stream_json_pretty`'s own real depth-exceeded error, not have this
+/// checker's stack overflow instead.
+fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        return None;
+    }
+    let byte = *bytes.get(pos)?;
+    match byte {
+        b'{' => scan_canonical_object(bytes, pos, depth),
+        b'[' => scan_canonical_array(bytes, pos, depth),
+        b'"' => scan_json_string_span(bytes, pos).map(|(.., end)| end),
+        b't' => scan_canonical_literal(bytes, pos, b"true"),
+        b'f' => scan_canonical_literal(bytes, pos, b"false"),
+        b'n' => scan_canonical_literal(bytes, pos, b"null"),
+        b'-' | b'0'..=b'9' => scan_canonical_number(bytes, pos),
+        _ => None,
+    }
+}
+
+/// Matches one of `true`/`false`/`null` at `pos` exactly -- no other
+/// spelling is legal JSON, so there is no "canonical vs. not" axis here the
+/// way there is for numbers/strings, only "present or not".
+fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<usize> {
+    let end = pos.checked_add(literal.len())?;
+    if bytes.get(pos..end) == Some(literal) {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+/// The number-token rule from `is_canonical_compact_jq_span`'s own doc
+/// comment: the maximal `[-+.eE0-9]*` run is jq's own canonical spelling
+/// iff [`is_jq_canonical_number`] says so.
+fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut end = pos;
+    while matches!(
+        bytes.get(end),
+        Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+    ) {
+        end += 1;
+    }
+    if end == pos || !is_jq_canonical_number(&bytes[pos..end]) {
+        return None;
+    }
+    Some(end)
+}
+
+/// The string-token rule: `bytes[pos]` must be `"`, and the scan returns
+/// `(content_start, content_end, end)` -- `end` is one past the closing
+/// quote, `content_start..content_end` the raw span strictly between the
+/// quotes -- iff every byte in that content span is exactly what
+/// [`write_json_body_jq`] would itself have emitted for the string this
+/// span decodes to:
+/// - a literal (unescaped) `"` ends the string;
+/// - a literal `\` must be followed by one of the 7 short escapes (`"` `\`
+///   `b` `f` `n` `r` `t` -- note `/` is deliberately absent: jq's writer
+///   never escapes solidus, so a source `\/` is not canonical), or `u`
+///   plus exactly 4 *lowercase* hex digits decoding to a control code
+///   [`write_json_body_jq`] has no short form for -- `0x00..=0x07`,
+///   `0x0B`, `0x0E..=0x1F`, or `0x7F` (DEL). A `\u00XX` for a codepoint
+///   that *does* have a short form (`0x08`/`0x09`/`0x0A`/`0x0C`/`0x0D`) is
+///   rejected here even though it decodes into the control range, because
+///   the writer would have emitted the short form instead -- see
+///   `is_canonical_compact_jq_span`'s own doc comment for why the
+///   accept-set is narrower than "any control code fits". Anything else
+///   after a backslash (uppercase hex, a surrogate half, any printable
+///   codepoint, any other letter) is rejected;
+/// - a literal byte `< 0x20` or `0x7F` appearing unescaped is rejected --
+///   the writer always escapes these;
+/// - every other byte, ASCII or a UTF-8 lead/continuation byte `>= 0x80`,
+///   is literal content.
+///
+/// The whole content span is then validated as UTF-8
+/// ([`validate_utf8`]) -- sound to defer to the end rather than tracking
+/// sequence boundaries during the scan above, because none of `"`, `\`,
+/// or a control/DEL byte can ever appear as a lead or continuation byte of
+/// a UTF-8 sequence (valid or not): every one of those bytes is `< 0x80`
+/// or exactly `0x7F`, and UTF-8 multi-byte bytes are always `>= 0x80`.
+fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+    debug_assert_eq!(bytes.get(pos), Some(&b'"'));
+    let content_start = pos + 1;
+    let mut i = content_start;
+    loop {
+        match *bytes.get(i)? {
+            b'"' => {
+                let content_end = i;
+                if validate_utf8(&bytes[content_start..content_end]).is_err() {
+                    return None;
+                }
+                return Some((content_start, content_end, i + 1));
+            }
+            b'\\' => {
+                let esc = *bytes.get(i + 1)?;
+                match esc {
+                    b'"' | b'\\' | b'b' | b'f' | b'n' | b'r' | b't' => i += 2,
+                    b'u' => {
+                        let hex = bytes.get(i + 2..i + 6)?;
+                        if !hex
+                            .iter()
+                            .all(|h| h.is_ascii_digit() || matches!(h, b'a'..=b'f'))
+                        {
+                            return None;
+                        }
+                        let cp = hex.iter().fold(0u32, |acc, &h| {
+                            let digit = if h.is_ascii_digit() {
+                                h - b'0'
+                            } else {
+                                h - b'a' + 10
+                            };
+                            (acc << 4) | u32::from(digit)
+                        });
+                        if !matches!(cp, 0x00..=0x07 | 0x0B | 0x0E..=0x1F | 0x7F) {
+                            return None;
+                        }
+                        i += 6;
+                    }
+                    // `/` (never escaped by jq's writer), any other letter,
+                    // or an unrecognized byte after `\` -- all not
+                    // canonical.
+                    _ => return None,
+                }
+            }
+            b if b < 0x20 || b == 0x7F => return None,
+            _ => i += 1,
+        }
+    }
+}
+
+/// The object-token rule: `{`, then either an immediate `}` or
+/// `"key":value` pairs separated by exactly one `,` with no trailing
+/// comma, each key checked against [`scan_json_string_span`] and hashed
+/// (raw span, undecoded -- see `is_canonical_compact_jq_span`'s own doc
+/// comment for why that's sound) into a fresh per-object [`KeyHashes`] to
+/// bail on any repeat.
+fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(pos), Some(&b'{'));
+    let mut i = pos + 1;
+    if bytes.get(i) == Some(&b'}') {
+        return Some(i + 1);
+    }
+    let mut seen_keys = KeyHashes::new();
+    loop {
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let (key_start, key_end, after_key) = scan_json_string_span(bytes, i)?;
+        if seen_keys.insert(key_hash(&bytes[key_start..key_end])) {
+            // A genuine duplicate key, or merely a hash collision -- either
+            // way this object's span cannot be certified canonical (see
+            // this function's own doc comment).
+            return None;
+        }
+        if bytes.get(after_key) != Some(&b':') {
+            return None;
+        }
+        i = scan_canonical_value(bytes, after_key + 1, depth + 1)?;
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => return Some(i + 1),
+            _ => return None,
+        }
+    }
+}
+
+/// The array-token rule: `[`, then either an immediate `]` or `value`
+/// items separated by exactly one `,` with no trailing comma.
+fn scan_canonical_array(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(pos), Some(&b'['));
+    let mut i = pos + 1;
+    if bytes.get(i) == Some(&b']') {
+        return Some(i + 1);
+    }
+    loop {
+        i = scan_canonical_value(bytes, i, depth + 1)?;
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b']') => return Some(i + 1),
+            _ => return None,
+        }
     }
 }
 
@@ -2954,6 +3222,32 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
             // SAFETY: JSON input is valid UTF-8 (checked during indexing)
             let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
             return Ok(out.write_str(s)?);
+        }
+        // #2608: checked *after* the `--preserve-input` branch above, so
+        // that branch's own behavior is completely unchanged -- this is an
+        // additional, narrower fast path for the *default* (non-preserve)
+        // compact jq-compat render. `numbers == JsonConvention::JqCompat`
+        // (not `uses_jq_escape_table()`, which is also true for
+        // `JqPreserveInput` -- already handled and returned above) is what
+        // keeps this from ever firing for a preserve-input render, and it's
+        // also -- see `is_canonical_compact_jq_span`'s own doc comment for
+        // the full argument -- what keeps `-a`/`--ascii-output` from ever
+        // reaching it: `stream_json` has no ascii parameter at all, and
+        // every caller that wants ascii-escaped output routes around this
+        // method entirely rather than calling it with `JqCompat`.
+        if indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
+            if let Some(bytes) = self.raw_bytes() {
+                if is_canonical_compact_jq_span(bytes) {
+                    // SAFETY: `is_canonical_compact_jq_span` only returns
+                    // `true` after validating every string's content as
+                    // UTF-8, so `bytes` as a whole is valid UTF-8 too.
+                    let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+                    return Ok(out.write_str(s)?);
+                }
+            }
+            // Falls through to the general re-render path below -- either
+            // no raw span was available, or the span wasn't certified
+            // canonical.
         }
         // #1676/#1576 review: a stray `,` in an *apparently* empty
         // container (`{,}`, `[,]`) has no child cursor for
@@ -5050,6 +5344,444 @@ mod tests {
         assert!(render(JsonConvention::Preserve).contains("1e100"));
         assert!(render(JsonConvention::JqPreserveInput).contains("1e100"));
         assert!(render(JsonConvention::JqCompat).contains("1E+100"));
+    }
+
+    /// The *ground truth* `is_canonical_compact_jq_span` must agree with,
+    /// for the differential tests below (#2608): the re-render path
+    /// `stream_json` itself falls through to once neither of its two
+    /// raw-echo branches fires, called directly rather than through
+    /// `stream_json` -- calling `stream_json` here instead would make the
+    /// property trivially agree with itself now that its new echo branch
+    /// *is* `is_canonical_compact_jq_span`, defeating the whole point of
+    /// the check. Mirrors `stream_json`'s own tail exactly (its
+    /// `empty_container_gap_ok` guard, then `stream_json_pretty` at
+    /// `IndentSpec::COMPACT`/unsorted/`JqCompat`). `None` for empty input
+    /// (skips even building an index -- a zero-length document never
+    /// reaches this far in the real CLI path either, `find_json_values`
+    /// yields no values for it) and for anything `stream_json_pretty`
+    /// itself rejects.
+    ///
+    /// Only the `is_canonical_compact_jq_span(doc) == true ==>
+    /// round-trips` direction is load-bearing (see the two differential
+    /// tests below) -- **not** the converse. Testing found a real,
+    /// pre-existing gap on the converse side, unrelated to #2608's own
+    /// code: `write_json_string_pretty`'s zero-copy echo
+    /// (`!escaped && !del_unsafe`) only special-cases a raw DEL byte
+    /// (`del_unsafe`, #2591); a raw *other* control byte (e.g. `0x01`)
+    /// left unescaped in the source slips through that same zero-copy
+    /// check uncaught, so this ground-truth renderer echoes it verbatim
+    /// -- where real `/usr/bin/jq 1.7.1` rejects the document outright
+    /// (`Invalid string: control characters from U+0000 through U+001F
+    /// must be escaped`). `is_canonical_compact_jq_span` still answers
+    /// `false` for that document (correctly, matching real jq's refusal
+    /// to treat it as valid input at all, not this renderer's own
+    /// leniency), so the gap never reaches the new echo path -- but it
+    /// does mean this helper cannot be trusted as a "definitely not
+    /// canonical" oracle, only a "definitely canonical" one. Not fixed
+    /// here: out of scope for #2608, which only adds an *echo* fast path
+    /// and must not change the unrelated re-render path's own behavior.
+    fn render_compact_jq_by_rerender(bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let index = JsonIndex::build(bytes);
+        let root = index.root(bytes);
+        let value = root.value();
+        if !empty_container_gap_ok(&root, &value) {
+            return None;
+        }
+        let mut buf = String::new();
+        stream_json_pretty(
+            &mut buf,
+            value,
+            0,
+            0,
+            ' ',
+            false,
+            JsonConvention::JqCompat,
+            0,
+        )
+        .ok()?;
+        Some(buf.into_bytes())
+    }
+
+    /// Wraps `content` in `"`...`"` to make a JSON string token, from
+    /// explicit byte literals rather than a string/byte-string literal
+    /// containing backslash-escape *text* (#2608 review: an earlier draft
+    /// of the corpus below typed those directly and two entries came out
+    /// wrong in ways that were not obvious to spot by eye -- an intended
+    /// `A` source spelling silently ended up as the literal letter
+    /// `A`, and an intended `\t` ended up as an actual raw tab byte).
+    /// A `&[u8]` of individual byte literals (`b'\\'`, `b'u'`, `b'0'`, ...)
+    /// has no such failure mode: every element is either a plain ASCII
+    /// byte or the single well-known escape `b'\\'`, so what is on the
+    /// page is exactly what ends up in the compiled byte sequence.
+    fn json_string_token(content: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(content.len() + 2);
+        v.push(b'"');
+        v.extend_from_slice(content);
+        v.push(b'"');
+        v
+    }
+
+    /// The whole safety argument for `is_canonical_compact_jq_span`, run
+    /// against a hand-picked corpus covering every rule in its own doc
+    /// comment, split into two groups asserted differently:
+    ///
+    /// - **Canonical** entries get the full, strong check: the checker
+    ///   must accept them (`is_canonical_compact_jq_span(doc)`) *and* the
+    ///   ground-truth re-render must agree byte-for-byte
+    ///   (`render_compact_jq_by_rerender(doc) == Some(doc)`) -- e.g.
+    ///   live-checked against `/usr/bin/jq 1.7.1`: `1.0`/`0.10` land here
+    ///   because jq preserves trailing zeros, despite looking
+    ///   superficially like a reformat target.
+    /// - **Non-canonical** entries only assert the checker *declines*
+    ///   them (`!is_canonical_compact_jq_span(doc)`) -- deliberately not
+    ///   the round-trip side. That is the direction that actually
+    ///   protects the new echo path (a decline can never cause wrong
+    ///   output, only a missed fast path), and two entries in this group
+    ///   (a raw control byte, an unterminated string) hit a pre-existing,
+    ///   unrelated leniency in the hand-rolled test-only ground truth --
+    ///   see `render_compact_jq_by_rerender`'s own doc comment -- that
+    ///   would fail a round-trip assertion for reasons that have nothing
+    ///   to do with `is_canonical_compact_jq_span` being wrong.
+    // The individual-byte-literal arrays below are deliberate, not an
+    // oversight clippy's `byte_char_slices` should collapse into a
+    // terser `b"..."` literal -- that terser form containing literal
+    // backslash-escape *text* is exactly what `json_string_token`'s own
+    // doc comment explains went wrong, twice, in an earlier draft.
+    #[test]
+    #[allow(clippy::byte_char_slices)]
+    fn is_canonical_compact_jq_span_agrees_with_rerender_2608() {
+        // All 7 short escapes, one string: `"a\tb\nc\rd\be\ff\"g\\h"`.
+        let all_short_escapes = json_string_token(&[
+            b'a', b'\\', b't', b'b', b'\\', b'n', b'c', b'\\', b'r', b'd', b'\\', b'b', b'e',
+            b'\\', b'f', b'f', b'\\', b'"', b'g', b'\\', b'\\', b'h',
+        ]);
+        // Every control code with no short form, spelled canonically.
+        let u00xx_no_short_form = json_string_token(&[
+            b'\\', b'u', b'0', b'0', b'0', b'0', b'\\', b'u', b'0', b'0', b'0', b'7', b'\\', b'u',
+            b'0', b'0', b'0', b'b', b'\\', b'u', b'0', b'0', b'1', b'f', b'\\', b'u', b'0', b'0',
+            b'7', b'f',
+        ]);
+        // `"a\/b"` -- jq's writer never escapes solidus.
+        let escaped_solidus = json_string_token(&[b'a', b'\\', b'/', b'b']);
+        // `"A"` -- decodes to 'A', which the writer would leave raw.
+        let escaped_u0041 = json_string_token(&[b'\\', b'u', b'0', b'0', b'4', b'1']);
+        // U+0008 spelled via \u -- decodes to a control code that *has* a short form
+        // (`\b`); the writer would use that, never this spelling.
+        let escaped_u0008_has_short_form =
+            json_string_token(&[b'\\', b'u', b'0', b'0', b'0', b'8']);
+        // uppercase hex digit, never emitted by the writer
+        // (lowercase only).
+        let escaped_uppercase_hex = json_string_token(&[b'\\', b'u', b'0', b'0', b'1', b'B']);
+        // `"\uD800"` -- a lone surrogate half, outside the control/DEL set
+        // entirely.
+        let escaped_lone_surrogate = json_string_token(&[b'\\', b'u', b'D', b'8', b'0', b'0']);
+        // Raw (unescaped) bytes the writer always escapes if present.
+        let raw_control_byte = json_string_token(&[0x01]);
+        let raw_del_byte = json_string_token(&[0x7f]);
+        // Invalid UTF-8: a bare continuation byte, and a truncated 2-byte
+        // lead with nothing (a valid continuation byte) after it.
+        let invalid_utf8_bare_continuation = json_string_token(&[0x80]);
+        let invalid_utf8_truncated_lead = json_string_token(&[0xC2]);
+
+        let canonical: Vec<Vec<u8>> = vec![
+            // -- scalars --
+            b"0".to_vec(),
+            b"-7".to_vec(),
+            b"42".to_vec(),
+            b"1000".to_vec(),
+            b"-0".to_vec(),
+            b"1.0".to_vec(), // live-verified: `1.0` -> `1.0` (jq preserves trailing zeros)
+            b"0.10".to_vec(), // live-verified: `0.10` -> `0.10`
+            b"12.345".to_vec(),
+            b"9.999".to_vec(),
+            b"true".to_vec(),
+            b"false".to_vec(),
+            b"null".to_vec(),
+            b"[]".to_vec(),
+            b"{}".to_vec(),
+            b"\"\"".to_vec(),
+            b"\"hello world\"".to_vec(),
+            b"\" \"".to_vec(), // a literal space is plain printable content
+            // -- escapes --
+            all_short_escapes,
+            u00xx_no_short_form,
+            // -- nesting, mixed types, unsorted keys kept as-is --
+            br#"{"b":2,"a":[1,2,3],"c":{"x":"y"},"d":null,"e":true,"f":false}"#.to_vec(),
+            br#"[1,-2,3.5,0.25,true,false,null,"x",{"k":"v"}]"#.to_vec(),
+        ];
+
+        let non_canonical: Vec<Vec<u8>> = vec![
+            // -- number spellings the formatter would rewrite --
+            b"1e2".to_vec(),
+            b"1E5".to_vec(),
+            b"007".to_vec(),
+            b"+7".to_vec(),
+            b"1.".to_vec(),
+            b"-000".to_vec(), // formatter rewrites to `-0`, not identity
+            b"01.5".to_vec(),
+            b"1.2.3".to_vec(),
+            b"-".to_vec(),
+            br"[1e2]".to_vec(),
+            br#"{"n":007}"#.to_vec(),
+            // -- string escape rules --
+            escaped_solidus,
+            escaped_u0041,
+            escaped_u0008_has_short_form,
+            escaped_uppercase_hex,
+            escaped_lone_surrogate,
+            raw_control_byte, // pre-existing renderer leniency -- see this test's own doc comment
+            raw_del_byte,
+            invalid_utf8_bare_continuation,
+            invalid_utf8_truncated_lead,
+            b"\"abc".to_vec(), // unterminated string -- same pre-existing leniency
+            // -- duplicate keys, first/middle/last position --
+            br#"{"a":1,"a":2}"#.to_vec(),
+            br#"{"x":0,"a":1,"a":2,"b":3}"#.to_vec(),
+            br#"{"a":1,"b":2,"a":3}"#.to_vec(),
+            // -- structural malformation (#1677/#1676/#2594-style) --
+            b"[1,,2]".to_vec(),
+            b"{,}".to_vec(),
+            b"[,]".to_vec(),
+            b"[1,2,]".to_vec(),
+            br#"{"a":1,}"#.to_vec(),
+            br#"{"a"1}"#.to_vec(),
+            br#"{"a" :1}"#.to_vec(), // valid JSON, but not *compact* -- extra space before `:`
+            br"[1, 2]".to_vec(),     // valid JSON, but not compact -- space after `,`
+            b"123abc".to_vec(),      // trailing garbage past the number token
+            b" 123".to_vec(),        // leading garbage before the value starts
+            b"".to_vec(),            // empty input
+        ];
+
+        for doc in &canonical {
+            assert!(
+                is_canonical_compact_jq_span(doc),
+                "expected canonical: {:?} (as text: {})",
+                doc,
+                String::from_utf8_lossy(doc)
+            );
+            assert_eq!(
+                render_compact_jq_by_rerender(doc).as_deref(),
+                Some(doc.as_slice()),
+                "expected round-trip: {:?} (as text: {})",
+                doc,
+                String::from_utf8_lossy(doc)
+            );
+        }
+        for doc in &non_canonical {
+            assert!(
+                !is_canonical_compact_jq_span(doc),
+                "expected non-canonical: {:?} (as text: {})",
+                doc,
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// Same load-bearing direction as the corpus test above --
+    /// `is_canonical_compact_jq_span(doc) == true ==>` `doc` round-trips
+    /// through the re-render unchanged -- swept over multi-byte-UTF-8-and-
+    /// edge-byte documents a seeded generator builds, rather than a
+    /// hand-picked list (the fuzz-alphabet rule in `CLAUDE.md`: a fuzzer
+    /// that only ever emits ASCII cannot find a bug in a UTF-8-aware
+    /// checker). One direction only, not the full biconditional the
+    /// corpus test above checks where it can afford to: the generator
+    /// deliberately includes a raw (unescaped) control byte among its
+    /// ingredients, which can trip the same pre-existing, unrelated
+    /// `render_compact_jq_by_rerender` gap that function's own doc
+    /// comment describes (a document `is_canonical_compact_jq_span`
+    /// correctly declines can still, by that gap, "round-trip" through
+    /// the renderer's own leniency) -- asserting the converse here would
+    /// make this test fail on a bug this change neither introduces nor
+    /// is responsible for fixing.
+    // See the corpus test's identical `#[allow]` just above for why:
+    // the individual-byte-literal arrays are the deliberate, safe
+    // choice here, not something clippy's suggested `b"..."` literal
+    // should replace.
+    #[test]
+    #[allow(clippy::byte_char_slices)]
+    fn is_canonical_compact_jq_span_fuzz_2608() {
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        // Ingredients a generated string's content is assembled from --
+        // deliberately mixing plain ASCII, multi-byte UTF-8 (2/3/4-byte
+        // sequences), every canonical escape spelling, and every
+        // non-canonical one this function's own doc comment calls out.
+        // Every ingredient is `&[u8]` (not `&str`) built from explicit
+        // byte literals for the escape sequences -- #2608 review: an
+        // earlier draft used `&str` raw-string literals containing
+        // backslash-escape *text* and several came out wrong in ways
+        // that were not obvious to spot by eye (see
+        // `json_string_token`'s own doc comment above, same lesson).
+        const STRING_INGREDIENTS: &[&[u8]] = &[
+            b"abcXYZ019 !#$%&()*+-.:;<=>?@[]^_`{|}~",
+            "日本語".as_bytes(), // 3-byte sequences
+            "café".as_bytes(),   // 2-byte (é)
+            "🎉🎊".as_bytes(),   // 4-byte sequences
+            "Ω∑".as_bytes(),     // more 2/3-byte mixes
+            &[b'\\', b't'],      // canonical short escape
+            &[b'\\', b'n'],
+            &[b'\\', b'r'],
+            &[b'\\', b'b'],
+            &[b'\\', b'f'],
+            &[b'\\', b'"'],
+            &[b'\\', b'\\'],
+            &[b'\\', b'u', b'0', b'0', b'0', b'0'], // canonical \u00xx (no short form)
+            &[b'\\', b'u', b'0', b'0', b'0', b'7'],
+            &[b'\\', b'u', b'0', b'0', b'0', b'b'],
+            &[b'\\', b'u', b'0', b'0', b'1', b'f'],
+            &[b'\\', b'u', b'0', b'0', b'7', b'f'],
+            &[b'\\', b'/'],                         // non-canonical: solidus escape
+            &[b'\\', b'u', b'0', b'0', b'4', b'1'], // non-canonical: should be raw 'A'
+            &[b'\\', b'u', b'0', b'0', b'0', b'8'], // non-canonical: has short form \b
+            &[b'\\', b'u', b'D', b'8', b'0', b'0'], // non-canonical: lone surrogate
+            &[b'\\', b'u', b'0', b'0', b'1', b'B'], // non-canonical: uppercase hex
+            &[0x01],                                // raw unescaped control byte
+            &[0x7f],                                // raw unescaped DEL byte
+        ];
+
+        // Raw (possibly invalid-UTF-8) byte-level ingredients, appended
+        // directly rather than through a `&str`.
+        const RAW_BYTE_INGREDIENTS: &[&[u8]] = &[&[0x80], &[0xC2], &[0xFF], &[0xE0, 0x80]];
+
+        const NUMBER_INGREDIENTS: &[&str] = &[
+            "0", "1", "-1", "42", "-7", "1.0", "0.10", "-0", "12.345", "9.999", "1000", "1e2",
+            "1E5", "007", "+7", "1.", "01.5", "-",
+        ];
+
+        fn gen_string_content(rng: &mut ChaCha8Rng, out: &mut Vec<u8>) {
+            let picks = rng.random_range(0..4);
+            for _ in 0..picks {
+                if rng.random_bool(0.15) {
+                    let raw = RAW_BYTE_INGREDIENTS[rng.random_range(0..RAW_BYTE_INGREDIENTS.len())];
+                    out.extend_from_slice(raw);
+                } else {
+                    let s = STRING_INGREDIENTS[rng.random_range(0..STRING_INGREDIENTS.len())];
+                    out.extend_from_slice(s);
+                }
+            }
+        }
+
+        fn gen_string(rng: &mut ChaCha8Rng, out: &mut Vec<u8>) {
+            out.push(b'"');
+            gen_string_content(rng, out);
+            out.push(b'"');
+        }
+
+        fn gen_number(rng: &mut ChaCha8Rng, out: &mut Vec<u8>) {
+            let n = NUMBER_INGREDIENTS[rng.random_range(0..NUMBER_INGREDIENTS.len())];
+            out.extend_from_slice(n.as_bytes());
+        }
+
+        fn gen_value(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+            if depth == 0 || rng.random_bool(0.35) {
+                match rng.random_range(0..6) {
+                    0 => gen_string(rng, out),
+                    1 => gen_number(rng, out),
+                    2 => out.extend_from_slice(b"true"),
+                    3 => out.extend_from_slice(b"false"),
+                    4 => out.extend_from_slice(b"null"),
+                    _ => gen_string(rng, out),
+                }
+                return;
+            }
+            if rng.random_bool(0.5) {
+                gen_object(rng, depth, out);
+            } else {
+                gen_array(rng, depth, out);
+            }
+        }
+
+        fn gen_array(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+            out.push(b'[');
+            let n = rng.random_range(0..4);
+            for i in 0..n {
+                if i > 0 {
+                    out.push(b',');
+                }
+                gen_value(rng, depth - 1, out);
+            }
+            out.push(b']');
+        }
+
+        fn gen_object(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+            out.push(b'{');
+            let n = rng.random_range(0..4);
+            // Occasionally force a repeated key, deliberately -- the
+            // duplicate-key rule needs positive coverage from the
+            // generator too, not just the hand-picked corpus. `key_0`
+            // captures index 0's *exact* bytes (as written to `out`, not
+            // regenerated from a second RNG -- a second draw would almost
+            // certainly produce a different string, defeating the whole
+            // point) so a later index can push a byte-for-byte copy,
+            // guaranteeing a real duplicate rather than a merely-possible
+            // one.
+            let dup_key: Option<usize> = if n > 1 && rng.random_bool(0.25) {
+                Some(rng.random_range(1..n))
+            } else {
+                None
+            };
+            let mut key_0: Vec<u8> = Vec::new();
+            for i in 0..n {
+                if i > 0 {
+                    out.push(b',');
+                }
+                if dup_key == Some(i) {
+                    out.extend_from_slice(&key_0);
+                } else {
+                    let key_start = out.len();
+                    gen_string(rng, out);
+                    if i == 0 {
+                        key_0 = out[key_start..].to_vec();
+                    }
+                }
+                out.push(b':');
+                gen_value(rng, depth - 1, out);
+            }
+            out.push(b'}');
+        }
+
+        let mut mismatches = Vec::new();
+        let mut canonical_count = 0usize;
+        const ITERATIONS: u64 = 2000;
+        for seed in 0..ITERATIONS {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut doc = Vec::new();
+            gen_value(&mut rng, 3, &mut doc);
+
+            let checker_says_canonical = is_canonical_compact_jq_span(&doc);
+            let actually_round_trips =
+                render_compact_jq_by_rerender(&doc).as_deref() == Some(doc.as_slice());
+            if checker_says_canonical {
+                canonical_count += 1;
+                // One direction only -- see this test's own doc comment
+                // for why the converse is not asserted here.
+                if !actually_round_trips {
+                    mismatches.push((seed, doc.clone()));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "{} of {ITERATIONS} generated documents were certified canonical but did not round-trip; first few: {:#?}",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .take(5)
+                .map(|(seed, doc)| (*seed, String::from_utf8_lossy(doc).into_owned()))
+                .collect::<Vec<_>>()
+        );
+        // Sanity: the generator must actually exercise the fast path some
+        // of the time, or this whole test would pass vacuously by only
+        // ever generating non-canonical documents.
+        assert!(
+            canonical_count > ITERATIONS as usize / 20,
+            "generator produced too few canonical documents to be a meaningful sweep: {canonical_count}/{ITERATIONS}"
+        );
     }
 
     // #1576 coverage: `stream_json_sequence`'s empty case. `map(...)` over
