@@ -34084,14 +34084,31 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     let mut target_escape: Option<EvalEscape> = None;
     let mut first_key = true;
 
-    // #843: `target` is a no-op read of the untracked value itself, so the
-    // key computed above is the first real navigation attempted against it
-    // — see `is_passthrough_target`'s doc comment. This has to run *before*
-    // `resolve_node` below, not just after: `target` being bare `Identity`
-    // and `trackable` false would otherwise make `resolve_node` itself
-    // raise `#530`'s classic "with result" message (via `resolve_leaf`'s
-    // own untracked-`Identity` handling) before this function ever gets to
-    // see the actual key, which is the wrong message for `.[.k]`.
+    // The two structural "is this target trackable" checks (#843/#986) run
+    // on *every* key's own freshly-resolved `branches`, not just the first
+    // (#2139 review finding): `target`'s trackability is NOT purely a
+    // function of its own static AST shape whenever that AST contains a
+    // runtime branch (`if`/`select`/`try`-`catch`) whose taken arm can
+    // differ per call -- and it can differ per call precisely because
+    // `target` is genuinely re-evaluated per key, so a stateful condition
+    // (`input`, ...) can steer an earlier key into a trackable arm and a
+    // later key into an untracked one. Latching a "trackable, don't check
+    // again" verdict from the first key let a later key's genuinely
+    // untracked branch through unchecked -- confirmed live as a real
+    // data-corruption bug in #2139's own first draft: an `if` target
+    // reading a fresh `input` per key, trackable on key 1 (`getpath(...)`)
+    // and untracked on key 2 (`(1|{"c":10})`), wrote straight through key
+    // 2's untracked branch into the live document instead of raising jq's
+    // "Invalid path expression". Re-running the check every key costs
+    // nothing extra to *resolve* -- `branches` is recomputed fresh each
+    // iteration regardless -- only a few more comparisons.
+    //
+    // `first_key` below is the one thing that *is* latched, and it is a
+    // different question: it gates the #843 passthrough refusal, whose two
+    // operands (`trackable`, and `target`'s static AST shape) are both
+    // loop-invariant parameters of this call. Nothing a key can do changes
+    // either, so asking once is asking every time -- unlike the per-branch
+    // checks above, whose input is resolved afresh per key.
     // Keeps `target`'s own partial prefix too, not just `key`'s (#896
     // review): `target` can itself be one of #896's 4 fixed sites
     // (`select`, `if`, `getpath`, a nested computed index), so its own
@@ -34129,18 +34146,28 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
                 return Demand::Stop;
             }};
         }
-        // #843 runs on the first key's iteration rather than ahead of the
-        // loop: it needs a key to name in its message, and with the
-        // generator driven one value at a time the first delivered key is
-        // the earliest point one exists. `out` is necessarily still empty
-        // here, so the empty prefix the pre-#2267 `Err((Vec::new(), ..))`
-        // returned is preserved exactly.
+        // #843: `target` is a no-op read of the untracked value itself, so
+        // this key is the first real navigation attempted against it -- see
+        // `is_passthrough_target`'s doc comment. It has to run *before*
+        // `resolve_target_for_pair` just below, not after: `target` being
+        // bare `Identity` with `trackable` false would otherwise make
+        // `resolve_node` raise #530's classic "with result" message (via
+        // `resolve_leaf`'s own untracked-`Identity` handling) before this
+        // function ever gets to see the actual key, which is the wrong
+        // message for `.[.k]`.
+        //
+        // It runs on the first delivered key rather than ahead of the drive
+        // (where it sat before #2267 made the key generator demand-driven):
+        // it needs a key to name in its message, and with keys arriving one
+        // at a time the first one is the earliest point such a key exists.
+        // `out` is necessarily still empty here, so the empty prefix the
+        // pre-#2267 `Err((Vec::new(), ..))` returned is preserved exactly.
+        // See the `first_key` note above for why latching this one check is
+        // sound where latching the per-branch ones was not.
         if first_key {
             first_key = false;
             if !trackable && is_passthrough_target(target) {
-                target_escape =
-                    Some(EvalError::invalid_path_expression_near_access(&k, value).into());
-                return Demand::Stop;
+                escape!(EvalError::invalid_path_expression_near_access(&k, value).into());
             }
         }
         let k = &k;
