@@ -35307,6 +35307,38 @@ mod tests {
         (out, flow)
     }
 
+    /// #2693: the generic evaluator's `recurse` arms, on the one route that
+    /// reaches them with no live cursor -- `each_recurse_cursor_generic`
+    /// takes the bare spelling whenever a cursor exists, so the owned walker
+    /// is otherwise only entered through the parameterised ones.
+    #[test]
+    fn each_recurse_generic_cursorless_2693() {
+        // Bare `recurse` is `recurse(.[]?)`: the root, `{"b":1}`, then `1`.
+        let (out, flow) = drive_each_sink_cursorless(br#"{"a":{"b":1}}"#, "recurse");
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out.len(), 3, "out: {out:?}");
+        let (out, flow) = drive_each_sink_cursorless(br#"{"a":{"b":1}}"#, "recurse_down");
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(out.len(), 3, "out: {out:?}");
+    }
+
+    /// #1755's rule on #2693's new lazy route: an undecodable root raises
+    /// rather than being visited as `""`. The collecting builtins' own copy
+    /// of this guard is pinned by
+    /// `eval::tests::test_recurse_walk_family_raises_on_decode_failure_1755`;
+    /// this is the generic evaluator's.
+    #[test]
+    fn each_recurse_generic_raises_on_undecodable_root_2693() {
+        for filter in ["recurse", "recurse(empty)", "recurse(empty; true)"] {
+            let (out, flow) = drive_each_sink_cursorless(b"\"\xff\xfe\"", filter);
+            assert!(out.is_empty(), "{filter}: out: {out:?}");
+            assert!(
+                matches!(&flow, Flow::Escaped(Control::Error(e)) if e.is_decode_failure()),
+                "{filter}: expected a decode failure"
+            );
+        }
+    }
+
     /// #2180 coverage: every sink arm this issue added that has to pull one
     /// item out of the stream shares a failure mode -- a `map(f)` operand
     /// arrives still lazy (`GenericItem::LazySeq`), and forcing it

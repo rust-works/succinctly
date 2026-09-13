@@ -57937,6 +57937,13 @@ mod tests {
             "[limit(1; repeat(.))]",
             "[recurse(empty)]",
             "[recurse(empty; true)]",
+            // #2693 gave the parameterised spellings a lazy arm of their
+            // own, which converts the root itself -- so the same guard has
+            // to hold on that route, not just the collecting one a bare
+            // `[recurse(...)]` takes.
+            "[limit(1; recurse(empty))]",
+            "[limit(1; recurse(empty; true))]",
+            "[first(recurse(empty))]",
             "walk(.)",
             "tostream",
         ] {

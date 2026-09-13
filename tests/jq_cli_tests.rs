@@ -42946,6 +42946,23 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
             String::new(),
             0,
         ),
+        // Bare `recurse` reaches the same arm once there is no live cursor
+        // to walk (`. + {}` builds a fresh value), rather than
+        // `each_recurse_cursor_generic`.
+        (
+            r#"{"a":{"b":1}}"#,
+            "[limit(2; (.+{}) | recurse)]",
+            "[{\"a\":{\"b\":1}},{\"b\":1}]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "[first((.+{}) | recurse)]",
+            "[{\"a\":{\"b\":1}}]\n".to_string(),
+            String::new(),
+            0,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -42955,6 +42972,14 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
         assert_eq!(stdout, want_out, "{filter}");
         assert_eq!(stderr, want_err, "{filter}");
     }
+
+    // The `-n` route reaches `eval::eval_each`'s own arm rather than the
+    // generic evaluator's -- both were added, so both are checked.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", r#"[limit(2; {"a":{"b":1}} | recurse)]"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"a\":{\"b\":1}},{\"b\":1}]\n");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
