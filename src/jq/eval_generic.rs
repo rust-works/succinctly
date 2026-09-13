@@ -16685,6 +16685,23 @@ fn path_context_getpath_walk_one<S: EvalSemantics, V: DocumentValue>(
 /// `{"a":5}` never prints the `DEBUG` line, since `["a","x"]`'s walk fails
 /// first and the generator is never pulled again.
 ///
+/// This laziness is only as good as [`eval_each_generic`]'s own: an `EXPR`
+/// shape with no native lazy arm there (e.g. `inputs`) still falls to its
+/// eager fallback and drains before this function's sink is ever consulted
+/// -- the same pre-existing limitation every other lazy consumer built on
+/// `eval_each_generic` already has (`fanout_arg_each_generic`,
+/// `stream_owned_outputs_generic`), including `builtin_getpath` itself.
+/// This fix closes the specific gap #2259 reported (a walk failure not
+/// stopping a *reachable* later output), not that broader, shared ceiling.
+///
+/// Three sibling call sites of [`path_context_component_values`] have the
+/// identical eager-drain-vs-side-effect-ordering bug and are not converted
+/// here: `path_context_step_computed_index`'s key stream,
+/// `path_context_step_computed_slice`'s bounds, and the `Expr::If`/
+/// `Expr::Limit` arms of `path_context_step_generic`. Tracked as #2916
+/// rather than folded into this fix, which is scoped to the one call site
+/// #2259 actually reported.
+///
 /// A walk failure is reported directly (bypassing
 /// [`path_context_component_escape`], which only ranks the *generator's
 /// own* trailing escape against output already produced) -- unchanged from
@@ -16990,6 +17007,14 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
 /// `Demand` back into the pull, so a caller that stops early (e.g. a
 /// `getpath` walk that just failed) genuinely halts the generator instead of
 /// only discarding what it already produced.
+///
+/// spine 2416 (walk residue): a component that halts or breaks is no longer
+/// refused -- the step carries a `Control`, so `.c[halt] | key` exits
+/// silently and `.[break $out] | key` unwinds to its label here exactly as
+/// they did on the eager route (#2495). The values produced *before* the
+/// escape are real output (`.[("a","b",halt)] | key` prints both keys and
+/// then halts, #1897), so they come back alongside it -- every caller that
+/// needs them takes them via `sink` before ever seeing the returned escape.
 fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
@@ -17015,14 +17040,19 @@ fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
                 Flow::Escaped(control) => Some(control),
             })
         }
-        PathNode::Absent => match eval_each_owned::<S>(&expr, &OwnedValue::Null, false, sink) {
-            Flow::Escaped(control) => Some(control),
-            Flow::Exhausted | Flow::Stopped { .. } => None,
-        },
-        PathNode::Owned(v) => match eval_each_owned::<S>(&expr, v, false, sink) {
-            Flow::Escaped(control) => Some(control),
-            Flow::Exhausted | Flow::Stopped { .. } => None,
-        },
+        // `Absent` evaluates the component against the `null` it holds; an
+        // `Owned` node against its own value -- the only difference between
+        // the two arms.
+        PathNode::Absent | PathNode::Owned(_) => {
+            let value: &OwnedValue = match &pos.node {
+                PathNode::Owned(v) => v,
+                _ => &OwnedValue::Null,
+            };
+            match eval_each_owned::<S>(&expr, value, false, sink) {
+                Flow::Escaped(control) => Some(control),
+                Flow::Exhausted | Flow::Stopped { .. } => None,
+            }
+        }
     }
 }
 
@@ -17030,15 +17060,8 @@ fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
 /// -- for the callers that only ever need the whole list (a bound, a
 /// condition, an index/slice target), not lazy per-output stopping. Built on
 /// [`path_context_component_each`], the same generator each of those already
-/// pulls from lazily underneath.
-///
-/// spine 2416 (walk residue): a component that halts or breaks is no longer
-/// refused -- the step carries a `Control`, so `.c[halt] | key` exits
-/// silently and `.[break $out] | key` unwinds to its label here exactly as
-/// they did on the eager route (#2495). The values produced *before* the
-/// escape are real output (`.[("a","b",halt)] | key` prints both keys and
-/// then halts, #1897), so they come back alongside it and every caller takes
-/// them before reporting the escape.
+/// pulls from lazily underneath, and inherits that function's own
+/// "spine 2416 (walk residue)" invariant (values before the escape survive).
 fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
