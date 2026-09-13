@@ -5351,6 +5351,22 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let f = Expr::Optional(Box::new(Expr::Iterate));
             each_recurse::<W, S>(&f, None, value, sink)
         }
+        // #2908: `path(f)` is a generator, so a consumer satisfied by the
+        // first path must be able to stop `f`. Without this arm it fell to
+        // the collecting `builtin_path`, which ran every output of `f`
+        // before `limit`/`first` could truncate the finished list.
+        Expr::Builtin(Builtin::Path(path_expr)) => {
+            // #2280: `optional` suppresses a decode failure into *no
+            // output*, exactly as `builtin_path`'s `to_owned_or_suppress!`
+            // does -- `suppresses` is the same predicate, so the two routes
+            // cannot disagree about which failures a `?` swallows.
+            let owned = match to_owned(&value) {
+                Ok(v) => v,
+                Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+                Err(e) => return Flow::Escaped(Control::Error(e)),
+            };
+            each_path::<W, S>(path_expr, &owned, optional, sink)
+        }
         Expr::Builtin(Builtin::RecurseF(f)) => each_recurse::<W, S>(f, None, value, sink),
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
             each_recurse::<W, S>(f, Some(cond), value, sink)
@@ -33466,6 +33482,20 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     }
 }
 
+/// [`eval_each`]'s `path(f)` arm (#2908): [`each_path_on_owned`] with its
+/// escape mapped onto a [`Flow`].
+fn each_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match each_path_on_owned::<S>(expr, owned, optional, &mut |v| sink(Item::Owned(v))) {
+        None => Flow::Exhausted,
+        Some(e) => Flow::Escaped(Control::from(e)),
+    }
+}
+
 /// [`eval_each`]'s `recurse`-family arm (#2693): the walk above, delivered
 /// one node at a time so a bounded consumer (`limit`, `first`, `any`,
 /// `isempty`) stops it instead of truncating a finished 10000-item list.
@@ -41247,6 +41277,87 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
     // path that always resolves, so rendering emptiness as it aims a
     // caller's `getpath`/`setpath`/`delpaths` at the document root (#489).
     owned_vec_to_result(paths)
+}
+
+/// [`builtin_path_on_owned`], delivering each path to `sink` as it is
+/// resolved and walked rather than collecting them all first (#2908).
+///
+/// jq's `path(f)` is a generator like any other: a consumer satisfied by the
+/// first path never asks for the second, and `f` is never resumed to produce
+/// it. Collecting inverted that for *every* multi-output `f`, not only a
+/// fold's source:
+///
+/// ```console
+/// $ echo '{"a":1,"b":2,"c":3}' | jq -c \
+///     '[limit(1; path((.a|stderr), (.b|stderr), (.c|stderr)))]'
+/// 1                      # succinctly wrote 1, 2 and 3
+/// [["a"]]
+/// ```
+///
+/// Resolution and walking now interleave: each resolved branch is walked and
+/// emitted before the next is asked for. That is jq's own order, and it is
+/// what carries the consumer's [`Demand::Stop`] back into the generator.
+/// Pure navigation fan-out (`path(.[])`, `path(.a[])`) already agreed --
+/// nothing in it is observable per element -- and still does.
+///
+/// Error precedence is unchanged: a walk error beats a resolution error, and
+/// either surfaces only after the paths already produced.
+pub(crate) fn each_path_on_owned<S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<EvalEscape> {
+    let root = PathTrail::root();
+    let mut walk_error: Option<EvalEscape> = None;
+    let mut stopped = false;
+    // Reused across branches so a wide fan-out does not allocate per branch.
+    let mut reached: Vec<(Rc<PathTrail>, WalkNode<'_>)> = Vec::new();
+
+    let resolve_error = resolve_dynamic_indexes_sink::<S>(expr, owned, true, &mut |resolved| {
+        reached.clear();
+        // A failing walk still emits whatever it reached first (#2680): jq's
+        // generator never un-emits an output it already produced, so
+        // `path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":{}},5]}` prints
+        // `["a",0,"b","c",{"start":0,"end":1}]` and *then* raises on the
+        // second element. `walk_path` fills `reached` as it goes, so the
+        // prefix is whatever is in it when the error comes back -- draining
+        // it before returning is what keeps that contract, and dropping it
+        // is what `builtin_path_on_owned`'s own `partial(paths, e)` warns
+        // against.
+        let outcome = walk_path::<S>(
+            &resolved,
+            WalkNode::Doc(owned),
+            &root,
+            &mut reached,
+            optional,
+        );
+        for (path, _) in reached.drain(..) {
+            // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
+            // once per reached branch (#2058).
+            if sink(OwnedValue::Array(path.to_vec())) == Demand::Stop {
+                stopped = true;
+                return Demand::Stop;
+            }
+        }
+        if let Err(e) = outcome {
+            walk_error = Some(e);
+            return Demand::Stop;
+        }
+        Demand::Continue
+    })
+    .err();
+
+    // A walk error is this call's own, raised while the prepass was still
+    // running, so it outranks whatever the prepass reported on the way out --
+    // the same precedence `builtin_path_on_owned` applies with
+    // `walk_error.or(resolve_error)`. A stop is neither: the consumer is
+    // satisfied and jq never resumes the generator, so an escape the
+    // prepass was still carrying is never reached.
+    if stopped {
+        return None;
+    }
+    walk_error.or(resolve_error)
 }
 
 /// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
