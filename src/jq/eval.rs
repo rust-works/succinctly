@@ -32895,6 +32895,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             }
         });
         if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+            // The stop this fork answers is *not* retryable: a `?//` in INIT
+            // would otherwise take it for an ordinary satisfied-consumer stop
+            // and try its next alternative, running the fold again past a
+            // `halt_error`. `[path(foreach (1) as $v ((1 as $x ?// $y | .a);
+            // ("h"|halt_error(3)); .))]` on `{"a":1}` writes `h` once in jq
+            // and wrote `hh` while this was a bare `Demand::Stop`. Same call
+            // `stop_with_escape` makes for the fold's own inner escapes --
+            // this is the one escape that leaves through INIT's sink instead.
+            mark_nonretryable_escape(&control);
             fork_outcome = Some(ResolveFlow::Escaped(control.into()));
             return Demand::Stop;
         }
@@ -33368,6 +33377,15 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             return Demand::Stop;
         }
         if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+            // The stop this fork answers is *not* retryable: a `?//` in INIT
+            // would otherwise take it for an ordinary satisfied-consumer stop
+            // and try its next alternative, running the fold again past a
+            // `halt_error`. `[path(foreach (1) as $v ((1 as $x ?// $y | .a);
+            // ("h"|halt_error(3)); .))]` on `{"a":1}` writes `h` once in jq
+            // and wrote `hh` while this was a bare `Demand::Stop`. Same call
+            // `stop_with_escape` makes for the fold's own inner escapes --
+            // this is the one escape that leaves through INIT's sink instead.
+            mark_nonretryable_escape(&control);
             fork_outcome = Some(ResolveFlow::Escaped(control.into()));
             return Demand::Stop;
         }
