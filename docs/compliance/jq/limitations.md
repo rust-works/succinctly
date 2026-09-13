@@ -1205,8 +1205,10 @@ succeeds" count for this whole fold-source area dropped from 67 to 3, with no in
 other divergence category.
 
 Seven residual divergences remain in this area (the first five predate
-[#2732](https://github.com/rust-works/succinctly/issues/2732); that issue closed a separate,
-sixth bug in `fold_source_ambient`'s fork-0 arm — a `null`/`bool` document did not reestablish
+[#2732](https://github.com/rust-works/succinctly/issues/2732); the second has since been
+narrowed to its consumer half by [#2694](https://github.com/rust-works/succinctly/issues/2694)
+and re-tracked as [#2908](https://github.com/rust-works/succinctly/issues/2908); #2732 closed a
+separate, sixth bug in `fold_source_ambient`'s fork-0 arm — a `null`/`bool` document did not reestablish
 against an equal-valued register, `path(reduce .a as $k (.b; .))` on `null` raised where jq
 answers `["b"]` — and classified the two residuals appended below):
 
@@ -1221,20 +1223,38 @@ answers `["b"]` — and classified the two residuals appended below):
   `git stash` A/B against the pre-#2031 build on `main` too. Tracked as
   [#2159](https://github.com/rust-works/succinctly/issues/2159).
 
-- **A generator the resolver reaches only through an eager arm is still collected before
-  its first element is folded.** `drive_fold_source` pulls by demand only as far as
-  `resolve_node_sink`'s lazy arms reach; `resolve_leaf`'s general case, an `if`/`select`
-  condition (`eval_owned_multi_keep_partial`), an `as` source (`resolve_bind_source`) and a
-  fold nested inside the source all materialize their own generator first. So `path(foreach
-  (inputs | .a) as $i (.; .))` drains every remaining input document where jq consumes one,
-  and `path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; error("u")))` on
-  `[1,2,3]` writes `123` for jq's `1`. Same cause as [#2466](https://github.com/rust-works/succinctly/pull/2466)'s
-  own left-out list: `resolve_leaf` has no sink form. The consumer side has the same edge:
-  `path()` itself collects every path before its own consumer sees one, so a bound *outside*
-  it cannot stop the fold (`[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.;
-  .)))]` is `[[],[]]` with two writes in jq — its `limit` break is retried by the source's
-  `?//` and the retried output lands past the bound — and `[[]]` with one write here).
-  Tracked as [#2694](https://github.com/rust-works/succinctly/issues/2694).
+- ~~**A generator the resolver reaches only through an eager arm is still collected before
+  its first element is folded.**~~ **Closed by
+  [#2694](https://github.com/rust-works/succinctly/issues/2694).** `drive_fold_source` used to
+  pull by demand only as far as `resolve_node_sink`'s lazy arms reached, and the four arms
+  that had none materialized their own generator first: `resolve_leaf`'s general case, an
+  `if`/`select` condition, an `as` source, and a fold nested inside the source. The nested
+  fold was already covered by #2235's own `Reduce`/`Foreach` sink arms; the other three now
+  stream through `resolve_leaf_sink`, `resolve_cond_fork_stream` and
+  `resolve_bind_source_sink`. The leaf arm was the one with a correctness cost rather than
+  only a side-effect one: `inputs` is a generator whose unconsumed documents stay readable, so
+  collecting the source drained the stream — `path(first(foreach (inputs | select(.a)) as $i
+  (.; .))), [inputs]` answered `[]` then `[]` where jq answers `[]` then
+  `[{"a":2},{"a":3}]`. `path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.;
+  error("u")))` on `[1,2,3]` now writes `1`, as jq does, where it wrote `123`.
+
+  **Two parts of the streaming stay collecting on purpose, and are not gaps.** A
+  `Keep::First` leaf (every ordinary `path()`/`=`/`|=`/`del()` entry) keeps the collecting
+  form because its halt rule returns *no* prefix — it discards the one value a limit-1 sink
+  had already taken, which streaming cannot take back — and loses nothing by it, since its
+  limit is 1. #2042's two `as`-source witness routes keep it because each can still *decline*
+  after resolving and fall back to by-value evaluation, another decision a streamed value
+  cannot be taken back from; they run only on `is_pure_navigation`'s closed grammar, which
+  has no side effects and no generator to interleave with.
+
+  **The consumer side remains**, a different mechanism under the same original bullet: `path()`
+  itself resolves past what its own consumer asked for, so a bound *outside* it cannot stop the
+  fold. `[limit(1; path(foreach ((1|stderr),(2|stderr),(3|stderr)) as $i (.; .a)))]` on
+  `{"a":1}` writes `1` in jq and `12` here (same for `first(...)` and for a `label`/`break`
+  bound), and `[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.; .)))]` is
+  `[[],[]]` with two writes in jq — its `limit` break is retried by the source's `?//` and the
+  retried output lands past the bound — and `[[]]` with one write here. Tracked as
+  [#2908](https://github.com/rust-works/succinctly/issues/2908).
 - **`recurse(f)`/`recurse(f; cond)` still collects one node's own `f` in full.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
