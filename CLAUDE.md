@@ -337,10 +337,7 @@ printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'   # b: 1
 ```
 
 Real yq's `sort_keys` diverges the same way when sorting would move an alias above its
-declaration — and succinctly's own `--sort-keys` currently *reproduces* that unsound output,
-because the soundness pass doesn't reach the streaming path (#1350). That is a bug against
-the rule, not a second exception to it, so the "never" above is the intent and #1350 is the
-one place it does not hold.
+declaration.
 
 **A write through an alias reaches the shared node (#1351).** yq decides by *path shape*: a
 path that ends exactly at an alias (`.b = 5`, `.b |= 5`, `del(.b)`) rebinds that position;
