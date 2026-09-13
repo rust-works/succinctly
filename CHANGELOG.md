@@ -139,6 +139,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth countdown runs as ordinary `Int` arithmetic the whole way, not a
   silent float promotion on the very first decrement.
 
+- **A computed slice's bounds now interleave with its target, as jq's own
+  desugaring does** (#2267). `resolve_slice_expr` (the `path()`/`=`/`|=`/`del()`
+  resolver for `E[S:T]`) drained `S` in full, then `T` in full per `s`, and only
+  then reached `E` for each pair. jq compiles the same expression as
+  `S as $s | T as $t | E | .[$s:$t]` -- three nested generators, each pulled one
+  value at a time -- so `E` runs before the next `t` is asked for, and a pair
+  completes before the next `s` is. Captured live against jq 1.7.1:
+
+  ```console
+  $ echo '[10,20,30]' | jq -c \
+      'path((.|debug("E"))[0:((1|debug("t1")),(2|debug("t2")))])' 1>/dev/null
+    t1, E, t2, E          # was: t1, t2, E, E
+  $ echo '[10,20,30]' | jq -c \
+      'path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|debug("t"))])' 1>/dev/null
+    s0, t, E, s1, t, E    # was: s0, s1, t, E, t, E
+  ```
+
+  The `S` row is a second gap of the same class that #2267 did not record; it
+  was found by this fix's own live-oracle verification. Stopping carries the
+  same weight as ordering: once a pair's `E` escapes, jq never resumes the `T`
+  generator, so a later `t` is not merely skipped but never evaluated
+  (`path((select((true,error("terr"))))[0:((1|debug("t1")),(2|debug("t2")))])`
+  prints `t1` and then the error, never `t2`).
+
+  Only the ordering moves -- every shape produced the same path outputs, in the
+  same order, before and after -- so the regression tests pin stderr content and
+  count alongside stdout. yq mode keeps the eager drain: #2351's rule discards
+  every value a bound produced once it escapes, which is only decidable once the
+  generator has finished, and real yq cannot express any of these shapes anyway
+  (no `path()`, no `debug`/`stderr`, and `.[0:(1,2)]` is "bad expression" on
+  v4.53.3).
+
 - **`succinctly jq`/`yq` no longer reject a `def` nobody ever calls** (#2740).
   `def h: nosuchfn; 1` used to fail at compile time (`nosuchfn/0 is not
   defined`) even though `h` is never referenced anywhere in the program;

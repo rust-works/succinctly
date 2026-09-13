@@ -2933,10 +2933,20 @@ be integers`, `del()` no-ops to `null`. succinctly's `Expr::Slice` path componen
 integer bounds, so the resolver raises that same error at resolution instead, unsuppressed by
 `?`: identical for every write jq refuses, wrong only for `path()` (jq reports the descriptor)
 and `del()` (jq answers `null`). Tracked as
-[#2853](https://github.com/rust-works/succinctly/issues/2853). The path-mode resolver also
-still drains each bound generator eagerly before slicing — the same gap
-[#2267](https://github.com/rust-works/succinctly/issues/2267) records for `resolve_index_expr`
-— so `path(.[("x",(1|debug)):])` still prints the DEBUG line jq never reaches.
+[#2853](https://github.com/rust-works/succinctly/issues/2853).
+
+The path-mode resolver used to drain each bound generator eagerly before slicing, so
+`path(.[("x",(1|debug)):])` printed a DEBUG line jq never reaches.
+[#2267](https://github.com/rust-works/succinctly/issues/2267) closed that: `S`, `T` and `E`
+are now driven as three nested demand-driven generators, exactly as jq's
+`S as $s | T as $t | E | .[$s:$t]` desugaring pulls them, so `E` runs before the next `t` is
+asked for and a pair completes before the next `s` is. `.[(0,1|debug):(2,3|debug)] = [9]`
+writes DEBUG `0 2 3 1 2 3` here as on jq 1.7.1, and a pair whose `E` escapes stops the `T`
+generator rather than letting a later `t`'s side effect fire. yq mode keeps the eager drain
+— [#2351](https://github.com/rust-works/succinctly/issues/2351)'s rule discards every value a
+bound produced once it escapes, which is only decidable after the generator has finished, and
+real yq cannot express any of these shapes anyway (no `path()`, no `debug`, and `.[0:(1,2)]`
+is "bad expression" on v4.53.3).
 
 ## Reading a path is indexing
 
