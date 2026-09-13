@@ -38037,17 +38037,15 @@ fn test_decode_failure_not_caught_by_try_catch_1620() {
     }
 }
 
-/// #2202 (decided, not a bug): route documentation. The CLI's
+/// #2202 (decided, not a bug) -- route documentation, see `builtin_in`'s own
+/// doc comment (`src/jq/eval.rs`) for the full argument. The CLI's
 /// `eval_generic.rs` bridge (`bridge_to_full_evaluator`/
 /// `bridge_to_each_owned_flow`) materializes the input one layer before any
 /// of `in`/`IN`/`contains`'s own `eval.rs` argument-vs-input ordering can
 /// run, so all three raise the identical decode failure from `succinctly
 /// jq` -- including `contains`, whose #1800 deferral only wins on the
-/// library route (`succinctly::jq::eval` on a cursor-native document, see
-/// `test_contains_defers_past_decode_failure_unlike_in_2202` in
-/// `src/jq/eval.rs`). This is not itself a bug: nothing here disagrees with
-/// a jq/yq reference, since no reference document containing an
-/// undecodable string can even be parsed to try.
+/// library route (see `test_contains_defers_past_decode_failure_unlike_in_2202`
+/// in `src/jq/eval.rs`).
 #[test]
 fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
     let doc = r#""\ud800""#;
