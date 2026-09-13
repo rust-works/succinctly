@@ -29,12 +29,16 @@
 #     template (see the `foreach-pattern` entry below) -- the three G
 #     variants then generate three identical cases per consumer, which is
 #     harmless and keeps the construct in the same table as its siblings.
-#   * `foreach`'s UPDATE and INIT positions, which WP3 deliberately left
-#     eager (see docs/compliance/jq/limitations.md). Sweeping them would
-#     report permanent "known" divergences and defeat this script's
-#     0-unexpected/0-known contract, so they are pinned as CLI rows in
-#     tests/jq_cli_tests.rs's
+#   * `reduce`'s own INIT position, which has the identical bug (see
+#     docs/compliance/jq/limitations.md's #2668 residual) but has no native,
+#     demand-forwarding dispatch arm at all to drive it through -- fixing it
+#     needs a new `each_reduce`-style dispatch, not a template row here.
+#     Sweeping it would report a permanent "known" divergence and defeat
+#     this script's 0-unexpected/0-known contract, so it is pinned as a CLI
+#     row in tests/jq_cli_tests.rs's
 #     test_nested_short_circuit_consumer_hides_the_stop_2180 instead.
+#     `foreach`'s own UPDATE and INIT positions, WP3's original residual, are
+#     now closed (#2668) and swept below like every other construct.
 #
 # **Design note, vs. jq-fanout-oracle-sweep.sh's classify_divergence**: that
 # script's classify_divergence greps the generated filter text for a known
@@ -163,8 +167,7 @@ W_ENTRIES=(
   #    points drive the same way too; the sink's Demand::Stop is treated by
   #    foreach's own ?// exactly as an escaping Control::Break is, with the
   #    same state threading -- so these rows must match jq now and any
-  #    divergence here is unexpected by definition. UPDATE and INIT stay
-  #    eager and are pinned as CLI rows instead (header note above). --
+  #    divergence here is unexpected by definition. --
   'foreach-source::::foreach (__G__) as $v (0; .+$v; .)'
   # #2180 WP3's review: a *later* INIT fork's own consumer stop has to reach
   # the source bind just as the first fork's does, and an element a
@@ -180,6 +183,17 @@ W_ENTRIES=(
   # cases per consumer. See the header note.
   'foreach-pattern::::foreach (1) as $x ?// $y (0; .+1; .)'
   'foreach-extract::::foreach (1) as $v (0; .; (__G__))'
+  # -- #2668: CLOSED. fold_step_each (eval.rs) drives UPDATE through
+  #    eval_each_owned, with EXTRACT (or the implicit identity push) running
+  #    from inside its own sink callback -- so a consumer's stop reaches
+  #    UPDATE's own generator, and any ?// bind inside it, before it produces
+  #    anything further. --
+  'foreach-update::::foreach (1) as $v (0; . + (__G__))'
+  # -- #2668: CLOSED. foreach_forks itself takes a ForeachInitDrive closure
+  #    (the same shape as its existing ForeachSourceDrive, one level further
+  #    out) instead of a pre-collected Vec, so a consumer's stop reaches
+  #    INIT's own generator the same way it already reaches the source. --
+  'foreach-init::::foreach (1) as $v ((__G__); .+1; .)'
   # -- confirmed correct, deliberately out of scope (limitations.md) --
   'collector::::[(__G__)] | .[]'
   'reduce::::reduce (__G__) as $v (0; .+$v)'
