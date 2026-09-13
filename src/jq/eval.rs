@@ -33490,10 +33490,7 @@ fn each_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    match each_path_on_owned::<S>(expr, owned, optional, &mut |v| sink(Item::Owned(v))) {
-        None => Flow::Exhausted,
-        Some(e) => Flow::Escaped(Control::from(e)),
-    }
+    each_path_on_owned::<S>(expr, owned, optional, &mut |v| sink(Item::Owned(v)))
 }
 
 /// [`eval_each`]'s `recurse`-family arm (#2693): the walk above, delivered
@@ -41307,7 +41304,7 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
     owned: &OwnedValue,
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Option<EvalEscape> {
+) -> Flow {
     let root = PathTrail::root();
     let mut walk_error: Option<EvalEscape> = None;
     let mut stopped = false;
@@ -41332,7 +41329,10 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
             &mut reached,
             optional,
         );
-        for (path, _) in reached.drain(..) {
+        // Borrowed, not drained: `reached` is cleared at the top of the next
+        // branch and reused, so a wide fan-out allocates once rather than
+        // once per branch.
+        for (path, _) in &reached {
             // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly
             // once per reached branch (#2058).
             if sink(OwnedValue::Array(path.to_vec())) == Demand::Stop {
@@ -41354,10 +41354,18 @@ pub(crate) fn each_path_on_owned<S: EvalSemantics>(
     // `walk_error.or(resolve_error)`. A stop is neither: the consumer is
     // satisfied and jq never resumes the generator, so an escape the
     // prepass was still carrying is never reached.
+    // A stop must be reported as one, not as exhaustion: a consumer that
+    // asked for no more (`isempty`, `first`, `limit`) distinguishes "the
+    // generator ended" from "I stopped it", and folding the two answered
+    // `isempty(path(.a,.b))` twice -- once `false` for the item it took and
+    // again `true` for the exhaustion it was told about.
     if stopped {
-        return None;
+        return Flow::Stopped { pending: None };
     }
-    walk_error.or(resolve_error)
+    match walk_error.or(resolve_error) {
+        None => Flow::Exhausted,
+        Some(e) => Flow::Escaped(Control::from(e)),
+    }
 }
 
 /// Walk `expr` as a path expression, pushing `(path, value-at-path)` for every
