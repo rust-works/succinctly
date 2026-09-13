@@ -1244,9 +1244,13 @@ Five residual divergences remain in this area:
   asked for); both fire here. Same underlying cause as the bullet above — `resolve_against_cow`
   has no sink form either — narrower in practice since it only over-fires a node's own
   later `f` outputs, not an entire subtree. Tracked as
-  [#2693](https://github.com/rust-works/succinctly/issues/2693). Bare `..`/`recurse`, which
-  predates #2235 and was not part of that migration at all, has the same gap one level up —
-  tracked separately as [#2696](https://github.com/rust-works/succinctly/issues/2696).
+  [#2693](https://github.com/rust-works/succinctly/issues/2693). Bare `..`/`recurse`/
+  `recurse_down`, which predates #2235 and was not part of that migration at all, had the
+  same gap one level up (no `f`/`cond` to over-fire, but the same "collects the whole
+  tree/queue before a bounded consumer sees the first branch" shape) — closed by
+  [#2696](https://github.com/rust-works/succinctly/issues/2696)'s own sink,
+  `resolve_recursive_descent_sink`, which streams each node as soon as it is popped with no
+  parameterised `f` in the way at all, so there is nothing left for it to over-fire.
 - **`E[K]` evaluates its target once where jq re-runs it per key.** jq compiles `E[K]` as
   `K as $k | E | .[$k]`, so a side effect in `E` fires once per output of `K`; here it fires
   once total — `[(.[] | stderr)[("a","b")]?]` on `[1,2]` writes `1212` in jq and `12` here.

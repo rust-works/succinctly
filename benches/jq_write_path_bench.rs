@@ -1283,6 +1283,61 @@ fn bench_path_leading_iterate_comma(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// #2696: bare `..`/`recurse` under a bound, vs the parameterised sibling
+// =============================================================================
+
+/// `path(limit(1; ..))` vs `path(limit(1; recurse(.[]?)))` over [`array_doc`]
+/// -- before this issue, bare `..`/`recurse` collected the whole tree
+/// (`push_recursive_branches`) before a bounded consumer ever saw the first
+/// branch, while the parameterised sibling already streamed one node at a
+/// time (`resolve_recurse_sink`, #2235). Both spellings answer the same
+/// value (`[]`, the root itself) and should now cost the same regardless of
+/// `n`, where before this issue `..`/`recurse` scaled with the document and
+/// `recurse(.[]?)` did not. Measured on an Apple M5 Max (single machine, not
+/// the pinned two-architecture set -- this issue's own triage class judged
+/// the mechanism unambiguous, buffer-the-tree vs. don't, rather than a
+/// micro-optimization needing the full interleaved A/B): CLI-level
+/// `/usr/bin/time -l` on a 10MB generated document (`succinctly json
+/// generate 10mb`) showed peak RSS 573 MB -> 190 MB and wall time
+/// 0.19s -> 0.12s for `path(limit(1; ..))`, matching `recurse(.[]?)`'s own
+/// floor; `[path(..)] | length`, the unbounded holdout that must show no
+/// regression, stayed within noise of its pre-fix time (~1.2s either way)
+/// with agreeing output on a document past the once-relevant `RECURSE_MAX_ITEMS`
+/// (10,000) node count.
+fn bench_recurse_family_bounded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_recurse_family_bounded");
+    for (label, filter) in [
+        ("bare_dotdot", "path(limit(1; ..))"),
+        ("recurse_f", "path(limit(1; recurse(.[]?)))"),
+    ] {
+        let expr = parse(filter).expect("must parse");
+        for &n in SIZES {
+            let json = array_doc(n);
+
+            // Guard the premise: both spellings' first output is the root
+            // itself, `[]` -- a silently-wrong bound (or a silently-eager
+            // fallback that still produces the right answer slower) would
+            // otherwise look identical to a correct, lazy one here.
+            assert_eq!(
+                eval_one(&expr, &json),
+                OwnedValue::Array(Vec::new()),
+                "{label} n={n}: path(limit(1; ...)) must answer the root path []"
+            );
+
+            let index = JsonIndex::build(&json);
+            group.throughput(Throughput::Elements(n as u64));
+            group.bench_with_input(BenchmarkId::new(label, n), &json, |b, json| {
+                b.iter(|| {
+                    let cursor = index.root(black_box(json));
+                    black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_del_array,
@@ -1306,5 +1361,6 @@ criterion_group!(
     bench_path_if_fanout_ast,
     bench_path_recursive_def_ast,
     bench_path_leading_iterate_comma,
+    bench_recurse_family_bounded,
 );
 criterion_main!(benches);

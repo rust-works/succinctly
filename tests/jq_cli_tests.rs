@@ -51570,6 +51570,26 @@ fn test_tracked_var_refuses_a_rebuilt_root_2642() -> Result<()> {
     Ok(())
 }
 
+/// #2696: `..`/bare `recurse` now resolve through a lazy sink
+/// (`resolve_recursive_descent_sink`) instead of collecting the whole tree
+/// first (`push_recursive_branches`, removed) -- order and output must be
+/// byte-identical to before. `recurse_down` has no jq oracle (jq 1.7.1 has no
+/// such builtin; confirmed live, `recurse_down/0 is not defined`), so it is
+/// pinned against `..`'s own output instead, which succinctly's own
+/// `Builtin::RecurseDown => builtin_recurse(...)` aliasing makes the correct
+/// comparison.
+#[test]
+fn test_bare_recurse_family_order_unchanged_by_lazy_sink_2696() -> Result<()> {
+    let doc = r#"{"a":[1,{"b":2}],"c":3}"#;
+    let want = r#"[[],["a"],["a",0],["a",1],["a",1,"b"],["c"]]"#;
+    for filter in ["[path(..)]", "[path(recurse)]", "[path(recurse_down)]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Every row here must stay accepted -- the fix is refuse-only by
 /// construction (a `Snapshot` marker only ever gets demoted to
 /// `Untracked`, never the reverse), so a regression here would mean the
@@ -51684,6 +51704,39 @@ fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
             "#2642: `{filter}` is a documented refuse-only residual (real jq \
              accepts it, `[]`), got stdout={stdout:?} stderr={stderr:?}"
         );
+    }
+    Ok(())
+}
+
+/// #2696: a bounded consumer over bare `..` must still answer exactly what
+/// jq answers -- captured live against jq 1.7.1 on the same document as
+/// `test_bare_recurse_family_order_unchanged_by_lazy_sink_2696`. This is the
+/// correctness half of the laziness fix; the demand-count half (that a
+/// bounded consumer now actually *stops* the walk rather than merely
+/// agreeing with jq about the answer) has no CLI-observable side effect to
+/// pin and is covered instead by
+/// `resolve_recursive_descent_sink_stops_after_first_demand_2696` in
+/// `src/jq/eval.rs`.
+#[test]
+fn test_bare_recurse_bounded_consumers_match_jq_2696() -> Result<()> {
+    let doc = r#"{"a":[1,{"b":2}],"c":3}"#;
+    for (filter, want) in [
+        ("path(limit(2; ..))", "[]\n[\"a\"]\n"),
+        ("path(first(..))", "[]\n"),
+        ("path(nth(3; ..))", "[\"a\",1]\n"),
+        (
+            "path(limit(3; .. | numbers))",
+            "[\"a\",0]\n[\"a\",1,\"b\"]\n[\"c\"]\n",
+        ),
+        ("del(first(..))", "null\n"),
+        (
+            "[path(..) | select(length == 2)]",
+            "[[\"a\",0],[\"a\",1]]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout, want, "`{filter}`");
     }
     Ok(())
 }
