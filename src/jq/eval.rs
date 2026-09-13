@@ -10200,11 +10200,27 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // compared against 0 and decremented by 1 per level
         // (`flatten_owned_at_depth`), and every value tree this crate can
         // hold is already capped at `MAX_VALUE_TREE_DEPTH` levels
-        // (`assert_value_tree_depth`, ~384) -- so any sentinel larger than
-        // that ceiling is indistinguishable from true infinity for every
-        // document this crate can represent. `i64::MAX` needs no new
-        // "infinite" concept in `OwnedValue`/`compare_values`/`arith_sub`.
-        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, OwnedValue::Int(i64::MAX)),
+        // (`assert_value_tree_depth`, ~384) -- so any sentinel comfortably
+        // larger than that ceiling is indistinguishable from true infinity
+        // for every document this crate can represent.
+        //
+        // 1 billion, not `i64::MAX`: `arith_sub`'s jq-mode arm
+        // (`jq_checked_int_arith`, #2631) only keeps an exact `Int` result
+        // when *both* operands stay within `f64`'s exact-integer range
+        // (`jq_int_within_exact_f64_range`, `<= 2^53`) -- `i64::MAX` fails
+        // that on the very first `- 1`, silently promoting `depth` to an
+        // `f64` whose value is far past the point where `- 1.0` changes
+        // anything (`i64::MAX as f64` has a ULP over 2000), so it would
+        // still work but via float arithmetic that never actually moves,
+        // not the ordinary per-level integer decrement this comment
+        // describes. 1 billion sits comfortably under `2^53` (~9.007e15),
+        // so every one of the at-most-384 decrements this can ever see
+        // stays exact `Int` arithmetic the whole way, matching what an
+        // ordinary `flatten(N)` call does -- no new "infinite" concept in
+        // `OwnedValue`/`compare_values`/`arith_sub`, genuinely.
+        Builtin::Flatten => {
+            builtin_flatten::<W, S>(value, optional, OwnedValue::Int(1_000_000_000))
+        }
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
         Builtin::Unique => builtin_unique::<W, S>(value, optional),
@@ -67471,6 +67487,62 @@ mod tests {
         query!(br"{}", "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert!(arr.is_empty());
+            }
+        );
+    }
+
+    /// #2818 review: independent verification confirmed bare `flatten`'s
+    /// depth sentinel must stay within `f64`'s exact-integer range
+    /// (`jq_int_within_exact_f64_range`, `<= 2^53`, #2631) or jq-mode
+    /// `arith_sub` silently promotes it to a `Float` on the very first `-
+    /// 1` (`jq_checked_int_arith` requires *both* operands in range to keep
+    /// an exact `Int` result) -- `i64::MAX` fails that check immediately,
+    /// which still happens to work (the resulting float's ULP is so large
+    /// past that magnitude that `- 1.0` never moves it, so it never
+    /// compares equal to `0`/`0.0` either), but via float arithmetic that
+    /// never actually decrements, not the ordinary per-level integer
+    /// subtraction the dispatch arm's own comment claims. Pins that the
+    /// actual sentinel (1 billion, comfortably under `2^53`) stays exact
+    /// `Int` arithmetic through `arith_sub` the same way any ordinary
+    /// `flatten(N)` call's own depth countdown does.
+    #[test]
+    fn test_flatten_unbounded_depth_sentinel_stays_exact_int_arithmetic_2818() {
+        match arith_sub::<JqSemantics>(OwnedValue::Int(1_000_000_000), OwnedValue::Int(1)) {
+            Ok(OwnedValue::Int(n)) => assert_eq!(n, 999_999_999),
+            other => panic!("expected an exact Int subtraction, got: {other:?}"),
+        }
+    }
+
+    /// #2818 review: `Builtin::Flatten`'s dispatch arm has no `S::TAG` gate,
+    /// so the depth-sentinel fix applies to yq mode too, unverified there by
+    /// `test_builtin_flatten` above (jq-mode `query!` only). Confirmed live
+    /// against yq v4.53.3 before writing this: real yq also fully flattens
+    /// bare `flatten` (`[[1,[2,[3,[4]]]],5] | flatten` is `[1,2,3,4,5]`) and
+    /// still rejects a non-array the same as before (`{"a":1} | flatten` is
+    /// "only arrays are supported for flatten") -- this is the shared-builtin
+    /// dual-mode check the #1003/PR #1036 incident established as required
+    /// for exactly this class of change.
+    #[test]
+    fn test_builtin_flatten_yq_mode_also_unbounded_2818() {
+        yq_query!(br"[[1,[2,[3,[4]]]],5]", "flatten",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                        OwnedValue::Int(4),
+                        OwnedValue::Int(5),
+                    ]
+                );
+            }
+        );
+        // yq rejects a non-array outright (#1901), unaffected by this fix --
+        // matches `builtin_flatten`'s own `yq_reject_non_array` doc comment.
+        yq_query!(br#"{"a": 1}"#, "flatten",
+            QueryResult::Error(e) => {
+                assert!(e.to_string().contains("only arrays are supported"), "{e}");
             }
         );
     }

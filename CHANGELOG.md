@@ -132,9 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unbounded-depth default (`[[1,[2]],3] | flatten` used to keep `[2]`
   nested, answering `[1,[2],3]` where jq answers `[1,2,3]`). Every value
   tree this crate can hold is already capped at `MAX_VALUE_TREE_DEPTH`
-  levels, so passing `i64::MAX` as the depth sentinel is indistinguishable
-  from true infinity for any document it can represent — no new "infinite
-  depth" concept needed in `OwnedValue`/`compare_values`/`arith_sub`.
+  levels, so passing 1 billion as the depth sentinel is indistinguishable
+  from true infinity for any document it can represent — and, unlike
+  `i64::MAX`, stays inside `f64`'s exact-integer range
+  (`jq_int_within_exact_f64_range`, #2631), so jq-mode `arith_sub`'s own
+  depth countdown runs as ordinary `Int` arithmetic the whole way, not a
+  silent float promotion on the very first decrement.
 
 - **`succinctly jq`/`yq` no longer reject a `def` nobody ever calls** (#2740).
   `def h: nosuchfn; 1` used to fail at compile time (`nosuchfn/0 is not
