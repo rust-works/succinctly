@@ -1841,6 +1841,13 @@ impl OwnedValue {
                 f64::INFINITY
             });
         }
+        // The reindex bridge's computed-float token (#2902): a bare `Float`
+        // going in must be a bare `Float` coming out, never a
+        // `NumberLiteral` -- checked with the sentinels, before any of the
+        // literal-preserving arms below can see the text.
+        if let Some(f) = crate::json::validate::parse_computed_float_token(bytes) {
+            return Self::Float(f);
+        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
@@ -2207,20 +2214,28 @@ impl OwnedValue {
     /// this same literal-preserving JSON text, not [`to_json`](Self::to_json)'s
     /// jq-normalized one.
     ///
-    /// Also keeps a whole-number `Float`'s decimal point (`format_float_with_fraction`,
-    /// #953) -- unlike jq, which happily prints `1.0` as `1` in JSON (matching
-    /// real jq's own `tojson`), yq must not: `1.0` and `1` are different YAML
-    /// types, and dropping the point on a round trip changes it (#169's own
-    /// reasoning, reused here for the same class of value reached from a
-    /// different path -- an i64-overflow decimal integer scalar, which
-    /// `resolve_plain` also classifies as `!!float`, confirmed live against
-    /// the pinned oracle: real yq's `-o json` gives `100...0.0`, not
-    /// `100...0`).
+    /// A plain `Float` takes yq's computed-float spelling (`format_float_yq`):
+    /// a whole number keeps its decimal point (#953 -- unlike jq, which
+    /// happily prints `1.0` as `1` in JSON, matching real jq's own `tojson`,
+    /// yq must not: `1.0` and `1` are different YAML types, and dropping the
+    /// point on a round trip changes it, #169's own reasoning), and a
+    /// magnitude past yq's threshold goes scientific (`(1e10*2) | tojson`
+    /// is `2e+10` in real yq). The threshold used to be unreachable from
+    /// here -- `tojson` reached this function only after a reindex round
+    /// trip that had already baked the computed value into a `NumberLiteral`
+    /// spelled `2e+10`, which the literal arm then echoed -- and became
+    /// load-bearing once #2902 made that round trip hand back a bare `Float`.
+    /// The i64-overflow decimal integer scalar this used to spell out in
+    /// full (`resolve_plain` classifies it `!!float`; real yq's `-o json`
+    /// gives `100...0.0`, not `1e+20`, confirmed live) still does, because
+    /// #2438 records it as a `NumberLiteral` at the document boundary
+    /// ([`from_document_float`](Self::from_document_float)) and the literal
+    /// arm echoes that.
     pub(crate) fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,
             crate::jq::stream::real_output_finite_literal,
-            crate::yaml::format_float_with_fraction,
+            crate::yaml::format_float_yq,
             yq_infinite_float_json_text,
         )
     }
@@ -2320,30 +2335,25 @@ impl OwnedValue {
     /// the bridge re-parses this text and hands the cursor to the full
     /// evaluator (#561, #472).
     ///
-    /// `S: EvalSemantics` picks the plain (non-`NumberLiteral`) `Float`
-    /// fallback's spelling (#953, #2438): yq applies its own magnitude
-    /// threshold (`format_float_yq` -- decimal-with-point for everyday
-    /// magnitudes, `e+NN`/`e-NN` past it), which is what a *computed* float
-    /// gets from real yq wherever it re-serializes one. This used to be an
-    /// unconditional `format_float_with_fraction` so that a **document**
-    /// float with no preserved literal (an i64-overflow YAML scalar reaching
-    /// this bridge via `[...]`/`map_values`/`with_entries`) would keep the
-    /// full decimal spelling real yq gives *it* at the same magnitude -- the
-    /// two answers genuinely differ for the identical `f64`, so the
-    /// provenance is now recorded upstream instead, at
-    /// [`from_document_float`](Self::from_document_float), leaving this
-    /// fallback free to spell the computed case correctly. jq keeps the
-    /// pre-existing bare `Display` (no forced
-    /// point): real jq's own convention drops a computed value's literal
-    /// formatting entirely (`1.0 + 4.0` prints `5`, not `5.0`), and a bare
-    /// `Float` reaching this fallback is by construction one that already
-    /// lost its `NumberLiteral` text — confirmed live this must stay
-    /// mode-gated, not unconditional: an earlier draft hardcoded yq's
-    /// formatter here unconditionally, which silently flipped
-    /// `reduce (1,2) as $i (1.0 + 4.0; [.])` in **jq** mode from the
-    /// correct `[[[5]]]` to `[[[5.0]]]` (caught in code review) since
-    /// `format_number_jq_compat` does not strip an explicit `.0` back off a
-    /// literal it's handed after the reparse.
+    /// A plain (non-`NumberLiteral`) finite `Float` is written as the
+    /// bridge-only token `crate::json::validate::computed_float_token`
+    /// (#2902), which [`from_number_bytes`](Self::from_number_bytes) and
+    /// `JsonNumber::as_f64` decode back to a bare `Float`. It used to be
+    /// written with a display formatter -- `format_float_yq` in yq mode
+    /// (#953, #2438), `jq_bare_float_display` in jq mode -- and since the
+    /// reparse cannot tell `1.0` written by this bridge from `1.0` written
+    /// in a document, the value came back as a `NumberLiteral` and every
+    /// literal-preserving rule downstream (#1008, #1054, #2456) echoed the
+    /// bridge's spelling: `[0.5+0.5] | .[0] | tostring` answered `1.0`
+    /// (real yq `1`) and `[2*1e16] | .[0] | tostring` answered `2E+16`
+    /// (real jq `2e+16`). The token carries no spelling at all, so each
+    /// mode re-derives its own from the `f64` after the round trip, and the
+    /// mode fork this fallback used to need is gone. A **document** float
+    /// with no preserved literal (an i64-overflow YAML scalar) still keeps
+    /// the full decimal spelling real yq gives *it* because its provenance
+    /// is recorded upstream, at
+    /// [`from_document_float`](Self::from_document_float), as a
+    /// `NumberLiteral` that echoes verbatim below.
     pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
         self.to_json_for_reindex_at_depth::<S>(0)
     }
@@ -2459,24 +2469,21 @@ impl OwnedValue {
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            // yq spells a computed float by its own magnitude threshold
-            // (#953, #2438); jq keeps the original bare `Display` (see
-            // this function's own doc comment for why the fork is required,
-            // not optional).
-            // `infinite_fmt` is unreachable from here either way -- every
-            // NaN/infinite case is already handled by the arms above, before
-            // this fallback -- so which one is passed only matters for
-            // reading, not behavior; picked per-mode for consistency.
-            other if S::TAG == EvalTag::Yq => other.to_json_at_depth(
-                depth,
-                format_number_jq_compat,
-                crate::yaml::format_float_yq,
-                yq_infinite_float_json_text,
-            ),
+            // A bare finite `Float` is a *computed* value (or a tag-forced
+            // document float that never had a decimal spelling, #1176/#2438)
+            // and must come back out of the reparse as a bare `Float` again,
+            // so it is written as the bridge-only token
+            // `computed_float_token` decodes (#2902), not as either mode's
+            // display spelling -- see that function's doc for why the token
+            // is unparseable as an ordinary number. Same in both modes; the
+            // spelling is re-derived from the `f64` downstream, per mode.
+            // `infinite_fmt` is unreachable from here -- every NaN/infinite
+            // case is already handled by the arms above, before this
+            // fallback -- so which one is passed only matters for reading.
             other => other.to_json_at_depth(
                 depth,
                 format_number_jq_compat,
-                jq_bare_float_display,
+                crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
             ),
         }
@@ -3579,6 +3586,31 @@ mod tests {
         assert!(NAN_SENTINEL.parse::<i64>().is_err());
     }
 
+    /// #2902: the bridge's computed-float token materializes as a bare
+    /// `Float`, never as a `NumberLiteral` carrying the token's text --
+    /// through the same public entry point real document numbers go
+    /// through, exactly like the overflow sentinels beside it.
+    #[test]
+    fn test_from_number_bytes_decodes_the_computed_float_token_2902() {
+        for f in [1.0, -0.0, 0.5, 2e16, 5e-6] {
+            let token = crate::json::validate::computed_float_token(f);
+            let got = OwnedValue::from_number_bytes(token.as_bytes());
+            assert!(
+                matches!(got, OwnedValue::Float(back) if back.to_bits() == f.to_bits()),
+                "{token} materialized as {got:?}"
+            );
+        }
+        // A genuine literal that merely ends in `e0` is still a literal.
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"1e0"),
+            OwnedValue::from_number_literal("1e0")
+        );
+        assert!(matches!(
+            OwnedValue::from_number_bytes(b"1e0"),
+            OwnedValue::NumberLiteral(_, _)
+        ));
+    }
+
     /// #2438: the document boundary bakes yq's own decimal spelling into a
     /// float that has no source literal left, but only past yq's
     /// scientific-notation threshold -- inside the everyday range the value
@@ -3604,38 +3636,70 @@ mod tests {
         }
     }
 
-    /// #2438: the bridge's yq fallback spells a *computed* float by yq's own
-    /// threshold, rather than forcing a decimal point at every magnitude.
-    /// #2456: jq mode's own fallback applies its own (different) threshold
-    /// too, rather than never reformatting a computed float at all -- this
-    /// used to pin the opposite (a full 21-digit decimal expansion) as
-    /// deliberately untouched by #2438, which #2456 fixes.
+    /// #2902: the bridge writes a bare finite `Float` as the computed-float
+    /// token in *both* modes -- no display spelling at all, so the reparse
+    /// cannot mistake it for a document literal. This used to pin each
+    /// mode's own display threshold here (#2438/#2456), which is exactly
+    /// what let `[0.5+0.5] | .[0] | tostring` come back as the literal `1.0`.
     #[test]
-    fn test_to_json_for_reindex_float_uses_each_modes_own_threshold_2438_2456() {
-        assert_eq!(
-            OwnedValue::Float(1e20).to_json_for_reindex::<YqSemantics>(),
-            "1e+20"
-        );
-        assert_eq!(
-            OwnedValue::Float(2.0).to_json_for_reindex::<YqSemantics>(),
-            "2.0"
-        );
-        assert_eq!(
-            OwnedValue::Float(1e20).to_json_for_reindex::<JqSemantics>(),
-            "1e+20"
-        );
-        // jq's own threshold sits at a different magnitude than yq's fixed
-        // `>= 1e6`/`<= 1e-4` (#953): 1e10 already clears yq's, but jq's own
-        // digit-count rule (`decpt = 11 <= ndigits(1) + 15 = 16`) keeps it
-        // decimal there.
-        assert_eq!(
-            OwnedValue::Float(1e10).to_json_for_reindex::<JqSemantics>(),
-            "10000000000"
-        );
-        assert_eq!(
-            OwnedValue::Float(1e10).to_json_for_reindex::<YqSemantics>(),
-            "1e+10"
-        );
+    fn test_to_json_for_reindex_writes_a_computed_float_as_the_token_2902() {
+        for (f, token) in [
+            (1e20, "1e20e0"),
+            (2.0, "2e0e0"),
+            (1e10, "1e10e0"),
+            (-0.5, "-5e-1e0"),
+        ] {
+            assert_eq!(
+                OwnedValue::Float(f).to_json_for_reindex::<YqSemantics>(),
+                token
+            );
+            assert_eq!(
+                OwnedValue::Float(f).to_json_for_reindex::<JqSemantics>(),
+                token
+            );
+        }
+    }
+
+    /// #2902: the invariant the fix rests on -- serialize-and-reparse hands
+    /// back the same *representation* it was given, in both modes: a bare
+    /// `Float` stays bare (never a `NumberLiteral` carrying the bridge's
+    /// spelling), a `NumberLiteral` keeps its text verbatim, and an `Int`
+    /// takes its one spelling.
+    #[test]
+    fn test_reindex_round_trip_keeps_float_and_literal_apart_2902() {
+        use crate::json::JsonIndex;
+        fn round_trip<S: EvalSemantics>(value: &OwnedValue) -> OwnedValue {
+            let json = value.to_json_for_reindex::<S>();
+            let bytes = json.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let root = index.root(bytes);
+            let crate::json::light::StandardJson::Array(items) = root.value() else {
+                panic!("expected the round-tripped array, got {json}");
+            };
+            OwnedValue::Array(
+                items
+                    .map(|item| match item {
+                        crate::json::light::StandardJson::Number(n) => {
+                            OwnedValue::from_number_bytes(n.raw_bytes())
+                        }
+                        other => panic!("expected a number, got {other:?}"),
+                    })
+                    .collect(),
+            )
+        }
+        let value = OwnedValue::Array(vec![
+            OwnedValue::Float(1.0),
+            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::Int(1),
+            OwnedValue::Float(2e16),
+            OwnedValue::from_number_literal("2e16"),
+            OwnedValue::Float(-0.0),
+        ]);
+        let want = "Array([Float(1.0), NumberLiteral(Float(1.0), \"1.0\"), \
+                    NumberLiteral(Int(1), \"1\"), Float(2e16), \
+                    NumberLiteral(Float(2e16), \"2e16\"), Float(-0.0)])";
+        assert_eq!(format!("{:?}", round_trip::<YqSemantics>(&value)), want);
+        assert_eq!(format!("{:?}", round_trip::<JqSemantics>(&value)), want);
     }
 
     /// #2456: `jq_bare_float_display`'s digit-count threshold

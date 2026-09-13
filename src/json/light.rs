@@ -2138,10 +2138,21 @@ impl<'a> JsonNumber<'a> {
     }
 
     /// Parse as f64.
+    ///
+    /// Also decodes the reindex bridge's computed-float token
+    /// (`crate::json::validate::computed_float_token`, #2902), which is
+    /// deliberately unparseable as an ordinary number: every cursor-level
+    /// reader of a bridged document (`length`, the math builtins, dates,
+    /// `isnan`, ...) reaches its value through this one accessor, so the
+    /// decode lives here rather than being repeated at each of them. Only
+    /// consulted once the ordinary parse has already failed, so a genuine
+    /// number pays nothing for it.
     pub fn as_f64(&self) -> Result<f64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
-        s.parse().map_err(|_| JsonError::InvalidNumber)
+        s.parse().or_else(|_| {
+            crate::json::validate::parse_computed_float_token(bytes).ok_or(JsonError::InvalidNumber)
+        })
     }
 
     fn find_end(&self) -> usize {
@@ -6230,6 +6241,33 @@ mod tests {
     fn test_nested_number_span_absorbs_dangling_exponent_marker_1218() {
         assert_eq!(nested_number_span(b"5e", 0), 2);
         assert_eq!(nested_number_span(b"1E", 0), 2);
+    }
+
+    /// #2902: a reindexed computed float arrives here as the bridge's token,
+    /// which the scanner captures whole and `as_f64` decodes, while
+    /// `as_i64` and `number_literal()` both refuse it -- so a materializer
+    /// that tries the literal first (`to_owned_at_depth`) still ends on a
+    /// bare `Float`, never a `NumberLiteral` carrying the token's text.
+    #[test]
+    fn json_number_decodes_the_computed_float_token_2902() {
+        for (f, token) in [(1.0, "1e0e0"), (2e16, "2e16e0"), (-0.5, "-5e-1e0")] {
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
+            let index = JsonIndex::build(bytes);
+            let root = index.root(bytes);
+            let StandardJson::Array(mut items) = root.value() else {
+                panic!("expected an array");
+            };
+            let StandardJson::Number(n) = items.next().expect("one element") else {
+                panic!("expected a number");
+            };
+            assert_eq!(n.raw_bytes(), token.as_bytes());
+            assert_eq!(n.as_f64().map(f64::to_bits), Ok(f64::to_bits(f)), "{token}");
+            assert_eq!(n.as_i64(), Err(JsonError::InvalidNumber), "{token}");
+            let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
+            assert_eq!(number.number_literal(), None, "{token}");
+        }
     }
 
     /// #2072 step 1: the `'static` handle round-trips on *every* node of a

@@ -1049,9 +1049,181 @@ pub fn has_leading_dot(bytes: &[u8]) -> bool {
     is_valid_number(&fixed)
 }
 
+/// The suffix [`computed_float_token`] appends to Rust's `{:e}` rendering,
+/// giving the token its second exponent marker.
+const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";
+
+/// The reindex bridge's spelling of a *computed* finite float (#2902) -- a
+/// bare `OwnedValue::Float`, one with no source literal left -- built so the
+/// reparse can tell it apart from every document literal and hand back a
+/// bare `Float` again instead of a `NumberLiteral` carrying this text.
+///
+/// Rust's shortest-round-trip exponential rendering (`1e0`, `1.5e0`, `2e16`,
+/// `5e-6`, `-0e0`) followed by a second `e0`: `1e0e0`, `2e16e0`. That
+/// doubled exponent marker is the whole design, borrowed from
+/// `NAN_SENTINEL`/`INFINITY_SENTINEL` (`src/jq/value.rs`, #472/#1083):
+/// `str::parse::<f64>()`/`::<i64>()` both reject it, so no valid JSON
+/// literal -- and none of the jq-lenient spellings this crate preserves as
+/// literals either (a leading `.`, a redundant leading zero, a trailing `.`
+/// before the exponent) -- can ever spell the same bytes; it starts with a
+/// digit or `-digit`, so the semi-index scanner classifies it as a number
+/// (a `+`-prefixed token does not survive `JsonIndex::build` at all,
+/// probed); and it is drawn from `[0-9.eE+-]`, so `nested_number_span`
+/// (`src/json/light.rs`) captures it whole.
+///
+/// This is *not* a display formatter: the value's spelling is re-derived
+/// from the `f64` by whichever mode's computed-float rule applies once it
+/// is back in an `OwnedValue` (`jq_bare_float_display`, `format_float_yq`,
+/// `numeric_display_string`). Before #2902 the bridge spelled a computed
+/// float with those display formatters directly, and the reparse -- which
+/// cannot tell `1.0` written by the bridge from `1.0` written in a document
+/// -- turned it into a literal, so `[0.5+0.5] | .[0] | tostring` echoed
+/// `1.0` where real yq answers `1` and `[2*1e16] | .[0] | tostring` echoed
+/// jq's literal-reformatting `2E+16` where real jq answers `2e+16`.
+///
+/// Same accepted trade-off as the sentinels: an *invalid* document span
+/// that happens to spell this shape (`[1e0e0]`, rejected by every strict
+/// reader including jq's own) now materializes through the lenient
+/// semi-index path as the float instead of `null`, exactly as `[9e999e999]`
+/// already materializes NaN.
+///
+/// `f` must be finite: NaN/±Infinity have their own sentinels, which every
+/// caller emits first.
+#[must_use]
+pub(crate) fn computed_float_token(f: f64) -> String {
+    debug_assert!(
+        f.is_finite(),
+        "computed_float_token requires a finite value; NaN/Infinity use their own sentinels"
+    );
+    let mut token = alloc::format!("{f:e}");
+    token.push_str(COMPUTED_FLOAT_TOKEN_SUFFIX);
+    token
+}
+
+/// Decodes a [`computed_float_token`], `None` for anything else -- the one
+/// definition every reader of a `to_json_for_reindex` number token consults
+/// (`OwnedValue::from_number_bytes`, `JsonNumber::as_f64`), so the check
+/// cannot diverge between call sites the way three copies of one predicate
+/// did in #106.
+///
+/// Strips the suffix, then requires the remainder to start the way `{:e}`
+/// does (a digit or `-digit`), to still carry an exponent marker, and to
+/// parse as a finite `f64`. The exponent requirement is what keeps a genuine
+/// literal out: `1e0` ends in `e0` too, but its remainder `1` has no `e`,
+/// while every `{:e}` rendering has exactly one.
+#[must_use]
+pub(crate) fn parse_computed_float_token(bytes: &[u8]) -> Option<f64> {
+    let inner = bytes.strip_suffix(COMPUTED_FLOAT_TOKEN_SUFFIX.as_bytes())?;
+    let digits = inner.strip_prefix(b"-").unwrap_or(inner);
+    if !digits.first().is_some_and(u8::is_ascii_digit) || !inner.contains(&b'e') {
+        return None;
+    }
+    let f: f64 = core::str::from_utf8(inner).ok()?.parse().ok()?;
+    f.is_finite().then_some(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // computed-float token tests (#2902)
+    // ========================================================================
+
+    /// Load-bearing for #2902, the same way
+    /// `test_nan_sentinel_is_unparseable_as_a_real_number` is for #472: the
+    /// token is only safe to reserve because no legitimately formatted
+    /// number can ever spell it -- both parses must fail, and it must still
+    /// be a number span to the semi-index scanner (digit-leading, drawn from
+    /// `[0-9.eE+-]`).
+    #[test]
+    fn computed_float_token_is_unparseable_as_a_real_number_2902() {
+        for f in [
+            0.0,
+            -0.0,
+            1.0,
+            0.1 + 0.2,
+            5e-6,
+            2e16,
+            1e300,
+            f64::MAX,
+            5e-324,
+        ] {
+            let token = computed_float_token(f);
+            assert!(token.parse::<f64>().is_err(), "{token}");
+            assert!(token.parse::<i64>().is_err(), "{token}");
+            assert!(!is_valid_number(token.as_bytes()), "{token}");
+            assert!(
+                token
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_digit() || b == b'-'),
+                "{token}"
+            );
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')),
+                "{token}"
+            );
+        }
+        assert_eq!(computed_float_token(1.0), "1e0e0");
+        assert_eq!(computed_float_token(2e16), "2e16e0");
+        assert_eq!(computed_float_token(-0.5), "-5e-1e0");
+    }
+
+    /// The decode is bit-exact, including the sign of zero and both
+    /// subnormal and maximal magnitudes -- the reparse must hand back the
+    /// very `f64` the bridge was given, not a nearby one.
+    #[test]
+    fn computed_float_token_round_trips_bit_exactly_2902() {
+        for f in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.1 + 0.2,
+            5e-6,
+            2e16,
+            1e300,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            let token = computed_float_token(f);
+            let back = parse_computed_float_token(token.as_bytes())
+                .unwrap_or_else(|| panic!("{token} must decode"));
+            assert_eq!(back.to_bits(), f.to_bits(), "{token}");
+        }
+    }
+
+    /// Nothing but a token decodes: a genuine literal that happens to end in
+    /// `e0` has no exponent left once the suffix is gone, the overflow
+    /// sentinels keep their own decoders, and a token with a non-finite or
+    /// malformed remainder is not one either.
+    #[test]
+    fn parse_computed_float_token_rejects_everything_else_2902() {
+        for text in [
+            "1e0",
+            "10e0",
+            "1",
+            "1.0",
+            "1e0e00",
+            "e0",
+            "1ee0",
+            "9e999e999",
+            "8e999e999",
+            "-8e999e999",
+            "1e999e0",
+            "1e0e0e0",
+            "",
+            "e0e0",
+            "+1e0e0",
+        ] {
+            assert_eq!(parse_computed_float_token(text.as_bytes()), None, "{text}");
+        }
+    }
 
     // ========================================================================
     // validate_jq_lenient tests (#2052)

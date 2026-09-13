@@ -2556,28 +2556,19 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
         return format_result::<S, _>(format_type, &owned, optional);
     }
 
-    // `tostring` needs the same bypass, for correctness here, not just
-    // speed (#1054): without it, `EXPR | tostring` on a genuinely computed
-    // value (e.g. `(1e10 * 2)`) serializes through `to_json_for_reindex`'s
-    // decimal-only float spelling below first, reparses as a
-    // document-sourced-*looking* number, and echoes that baked text
-    // verbatim per #1008's literal-preservation rule once `Builtin::
-    // ToString`'s own arm (this file's `eval_builtin`, which now calls
-    // `owned_to_string` directly too) finally runs -- permanently losing
-    // the scientific-notation spelling real yq applies to a computed float
-    // before the round trip ever has a chance to run.
-    //
-    // Narrow on purpose, not exhaustive: this only matches `tostring` as
-    // the *immediately next* stage. Any intervening stage (even a no-op
-    // `.`), a parenthesized `(tostring)`, `tostring?`, or `map(...|
-    // tostring)` all still fall through to the round-trip below and
-    // reproduce the original bug, since each intervening stage re-enters
-    // this function with its own, different `expr` and bakes the float
-    // into a `NumberLiteral` before `tostring` ever sees it in its
-    // original form. Fixing that needs either threading "was this ever
-    // reindexed" through every intermediate call here, or the same
-    // origin-tracking mechanism #1128 already identifies as the real fix
-    // for `@json`'s sibling gap -- tracked as #1134, not attempted here.
+    // `tostring` takes the same bypass. It was added for correctness, not
+    // speed (#1054): `EXPR | tostring` on a genuinely computed value (e.g.
+    // `(1e10 * 2)`) used to serialize through `to_json_for_reindex`'s
+    // decimal-only float spelling below first, reparse as a
+    // document-sourced-*looking* number, and echo that baked text verbatim
+    // per #1008's literal-preservation rule once `Builtin::ToString`'s own
+    // arm finally ran -- and because this matches only the *immediately
+    // next* stage, any intervening stage (`EXPR | . | tostring`,
+    // `(tostring)`, `[EXPR] | .[0] | tostring`, `map(... | tostring)`)
+    // still reproduced it (#1134). #2902 fixed that at the source: the
+    // round trip below now writes a computed float as a token the reparse
+    // hands back as a bare `Float`, so every one of those shapes is right
+    // through the bridge too, and this arm is speed-only.
     if let Expr::Builtin(Builtin::ToString) = expr {
         return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)));
     }
@@ -2821,15 +2812,22 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// exceptions are all numeric, because `to_json_for_reindex` is a *formatter*
 /// as much as a serializer:
 ///
-/// - A **bare `Float`** is re-spelled by that formatter's mode-forked rule
-///   (yq keeps a whole number's decimal point at any magnitude, jq keeps the
-///   bare `Display` spelling, #953) and comes back as a `NumberLiteral`
-///   carrying that new text. This is the case the bridge is genuinely
-///   load-bearing for: without the guard, `.outer.big | parent` on
-///   `10000000000000000000.0` prints `1e+19` in yq mode.
 /// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
 /// - A `NumberLiteral` whose source text exceeds
 ///   [`REINDEX_LITERAL_LEN_CAP`] is discarded (#1211).
+/// - A non-finite bare `Float` goes through a sentinel/overflow literal;
+///   it comes back as the same value, but this predicate stays out of that
+///   corner rather than reason about it.
+///
+/// A bare finite **`Float`** used to head this list: the formatter re-spelled
+/// it by a mode-forked rule (#953) and it came back as a `NumberLiteral`
+/// carrying that new text, which was the case the bridge was genuinely
+/// load-bearing for (without the guard, `.outer.big | parent` on
+/// `10000000000000000000.0` printed `1e+19` in yq mode). Since #2902 the
+/// bridge writes a bare finite `Float` as a token
+/// (`crate::json::validate::computed_float_token`) that reparses to the same
+/// bare `Float`, so the round trip is an identity on it too and the bypass
+/// applies.
 ///
 /// Everything else -- `null`, booleans, strings (escaped and unescaped
 /// symmetrically), object keys, and the overwhelmingly common
@@ -2839,14 +2837,11 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 ///
 /// A bare **`Int`** is the one node that is *normalized* rather than
 /// preserved and is still allowed through: it comes back as
-/// `NumberLiteral(Int(n), "n")`. That is sound where a bare `Float` isn't,
-/// because `to_json_for_reindex` writes an `Int` as exactly `format!("{n}")`
-/// in both modes -- the only spelling an `i64` has -- so the literal the
-/// bridge bakes in is the same text the bare `Int` renders as anyway, and
-/// #1008's literal preservation has nothing new to echo. A `Float`'s
-/// spelling, by contrast, is mode-forked and genuinely differs from what the
-/// bare value would produce, which is exactly the `1e+19` breakage the guard
-/// exists to prevent.
+/// `NumberLiteral(Int(n), "n")`. That is sound because `to_json_for_reindex`
+/// writes an `Int` as exactly `format!("{n}")` in both modes -- the only
+/// spelling an `i64` has -- so the literal the bridge bakes in is the same
+/// text the bare `Int` renders as anyway, and #1008's literal preservation
+/// has nothing new to echo.
 ///
 /// Excluding `Int` is not merely conservative here, it is the difference
 /// between this fix applying to `succinctly yq` and not (code review):
@@ -2868,7 +2863,7 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// alone can safely skip the bridge.
 pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
     match value {
-        OwnedValue::Float(_) => false,
+        OwnedValue::Float(f) => f.is_finite(),
         OwnedValue::Int(_) => true,
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => false,
         OwnedValue::NumberLiteral(_, literal) => literal.len() <= REINDEX_LITERAL_LEN_CAP,
@@ -2920,8 +2915,10 @@ pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
 /// is that a document-sourced float now arrives already carrying its
 /// spelling, so the round trip preserves it as a literal instead of having
 /// to synthesize one for everything. `[1e10 * 2]` keeps scientific notation
-/// as a result; the ordinary-magnitude `join` gap (#1124/#1144, `[2.0/2]`)
-/// is below the threshold and is untouched.
+/// as a result. #2902 then closed the ordinary-magnitude `join` gap
+/// (#1124/#1144, `[2.0/2]`) from the other side: the bridge now writes a
+/// bare `Float` as a token it hands back as a bare `Float`, so this round
+/// trip no longer bakes a computed float into a literal at any magnitude.
 ///
 /// Round-tripping just `values` (not the whole input document, unlike the
 /// old wildcard fallback these two arms replace) keeps `Expr::Array`'s and
@@ -25062,20 +25059,37 @@ mod tests {
             );
         }
 
-        // The shape the guard exists for: a bare `Float`, which #953's
-        // mode-forked re-spelling rewrites. Asserted in both directions --
-        // the predicate refuses it, *and* the bridge really does change it,
-        // so this case can't quietly stop being a real one.
-        let respelled = OwnedValue::Float(1e19);
-        assert!(!super::reindex_bridge_is_identity(&respelled));
-        assert!(
-            !round_trips_unchanged::<YqSemantics>(&respelled),
-            "sanity: the yq-mode bridge really does rewrite {respelled:?}"
-        );
-        assert!(
-            !round_trips_unchanged::<JqSemantics>(&respelled),
-            "sanity: the jq-mode bridge really does rewrite {respelled:?}"
-        );
+        // The shape the guard used to exist for: a bare `Float`, which #953's
+        // mode-forked re-spelling rewrote into a `NumberLiteral`. Since #2902
+        // the bridge writes it as a token that reparses to the same bare
+        // `Float`, so it is an identity in both modes and the predicate admits
+        // it -- asserted in both directions so a formatter regression that
+        // starts re-spelling it again fails here, not in a user's `tostring`.
+        for computed in [
+            OwnedValue::Float(1e19),
+            OwnedValue::Float(1.0),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(5e-6),
+        ] {
+            assert!(
+                super::reindex_bridge_is_identity(&computed),
+                "the bypass must fire for a computed float: {computed:?}"
+            );
+            assert!(
+                round_trips_unchanged::<YqSemantics>(&computed),
+                "sanity: the yq-mode bridge hands back {computed:?} unchanged"
+            );
+            assert!(
+                round_trips_unchanged::<JqSemantics>(&computed),
+                "sanity: the jq-mode bridge hands back {computed:?} unchanged"
+            );
+        }
+        assert!(!super::reindex_bridge_is_identity(&OwnedValue::Float(
+            f64::NAN
+        )));
+        assert!(!super::reindex_bridge_is_identity(&OwnedValue::Float(
+            f64::INFINITY
+        )));
     }
 
     /// The one thing [`reindex_bridge_is_identity`]'s `Int` arm rests on, and

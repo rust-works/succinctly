@@ -32829,15 +32829,54 @@ fn test_tonumber_rejects_doubled_sign_1090() {
     }
 }
 
+/// #2902: a computed float read back out of a container must not regain a
+/// literal spelling. jq mode already answered `"1"` for the issue's own row
+/// (its bridge spelled `Float(1.0)` as `1`), but one threshold up the same
+/// mechanism bit: `[2*1e16] | .[0] | tostring` crossed the reindex bridge,
+/// which spelled the computed value `2e+16`, reparsed it as a `NumberLiteral`,
+/// and `tostring` then applied jq's *literal*-reformatting convention
+/// (uppercase `E`, `2E+16`) instead of its computed-value one. The bridge now
+/// writes a bare `Float` as a token it hands back as a bare `Float`. Every
+/// expectation captured live from jq 1.7.1 (`-c`, `null` on stdin), the
+/// already-right rows included so a genuine literal keeps echoing verbatim.
+#[test]
+fn test_computed_float_through_container_keeps_computed_spelling_2902() -> Result<()> {
+    for (filter, want) in [
+        ("[2*1e16] | .[0] | tostring", r#""2e+16""#),
+        ("[2*1e16] | . | .[0] | tostring", r#""2e+16""#),
+        ("(2*1e16) as $x | [$x] | .[0] | tostring", r#""2e+16""#),
+        ("[2*1e17] | .[0] | tojson", r#""2e+17""#),
+        ("[1e-5/2] | .[0] | tojson", r#""5e-06""#),
+        ("[1e10] | map(. * 2 | tostring)", r#"["20000000000"]"#),
+        ("[0.5+0.5] | .[0] | tostring", r#""1""#),
+        ("[1.0] | .[0] | tostring", r#""1.0""#),
+        ("[1e2] | .[0] | tostring", r#""1E+2""#),
+        ("[1.50e10] | .[0]", "1.50E+10"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "null\n", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` exited {code}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #1090 follow-on: preserving `tonumber`'s literal must not start
 /// accepting text real jq rejects. The internal overflow sentinels
-/// (`9e999e999` -> NaN, `8e999e999` -> Infinity) are ordinary user input
-/// here, and routing this builtin through `OwnedValue::from_number_bytes`
-/// -- which decodes them -- would silently turn jq's documented error into
-/// a NaN. Error wording confirmed against jq 1.7.1.
+/// (`9e999e999` -> NaN, `8e999e999` -> Infinity) and, since #2902, the
+/// reindex bridge's computed-float token (`1e0e0` -> `1`) are ordinary
+/// user input here, and routing this builtin through
+/// `OwnedValue::from_number_bytes` -- which decodes them -- would silently
+/// turn jq's documented error into a number. Error wording confirmed
+/// against jq 1.7.1.
 #[test]
 fn test_tonumber_rejects_internal_overflow_sentinels_1090() {
-    for input in [r#""9e999e999""#, r#""8e999e999""#, r#""-8e999e999""#] {
+    for input in [
+        r#""9e999e999""#,
+        r#""8e999e999""#,
+        r#""-8e999e999""#,
+        r#""1e0e0""#,
+        r#""2e16e0""#,
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
             .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
         assert_ne!(code, 0, "`{input}` should error\nstdout: {stdout}");

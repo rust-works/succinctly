@@ -3896,11 +3896,11 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   `True`/`yes`), `"~" == null` is `true` here (yq `false`), and a leading-zero, hex or
   underscored integer compares by its resolved decimal text (`1 == 01` is `true` here,
   `false` in yq). Every one of these already shows in `tostring`.
-- **The reindex bridge re-spells a computed float**: `[(0.5+0.5)] | .[0] == 1` is `true`
-  in yq and `false` here, because the bridge serializes the computed `Float(1.0)` as
-  `1.0` and the text rule then sees `1.0` -- the same pre-existing artefact behind
-  `[(0.5+0.5)] | .[0] | tostring` printing `"1.0"` (yq `"1"`). `(0.5+0.5) == 1` itself,
-  which never crosses the bridge, is `true` in both.
+
+A third entry used to sit here -- the reindex bridge re-spelling a computed float, so that
+`[(0.5+0.5)] | .[0] == 1` was `false` (yq `true`) and `[(0.5+0.5)] | .[0] | tostring`
+printed `1.0` (yq `1`). Fixed by [#2902](https://github.com/rust-works/succinctly/issues/2902):
+the bridge now writes a bare `Float` as a token the reparse hands back as a bare `Float`.
 
 Pinned by the `yq_text_equality_2785` module (`tests/yq_cli_tests.rs`), the
 `scalar_text_equality_2785`/`scalar_wildcard_equality_2785` goldens, and the

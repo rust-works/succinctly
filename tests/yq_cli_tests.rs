@@ -22239,23 +22239,27 @@ fn test_yq_join_separator_computed_int_unaffected_1124() -> Result<()> {
     Ok(())
 }
 
-/// #1124 (partial fix, tracked further as #1144): `yq_join_element_part`'s
-/// equivalent catch-all was fixed the same way as `yq_join_separator`'s
-/// above, but a *constructed* array's computed-float element still doesn't
-/// reach real yq's `"1"` answer -- `builtin_join`'s array branch only ever
-/// receives a cursor-backed element, and reaching that cursor for a
-/// constructed array requires a `to_json_for_reindex` round-trip that bakes
+/// #1124/#1144, closed by #2902: a *constructed* array's computed-float
+/// element now reaches real yq's `"1"` answer. `builtin_join`'s array branch
+/// only ever receives a cursor-backed element, so a constructed array gets
+/// there through a `to_json_for_reindex` round-trip -- which used to bake
 /// the decimal point into synthesized `NumberLiteral` source text
-/// indistinguishable from a genuine document literal, so this fix's
-/// `numeric_display_string` call never actually sees a bare `Float` here.
-/// Pinned as a known, separately-tracked gap rather than silently
-/// unasserted -- if #1144 closes this, this assertion should change to
-/// `"1"` and the doc comment above should be updated to match.
+/// indistinguishable from a genuine document literal (this test pinned
+/// `"1.0"` as the known gap). The bridge now hands the element back as the
+/// bare `Float` it was, so `yq_join_element_part`'s `numeric_display_string`
+/// call finally sees it. A genuine document literal still echoes verbatim.
+/// Both captured from yq v4.53.3.
 #[test]
-fn test_yq_join_element_computed_float_known_gap_1124() -> Result<()> {
-    let (stdout, code) = run_yq_stdin(r#"(2.0 / 2) | [.] | join(",")"#, "null\n", &["-r"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "1.0");
+fn test_yq_join_element_computed_float_matches_yq_1144() -> Result<()> {
+    for (filter, want) in [
+        (r#"(2.0 / 2) | [.] | join(",")"#, "1"),
+        (r#"[2.0/2] | map(.) | join(",")"#, "1"),
+        (r#"[1.500] | join(",")"#, "1.500"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "null\n", &["-r"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
     Ok(())
 }
 
@@ -45796,6 +45800,112 @@ fn test_yq_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result
     Ok(())
 }
 
+/// #2902: a computed float read back out of a container must not regain a
+/// literal spelling. `[0.5+0.5] | .[0] | tostring` crossed the reindex bridge
+/// (`to_json_for_reindex` + `JsonIndex::build`), which spelled the computed
+/// `Float(1.0)` as `1.0` and reparsed it as a `NumberLiteral` carrying that
+/// text, so `tostring` echoed `1.0` where real yq answers `1`. The bridge now
+/// writes a bare `Float` as a token it hands back as a bare `Float`. Every
+/// expectation below was captured live from yq v4.53.3 (no flags, `null` on
+/// stdin) -- including the rows that were already right, which pin that a
+/// genuine literal still echoes verbatim and that the above-threshold
+/// spellings the old literal accident happened to get right still hold.
+mod computed_float_through_container_2902 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    fn check(rows: &[(&str, &str)]) -> Result<()> {
+        for (filter, want) in rows {
+            let (out, code) = run_yq_stdin(filter, "null\n", &[])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out, format!("{want}\n"), "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// The issue's own table, plus the same value through deeper and
+    /// differently-shaped containers.
+    #[test]
+    fn tostring_drops_the_bridge_spelling_2902() -> Result<()> {
+        check(&[
+            ("[0.5+0.5] | .[0] | tostring", "1"),
+            ("(0.5+0.5) | tostring", "1"),
+            ("1.0 | tostring", "1.0"),
+            ("[1.0] | .[0] | tostring", "1.0"),
+            ("[0.0*1] | .[0] | tostring", "0"),
+            ("[2.5+2.5] | .[] | tostring", "5"),
+            ("[[0.5+0.5]] | .[0][0] | tostring", "1"),
+            ("[0.5+0.5] | map(.) | .[0] | tostring", "1"),
+            ("[1e2] | .[0] | tostring", "1e2"),
+        ])
+    }
+
+    /// Not only `tostring`: plain output and the nested `!!float` tag follow
+    /// the computed value's own rule again.
+    #[test]
+    fn output_follows_the_computed_rule_2902() -> Result<()> {
+        check(&[
+            ("[0.5+0.5] | .[0]", "1"),
+            ("[0.5+0.5]", "- !!float 1"),
+            ("[0.5+0.5] | .[0] | type", "!!float"),
+        ])
+    }
+
+    /// yq's JSON encoder keeps a whole computed float's `.0` and switches to
+    /// scientific notation past its magnitude threshold. The latter rows used
+    /// to be right only because the bridge's literal spelled them that way;
+    /// `to_json_yq` now applies the threshold itself. Compared trimmed, like
+    /// every other `tojson` test here: real yq's encoder ends the string
+    /// with a newline of its own, which succinctly does not reproduce.
+    #[test]
+    fn tojson_keeps_yqs_own_threshold_2902() -> Result<()> {
+        for (filter, want) in [
+            ("[0.5+0.5] | .[0] | tojson", "1.0"),
+            ("[1e10*2] | .[0] | tojson", "2e+10"),
+            ("(1e10*2) | tojson", "2e+10"),
+            ("[1e-5/2] | .[0] | tojson", "5e-06"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, "null\n", &[])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out.trim_end(), want, "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// #1134's shapes: every intervening stage that used to re-bake the
+    /// value before `tostring` could see it.
+    #[test]
+    fn any_intervening_stage_is_fine_now_1134() -> Result<()> {
+        check(&[
+            ("[1e10*2] | .[0] | tostring", "2e+10"),
+            ("[1e6*2] | .[0] | tostring", "2e+06"),
+            ("(1e10 * 2) | . | tostring", "2e+10"),
+            ("(1e10 * 2) | (tostring)", "2e+10"),
+            ("(1e10*2) as $x | $x | tostring", "2e+10"),
+            ("[1e10] | map(. * 2 | tostring)", "- \"2e+10\""),
+        ])
+    }
+
+    /// A tag-forced document float (`!!float 2`) is the one *document* shape
+    /// that is also a bare `Float`; it keeps answering the way it did, and
+    /// its text equality through a container (which used to see the
+    /// bridge's `2.0`) now agrees with yq too.
+    #[test]
+    fn tag_forced_document_float_is_unchanged_2902() -> Result<()> {
+        for (filter, want) in [
+            ("[.a] | .[0] | tostring", "2"),
+            ("[.a] | .[0]", "2"),
+            ("[.a] | .[0] | tojson", "2.0"),
+            ("[.a] | .[0] == 2", "true"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, "a: !!float 2\n", &[])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out.trim_end(), want, "`{filter}`");
+        }
+        Ok(())
+    }
+}
+
 /// #2785: real yq's `==`/`!=` between two scalars compares their *text*, with
 /// its wildcard matcher applied to the right-hand operand -- not jq's typed
 /// equality. See `eval::yq_scalar_text_eq`. Every expectation below was
@@ -45840,6 +45950,11 @@ mod yq_text_equality_2785 {
             ("(1 + 1) == \"2\"", "true"),
             ("(0.5 + 0.5) == 1", "true"),
             ("(0.5 + 0.5) == \"1\"", "true"),
+            // #2902: the same computed float read back out of a container
+            // crosses the reindex bridge, which used to re-spell it `1.0`.
+            ("[0.5 + 0.5] | .[0] == 1", "true"),
+            ("[0.5 + 0.5] | .[0] == \"1\"", "true"),
+            ("[0.5 + 0.5] | .[0] == 1.0", "false"),
             (".a == (.b | tonumber)", "true"),
         ])
     }
