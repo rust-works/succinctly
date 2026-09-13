@@ -10189,7 +10189,22 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Last => builtin_last::<W>(value, optional),
         Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
         Builtin::Reverse => builtin_reverse::<W, S>(value, optional),
-        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, OwnedValue::Int(1)),
+        // #2818: bare `flatten` is jq's `def flatten: flatten(1/0);` --
+        // unconditionally full-depth, not `flatten(1)`. `1/0` itself
+        // actually raises in jq 1.7.1 (`number and number cannot be
+        // divided because the divisor is zero`, confirmed live), so real
+        // jq's C implementation must not literally evaluate that
+        // definition's `1/0` as this crate's own `/` would; empirically,
+        // real jq fully flattens a 200-level-deep array with bare
+        // `flatten`, i.e. genuinely unbounded. `depth` here is only ever
+        // compared against 0 and decremented by 1 per level
+        // (`flatten_owned_at_depth`), and every value tree this crate can
+        // hold is already capped at `MAX_VALUE_TREE_DEPTH` levels
+        // (`assert_value_tree_depth`, ~384) -- so any sentinel larger than
+        // that ceiling is indistinguishable from true infinity for every
+        // document this crate can represent. `i64::MAX` needs no new
+        // "infinite" concept in `OwnedValue`/`compare_values`/`arith_sub`.
+        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, OwnedValue::Int(i64::MAX)),
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
         Builtin::Unique => builtin_unique::<W, S>(value, optional),
@@ -67409,11 +67424,21 @@ mod tests {
 
     #[test]
     fn test_builtin_flatten() {
+        // #2818: bare `flatten` is unbounded depth, not `flatten(1)` --
+        // `[4]` must fully unwrap to `4`, not stay a nested array.
+        // Confirmed live: `[[1, 2], [3, [4]]] | flatten` is `[1,2,3,4]` in
+        // jq 1.7.1.
         query!(br"[[1, 2], [3, [4]]]", "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr.len(), 4);
-                assert_eq!(arr[0], OwnedValue::Int(1));
-                assert_eq!(arr[3], OwnedValue::Array(vec![OwnedValue::Int(4)]));
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                        OwnedValue::Int(4),
+                    ]
+                );
             }
         );
 
@@ -67429,7 +67454,7 @@ mod tests {
 
         // flatten is defined over [.[]], and .[] over an object iterates
         // its values, so jq accepts an object here as readily as an array
-        // (#422). Same one-level depth as the array case above.
+        // (#422). Same unbounded depth as the array case above (#2818).
         query!(br#"{"a": [1, 2], "b": [3, [4]]}"#, "flatten",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(
@@ -67438,7 +67463,7 @@ mod tests {
                         OwnedValue::Int(1),
                         OwnedValue::Int(2),
                         OwnedValue::Int(3),
-                        OwnedValue::Array(vec![OwnedValue::Int(4)]),
+                        OwnedValue::Int(4),
                     ]
                 );
             }

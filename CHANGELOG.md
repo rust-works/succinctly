@@ -127,6 +127,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bare `flatten` (no depth argument) now flattens fully, matching jq** (#2818).
+  `Builtin::Flatten` was wired to `flatten(1)` instead of jq's actual
+  unbounded-depth default (`[[1,[2]],3] | flatten` used to keep `[2]`
+  nested, answering `[1,[2],3]` where jq answers `[1,2,3]`). Every value
+  tree this crate can hold is already capped at `MAX_VALUE_TREE_DEPTH`
+  levels, so passing `i64::MAX` as the depth sentinel is indistinguishable
+  from true infinity for any document it can represent — no new "infinite
+  depth" concept needed in `OwnedValue`/`compare_values`/`arith_sub`.
+
 - **`succinctly jq`/`yq` no longer reject a `def` nobody ever calls** (#2740).
   `def h: nosuchfn; 1` used to fail at compile time (`nosuchfn/0 is not
   defined`) even though `h` is never referenced anywhere in the program;
