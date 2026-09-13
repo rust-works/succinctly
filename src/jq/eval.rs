@@ -50566,17 +50566,18 @@ pub(crate) fn bind_def_call<'e>(
 /// under [`DOLLAR_NAMESPACE_ONLY`] reproduces this, whichever position wins
 /// which namespace.
 ///
-/// The two passes are independent: each rewrites a disjoint set of nodes
+/// The two winners are independent: each rewrites a disjoint set of nodes
 /// ([`SubstScope`] gates the `Expr::Var` and bare `Expr::FuncCall` arms
 /// separately since #2555), so neither can consume or clobber what the other
-/// is looking for, and their order does not matter. Before #2555 the bare
-/// arm fired unconditionally, and this relied on the bare pass running first
-/// and leaving opaque `Expr::Shared` behind for the `$` pass to skip over --
-/// correct, but only by construction rather than by the flags actually
-/// saying so.
+/// is looking for. That is what lets them share a single walk since #2633,
+/// where they used to be two sequential passes; before #2555 the bare arm
+/// fired unconditionally and even the two-pass form relied on the bare pass
+/// running first and leaving opaque `Expr::Shared` behind for the `$` pass
+/// to skip over -- correct, but only by construction rather than by the
+/// flags actually saying so.
 ///
 /// One consequence worth keeping: when a duplicated name has *no* `$`-style
-/// occurrence at all, the `$` pass never runs, so a `$name` in the body is
+/// occurrence at all, no `$` entry is built at all, so a `$name` in the body is
 /// left for an enclosing binder -- which is what jq does
 /// (`5 as $a | def f(a;a): $a + a; f(1;2)` is `7`; the blanket
 /// `subst_dollar: true` fold this replaced captured `$a` as the parameter
@@ -50588,8 +50589,15 @@ pub(crate) fn bind_def_call<'e>(
 /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
 /// below, plus `tests/jq_cli_tests.rs`' own `test_duplicate_named_param_*_2560`
 /// family end to end.
+///
 /// #2633: one walk over the body carrying every parameter, not one walk per
-/// parameter.
+/// parameter. The two shapes described above are now two *slice* shapes fed
+/// to that one walk -- the distinct-name case one entry per parameter, the
+/// duplicate-name case a bare-winner and (where one exists) a `$`-winner
+/// entry per distinct name -- rather than one fold and two passes over
+/// rebuilt bodies. `sequential_param_substitution` below is what still has
+/// the per-parameter shape, as the >64 fallback and the differential
+/// oracle.
 ///
 /// Measured interleaved against `c21736b2f`, 11 reps, best-of, both pinned
 /// boxes, body held at 60 nodes and depth at 1200 so only the parameter
@@ -50623,6 +50631,12 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         // equivalent -- a substituted argument is never descended into, so
         // no parameter can be substituted into another's argument whether
         // the walks are sequential or simultaneous.
+        // Checked before the `collect` (review): past the ceiling the vec
+        // would be built -- one `arg.clone()` and `Rc::new` per parameter --
+        // only to be thrown away by the fallback.
+        if params.len() > MAX_COMBINED_PARAM_SUBSTS {
+            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+        }
         let subs: Vec<ParamSubst<'_>> = params
             .iter()
             .zip(args.iter())
@@ -50634,9 +50648,6 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
             .collect();
         if subs.is_empty() {
             return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
-        }
-        if subs.len() > MAX_COMBINED_PARAM_SUBSTS {
-            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
         }
         return substitute_func_params_impl(body, &subs, ScopeMask::start(&subs));
     }
@@ -50652,6 +50663,12 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     // dollar-winner entry; the two rewrite provably disjoint node sets (a
     // `Var` consults only the dollar mask, a bare `FuncCall` only the bare
     // mask), which is why they can share a pass rather than needing two.
+    // Two entries per distinct name in the worst case (a bare winner and a
+    // `$` winner), so the ceiling is checked against that bound before any
+    // argument is cloned -- same reason as the non-duplicate path above.
+    if params.len() * 2 > MAX_COMBINED_PARAM_SUBSTS {
+        return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: needs more than 32 duplicated-name parameters; see the non-duplicate path's own note (#2633)"
+    }
     let mut subs: Vec<ParamSubst<'_>> = Vec::new();
     let mut substituted_names: Vec<&str> = Vec::new();
     for param in params {
@@ -50689,9 +50706,6 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     }
     if subs.is_empty() {
         return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: `params` is non-empty here (bind_def_call's own guard) and its first entry is never skipped, so at least one substitution always ran (#2560)"
-    }
-    if subs.len() > MAX_COMBINED_PARAM_SUBSTS {
-        return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: needs more than 64 distinct-name entries; see the non-duplicate path's own note (#2633)"
     }
     substitute_func_params_impl(body, &subs, ScopeMask::start(&subs))
 }
@@ -50752,7 +50766,7 @@ fn sequential_param_substitution(body: &Expr, params: &[Param], args: &[Expr]) -
                 .filter(|(p, _)| p.name() == name)
         };
         let Some((_, bare_arg)) = by_name().next_back() else {
-            continue;
+            continue; // omni-dev: coverage tolerate-line reason="unreachable: same arity invariant as bind_def_call_params' own copy of this loop -- `name` came from `params`, so the zip has a matching pair unless args is shorter, which install_def_calls rules out (#2560)"
         };
         let mut substituted = substitute_func_param_impl(
             result.as_ref().unwrap_or(body),
@@ -51391,6 +51405,19 @@ impl ScopeMask {
     /// The mask every substitution starts in: each parameter's own
     /// [`SubstScope::for_param`] answer, one bit per index.
     fn start(subs: &[ParamSubst<'_>]) -> Self {
+        // The capture-hygiene precondition (#2096/#2077): every argument
+        // must be `Expr::Shared`-wrapped, or a same-named binder inside the
+        // body could recapture it. Asserted here rather than inside the walk
+        // (review) -- it is a property of the slice, and every entry point
+        // builds its mask through this function, so checking it once per
+        // bind replaces an O(subs.len()) scan at *every node* of the
+        // recursion.
+        debug_assert!(
+            subs.iter().all(|s| matches!(s.arg, Expr::Shared(_))),
+            "substitute_func_param's capture-hygiene argument (#2096) requires every `arg` to \
+             be Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named \
+             binder in `expr` (#2077)"
+        );
         let mut mask = Self { dollar: 0, bare: 0 };
         for (i, sub) in subs.iter().enumerate() {
             if sub.scope.dollar {
@@ -51516,12 +51543,6 @@ fn substitute_func_param(expr: &Expr, param: &Param, arg: &Expr) -> Expr {
 }
 
 fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: ScopeMask) -> Expr {
-    debug_assert!(
-        subs.iter().all(|s| matches!(s.arg, Expr::Shared(_))),
-        "substitute_func_param's capture-hygiene argument (#2096) requires every `arg` to be \
-         Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named binder \
-         in `expr` (#2077)"
-    );
     match expr {
         // #1371: opaque, for the same reasons `substitute_var_impl` gives --
         // and for one more that is specific to parameters. Binding a
@@ -51727,9 +51748,7 @@ fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: Scop
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args, .. }
-            if args.is_empty() && ScopeMask::resolve(scope.bare, subs, name).is_some() =>
-        {
+        Expr::FuncCall { name, args, .. } if args.is_empty() => {
             // In jq, function parameters are bare identifiers that parse as
             // zero-arg FuncCalls. This is a reference to the parameter.
             //
@@ -51737,10 +51756,14 @@ fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: Scop
             // *filter*-namespace binder (a nested `def`, or a nested def's
             // own matching parameter) can shadow this, never an `as`/
             // `reduce`/`foreach` binder, however that binder is spelled.
-            ScopeMask::resolve(scope.bare, subs, name)
-                .expect("the match guard just resolved this name in the bare namespace")
-                .arg
-                .clone()
+            match ScopeMask::resolve(scope.bare, subs, name) {
+                Some(sub) => sub.arg.clone(),
+                // Not a parameter reference after all -- an ordinary
+                // zero-arity call, which recurses like any other node.
+                None => map_subexprs(expr, &mut |sub| {
+                    substitute_func_params_impl(sub, subs, scope)
+                }),
+            }
         }
 
         // #2095: every remaining variant's recursive-structural-child
@@ -51758,18 +51781,15 @@ fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: Scop
 }
 
 fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
-    substitute_func_params_impl(
-        expr,
-        &[ParamSubst {
-            name: param,
-            arg: arg.clone(),
-            scope,
-        }],
-        ScopeMask {
-            dollar: u64::from(scope.dollar),
-            bare: u64::from(scope.bare),
-        },
-    )
+    let subs = [ParamSubst {
+        name: param,
+        arg: arg.clone(),
+        scope,
+    }];
+    // `ScopeMask::start`, not a hand-rolled `SubstScope` -> mask conversion:
+    // this function family's own comments record repeated bugs from a
+    // derivation kept in two places (review).
+    substitute_func_params_impl(expr, &subs, ScopeMask::start(&subs))
 }
 
 /// Expand function calls in a builtin expression.
@@ -52328,13 +52348,45 @@ mod tests {
                 let args: Vec<Expr> = (0..params.len())
                     .map(|i| int(i64::try_from(i).expect("small index") + 1))
                     .collect();
+                let combined = bind_def_call_params(body, params, &args);
                 assert_eq!(
-                    bind_def_call_params(body, params, &args),
+                    combined,
                     sequential_param_substitution(body, params, &args),
                     "combined walk diverged from the sequential fold\n  body: {body:?}\n  params: {params:?}"
                 );
+                // #2633 review: `Expr`'s own `PartialEq` cannot see this.
+                // `FuncDefBound::eq` is unconditionally `true` -- deliberately,
+                // since a cached bound body is derived state, not identity --
+                // so the assertion above would pass even if a rebuilt
+                // `FuncDef` kept a cache the rebuild invalidated, which is
+                // exactly #2094's rule.
+                assert!(
+                    !any_def_bound_cached(&combined),
+                    "a rebuilt FuncDef kept its bound-body cache (#2094)\n  body: {body:?}"
+                );
             }
         }
+    }
+
+    /// Whether any `FuncDef` in `expr` still carries a cached bound body --
+    /// the property `Expr`'s own `PartialEq` deliberately ignores (#2633
+    /// review).
+    fn any_def_bound_cached(expr: &Expr) -> bool {
+        if let Expr::FuncDef { bound, .. } = expr {
+            if bound.is_cached() {
+                return true;
+            }
+        }
+        let mut found = false;
+        // `map_subexprs` is a rebuild rather than a visitor, but it is the
+        // one definition of "every `Expr`-typed child" this module already
+        // trusts everywhere else -- reusing it keeps the check from missing
+        // a variant a hand-written walk would forget.
+        let _ = map_subexprs(expr, &mut |sub| {
+            found |= any_def_bound_cached(sub);
+            sub.clone()
+        });
+        found
     }
 
     /// The `$`-first/bare-last row is the one that pins the two winners

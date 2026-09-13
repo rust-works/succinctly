@@ -955,6 +955,20 @@ impl FuncDefBound {
     }
 }
 
+impl FuncDefBound {
+    /// Whether a bound body is cached here (#2633 review).
+    ///
+    /// [`PartialEq`] below deliberately ignores this, so a structural
+    /// comparison of two `Expr` trees cannot see it -- and #2094's rule is
+    /// precisely that a pass which *rebuilds* a `FuncDef` must reset the
+    /// cache, since the rebuilt body invalidates it. Exposed so a test
+    /// asserting that rule has something to read.
+    #[must_use]
+    pub fn is_cached(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+}
+
 /// Two `FuncDef`s are equal when their name/params/body/then are — whether
 /// either has been evaluated yet, or at what depth, is derived state, not
 /// identity (mirrors [`BoundBody`]'s own `PartialEq`).
