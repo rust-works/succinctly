@@ -33947,6 +33947,27 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
+        // ---- #2668 review finding, filed as #2903 -------------------------
+        // `resolve_foreach` (path-mode `foreach`, reached via
+        // `path(foreach(...))`) has its own separate fold loop
+        // (`FoldRegister`/`drive_fold_source`) that #2668 did not touch --
+        // an explicitly anticipated risk in #2668's own triage plan, which
+        // checked it does not call `foreach_forks` and left it alone on
+        // that basis. Before #2668 both evaluators collected INIT eagerly
+        // and agreed with each other; #2668 fixed only value-mode, so
+        // path-mode now disagrees with value-mode too, on top of its own
+        // unchanged divergence from jq. Captured live against jq 1.7.1,
+        // which writes nothing.
+        (
+            &[
+                "-c",
+                r#"first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))"#,
+            ],
+            Some(r#"{"a":1}"#),
+            "[\"a\"]\n",
+            "I",
+            0,
+        ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry ------
         // `Flow::Stopped { pending }` is dropped by every lazy consumer but
         // one: `binary_fanout_each` has two operands and so can be handed

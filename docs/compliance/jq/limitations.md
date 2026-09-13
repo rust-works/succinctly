@@ -3756,6 +3756,17 @@ nothing ever calls it through a live sink. Actually closing this gap needs a new
 style dispatch arm (mirroring `each_foreach`/`each_foreach_generic`) added to both evaluators
 first, a materially larger change than a plumbing reshape, and out of scope for #2668 itself.
 
+**`path(foreach(...))`'s own INIT is now inconsistent with value-mode `foreach` — filed as #2903.**
+`resolve_foreach` (`src/jq/eval.rs`), the path-mode evaluator reached from `path(foreach(...))` and
+assignment targets, has its own separate fold loop (`FoldRegister`/`drive_fold_source`) and was not
+touched by #2668 — an explicitly anticipated risk in #2668's own triage plan, which checked it does
+not call `foreach_forks` and left it alone on that basis. Before #2668 both evaluators collected
+INIT eagerly and so agreed with each other; #2668 fixed only the value-mode one, so path-mode now
+*disagrees with value-mode* on top of its own pre-existing (unchanged) divergence from jq:
+`echo '{"a":1}' | jq -c 'first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))'` writes nothing
+and answers `["a"]`; `succinctly jq` writes `I` first. Confirmed live; pinned in
+`test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`).
+
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
 [`bcb41f74f`](https://github.com/rust-works/succinctly/commit/bcb41f74f49a64953f66cf03fab41c84899b1629)

@@ -38315,6 +38315,61 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
 /// `test_repeat_eager_fallback_raises_instead_of_silently_truncating_2014`),
 /// and driving it lazily here would change which cap fires. Real jq hangs on
 /// that shape, so there is no oracle to prefer either message.
+/// Drives `expr` lazily through [`eval_each`], one output at a time, folding
+/// an undecodable output's error into `per_item`'s own escape channel
+/// (#1902) rather than losing it silently. Shared by [`eval_foreach`]'s own
+/// INIT and source drives and by [`each_foreach`]'s (#2668 review: the two
+/// positions used to each get their own near-identical copy of this,
+/// differing only in which `Expr` they closed over -- exactly the "a second
+/// copy is free to drift" risk [`foreach_forks`]'s own doc comment warns
+/// about, one level further in).
+fn drive_lazy<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut escape: Option<Control> = None;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| match item.into_owned() {
+        Ok(v) => per_item(v),
+        Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+    });
+    // Raw, not suppressed: `foreach_forks` adjudicates a drive's own
+    // trailing escape against the ambient `?` itself, at the point where it
+    // also stops every untried fork -- suppressing here would turn a caught
+    // error into "this drive finished normally" and let the next fork run,
+    // which is not what `(...)?` around the whole construct means.
+    resume_from_escape(escape, flow)
+}
+
+/// The bounded fallback for an unbounded `expr` (`repeat(1)`-shaped
+/// queries): collects `expr`'s outputs through the ordinary, capped
+/// `eval_single` evaluator instead of [`eval_each`], then replays them
+/// through `per_item` one at a time so an unbounded generator still gets a
+/// `Demand::Stop` to end it on. Shared by [`eval_foreach`]'s own INIT and
+/// source eager fallbacks -- see [`drive_lazy`]'s doc comment for why a
+/// shared function rather than two copies.
+fn drive_eager<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let (values, control) =
+        stream_outputs(eval_single::<W, S>(expr, value, optional).materialize_cursor());
+    for v in values {
+        if per_item(v) == Demand::Stop {
+            // The step itself ended; `foreach_forks` already holds the
+            // reason and it outranks whatever this returns.
+            return Flow::Exhausted;
+        }
+    }
+    match control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
 fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     patterns: &[Pattern],
@@ -38347,21 +38402,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // generator, and with it any `?//` bind sitting inside it, the same way
     // it already reaches EXTRACT, UPDATE and the source (#2180, #2668).
     let mut lazy_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
-        // Tracked out-of-band for the usual reason (#1902): the sink can
-        // only answer `Demand`, so an undecodable INIT output's error has
-        // to be recorded beside it, folding into the drive's terminator
-        // with the already-iterated prefix standing in front of it.
-        let mut escape: Option<Control> = None;
-        let flow = eval_each::<W, S>(init, value.clone(), optional, &mut |item| match item
-            .into_owned()
-        {
-            Ok(v) => per_init(v),
-            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
-        });
-        // Raw, not suppressed: `foreach_forks` adjudicates INIT's own
-        // trailing escape against the ambient `?` once, the same reason the
-        // source's own `lazy_drive` below leaves it raw.
-        resume_from_escape(escape, flow)
+        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
     // The bounded fallback for an unbounded INIT (`foreach repeat(1) as $x
     // ((0,100); .+1)`-shaped queries): same reasoning as the source's own
@@ -38370,17 +38411,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `!streams_unbounded(init)` too, so an unbounded INIT reaches this
     // fallback exactly as an unbounded source reaches its own).
     let mut eager_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
-        let (values, control) =
-            stream_outputs(eval_single::<W, S>(init, value.clone(), optional).materialize_cursor());
-        for v in values {
-            if per_init(v) == Demand::Stop {
-                return Flow::Exhausted;
-            }
-        }
-        match control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        }
+        drive_eager::<W, S>(init, value.clone(), optional, per_init)
     };
     let drive_init: ForeachInitDrive<'_> = if streams_unbounded(init) {
         &mut eager_drive_init
@@ -38393,47 +38424,11 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // stop (and any `?//` in the source) is reached exactly as it is under a
     // wrapping `first`/`limit`.
     let mut lazy_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        // Tracked out-of-band for the usual reason: the sink can only answer
-        // `Demand`, so an undecodable source element's error has to be
-        // recorded beside it. It folds into the drive's terminator with the
-        // already-iterated prefix standing in front of it (#1902), exactly
-        // as `promote_borrowed`'s own failure used to.
-        let mut escape: Option<Control> = None;
-        let flow = eval_each::<W, S>(input, value.clone(), optional, &mut |item| {
-            // STYLE-0012: routed, one level out -- the error folds into
-            // `escape` and reaches `finish_fork(.., optional)` through
-            // `finish_fork_from_flow`, the shared suppression point #1902
-            // fixed.
-            match item.into_owned() {
-                Ok(v) => per_element(v),
-                Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
-            }
-        });
-        // Raw, not suppressed: `foreach_forks` adjudicates a fork's escape
-        // against the ambient `?` once, at the point where it also stops
-        // every untried INIT fork -- suppressing here would turn a caught
-        // source error into "this fork finished normally" and let the next
-        // fork run, which is not what `(...)?` around the whole `foreach`
-        // means.
-        resume_from_escape(escape, flow)
+        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
     };
     // The bounded fallback: see this function's own doc comment.
     let mut eager_drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        let (values, control) = stream_outputs(
-            eval_single::<W, S>(input, value.clone(), optional).materialize_cursor(),
-        );
-        for v in values {
-            if per_element(v) == Demand::Stop {
-                // The step itself ended; `foreach_forks` already holds the
-                // reason and it outranks whatever this returns.
-                return Flow::Exhausted;
-            }
-        }
-        // Raw, as above.
-        match control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        }
+        drive_eager::<W, S>(input, value.clone(), optional, per_element)
     };
     let drive: ForeachSourceDrive<'_> = if streams_unbounded(input) {
         &mut eager_drive
@@ -38601,7 +38596,13 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     drive_source: ForeachSourceDrive<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    let all_var_names = pattern_alternatives_var_names(patterns);
+    // Lazily computed on the first fork, then reused for every later one --
+    // `#2440`'s zero-INIT-outputs short-circuit is no longer a separate
+    // early return this could sit above (see this function's own doc
+    // comment), so gating it here instead is what keeps a zero-output INIT
+    // (`foreach empty as $x (...)`, `foreach halt_error as $x (empty; .)`)
+    // from paying for a `Vec` build/sort/dedup it will never use.
+    let mut all_var_names: Option<Vec<String>> = None;
     let invert_dedup = patterns.len() > 1;
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
 
@@ -38613,6 +38614,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     let mut terminal: Option<Flow> = None;
 
     let init_flow = drive_init(&mut |init_val| {
+        let all_var_names =
+            all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let mut state = init_val;
         // Recorded out-of-band for the usual reason: the per-element callback
         // can only answer `Demand`, so "why did the fold stop" has to be kept
@@ -38632,7 +38635,7 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
             // hoist anywhere.
             let row = substitute_foreach_steps::<S>(
                 patterns,
-                &all_var_names,
+                all_var_names,
                 update,
                 extract,
                 &input_val,
@@ -38644,37 +38647,38 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
             state = new_state;
             match step_flow {
                 Flow::Exhausted => Demand::Continue,
-                end => {
-                    // #2180 WP3 review: `ended` is this driver's out-of-band
-                    // escape slot, so an escape reaching it carries the same
-                    // non-retryable classification [`stop_with_escape`]
-                    // applies to `Option<Control>` slots -- without it, a
-                    // source-side `?//` retried a step that had already
-                    // halted, running (and in one shape swallowing) the halt
-                    // a second time. See [`mark_nonretryable_escape`].
-                    if let Flow::Escaped(ref control) = end {
-                        mark_nonretryable_escape(control);
-                    }
-                    ended = Some(end);
-                    Demand::Stop
-                }
+                // #2180 WP3 review: an escape reaching this out-of-band slot
+                // carries the same non-retryable classification
+                // [`stop_with_escape`] applies to `Option<Control>` slots --
+                // without it, a source-side `?//` retried a step that had
+                // already halted, running (and in one shape swallowing) the
+                // halt a second time. [`stop_with_downstream`] is the one
+                // place that rule lives, so `ended` and `terminal` (below)
+                // both go through it rather than each hand-copying
+                // [`mark_nonretryable_escape`].
+                end => stop_with_downstream(&mut ended, end),
             }
         });
 
         match ended.unwrap_or(flow) {
             Flow::Exhausted => Demand::Continue,
-            other => {
-                terminal = Some(other);
-                Demand::Stop
-            }
+            other => stop_with_downstream(&mut terminal, other),
         }
     });
 
     match terminal {
-        // A fork's own escape/stop ends everything -- INIT's own trailing
-        // control (if it goes on to have one) is moot, jq's `break` having
-        // already unwound past every untried INIT output.
-        Some(flow) => flow,
+        // A fork's own stop ends everything, `pending` dropped the same
+        // reason every other lazy consumer drops it.
+        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
+        // A fork's own escape, adjudicated against the ambient `?` exactly
+        // as `init_flow`'s own trailing escape is just below -- INIT's own
+        // trailing control (if it goes on to have one) is moot either way,
+        // jq's `break` having already unwound past every untried INIT
+        // output.
+        Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
+        Some(Flow::Exhausted) => {
+            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream")
+        }
         // No fork ever aborted -- `init_flow` is INIT's own generator's raw
         // terminal (never `Stopped`: our own callback above only answers
         // `Demand::Stop` after recording `terminal`), the same trailing
@@ -38824,37 +38828,11 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `foreach_forks` enforces that ordering structurally: `drive_source` is
     // only ever called from *inside* `drive_init`'s own per-output callback.
     let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
-        let mut escape: Option<Control> = None;
-        let flow = eval_each::<W, S>(init, value.clone(), optional, &mut |item| match item
-            .into_owned()
-        {
-            Ok(v) => per_init(v),
-            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
-        });
-        // Raw: `foreach_forks` owns the `suppresses` decision -- see
-        // [`eval_foreach`]'s own drive for why suppressing here would be
-        // wrong.
-        resume_from_escape(escape, flow)
+        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
     };
 
     let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        // Tracked out-of-band for the usual reason: the sink can only answer
-        // `Demand`, so an undecodable source element's error has to be
-        // recorded beside it. It folds into the drive's terminator with the
-        // already-iterated prefix standing in front of it (#1902).
-        let mut escape: Option<Control> = None;
-        let flow = eval_each::<W, S>(input, value.clone(), optional, &mut |item| {
-            // STYLE-0012: routed, one level out -- the error folds into
-            // `escape` and reaches the shared `suppresses` point (#1902).
-            match item.into_owned() {
-                Ok(v) => per_element(v),
-                Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
-            }
-        });
-        // Raw: `foreach_forks` owns the `suppresses` decision -- see
-        // [`eval_foreach`]'s own drive for why suppressing here would be
-        // wrong.
-        resume_from_escape(escape, flow)
+        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
     };
 
     foreach_forks::<S>(
