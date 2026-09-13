@@ -17072,6 +17072,113 @@ fn test_resolve_slice_expr_target_not_evaluated_when_end_always_empty_2245() -> 
     Ok(())
 }
 
+/// #2267: `resolve_slice_expr` drained `T` (`end`) in full for a given `s`
+/// before `E` (`target`) was reached for any `(s, t)` pair, where jq's own
+/// `S as $s | T as $t | E | .[$s:$t]` desugaring interleaves them -- so a
+/// bound and a target that both have real side effects fired in the wrong
+/// order. Every assertion below is captured live from jq 1.7.1; the *path
+/// outputs* were already correct before this fix and are asserted too, so a
+/// regression that "fixes" the ordering by changing what is produced fails
+/// here rather than passing quietly.
+#[test]
+fn test_resolve_slice_expr_interleaves_end_bound_with_target_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((.|debug("E"))[0:((1|debug("t1")),(2|debug("t2")))])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":1}]\n[{\"start\":0,\"end\":2}]\n"
+    );
+    // jq 1.7.1: t1, E, t2, E -- not the pre-#2267 t1, t2, E, E.
+    assert_eq!(
+        stderr,
+        "[\"DEBUG:\",\"t1\"]\n[\"DEBUG:\",\"E\"]\n[\"DEBUG:\",\"t2\"]\n[\"DEBUG:\",\"E\"]\n"
+    );
+
+    Ok(())
+}
+
+/// #2267 (found by this fix's own live-oracle verification, and *not*
+/// recorded on the issue, which only described the `T`-vs-`E` half): `S`
+/// (`start`) was drained in full up front too, one level further out than
+/// the `T` gap. jq reaches `E` for the first `s` before it ever asks the
+/// `S` generator for the second.
+#[test]
+fn test_resolve_slice_expr_interleaves_start_bound_with_pairs_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|debug("t"))])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":2}]\n[{\"start\":1,\"end\":2}]\n"
+    );
+    // jq 1.7.1: s0, t, E, s1, t, E -- not the pre-#2267 s0, s1, t, E, t, E.
+    assert_eq!(
+        stderr,
+        "[\"DEBUG:\",\"s0\"]\n[\"DEBUG:\",\"t\"]\n[\"DEBUG:\",\"E\"]\n\
+         [\"DEBUG:\",\"s1\"]\n[\"DEBUG:\",\"t\"]\n[\"DEBUG:\",\"E\"]\n"
+    );
+
+    Ok(())
+}
+
+/// #2267: the stopping half of the same rule, and the reason
+/// `drive_slice_bound`'s sink answers with [`Demand`] rather than draining
+/// and discarding. Once a pair's own `E` escapes, jq never resumes the `T`
+/// generator, so a later `t`'s side effect does not merely get ignored --
+/// it is never evaluated. Pre-#2267, `t2` fired here because `T` had
+/// already been drained in full before `E` ran at all.
+#[test]
+fn test_resolve_slice_expr_target_escape_stops_end_generator_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((select((true,error("terr"))))[0:((1|debug("t1")),(2|debug("t2")))])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":1}]\n");
+    // jq 1.7.1: `t1`, then the error. No `t2` line at all.
+    assert!(
+        stderr.contains("\"t1\"") && !stderr.contains("\"t2\""),
+        "`t2` must never be evaluated: stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("terr"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2267: a `halt_error` reached while producing a later `t` now fires
+/// *after* the already-formed pair's `E`, matching jq. Pre-#2267 the whole
+/// `T` generator ran first, so the halt took the process down before `E`
+/// was ever reached -- `t1, H` instead of jq's `t1, E, H`.
+#[test]
+fn test_resolve_slice_expr_end_halt_lands_after_earlier_pair_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((.|debug("E"))[0:((1|debug("t1")),("H"|halt_error(7)))])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":1}]\n");
+    assert_eq!(stderr, "[\"DEBUG:\",\"t1\"]\n[\"DEBUG:\",\"E\"]\nH");
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
