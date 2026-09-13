@@ -50454,6 +50454,24 @@ pub(crate) fn bind_def_call<'e>(
 /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
 /// below, plus `tests/jq_cli_tests.rs`' own `test_duplicate_named_param_*_2560`
 /// family end to end.
+/// #2633: one walk over the body carrying every parameter, not one walk per
+/// parameter.
+///
+/// Measured interleaved against `c21736b2f`, 11 reps, best-of, both pinned
+/// boxes, body held at 60 nodes and depth at 1200 so only the parameter
+/// count varies:
+///
+/// | parameters | M4 Pro | 7950X |
+/// |---:|---:|---:|
+/// | 1 | +1.2% | -0.3% |
+/// | 5 | **-10.8%** | **-12.4%** |
+/// | 9 | **-20.0%** | **-19.0%** |
+///
+/// The shape is the claim: 5 and 9 collapse onto the 1-parameter cost
+/// (153 ms / 216 ms) because the walk no longer scales with parameter
+/// count. A 1-parameter `def` has nothing to win -- one walk before, one
+/// after. Every row's output is byte-identical across the two binaries and
+/// against jq 1.7.1.
 fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     let has_duplicate_names = params
         .iter()
@@ -51353,6 +51371,12 @@ const DOLLAR_NAMESPACE_ONLY: SubstScope = SubstScope {
 /// the walk crosses each binder, is [`SubstScope`] -- `param`'s own spelling
 /// decides where it starts (#2726), and only a binder in the matching
 /// namespace clears it (#2555).
+///
+/// #2633: this is now the one-parameter spelling of
+/// [`substitute_func_params_impl`], which carries a whole parameter list
+/// through a single walk. `bind_def_call_params` uses the combined form;
+/// this wrapper serves the two callers that genuinely have one parameter,
+/// and keeps them on the same walk rather than a second copy of it.
 fn substitute_func_param(expr: &Expr, param: &Param, arg: &Expr) -> Expr {
     substitute_func_param_impl(expr, param.name(), arg, SubstScope::for_param(param))
 }
