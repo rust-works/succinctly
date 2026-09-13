@@ -51888,6 +51888,14 @@ fn test_int_arith_past_exact_f64_range_matches_jq_bare_float_display_2631() -> R
         ("3 * 3002399751580331", "9007199254740992"),
         ("0 - 9007199254740993", "-9007199254740992"),
         ("1 + 9007199254740993", "9007199254740992"),
+        // Both operands individually exceed 2^53 (each already lossy in
+        // jq's own f64 number model) but the *exact* i64 result cancels
+        // back under 2^53 -- checking only the result's own magnitude
+        // would wrongly take the exact-int fast path here (confirmed live:
+        // jq rounds 9007199254740995 up to 9007199254740996.0 before
+        // subtracting, giving 2, not the exact-i64 answer of 1).
+        ("9007199254740995 - 9007199254740994", "2"),
+        ("18014398509481987 - 18014398509481984", "4"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");

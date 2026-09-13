@@ -5622,6 +5622,46 @@ itself a rule-4 condition — the condition being invoked here is 4(c), inherite
 `range` entry above, not re-derived from consistency alone.) Pinned by
 `test_unary_minus_destroys_literal_preservation_2357` (`tests/jq_cli_tests.rs`).
 
+### Large-integer `+`/`-` past `2^53` can still round to a different `f64` than real jq even after #2631's fix — no carve-out; recorded as a still-open gap (#2906)
+
+#2631 fixed a fast-path bug where an exact, non-overflowing `i64` `+`/`-`/`*` result past
+`2^53` was kept as `OwnedValue::Int` and printed via its own exact digits, bypassing
+`jq_bare_float_display`'s shortest-round-trip formatting entirely. The fix (`eval.rs`'s
+`jq_checked_int_arith`) now falls back to jq's own `f64` model — `a as f64 op b as f64` —
+whenever either operand or the exact result exceeds `2^53`, which is a strict improvement
+(that fallback matches jq in the large majority of cases where it wasn't reachable at all
+before). It is not a complete fix, though: differential fuzzing against `/usr/bin/jq` 1.7.1
+found real jq's own `+`/`-` sometimes rounds to a *different* double than plain
+`a as f64 op b as f64`, even with **both operands non-negative** (so unrelated to the
+separate unary-minus divergence recorded above):
+
+```console
+$ jq  -n '869389897822472004 + 944331'    # 869389897823416300
+$ sjq -n '869389897822472004 + 944331'    # 869389897823416400
+```
+
+Both tools agree the *exact* integer sum is `869389897823416335`; the divergence is in
+which double each implementation's addition produces. A 400-case-per-operator random
+sample (both operands drawn from a wide magnitude range, `f64(a) op f64(b)` vs. the exact
+integer sum cast to `f64` once, each compared against jq's live answer) found neither
+model predicts jq in ~4% of cases for `+`/`-` and ~4% for `*`, while the naive
+per-operand-cast model (what `jq_checked_int_arith` falls back to) is right in the
+remaining ~96% — see #2906 for the full breakdown. This is almost certainly jq's own
+decNumber-backed literal preservation interacting with plain `f64` arithmetic in some
+mixed, not-fully-naive way that hasn't been traced to jq's C source, rather than a
+tie-break or formatting question `jq_bare_float_display` could resolve on its own — #2542's
+tie-break mechanism only ever acts on an already-odd trailing digit, and every case found
+here already has an even last digit on both sides.
+
+Recorded here rather than fixed because closing it fully would mean replicating jq's actual
+arbitrary-precision decimal arithmetic model for `+`/`-` (and, per the ~4% mul figure above,
+possibly `*` too) — a real decNumber-equivalent dependency, not a formatting-path change —
+and no model tried so far explains 100% of cases even as a starting point. This does not fit
+ADR-0018 rule 4's four named conditions (the output is readable, nothing is corrupted, the
+process doesn't die), so per rule 4 it is recorded as a still-open gap rather than a settled
+divergence, matching this file's own "`foreach`/`reduce`'s INIT-fork re-entry" entry above.
+`jq_checked_int_arith`'s own doc comment in `src/jq/eval.rs` links back here.
+
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 
 Real jq's own number reader accepts a bare trailing `.` with nothing after it at all,
