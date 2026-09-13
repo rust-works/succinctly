@@ -388,20 +388,28 @@ fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
 }
 
 /// [`empty_fields_tail_gap_ok`]/[`empty_elements_tail_gap_ok`] for an arm
-/// that walks whichever container it was handed -- `paths`, `leaf_paths`,
-/// `getpath` (#2594).
+/// that walks whichever container it was handed without knowing which one
+/// it has until it looks (#2594) -- today, `Builtin::Paths`/`LeafPaths`'
+/// value-domain walk (`collect_paths_generic`) and `Builtin::GetPath`'s own
+/// root pre-check ahead of `getpath_walk_cursor`. Same contract as the two
+/// helpers it dispatches to, including the rule that this is called from
+/// the arm about to walk, never from the top of the dispatch function --
+/// see [`empty_fields_tail_gap_ok`]'s own doc comment.
 ///
-/// Those three dispatch to a *value-domain* walk (`collect_paths_generic`,
-/// `getpath_walk_cursor`), so unlike the arms that call one of the two
-/// helpers directly they do not know which container they have until they
-/// look. Same contract as those helpers, including the rule that this is
-/// called from the arm about to walk, never from the top of the dispatch
-/// function -- see [`empty_fields_tail_gap_ok`]'s own doc comment.
+/// **`getpath_walk_cursor`'s own per-step child-miss checks call
+/// [`empty_fields_tail_gap_ok`]/[`empty_elements_tail_gap_ok`] directly
+/// instead of this function (#2731 review):** each miss site already has
+/// `fields`/`elements` in scope from its own `v.as_object()`/`as_array()`
+/// dispatch, so routing through here would re-derive them from `v` a
+/// second time -- for a YAML alias, a second full chain resolution the
+/// surrounding function's own doc comment already warns against paying for
+/// twice.
 ///
-/// Covers the container this arm is standing on. A `{,}` nested *inside*
-/// the walk stays unchecked, because `collect_paths_generic` recurses over
-/// values and carries no cursor to check against -- the same shape
-/// [`to_owned_at_depth`] documents, tracked separately.
+/// A nested `{,}`/`[,]` reached through `collect_paths_generic`'s own
+/// recursion is closed by #2731 threading a `cursor: Option<&V::Cursor>`
+/// down through every recursive call (the same shape [`to_owned_at_depth`]
+/// already used, #2358) -- this function alone only ever covers the
+/// *outermost* container an arm is standing on.
 fn empty_container_gap_error<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
@@ -14074,22 +14082,32 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             current_path.pop();
         }
     } else if let Some(elements) = value.as_array() {
-        if elements.is_empty() {
-            // #2731: array twin of the object-arm check above.
+        // #2731 (review): `collect_cursors_checked` rather than a bare
+        // `uncons_cursor` loop -- it carries the per-element
+        // `element_gap_ok` check and the trailing-comma-after-a-real-
+        // element check (`[1,]`, #2261) that a hand-rolled loop here
+        // dropped on a first pass (an array with real elements walked with
+        // no gap checking at all, silently accepting `[1,,2]`/`[1,2,]`
+        // nested inside a `paths`/`leaf_paths` walk where `.a[]` on the
+        // same document already raised). Same helper `to_owned_at_depth`'s
+        // array arm effectively inlines by hand; this reuses it instead of
+        // a second hand-written copy.
+        let cursors = elements.collect_cursors_checked()?;
+        if cursors.is_empty() {
+            // #2731: the zero-real-element stray comma (`[,]`) --
+            // `collect_cursors_checked` has no container cursor to check
+            // that shape against (same documented limitation as
+            // `to_owned_at_depth`'s own callers), so this function's own
+            // `cursor` parameter closes it instead, mirroring the object
+            // arm above.
             empty_elements_tail_gap_ok(&elements, cursor)?;
             if leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
             return Ok(());
         }
-        let mut i = 0i64;
-        let mut rest = elements;
-        // #2731: `uncons_cursor` rather than `uncons` -- the same switch
-        // `to_owned_at_depth`'s array arm makes -- purely to have a cursor
-        // to hand the recursive call for its own nested-`{,}`/`[,]` check;
-        // navigation underneath is identical either way.
-        while let Some((elem_cursor, tail)) = rest.uncons_cursor() {
-            current_path.push(OwnedValue::Int(i));
+        for (i, elem_cursor) in cursors.into_iter().enumerate() {
+            current_path.push(OwnedValue::Int(i as i64));
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
@@ -14101,8 +14119,6 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
                 leaves_only,
             )?;
             current_path.pop();
-            i += 1;
-            rest = tail;
         }
     } else if leaves_only {
         paths.push(OwnedValue::Array(current_path.clone()));
@@ -16085,9 +16101,16 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                         // -- must still raise the same way `.b.x` already
                         // does on this exact document (#2594's per-arm
                         // guards never reached this value-domain walk).
-                        Ok(None) => match empty_container_gap_error(&v, Some(&c)) {
-                            Some(e) => GenericResult::Error(e),
-                            None => GenericResult::Owned(OwnedValue::Null),
+                        // `empty_fields_tail_gap_ok` directly against
+                        // `fields` (review) -- not `empty_container_gap_error(&v, ..)`,
+                        // which would re-derive `fields` via a second
+                        // `v.as_object()` call, paying for a YAML alias
+                        // chain's full resolution twice on a miss (this
+                        // function's own doc comment above already warns
+                        // against exactly that).
+                        Ok(None) => match empty_fields_tail_gap_ok(&fields, Some(&c)) {
+                            Ok(()) => GenericResult::Owned(OwnedValue::Null),
+                            Err(e) => GenericResult::Error(e),
                         },
                         Err(e) if suppresses(&e, optional) => GenericResult::None,
                         Err(e) => GenericResult::Error(e),
@@ -16114,10 +16137,12 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                             continue;
                         }
                         // #2731: array twin of the object-key-miss check
-                        // above.
-                        None => match empty_container_gap_error(&v, Some(&c)) {
-                            Some(e) => GenericResult::Error(e),
-                            None => GenericResult::Owned(OwnedValue::Null),
+                        // above, same reason for calling the specific
+                        // helper against `elements` directly rather than
+                        // `empty_container_gap_error(&v, ..)`.
+                        None => match empty_elements_tail_gap_ok(&elements, Some(&c)) {
+                            Ok(()) => GenericResult::Owned(OwnedValue::Null),
+                            Err(e) => GenericResult::Error(e),
                         },
                     };
                 }
