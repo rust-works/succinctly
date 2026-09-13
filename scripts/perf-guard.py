@@ -47,6 +47,18 @@ shape, plus an `arrays` shape (no objects, isolates whether a regression is
 object-specific) and one `yq`-mode query (the shared evaluator's cost is
 otherwise unverified in yq mode at all).
 
+#2655 added a second class the original set missed entirely: every query
+above it reads only, so none exercises `resolve_node`/`resolve_node_sink`
+(`src/jq/eval.rs`) or anything beneath it -- the resolver `del()`/`=`/`|=`/
+`path(...)` and an `as` binding used inside one of those route through. A
+regression confined to that resolver passed this guard at -0.0% no matter
+how large (#2042's own +21-33%, the incident that exposed the gap). The
+`users_del_select`/`users_del_bound_select`/`users_assign_scores`/
+`users_path_walk` rows cover jq-mode path-mode; `users_yq_del_select` covers
+yq-mode writes, which take a different route (`evaluate_yaml_cursor`'s DOM
+path in `src/bin/succinctly/yq_runner.rs`) than the jq-mode rows above and
+that `users_yq_keys_unsorted` (a read) never exercised either.
+
 Fixtures are generated fresh each run (`succinctly json generate --seed
 <fixed>`) rather than checked in, so instruction counts stay meaningful
 without growing the repo -- generation is deterministic per pattern/seed, so
@@ -197,7 +209,12 @@ EPILOG = (
     "(typical small-record) shape, plus an `arrays` shape (no objects, "
     "isolates whether a regression is object-specific) and one `yq`-mode "
     "query (the shared evaluator's cost is otherwise unverified in yq mode "
-    "at all)."
+    "at all). #2655 added path-mode coverage on top of that: del()/=/"
+    "path(...) and an as binding, in both jq mode (four `users_*` rows) and "
+    "yq mode (`users_yq_del_select`, since yq-mode writes take a different "
+    "route than jq-mode ones) -- every row before #2655 read only, so a "
+    "regression confined to the write/path resolver passed at -0.0% no "
+    "matter how large."
 )
 
 
