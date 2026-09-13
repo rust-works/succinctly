@@ -1263,20 +1263,38 @@ answers `["b"]` — and classified the two residuals appended below):
   `[[],[]]` with two writes in jq — its `limit` break is retried by the source's `?//` and the
   retried output lands past the bound — and `[[]]` with one write here. Tracked as
   [#2908](https://github.com/rust-works/succinctly/issues/2908).
-- **`recurse(f)`/`recurse(f; cond)` still collects one node's own `f` in full.**
+- **`recurse(f)`/`recurse(f; cond)` finishes one node's own `f` before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
   `path(limit(1; recurse(if (.|debug) < 3 then .+1 else empty end)))` now runs `debug` zero
   times in both jq and here, where the pre-#2235 collecting version ran it for every node up
-  to `RECURSE_MAX_ITEMS` regardless of the bound. What remains: `f` itself is still resolved
-  for an accepted node via `resolve_against_cow`, not streamed, so a multi-output `f`'s later
-  outputs fire even when only the first is ever consumed — confirmed live,
-  `path(limit(2; recurse((.a|debug), (.b|debug))))` on `{"a":1,"b":2}` writes `debug` for
-  `.a` only in jq (the bound is satisfied by `.a`'s own self-emission before `.b` is ever
-  asked for); both fire here. Same underlying cause as the bullet above — `resolve_against_cow`
-  has no sink form either — narrower in practice since it only over-fires a node's own
-  later `f` outputs, not an entire subtree. Tracked as
-  [#2693](https://github.com/rust-works/succinctly/issues/2693). Bare `..`/`recurse`/
+  to `RECURSE_MAX_ITEMS` regardless of the bound.
+
+  **The *value* evaluators had no such arm at all until
+  [#2693](https://github.com/rust-works/succinctly/issues/2693)**, which is where the cost
+  actually was: neither `eval_each` nor `eval_each_generic` handled the parameterised
+  spellings, so both fell to the collecting route, walked to `RECURSE_MAX_ITEMS`, and ran `f`
+  at every one of those nodes before a bounded consumer could truncate the finished list.
+  `[limit(1; recurse((.a|debug), (.b|debug)))]` on `{"a":{"x":1},"b":{"y":2}}` wrote **20000**
+  `debug` lines — 10000 visited nodes, two `f` outputs each — for a five-node document, where
+  jq writes none. The walk is now one shared `each_recurse_walk` behind both the collecting
+  builtins and the two lazy arms, and emits a node before running `f` on it, as jq's
+  `def r: ., (f | r); r;` does. That also closed a halt leak the short-circuit tests had
+  pinned: `path((0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)` exited 3
+  with `x` on stderr where jq raises a path error, and its mirror wrote a stray `x`; with `f`
+  unevaluated the `halt_error` is never reached at all.
+
+  **What remains** is that `f` still runs to completion at the node the traversal is *at*:
+  jq descends into `f`'s first output's whole subtree before asking `f` for the second, and
+  an explicit stack of materialized nodes cannot suspend a push-driven `f` mid-stream. So a
+  bound overshoots by one node's fan-out (`[limit(2; recurse(.[]?|debug))]` on `[1,[2,[3]]]`
+  writes two `debug` lines where jq writes one — it wrote five before #2693), and unbounded it
+  shows as stderr *ordering* (`[recurse(.[]?|debug)]` interleaves in jq, groups each node's
+  fan-out here). Values are identical in every case. All three walkers share it, path mode
+  included. Tracked as [#2918](https://github.com/rust-works/succinctly/issues/2918), whose
+  own text sets out the fork — bounded native recursion with a fallback, versus a pull-based
+  generator protocol that would close this, #2908 and the path-side half together.
+  Bare `..`/`recurse`/
   `recurse_down`, which predates #2235 and was not part of that migration at all, had the
   same gap one level up (no `f`/`cond` to over-fire, but the same "collects the whole
   tree/queue before a bounded consumer sees the first branch" shape) — closed by
