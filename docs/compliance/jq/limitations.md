@@ -3904,16 +3904,29 @@ nothing ever calls it through a live sink. Actually closing this gap needs a new
 style dispatch arm (mirroring `each_foreach`/`each_foreach_generic`) added to both evaluators
 first, a materially larger change than a plumbing reshape, and out of scope for #2668 itself.
 
-**`path(foreach(...))`'s own INIT is now inconsistent with value-mode `foreach` — filed as #2903.**
-`resolve_foreach` (`src/jq/eval.rs`), the path-mode evaluator reached from `path(foreach(...))` and
-assignment targets, has its own separate fold loop (`FoldRegister`/`drive_fold_source`) and was not
-touched by #2668 — an explicitly anticipated risk in #2668's own triage plan, which checked it does
-not call `foreach_forks` and left it alone on that basis. Before #2668 both evaluators collected
-INIT eagerly and so agreed with each other; #2668 fixed only the value-mode one, so path-mode now
-*disagrees with value-mode* on top of its own pre-existing (unchanged) divergence from jq:
+**~~`path(foreach(...))`'s own INIT is now inconsistent with value-mode `foreach`~~ — closed by
+[#2903](https://github.com/rust-works/succinctly/issues/2903).** `resolve_foreach`
+(`src/jq/eval.rs`), the path-mode evaluator reached from `path(foreach(...))` and assignment
+targets, has its own separate fold loop (`FoldRegister`/`drive_fold_source`) and was not touched
+by #2668 — an explicitly anticipated risk in #2668's own triage plan, which checked it does not
+call `foreach_forks` and left it alone on that basis. Before #2668 both evaluators collected INIT
+eagerly and so agreed with each other; #2668 fixed only the value-mode one, so path-mode
+*disagreed with value-mode* as well as with jq:
 `echo '{"a":1}' | jq -c 'first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))'` writes nothing
-and answers `["a"]`; `succinctly jq` writes `I` first. Confirmed live; pinned in
-`test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`).
+and answers `["a"]`, where `succinctly jq` wrote `I` first.
+
+#2903 resolves INIT through `resolve_node_sink`, running each fork's whole fold inside that sink
+before the next INIT output is asked for. The per-fork body is unchanged — it already lived in a
+closure driven by `drive_fold_source` — so only the *outer* loop moved. **`resolve_reduce` was
+fixed alongside it**: the same loop in the adjacent function, diverging identically
+(`first(path(reduce (1) as $i ((.a, ("I"|stderr)); .)))` wrote `I` too), which #2903's own text did
+not name. Fixing one and not the other would have left the two path-mode folds inconsistent with
+each other — the very complaint #2903 makes about path versus value mode. Pinned in
+`path_mode_fold_resolves_init_by_demand_2903` (`tests/jq_cli_tests.rs`), with the moved rows in
+`test_short_circuit_side_effect_shapes_already_match_jq_820`.
+
+Value-mode `reduce`'s INIT (#2899 above) is untouched and still collects — it needs a native
+`Expr::Reduce` dispatch arm before a stop has anywhere to land, which is a different change.
 
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at

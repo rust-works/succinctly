@@ -43126,6 +43126,150 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     Ok(())
 }
 
+/// #2903: a path-mode fold resolves INIT **by demand** — each fork's whole
+/// fold runs before INIT is asked for the next output.
+///
+/// `resolve_foreach`/`resolve_reduce` collected every INIT fork first, so a
+/// consumer satisfied by an earlier fork still paid for every later one.
+/// #2668 fixed the same thing for *value*-mode `foreach`, but could not
+/// reach these — they have their own fold loop and do not call
+/// `foreach_forks` — which left path-mode disagreeing with value-mode as
+/// well as with jq.
+///
+/// Every row is captured whole from jq 1.7.1, so the side-effect count is
+/// pinned exactly. `reduce` is here alongside `foreach` because it is the
+/// same loop in the adjacent function and diverged identically, though
+/// #2903 names only `foreach`.
+#[test]
+fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
+    for (input, filter, want_out, want_err, want_code) in [
+        // The issue's own row, and its `reduce` twin: jq never reaches
+        // INIT's second fork, so it never writes.
+        (
+            r#"{"a":1}"#,
+            r#"first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"first(path(reduce (1) as $i ((.a, ("I"|stderr)); .)))"#,
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // Every bounded consumer reaches it, not just `first`.
+        (
+            r#"{"a":1}"#,
+            r#"[limit(1; path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))]"#,
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[limit(1; path(reduce (1) as $i ((.a, ("I"|stderr)); .)))]"#,
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[label $o | path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)) | ., break $o]"#,
+            "[[\"a\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"isempty(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))"#,
+            "false\n",
+            "",
+            0,
+        ),
+        // A bound of two takes exactly two forks, so the second fork's own
+        // side effect *does* fire — demand, not suppression.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"[limit(2; path(foreach (1) as $i (((.a|stderr), (.b|stderr)); .; .)))]"#,
+            "[[\"a\"],[\"b\"]]\n",
+            "12",
+            0,
+        ),
+        // A multi-element source with a bound: one fork, one write.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"[first(path(foreach (1,2) as $i (((.a|stderr), (.b|stderr)); .; .)))]"#,
+            "[[\"a\"]]\n",
+            "1",
+            0,
+        ),
+        // Unbounded: every fork, every side effect, unchanged — a deferred
+        // INIT fork must not become a skipped one.
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(foreach (1) as $i ((.a, .b); .; .))]",
+            "[[\"a\"],[\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(reduce (1) as $i ((.a, .b); .))]",
+            "[[\"a\"],[\"b\"]]\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[path(foreach (1) as $i ((.a, ("I"|stderr)); .; .))]"#,
+            "",
+            "Ijq: error (at <stdin>:0): Invalid path expression with result \"I\"\n",
+            5,
+        ),
+        // INIT's own escape still surfaces after the forks it preceded.
+        (
+            r#"{"a":1}"#,
+            r#"[path(foreach (1) as $i ((.a, error("e")); .; .))]"#,
+            "",
+            "jq: error (at <stdin>:0): e\n",
+            5,
+        ),
+        // Value mode was already correct (#2668) and is untouched.
+        (
+            r#"{"a":1}"#,
+            r#"first(foreach (1) as $i ((.a, ("I"|stderr)); .; .))"#,
+            "1\n",
+            "",
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+
+    // #2899, the sibling this does *not* close: value-mode `reduce` has no
+    // demand-forwarding dispatch arm at all, so its INIT is still collected.
+    // jq's first fork errors in UPDATE and it never reaches the second.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"[reduce (1) as $i ((.a, ("I"|stderr)); .a)]"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr, "Ijq: error (at <stdin>:0): Cannot index number with string \"a\"\n",
+        "#2899's residual changed -- jq writes no `I` here; if this closed, move the row up"
+    );
+    Ok(())
+}
+
 /// #2908: `path(f)` is a generator, so a consumer *outside* it can stop `f`.
 ///
 /// Both evaluators collected every path before their consumer saw one, so a
