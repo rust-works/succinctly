@@ -52390,3 +52390,87 @@ fn test_int_arith_within_exact_f64_range_or_already_overflowing_unaffected_2631(
     }
     Ok(())
 }
+
+/// #2608: the new default-compact-mode echo fast path
+/// (`is_canonical_compact_jq_span`, `src/json/light.rs`) must never leak a
+/// non-canonical span verbatim -- every probe here is a case its own doc
+/// comment calls out as something the checker must decline, so `-c .`
+/// still goes through the unchanged re-render path and produces exactly
+/// what real jq does. Every expected value below is captured live against
+/// `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_canonical_compact_echo_declines_non_canonical_spans_2608() -> Result<()> {
+    // A structurally malformed document (#2349's own doubled-comma shape)
+    // must still be rejected at exit 5, not echoed.
+    let (_, code) = run_jq_stdin(".", "[1,,2]", &["-c"])?;
+    assert_eq!(code, 5, "`[1,,2]` must still be exit 5 under `-c .`");
+
+    for (input, want) in [
+        // Duplicate object key: jq's own object model collapses to the
+        // last value, so the raw (both-keys-present) span is never
+        // canonical -- the re-render must still do the collapse.
+        (r#"{"a":1,"a":2}"#, r#"{"a":2}"#),
+        // Exponent notation: jq always reformats to its own canonical
+        // spelling, never an identity echo.
+        ("1e2", "1E+2"),
+        // `A` decodes to 'A', which jq's writer always leaves raw --
+        // the source `\u`-escape spelling itself is never canonical, so
+        // this must decode-and-re-encode, not echo the escape verbatim.
+        (r#""A""#, r#""A""#),
+    ] {
+        let (output, code) = run_jq_stdin(".", input, &["-c"])?;
+        assert_eq!(code, 0, "input {input:?}");
+        assert_eq!(output.trim(), want, "input {input:?}");
+    }
+
+    // A raw, unescaped DEL byte (0x7f) inside a string: jq's writer
+    // always escapes it as the 6-byte sequence backslash, u, 0, 0, 7, f
+    // -- so this must never be echoed with the raw byte still present.
+    // `want_del` is built with `format!` rather than a literal
+    // containing that escape sequence as text -- see
+    // `json_string_token`'s doc comment in `src/json/light.rs` for why
+    // a hand-typed literal backslash-escape sequence is the wrong way
+    // to author this (#2608 review).
+    let del_input = "\"\x7f\"";
+    let want_del = format!("\"{}u007f\"", '\\');
+    let (output, code) = run_jq_stdin(".", del_input, &["-c"])?;
+    assert_eq!(code, 0, "raw DEL byte input");
+    assert_eq!(output.trim(), want_del, "raw DEL byte input");
+
+    Ok(())
+}
+
+/// #2608's own explicit warning: `-a`/`--ascii-output` must never reach the
+/// new echo path, because the checker's notion of "canonical" is pinned to
+/// [`write_json_body_jq`](succinctly::jq::escape::write_json_body_jq) (raw
+/// non-ASCII content), not
+/// [`write_json_body_jq_ascii`](succinctly::jq::escape::write_json_body_jq_ascii)
+/// (which re-escapes every non-ASCII character as `\uXXXX`). This is
+/// guaranteed structurally, not by a runtime flag check: `JsonCursor::
+/// stream_json` has no ascii parameter at all, and every `-a` call site in
+/// `src/bin/succinctly/jq_runner.rs` routes around it entirely (the M2
+/// fast path's own gate excludes `ascii_output` before ever reaching
+/// `stream_json`; the general fallback materializes and uses
+/// `format_json`'s own ascii handling instead) -- but this test pins the
+/// externally observable behavior that structural guarantee is supposed to
+/// produce: a document with non-ASCII content still gets `\uXXXX`-escaped
+/// under `-a`, on both an already-compact-looking document and one that
+/// needs no other reformatting at all.
+#[test]
+fn test_ascii_output_still_escapes_through_new_echo_gate_2608() -> Result<()> {
+    for (input, want) in [
+        // Multi-byte UTF-8 (CJK + Latin-1 accented) in an otherwise
+        // already-canonical-looking compact object.
+        (
+            "{\"name\":\"\u{65e5}\u{672c}\u{8a9e} caf\u{e9}\"}",
+            "{\"name\":\"\\u65e5\\u672c\\u8a9e caf\\u00e9\"}",
+        ),
+        // A bare non-ASCII string value.
+        ("\"\u{1f389}\"", "\"\\ud83c\\udf89\""),
+    ] {
+        let (output, code) = run_jq_stdin(".", input, &["-ac"])?;
+        assert_eq!(code, 0, "input {input:?}");
+        assert_eq!(output.trim(), want, "input {input:?}");
+    }
+    Ok(())
+}
