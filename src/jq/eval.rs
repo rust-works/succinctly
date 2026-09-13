@@ -33989,6 +33989,39 @@ fn resolve_target_for_pair<'a, S: EvalSemantics>(
     }
 }
 
+/// Drive `E[K]`'s key generator (`K`), delivering one key at a time.
+///
+/// [`drive_slice_bound`]'s sibling for the index resolver, and the same
+/// #2267 rule: jq's `K as $k | E | .[$k]` pulls one `$k`, reaches `E` for
+/// it, and only then asks for the next, so a caller that resolves `target`
+/// per key has to be handed them one at a time rather than a drained `Vec`.
+///
+/// Unlike the slice bound, this streams in **both** modes. The yq carve-out
+/// there exists for #2351's Gap 1 rule -- discard every value the generator
+/// produced once it escapes -- and that rule is deliberately scoped to the
+/// slice bound's own call site, not to `eval_owned_multi_keep_partial`
+/// itself: that helper's other callers, this key among them, "must keep
+/// their own prefix in yq mode too" (see [`drive_slice_bound`]'s doc
+/// comment). With nothing to decide after the fact, there is nothing that
+/// needs the whole list first.
+///
+/// Keeps the generator's own partial prefix on escape (#896): keys already
+/// delivered stay delivered, and the escape rides back as the return value
+/// for the caller to rank against `target`'s (which outranks it).
+fn drive_index_key<S: EvalSemantics>(
+    key: &Expr,
+    value: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<EvalEscape> {
+    match eval_each_owned::<S>(key, value, false, sink) {
+        Flow::Exhausted => None,
+        // `pending` is dropped, with every other Stage-2 consumer (see
+        // [`Flow::Stopped`]): the caller stops only because `target` already
+        // escaped, and that escape outranks this generator's own.
+        Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(EvalEscape::from(control)),
+    }
+}
 /// Resolve `E[K]` in path context, with or without a trailing `?`.
 ///
 /// The two spellings differ in one thing only: what happens when the resolved
@@ -34022,10 +34055,35 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // (the branch for the already-produced `"a"`) before raising `x`. A
     // bare escape (zero prior `key` outputs) still propagates with an empty
     // prefix, same as every other bare-escape site in this file.
-    let (keys, key_escape) = eval_owned_multi_keep_partial::<S>(key, value);
-    if keys.is_empty() {
-        return path_result(Vec::new(), key_escape);
-    }
+    // #2267: `K` and `E` are driven as two nested generators, in the shape
+    // jq's own `K as $k | E | .[$k]` desugaring names -- not as an eagerly
+    // drained `keys` Vec with `E` resolved inside it. Each key is consumed
+    // one at a time, so a pair's `E` is reached before the *next* `k` is
+    // ever asked for. `resolve_slice_expr`'s sibling gap was closed the
+    // same way earlier in this issue; confirmed live against jq 1.7.1
+    // (stderr only):
+    //
+    // ```console
+    // $ echo '{"a":1,"b":2}' | jq -c \
+    //     'path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))])' 1>/dev/null
+    //   ka, E, kb, E          <- jq; was ka, kb, E, E here
+    // ```
+    //
+    // And the stopping half: once a key's own `E` escapes, jq never
+    // resumes the key generator, so a later key is not merely skipped but
+    // never evaluated -- `path((select((true,error("terr"))))
+    // [("a"|debug("ka")),("b"|debug("kb"))])` prints `ka` and then the
+    // error, where `kb` printed here before.
+    //
+    // Only the ordering moves: every one of these shapes produced the same
+    // path outputs, in the same order, before and after.
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+    // The escape that aborts the whole call, raised once the driver has
+    // unwound -- `target`'s own, or the #843 refusal below. Neither can
+    // travel out through the sink, whose answer is a [`Demand`].
+    let mut target_escape: Option<EvalEscape> = None;
+    let mut first_key = true;
+
     // #843: `target` is a no-op read of the untracked value itself, so the
     // key computed above is the first real navigation attempted against it
     // — see `is_passthrough_target`'s doc comment. This has to run *before*
@@ -34034,82 +34092,58 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // raise `#530`'s classic "with result" message (via `resolve_leaf`'s
     // own untracked-`Identity` handling) before this function ever gets to
     // see the actual key, which is the wrong message for `.[.k]`.
-    if !trackable && is_passthrough_target(target) {
-        return Err((
-            Vec::new(),
-            EvalError::invalid_path_expression_near_access(&keys[0], value).into(),
-        ));
-    }
-
-    // jq compiles `E[K]` as `K as $k | E | .[$k]` — key outer, target
-    // inner. `target` (`E`) is genuinely re-evaluated once per key here
-    // (#2139, mirroring #2032's identical fix for the value-mode sibling,
-    // `eval_index_expr`): a side effect inside `E` (`stderr`, `input`, ...)
-    // fires once per key, not once total, and each key's own output count
-    // is independent -- confirmed live against jq 1.7.1: `[(.[] | stderr)
-    // [("a","b")]?]` on `[1,2]` writes `1212` to stderr (target's own
-    // `1, 2` stream evaluated twice, once per key), where the pre-#2139
-    // once-for-all-keys evaluation only wrote `12`.
-    //
-    // The two structural "is this target trackable" checks (#843/#986)
-    // run on *every* key's own freshly-resolved `branches`, not just the
-    // first (review finding): `target`'s trackability is NOT purely a
-    // function of its own static AST shape whenever that AST contains a
-    // runtime branch (`if`/`select`/`try`-`catch`) whose taken arm can
-    // differ per call -- and it can differ per call precisely because
-    // `target` is now genuinely re-evaluated per key (the very thing this
-    // fix exists to do), so a stateful condition (`input`, ...) can steer
-    // an earlier key into a trackable arm and a later key into an
-    // untracked one. Checking only the first key's resolution and
-    // latching a "trackable, don't check again" verdict let a later key's
-    // genuinely untracked branch through unchecked -- confirmed live as a
-    // real data-corruption bug in this fix's own first draft: an `if`
-    // target reading a fresh `input` per key, trackable on key 1
-    // (`getpath(...)`) and untracked on key 2 (`(1|{"c":10})`), wrote
-    // straight through key 2's untracked branch into the live document
-    // instead of raising jq's "Invalid path expression" the way real jq
-    // does. Re-running the check every key costs nothing extra to
-    // *resolve* -- `branches` is already recomputed fresh each iteration
-    // regardless -- only a few more comparisons.
-    let mut target_escape: Option<EvalEscape> = None;
-    let mut out: Vec<PathBranch<'a>> = Vec::new();
-
-    // The shared exit every escape arm below funnels through, so folding
-    // the running `out` in as a `Partial`-equivalent prefix can't drift
-    // between arms -- mirrors #2245's identical `escape!` macro in
-    // `resolve_slice_expr`.
-    macro_rules! escape {
-        ($control:expr) => {
-            return Err((out, $control))
-        };
-    }
-
-    for k in &keys {
-        // Keeps `target`'s own partial prefix too, not just `key`'s (#896
-        // review): `target` can itself be one of #896's 4 fixed sites
-        // (`select`, `if`, `getpath`, a nested computed index), so its own
-        // `Err` can carry a non-empty prefix that still needs indexing by
-        // this key rather than being returned unindexed. Confirmed against
-        // jq 1.7.1: `path(select((true, error("t")))[("x", error("k"))])`
-        // on `{"a":1,"x":9}` prints `["x"]` (the already-produced `select`
-        // branch, indexed by `"x"`) before raising `t` — `key`'s own
-        // deferred escape (`k`) is never reached, since jq's `K as $k | E
-        // | .[$k]` compilation evaluates `E`'s whole generator, escape
-        // included, before ever asking `K`'s generator for its next value
-        // — so `target_escape` takes priority over `key_escape` below.
-        // Ambient snapshot for `target`'s own resolution is irrelevant here
-        // — `E[K]` genuinely indexes into whatever `E` resolves to, and
-        // every use of `branches` below reads only `.value`/`.trackable`,
-        // never `.snapshot` (this function's own output is unconditionally
-        // `PathBranch::new`'s hardcoded `false`, since indexing always
-        // breaks the frozen-pointer identity regardless of ambient) — so
-        // `false` here is provably unobservable, not a real decision
-        // (#1591).
-        // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
-        // plus this pair's own `out` reservation, one definition shared with
-        // the sibling resolver -- see its doc comment for the kept-partial-
-        // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
-        // carries, which used to be stated twice here and there.
+    // Keeps `target`'s own partial prefix too, not just `key`'s (#896
+    // review): `target` can itself be one of #896's 4 fixed sites
+    // (`select`, `if`, `getpath`, a nested computed index), so its own
+    // `Err` can carry a non-empty prefix that still needs indexing by
+    // this key rather than being returned unindexed. Confirmed against
+    // jq 1.7.1: `path(select((true, error("t")))[("x", error("k"))])`
+    // on `{"a":1,"x":9}` prints `["x"]` (the already-produced `select`
+    // branch, indexed by `"x"`) before raising `t` — `key`'s own
+    // deferred escape (`k`) is never reached, since jq's `K as $k | E
+    // | .[$k]` compilation evaluates `E`'s whole generator, escape
+    // included, before ever asking `K`'s generator for its next value
+    // — so `target_escape` takes priority over `key_escape` below.
+    // Ambient snapshot for `target`'s own resolution is irrelevant here
+    // — `E[K]` genuinely indexes into whatever `E` resolves to, and
+    // every use of `branches` below reads only `.value`/`.trackable`,
+    // never `.snapshot` (this function's own output is unconditionally
+    // `PathBranch::new`'s hardcoded `false`, since indexing always
+    // breaks the frozen-pointer identity regardless of ambient) — so
+    // `false` here is provably unobservable, not a real decision
+    // (#1591).
+    // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
+    // plus this pair's own `out` reservation, one definition shared with
+    // the sibling resolver -- see its doc comment for the kept-partial-
+    // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
+    // carries, which used to be stated twice here and there.
+    let key_escape = drive_index_key::<S>(key, value, &mut |k| {
+        // The shared exit every escape arm below funnels through, so parking
+        // the escape and stopping the driver can't drift between arms --
+        // `out` is folded in as the `Partial`-equivalent prefix by
+        // `path_result` at the end, exactly as this macro's pre-#2267 form
+        // (`return Err((out, ..))`) did at each site.
+        macro_rules! escape {
+            ($control:expr) => {{
+                target_escape = Some($control);
+                return Demand::Stop;
+            }};
+        }
+        // #843 runs on the first key's iteration rather than ahead of the
+        // loop: it needs a key to name in its message, and with the
+        // generator driven one value at a time the first delivered key is
+        // the earliest point one exists. `out` is necessarily still empty
+        // here, so the empty prefix the pre-#2267 `Err((Vec::new(), ..))`
+        // returned is preserved exactly.
+        if first_key {
+            first_key = false;
+            if !trackable && is_passthrough_target(target) {
+                target_escape =
+                    Some(EvalError::invalid_path_expression_near_access(&k, value).into());
+                return Demand::Stop;
+            }
+        }
+        let k = &k;
         let (branches, this_escape) =
             resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
 
@@ -34235,7 +34269,6 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             // Untracked targets were rejected above.
             out.push(PathBranch::new(path, next_value, true));
         }
-
         // jq compiles `E[K]` as `K as $k | E | .[$k]` — target inner, key
         // outer — so when `target` itself escapes, that escape fires
         // while jq is still inside *this* key's iteration; the key
@@ -34246,9 +34279,10 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // jq's generator never reaches.
         if let Some(control) = this_escape {
             target_escape = Some(control);
-            break;
+            return Demand::Stop;
         }
-    }
+        Demand::Continue
+    });
     // `target_escape` first: see the comment above for why jq's evaluation
     // order surfaces it ahead of `key_escape`.
     path_result(out, target_escape.or(key_escape))

@@ -17179,6 +17179,89 @@ fn test_resolve_slice_expr_end_halt_lands_after_earlier_pair_2267() -> Result<()
     Ok(())
 }
 
+/// #2267: `resolve_index_expr` drained `K` (a computed key's generator) in
+/// full before reaching `E` (`target`) for any key -- the sibling of the
+/// slice-bound gap fixed just above, and the one `limitations.md` already
+/// attributed to this issue. jq compiles `E[K]` as `K as $k | E | .[$k]`, so
+/// `E` runs before the next `k` is asked for. Captured live from jq 1.7.1;
+/// stdout is asserted too, because it was already correct -- the divergence
+/// was only ever in when the target ran.
+#[test]
+fn test_resolve_index_expr_interleaves_key_with_target_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))])"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n[\"b\"]\n");
+    // jq 1.7.1: ka, E, kb, E -- not the pre-#2267 ka, kb, E, E.
+    assert_eq!(
+        stderr,
+        "[\"DEBUG:\",\"ka\"]\n[\"DEBUG:\",\"E\"]\n[\"DEBUG:\",\"kb\"]\n[\"DEBUG:\",\"E\"]\n"
+    );
+
+    Ok(())
+}
+
+/// #2267: the stopping half for `E[K]`, and the reason `drive_index_key`'s
+/// sink answers with [`Demand`] rather than draining. A key's own `E`
+/// escaping means jq never resumes the key generator, so a later key is not
+/// merely skipped -- it is never evaluated, and its side effect never fires.
+#[test]
+fn test_resolve_index_expr_target_escape_stops_key_generator_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((select((true,error("terr"))))[("a"|debug("ka")),("b"|debug("kb"))])"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(
+        stderr.contains("\"ka\"") && !stderr.contains("\"kb\""),
+        "`kb` must never be evaluated: stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("terr"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2267 (must-not-change): the write paths whose target must still be
+/// resolved exactly once per path -- not once per (RHS output x path).
+///
+/// This is the pin for a fix that was tried and backed out. Re-resolving an
+/// assignment's path per right-hand-side output does match jq's
+/// `_assign(paths; $value)` *when every output is consumed*, but jq's RHS
+/// generator is lazy and this one is not, so under `first`/`limit`/`break`
+/// the re-resolution fires target side effects for outputs jq never
+/// evaluates -- and with `input` in the path it changes stdout. The two
+/// halves are one mechanism; see the issue.
+#[test]
+fn test_write_paths_resolve_once_per_path_2267() -> Result<()> {
+    for (filter, input) in [
+        (r#"(.|stderr)[("a","b")] |= . + 1"#, r#"{"a":1,"b":2}"#),
+        (r#"del((.|stderr)[("a","b")])"#, r#"{"a":1,"b":2}"#),
+        (r#"[path((.|stderr)[("a","b")])]"#, r#"{"a":1,"b":2}"#),
+        (r#"first((.|stderr)["a"] = (1,2))"#, "{}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert!(!stdout.is_empty(), "{filter}");
+        let fired = stderr.matches(input).count();
+        let expected = if filter.starts_with("first(") { 1 } else { 2 };
+        assert_eq!(
+            fired, expected,
+            "{filter}: target fired {fired} times, jq 1.7.1 fires {expected}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
