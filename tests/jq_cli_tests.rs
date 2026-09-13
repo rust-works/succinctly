@@ -50974,8 +50974,9 @@ fn test_wrong_arity_single_arg_resolution_is_unchanged_2749() -> Result<()> {
 /// jq rejects **all four** — it cannot parse the document at all — so this is
 /// the pre-existing #2692 divergence being applied consistently, not a new
 /// one, and it is the reason the switch is not purely a stderr-ordering
-/// change. The open question of whether truthiness-only reads should
-/// validate at all is #2701; this test pins only that the routes agree.
+/// change. Whether truthiness-only reads should validate at all is settled
+/// by #2692's own ADR-0018 instance (#2701's decision); this test pins only
+/// that the routes agree.
 #[test]
 fn test_boolean_routes_agree_on_a_malformed_document_2669() -> Result<()> {
     for doc in [r#"{"a":1,}"#, "{,}", "[1,]", r#"{"a":1,,"b":2}"#] {

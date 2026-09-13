@@ -2808,11 +2808,12 @@ expression answered differently depending only on which consumer wrapped it, mea
 Three of the four already accepted, so #2669's switch to the lazy strategy moved the fourth
 to join them rather than the reverse — the direction #2692 chose. Real jq rejects all four
 (it cannot parse the document at all), so this is the existing #2692 divergence applied
-consistently, not a new one. Whether a truthiness-only read should validate at all remains
-open as [#2701](https://github.com/rust-works/succinctly/issues/2701); #2669 does not
-settle that, it only removes the route-dependence. A route that genuinely reads a member
-(`.a and true`) still raises. Pinned by
-`test_boolean_routes_agree_on_a_malformed_document_2669`.
+consistently, not a new one. Whether a truthiness-only read should validate at all is
+settled by #2692's own ADR-0018 instance above ("a filter validates only what it
+materializes" — truthiness is not a read that can meet a malformed byte, so the line
+belongs there and has no remainder): #2669 only removed the route-dependence, it did not
+newly decide this. A route that genuinely reads a member (`.a and true`) still raises.
+Pinned by `test_boolean_routes_agree_on_a_malformed_document_2669`.
 
 ## Regex flags `l` and `n`
 
