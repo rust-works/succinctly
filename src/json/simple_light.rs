@@ -380,11 +380,14 @@ fn find_string_end(json: &[u8], start: usize) -> usize {
 ///   character-class-limited to `[0-9.eE+-]`, backing `StandardJson`'s
 ///   nested-value materialization (a malformed nested number degrades to
 ///   `null` downstream instead of erroring the whole document).
-/// - `src/bin/succinctly/jq_runner.rs`'s private `find_number_end` --
-///   structured optional frac/exp, but lenient on a dangling exponent
-///   marker, purpose-built for `--argjson`'s leading-zero repair.
 ///
-/// This one is the *most* permissive of the four: same greedy character
+/// #1218's survey listed a fourth -- `jq_runner.rs`'s own `find_number_end`,
+/// structured optional frac/exp but lenient on a dangling exponent marker,
+/// purpose-built for `--argjson`'s leading-zero repair. #2052 replaced that
+/// repair pass with a leniency mode on [`crate::json::validate`] and deleted
+/// the scanner with it.
+///
+/// This one is the *most* permissive of the three: same greedy character
 /// class as `nested_number_span` (any `[0-9.eE+-]` byte, no grammar
 /// validation at all -- a malformed shape like `1.2.3` or a dangling `5e`
 /// still consumes as one span), backing the separate, simpler

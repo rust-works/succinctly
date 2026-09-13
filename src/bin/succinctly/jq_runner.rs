@@ -3424,9 +3424,9 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 ///
 /// It *does* fall back to `find_json_values` on a `serde_json` failure,
 /// though (#1243): real jq's own number parser tolerates a leading zero
-/// (`007`) that strict JSON doesn't (#1094), and unlike `parse_json_value`'s
-/// own `--argjson` retry, there's no cheap single-string
-/// `normalize_leading_zero_numbers` fix here -- this function also backs
+/// (`007`) that strict JSON doesn't (#1094), and unlike `parse_json_value`,
+/// which since #2052 states that leniency directly in
+/// `validate::validate_jq_lenient`'s accept-set, this function also backs
 /// plain `--slurp` on the crate's own *primary* document-input path, where
 /// stripping leading zeros from a re-validated copy but still needing to
 /// materialize spans from the *original* text hits the same
@@ -3740,8 +3740,10 @@ fn remap_ends_to_locations(
 ///
 /// Validates via the crate's own zero-allocation RFC 8259 grammar
 /// validator (`json::validate::validate`, already used by `--validate`/
-/// `json validate`) rather than `validate_and_materialize_json`'s
-/// `serde_json::Value`-tree-based check (#1267) -- `--seq` is a streaming,
+/// `json validate`) rather than the `serde_json::Value`-tree-based check
+/// `--argjson` used to run (#1267; that gate is gone as of #2052, which
+/// moved every one of these call sites onto this same validator) --
+/// `--seq` is a streaming,
 /// record-oriented format, so a discarded parse tree's allocation cost is
 /// paid once per record rather than a bounded number of times per run the
 /// way `--argjson`/`--jsonargs` pay it. Measured (500k-record stream,
@@ -3758,12 +3760,12 @@ fn remap_ends_to_locations(
 /// rejection, unlike `serde_json::Value` -- so a magnitude-overflowing
 /// literal (`1e400`) that used to silently drop as an "unparseable" record
 /// now materializes correctly (`1E+400`, matching real jq's own primary-
-/// document-input behavior, live-verified) instead. `validate_json_str`
-/// (used by `--argjson` and this function's own leading-zero retry below)
-/// keeps its `serde_json::Value`-based magnitude rejection unchanged --
-/// this fix is scoped to `parse_json_seq`'s own hot path only; see #1267's
-/// own text for why extending it to the shared `--argjson` helper too
-/// isn't attempted here (that path's error-message text is user-visible
+/// document-input behavior, live-verified) instead. #1267 scoped that to
+/// this hot path only, leaving `--argjson`'s own `serde_json::Value`
+/// magnitude rejection in place; #2052 has since removed that gate too, so
+/// jq mode now answers `1E+400` on every path (see `parse_json_value`).
+/// The paragraph below records why #1267 stopped where it did (the path's
+/// error-message text is user-visible
 /// and untouched by this issue).
 ///
 /// Also retries a failed segment with its leading zeros stripped before
@@ -3904,8 +3906,8 @@ fn seq_pending_token_is_terminated(
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
 /// same leading-zero form (`007e5`) `--seq` has accepted since #1243, the
 /// same lone-low-surrogate escape (`\uDC00`-`\uDFFF`) `--argjson` accepts
-/// since #2012 (code review: `validate::validate` -- strict RFC 8259 --
-/// and `validate_json_str` -- `serde_json` -- both reject a lone low
+/// since #2012 (code review: strict RFC 8259 validation -- `validate::validate`
+/// then, `serde_json` at the `--argjson` gate of the day -- rejects a lone low
 /// surrogate, so without this, a `--seq` record real jq accepts
 /// [confirmed live: `printf '\x1e"\udc00"\n' | jq --seq -c '.'` =>
 /// `"�"`, exit 0] silently vanished instead, the exact leniency gap
@@ -5595,8 +5597,9 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
 /// designed guard rather than an unrelated library's incidental default.
 ///
 /// #2295: used by every call site in this file that parses genuinely
-/// external text -- `validate_and_materialize_json` and `parse_json_value`'s
-/// leading-zero/low-surrogate retry (`--argjson`/`--jsonargs`),
+/// external text -- `parse_json_value` (`--argjson`/`--jsonargs`, which
+/// since #2052 validates through `validate::validate_jq_lenient` and calls
+/// this once, with no retry),
 /// `parse_json_stream_strict` (the primary `--slurp`/`--slurpfile`
 /// document-input path), and the `--seq` per-record materializer. Before
 /// #2295 only `parse_json_stream`'s `find_json_values` fallback used this;

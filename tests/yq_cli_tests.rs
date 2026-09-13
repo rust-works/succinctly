@@ -9999,6 +9999,15 @@ fn test_argjson_materialization_is_unchanged_by_2052() -> Result<()> {
         ("99999999999999999", "99999999999999999"),
         ("0099999999999999999999999", "1e+23"),
         ("123", "123"),
+        // Two spellings the serde materializer rendered differently, both
+        // now agreeing with this crate's own decoder. `-0` was `-0.0` and
+        // is `0`, which is what `-p json` already answered for the same
+        // literal; `1.0e50` was `9.999999999999999e+49` -- a 1-ULP artifact
+        // of `serde_json`'s own pow10 path -- and is now the exact `1e+50`.
+        ("-0", "0"),
+        ("-00", "0"),
+        ("1.0e50", "1e+50"),
+        ("1.e50", "1e+50"),
     ] {
         let (output, code) =
             run_yq_stdin("$x", "a: 1", &["--argjson", "x", value, "-o=json", "-I=0"])?;
@@ -10016,12 +10025,16 @@ fn test_argjson_materialization_is_unchanged_by_2052() -> Result<()> {
 /// with `-p json` refuses them too (#2262/#2781), so the guarantee survived
 /// the swap.
 ///
-/// `1e400` is the one deliberate change: it was `invalid JSON: 1e400`
-/// (`serde_json`'s "number out of range") and is now `.inf` -- the same
-/// value yq already answers for an overflow it computes itself
-/// (`--argjson x 1e308 '$x * 10'`), and the counterpart of jq mode's own
-/// new answer for the same input (`1E+400`, matching jq 1.7.1). Recorded in
-/// `docs/compliance/yq/limitations.md`.
+/// A magnitude-overflowing literal stays rejected, and that is where the two
+/// modes deliberately part company (review of #2880). jq 1.7.1 accepts
+/// `1e400` as `1E+400`, so `succinctly jq` now does too; real yq's own JSON
+/// input path refuses it (`printf '{"a":1e400}' | yq -p json '.a'` is
+/// `strconv.ParseFloat: parsing "1e400": value out of range`, v4.53.3), and
+/// yq mode has nowhere to put an infinity -- YAML output would say `.inf`,
+/// which real yq itself cannot read back, and `-o=json` would print a silent
+/// `null`, the exact outcome #1095 added the serde gate to prevent. The
+/// nested rows matter because the check runs over the materialized value
+/// rather than the top-level literal.
 #[test]
 fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
     for value in [
@@ -10040,11 +10053,28 @@ fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
         assert_eq!(output, "", "--argjson {value}");
     }
 
-    for (value, expected) in [("1e400", ".inf"), ("-1e400", "-.inf")] {
-        let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", value])?;
-        assert_eq!(code, 0, "--argjson {value}: {output:?}");
-        assert_eq!(output.trim(), expected, "--argjson {value}");
+    for value in [
+        "1e400",
+        "-1e400",
+        "1e400000000000",
+        "[1e400]",
+        r#"{"a":1e400}"#,
+    ] {
+        for extra in [
+            vec!["--argjson", "x", value],
+            vec!["--argjson", "x", value, "-o=json"],
+        ] {
+            let (output, code) = run_yq_stdin("$x", "a: 1", &extra)?;
+            assert_ne!(code, 0, "overflow {value} must be rejected: {output:?}");
+            assert_eq!(output, "", "overflow {value}");
+        }
     }
+
+    // The largest representable magnitude is still accepted -- the rule is
+    // "does not fit in an `f64`", not "has a big exponent".
+    let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", "1e308", "-o=json"])?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(output.trim(), "1e+308");
     Ok(())
 }
 

@@ -654,14 +654,6 @@ impl<'a> Validator<'a> {
                     reason: "expected digit after decimal point",
                 }));
             }
-        } else if integer_digits == 0 {
-            // Lenient mode entered on a `.` that turned out not to be one:
-            // unreachable today (the arm above only matches `.`), kept so a
-            // future relaxation of the integer part cannot silently admit a
-            // number with no digits at all.
-            return Err(self.error(ValidationErrorKind::InvalidNumber {
-                reason: "expected digit after minus sign",
-            }));
         }
 
         // Optional exponent
@@ -945,12 +937,13 @@ pub fn is_valid_number(bytes: &[u8]) -> bool {
 /// `0`/`0.x`-style integer part RFC 8259 already accepts unchanged. An
 /// all-zero run (`00`, `-000`) strips down to a single `0`, not empty.
 ///
-/// Deliberately scoped to one token, unlike
-/// `normalize_leading_zero_numbers` (`src/bin/succinctly/jq_runner.rs`,
-/// #1094) which scans a whole raw JSON *string* while tracking
-/// string-literal context to find every number token inside it -- both
-/// of this function's callers already receive one isolated span, so
-/// neither needs that machinery.
+/// Deliberately scoped to one token. It was written as the narrow
+/// counterpart of `normalize_leading_zero_numbers`
+/// (`src/bin/succinctly/jq_runner.rs`, #1094), which scanned a whole raw
+/// JSON *string* while tracking string-literal context to find every number
+/// token inside it; #2052 removed that normalizer in favour of
+/// [`validate_jq_lenient`], and both of this function's own callers already
+/// receive one isolated span, so neither ever needed that machinery.
 #[must_use]
 pub fn strip_redundant_leading_zeros(bytes: &[u8]) -> Option<Vec<u8>> {
     let (sign, rest) = match bytes.first() {

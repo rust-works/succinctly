@@ -5491,6 +5491,10 @@ serde gate closed a divergence rather than opening one. `+1`, `nan`/`NaN` and
 tracked as [#2877](https://github.com/rust-works/succinctly/issues/2877): the decoder cannot
 represent them yet, and admitting a spelling it then refuses is the #1247 shape.
 
+`succinctly yq`'s own `--argjson` keeps the rejection, per ADR-0018 rule 2 -- real yq's JSON
+input path refuses an overflowing literal as well, and yq mode has nowhere to put an
+infinity. See the yq limitations doc for that half.
+
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 
 `foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward
