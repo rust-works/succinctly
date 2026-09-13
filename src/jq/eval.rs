@@ -37644,7 +37644,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // halting. The source is handed to the shared core as a closure so that
     // "INIT produced nothing" can short-circuit it there, once, for every
     // caller (#106's one-definition rule) -- see
-    // [`eval_reduce_with_values`]. `path()`'s own resolver already ordered
+    // [`reduce_forks`]. `path()`'s own resolver already ordered
     // the two this way (#2388).
     //
     // #1902/#1934: `stream_outputs` (to_owned/promote_borrowed,
@@ -40023,7 +40023,6 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
 /// The INIT fan-out loop stays outer, so the source is driven afresh per
 /// fork -- see [`foreach_forks`], which owns that loop and the reasons it
 /// re-drives rather than replays a recording.
-#[allow(clippy::too_many_arguments)]
 /// [`eval_each`]'s `reduce` arm (#2899) -- [`each_foreach`]'s twin over
 /// [`reduce_forks`], with the same INIT-then-source drive pair and the same
 /// unbounded-stream fallback.
@@ -40053,6 +40052,7 @@ fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's own ambient-threading list
 fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     patterns: &[Pattern],
@@ -90888,7 +90888,7 @@ mod tests {
     #[test]
     fn test_2079_path_reduce_ordinary_linear_fold_over_10001_elements_succeeds() {
         // #2079: `resolve_reduce` (path-mode) has its own separate
-        // budget-charging loop from `eval_reduce_with_values` (value
+        // budget-charging loop from `reduce_forks` (value
         // mode), so the fix needs its own coverage here too. UPDATE is
         // `.` (identity) so the accumulator stays trackable throughout —
         // only the sheer element count is under test, previously capped

@@ -9539,7 +9539,7 @@ fn test_negative_index_lookup_resolves_element_2568() -> Result<()> {
 /// `key`/`parent`/`file_index` against the caller's own ambient position,
 /// mirroring `Expr::Limit`'s own hybrid dispatch above -- `input`/`INIT`
 /// route through the path-context evaluator only when either needs it,
-/// then feed `eval_reduce_with_values`/`foreach_forks` (the
+/// then feed `reduce_forks`/`foreach_forks` (the
 /// OwnedValue-domain core shared with each function's ordinary,
 /// cursor-sourced entry point) exactly as before. `UPDATE`/`EXTRACT` are
 /// deliberately unchanged: both evaluate against the accumulator, a
@@ -43123,6 +43123,161 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "[\"u\"]\n2\n");
+    Ok(())
+}
+
+/// #2899: `reduce` is demand-forwarding — its INIT is driven one fork at a
+/// time, and each fork drives its own source.
+///
+/// `reduce` had no lazy dispatch arm in either evaluator, so every evaluation
+/// reached the collecting `eval_single` path and a wrapping consumer drained
+/// an already-finished result. Its stop had nowhere live to land.
+///
+/// Every row is captured whole from jq 1.7.1, so the side-effect count is
+/// pinned exactly.
+#[test]
+fn reduce_is_demand_forwarding_2899() -> Result<()> {
+    let g = "1 as $x ?// $y | 1";
+    for (input, filter, want_out, want_err, want_code) in [
+        // A `?//` in INIT: the consumer's stop now reaches it, so the
+        // alternative is retried and the whole reduce runs twice, as in jq.
+        (
+            "null",
+            format!("[first(reduce (1) as $v (({g}); . + 1))]"),
+            "[2,2]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            format!("[isempty(reduce (1) as $v (({g}); . + 1))]"),
+            "[false,false]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            format!("[limit(1; reduce (1) as $v (({g}); . + 1))]"),
+            "[2,2]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            format!("[label $o | reduce (1) as $v (({g}); . + 1) | ., break $o]"),
+            "[2,2]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // The same `?//` in UPDATE was already correct (#2668 covered it by
+        // sharing `fold_step_each`) and is unchanged.
+        (
+            "null",
+            format!("[first(reduce (1) as $v (0; . + ({g})))]"),
+            "[1]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // The source is re-driven once per INIT fork, which #2899 did not
+        // report: the collecting version pulled it once and shared the
+        // values, so these wrote `s`/`ss` where jq writes `ss`/`sss`.
+        (
+            "null",
+            r#"[reduce ("s"|stderr) as $x ((0,1); .)]"#.to_string(),
+            "[0,1]\n".to_string(),
+            "ss".to_string(),
+            0,
+        ),
+        (
+            "null",
+            r#"[reduce ("s"|stderr) as $x ((0,1,2); .)]"#.to_string(),
+            "[0,1,2]\n".to_string(),
+            "sss".to_string(),
+            0,
+        ),
+        // A fold whose INIT errors on a later fork: the earlier fork's own
+        // side effect is not re-run, and jq never reaches the later one.
+        (
+            r#"{"a":1}"#,
+            r#"[reduce (1) as $i ((.a, ("I"|stderr)); .a)]"#.to_string(),
+            String::new(),
+            "jq: error (at <stdin>:0): Cannot index number with string \"a\"\n".to_string(),
+            5,
+        ),
+        // Everything the collecting core already got right, unchanged: one
+        // result per INIT fork, #2440's INIT-before-source ordering, the
+        // zero-output INIT that leaves the source unevaluated, a suppressed
+        // trailing INIT error keeping its successful forks, and an
+        // unstoppable plain source.
+        (
+            "null",
+            "[reduce (1,2) as $x ((10,20); .+$x)]".to_string(),
+            "[13,23]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            "reduce (1,2,3) as $x (0; .+$x)".to_string(),
+            "6\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            r#"[reduce (5) as $x ((1,2,error("boom")); .+$x)?]"#.to_string(),
+            "[6,7]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            "reduce halt_error as $x (empty; .)".to_string(),
+            String::new(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            r#"[reduce (1, error("in")) as $x (error("init"); .)]"#.to_string(),
+            String::new(),
+            "jq: error (at <stdin>:0): init\n".to_string(),
+            5,
+        ),
+        (
+            "null",
+            "[reduce empty as $x ((0,1); .+1)]".to_string(),
+            "[0,1]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "null",
+            r#"[reduce (1) as $x ((0,1); ("h"|halt_error(3)))]"#.to_string(),
+            String::new(),
+            "h".to_string(),
+            3,
+        ),
+        // A plain (non-`?//`) source still cannot be stopped early by either
+        // tool: `reduce` emits only its final accumulator, so it must
+        // exhaust the source to produce anything at all.
+        (
+            "null",
+            r#"first(reduce (1,2,("X"|stderr),4) as $x (0; .+$x))"#.to_string(),
+            String::new(),
+            "Xjq: error (at <stdin>:0): number (3) and string (\"X\") cannot be added\n"
+                .to_string(),
+            5,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
     Ok(())
 }
 
