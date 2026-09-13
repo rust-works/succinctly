@@ -2110,7 +2110,17 @@ struct Instruction {
 #[derive(Clone)]
 pub struct LazySeq<V: DocumentValue> {
     source: LazySource<V>,
-    instructions: Rc<Vec<Instruction>>,
+    // #2575 Phase 2b: `None` rather than an always-allocated
+    // `Rc::new(Vec::new())` -- every `LazySeq` used to pay one `Rc` heap
+    // allocation (the control block, regardless of the inner `Vec`'s own
+    // empty backing buffer) even when no `map` stage would ever be pushed,
+    // which is the common case for `from_cursors`'s own callers (#1687's
+    // reordering builtins, and #2575's own array-construction fast path).
+    // Measured as a real, if modest, part of the tiny-array regression
+    // class #2575's own plan flagged (`[.xs[] | [.id]] | length`-shaped
+    // queries): interleaved A/B, +11-16% before this, back inside the
+    // control range after.
+    instructions: Option<Rc<Vec<Instruction>>>,
     pending: Vec<LazyElem<V>>,
 }
 
@@ -2120,8 +2130,11 @@ pub struct LazySeq<V: DocumentValue> {
 impl<V: DocumentValue> core::fmt::Debug for LazySeq<V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LazySeq")
+            .field(
+                "instructions_len",
+                &self.instructions.as_deref().map_or(0, Vec::len),
+            )
             .field("source", &self.source)
-            .field("instructions_len", &self.instructions.len())
             .field("pending_len", &self.pending.len())
             .finish()
     }
@@ -2131,7 +2144,7 @@ impl<V: DocumentValue> LazySeq<V> {
     fn new(source: LazySource<V>) -> Self {
         Self {
             source,
-            instructions: Rc::new(Vec::new()),
+            instructions: None,
             pending: Vec::new(),
         }
     }
@@ -2146,10 +2159,17 @@ impl<V: DocumentValue> LazySeq<V> {
     /// its `Box` (freeing the allocation) only to immediately `Box::new` a
     /// same-size replacement.
     fn push_map_in_place(&mut self, f: &Expr, tag: EvalTag) {
-        Rc::make_mut(&mut self.instructions).push(Instruction {
+        let instr = Instruction {
             f: Rc::new(f.clone()),
             tag,
-        });
+        };
+        match &mut self.instructions {
+            Some(instructions) => Rc::make_mut(instructions).push(instr),
+            // #2575 Phase 2b: the first stage is what actually needs the
+            // `Rc<Vec<_>>` to exist at all -- see the field's own doc
+            // comment.
+            None => self.instructions = Some(Rc::new(alloc::vec![instr])),
+        }
     }
 
     /// Builder-style wrapper around [`Self::push_map_in_place`], for the
@@ -2208,7 +2228,7 @@ impl<V: DocumentValue> LazySeq<V> {
     /// per-array-construction atomicity.
     fn fold_one(&self, elem: LazyElem<V>) -> Result<Vec<LazyElem<V>>, Control> {
         let mut items = vec![elem];
-        for instr in self.instructions.iter() {
+        for instr in self.instructions.iter().flat_map(|rc| rc.iter()) {
             let mut next_items = vec_with_capacity(items.len());
             for item in items {
                 next_items.extend(into_lazy_items(Self::eval_one(instr, item))?);
@@ -2251,6 +2271,23 @@ impl<V: DocumentValue> LazySeq<V> {
     /// `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
     /// diagnostic).
     pub fn materialize_atomic(self) -> Result<OwnedValue, Control> {
+        // #2575 Phase 2b: an instruction-free `Cursors` source has no stage
+        // to run and nothing buffered in `pending` (a stage is the only
+        // thing that ever populates it), so `drain_atomic`'s own
+        // `Vec<LazyElem<V>>` -- one small `Vec` allocated and dropped per
+        // element inside `fold_one`, then a second full pass converting
+        // each to `OwnedValue` -- is pure overhead here. Map cursors
+        // straight to `OwnedValue` in one pass instead.
+        if self.instructions.is_none() && self.pending.is_empty() {
+            if let LazySource::Cursors { cursors, next } = &self.source {
+                let remaining = &cursors[*next..];
+                let mut out = vec_with_capacity(remaining.len());
+                for c in remaining {
+                    out.push(to_owned_cursor(c).map_err(Control::Error)?);
+                }
+                return Ok(OwnedValue::Array(out));
+            }
+        }
         let items = self.drain_atomic()?;
         let mut out = vec_with_capacity(items.len());
         for item in &items {
@@ -5905,6 +5942,93 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     optional: bool,
 ) -> GenericResult<V> {
+    // #2575 Phase 2: when `seq` is a still-untouched `LazySource::Cursors`
+    // with no `map` stage on top, indexing is exact -- there is no
+    // per-element stage to run, so no element can error and the
+    // #725/#2174 "a later element might have failed" boundary every other
+    // arm below has to respect does not apply here at all. `.[0]`/`first`
+    // already has its own fast path in the main match below (it works for
+    // every `seq` shape via the `Iterator` protocol, not just this one);
+    // this covers every other integer index and `last`, checked ahead of
+    // the main match so those two arms don't have to repeat the guard.
+    if seq.instructions.is_none() {
+        if let LazySource::Cursors { cursors, next } = &seq.source {
+            let remaining = &cursors[*next..];
+            match unwrap_paren(expr) {
+                Expr::Index { idx, key: None } if *idx != 0 => {
+                    let len = remaining.len();
+                    let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
+                    // #2254/#2264: yq's own negative-index-out-of-range
+                    // check, same rule the owned-array read and
+                    // `LazyIndexRange`'s own `Expr::Index` arm apply.
+                    if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
+                        return GenericResult::Error(e);
+                    }
+                    return match usize::try_from(resolved)
+                        .ok()
+                        .and_then(|i| remaining.get(i).copied())
+                    {
+                        Some(c) => GenericResult::OneCursor(c),
+                        None => GenericResult::Owned(OwnedValue::Null),
+                    };
+                }
+                Expr::Builtin(Builtin::Last) => {
+                    return match remaining.last().copied() {
+                        Some(c) => GenericResult::OneCursor(c),
+                        None => GenericResult::Owned(OwnedValue::Null),
+                    };
+                }
+                // Literal-bounds slice: still a `LazySeq`, not a
+                // materialized array -- `SliceBounds::from_literals(..)
+                // .resolve(len)` is the exact same bound normalization
+                // `slice_one_generic`'s own literal-bounds array arm uses
+                // (#1326: the two must not drift on how a fractional-widen
+                // or crossed-bounds edge case is clamped).
+                Expr::Slice { start, end, .. } => {
+                    let range = SliceBounds::from_literals(*start, *end).resolve(remaining.len());
+                    return GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
+                        remaining[range].to_vec(),
+                    )));
+                }
+                // A nested-pipe stage whose *head* is one of the shapes
+                // above: `.[0].name` parses as one `Expr::Pipe([Index{0},
+                // Field])` handed to this function as a single stage
+                // (`parse_postfix` builds a `Pipe` chain), so without this
+                // it falls straight to the general `materialize_atomic`
+                // path below and never reaches the arms above at all.
+                // Peel just the head against this same fast path
+                // (recursing once), then fold whatever it answers through
+                // the rest of the pipe the ordinary way
+                // (`fold_pipe_stages`, #724/#725's own already-correct
+                // "an already-evaluated stage folded through the rest").
+                // Guarded on the head's own shape, not applied
+                // unconditionally: an ordinary nested pipe whose head
+                // isn't one of these (`.foo.bar`) must keep going through
+                // the same single atomic `materialize_atomic` +
+                // `eval_on_owned` call it already does, not a split
+                // two-step version of the identical work.
+                Expr::Pipe(stages)
+                    if matches!(
+                        stages.first().map(unwrap_paren),
+                        Some(
+                            Expr::Index { key: None, .. }
+                                | Expr::Builtin(Builtin::Last)
+                                | Expr::Slice { .. }
+                        )
+                    ) =>
+                {
+                    let (head, rest) = stages.split_first().expect("checked by the guard above");
+                    let head_result = fold_lazy_seq_stage::<S, V>(
+                        Box::new(LazySeq::from_cursors(remaining.to_vec())),
+                        head,
+                        optional,
+                    );
+                    return fold_pipe_stages::<S, V>(head_result, rest, optional);
+                }
+                _ => {}
+            }
+        }
+    }
     match unwrap_paren(expr) {
         // In place (#789 code review follow-up): reuses the `Box`'s
         // existing heap slot instead of freeing it and allocating a
@@ -7736,9 +7860,36 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
 
         Expr::Array(inner) => {
-            let items: Vec<OwnedValue> = match eval_single::<S, _>(inner, value, optional, cursor)
-                .materialize_lazy()
-            {
+            let inner_result = eval_single::<S, _>(inner, value, optional, cursor);
+            // #2575 Phase 1: a cursor-shaped inner result stays a `LazySeq`
+            // instead of materializing into an `OwnedValue::Array` up front --
+            // `[.[]]`/`[.[] | select(f)]` used to pay a whole-array copy even
+            // when the consumer only wants `length`/`first`/`.[0]`, where
+            // `map(f)` (which already returns `GenericResult::LazySeq`) never
+            // did. `LazySeq::from_cursors` is the lossless "these elements, in
+            // this order, no map stage" answer #1687's reordering builtins
+            // already use for the identical reason (preserving a duplicate
+            // mapping key inside a moved element, which an `IndexMap`-backed
+            // `OwnedValue::Object` cannot).
+            //
+            // The float-fidelity fixup below does not apply here: it exists
+            // for a value that arrived *computed* (no spelling of its own),
+            // but every element `fold_one`/`materialize_atomic` eventually
+            // decodes off a `LazySeq::Cursors` source goes through the
+            // ordinary document-to-`OwnedValue` conversion first, which
+            // already tags a document-sourced float's own spelling
+            // (`OwnedValue::from_document_float`, #2438) -- there is no
+            // "just-computed, no spelling" value to fix up along this path.
+            match inner_result {
+                GenericResult::OneCursor(c) => {
+                    return GenericResult::LazySeq(Box::new(LazySeq::from_cursors(alloc::vec![c])));
+                }
+                GenericResult::ManyCursor(cs) => {
+                    return GenericResult::LazySeq(Box::new(LazySeq::from_cursors(cs)));
+                }
+                _ => {}
+            }
+            let items: Vec<OwnedValue> = match inner_result.materialize_lazy() {
                 // STYLE-0012: array construction is atomic in jq -- the twin
                 // of `eval::eval_array_construction`, which #2327
                 // investigated and deliberately left unrouted for the same
@@ -7746,11 +7897,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // evaluation above and never consulted for these errors.
                 GenericResult::One(v) => vec![owned_or_err!(to_owned(&v))],
                 // STYLE-0012: atomic array construction -- see the `One` arm above.
-                GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_cursor(&c))],
-                // STYLE-0012: atomic array construction -- see the `One` arm above.
                 GenericResult::Many(vs) => owned_or_err!(to_owned_all(&vs)),
-                // STYLE-0012: atomic array construction -- see the `One` arm above.
-                GenericResult::ManyCursor(cs) => owned_or_err!(to_owned_all_cursors(&cs)),
                 GenericResult::None => Vec::new(),
                 GenericResult::Owned(v) => vec![v],
                 GenericResult::ManyOwned(vs) => vs,
@@ -7782,6 +7929,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 }
                 GenericResult::Halt(code) | GenericResult::Partial(_, Control::Halt(code)) => {
                     return GenericResult::Halt(code)
+                }
+                GenericResult::OneCursor(_) | GenericResult::ManyCursor(_) => {
+                    unreachable!("handled above, before materialize_lazy() ever ran")
                 }
                 GenericResult::LazyKeys { .. }
                 | GenericResult::LazyIndexRange(_)

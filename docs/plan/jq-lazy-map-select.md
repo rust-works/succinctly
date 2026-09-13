@@ -546,6 +546,59 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     change; a cheaper implementation of that same guarantee (e.g. a size-based fast path, or
     validating before writing instead of buffering while writing) is a reasonable follow-up.
 
+- Array construction, `[...]` itself: [#2575](https://github.com/rust-works/succinctly/issues/2575)
+  — **landed**. `map(f)` returning `LazySeq` (Slice 1) never covered the constructor `[...]`
+  wraps around a cursor-shaped body — `[.[]]`, `[.[] | select(f)]` — which still materialized
+  into an `OwnedValue::Array` up front the moment `Expr::Array`'s arm saw a `GenericResult::
+  OneCursor`/`ManyCursor`, even when the consumer only wanted `length`/`first`/`.[n]`. Closed the
+  same way Slice 1 closed it for `map`: those two `GenericResult` shapes now become
+  `LazySeq::from_cursors` instead of a materialized copy, so `[...]`'s own construction is lazy
+  by the same mechanism, not a new one.
+  - **The `#2103`/`#2692` validation-contract rule ("anything that materializes validates
+    everything it materializes, nothing else validates anything") widened by one more
+    construct**, exactly as it did for `select` in #2692: `[.[]] | length` on a document with
+    an undecodable member now answers instead of raising, since `length` never decodes what it
+    counts. Pinned in `test_lazy_validation_boundary_2168`/
+    `test_select_passes_through_corruption_it_only_tests_1645_2692`
+    (`tests/jq_cli_tests.rs`), recorded in `docs/compliance/jq/limitations.md`'s `#2103` table.
+  - **Closed one row of #2642's own "owned embed map" residual as a side effect, not a
+    targeted fix**: `. as $x | [.] | .[0] | path($x)` now stays accepted (jq's `[]`) — `[.]`'s
+    single element is a `LazySeq` pointing at the same cursor `.` came from, which is exactly
+    the node identity jq's own reference-counted `jv` already had. The sibling shape where the
+    navigation happens *inside* `path()`'s own argument (`path(.[0] | $x)`) is a different
+    mechanism (`path()`'s own resolver) and stays refused.
+  - **Phase 2 fast paths**: `.[n]` (any `n`), `last` and a literal-bounds slice over an
+    *instruction-free* `Cursors` source (no `map` stage on top) are exact — there is no
+    per-element stage to run, so no element can error, unlike every other consumer here which
+    still pays one atomic `materialize_atomic` + `eval_on_owned` pass. A nested-pipe stage whose
+    *head* is one of these (`.[0].name`) is peeled and folded through `fold_pipe_stages` instead
+    of falling to the general path just because the whole thing parses as one `Expr::Pipe`.
+  - **A real, small, accepted regression on doubly-nested tiny-array construction.**
+    `[.xs[] | [.id]] | length`-shaped queries — an array of many *tiny* per-element arrays,
+    consumed by an outer construct that materializes anyway — regress: two mitigations applied
+    (`LazySeq`'s `instructions` field is `Option<Rc<Vec<Instruction>>>` rather than an
+    always-allocated `Rc<Vec::new()>`, since every `LazySeq` used to pay one `Rc` heap
+    allocation even when no `map` stage would ever be pushed; `materialize_atomic` gets its own
+    fast path for an instruction-free `Cursors` source, mapping cursors straight to `OwnedValue`
+    in one pass instead of `drain_atomic`'s intermediate `Vec<LazyElem>` plus a second
+    conversion pass) brought it from +11-16.5% down to +3.4-4.3%, confirmed still outside this
+    machine's own measured noise floor (a `--control` run on the same machine: -1.8%..+0.9%).
+    Accepted rather than chasing further: the shape with the least to save is where a
+    constant-factor overhead shows most (the benchmarking notes' own recurring lesson), and it
+    is a small, narrow cost against 4-7x wins on the shapes this issue actually targets. A
+    `cs.len()` gate was the plan's own suggested fallback but was not taken — it would also
+    forfeit this same fix's yq fidelity wins (comment/anchor/position preservation through
+    `[.]`/`[.] | .[0]`-shaped constructions) for every small array, a worse trade than the
+    regression it would close.
+  - **Benchmarked** (interleaved A/B, `scripts/ab-cli.py`, Apple M4 Pro mini, 4 MB `users`
+    corpus, 28,672 objects, output-identity gated, 2026-09-13): `[.xs[]] | length` **6.7-7.3x**
+    faster, `[.xs[]] | first` **7.5-8.7x** faster, `[.xs[] | select(f)] | length` **4.1-4.3x**
+    faster, `[.xs[]] | .[n]` (Phase 2) **4.2-4.5x** faster — all matching the issue's own
+    pre-measured spike numbers. Holdouts (`.`, `.xs | map(select(f)) | length`) inside the
+    control range. AMD Ryzen 9 7950X was unavailable for a same-session run (occupied by
+    unrelated work); CI's own dual-architecture Perf Regression Guard is the independent x86_64
+    confirmation.
+
 ## Critical files
 
 - `src/jq/eval_generic.rs` — `GenericResult` enum, `LazyKeys`/`LazyIndexRange` variants, the

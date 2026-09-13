@@ -791,11 +791,19 @@ is the revert that established what the other one costs.
    rebuilt copy — refuse-only by construction, since the only transition is `Snapshot →
    Untracked` and `Untracked` never certifies. A documented residual remains: a handful of
    constructions jq's own reference-counted `jv` passes an embedded node through *without
-   copying it* (`[.] \| .[0]`, `{k:.} \| .k`, `. + {}`, `reduce empty as $i (.; .)`) now refuse
-   rather than silently accept a copy, since succinctly's `OwnedValue`-cloning model has no way
-   to tell "this position embeds the original node" from "this position merely happens to be
-   value-equal" — recovering them (an "owned embed map" recording which positions of a
-   constructed value embed a document node) is tracked as a follow-up, not attempted here.
+   copying it* (`{k:.} \| .k`, `. + {}`, `reduce empty as $i (.; .)`, and `path(.[0] | $x)`
+   navigation *inside* a `path()` call over `[.]`) now refuse rather than silently accept a
+   copy, since succinctly's `OwnedValue`-cloning model has no way to tell "this position embeds
+   the original node" from "this position merely happens to be value-equal" — recovering them
+   (an "owned embed map" recording which positions of a constructed value embed a document
+   node) is tracked as a follow-up, not attempted here. **[#2575](https://github.com/rust-works/succinctly/issues/2575)
+   closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
+   path($x)` now stays accepted, because `Expr::Array`'s generic-evaluator arm no longer
+   materializes a cursor-shaped inner result into a fresh `OwnedValue` copy — `[.]`'s single
+   element is a `LazySeq` pointing at the same cursor `.` came from, which is exactly the node
+   identity jq's own `jv` already had. `[.] \| path(.[0] \| $x)` (the same construction, but
+   with the navigation happening inside `path()`'s own argument) is a genuinely different
+   mechanism and stays refused.
    **Applied at every "funnel" crossing except one deliberately excluded class:** sites inside
    `eval_owned_identity_stages`/`owned_identity_values`/`try_path_context_absent_sink` (the
    `OwnedIdentity`/#2072 machinery a `key`/`parent`/`path`/`file_index`-reading sibling stage
@@ -4104,6 +4112,21 @@ under jq's own last-occurrence duplicate-key rule (#422), which resolves the key
 `{123: 1} | any` still raises, because resolving a key reads it. That is the rule applying
 inside a single builtin, not an exception to it.
 
+[#2575](https://github.com/rust-works/succinctly/issues/2575) widened the rule once more, to
+array *construction*: `[.[]]`, `[.[] | select(f)]` and the sibling shapes `Expr::Array`'s
+generic-evaluator arm can now answer straight from a `LazySeq` (no `map` stage needed, unlike
+#1687's own reordering-builtin route into the same type) instead of materializing an
+`OwnedValue::Array` up front. `[.[]] | length` and `[.[] | select(.)] | length` on
+`{"a":"\ud800","d":5}` now answer `2` where they used to raise — `length` counts without
+converting anything, the same "count-and-discard" fast path `map`'s own `Length` arm has
+always had. Recorded on the same footing, for the same three reasons #2103's own list gives:
+the agreement being given up was an accident of a materializing implementation, not a
+decision that `[...]` should validate its elements; it made the answer depend on spelling
+(`[.[]] | length` raised where `.[] | select(.) | .. ; map(.) | length` did not); and it cost
+a whole-array copy on a filter that reads nothing it did not already need to. Pinned in
+`test_lazy_validation_boundary_2168`'s and
+`test_select_passes_through_corruption_it_only_tests_1645_2692`'s own rows.
+
 Step 2 of ADR-0018's decision order therefore separates the two options and favours the
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
 corrupted or discarded, and neither choice takes the process down. **This is a deliberate
@@ -4139,13 +4162,15 @@ which walks it exactly as `.` does, so a structural fault is still found where t
 reaches it (`{123:1,"b":2}` still exits 5 under `.,.`, as under `.`) and a colliding
 undecodable key, which the walk never has to resolve, is echoed as `.` echoes it. A filter
 whose only route is still the wildcard bridge — `. as $x | $x`, `if . then . else . end`,
-`[.]`, `{k: .}`, anything without a native streaming arm **that reads `.`** — still
-materializes and so still validates, which is the same rule applied to a route that reads
-the whole document, not an exception to it. (`label $x | .` is *not* one of those: it has a
-native arm and already answered at exit 0 on the eager route, as the matrix in 2 above
-records.) The four examples just named all read `.`, and all still materialize; what
-changed under #2173 is the bridge's behaviour for a filter that does **not** — see the
-next entry.
+`{k: .}`, anything without a native streaming arm **that reads `.`** — still materializes
+and so still validates, which is the same rule applied to a route that reads the whole
+document, not an exception to it. (`label $x | .` is *not* one of those: it has a native arm
+and already answered at exit 0 on the eager route, as the matrix in 2 above records. `[.]`
+was in this group until #2575 gave `Expr::Array` its own native, cursor-forwarding arm —
+`[.]`'s single element is now a `LazySeq` pointing at the same cursor `.` did, so it no
+longer materializes or validates either; see that issue's own entry above.) The three
+examples just named all read `.`, and all still materialize; what changed under #2173 is the
+bridge's behaviour for a filter that does **not** — see the next entry.
 
 The context that makes the loss survivable is the one #2168's entry states: succinctly
 already diverges on this whole class of document through `.` itself, deliberately, and a
@@ -4254,14 +4279,20 @@ table — the rows below, not the sweep, are what now holds the answer.) Measure
 
 | raw (never materialized) | doubled (materialized) |
 |---|---|
-| `.`, `. \| .`, `first(.)`, `getpath([])` | `[.] \| .[0]`, `[.] as [$x] \| $x` |
-| `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| [$x] \| .[0]`, `. as $x \| $x + {}` |
+| `.`, `. \| .`, `first(.)`, `getpath([])` | `[.] as [$x] \| $x` |
+| `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| $x + {}` |
 | `if . then . else . end` | `tojson`, `to_entries`, `keys`, `with_entries(.)` |
+| `[.] \| .[0]`, `. as $x \| [$x] \| .[0]` (#2575) | |
 
 Every raw row forwards a cursor; every doubled row builds an `OwnedValue`. No filter on
 either side contradicts the rule, which is what makes "the golden was stale" the answer
 rather than "the rule is too broad". jq 1.7.1 has no opinion to appeal to — it rejects both
-documents at parse time — so this is succinctly's own rule throughout.
+documents at parse time — so this is succinctly's own rule throughout. `[.] \| .[0]` and
+`. as $x \| [$x] \| .[0]` moved from doubled to raw with #2575: `Expr::Array`'s
+generic-evaluator arm no longer materializes a cursor-shaped inner result, so a
+single-element `[...]` forwards its element's own cursor through `.[0]` instead of decoding
+it. `[.] as [$x] \| $x` stays doubled — pattern destructuring binds through a different,
+still-materializing route.
 
 The sweep is a verification tool, not a CI gate, which is how the drift survived long
 enough to be absorbed by an unrelated `--update`;
