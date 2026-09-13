@@ -30,9 +30,10 @@
 #     variants then generate three identical cases per consumer, which is
 #     harmless and keeps the construct in the same table as its siblings.
 #   * `reduce`'s own INIT position, which has the identical bug (see
-#     docs/compliance/jq/limitations.md's #2668 residual) but has no native,
-#     demand-forwarding dispatch arm at all to drive it through -- fixing it
-#     needs a new `each_reduce`-style dispatch, not a template row here.
+#     docs/compliance/jq/limitations.md's #2668 residual, filed as #2899) but
+#     has no native, demand-forwarding dispatch arm at all to drive it
+#     through -- fixing it needs a new `each_reduce`-style dispatch, not a
+#     template row here.
 #     Sweeping it would report a permanent "known" divergence and defeat
 #     this script's 0-unexpected/0-known contract, so it is pinned as a CLI
 #     row in tests/jq_cli_tests.rs's
