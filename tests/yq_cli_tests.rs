@@ -34541,6 +34541,26 @@ fn test_reduce_and_foreach_see_every_duplicate_key_1687() -> Result<()> {
     Ok(())
 }
 
+/// #2732 (yq half): the jq-mode-only `null`/`bool` reestablishment fix
+/// must not reach yq mode -- gated on `S::TAG == EvalTag::Jq` in
+/// `fold_source_ambient` specifically because yq has no oracle for this
+/// shape at all (its own lexer rejects `reduce`/`foreach`/`path`
+/// outright), and #2161/#2632's own precedent already established that
+/// widening this exact register machinery for yq mode is the wrong
+/// direction. The write-side refusal stays unchanged.
+#[test]
+fn test_fold_source_null_bool_reestablishment_stays_jq_mode_only_2732() -> Result<()> {
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("(reduce .a as $k (.b; .)) = 5", "null", &args)?;
+    assert_ne!(code, 0, "must still refuse: stderr {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression near attempt to access element "a" of null"#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1687 item 1's documented residual: `reduce`/`foreach` recover the
 /// *number* of elements, not each element's own shape.
 ///
