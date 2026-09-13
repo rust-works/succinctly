@@ -2442,14 +2442,18 @@ fn test_builtin_select() -> Result<()> {
 /// whatever the filter (`docs/compliance/jq/limitations.md`).
 #[test]
 fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()> {
-    // (label, document, select filter that only tests, materializing control)
-    let cases: &[(&str, &str, &str, &str, &str)] = &[
+    // (label, document, select filter that only tests, materializing control,
+    // #2575: a `[...]`-wrapped filter that used to also materialize (through
+    // `length`) but no longer does, now that array construction over a
+    // cursor-shaped result stays a `LazySeq`)
+    let cases: &[(&str, &str, &str, &str, &str, &str)] = &[
         (
             // `\x` is not a valid JSON escape -- structurally a string
             // token, but its bytes don't decode (#1247's own trigger shape).
             "decode failure, tested directly",
             r#"["\x"]"#,
             ".[] | select(.) | 1",
+            "[.[] | select(.)] | tojson",
             "[.[] | select(.)] | length",
             "invalid escape sequence",
         ),
@@ -2459,6 +2463,7 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
             "structural error, tested directly",
             "[xyz123]",
             ".[] | select(.) | 1",
+            "[.[] | select(.)] | tojson",
             "[.[] | select(.)] | length",
             "unexpected character",
         ),
@@ -2473,6 +2478,7 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
             "decode failure, nested in the tested container",
             r#"{"bad": ["\x"], "keep": 5}"#,
             "select(.bad) | .keep",
+            "[select(.bad)] | tojson",
             "[select(.bad)] | length",
             "invalid escape sequence",
         ),
@@ -2480,12 +2486,13 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
             "structural error, nested in the tested container",
             r#"{"bad": [xyz123], "keep": 5}"#,
             "select(.bad) | .keep",
+            "[select(.bad)] | tojson",
             "[select(.bad)] | length",
             "unexpected character",
         ),
     ];
 
-    for (label, doc, tests_only, materializes, want_stderr) in cases {
+    for (label, doc, tests_only, materializes, now_answers, want_stderr) in cases {
         let (stdout, stderr, code) = run_jq_full(&["-c", tests_only], Some(doc))?;
         assert_eq!(
             code, 0,
@@ -2506,6 +2513,22 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
         assert!(
             stderr.contains(want_stderr),
             "[{label}] `{materializes}`: stderr {stderr:?} lacks {want_stderr:?}"
+        );
+
+        // #2575: `[...]` over a cursor-shaped `select`/`.[] | select` result
+        // stays a `LazySeq`, so `length` -- unlike `tojson` above -- no
+        // longer decodes the corrupted element it never reads. Same rule as
+        // `map(select(.)) | length`'s own long-standing answering behavior
+        // (`map` already returned `LazySeq`), applied to array construction.
+        let (stdout, stderr, code) = run_jq_full(&["-c", now_answers], Some(doc))?;
+        assert_eq!(
+            code, 0,
+            "[{label}] `{now_answers}` no longer materializes and must answer\
+             \nstdout: {stdout:?}\nstderr: {stderr:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "[{label}] `{now_answers}`: stderr {stderr:?}"
         );
     }
     Ok(())
@@ -42188,6 +42211,20 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         ("(. // 1) | .d", "5"),
         ("[.[] | not]", "[false,false]"),
         ("(true and true) | 1", "1"),
+        // #2575: `[...]` over a cursor-shaped inner result (`.[]`, `select`)
+        // stays a `LazySeq` instead of materializing into an
+        // `OwnedValue::Array` up front, so `length`/`.[0]` answer without
+        // ever decoding either element -- the same rule `map(f)` (already
+        // `LazySeq`-returning) and `select` (#2692) already follow, applied
+        // to array construction. `[.[]] | length` moved out of the raising
+        // column below.
+        ("[.[]] | length", "2"),
+        ("[.[] | select(.)] | length", "2"),
+        // #2575 Phase 2: `.[n]` (n != 0) and `last` over an instruction-free
+        // `Cursors` source are exact -- no stage runs, so nothing can
+        // error -- and index/last `1` in each case is `.d`, never `.a`.
+        ("[.[]] | .[1]", "5"),
+        ("[.[]] | last", "5"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -42203,7 +42240,7 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         ". as $x | $x",   // materializes the binding
         ".a |= 1",        // the write path materializes
         "sort_by(.d)",    // the sort family keeps its gate
-        "[.[]] | length", // array construction materializes each element
+        "[.[]] | tojson", // #2575: still materializes every element (unlike `length`)
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -42221,7 +42258,7 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
     for filter in [
         "select(.) | to_entries",
         "select(.) | . as $x | $x",
-        "select(.) | [.[]] | length",
+        "select(.) | [.[]] | tojson", // #2575: `length` no longer materializes -- see above
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -51257,15 +51294,22 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
 ///
 /// | raw (never materialized) | doubled (materialized) |
 /// |---|---|
-/// | `.`, `. \| .`, `first(.)` | `[.] \| .[0]`, `[.] as [$x] \| $x` |
-/// | `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| [$x] \| .[0]` |
-/// | `if . then . else . end` | `. as $x \| $x + {}`, `tojson` |
-/// | `getpath([])`, `(., .) \| first(.)` | `to_entries`, `keys`, `with_entries(.)` |
+/// | `.`, `. \| .`, `first(.)` | `[.] as [$x] \| $x` |
+/// | `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| $x + {}`, `tojson` |
+/// | `if . then . else . end` | `to_entries`, `keys`, `with_entries(.)` |
+/// | `getpath([])`, `(., .) \| first(.)` | |
+/// | `[.] \| .[0]`, `. as $x \| [$x] \| .[0]` (#2575) | |
 ///
 /// Every raw row forwards a cursor; every doubled row builds an
 /// `OwnedValue`. There is no filter on either side that contradicts the
 /// rule, which is what makes "the rule stands, the golden was stale" the
-/// answer rather than "the wording needs narrowing".
+/// answer rather than "the wording needs narrowing". `[.] \| .[0]` and
+/// `. as $x \| [$x] \| .[0]` moved from doubled to raw with #2575:
+/// `Expr::Array`'s generic-evaluator arm no longer materializes a
+/// cursor-shaped inner result, so a single-element `[...]` forwards its
+/// element's own cursor through `.[0]` instead of decoding it. `[.] as
+/// [$x] \| $x` stays doubled -- pattern destructuring binds through a
+/// different, still-materializing route, unaffected by this fix.
 ///
 /// jq 1.7.1 has no opinion to appeal to: it rejects both documents at parse
 /// time (`Invalid \uXXXX\uXXXX surrogate pair`, `Invalid escape`), so this
@@ -51292,6 +51336,11 @@ fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
             "getpath([])",
             "first(.)",
             "(., .) | first(.)",
+            // #2575: `[.]`'s single element is now a `LazySeq` pointing at
+            // the same cursor `.` came from, so `.[0]` forwards it instead
+            // of decoding -- these moved out of the "doubled" list below.
+            "[.] | .[0]",
+            ". as $x | [$x] | .[0]",
         ] {
             let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
             assert_eq!(code, 0, "`{filter}` on {doc}: stderr {err:?}");
@@ -51307,13 +51356,7 @@ fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
 
         // ... and a materializing route doubles the source `\`.
         let doubled = doc.replace('\\', "\\\\");
-        for filter in [
-            "[.] | .[0]",
-            "[.] as [$x] | $x",
-            ". as $x | [$x] | .[0]",
-            ". as $x | $x + {}",
-            "with_entries(.)",
-        ] {
+        for filter in ["[.] as [$x] | $x", ". as $x | $x + {}", "with_entries(.)"] {
             let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
             assert_eq!(code, 0, "`{filter}` on {doc}: stderr {err:?}");
             let lines: Vec<&str> = out.lines().collect();
@@ -51325,6 +51368,86 @@ fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
                 );
             }
         }
+
+        // #2575: printing a `LazySeq`-backed array directly (no `.[0]`
+        // needed) also streams its element from its own live cursor, the
+        // same way `map(.)` (already `LazySeq`) always has -- checked
+        // separately since the wrapping brackets mean the expected line
+        // isn't a bare `doc`/`doubled` comparison.
+        let (out, err, code) = run_jq_full(&["-c", "[.]"], Some(doc))?;
+        assert_eq!(code, 0, "`[.]` on {doc}: stderr {err:?}");
+        assert_eq!(
+            out.trim_end(),
+            format!("[{doc}]"),
+            "`[.]` forwards its element's own cursor, so it must echo the raw source bytes"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2575 Phase 2: `.[n]` (any `n`, negative included) and `last` over an
+/// array constructed from a cursor-shaped source (`[.[]]`, `[.[] |
+/// select(f)]`) answer exactly, since there is no per-element stage to run
+/// and so no element can error. Every row captured live against jq 1.7.1.
+#[test]
+fn test_lazy_seq_index_and_last_are_exact_2575() -> Result<()> {
+    let doc = "[10,20,30,40,50]";
+
+    for (filter, want) in [
+        ("[.[]] | .[0]", "10"),
+        ("[.[]] | .[2]", "30"),
+        ("[.[]] | .[4]", "50"),
+        ("[.[]] | .[5]", "null"),
+        ("[.[]] | .[-1]", "50"),
+        ("[.[]] | .[-5]", "10"),
+        ("[.[]] | .[-6]", "null"),
+        ("[.[]] | last", "50"),
+        ("[.[] | select(. > 20)] | .[0]", "30"),
+        ("[.[] | select(. > 20)] | last", "50"),
+        ("[.[] | select(. > 20)] | .[-1]", "50"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    // Empty source: `.[n]`/`last` both answer `null`, never raise.
+    for filter in ["[.[]] | .[0]", "[.[]] | .[-1]", "[.[]] | last"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[]"))?;
+        assert_eq!(code, 0, "`{filter}` on []: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), "null", "`{filter}` on []");
+    }
+
+    // Literal-bounds slice: still a `LazySeq`, not a materialized array.
+    for (filter, want) in [
+        ("[.[]] | .[1:3] | length", "2"),
+        ("[.[]] | .[1:] | length", "4"),
+        ("[.[]] | .[:3] | length", "3"),
+        ("[.[]] | .[-3:-1] | length", "2"),
+        ("[.[]] | .[10:20] | length", "0"),
+        ("[.[]] | .[3:1] | length", "0"),
+        ("[.[]] | .[-100:100] | length", "5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    // Nested-pipe stage: `.[0].name`-shaped queries peel the array
+    // construction's fast path from the field access after it, instead of
+    // falling to the general materializing path just because the whole
+    // thing parses as one `Expr::Pipe`.
+    let people = r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#;
+    for (filter, want) in [
+        ("[.[]] | .[0].name", r#""a""#),
+        ("[.[]] | .[-1].name", r#""c""#),
+        ("[.[] | select(true)] | .[0].name", r#""a""#),
+        ("[.[] | select(true)] | .[1:] | length", "2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(people))?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
     }
 
     Ok(())
@@ -52076,14 +52199,18 @@ fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
         // `run_try_handler_generic` deliberately do not call
         // `demote_rebuilt_markers`.
         ("1", ". as $x | try error($x) catch path($x)", "[]"),
-        // `[.] | path(.[0] | $x)` -- navigation *inside* the same `path()`
-        // invocation the marker is referenced in -- is deliberately not
-        // covered here: it hits the same "owned embed map" residual as
-        // `[.] | .[0] | path($x)` below (`[.]`'s single element is `.`
-        // unchanged in jq's own reference-counted jv, which succinctly's
-        // `OwnedValue`-cloning model cannot represent), confirmed live to
-        // now refuse rather than accept -- see
-        // `test_tracked_var_owned_embed_residual_refuses_cleanly_2642`.
+        // #2575: `[.]`'s single element now stays a `LazySeq` pointing at
+        // the same cursor `.` came from, rather than materializing a fresh
+        // `OwnedValue` copy -- the same node identity jq's own
+        // reference-counted `jv` already had, closing this one row of the
+        // "owned embed map" residual (`test_tracked_var_owned_embed_residual_refuses_cleanly_2642`'s
+        // own doc comment). `path(.[0] | $x)` -- navigation *inside* the
+        // same `path()` invocation the marker is referenced in -- is a
+        // genuinely different mechanism (`path()`'s own resolver, not the
+        // generic evaluator's `Expr::Array` arm this fix touches) and
+        // deliberately not covered here: confirmed live to still refuse,
+        // see that same test.
+        (r#"{"a":1}"#, ". as $x | [.] | .[0] | path($x)", "[]"),
     ] {
         let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
         assert_eq!(
@@ -52128,21 +52255,33 @@ fn test_tracked_var_owned_identity_sibling_gap_unaffected_2642() -> Result<()> {
 /// Known, accepted "refuse-only" residual (#2642's own follow-up, "owned
 /// embed map"): a construction that jq's own reference-counted jv passes
 /// through *without allocating a new container for the embedded node*
-/// (`[.] | .[0]`, `{k:.} | .k`, `. + {}`) still keeps real jq's own node
-/// identity, but succinctly's `OwnedValue`-cloning model has no way to tell
-/// "this constructed value's position N is literally the same node" from
+/// (`{k:.} | .k`, `. + {}`) still keeps real jq's own node identity, but
+/// succinctly's `OwnedValue`-cloning model has no way to tell "this
+/// constructed value's position N is literally the same node" from
 /// "position N merely happens to be value-equal" -- so these now refuse
 /// rather than silently accepting a copy, matching this fix's own
 /// refuse-only safety property. Recovering them needs the generic evaluator
 /// to record which positions of a constructed value embed a document node
 /// (tracked in the #2642 follow-up), not attempted here.
+///
+/// #2575 closed one row of this residual as a side effect, not a targeted
+/// fix: `[.] | .[0] | path($x)` now stays accepted (moved to
+/// `test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642`), because
+/// `Expr::Array`'s generic-evaluator arm no longer materializes a
+/// cursor-shaped inner result into a fresh `OwnedValue` copy -- `[.]`'s
+/// single element is now a `LazySeq` pointing at the same cursor `.` came
+/// from, which is exactly the node identity jq's own `jv` already had.
+/// `[.] | path(.[0] | $x)` -- the same construction, but with the
+/// navigation happening *inside* `path()`'s own argument -- is a genuinely
+/// different mechanism (`path()`'s own resolver, not the generic
+/// evaluator's `Expr::Array` arm #2575 touches) and stays refused,
+/// confirmed live.
 #[test]
 // jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone.
 #[allow(clippy::literal_string_with_formatting_args)]
 fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
     for filter in [
-        ". as $x | [.] | .[0] | path($x)",
         ". as $x | [.] | path(.[0] | $x)",
         ". as $x | {k:.} | .k | path($x)",
         ". as $x | . + {} | path($x)",
