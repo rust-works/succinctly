@@ -1082,8 +1082,8 @@ with priority over any retry decision (`test_pattern_computed_key_review_fixes_2
 (`test_pattern_computed_key_multi_output_refuses_in_path_position_2677`), the same reasoning
 that motivated `extract_single_pattern_binding` in the first place: fanning out correctly needs
 each call site's own retry/register machinery threaded through, not just the core function.
-`reduce`/`foreach`'s own pattern (`eval_reduce_with_values`/`substitute_foreach_steps`'s
-pre-loop substitution-matrix builders) is unaffected either way — a multi-output computed key
+`reduce`/`foreach`'s own pattern (`substitute_foreach_steps`, which both folds now call
+per element) is unaffected either way — a multi-output computed key
 there still refuses in both value and path position. Tracked as follow-up
 [#2872](https://github.com/rust-works/succinctly/issues/2872), alongside `walk_pattern`'s own
 narrower gap that a `Halt`/`Break` interrupting a computed key's generator in path position (or
@@ -3888,21 +3888,28 @@ Pinned in `test_nested_short_circuit_consumer_hides_the_stop_2180` and
 `test_short_circuit_side_effect_shapes_already_match_jq_820` (`tests/jq_cli_tests.rs`), and both
 positions are back in `scripts/jq-alt-retry-oracle-sweep.sh`'s `W_ENTRIES`.
 
-**`reduce`'s own INIT has the identical bug and is *not* fixed by #2668 — filed as #2899.**
-`[first(reduce (1) as $v ((1 as $x ?// $y \| 1); . + 1))]` is jq's `[2,2]`, `succinctly jq`'s
-`[2]`, the same class as `foreach`'s own INIT row above (confirmed live; `reduce`'s own UPDATE is
-unaffected — its construct has no per-step visible output, so #2668's UPDATE fix already covers it
-by sharing `fold_step_each`). Unlike `foreach`, `reduce` has no native, demand-forwarding dispatch
-arm at all: neither `eval_each` (`src/jq/eval.rs`) nor `eval_each_generic` (`src/jq/eval_generic.rs`)
-has an `Expr::Reduce` case, so `first(reduce(...))` always reaches `eval_reduce`/`eval_reduce_with_values`
-through the fully-eager, collecting `eval_single` path and drains the (already complete) result
-afterward — confirmed live: `first(reduce (1,2,("X"\|stderr),4) as $x (0; .+$x))` writes `X` in
-*both* jq and here, since neither ever gets to stop the source early for a plain (non-`?//`)
-reduce. Reshaping `eval_reduce_with_values` to take a `ForeachInitDrive`-shaped closure, the way
-#2668 reshaped `foreach_forks`, therefore cannot by itself change `first(reduce(...))`'s answer —
-nothing ever calls it through a live sink. Actually closing this gap needs a new `each_reduce`-
-style dispatch arm (mirroring `each_foreach`/`each_foreach_generic`) added to both evaluators
-first, a materially larger change than a plumbing reshape, and out of scope for #2668 itself.
+**~~`reduce`'s own INIT has the identical bug and is *not* fixed by #2668~~ — closed by
+[#2899](https://github.com/rust-works/succinctly/issues/2899).**
+`[first(reduce (1) as $v ((1 as $x ?// $y \| 1); . + 1))]` is jq's `[2,2]` and was
+`succinctly jq`'s `[2]`, the same class as `foreach`'s own INIT row above (`reduce`'s own UPDATE
+was never affected — its construct has no per-step visible output, so #2668's UPDATE fix already
+covered it by sharing `fold_step_each`).
+
+The diagnosis when this was filed was right and is worth keeping: unlike `foreach`, `reduce` had
+no demand-forwarding dispatch arm at all, in either evaluator, so reshaping its core alone could
+not have changed `first(reduce(...))`'s answer — nothing would ever have called it through a live
+sink. #2899 therefore did both halves: `reduce_forks` replaces `eval_reduce_with_values` as
+`foreach_forks`' structural twin, and `each_reduce`/`each_reduce_generic` are the arms that give a
+consumer's stop somewhere to land, gated on `!streams_unbounded` exactly as `foreach`'s are.
+
+What that diagnosis did *not* predict is the second divergence the reshape fixed: the collecting
+version pulled SOURCE once and reused its values across every INIT fork, where jq re-drives it per
+fork — `[reduce ("s"\|stderr) as $x ((0,1); .)]` writes `ss` in jq and wrote `s` here. See the
+INIT-fork re-entry entry below, whose own description of `reduce` this changed.
+
+A plain (non-`?//`) reduce source still cannot be stopped early by either tool:
+`first(reduce (1,2,("X"\|stderr),4) as $x (0; .+$x))` writes `X` in jq and here, because `reduce`
+emits only its final accumulator and so has to exhaust the source to produce anything at all.
 
 **~~`path(foreach(...))`'s own INIT is now inconsistent with value-mode `foreach`~~ — closed by
 [#2903](https://github.com/rust-works/succinctly/issues/2903).** `resolve_foreach`
@@ -5912,11 +5919,13 @@ $ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'
 ```
 
 Two of succinctly's three jq evaluators — `eval.rs`'s value evaluator and
-`eval_generic.rs`'s generic/CLI evaluator — share one core per construct
-(`eval_reduce_with_values`, `foreach_forks`), and neither ever substitutes a synthetic `null`
-for the ambient document: `reduce` computes SOURCE's values once, upfront, and reuses them
-across every INIT fork, while `foreach` (since #2180 WP3's review) re-drives SOURCE per fork
-— against the *real* ambient input every time, which is exactly the half jq does not do. That front-end-level agreement (not independent
+`eval_generic.rs`'s generic/CLI evaluator — share one core per construct (`reduce_forks`,
+`foreach_forks`), and neither ever substitutes a synthetic `null` for the ambient document.
+Both now re-drive SOURCE per INIT fork — `foreach` since #2180 WP3's review, `reduce` since
+#2899 — against the *real* ambient input every time, which is exactly the half jq does not
+do. (Before #2899 `reduce` differed again: it computed SOURCE's values once, upfront, and
+reused them across every fork, so `[reduce ("s"|stderr) as $x ((0,1); .)]` wrote `s` where
+jq writes `ss`. That half is closed; the synthetic-`null` half is what remains.) That front-end-level agreement (not independent
 double-implementation of the fold itself, since both front ends call the same shared
 functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163`
 (`tests/jq_evaluator_parity_tests.rs`) pins.
@@ -5947,10 +5956,10 @@ structurally malformed value doesn't abort the rest of a multi-value stream" ent
 itself still open rather than a settled precedent to build on. Matching jq's quirk exactly
 would mean re-deriving jq's own undocumented VM register-threading rule (which expression
 shapes get a fresh backtrack point, and what `.` reads as across one) and reshaping the
-shared `eval_reduce_with_values`/`foreach_forks` core so it evaluates SOURCE per-fork against
-a synthetic `null` document — for `foreach` that is now only the synthetic-`null` half, since
-the per-fork re-evaluation itself already landed with #2180 WP3's review; for `reduce` it is
-still both halves. A prior attempt at a narrower version of this fix (nulling only the bound
+shared `reduce_forks`/`foreach_forks` core so it evaluates SOURCE per-fork against a
+synthetic `null` document — which is now only the synthetic-`null` half for *both* folds, the
+per-fork re-evaluation itself having landed with #2180 WP3's review for `foreach` and #2899
+for `reduce`. A prior attempt at a narrower version of this fix (nulling only the bound
 pattern variable, not re-deriving SOURCE itself) regressed a passing test
 (`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`) —
 but that test's own SOURCE is a constant (`5`) that never reads `.` at all, so the regression

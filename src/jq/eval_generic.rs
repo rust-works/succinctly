@@ -9088,7 +9088,6 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 /// `first(...)` is intercepted by this file's own native `FirstExpr` arm and
 /// drives `eval_each_generic`, while `isempty(...)` has no native arm here
 /// and reaches `eval.rs`'s `eval_each` instead.
-#[allow(clippy::too_many_arguments)]
 /// [`eval_each_generic`]'s `reduce` arm (#2899) -- `each_foreach_generic`'s
 /// twin over [`reduce_forks`].
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach_generic`'s parameter list
@@ -9119,6 +9118,7 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the generic evaluator's ambient-threading list
 fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     input: &Expr,
     patterns: &[Pattern],
