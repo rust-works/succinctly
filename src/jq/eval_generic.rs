@@ -14032,6 +14032,7 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
 /// #1194/#1677 policy on the same document.
 fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     value: &V,
+    cursor: Option<&V::Cursor>,
     current_path: &mut Vec<OwnedValue>,
     paths: &mut Vec<OwnedValue>,
     leaves_only: bool,
@@ -14040,6 +14041,12 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(fields) = value.as_object() {
         let checked = effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)?;
         if checked.is_empty() {
+            // #2731: closes the nested-`{,}` gap `empty_container_gap_error`
+            // at this function's own call sites can only ever cover for the
+            // *outermost* container -- this arm has no cursor to check
+            // against until a caller threads one down through `cursor`,
+            // mirroring `to_owned_at_depth`'s identical object arm.
+            empty_fields_tail_gap_ok(&fields, cursor)?;
             if leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
@@ -14057,11 +14064,19 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            collect_paths_generic::<S, _>(&field.value, current_path, paths, leaves_only)?;
+            collect_paths_generic::<S, _>(
+                &field.value,
+                Some(&field.value_cursor),
+                current_path,
+                paths,
+                leaves_only,
+            )?;
             current_path.pop();
         }
     } else if let Some(elements) = value.as_array() {
         if elements.is_empty() {
+            // #2731: array twin of the object-arm check above.
+            empty_elements_tail_gap_ok(&elements, cursor)?;
             if leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
@@ -14069,12 +14084,22 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
         }
         let mut i = 0i64;
         let mut rest = elements;
-        while let Some((elem, tail)) = rest.uncons() {
+        // #2731: `uncons_cursor` rather than `uncons` -- the same switch
+        // `to_owned_at_depth`'s array arm makes -- purely to have a cursor
+        // to hand the recursive call for its own nested-`{,}`/`[,]` check;
+        // navigation underneath is identical either way.
+        while let Some((elem_cursor, tail)) = rest.uncons_cursor() {
             current_path.push(OwnedValue::Int(i));
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            collect_paths_generic::<S, _>(&elem, current_path, paths, leaves_only)?;
+            collect_paths_generic::<S, _>(
+                &elem_cursor.value(),
+                Some(&elem_cursor),
+                current_path,
+                paths,
+                leaves_only,
+            )?;
             current_path.pop();
             i += 1;
             rest = tail;
@@ -16051,7 +16076,16 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                             c = field;
                             continue;
                         }
-                        Ok(None) => GenericResult::Owned(OwnedValue::Null),
+                        // #2731: a miss on a *real* `{}` is `null` (jq's own
+                        // rule), but a miss on `{,}` -- zero real members,
+                        // indistinguishable from `{}` to `find_cursor` alone
+                        // -- must still raise the same way `.b.x` already
+                        // does on this exact document (#2594's per-arm
+                        // guards never reached this value-domain walk).
+                        Ok(None) => match empty_container_gap_error(&v, Some(&c)) {
+                            Some(e) => GenericResult::Error(e),
+                            None => GenericResult::Owned(OwnedValue::Null),
+                        },
                         Err(e) if suppresses(&e, optional) => GenericResult::None,
                         Err(e) => GenericResult::Error(e),
                     };
@@ -16076,7 +16110,12 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                             c = element;
                             continue;
                         }
-                        None => GenericResult::Owned(OwnedValue::Null),
+                        // #2731: array twin of the object-key-miss check
+                        // above.
+                        None => match empty_container_gap_error(&v, Some(&c)) {
+                            Some(e) => GenericResult::Error(e),
+                            None => GenericResult::Owned(OwnedValue::Null),
+                        },
                     };
                 }
             }
@@ -19696,13 +19735,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // format's own `effective_fields` rule at every nesting level, not
         // just the root.
         Builtin::Paths => {
-            // #2594: `collect_paths_generic` is a value-domain walk, so it
-            // cannot see the container it was handed is really `{,}`/`[,]`.
-            if let Some(err) = empty_container_gap_error(&value, cursor.as_ref()) {
-                return GenericResult::Error(err);
-            }
+            // #2731: `collect_paths_generic` now threads `cursor` down
+            // through every recursive call (mirroring `to_owned_at_depth`),
+            // so it closes #2594's `{,}`/`[,]` gap at every nesting level
+            // itself -- no separate pre-check needed at this outermost
+            // dispatch site.
             let mut paths = Vec::new();
-            match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, false) {
+            match collect_paths_generic::<S, _>(
+                &value,
+                cursor.as_ref(),
+                &mut Vec::new(),
+                &mut paths,
+                false,
+            ) {
                 Ok(()) => collapse_vec(
                     paths,
                     || GenericResult::None,
@@ -19714,12 +19759,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::LeafPaths => {
-            // #2594: same value-domain walk as `Builtin::Paths` above.
-            if let Some(err) = empty_container_gap_error(&value, cursor.as_ref()) {
-                return GenericResult::Error(err);
-            }
+            // #2731: same reasoning as `Builtin::Paths` above.
             let mut paths = Vec::new();
-            match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, true) {
+            match collect_paths_generic::<S, _>(
+                &value,
+                cursor.as_ref(),
+                &mut Vec::new(),
+                &mut paths,
+                true,
+            ) {
                 Ok(()) => collapse_vec(
                     paths,
                     || GenericResult::None,

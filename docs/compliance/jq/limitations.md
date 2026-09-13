@@ -1986,11 +1986,23 @@ with `test_jq_genuinely_empty_containers_unaffected_2594` and
 `test_jq_closed_terms_unaffected_by_empty_container_check_2594` for the two
 things the fix must *not* do.
 
-Still open, unchanged by #2594: the same shape reached through
-`to_owned_at_depth`'s cursor-less top-level callers (#2262 above) and
-through `collect_paths_generic`'s value-domain recursion for a container
-nested *inside* a `paths`/`leaf_paths` walk -- neither has a container
-cursor to check against.
+**`paths`/`leaf_paths`'s nested recursion and `getpath`'s cursor walk --
+closed by #2731.** `collect_paths_generic` now threads a `cursor:
+Option<&V::Cursor>` down through every recursive call (the same shape
+`to_owned_at_depth` already used, #2358), so `empty_fields_tail_gap_ok`/
+`empty_elements_tail_gap_ok` can run for a `{,}`/`[,]` nested at any depth
+inside a `paths`/`leaf_paths` walk, not only the outermost container the
+dispatch site's own pre-check covered. `getpath_walk_cursor`'s two
+child-miss exits (`find_cursor` returning `Ok(None)`, an out-of-range
+`get_cursor`) run the same check against the container they just failed to
+find a child in before answering `null`, closing the gap `.b.x`-style
+navigation already closed via #2594's `Expr::Field`/`Index` arms.
+
+Still open, unchanged by #2594/#2731: the same shape reached through
+`to_owned_at_depth`'s cursor-less top-level callers (#2262 above) -- no
+cursor exists to give it at the true top level by construction, and (unlike
+`paths`/`getpath`) there is no dispatch site further out that could hand
+one down.
 
 **`length` (objects) -- fixed by #2307/#2311.** Not one of this issue's own
 five repros, originally left open here with reasoning that turned out to be
