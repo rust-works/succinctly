@@ -36503,18 +36503,33 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         // #2157: `state` is unconditionally overwritten by the very next
         // statement regardless of which branch runs, so there is no live
         // borrow of its old value to preserve -- the one call site where
-        // `fold_step_via_accumulator_or_fork` can move `state` straight
-        // into `arith_combine` instead of `eval_owned_expr_fork`'s own
-        // `&OwnedValue`-forced clone.
-        let (update_vals, update_control) =
-            fold_step_via_accumulator_or_fork::<S>(substituted, state, optional);
+        // `fold_step_each` can move `state` straight into `arith_combine`
+        // instead of `eval_owned_expr_fork`'s own `&OwnedValue`-forced
+        // clone.
+        //
+        // #2668: `reduce`'s UPDATE never lets a downstream consumer stop it
+        // early -- there is no per-step visible output for one to stop
+        // after, unlike `foreach`'s EXTRACT (confirmed live: reduce's own
+        // UPDATE position matches jq exactly both before and after this
+        // fix, only `reduce`'s INIT was the affected position) -- so
+        // `on_update` here always asks for more; it exists only to capture
+        // UPDATE's last delivered output, the same value the old
+        // `update_vals.into_iter().last()` read off the collected `Vec`.
+        let mut last_val: Option<OwnedValue> = None;
+        let flow = fold_step_each::<S>(substituted, state, optional, &mut |v| {
+            last_val = Some(v);
+            Demand::Continue
+        });
         // Unconditional, mirroring the pre-#1365 single-pattern fold's own
-        // "acc = update_vals.into_iter().last()" -- run even when
-        // `update_control` is `Some(..)`, since a retried alternative
-        // resumes from exactly this value (see doc comment above).
-        state = update_vals.into_iter().last().unwrap_or(OwnedValue::Null);
-        match update_control {
-            None => return (state, None),
+        // "acc = update_vals.into_iter().last()" -- run even when `flow` is
+        // `Escaped`, since a retried alternative resumes from exactly this
+        // value (see doc comment above).
+        state = last_val.unwrap_or(OwnedValue::Null);
+        match flow {
+            Flow::Exhausted => return (state, None),
+            Flow::Stopped { .. } => {
+                unreachable!("on_update above always answers Demand::Continue")
+            }
             // #1570: routed through the shared predicate instead of a
             // hand-rolled copy of the same match (also used by
             // `try_foreach_step_alternatives`'s two retries and
@@ -36522,7 +36537,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
             // doc comment for the #1620/#1660 decode-failure exclusion this
             // absorbs unchanged (not currently reachable through any live
             // input here, kept for parity with the sibling functions).
-            Some(control) => {
+            Flow::Escaped(control) => {
                 if is_retryable_control(&control, is_last) {
                     continue;
                 }
@@ -36920,7 +36935,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // (the `&OwnedValue` signature below leaves no other option), so
         // it only shrinks the constant factor -- the fold itself remains
         // O(n^2) over a growing accumulator here; see #2157, whose own
-        // fix is [`fold_step_via_accumulator_or_fork`] below, for the
+        // fix is [`fold_step_each`] below, for the
         // genuinely owned sibling `reduce`'s own fold loop calls instead
         // of this borrowed one.
         //
@@ -36948,7 +36963,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// a literal-shaped right operand `to_owned`-able with no input access) --
 /// the common `reduce`/`foreach`/`until`/`while` UPDATE-body accumulator
 /// idiom both [`eval_owned_fast_path`]'s own arm and #2157's genuinely
-/// owned [`fold_step_via_accumulator_or_fork`] fast-path. `None` for any other
+/// owned [`fold_step_each`] fast-path. `None` for any other
 /// shape, including a syntactically-`Arithmetic` one whose right operand
 /// isn't [`literal_shaped_expr_to_owned`]-recognizable.
 fn owned_arith_accumulator_shape(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
@@ -36992,30 +37007,46 @@ fn owned_arith_accumulator_shape(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
 /// `docs/compliance/jq/limitations.md`'s #2157 section for the measured
 /// (modest, non-asymptotic) result there.
 ///
-/// On a match, returns the exact `(Vec<OwnedValue>, Option<Control>)`
-/// shape [`eval_owned_expr_fork`] itself returns for this same expression
-/// (`(vec![v], None)` on success, `(Vec::new(), Some(Control::Error(e)))`
-/// or `(Vec::new(), None)` when `optional` suppresses the error) -- so the
-/// caller's own `update_vals`/`update_control` handling downstream
-/// (retry-on-`?//`-alternative included) needs no changes either way.
-/// Deliberately doesn't replicate `eval_owned_expr_fork`'s own
-/// `?//`-retry/decode-failure semantics for the failing-combine case --
-/// new surface for exactly the kind of subtle regression #2237's own
-/// review already caught twice in a similarly "looks like a safe
-/// mechanical copy" refactor (#2389), for a case that isn't the O(n^2)
-/// driver this fix targets in the first place.
-fn fold_step_via_accumulator_or_fork<S: EvalSemantics>(
+/// On a match, calls `on_update` exactly once with the combined value and
+/// reports the same terminal [`Flow`] [`eval_each_owned`] itself would for
+/// this same expression -- `Flow::Exhausted`/`Flow::Stopped` from
+/// `on_update`'s own answer, or `Flow::Escaped(Control::Error(e))` (silently
+/// dropped -- no call to `on_update` at all -- when `optional` suppresses
+/// it) on a failing combine. Deliberately doesn't replicate
+/// `eval_owned_expr_fork`'s own `?//`-retry/decode-failure semantics for the
+/// failing-combine case -- new surface for exactly the kind of subtle
+/// regression #2237's own review already caught twice in a similarly
+/// "looks like a safe mechanical copy" refactor (#2389), for a case that
+/// isn't the O(n^2) driver this fix targets in the first place.
+///
+/// #2668: sink-shaped rather than `Vec`-collecting, so a consumer's
+/// `Demand::Stop` -- reported by `on_update` itself, e.g. after EXTRACT (or
+/// the implicit-identity push) it drives -- reaches a `?//` bind sitting
+/// inside `expr` the same way #2180 already let it reach EXTRACT and the
+/// source. `on_update`'s own richer verdict (which alternative to retry,
+/// which `Control` to propagate) isn't carried in this `Flow` -- like
+/// [`foreach_forks`]'s `ended`, that has to be recorded out-of-band by
+/// `on_update` itself, because a sink can only answer `Demand`. This
+/// `Flow` is only the fallback for when `on_update` never recorded
+/// anything of its own: `expr` produced nothing (an `optional`-suppressed
+/// combine failure or an empty general-path stream), or its own generator
+/// escaped without `on_update` ever seeing a stop.
+fn fold_step_each<S: EvalSemantics>(
     expr: &Expr,
     state: OwnedValue,
     optional: bool,
-) -> (Vec<OwnedValue>, Option<Control>) {
+    on_update: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
     match owned_arith_accumulator_shape(expr) {
         Some((op, rhs)) => match arith_combine::<S>(op, state, rhs) {
-            Ok(v) => (vec![v], None),
-            Err(_) if optional => (Vec::new(), None),
-            Err(e) => (Vec::new(), Some(Control::Error(e))),
+            Ok(v) => match on_update(v) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            },
+            Err(_) if optional => Flow::Exhausted,
+            Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        None => eval_owned_expr_fork::<S>(expr, &state, optional),
+        None => eval_each_owned::<S>(expr, &state, optional, on_update),
     }
 }
 
@@ -38235,46 +38266,40 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             return (state, Flow::Escaped(control));
         }
 
-        // #2157: `state` is fed into `fold_step_via_accumulator_or_fork` by
-        // value (see `try_reduce_step_alternatives`'s own identical call
-        // site), but unlike that sibling, the resulting `update_vals`
-        // can't be consumed right away here -- the EXTRACT loop just below
-        // still needs to borrow it. Setting the *next* `state` from
-        // `update_vals` is therefore deferred past that loop (see the
-        // `into_iter().last()` after it) instead of happening right here;
-        // review found an earlier version of this fix set `state` via
-        // `.last().cloned()` at this exact point, which clones the whole
-        // accumulator every step on top of the EXTRACT loop's own read of
-        // it -- paying both clones and confirmed (interleaved benchmark)
-        // to land zero measurable improvement. Deferring to `into_iter()`
-        // below removes one of those two clones, a real but modest win
-        // (~7%, measured) -- not `reduce`'s O(n) result, since the
-        // EXTRACT/output read is a second, structurally unavoidable read
-        // of `state` this fix was never going to eliminate on its own; see
-        // `fold_step_via_accumulator_or_fork`'s own doc comment and
-        // `docs/compliance/jq/limitations.md`'s #2157 section.
-        let (update_vals, update_control) =
-            fold_step_via_accumulator_or_fork::<S>(substituted_update, state, optional);
-
-        // EXTRACT (or the implicit identity when omitted) runs once per
-        // UPDATE output THIS alternative actually produced -- unconditionally,
-        // before checking `update_control` below, mirroring the pre-#1365
-        // code's own ordering: even an UPDATE that partially succeeds then
-        // errors still gets every one of its successful outputs extracted
-        // first (#494's "already-produced output doesn't vanish", applied
-        // per attempt, not just per element -- verified against the oracle:
-        // a partial attempt's own already-extracted output survives even
-        // when that same attempt goes on to fail and fall through to the
-        // next alternative; see this function's own doc comment).
-        // Iterated **by value** (#2180 WP3 review, the same rule #2157
-        // applied one level up): every terminal below hands `update_val` back
-        // as the accumulator, and every retry seeds `state` from it, so
-        // borrowing here meant five `update_val.clone()`s of a whole
-        // accumulator on paths that are about to drop the rest of the vector
-        // anyway. `last_update` carries the surviving one out instead of
-        // `update_vals.into_iter().last()`.
+        // #2668: EXTRACT (or the implicit identity when omitted) now runs
+        // from *inside* `on_update`, called once per UPDATE output as it is
+        // produced rather than after every output has been collected into a
+        // `Vec` -- so a consumer's `Demand::Stop` (from EXTRACT's own
+        // generator, or the implicit-identity `sink` call) reaches UPDATE's
+        // own generator before it produces anything further, and with it
+        // any `?//` bind inside UPDATE (see `fold_step_each`'s doc comment).
+        // Live against jq 1.7.1, input `1`:
+        // `[first(foreach (1) as $v (0; . + (1 as $x ?// $y | 1)))]` is
+        // `[1,1]` (UPDATE's own `?//` retries once on the consumer's stop),
+        // matching the identical rule EXTRACT's own chain already had
+        // (`[first(foreach (1) as $x (0; .+1; (1 as $a ?// $b | .)))]` is
+        // `[1,1,2,2]`).
+        //
+        // `on_update` can only answer `Demand`, so the richer verdict this
+        // loop needs (which alternative to retry, with what state, or which
+        // terminal `Flow` to return) is stashed in `outcome` -- the same
+        // out-of-band pattern [`foreach_forks`]'s own `ended` uses for
+        // exactly the same reason (a per-element sink can't itself `continue
+        // 'alternatives` across the closure boundary). `last_update` tracks
+        // the surviving accumulator when every EXTRACT call this attempt
+        // made stayed `Flow::Exhausted` -- `fold_step_each`'s own returned
+        // `Flow` in that case just reports "UPDATE's generator ran to
+        // completion/errored/produced nothing," never `Stopped` (nothing
+        // ever answered `Demand::Stop`), which is why the fallback match
+        // below never reaches the `Flow::Stopped` arm.
+        enum StepOutcome {
+            Retry(OwnedValue),
+            Return(OwnedValue, Flow),
+        }
+        let mut outcome: Option<StepOutcome> = None;
         let mut last_update: Option<OwnedValue> = None;
-        for update_val in update_vals {
+
+        let on_update = &mut |update_val: OwnedValue| -> Demand {
             // EXTRACT's own `Flow`, computed the same way whether EXTRACT is
             // written or implicit, so the arms below decide once rather than
             // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
@@ -38288,18 +38313,13 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // present, exactly as before -- the implicit-identity
                     // form performs no extra evaluation to charge for.
                     if let Some(control) = charge_budget(budget, "foreach") {
-                        // `state` was already moved into
-                        // `fold_step_via_accumulator_or_fork` above and not
-                        // yet reassigned (that happens after this loop), so
-                        // the accumulator this step is standing on is
-                        // `update_val` -- which is also the state a `?//`
-                        // retry at this same position would resume from
-                        // (#1458). The eager caller discards it (it aborts
-                        // the fold), but the lazy one can be re-entered by a
-                        // `?//` retry in the *source* generator after this
-                        // return, and then it is the register jq's own fold
-                        // would still be holding (#2180 WP3).
-                        return (update_val, Flow::Escaped(control));
+                        // `update_val` is also the state a `?//` retry at
+                        // this same position would resume from (#1458), but
+                        // a budget cap is never retryable -- straight to
+                        // the terminal, same as the pre-#2668 direct
+                        // `return` here.
+                        outcome = Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                        return Demand::Stop;
                     }
                     // #2180 WP3: EXTRACT is *driven* through the
                     // demand-forwarding [`eval_each_owned`] rather than
@@ -38336,7 +38356,10 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 },
             };
             match ext_flow {
-                Flow::Exhausted => {}
+                Flow::Exhausted => {
+                    last_update = Some(update_val);
+                    Demand::Continue
+                }
                 // The stop is jq's escaping `break` in different clothes,
                 // so it takes `Control::Break`'s own rule at this exact
                 // position -- retry the next alternative, seeded with the
@@ -38348,14 +38371,18 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // state `0` giving `1`, and the retried alternative runs
                 // UPDATE again on that `1`, giving `2`.
                 Flow::Stopped { .. } if is_retryable_stop(is_last) => {
-                    state = update_val;
-                    continue 'alternatives;
+                    outcome = Some(StepOutcome::Retry(update_val));
+                    Demand::Stop
                 }
                 // Nothing left to fall through to: the stop is this
                 // step's terminator, and `update_val` is the accumulator
                 // it leaves behind (see the budget arm above).
                 Flow::Stopped { .. } => {
-                    return (update_val, Flow::Stopped { pending: None });
+                    outcome = Some(StepOutcome::Return(
+                        update_val,
+                        Flow::Stopped { pending: None },
+                    ));
+                    Demand::Stop
                 }
                 // #1458: real jq retries here too, but with a state-
                 // threading rule found nowhere else in this file -- the
@@ -38364,38 +38391,57 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // attempt state and not `update_vals.last()` (this same
                 // attempt's own final UPDATE output, which may not even
                 // be `update_val` -- the failure can land on an earlier
-                // one while later ones sit unprocessed). Any of
-                // `update_vals` after this point, and this attempt's
-                // own trailing `update_control` (if UPDATE itself also
-                // partially failed), are both abandoned in favor of the
-                // next alternative's fresh UPDATE-then-EXTRACT run --
-                // matching the doc comment's oracle repro, where the
-                // retry re-runs UPDATE wholesale rather than resuming
-                // this attempt's own remaining outputs.
+                // one while later ones sit unprocessed). Every subsequent
+                // UPDATE output this attempt would have gone on to produce,
+                // and this attempt's own trailing terminator (if UPDATE
+                // itself also partially failed), are both abandoned in
+                // favor of the next alternative's fresh UPDATE-then-EXTRACT
+                // run -- matching the doc comment's oracle repro, where the
+                // retry re-runs UPDATE wholesale rather than resuming this
+                // attempt's own remaining outputs. `on_update` answering
+                // `Demand::Stop` here is exactly what stops UPDATE's own
+                // generator from producing those later outputs at all.
                 Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
-                    state = update_val;
-                    continue 'alternatives;
+                    outcome = Some(StepOutcome::Retry(update_val));
+                    Demand::Stop
                 }
                 // Same accumulator-on-abort reasoning as the budget-check
                 // return above.
                 Flow::Escaped(control) => {
-                    return (update_val, Flow::Escaped(control));
+                    outcome = Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                    Demand::Stop
                 }
             }
-            last_update = Some(update_val);
-        }
+        };
 
-        // Only reached once the loop above has run to completion without
-        // retrying (a retry already set `state` itself and jumped straight to
-        // the next `'alternatives` iteration, skipping this) -- mirroring
-        // `try_reduce_step_alternatives`'s own `into_iter().last()`, which
-        // this replaces now that the loop consumes `update_vals`.
-        state = last_update.unwrap_or(OwnedValue::Null);
+        let update_flow = fold_step_each::<S>(substituted_update, state, optional, on_update);
 
-        match update_control {
-            None => return (state, Flow::Exhausted),
-            Some(control) if is_retryable_control(&control, is_last) => continue,
-            Some(control) => return (state, Flow::Escaped(control)),
+        match outcome {
+            Some(StepOutcome::Retry(update_val)) => {
+                state = update_val;
+                continue 'alternatives;
+            }
+            Some(StepOutcome::Return(update_val, flow)) => {
+                return (update_val, flow);
+            }
+            // `on_update` was never called with an output that led it to
+            // answer `Demand::Stop` -- either because UPDATE produced no
+            // output at all (an `optional`-suppressed combine failure, or a
+            // general-path stream with zero outputs), or every output it did
+            // produce ran through EXTRACT and stayed `Flow::Exhausted`. Either
+            // way `update_flow` (UPDATE's own generator terminal) is the
+            // fallback, exactly mirroring the old `update_control` check.
+            None => {
+                state = last_update.take().unwrap_or(OwnedValue::Null);
+                match update_flow {
+                    Flow::Exhausted => return (state, Flow::Exhausted),
+                    Flow::Stopped { .. } => unreachable!(
+                        "on_update always records an `outcome` before answering Demand::Stop"
+                    ),
+                    Flow::Escaped(control) if is_retryable_control(&control, is_last) => continue,
+                    Flow::Escaped(control) => return (state, Flow::Escaped(control)),
+                }
+            }
         }
     }
 
@@ -38841,7 +38887,7 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
 /// outermost loop, #534, and it must be evaluated before the source is ever
 /// pulled, #2440 — so it is collected here, exactly as [`eval_foreach`]
 /// collects it) and **UPDATE** (driving it demands reshaping
-/// [`fold_step_via_accumulator_or_fork`], which `reduce`'s own O(n)
+/// [`fold_step_each`], which `reduce`'s own O(n)
 /// accumulator fix shares).
 ///
 /// The INIT fan-out loop stays outer, so the source is driven afresh per
@@ -71852,7 +71898,7 @@ mod tests {
 
     #[test]
     fn test_2157_owned_arith_accumulator_shape_recognizes_and_rejects_correctly() {
-        // Direct unit coverage of the shape-check `fold_step_via_accumulator_or_fork`
+        // Direct unit coverage of the shape-check `fold_step_each`
         // gates on: `Some` only for a bare `Identity`-left `Arithmetic` whose
         // right side `literal_shaped_expr_to_owned` can convert with no
         // input access, `None` for everything else (including a
@@ -71891,7 +71937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_2157_fold_step_via_accumulator_or_fork_borrows_state_on_shape_mismatch() {
+    fn test_2157_fold_step_each_borrows_state_on_shape_mismatch() {
         // On a shape mismatch, `owned_arith_accumulator_shape` (which only
         // ever inspects `&expr`) has already decided `None` before `state`
         // is touched at all, so the `None` arm borrows it for
@@ -71910,27 +71956,30 @@ mod tests {
     }
 
     #[test]
-    fn test_2157_fold_step_via_accumulator_or_fork_suppresses_error_when_optional() {
-        // `fold_step_via_accumulator_or_fork`'s `Err(_) if optional` arm
-        // mirrors `eval_owned_fast_path`'s own identical convention for
-        // this same `. + <literal>` shape (#2086) -- exercised directly
-        // here since no ordinary jq syntax reaches it *through*
-        // `reduce`/`foreach`'s own callers: `Expr::Try`/`Expr::Optional`
-        // never force `optional = true` into the expression they wrap
-        // (#693 -- see the `scalar_noop` binding's doc comment in
-        // `update_path` for the established precedent), so `(reduce ...)?`
-        // catches a per-step error via its own outer `eval_try`, not by
-        // setting this flag. Unit-level-only coverage, not
-        // jq-oracle-verifiable through any surface syntax.
+    fn test_2157_fold_step_each_suppresses_error_when_optional() {
+        // `fold_step_each`'s `Err(_) if optional` arm mirrors
+        // `eval_owned_fast_path`'s own identical convention for this same
+        // `. + <literal>` shape (#2086) -- exercised directly here since no
+        // ordinary jq syntax reaches it *through* `reduce`/`foreach`'s own
+        // callers: `Expr::Try`/`Expr::Optional` never force `optional =
+        // true` into the expression they wrap (#693 -- see the
+        // `scalar_noop` binding's doc comment in `update_path` for the
+        // established precedent), so `(reduce ...)?` catches a per-step
+        // error via its own outer `eval_try`, not by setting this flag.
+        // Unit-level-only coverage, not jq-oracle-verifiable through any
+        // surface syntax.
         let expr = Expr::Arithmetic {
             op: ArithOp::Add,
             left: Box::new(Expr::Identity),
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
         };
-        let (vals, control) =
-            fold_step_via_accumulator_or_fork::<JqSemantics>(&expr, OwnedValue::Int(1), true);
-        assert!(vals.is_empty());
-        assert!(control.is_none());
+        let mut on_update_calls = 0;
+        let flow = fold_step_each::<JqSemantics>(&expr, OwnedValue::Int(1), true, &mut |_| {
+            on_update_calls += 1;
+            Demand::Continue
+        });
+        assert_eq!(on_update_calls, 0);
+        assert!(matches!(flow, Flow::Exhausted));
     }
 
     #[test]
