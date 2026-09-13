@@ -8958,15 +8958,6 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
         }
 
-        // #2693: the parameterised `recurse` spellings, and the bare one
-        // with no live cursor to walk, stream their visited nodes through
-        // the owned walker `eval::builtin_recurse_f`/`builtin_recurse_cond`
-        // already use. Without this they fell to the `eval_single` wildcard
-        // below, which builds the whole 10000-item walk before a bounded
-        // consumer can truncate it -- and runs `f` at every one of those
-        // nodes, where jq emits a node *before* evaluating `f` on it and so
-        // never pays for the children of a node its consumer was already
-        // satisfied by.
         // #2908: `path(f)` is a generator, so a consumer satisfied by the
         // first path must be able to stop `f`. The guard mirrors the eager
         // arm's own two gates rather than restating the decision: a
@@ -8974,8 +8965,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // navigation, nothing observable per output, and the #2061/#2168
         // route that avoids materializing the document at all), and a
         // document the reindex bridge would not round-trip identically
-        // keeps the bridge. What is left is exactly the shape whose `f` can
-        // have side effects.
+        // keeps the bridge -- and so keeps the collecting behaviour, a
+        // recorded residual (#2925).
         Expr::Builtin(Builtin::Path(path_expr))
             if !(cursor.is_some() && path_expr_is_cursor_navigable(path_expr)) =>
         {
@@ -8990,8 +8981,15 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
             if !reindex_bridge_is_identity(&owned) {
+                // Hand the bridge the document already materialized above,
+                // the way the eager arm does -- re-entering `eval_single`
+                // would run `RootWitness::of` + `demote_rebuilt_markers` +
+                // `to_owned_with_cursor` a second time over the whole
+                // document to rebuild exactly these values.
+                let owned_builtin_expr = Expr::Builtin(Builtin::Path(path_expr.clone()));
+                let builtin_expr = demote_rebuilt_markers(&owned_builtin_expr, &root);
                 return drain_result_generic(
-                    eval_single::<S, V>(expr, value, optional, cursor),
+                    eval_on_owned::<S, _>(&builtin_expr, owned, optional),
                     sink,
                 );
             }
@@ -8999,6 +8997,15 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 sink.push(GenericItem::Owned(v))
             })
         }
+        // #2693: the parameterised `recurse` spellings, and the bare one
+        // with no live cursor to walk, stream their visited nodes through
+        // the owned walker `eval::builtin_recurse_f`/`builtin_recurse_cond`
+        // already use. Without this they fell to the `eval_single` wildcard
+        // below, which builds the whole 10000-item walk before a bounded
+        // consumer can truncate it -- and runs `f` at every one of those
+        // nodes, where jq emits a node *before* evaluating `f` on it and so
+        // never pays for the children of a node its consumer was already
+        // satisfied by.
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
             let f = Expr::Optional(Box::new(Expr::Iterate));
             each_recurse_generic::<S, V>(&f, None, value, cursor, sink)

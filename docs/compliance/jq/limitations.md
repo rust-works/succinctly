@@ -1267,6 +1267,16 @@ answers `["b"]` — and classified the two residuals appended below):
   the consumer's stop back into the generator. Pure navigation fan-out (`path(.[])`,
   `path(.a[])`) always agreed — nothing in it is observable per element — and keeps #2061/
   #2168's no-materialization cursor walk untouched.
+
+  **Two shapes still collect**, neither introduced by that work and both tracked as
+  [#2925](https://github.com/rust-works/succinctly/issues/2925). A document the reindex bridge
+  will not round-trip identically (any `Float`, or a number literal too large to survive the
+  trip) takes the bridge, which collects — so the *document*, not the filter, selects the
+  route: `[limit(1; path((.a|stderr),(.b|stderr)))]` writes `1` on `{"a":1,"b":2}` and `12`
+  once a 300-digit literal is added. And the stop reaches the branch producer but not a
+  generator in *index* position: `[limit(1; path(.[("a"|stderr),("b"|stderr)]))]` writes `ab`
+  where jq writes `a`, which is `resolve_index_expr`'s eager key evaluation — the same function
+  #2032 sits in.
 - **`recurse(f)`/`recurse(f; cond)` finishes one node's own `f` before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
