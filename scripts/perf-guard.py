@@ -49,16 +49,30 @@ otherwise unverified in yq mode at all) -- #2655 adds a second yq-mode row,
 see below.
 
 #2655 added a second class the original set missed entirely: every query
-above it reads only, so none exercises `resolve_node`/`resolve_node_sink`
-(`src/jq/eval.rs`) or anything beneath it -- the resolver `del()`/`=`/`|=`/
-`path(...)` and an `as` binding used inside one of those route through. A
-regression confined to that resolver passed this guard at -0.0% no matter
-how large (#2042's own +21-33%, the incident that exposed the gap). The
-`users_del_select`/`users_del_bound_select`/`users_assign_scores`/
-`users_path_walk` rows cover jq-mode path-mode; `users_yq_del_select` covers
-yq-mode writes, which take a different route (`evaluate_yaml_cursor`'s DOM
-path in `src/bin/succinctly/yq_runner.rs`) than the jq-mode rows above and
-that `users_yq_keys_unsorted` (a read) never exercised either.
+above it reads only, so none exercised the write/path machinery at all --
+`del()`/`=`/`path(...)` and an `as` binding route through one of *two*
+walkers depending on shape (`needs_path_prepass`, `src/jq/eval.rs`): a
+plain `Identity`/`Field`/`Index`/`Slice`/`Iterate` chain (nested under
+`Pipe`/`Paren`/`Optional`) takes the single-path walkers (`walk_path`/
+`set_path`/`set_path_steps`/`update_path`/`delete_at_path`); anything else
+-- a computed key, a `Comma`, or a control-flow shape like `select`/`as`/
+`..`/`if` -- needs `resolve_node`/`resolve_node_sink` first. A regression
+confined to either was invisible before this issue (#2042's own +21-33%,
+the incident that exposed the gap, was in `resolve_node_sink`'s own
+`as`-binding/frame-witness machinery). `users_del_select` (a `select`) and
+`users_del_bound_select` (an `as` binding, #2042's own shape) exercise
+`resolve_node`/`resolve_node_sink`; `users_assign_scores`/`users_path_walk`
+are plain field/iterate targets, so they exercise the single-path walkers
+instead -- first-ever coverage for that route, not a second instance of the
+`resolve_node_sink` coverage the other two rows already give. `|=` is not
+yet covered by any row either way (tracked as #2905, since a row for it
+needs the same `select`/`as`-shaped target the two `del_*` rows above use
+to actually reach `resolve_node_sink`, not a plain field target, which
+would only re-cover the single-path walkers already-covered above).
+`users_yq_del_select` covers yq-mode writes, which take a different route
+(`evaluate_yaml_cursor`'s DOM path in `src/bin/succinctly/yq_runner.rs`)
+than any jq-mode row above and that `users_yq_keys_unsorted` (a read) never
+exercised either.
 
 Fixtures are generated fresh each run (`succinctly json generate --seed
 <fixed>`) rather than checked in, so instruction counts stay meaningful
@@ -145,11 +159,17 @@ QUERIES = [
     ("arrays_first_map_iterate", "arrays", "2mb", "jq", "first(map(length) | .[])"),
     ("arrays_map_iterate", "arrays", "2mb", "jq", "map(length) | .[]"),
     # #2655: path-mode rows. Every query above reads only -- none exercises
-    # `resolve_node`/`resolve_node_sink` (`src/jq/eval.rs`) or anything under
-    # it, so a regression confined to that resolver (like #2042's own
-    # +21-33%) passes this guard at -0.0% no matter how large. Four rows on
-    # the existing `users`/`2mb` fixture, each naming the resolver path it
-    # watches:
+    # the write/path machinery at all, so a regression confined to it (like
+    # #2042's own +21-33%, in `resolve_node_sink`'s `as`-binding machinery)
+    # passes this guard at -0.0% no matter how large. Four rows on the
+    # existing `users`/`2mb` fixture: the two `del_*` rows below have a
+    # `select`/`as` in them, so `needs_path_prepass` routes them through
+    # `resolve_node`/`resolve_node_sink` (`src/jq/eval.rs`) -- the general
+    # resolver #2042 hit; `users_assign_scores`/`users_path_walk` are plain
+    # field/iterate targets, so they route through the single-path walkers
+    # (`walk_path`/`set_path`) instead -- a different route, not a second
+    # instance of the same coverage. See the module docstring for the full
+    # split, and #2905 for `|=`, not yet covered either way.
     ("users_del_select", "users", "2mb", "jq", "del(.users[] | select(.score < 100))"),
     (
         "users_del_bound_select",
@@ -211,12 +231,17 @@ EPILOG = (
     "isolates whether a regression is object-specific) and one `yq`-mode "
     "query (the shared evaluator's cost is otherwise unverified in yq mode "
     "at all) -- #2655 adds a second yq-mode row below. #2655 also added "
-    "path-mode coverage on top of that: del()/=/"
-    "path(...) and an as binding, in both jq mode (four `users_*` rows) and "
-    "yq mode (`users_yq_del_select`, since yq-mode writes take a different "
-    "route than jq-mode ones) -- every row before #2655 read only, so a "
-    "regression confined to the write/path resolver passed at -0.0% no "
-    "matter how large."
+    "path-mode coverage on top of that: every row before #2655 read only, "
+    "so a regression confined to del()/=/path(...)/an as binding's resolver "
+    "passed at -0.0% no matter how large. users_del_select/"
+    "users_del_bound_select exercise resolve_node/resolve_node_sink "
+    "(needs_path_prepass's multi-path route); users_assign_scores/"
+    "users_path_walk exercise the single-path walkers instead (a plain "
+    "field/iterate target skips resolve_node entirely) -- first coverage "
+    "for that route, not a second instance of the other two rows'. "
+    "users_yq_del_select covers yq-mode writes (a different route, "
+    "evaluate_yaml_cursor's DOM path) than any jq-mode row. |= is not yet "
+    "covered either way -- #2905."
 )
 
 
