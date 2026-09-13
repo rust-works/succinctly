@@ -42813,6 +42813,207 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     Ok(())
 }
 
+/// #2693: `recurse(f)`/`recurse(f; cond)` evaluate `f` at a node only if the
+/// consumer still wants more output.
+///
+/// jq's `recurse` is `def r: ., (f | r); r;` -- the node is emitted *before*
+/// `f` runs on it -- so a consumer satisfied by the node itself never pays
+/// for that node's children. Neither evaluator had a lazy arm for the
+/// parameterised spellings, so both fell to the collecting route, walked to
+/// `RECURSE_MAX_ITEMS`, and ran `f` at every one of those nodes before a
+/// bounded consumer could truncate the finished list: the first row below
+/// wrote **20000** DEBUG lines for a five-node document where jq writes
+/// none.
+///
+/// Every row's stdout, stderr and exit code is captured whole from jq 1.7.1,
+/// so the side-effect count is pinned exactly rather than bounded. The
+/// delivered values never differed before or after -- the unbounded rows are
+/// here to keep it that way.
+#[test]
+fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
+    let doc = r#"{"a":{"x":1},"b":{"y":2}}"#;
+    let dbg = |v: &str| format!("[\"DEBUG:\",{v}]\n");
+    for (input, filter, want_out, want_err, want_code) in [
+        // A consumer satisfied by the root itself: `f` never runs at all.
+        (
+            doc,
+            "[limit(1; recurse((.a|debug), (.b|debug)))]",
+            format!("[{doc}]\n"),
+            String::new(),
+            0,
+        ),
+        (
+            doc,
+            "[first(recurse((.a|debug), (.b|debug)))]",
+            format!("[{doc}]\n"),
+            String::new(),
+            0,
+        ),
+        (
+            doc,
+            "[limit(1; recurse(.[]?|debug))]",
+            format!("[{doc}]\n"),
+            String::new(),
+            0,
+        ),
+        // ... including through `cond`, whose own evaluation is equally
+        // deferred -- neither `f` nor `cond` runs.
+        (
+            doc,
+            "[limit(1; recurse(.[]?|debug; true))]",
+            format!("[{doc}]\n"),
+            String::new(),
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[limit(1; recurse(.[]?; ("c"|stderr|true)))]"#,
+            "[{\"a\":1}]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // Other bounded consumers reach the same arm: `isempty` needs one
+        // output, `break` takes one and leaves.
+        (
+            doc,
+            "isempty(recurse(.[]?|debug))",
+            "false\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            doc,
+            "[label $o | (recurse(.[]?|debug) | ., break $o)]",
+            format!("[{doc}]\n"),
+            String::new(),
+            0,
+        ),
+        // An `f` that errors, and an `f` that halts, are never reached when
+        // the bound is already satisfied -- the halt row is the one that used
+        // to leak (it is the shape `test_short_circuit_side_effect_leaks_820_932_987`
+        // held until this landed).
+        (
+            r#"{"a":1}"#,
+            r#"[limit(1; recurse(.[]?, ("x"|stderr|error("f"))))]"#,
+            "[{\"a\":1}]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "0",
+            r#"[limit(1; recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end))]"#,
+            "[0]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // Unbounded: every value, every side effect, exactly as before. A
+        // deferred `f` must not become a *skipped* `f`.
+        (
+            "0",
+            "[recurse(if . < 3 then (.+1|debug) else empty end)]",
+            "[0,1,2,3]\n".to_string(),
+            format!("{}{}{}", dbg("1"), dbg("2"), dbg("3")),
+            3 - 3,
+        ),
+        (
+            "0",
+            r#"[recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)]"#,
+            String::new(),
+            "x".to_string(),
+            3,
+        ),
+        (
+            "[1,[2,[3]]]",
+            "[recurse(.[]?)] | length",
+            "6\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // A partial bound still runs `f` for the nodes it does reach, and no
+        // further: two outputs wanted, so `f` runs at the root only.
+        (
+            "0",
+            "[limit(2; recurse(if . < 5 then (.+1|debug) else empty end))]",
+            "[0,1]\n".to_string(),
+            dbg("1"),
+            0,
+        ),
+        // Path mode was already node-bounded (#2235) and is unchanged.
+        (
+            doc,
+            "[path(limit(1; recurse(.[]?|debug)))]",
+            "[[]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2918, the residual #2693 deliberately does **not** close: `f` is still
+/// run to completion at the node the traversal is at, because the walk is an
+/// explicit stack of materialized nodes and `f` is driven by a push-based
+/// sink that cannot be suspended between its own outputs. jq descends into
+/// `f`'s first output's whole subtree before asking `f` for its second.
+///
+/// Each row records what jq does and what succinctly does, so closing #2918
+/// trips this test rather than passing silently. Values match in every row;
+/// only stderr differs, and in the third only its *order*.
+#[test]
+fn recurse_still_finishes_a_nodes_f_before_descending_2918() -> Result<()> {
+    for (input, filter, want_out, jq_err, our_err) in [
+        // Under a bound: one node's fan-out too many. Before #2693 this was
+        // five DEBUG lines (the whole remaining tree), not two.
+        (
+            "[1,[2,[3]]]",
+            "[limit(2; recurse(.[]?|debug))]",
+            "[[1,[2,[3]]],1]\n",
+            "[\"DEBUG:\",1]\n",
+            "[\"DEBUG:\",1]\n[\"DEBUG:\",[2,[3]]]\n",
+        ),
+        // Through `?`, one extra `f` run at the node that errors.
+        (
+            r#"{"a":1}"#,
+            r#"[recurse(.[]?, ("x"|stderr|error("f")))?]"#,
+            "[{\"a\":1},1]\n",
+            "x",
+            "xx",
+        ),
+        // Unbounded, it is stderr *ordering*: a node's whole fan-out is
+        // evaluated before its first child is descended into.
+        (
+            r#"{"a":{"x":1},"b":{"y":2}}"#,
+            "[recurse(.[]?|debug)]",
+            "[{\"a\":{\"x\":1},\"b\":{\"y\":2}},{\"x\":1},1,{\"y\":2},2]\n",
+            "[\"DEBUG:\",{\"x\":1}]\n[\"DEBUG:\",1]\n[\"DEBUG:\",{\"y\":2}]\n[\"DEBUG:\",2]\n",
+            "[\"DEBUG:\",{\"x\":1}]\n[\"DEBUG:\",{\"y\":2}]\n[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_ne!(
+            our_err, jq_err,
+            "{filter}: this row exists because the two differ -- if they no longer do, \
+             move it into `recurse_runs_f_only_on_demand_2693`"
+        );
+        assert_eq!(
+            stderr, our_err,
+            "{filter}: #2918's residual changed -- if it closed, move this row into \
+             `recurse_runs_f_only_on_demand_2693` with jq's own stderr ({jq_err:?})"
+        );
+    }
+    Ok(())
+}
+
 /// #2694: `resolve_node_sink`'s three remaining *collecting* arms now stream
 /// their generator, so a demand-driven consumer -- a `reduce`/`foreach`
 /// source, pulled one value at a time since #2235 -- stops the generator
