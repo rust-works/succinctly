@@ -1992,11 +1992,16 @@ Option<&V::Cursor>` down through every recursive call (the same shape
 `to_owned_at_depth` already used, #2358), so `empty_fields_tail_gap_ok`/
 `empty_elements_tail_gap_ok` can run for a `{,}`/`[,]` nested at any depth
 inside a `paths`/`leaf_paths` walk, not only the outermost container the
-dispatch site's own pre-check covered. `getpath_walk_cursor`'s two
-child-miss exits (`find_cursor` returning `Ok(None)`, an out-of-range
-`get_cursor`) run the same check against the container they just failed to
-find a child in before answering `null`, closing the gap `.b.x`-style
-navigation already closed via #2594's `Expr::Field`/`Index` arms.
+dispatch site's own pre-check covered. Its array arm also switched from a
+bare-value walk to `collect_cursors_checked` (review finding, not the
+original draft), so a *non-empty* array with a mid-list or trailing stray
+comma nested inside the walk raises too, matching what `.a[]` already did
+on the same document -- a first pass that only added the zero-element
+check left this half open. `getpath_walk_cursor`'s two child-miss exits
+(`find_cursor` returning `Ok(None)`, an out-of-range `get_cursor`) run the
+object/array-specific check directly against the container already in
+scope before answering `null`, closing the gap `.b.x`-style navigation
+already closed via #2594's `Expr::Field`/`Index` arms.
 
 Still open, unchanged by #2594/#2731: the same shape reached through
 `to_owned_at_depth`'s cursor-less top-level callers (#2262 above) -- no

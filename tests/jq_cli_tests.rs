@@ -27687,6 +27687,45 @@ fn test_jq_nested_value_domain_walks_empty_container_now_raises_2731() -> Result
     Ok(())
 }
 
+/// #2731 (review): `collect_paths_generic`'s array arm needs the same
+/// per-element/trailing gap checking as its object arm gets for free from
+/// `effective_fields_checked` -- a first draft switched to `uncons_cursor`
+/// purely to have a cursor to hand recursion, but the raw loop that used
+/// dropped `element_gap_ok`/the trailing-comma-after-a-real-element check
+/// entirely, so a *non-empty* array with a stray comma nested inside a
+/// `paths`/`leaf_paths` walk silently walked past it -- confirmed live that
+/// `.a[]` on the same document already raised where `[paths]` did not.
+/// Fixed by routing the array arm through `collect_cursors_checked`
+/// (already used at other call sites in this file) instead of a second
+/// hand-written copy of `to_owned_at_depth`'s own inline checks.
+#[test]
+fn test_jq_nested_paths_array_stray_comma_with_real_elements_now_raises_2731() -> Result<()> {
+    for (input, query) in [
+        // Trailing comma after a real last element (#2261's own shape).
+        (r#"{"a":[1,2,]}"#, "[paths]"),
+        ("[1,2,]", "[paths]"),
+        // Mid-list stray comma (zero-width "element" between two commas).
+        (r#"{"a":[1,,2]}"#, "[paths]"),
+        ("[1,,2]", "leaf_paths"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: expected the #2211 raise, got out={out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2731: that raise fires on a *malformed* nested container only -- a
 /// genuinely empty one (`{}`/`[]`) reached the same way is unaffected,
 /// mirroring `test_jq_genuinely_empty_containers_unaffected_2594`'s own
@@ -27701,6 +27740,14 @@ fn test_jq_nested_value_domain_walks_wellformed_unaffected_2731() -> Result<()> 
         (r#"{"a":1,"b":{}}"#, r#"getpath(["b","x"])"#, "null"),
         (r#"{"a":1,"b":[]}"#, r#"getpath(["b",0])"#, "null"),
         ("[[]]", "[paths]", "[[0]]"),
+        // #2731 (review): a well-formed *non-empty* nested array, the
+        // shape the array-arm gap-check fix must not touch.
+        (
+            r#"{"a":[1,2,3]}"#,
+            "[paths]",
+            r#"[["a"],["a",0],["a",1],["a",2]]"#,
+        ),
+        ("[1,2,3]", "[leaf_paths]", "[[0],[1],[2]]"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
         assert_eq!(code, 0, "input={input} query={query}: stderr {stderr:?}");
