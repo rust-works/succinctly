@@ -44506,6 +44506,113 @@ fn test_foreach_extract_untaken_branch_navigation_is_a_known_residual_2860() -> 
     Ok(())
 }
 
+/// #2732 (Shape 1): `fold_source_ambient`'s fork-0 arm decided SOURCE's own
+/// trackability with a pure path comparison (`branch_provenance`), never
+/// consulting the `null`/`bool` kind-equality rule
+/// (`register_identical`'s `null_bool_identical` clause) the *later*-fork
+/// arm of the same function already ORs in. A `null`/`bool` document is
+/// `jv_identical` to a `null`/`bool` register in real jq regardless of
+/// position, so `path(reduce .a as $k (.b; .))` on `null` -- register
+/// `null` at `.b`, document `null` at root, no path match -- raised an
+/// untracked-navigation error before jq's own kind check ever ran.
+/// jq-mode only: real yq's lexer rejects `reduce`/`foreach`/`path`
+/// outright.
+#[test]
+fn test_fold_source_null_bool_document_reestablishes_against_register_2732() -> Result<()> {
+    for (input, filter, expected) in [
+        ("null", "path(reduce .a as $k (.b; .))", r#"["b"]"#),
+        (
+            "null",
+            "path(foreach .a as $k (.b; .c; .d))",
+            r#"["b","a","c","d"]"#,
+        ),
+        ("null", "path(reduce .[]? as $k (.b; .))", r#"["b"]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}`");
+    }
+
+    // The write side: the same reestablishment must support `=`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(reduce .a as $k (.b; .)) = 5"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#"{"b":5}"#);
+
+    // `.[]` (unsuppressed) on a `null` register is a genuine iteration
+    // error once SOURCE is intact, not a path-tracking refusal -- the two
+    // must not be conflated by this fix.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(reduce .[] as $k (.b; .))"], Some("null"))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null (null)"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2732 (Shape 1, must-not-regress): an *object*/array document is never
+/// identical to a `null`/`bool` register regardless of value equality --
+/// `register_identical`'s kind-equality clause only ever fires for
+/// `null`/`true`/`false`, so this fix cannot promote a container. `true`
+/// negative control is a type error from `.b` itself, unrelated to
+/// register tracking at all.
+#[test]
+fn test_fold_source_null_bool_document_wellformed_unaffected_2732() -> Result<()> {
+    for (input, filter, want_fragment) in [
+        (
+            r#"{"b":null}"#,
+            "path(reduce .a as $k (.b; .))",
+            r#"Invalid path expression near attempt to access element "a" of {"b":null}"#,
+        ),
+        (
+            "true",
+            "path(reduce .a as $k (.b; .))",
+            "Cannot index boolean with string \"b\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            stdout, "",
+            "input={input} filter={filter}: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(want_fragment),
+            "input={input} filter={filter}: stderr: {stderr:?}"
+        );
+        assert_eq!(
+            code, 5,
+            "input={input} filter={filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2732 (Shape 2, known residual): `reduce`'s mid-step register position
+/// is message-only wrong -- see `resolve_reduce`'s own doc comment and
+/// `docs/compliance/jq/limitations.md` for the full mechanism. Exit codes
+/// and values already agree with jq; only the error text differs. Pinned
+/// so a future change to this area notices if the wording either
+/// coincidentally starts matching (worth promoting) or drifts further.
+#[test]
+fn test_reduce_mid_step_register_position_is_a_known_message_only_residual_2732() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce .[] as $k (.; .a))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1576 moved every shape `can_use_m2_streaming` admits onto the cursor
 /// streamer, which quietly took the *existing* suite's only coverage of
 /// `print_json`'s own pretty-container, empty-container, `null`/`true`,

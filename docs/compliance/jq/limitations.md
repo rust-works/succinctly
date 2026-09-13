@@ -1204,7 +1204,11 @@ adds the register threading that closes it instead of reopening it; re-run again
 succeeds" count for this whole fold-source area dropped from 67 to 3, with no increase in any
 other divergence category.
 
-Five residual divergences remain in this area:
+Seven residual divergences remain in this area (the first five predate
+[#2732](https://github.com/rust-works/succinctly/issues/2732); that issue closed a separate,
+sixth bug in `fold_source_ambient`'s fork-0 arm — a `null`/`bool` document did not reestablish
+against an equal-valued register, `path(reduce .a as $k (.b; .))` on `null` raised where jq
+answers `["b"]` — and classified the two residuals appended below):
 
 - **A fold source whose navigation is discarded by a later non-navigating stage still
   clobbers jq's real path register, undetected.** `path(foreach (.a|tostring) as $k (.; .a))`
@@ -1263,6 +1267,41 @@ Five residual divergences remain in this area:
   would hand the *unchanged target* to the fold where the evaluator raises. `succinctly yq`
   therefore still path-checks with `Keep::First` and then drives its values by value
   through `eval_each_owned`; only the jq-mode value reuse is new.
+- **`reduce`'s mid-step register position is message-only wrong ([#2732](https://github.com/rust-works/succinctly/issues/2732)).**
+  `resolve_reduce` checks every UPDATE step against the fold's persistent register, never a
+  per-step one seeded from a navigating SOURCE element the way `resolve_foreach` already does
+  — correctly, for the *final* re-entry check (`path(reduce (.[]) as $k (.; .))` on
+  `{"a":[1,2]}` is `[]` in both, jq's own path-restoring `FORK`/`BACKTRACK` at the exit
+  boundary). But jq's `gen_reduce` bytecode is `DUPN, source, …` with no `SUBEXP` around it,
+  so *inside* a step the register genuinely sits where SOURCE left it — the same per-step
+  position `foreach` already models. Exit codes and every value agree; only the mid-step
+  error message can differ:
+  ```
+  $ echo '{"a":1}' | jq -c 'path(reduce .[] as $k (.; .a))'
+  jq: error: Invalid path expression near attempt to access element "a" of {"a":1}
+  $ echo '{"a":1}' | succinctly jq -c 'path(reduce .[] as $k (.; .a))'
+  jq: error: Invalid path expression with result 1
+  ```
+  Both exit 5. Modelling the mid-step position too needs a dual provenance per step ("at the
+  per-step register" *and* "still identical to the persistent one") without regressing the
+  `[]` case above — recorded rather than built, since the exit code and value already match
+  and only wording differs.
+- **`foreach` + `getpath` on a `getpath` call whose position `EXTRACT` continues from is
+  pointer-aliased in real jq, which this evaluator's snapshot model cannot see
+  ([#2732](https://github.com/rust-works/succinctly/issues/2732)'s Shape 3, out of that
+  issue's own scope; tracked separately as
+  [#2896](https://github.com/rust-works/succinctly/issues/2896)).** jq's `_jq_path_append`
+  (the C function backing `getpath`) silently returns its argument value unchanged when the
+  input is not itself intact, and that returned value happens to be *pointer-identical* to
+  `value_at_path` left by SOURCE — so a later step in the same EXTRACT continues from SOURCE's
+  own position through `getpath`, transparently. `path(foreach .[] as $k (.; getpath(["a"]);
+  .b))` on `{"a":{"b":2}}` is `["a","b"]` in jq; succinctly refuses. The `reduce` spelling of
+  the identical shape already agrees with jq (`with result 1`, the persistent-register
+  position restored) — this is `getpath` specifically inheriting a *value*, not a path, so
+  succinctly's own path-provenance model (`PathBranch::trackable`/`snapshot`) has nothing to
+  key off; jq's own C-level pointer identity is not something an owned-value model can
+  reproduce without `getpath` growing its own register-threading, unlike the ordinary
+  `Field`/`Index` steps every other divergence in this section is about.
 
 ## Duplicate object keys collapse, except under `--preserve-input`
 

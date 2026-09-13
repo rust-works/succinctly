@@ -31914,7 +31914,7 @@ impl FoldSourceAmbient<'_> {
 ///
 /// The second row is where `relocate` earns its keep: that fork's register
 /// was moved to `["c"]` by INIT, so SOURCE's own `["a"]` is relative to it.
-fn fold_source_ambient<'v>(
+fn fold_source_ambient<'v, S: EvalSemantics>(
     fork_index: usize,
     reg: &FoldRegister,
     value: &'v OwnedValue,
@@ -31943,11 +31943,29 @@ fn fold_source_ambient<'v>(
             trackable,
             snapshot.clone(),
         );
-        let (source_trackable, source_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        let (path_trackable, path_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        // #2732: `branch_provenance` alone answers only "is `.` still
+        // *where* the register is" -- a pure path comparison, blind to the
+        // one case jq's own `jv_identical` still admits despite the paths
+        // disagreeing: a `null`/`bool` document is identical to a
+        // `null`/`bool` register regardless of position (the same
+        // `null_bool_identical` clause the *later*-fork arm below already
+        // ORs in). Fork 0 never applied it, so `path(reduce .a as $k (.b;
+        // .))` on `null` -- register `null` at `.b`, document `null` at
+        // root, no path match -- fell through to a raised
+        // untracked-navigation error before jq's own kind check ever runs.
+        // jq-mode only: real yq's lexer rejects `reduce`/`foreach`/`path`
+        // outright, and yq's own scalar no-op convention makes a widened
+        // acceptance here the *wrong* direction for that mode (#2161/#2632's
+        // own precedent for this exact gate).
+        let source_trackable = path_trackable
+            || (S::TAG == EvalTag::Jq
+                && reg.trackable
+                && register_identical(&reg.value, &reg.frame, value, snapshot));
         return FoldSourceAmbient {
             value,
             trackable: source_trackable,
-            snapshot: source_snapshot,
+            snapshot: path_snapshot,
             frame: frame.clone(),
         };
     }
@@ -32042,7 +32060,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // shared register real jq threads through the whole construct.
         // #2388: and only the *first* INIT fork sees the fold's own input
         // as that SOURCE's ambient `.` -- see `fold_source_ambient`.
-        let ambient = fold_source_ambient(
+        let ambient = fold_source_ambient::<S>(
             fork_index,
             &reg,
             value,
@@ -32074,21 +32092,39 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // register seeded from a trackable source element — confirmed live
         // that `reduce` does not share `foreach`'s per-emission clobber:
         // `path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in
-        // real jq (`.` never navigates, so the accumulator's own
-        // trackability survives untouched), where the *identical* filter
-        // spelled with `foreach` instead raises "Invalid path expression
-        // with result {\"a\":[1,2]}". `reduce`'s own single, once-only
-        // final re-entry check (below, after this loop) is already exactly
-        // what real jq's exit boundary re-verifies against — reusing `reg`
-        // uniformly here is what keeps that final check meaningful; a
-        // per-step override would let an intermediate step's own
-        // source-derived trackability leak into `acc_at_register` in a way
-        // the final check was never designed to see through. The
-        // `Expr::TrackedVar` substitution above still matters here even
-        // without the override: it is what lets a bare `$var` reference
-        // recognise `reg` itself when the two coincide (`identical()`'s
-        // existing snapshot-gated fallback), exactly as any other
-        // navigated value would.
+        // real jq, where the *identical* filter spelled with `foreach`
+        // instead raises "Invalid path expression with result
+        // {\"a\":[1,2]}". `reduce`'s own single, once-only final re-entry
+        // check (below, after this loop) is already exactly what real jq's
+        // exit boundary re-verifies against — reusing `reg` uniformly here
+        // is what keeps that final check meaningful; a per-step override
+        // would let an intermediate step's own source-derived trackability
+        // leak into `acc_at_register` in a way the final check was never
+        // designed to see through. The `Expr::TrackedVar` substitution
+        // above still matters here even without the override: it is what
+        // lets a bare `$var` reference recognise `reg` itself when the two
+        // coincide (`identical()`'s existing snapshot-gated fallback),
+        // exactly as any other navigated value would.
+        //
+        // **#2732: this is the *final-emission* behaviour, not "SOURCE
+        // never navigates the register within a step."** jq's own
+        // `gen_reduce` is `DUPN, source, …` with no `SUBEXP` around it, so
+        // *inside* one step the register genuinely sits where SOURCE left
+        // it -- `foreach`'s per-step register (which this resolver already
+        // models below) is what jq's own bytecode actually produces
+        // mid-step; `reduce`'s `[]` above is jq's own path-restoring
+        // `FORK`/`BACKTRACK` at the *exit* boundary, not evidence that
+        // navigation never happened in between. The two agree at every
+        // exit code and every value; only the *mid-step* error message can
+        // differ (`path(reduce .[] as $k (.; .a))` on `{"a":1}`: jq's
+        // "near attempt to access element \"a\" of {\"a\":1}" -- position
+        // restored -- versus this resolver's own "with result 1" -- the
+        // fold's persistent position -- both exit 5). Modelling the
+        // mid-step position too would need a dual provenance per step
+        // ("at the per-step register" *and* "still identical to the
+        // persistent one") without breaking the `[]` case above; recorded
+        // as a message-only residual in `docs/compliance/jq/limitations.md`
+        // rather than built here.
         //
         // The source is driven by demand (#2235): each element runs its
         // UPDATE step here, inside the drive, before the next one is
@@ -32367,7 +32403,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
-        let ambient = fold_source_ambient(
+        let ambient = fold_source_ambient::<S>(
             fork_index,
             &reg,
             value,
