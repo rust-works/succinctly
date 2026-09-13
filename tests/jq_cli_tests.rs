@@ -51337,3 +51337,124 @@ fn test_literal_inside_pipe_operand_must_not_change_shapes_2771() -> Result<()> 
     assert_eq!(out, "");
     Ok(())
 }
+
+// ============================================================================
+// #2642: a root-bound `$x`'s Snapshot certification must not admit a rebuilt
+// equal-valued copy
+// ============================================================================
+
+/// The issue's own five repro rows: a root-bound `$x` (`. as $x`, an
+/// identity-passthrough binding, `Origin::Snapshot`) used inside a
+/// `path()`/write call *after* an intervening stage rebuilds an equal-valued
+/// but structurally different document. jq's `jv_identical` refuses every
+/// one of these; before this fix succinctly's value-equality-only
+/// certification wrongly admitted them. Captured live against jq 1.7.1.
+#[test]
+// jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_refuses_a_rebuilt_root_2642() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":1}"#, ". as $x | {a:1} | ($x.a) = 9"),
+        (
+            r#"{"a":1}"#,
+            ". as $x | [(tojson|fromjson)] | del(.[0] | $x)",
+        ),
+        (r#"{"a":1}"#, ". as $x | {a:1} | path($x)"),
+        (r#"{"a":1}"#, ". as $x | (tojson|fromjson) | path($x)"),
+        (
+            r#"{"a":1}"#,
+            ". as $x | {k: (tojson|fromjson)} | path(.k | $x)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2642: `{filter}` must refuse (jq: Invalid path expression), got \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#2642: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Every row here must stay accepted -- the fix is refuse-only by
+/// construction (a `Snapshot` marker only ever gets demoted to
+/// `Untracked`, never the reverse), so a regression here would mean the
+/// demotion fired somewhere it structurally cannot be correct. Captured
+/// live against jq 1.7.1.
+#[test]
+// jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
+    for (input, filter, want) in [
+        (r#"{"a":1}"#, ". as $x | ($x.a) = 9", r#"{"a":9}"#),
+        (r#"{"a":1}"#, ". as $x | $x = 5", "5"),
+        (r#"{"a":1}"#, ". as $x | $x |= {b:2}", r#"{"b":2}"#),
+        (r#"{"a":1}"#, ". as $x | del($x.a)", "{}"),
+        (
+            r#"{"a":{"b":1}}"#,
+            ".a | . as $y | ($y.b) = 9",
+            r#"{"b":9}"#,
+        ),
+        ("null", ". as $x | {a:null} | path(.a | $x)", r#"["a"]"#),
+        ("true", ". as $x | [true] | path(.[0] | $x)", "[0]"),
+        (r#"{"a":1}"#, ". as $x | first(.) | path($x)", "[]"),
+        (r#"{"a":1}"#, ". as $x | select(true) | path($x)", "[]"),
+        (r#"{"a":1}"#, ". as $x | try . catch 1 | path($x)", "[]"),
+        (r#"{"a":1}"#, ". as $x | getpath([]) | path($x)", "[]"),
+        // `[.] | path(.[0] | $x)` -- navigation *inside* the same `path()`
+        // invocation the marker is referenced in -- is deliberately not
+        // covered here: it hits the same "owned embed map" residual as
+        // `[.] | .[0] | path($x)` below (`[.]`'s single element is `.`
+        // unchanged in jq's own reference-counted jv, which succinctly's
+        // `OwnedValue`-cloning model cannot represent), confirmed live to
+        // now refuse rather than accept -- see
+        // `test_tracked_var_owned_embed_residual_refuses_cleanly_2642`.
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#2642: `{filter}` must stay accepted (real jq accepts it)"
+        );
+    }
+    Ok(())
+}
+
+/// Known, accepted "refuse-only" residual (#2642's own follow-up, "owned
+/// embed map"): a construction that jq's own reference-counted jv passes
+/// through *without allocating a new container for the embedded node*
+/// (`[.] | .[0]`, `{k:.} | .k`, `. + {}`) still keeps real jq's own node
+/// identity, but succinctly's `OwnedValue`-cloning model has no way to tell
+/// "this constructed value's position N is literally the same node" from
+/// "position N merely happens to be value-equal" -- so these now refuse
+/// rather than silently accepting a copy, matching this fix's own
+/// refuse-only safety property. Recovering them needs the generic evaluator
+/// to record which positions of a constructed value embed a document node
+/// (tracked in the #2642 follow-up), not attempted here.
+#[test]
+// jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
+    for filter in [
+        ". as $x | [.] | .[0] | path($x)",
+        ". as $x | [.] | path(.[0] | $x)",
+        ". as $x | {k:.} | .k | path($x)",
+        ". as $x | . + {} | path($x)",
+        ". as $x | reduce empty as $i (.; .) | path($x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "#2642: `{filter}` is a documented refuse-only residual (real jq \
+             accepts it, `[]`), got stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}

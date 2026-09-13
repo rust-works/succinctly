@@ -211,9 +211,17 @@ Three findings, in order of what they cost:
 
 ## What remains
 
-- [#2642](https://github.com/rust-works/succinctly/issues/2642) — the pre-existing
-  root-marker (`Origin::Snapshot`) fabrication across a rebuilt copy, unrelated to the frame
-  witness and not touched by it.
+- **Closed by [#2642](https://github.com/rust-works/succinctly/issues/2642).** The
+  root-marker (`Origin::Snapshot`) fabrication across a rebuilt copy is fixed by
+  `RootWitness`/`demote_rebuilt_markers` (`eval.rs`), applied at every funnel call site that
+  hands an expression from the generic (cursor-based) evaluator to the owned-value evaluator
+  — a `Snapshot` marker not proven to name that call's own document node is demoted to
+  `Untracked` before `Frame::certifies` ever sees it. Unrelated to the frame witness itself
+  and not implemented inside `Frame`/`Origin`/`resolve_node` at all. A documented, accepted
+  residual remains: jq's own reference-counted `jv` keeps node identity through a handful of
+  constructions succinctly's `OwnedValue`-cloning model cannot represent as "the same node"
+  (`[.] | .[0]`, `{k:.} | .k`, `. + {}`, `reduce empty as $i (.; .)`) — these now refuse
+  rather than silently accept a copy, tracked as a follow-up ("owned embed map").
 - **Value-mode bindings.** `eval_as` (the non-path-tracked evaluator) still binds with no
   path at all, so `.a as $y | path(.a | $y)` — jq `["a"]` — stays refuse-only. Closing it
   needs document-absolute identity reachable from a value-mode cursor plus
