@@ -615,12 +615,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// moving nodes around can break that, and `reverse` on `- &x {p: 1}` /
     /// `- *x` demonstrably does -- it yields `- *x` / `- &x {p: 1}`, a
     /// forward reference real yq rejects with `unknown anchor 'x'
-    /// referenced`. `enforce_anchor_soundness` (`yq_runner.rs`) exists to
-    /// prevent exactly that, but it is a DOM-path pass over a
-    /// `CommentTree`, and the cursor-streaming path has none to run it over
-    /// (#1350). So those builtins consult this instead and hand an
-    /// alias-bearing document to the DOM path unchanged, rather than
-    /// emitting YAML succinctly could not read back.
+    /// referenced`. `enforce_anchor_soundness` (`yq_runner.rs`) prevents
+    /// exactly that on the DOM path, but no per-operation equivalent exists
+    /// for these cursor-streaming builtins -- rather than building one for
+    /// every stage that could invalidate an alias, those builtins consult
+    /// this instead and hand an alias-bearing document to the DOM path
+    /// unconditionally, rather than emitting YAML succinctly could not read
+    /// back.
     ///
     /// Gating on aliases rather than anchors is deliberate: an unreferenced
     /// `&x` is valid YAML wherever it lands, so a document with anchors but

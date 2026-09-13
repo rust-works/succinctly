@@ -14350,11 +14350,14 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
 /// See [`DocumentCursor::document_has_aliases`] for the full reasoning: an
 /// alias is only sound while it still follows a declaration of the same name,
 /// and reordering, selecting or dropping nodes can break that. The DOM path's
-/// `enforce_anchor_soundness` is what normally prevents it, and the
-/// cursor-streaming path cannot reach that pass (#1350). So an alias-bearing
-/// document keeps exactly the behaviour it had before #1687 -- sound output,
-/// at the cost of the duplicate keys this fix would otherwise have saved --
-/// rather than gaining faithful marks it could not read back.
+/// `enforce_anchor_soundness` prevents it there, but no equivalent
+/// per-operation check exists for these cursor-streaming reordering builtins
+/// -- rather than building one for every stage that could invalidate an
+/// alias, this falls back to the DOM path unconditionally whenever any alias
+/// is present. So an alias-bearing document keeps exactly the behaviour it
+/// had before #1687 -- sound output, at the cost of the duplicate keys this
+/// fix would otherwise have saved -- rather than gaining faithful marks it
+/// could not read back.
 ///
 /// `cursor` is `None` when the array being reordered is itself a computed
 /// value with no document position; there are no marks to get wrong then.

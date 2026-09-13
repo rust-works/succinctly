@@ -704,11 +704,12 @@ is switched off entirely for a document carrying any `*alias`, via
 `DocumentCursor::document_has_aliases`. Reordering can lift an alias above the anchor it
 resolves to, and `reverse` on `- &x {p: 1}` / `- *x` does: real yq answers `- *x` then
 `- &x {p: 1}`, then rejects its own output with `unknown anchor 'x' referenced` when asked to
-read it back (both verified live against v4.53.3). `enforce_anchor_soundness` is what normally
-prevents that, but it is a DOM-path pass over a `CommentTree` and the cursor-streaming path has
-none to run it over ([#1350](https://github.com/rust-works/succinctly/issues/1350)) — so an
-alias-bearing document takes the DOM path unchanged, losing the marks rather than emitting a
-file succinctly could not read back. The gate is on *aliases*, not anchors: an unreferenced
+read it back (both verified live against v4.53.3). `enforce_anchor_soundness` prevents
+that on the DOM path, but no per-operation equivalent exists for these cursor-streaming
+reordering builtins specifically — rather than building one for every stage that could
+invalidate an alias, `DocumentCursor::document_has_aliases` unconditionally routes any
+alias-bearing document to the DOM path for them instead, losing the marks rather than
+emitting a file succinctly could not read back. The gate is on *aliases*, not anchors: an unreferenced
 `&x` is valid YAML wherever it lands.
 
 Four narrower gaps #1398's fix deliberately left alone remain open, each already filed before
@@ -4019,7 +4020,8 @@ item still attaches to its next sibling's first key/inner item rather than the s
 itself when that sibling is a compact mapping or a nested sequence (`- # c\n- b: 1\n` is
 `.[1] | head_comment` in real yq, `.[1].b | key | head_comment` here). This residual is
 specific to #1079's floating mechanism, not #2811's ordinary-comment placement it was
-originally conflated with, and has no dedicated tracking issue yet. Blank lines in any
+originally conflated with, and is tracked separately as
+[#2835](https://github.com/rust-works/succinctly/issues/2835). Blank lines in any
 of these shapes are unmodelled on both sides (yq keeps a `\n` inside the slot value and
 reorders).
 
