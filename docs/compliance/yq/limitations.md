@@ -4155,6 +4155,54 @@ Getting this backwards is worse than it looks: rule 5 exempts extensions from ru
 labelling reference surface an "extension" silently retires a fidelity obligation. Check
 `yq --help` before adding to the list above.
 
+### `--argjson`'s validator changed, and two number renderings moved with it (#2052)
+
+`--argjson` is a jq-inherited extension: real mikefarah/yq v4.53.3 has no such flag
+(`Error: unknown flag: --argjson`), so nothing here is measured against an oracle -- it is
+recorded because the behaviour changed.
+
+Until #2052 the flag validated through `serde_json::Value` and materialized through it too.
+#2052 replaced the validation gate crate-wide with `json::validate::validate_jq_lenient`
+(see the jq-mode limitations doc for why) and moved yq's materialization onto the
+`JsonIndex` + `to_owned_canonicalizing_numbers_at_depth` pair its `--input-format json` path
+already uses. #978's convention is intact -- `--argjson` still discards a literal's source
+spelling (`1.500` is `1.5`, `1.0` is `1.0`, `0099999999999999999999999` is `1e+23`) and
+still does not preserve it the way `succinctly jq`'s own `--argjson` does (#1058 was
+deliberately jq-mode-only).
+
+Two renderings do move, both because `serde_json` is no longer the one producing them
+(review of #2880 -- the PR text originally claimed nothing moved):
+
+| value | before | after | why |
+|---|---|---|---|
+| `-0`, `-00` | `-0.0` | `0` | what `-p json` already answered for the same literal |
+| `1.0e50`, `1.e50` | `9.999999999999999e+49` | `1e+50` | `serde_json`'s pow10 path was 1 ULP off |
+
+**A magnitude-overflowing literal stays rejected, and this is where the two modes
+deliberately part company** (ADR-0018 rule 2 -- the mode decides). jq 1.7.1 accepts
+`--argjson x 1e400` as `1E+400`, and `succinctly jq` now matches it; yq mode keeps
+refusing, because real yq's own JSON input path refuses it too and this materializer has
+nowhere to put an infinity:
+
+```console
+$ printf '{"a":1e400}' | yq -p json '.a'
+Error: bad file '-': strconv.ParseFloat: parsing "1e400": value out of range
+$ printf 'a: .inf\n' | yq -o=json '.a'
+Error: json: error calling MarshalJSON ...: strconv.ParseFloat: parsing ".inf": invalid syntax
+```
+
+Accepting it would render `.inf` in YAML output -- which real yq then cannot read back --
+and a silent `null` under `-o=json`, which is precisely the outcome #1095 added the
+`serde_json` gate to prevent. `has_non_finite_number` (`yq_runner.rs`) now provides
+deliberately what that gate used to provide incidentally, and checks the materialized value
+rather than the literal, so a nested `[1e400]` is refused too. Pinned in
+`test_argjson_reject_set_and_overflow_after_2052` (`tests/yq_cli_tests.rs`).
+
+The swap also brings the stray-comma rejection that materializer already carries
+(`--argjson x '[1,]'`, `'{,}'`, #2262/#2781) to this flag -- previously `serde_json` was the
+only thing refusing them, so this is the same guarantee from a different place, not a new
+one.
+
 ## Provenance
 
 | Artifact | Path |

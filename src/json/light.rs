@@ -2010,15 +2010,15 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// (caught by review of #1171 before merge, 4 `#966` regression tests
 /// failed).
 ///
-/// One of (at least) four independent "find a JSON-ish number token's
+/// One of (at least) three independent "find a JSON-ish number token's
 /// boundaries" functions in the crate, each with a genuinely different
 /// strictness grammar for its own caller (#1218) -- besides
 /// `nested_number_span` above, see
 /// [`crate::json::simple_light`]'s private `find_number_end` (backs the
-/// separate `SimpleJsonIndex`, fully greedy) and
-/// `src/bin/succinctly/jq_runner.rs`'s private `find_number_end` (a
-/// `--argjson` leading-zero repair pass, lenient on a dangling exponent
-/// marker unlike this function). None delegate to any other; see #1218
+/// separate `SimpleJsonIndex`, fully greedy). #1218's survey counted a
+/// fourth, `jq_runner.rs`'s own `find_number_end`, which backed
+/// `--argjson`'s leading-zero repair pass; #2052 deleted that pass and the
+/// scanner with it. None delegate to any other; see #1218
 /// for the full survey and why a blanket consolidation needs its own
 /// design pass.
 pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
@@ -2724,7 +2724,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 // don't reach this arm at all -- both validate via a
                 // stricter path with no leading-zero retry
                 // (`parse_json_stream`'s `serde_json::Deserializer`,
-                // `parse_json_seq`'s `validate_and_materialize_json`), so
+                // `parse_json_seq`'s own `validate::validate`), so
                 // a leading-zero literal there still errors/is dropped
                 // before ever reaching `number_literal()` (confirmed
                 // live; pre-existing, out-of-scope gap, unchanged by this
