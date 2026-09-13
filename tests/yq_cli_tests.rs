@@ -46357,3 +46357,27 @@ mod typed_key_node_2785 {
         ])
     }
 }
+
+/// #2267 (must-not-change): yq mode keeps `drive_slice_bound`'s eager
+/// drain, unlike jq mode's now-interleaved one. #2351's Gap 1 rule
+/// discards *every* value a bound produced once that bound escapes, and
+/// that is only decidable once the generator has run to completion -- a
+/// value already handed to a sink cannot be taken back. There is no oracle
+/// pressure the other way either: real yq has no `path()`, no
+/// `debug`/`stderr`, and rejects a computed comma bound outright
+/// (`.[0:(1,2)]` is "bad expression" on v4.53.3), so none of the orderings
+/// #2267 fixes are expressible through yq's own surface. This pins the
+/// discard rule across #2267's restructuring of the function it lives in.
+#[test]
+fn test_drive_slice_bound_yq_mode_still_discards_escaped_prefix_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#"del(.[(0,1,error("x")):3])"#,
+        "- 1\n- 2\n- 3\n",
+        &["--jq-extensions"],
+    )?;
+    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+
+    Ok(())
+}
