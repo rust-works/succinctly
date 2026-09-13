@@ -1582,18 +1582,25 @@ ones). Two different checks are in play, and their coverage differs:
   evaluate their argument against the *decoded* input (`eval_owned_multi_keep_partial`/
   `eval_each_owned` take `&OwnedValue`), so they keep the eager early return rather than
   #1800's deferral: `in(error("boom"), {"a":1})` and `IN(error("boom"), {"a":1})` both raise
-  the decode failure, not `boom`. This agrees with `in(xs)`'s own desugar,
-  `. as $x | xs | has($x)` — binding `$x` already materializes (every `as` binding does, since
-  #1902), so there is nothing "argument first" to defer to; deferring `in`/`IN` the way
-  `contains` defers would make the builtin disagree with its own definition instead of
-  matching it. There is also no jq oracle for either ordering: every reference document
-  containing an undecodable string is rejected at JSON-parse time, before any filter runs. The
-  rule in one line: an argument that runs against the raw cursor (`contains`/`inside`) lets the
-  argument's own escape win; an argument that runs against the decoded input (`in`/`IN`, and
-  every `as` binding) raises the decode failure first. Like #1800's asymmetry above, this is
-  reachable through the library API only — the CLI's `eval_generic.rs` bridge materializes the
-  input a layer earlier and raises the decode failure uniformly for all three builtins,
-  `contains` included.
+  the decode failure, not `boom`. Nothing about `in(xs)`'s desugar, `. as $x | xs | has($x)`,
+  structurally *forces* this — `contains`'s own #1800 fix shows the same poisoned-value shape
+  (fan the argument out over the raw cursor, consult a stored `to_owned` `Result` lazily inside
+  the per-candidate body) would work here too, it just isn't built. What actually decides it is
+  that there is no jq oracle for either ordering — every reference document containing an
+  undecodable string is rejected at JSON-parse time, before any filter runs — so with today's
+  eager `. as $x` (#1902), the eager order already agrees with `in(xs)`'s own desugar for
+  strictly less work (ADR-0018 step 3); deferring `in`/`IN` the way `contains` defers would need
+  `eval_as` to also defer materializing `$x`, or the desugar and the builtin would newly
+  disagree with each other. This is a different question from the #2103/#2168/#2692 amendment
+  above: those concern whether *navigating to a value* triggers its own validation depending on
+  spelling, one value, one answer either way; here two *independent* computations (the ambient
+  input's decode and the argument's own error) can each fail, and the question is only which
+  failure is reported first when both are present — the same "earlier step wins" precedent
+  `IN(s)`'s own #910/#932 fix and `builtin_contains`'s #1800 fix already establish, not a new
+  per-spelling validation split. Like #1800's asymmetry above, the asymmetry between `in`/`IN`
+  and `contains` is reachable through the library API only — the CLI's `eval_generic.rs` bridge
+  materializes the input a layer earlier and raises the decode failure uniformly for all three
+  builtins, `contains` included.
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/

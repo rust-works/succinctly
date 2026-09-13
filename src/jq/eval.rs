@@ -10759,16 +10759,19 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // this function's own `check_escape`/fanout handling below does.
     //
     // #2202 (decided, not a bug): this stays an *eager* early return, unlike
-    // `builtin_contains`/`builtin_inside`'s own #1800 deferral. This matches
-    // `in(xs)`'s own definition, `. as $x | xs | has($x)` -- binding `$x`
-    // already materializes here (`eval_as` -> `substitute_bound_var`), so
-    // the eager decode below agrees with the desugared spelling rather than
-    // diverging from it. There is also no jq oracle for an undecodable
-    // input either way (every reference document containing one is rejected
-    // at parse time), so ADR-0018 falls through to step 3: the eager order
-    // does strictly less work. Deferring this the way `builtin_contains`
-    // does would make `in(xs)` disagree with its own desugar instead of
-    // matching it -- see #2202's resolution for the full argument.
+    // `builtin_contains`/`builtin_inside`'s own #1800 deferral. Those two fan
+    // `b_expr` out over the cursor and only *consult* `to_owned(&value)`
+    // lazily inside the per-candidate body -- a poisoned-value shape this
+    // function could adopt too (`obj_expr`/`xs` doesn't structurally need an
+    // owned `key_owned` up front, only `has($x)`'s eventual comparison does),
+    // it just isn't built here. Left eager because there is nothing in #1800
+    // to match against either way: no jq oracle exists for an undecodable
+    // input (every reference document containing one is rejected at parse
+    // time), and with today's eager `. as $x` (#1902) the eager order here
+    // already agrees with `in(xs)`'s own desugar, `. as $x | xs | has($x)`,
+    // for strictly less work (ADR-0018 step 3) -- see #2202's resolution for
+    // the full argument, including what deferring this would also require
+    // of `eval_as`.
     let key_owned = to_owned_or_suppress!(&value, optional);
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
@@ -10894,12 +10897,13 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // give one for *its* unused `optional`).
     //
     // #2202 (decided, not a bug): eager, not deferred into the sink the way
-    // `builtin_contains`/`builtin_inside` defer theirs (#1800) -- `IN(s)` has
-    // no `. as $x`-style desugar to agree with the way `builtin_in` does, but
-    // the same "no jq oracle for an undecodable input" reasoning applies:
-    // there is nothing to check this ordering against, so ADR-0018 falls
-    // through to step 3 and the eager decode (strictly less work) stands.
-    // Same resolution `builtin_in` documents; see #2202.
+    // `builtin_contains`/`builtin_inside` defer theirs (#1800) -- the same
+    // unbuilt poisoned-value shape `builtin_in`'s own #2202 comment describes
+    // would work here too, it just isn't built. Left eager because there is
+    // no jq oracle for an undecodable input to check this ordering against
+    // either way, so ADR-0018 falls through to step 3 and the eager decode
+    // (strictly less work) stands. Same resolution `builtin_in` documents;
+    // see #2202.
     let current = to_owned_or_suppress!(&value, optional);
     // #1519: a count, not a latch -- `IN(s)` is jq's `any(s == .; .)`, so it
     // answers once per `?//` alternative that matched, exactly as
@@ -54294,17 +54298,12 @@ mod tests {
         }
     }
 
-    /// #2202 (decided, not a bug): `in(xs)`'s eager decode of the input
-    /// agrees with its own desugar, `. as $x | xs | has($x)` -- binding
-    /// `$x` already materializes (`eval_as` -> `substitute_bound_var`), so
-    /// there is nothing "argument first" to defer to, unlike
-    /// `builtin_contains`/`builtin_inside`'s own #1800 deferral. `IN(s)` has
-    /// no such desugar, but the same "no jq oracle for an undecodable
-    /// input" reasoning applies. This pins the *agreement*: all three raise
-    /// the identical decode-failure error on the library route (`eval::<>`,
-    /// not the CLI's `eval_generic.rs` bridge, which decodes even earlier
-    /// and makes all four of these indistinguishable -- see the sibling test
-    /// below for the CLI's own route).
+    /// #2202 (decided, not a bug) -- see `builtin_in`'s own doc comment for
+    /// the full argument. Pins the *agreement*: `in`/`IN`/the `as`-desugar
+    /// all raise the identical decode-failure error on the library route
+    /// (`query!`'s `eval::<>`, not the CLI's `eval_generic.rs` bridge, which
+    /// decodes even earlier and makes all four of these indistinguishable --
+    /// see the sibling CLI test in `tests/jq_cli_tests.rs`).
     #[test]
     fn test_in_and_upper_in_agree_with_as_binding_on_decode_failure_2202() {
         let json: &[u8] = br#""\ud800""#;
@@ -54313,35 +54312,26 @@ mod tests {
             r#"IN(error("boom"), {"a":1})"#,
             r#". as $x | (error("boom"), {"a":1}) | has($x)"#,
         ] {
-            let index = JsonIndex::build(json);
-            let cursor = index.root(json);
-            let expr = parse(filter).unwrap();
-            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            query!(json, filter,
                 QueryResult::Error(e) => assert!(
                     e.is_decode_failure(),
                     "{filter}: expected a decode-failure error, got: {e:?}"
-                ),
-                other => panic!("{filter}: expected a decode-failure error, got: {other:?}"),
-            }
+                )
+            );
         }
     }
 
-    /// #2202 (decided, not a bug): pins the *asymmetry* the plan records --
-    /// `contains`/`inside`'s #1800 deferral fans its argument out over the
-    /// raw cursor, so `error("boom")` there fires before the input is ever
-    /// decoded, unlike `in(xs)`/`IN(s)` above. Only observable on the
-    /// library route (`eval::<>`); the CLI's `eval_generic.rs` bridge
-    /// (`bridge_to_full_evaluator`) materializes the input one layer
-    /// earlier, so `succinctly jq` itself raises the decode failure here
-    /// too -- this asymmetry is a property of the `eval.rs` builtins in
-    /// isolation, not something reachable through the CLI today.
+    /// #2202 (decided, not a bug) -- see `builtin_in`'s own doc comment.
+    /// Pins the *asymmetry*: `contains`/`inside`'s #1800 deferral fans its
+    /// argument out over the raw cursor, so `error("boom")` there fires
+    /// before the input is ever decoded, unlike `in(xs)`/`IN(s)` above. Only
+    /// observable on the library route -- the CLI's `eval_generic.rs` bridge
+    /// materializes the input one layer earlier, so `succinctly jq` itself
+    /// raises the decode failure here too (sibling CLI test).
     #[test]
     fn test_contains_defers_past_decode_failure_unlike_in_2202() {
         let json: &[u8] = br#""\ud800""#;
-        let index = JsonIndex::build(json);
-        let cursor = index.root(json);
-        let expr = parse(r#"contains(error("boom"), 1)"#).unwrap();
-        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+        query!(json, r#"contains(error("boom"), 1)"#,
             QueryResult::Error(e) => {
                 assert!(e.to_string().contains("boom"), "{e}");
                 assert!(
@@ -54349,8 +54339,7 @@ mod tests {
                     "expected `boom`, not a decode failure: {e}"
                 );
             }
-            other => panic!("expected Error(boom), got: {other:?}"),
-        }
+        );
     }
 
     /// #2184: `builtin_tostring` had the identical shape as `IN(s)`
