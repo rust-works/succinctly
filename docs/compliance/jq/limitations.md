@@ -2966,6 +2966,30 @@ bound produced once it escapes, which is only decidable after the generator has 
 real yq cannot express any of these shapes anyway (no `path()`, no `debug`, and `.[0:(1,2)]`
 is "bad expression" on v4.53.3).
 
+`resolve_index_expr` had the identical gap for a computed key's own generator and was
+closed the same way: `path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))])` printed
+`ka, kb, E, E` where jq prints `ka, E, kb, E`, and a key whose target escaped still
+evaluated the *next* key, which jq never reaches.
+
+**Still open, tracked on #2267.** A write that fails partway through a multi-path
+assignment does not stop the path producer: jq's
+`reduce path(paths) as $p (.; setpath($p; $v))` pulls one path, applies its write, and
+abandons the reduce on the first failure, so a later path's target side effects never
+fire. `echo '[10,20,30]' | jq -c '(.|stderr)[(0,1):(2,3)] = 99'` writes the document to
+stderr once on jq 1.7.1 and four times here. Closing it needs `Expr::IndexExpr`/
+`Expr::SliceExpr` to become native `resolve_node_sink` arms rather than
+`resolve_node_eager` ones -- they currently produce every branch before any reaches a
+write sink.
+
+Related, and **not separable from it**: jq re-resolves an assignment's path once per
+right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
+so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
+this fires it twice. That cannot be fixed on its own while `collect_rhs_outputs` is
+eager -- re-resolving per output then fires the target for outputs a downstream consumer
+never pulls, which is *worse*: `first((.|debug("E"))["a"] = (1,2))` would fire `E` twice
+where jq fires it once, and with `input` in the path it changes stdout. Both halves are
+the same mechanism and have to land together.
+
 ## Reading a path is indexing
 
 `path(f)` used to walk `f` through its own copy of jq's indexing rules, and that copy
