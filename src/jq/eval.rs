@@ -36624,8 +36624,8 @@ fn eval_owned_fast_path<S: EvalSemantics>(
     // `.a.b > 3`, ...). Gated on `!optional` so the `?`-suppression rules
     // `binary_fanout_core`/`boolean_fanout_core` apply to an erroring operand
     // stay the slow path's business alone -- see [`eval_owned_pure`].
-    if !optional && is_owned_pure_composite(expr) {
-        if let Some(result) = eval_owned_pure::<S>(expr, input) {
+    if !optional {
+        if let Some(result) = eval_owned_pure::<S>(expr, input, ResultPosition::Fresh) {
             return Some(result.map(Some));
         }
     }
@@ -36654,6 +36654,9 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }
+        // #2397: the `!optional` route reaches this through
+        // [`eval_owned_pure`] above; this arm remains for the `optional`
+        // one, which that call is gated out of.
         Expr::Builtin(Builtin::ToString) => {
             Some(Ok(Some(OwnedValue::String(owned_to_string::<S>(input)))))
         }
@@ -36918,6 +36921,10 @@ fn eval_owned_navigation<S: EvalSemantics>(
 /// `del(.[] | .score as $y | select($y < 100))` would otherwise reindex
 /// the whole branch per element for a condition that reads none of it --
 /// measured at +21% (7950X) / +31% (M4 Pro) on that shape.
+/// #2397 (item 2): see [`is_pure_chain_link`]'s doc comment for why these
+/// two overlapping purity grammars stay separate rather than sharing a
+/// primitive.
+#[cfg(test)]
 fn is_owned_pure_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Identity
@@ -36938,6 +36945,12 @@ fn is_owned_pure_expr(expr: &Expr) -> bool {
     }
 }
 
+/// #2397: no longer consulted at runtime -- [`eval_owned_pure`] applies this
+/// rule itself, per arm, via [`ResultPosition`]. Kept `#[cfg(test)]` as the
+/// oracle `eval_owned_pure_declines_exactly_where_the_old_pre_walk_said_no`
+/// checks the fused form against, so the rewrite is pinned against the
+/// predicate it replaced rather than only against its own behaviour.
+///
 /// Whether `expr`'s own result is a value it *constructs* — a `Bool` from a
 /// comparison or a boolean operator, a `String` from `type`, a literal —
 /// rather than a subvalue it read back out of its input.
@@ -36961,6 +36974,16 @@ fn is_owned_pure_expr(expr: &Expr) -> bool {
 /// their pre-#2048 arms in [`eval_owned_fast_path`], whose own equivalent
 /// widening is pinned separately by
 /// `eval_owned_fast_path_agrees_with_index_object_by_name_and_index_array_by_position`.
+/// The pre-#2397 gate: [`eval_owned_fast_path`] consulted this before the
+/// walk ran, and [`eval_owned_pure`] now applies the same rule per arm via
+/// [`ResultPosition`]. `#[cfg(test)]`, as the oracle the fused form is
+/// checked against.
+#[cfg(test)]
+fn is_owned_pure_composite(expr: &Expr) -> bool {
+    produces_fresh_value(expr) && is_owned_pure_expr(expr)
+}
+
+#[cfg(test)]
 fn produces_fresh_value(expr: &Expr) -> bool {
     match expr {
         Expr::Not
@@ -36975,20 +36998,6 @@ fn produces_fresh_value(expr: &Expr) -> bool {
         Expr::Pipe(stages) => stages.last().is_some_and(produces_fresh_value),
         _ => false,
     }
-}
-
-/// Whether the #2048 pre-check in [`eval_owned_fast_path`] should consult
-/// [`eval_owned_pure`] for `expr`: it has to be pure and single-output
-/// ([`is_owned_pure_expr`]) *and* return a freshly-constructed value
-/// ([`produces_fresh_value`]).
-///
-/// The second half is the correctness gate (see its doc comment). The first
-/// half is also what keeps the pre-#2048 arms
-/// (`Identity`/`Field`/`Index`/`ToString`/`Arithmetic`) answering from their
-/// own arms byte for byte — none of them is `produces_fresh_value`, except
-/// `Arithmetic`, which `is_owned_pure_expr` rejects.
-fn is_owned_pure_composite(expr: &Expr) -> bool {
-    produces_fresh_value(expr) && is_owned_pure_expr(expr)
 }
 
 /// Evaluate a pure, single-output expression ([`is_owned_pure_expr`])
@@ -37036,9 +37045,10 @@ fn is_owned_pure_composite(expr: &Expr) -> bool {
 fn eval_owned_pure<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
+    position: ResultPosition,
 ) -> Option<Result<OwnedValue, EvalError>> {
     match expr {
-        Expr::Paren(inner) => eval_owned_pure::<S>(inner, input),
+        Expr::Paren(inner) => eval_owned_pure::<S>(inner, input, position),
         // `eval_single`'s own `Expr::Literal` arm, verbatim.
         Expr::Literal(lit) => Some(Ok(literal_to_owned(lit))),
         // `eval_single`'s own `Expr::TrackedVar` arm, verbatim (#2042). The
@@ -37078,6 +37088,18 @@ fn eval_owned_pure<S: EvalSemantics>(
         // these three shapes anyway (see its own doc comment), so going
         // through it here was a detour, not a behavior difference.
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
+            // #2397: the representation gate `produces_fresh_value` used to
+            // apply from outside, now applied where the shape actually
+            // occurs. A navigated subvalue may differ in *representation*
+            // from what the reindex bridge would hand back (`Int(2)` vs
+            // `NumberLiteral(Int(2), "2")`), so it must not escape as an
+            // expression's own result -- but it is fine as an operand, where
+            // `apply_compare_op`/truthiness read the two identically. In
+            // result position this returns `None` and the caller falls back,
+            // exactly as the pre-check used to arrange.
+            if position == ResultPosition::Fresh {
+                return None;
+            }
             match eval_owned_navigation::<S>(expr, input, false)? {
                 Ok(Some(v)) => Some(Ok(v)),
                 Ok(None) => None,
@@ -37099,11 +37121,11 @@ fn eval_owned_pure<S: EvalSemantics>(
         // `.a.b`'s message — pinned by
         // `compare_condition_reports_the_right_operands_error_first_2048`.
         Expr::Compare { op, left, right } => {
-            let r = match eval_owned_pure::<S>(right, input)? {
+            let r = match eval_owned_pure::<S>(right, input, ResultPosition::Operand)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            let l = match eval_owned_pure::<S>(left, input)? {
+            let l = match eval_owned_pure::<S>(left, input, ResultPosition::Operand)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
@@ -37116,22 +37138,66 @@ fn eval_owned_pure<S: EvalSemantics>(
         // otherwise the answer is the right operand's own truthiness.
         Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false),
         Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true),
+        // #2397 step 3: folded in from `eval_owned_fast_path`'s own arms.
+        // Both construct their result, so both are safe in either position
+        // -- there is no navigated subvalue to leak a representation.
+        //
+        // `tostring` (#2543's `Pipe`-of-one shape reaches it through the
+        // `Pipe` arm above now, rather than through a second unwrapping in
+        // the caller).
+        Expr::Builtin(Builtin::ToString) => {
+            Some(Ok(OwnedValue::String(owned_to_string::<S>(input))))
+        }
+        // `. + <literal>` (#2086/#2152), the `reduce`/`foreach` accumulator
+        // idiom. Only the literal-RHS shape `owned_arith_accumulator_shape`
+        // recognizes: a general pure-operand `Arithmetic` arm is *not* in
+        // scope, because its `?`-suppression rules live in
+        // `binary_fanout_core`, which is why the pre-#2397
+        // `is_owned_pure_expr` excluded `Arithmetic` outright. The
+        // `optional == true` case never reaches here (`eval_owned_fast_path`
+        // gates this whole call on `!optional`) and keeps its own arm there.
+        Expr::Arithmetic { .. } => {
+            let (op, rhs) = owned_arith_accumulator_shape(expr)?;
+            Some(arith_combine::<S>(op, input.clone(), rhs))
+        }
         // A pure pipe threads one value stage to stage — `eval_pipe`'s own
         // shape once every stage is single-output (and, per
         // [`is_owned_pure_expr`], once no stage needs path context, which is
         // the branch `eval_pipe` takes *before* threading anything).
         Expr::Pipe(stages) => {
+            let (last, rest) = stages.split_last()?;
             let mut current = input.clone();
-            for stage in stages {
-                current = match eval_owned_pure::<S>(stage, &current)? {
+            // Only the last stage's result leaves the pipe, so only it
+            // inherits `position`; every earlier stage feeds the next one
+            // and is an operand by construction.
+            for stage in rest {
+                current = match eval_owned_pure::<S>(stage, &current, ResultPosition::Operand)? {
                     Ok(v) => v,
                     Err(e) => return Some(Err(e)),
                 };
             }
-            Some(Ok(current))
+            eval_owned_pure::<S>(last, &current, position)
         }
         _ => None,
     }
+}
+
+/// Whether an [`eval_owned_pure`] call's result is the whole expression's
+/// own answer or is about to be consumed by an enclosing operator (#2397).
+///
+/// The gate `produces_fresh_value` used to apply as a separate pre-walk. It
+/// is the same rule either way -- a *navigated* subvalue may differ in
+/// representation from what the reindex bridge hands back (`Int(2)` vs
+/// `NumberLiteral(Int(2), "2")`, #1008/#1054), so it may be an operand but
+/// never an expression's own result -- but stating it inside the walk means
+/// the classification and the evaluation cannot disagree, which is what the
+/// old pairing needed a dedicated agreement test to rule out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResultPosition {
+    /// This value leaves the fast path as the expression's answer.
+    Fresh,
+    /// An enclosing operator consumes this value and constructs its own.
+    Operand,
 }
 
 /// Shared body of [`eval_owned_pure`]'s `and`/`or` arms, which differ only in
@@ -37144,14 +37210,14 @@ fn eval_owned_pure_boolean<S: EvalSemantics>(
     input: &OwnedValue,
     short_circuit: bool,
 ) -> Option<Result<OwnedValue, EvalError>> {
-    let l = match eval_owned_pure::<S>(left, input)? {
+    let l = match eval_owned_pure::<S>(left, input, ResultPosition::Operand)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
     if l.is_truthy() == short_circuit {
         return Some(Ok(OwnedValue::Bool(short_circuit)));
     }
-    let r = match eval_owned_pure::<S>(right, input)? {
+    let r = match eval_owned_pure::<S>(right, input, ResultPosition::Operand)? {
         Ok(v) => v,
         Err(e) => return Some(Err(e)),
     };
@@ -50386,6 +50452,20 @@ pub(crate) fn enter_def_call_frame(frames: u32) -> ambient_frame_depth::Guard {
 /// `FuncCall`/`DefCall`, a builtin, `Index`/`Field` navigation -- is
 /// conservatively *not* a pure chain link, which only ever costs the slower,
 /// always-correct lazy path, never correctness.
+/// #2397 (item 2): deliberately **not** merged with
+/// [`is_owned_pure_expr`], despite the two grammars overlapping on
+/// `Literal`/`Paren`/`Compare`. Each side's other leaves are load-bearing
+/// for its own consumer and wrong for the other's: `Expr::Shared` is
+/// meaningless to the owned evaluator, and `Field`/`Index` are deliberately
+/// *impure* here (this predicate's callers, the `Expr::Shared` arms in
+/// `eval.rs` and `eval_generic.rs`, use it to decide whether a chain link
+/// can be re-evaluated without re-reading the input). Extracting a shared
+/// three-arm primitive would save six lines and create exactly the widening
+/// hazard that would break one caller silently. Instead
+/// `pure_predicates_agree_on_their_intersection_2397` pins that they agree
+/// on the overlap and disagree only on the documented exclusive shapes --
+/// CLAUDE.md's "one definition, plus a test that the call sites agree",
+/// applied to the case where one definition is the wrong answer.
 pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
     match expr {
         Expr::Shared(_) | Expr::Literal(_) => true,
@@ -59589,15 +59669,17 @@ mod tests {
         outer.insert("a".to_string(), OwnedValue::Object(inner));
         let value = OwnedValue::Object(outer);
 
-        // Pure and single-output ...
+        // Pure and single-output, so evaluable as an operand ...
         assert!(is_owned_pure_expr(&expr));
-        assert!(eval_owned_pure::<JqSemantics>(&expr, &value).is_some());
-        // ... but not freshly constructed, so not gated in.
+        assert!(eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Operand).is_some());
+        // ... but not freshly constructed, so it declines in result
+        // position (#2397: the gate that used to be `is_owned_pure_composite`
+        // applied before the walk is now the walk's own answer).
         assert!(!produces_fresh_value(&expr));
-        assert!(!is_owned_pure_composite(&expr));
+        assert!(eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Fresh).is_none());
 
         // And this is why: the two disagree on representation.
-        let direct = eval_owned_pure::<JqSemantics>(&expr, &value)
+        let direct = eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Operand)
             .unwrap()
             .unwrap();
         let bridge = debug_normalize(eval_owned_input_reindexed::<Vec<u64>, JqSemantics>(
@@ -59645,7 +59727,8 @@ mod tests {
         };
         assert!(is_owned_pure_composite(&cond));
         assert!(
-            eval_owned_pure::<JqSemantics>(&cond, &OwnedValue::Int(1)).is_some(),
+            eval_owned_pure::<JqSemantics>(&cond, &OwnedValue::Int(1), ResultPosition::Fresh)
+                .is_some(),
             "the repro's own condition must not fall back to the reindex bridge"
         );
         // And it still answers what the bridge answers, on both sides of the
@@ -59655,7 +59738,7 @@ mod tests {
             (OwnedValue::String("1".to_string()), false),
         ] {
             assert_eq!(
-                eval_owned_pure::<JqSemantics>(&cond, &value)
+                eval_owned_pure::<JqSemantics>(&cond, &value, ResultPosition::Fresh)
                     .unwrap()
                     .unwrap(),
                 OwnedValue::Bool(expected)
@@ -59682,7 +59765,7 @@ mod tests {
         value.insert("c".to_string(), OwnedValue::Int(1));
         let value = OwnedValue::Object(value);
 
-        let err = eval_owned_pure::<JqSemantics>(&cond, &value)
+        let err = eval_owned_pure::<JqSemantics>(&cond, &value, ResultPosition::Fresh)
             .unwrap()
             .unwrap_err();
         assert!(
@@ -59756,17 +59839,153 @@ mod tests {
     /// leaves the speedup on the floor. Two definitions of one predicate is
     /// the #106 shape; this is the test that they agree.
     #[test]
-    fn is_owned_pure_expr_agrees_with_eval_owned_pure() {
+    fn eval_owned_pure_declines_exactly_where_the_old_pre_walk_said_no() {
         for src in pure_expr_matrix() {
             let expr = parse(src).unwrap();
+            // #2397: the pre-#2397 gate was `produces_fresh_value(e) &&
+            // is_owned_pure_expr(e)`, checked before the walk ran. The fused
+            // form has to decline in exactly the same places -- including
+            // the navigation-in-result-position case, which is the whole
+            // reason the representation gate exists.
+            let old_gate = produces_fresh_value(&expr) && is_owned_pure_expr(&expr);
             for value in pure_value_matrix() {
                 assert_eq!(
+                    old_gate,
+                    eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Fresh).is_some(),
+                    "fused walk and the pre-#2397 gate disagree for {src:?} on {value:?}"
+                );
+                // As an *operand*, the wider grammar still applies: purity
+                // alone decides, navigation included. This is the half the
+                // old pairing expressed by having two predicates.
+                assert_eq!(
                     is_owned_pure_expr(&expr),
-                    eval_owned_pure::<JqSemantics>(&expr, &value).is_some(),
-                    "gate and evaluator disagree for {src:?} on {value:?}"
+                    eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Operand)
+                        .is_some(),
+                    "operand-position walk disagrees with is_owned_pure_expr for {src:?} on {value:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn probe_2397_shapes() {
+        for src in [
+            "1 + 2", "-1", "-(1 + 2)", "1 * 2", "-.a", "1", "(1)", "1 == 2",
+        ] {
+            let e = parse(src).unwrap();
+            println!(
+                "{src:20} owned_pure={} chain_link={} expr={:?}",
+                is_owned_pure_expr(&e),
+                is_pure_chain_link(&e),
+                e
+            );
+        }
+    }
+
+    /// #2397 (item 2): the two purity grammars agree on their intersection
+    /// and differ only where each one's own consumer needs it to.
+    ///
+    /// They are *not* merged -- see [`is_pure_chain_link`]'s doc comment --
+    /// so this is the "test that the call sites agree" half of CLAUDE.md's
+    /// duplicated-predicate rule. A future edit that widens one of them into
+    /// the other's exclusive territory fails here rather than silently
+    /// changing what the other's callers accept.
+    #[test]
+    fn pure_predicates_agree_on_their_intersection_2397() {
+        // The overlap: literals, parens, and comparisons built from them.
+        for src in [
+            "1",
+            "\"s\"",
+            "null",
+            "(1)",
+            "((2))",
+            "1 == 2",
+            "(1) < (2)",
+            "1 == (2)",
+            // The parser folds unary minus on a literal, so this is
+            // `Literal(-1)` -- in the intersection, not in the chain-link-only
+            // group below where a first draft of this test put it.
+            "-1",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                is_owned_pure_expr(&expr),
+                "{src:?} should be owned-pure (intersection)"
+            );
+            assert!(
+                is_pure_chain_link(&expr),
+                "{src:?} should be a pure chain link (intersection)"
+            );
+        }
+
+        // Owned-pure only: input-reading navigation and the shapes that
+        // construct a value from the input. A chain link must reject these
+        // -- its callers re-evaluate a link without re-reading the input.
+        for src in [
+            ".",
+            ".a",
+            ".a.b",
+            ".[0]",
+            "type",
+            "not",
+            ".a and .b",
+            ".a or .b",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(is_owned_pure_expr(&expr), "{src:?} should be owned-pure");
+            assert!(
+                !is_pure_chain_link(&expr),
+                "{src:?} must not be a pure chain link -- it reads the input"
+            );
+        }
+
+        // Chain-link only: arithmetic and negation, which the owned grammar
+        // excludes because their `?`-suppression rules live in
+        // `binary_fanout_core` (see `eval_owned_pure`'s own `Arithmetic`
+        // arm, which admits only the literal-RHS accumulator shape).
+        for src in ["1 + 2", "-(1 + 2)", "1 * 2"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                is_pure_chain_link(&expr),
+                "{src:?} should be a pure chain link"
+            );
+            assert!(
+                !is_owned_pure_expr(&expr),
+                "{src:?} must not be owned-pure -- its suppression rules live elsewhere"
+            );
+        }
+    }
+
+    /// #2397: the navigation shapes the representation gate exists for must
+    /// decline in result position and evaluate as operands -- spelled out
+    /// rather than left to `pure_expr_matrix`'s coverage, since this is the
+    /// one rule whose failure mode (`Int(2)` escaping where the bridge would
+    /// hand back `NumberLiteral(Int(2), "2")`) is a silent representation
+    /// swap rather than a wrong answer (#1008/#1054).
+    #[test]
+    fn navigation_declines_in_result_position_but_evaluates_as_an_operand_2397() {
+        let mut inner = indexmap::IndexMap::new();
+        inner.insert("b".to_string(), OwnedValue::Int(2));
+        let mut outer = indexmap::IndexMap::new();
+        outer.insert("a".to_string(), OwnedValue::Object(inner));
+        let value = OwnedValue::Object(outer);
+        for src in [".", ".a", ".a.b", ".[\"a\"]", ".a | .b"] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Fresh).is_none(),
+                "{src:?} must fall back to the bridge in result position"
+            );
+            assert!(
+                eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Operand).is_some(),
+                "{src:?} must evaluate as an operand"
+            );
+        }
+        // And the composite that consumes one still answers.
+        let expr = parse(".a.b == 2").unwrap();
+        assert_eq!(
+            eval_owned_pure::<JqSemantics>(&expr, &value, ResultPosition::Fresh),
+            Some(Ok(OwnedValue::Bool(true)))
+        );
     }
 
     #[test]
