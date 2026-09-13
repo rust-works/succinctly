@@ -51339,6 +51339,24 @@ fn test_tracked_var_refuses_a_rebuilt_root_2642() -> Result<()> {
             r#"{"a":1}"#,
             ". as $x | {k: (tojson|fromjson)} | path(.k | $x)",
         ),
+        // `reduce`/`foreach`'s own UPDATE/EXTRACT rerun against the fold's
+        // own accumulator (INIT's own rebuild, here), not the ambient
+        // cursor -- the identical bug class reached through a fold instead
+        // of a pipe stage. Confirmed live against jq 1.7.1; found in code
+        // review (both the eager `eval_single` arm and the streaming
+        // `each_foreach_generic` twin needed the same fix).
+        (
+            r#"{"a":1}"#,
+            ". as $x | reduce (1) as $i ({a:1}; ($x.a) = 9)",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $x | foreach (1) as $i ({a:1}; ($x.a) = 9; .)",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $x | foreach (1) as $i (0; {a:1}; ($x.a) = 9)",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -51380,6 +51398,16 @@ fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
         (r#"{"a":1}"#, ". as $x | select(true) | path($x)", "[]"),
         (r#"{"a":1}"#, ". as $x | try . catch 1 | path($x)", "[]"),
         (r#"{"a":1}"#, ". as $x | getpath([]) | path($x)", "[]"),
+        // `error($x)` raises a marker's own value verbatim (no rebuild at
+        // all) and jq's own `catch` handler runs against that exact same
+        // `jv`, so `path($x)` inside the handler is legitimately
+        // trackable. A blanket `Owned` demotion here was tried and
+        // reverted during review -- it cannot distinguish "the payload IS
+        // the marker's own value" from "a genuine rebuild happened," and
+        // wrongly refused this. `try_single_generic`'s `run_catch` and
+        // `run_try_handler_generic` deliberately do not call
+        // `demote_rebuilt_markers`.
+        ("1", ". as $x | try error($x) catch path($x)", "[]"),
         // `[.] | path(.[0] | $x)` -- navigation *inside* the same `path()`
         // invocation the marker is referenced in -- is deliberately not
         // covered here: it hits the same "owned embed map" residual as
@@ -51395,6 +51423,36 @@ fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
             (want, 0),
             "#2642: `{filter}` must stay accepted (real jq accepts it)"
         );
+    }
+    Ok(())
+}
+
+/// A pre-existing, still-open gap: `key`/`parent`/`path`/`file_index`-driven
+/// stages route through `eval_owned_identity_stages`'s own `OwnedIdentity`-
+/// tracked position (#2072), which can carry a genuine, unrebuilt document
+/// node -- but this fix's own `RootWitness` doesn't consult it, so a
+/// blanket `Owned` demotion there was tried and reverted during code
+/// review (it wrongly refused a write that a sibling `key`/`parent`/`path`
+/// read had no business affecting). `parent` is a succinctly-only
+/// extension (real jq has no such builtin, "parent/0 is not defined"), so
+/// this pins succinctly's own behavior -- unchanged from `main`, both
+/// before and after this fix -- rather than comparing against the oracle.
+#[test]
+fn test_tracked_var_owned_identity_sibling_gap_unaffected_2642() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"foo":{"a":1},"b":2}"#,
+            ".foo | . as $x | (parent, ($x.a = 9))",
+            "{\"foo\":{\"a\":1},\"b\":2}\n{\"a\":9}\n",
+        ),
+        (
+            r#"{"foo":{"a":1},"b":2}"#,
+            ".foo | . as $x | (parent, ($x.a |= 9))",
+            "{\"foo\":{\"a\":1},\"b\":2}\n{\"a\":9}\n",
+        ),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "`{filter}`");
     }
     Ok(())
 }
