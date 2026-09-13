@@ -74,8 +74,8 @@ use super::eval::{
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, ForeachElementSink, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
+    RootWitness, SliceTargetKind, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -7688,7 +7688,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // #2440: INIT first, `input` second, same as the `reduce` arm above.
         //
         // #2180 WP3 review: the source is *driven* one element at a time
-        // (`drive_foreach_source_generic`, shared with the demand-forwarding
+        // (`drive_foreach_expr_generic`, shared with the demand-forwarding
         // arm) rather than collected by `stream_owned_outputs_generic` first,
         // so this route's answers match the demand-driven one's. They did
         // not: `[foreach (1 as $x ?// $y | 1) as $v (0; if . == 0 then
@@ -7704,7 +7704,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             extract,
         } if !streams_unbounded(input) && !streams_unbounded(init) => {
             // #2668: INIT is driven through `eval_each_generic` (via
-            // `drive_foreach_init_generic`) rather than collected by
+            // `drive_foreach_expr_generic`) rather than collected by
             // `stream_owned_outputs_generic`, the same demand-forwarding
             // treatment the source already gets just below.
             //
@@ -7721,17 +7721,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 &update,
                 extract.as_deref(),
                 &mut |per_init| {
-                    drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, per_init)
+                    drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
                 },
                 optional,
                 &mut |per_element| {
-                    drive_foreach_source_generic::<S, V>(
-                        input,
-                        &value,
-                        optional,
-                        cursor,
-                        per_element,
-                    )
+                    drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
                 },
                 &mut |v| {
                     outputs.push(v);
@@ -8793,59 +8787,46 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// The generic evaluator's own `foreach` source drive (#2180 WP3), shared by
-/// its demand-forwarding `eval_each_generic` arm and its eager `eval_single`
-/// one — the only thing either has that `eval::foreach_forks` does not own.
+/// The generic evaluator's own `foreach` expr drive (#2180 WP3, #2668),
+/// shared by every one of its `foreach`-related call sites -- the eager
+/// `Expr::Foreach` arm and `each_foreach_generic`, for both INIT and the
+/// source -- the only thing any of them has that `eval::foreach_forks` does
+/// not already own. One shared function rather than a copy per position:
+/// two near-identical `drive_foreach_source_generic`/`drive_foreach_init_generic`
+/// functions used to exist here, differing only in which `Expr` (`input` vs
+/// `init`) they closed over -- exactly the "a second copy is free to drift"
+/// risk `eval::foreach_forks`'s own doc comment warns about, one level
+/// further in.
 ///
 /// Native rather than bridged for the same reason this file's eager
-/// `Expr::Foreach` arm is native: `eval_each_generic` recovers source
-/// elements this evaluator can see and `eval.rs` cannot (#1687's
-/// duplicate-key fidelity), and a wholesale bridge would collapse them at
-/// `to_owned_with_cursor` before the fold ever ran.
+/// `Expr::Foreach` arm is native: `eval_each_generic` recovers elements this
+/// evaluator can see and `eval.rs` cannot (#1687's duplicate-key fidelity),
+/// and a wholesale bridge would collapse them at `to_owned_with_cursor`
+/// before the fold ever ran.
 ///
-/// Called once per INIT fork, driving the source afresh each time — see
-/// `eval::foreach_forks` for why that is not a recording-and-replay.
-fn drive_foreach_source_generic<S: EvalSemantics, V: DocumentValue>(
-    input: &Expr,
+/// The source's own call site passes this once per INIT fork, driving the
+/// source afresh each time — see `eval::foreach_forks` for why that is not
+/// a recording-and-replay. INIT's own call site passes it exactly once.
+fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    per_element: ForeachElementSink<'_>,
+    per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     // Out-of-band, same as `stream_owned_outputs_generic`'s own
     // `decode_err`: the already-iterated prefix stands in front of an
     // undecodable element's error.
     let mut escape: Option<Control> = None;
-    let flow = eval_each_generic::<S, V>(input, value.clone(), optional, cursor, &mut |item| {
+    let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
         match generic_item_into_owned(item) {
-            Ok(v) => per_element(v),
+            Ok(v) => per_item(v),
             Err(control) => stop_with_escape(&mut escape, control),
         }
     });
     // Raw: `eval::foreach_forks` owns the `suppresses` decision -- see
     // `eval::eval_foreach`'s own drive for why suppressing here would be
     // wrong.
-    resume_from_escape(escape, flow)
-}
-
-/// The generic evaluator's own `foreach` INIT drive (#2668), shared by its
-/// demand-forwarding `each_foreach_generic` and its eager `Expr::Foreach`
-/// arm just above -- [`drive_foreach_source_generic`]'s twin, one level
-/// further out. Called exactly once, unlike that sibling.
-fn drive_foreach_init_generic<S: EvalSemantics, V: DocumentValue>(
-    init: &Expr,
-    value: &V,
-    optional: bool,
-    cursor: Option<V::Cursor>,
-    per_init: &mut dyn FnMut(OwnedValue) -> Demand,
-) -> Flow {
-    let mut escape: Option<Control> = None;
-    let flow = eval_each_generic::<S, V>(init, value.clone(), optional, cursor, &mut |item| {
-        match generic_item_into_owned(item) {
-            Ok(v) => per_init(v),
-            Err(control) => stop_with_escape(&mut escape, control),
-        }
-    });
     resume_from_escape(escape, flow)
 }
 
@@ -8887,11 +8868,11 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
         &update,
         extract.as_deref(),
         &mut |per_init| {
-            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, per_init)
+            drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
         },
         optional,
         &mut |per_element| {
-            drive_foreach_source_generic::<S, V>(input, &value, optional, cursor, per_element)
+            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
         },
         &mut |v| sink.push(GenericItem::Owned(v)),
     )
@@ -35050,7 +35031,7 @@ mod tests {
         let json: &[u8] = br#"{"x":{"a":1},"k":"a"}"#;
         for (arm, filter) in [
             (
-                "drive_foreach_source_generic",
+                "drive_foreach_expr_generic (source)",
                 "foreach map(1/0) as $x (0; .+1)",
             ),
             ("each_if_generic's cond", "if map(1/0) then 1 else 2 end"),
