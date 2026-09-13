@@ -33395,7 +33395,7 @@ pub(crate) struct RecurseWalkEnd {
 /// `[limit(2; recurse(.[]?|debug))]` writes two DEBUG lines where jq writes
 /// one. That residual is bounded by one node's fan-out (it was the whole
 /// remaining tree before), and `resolve_recurse_sink` has the identical one
-/// on the path side. See #2913.
+/// on the path side. See #2918.
 pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
