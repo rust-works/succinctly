@@ -24639,6 +24639,15 @@ fn set_path<S: EvalSemantics>(
 /// computed component makes a list non-atomic and sends it through
 /// [`flatten_path_components`] first.
 ///
+/// Since #2909 the flatten is no longer guaranteed to *produce* atomic
+/// components: a `?` over a group that can fan out stays one opaque
+/// `Optional(Pipe(..))` element, because jq's `?` is a single abort scope
+/// over the whole group. That element never reaches this walker anyway --
+/// `needs_path_prepass` answers `true` for exactly that shape, so
+/// `=`/`|=`/`del`/`path` resolve it through `resolve_optional_sink` first
+/// and hand the walker already-resolved components. Verified by sweeping 756
+/// group/outer/input combinations for an "invalid path component" leak: none.
+///
 /// `Identity` counts as atomic even though the flattener would drop it
 /// (`push_path_components`): the walker has a one-line arm for it, and
 /// treating it as non-atomic would send an otherwise-flat `.a | . | .b`
@@ -25137,7 +25146,9 @@ fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
 /// `Optional(Pipe([…]))` component and continue with one recursive call over
 /// the combined list, so the same fix applies identically to each: when
 /// `here` (the group's own `?`, folded with whatever optionality was already
-/// ambient before it) is set, wrap each of `inner`'s own components in
+/// ambient before it) is set *and the group cannot fan out* (#2909 --
+/// [`optional_group_slice_is_scope_safe`]), wrap each of `inner`'s own
+/// components in
 /// `Expr::Optional` — [`unwrap_path_component`] already peels this at every
 /// step — instead of threading `here` as the recursive call's blanket
 /// `optional` parameter, which previously kept suppressing `rest` too, past
@@ -25146,6 +25157,18 @@ fn unwrap_path_component(expr: &Expr) -> (&Expr, bool) {
 /// `optional` — not `here` — as that call's baseline, so `rest` keeps
 /// whatever optionality it already had on its own.
 fn splice_optional_group(inner: &[Expr], rest: &[Expr], here: bool) -> Vec<Expr> {
+    // #2909: distributing `here` across `inner`'s components is only
+    // observationally identical to jq's single abort scope when the group
+    // cannot fan out -- see [`optional_group_is_scope_safe`]. When it can,
+    // the group stays one opaque `Optional(Pipe(..))` element, which
+    // `needs_path_prepass` now routes to the resolver's own `Expr::Optional`
+    // arm rather than to a walker that would see N independently-pruned
+    // steps.
+    if here && !optional_group_slice_is_scope_safe(inner) {
+        let mut spliced = vec![Expr::Optional(Box::new(flatten_components(inner.to_vec())))];
+        spliced.extend_from_slice(rest);
+        return spliced;
+    }
     let mut spliced: Vec<Expr> = if here {
         inner
             .iter()
@@ -26701,6 +26724,12 @@ fn needs_path_prepass(expr: &Expr) -> bool {
         | Expr::Slice { .. }
         | Expr::Iterate => false,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
+        // #2909: a `?` over a group that can fan out must reach the resolver
+        // even when every component of it is otherwise native-walkable, so
+        // `resolve_node_sink`'s own `Expr::Optional` arm gives it jq's single
+        // abort scope instead of a walker seeing N independently-pruned
+        // steps.
+        Expr::Optional(inner) if !optional_group_is_scope_safe(inner) => true,
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
         _ => true,
     }
@@ -26735,7 +26764,11 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 ///
 /// No `Expr::Pipe` arm: this function's only caller (`resolve_seq`) always
 /// calls it on `flat`'s already-`push_path_components`-flattened elements,
-/// which by construction never contains a raw `Pipe` -- so unlike
+/// which never contains a raw `Pipe` at the top level. (Since #2909 an
+/// element *can* be an `Optional` wrapping one -- a group that can fan out
+/// keeps jq's single abort scope by staying opaque -- which is what the
+/// `Expr::Optional` arm above answers `true` for, rather than peeling into
+/// it.) So unlike
 /// `needs_path_prepass`, which is also called on whole (possibly
 /// un-flattened) expressions elsewhere, adding one here would be untested
 /// dead code.
@@ -26751,6 +26784,11 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 fn needs_fanout_pass(expr: &Expr) -> bool {
     match expr {
         Expr::Iterate => true,
+        // #2909: this function peels `Optional` before testing, so without
+        // this arm `Optional(Pipe([Iterate, Field]))` answers `false` and is
+        // mistaken for `resolve_seq_sink`'s single-valued static tail. Same
+        // rule, same predicate as `needs_path_prepass`'s own arm.
+        Expr::Optional(inner) if !optional_group_is_scope_safe(inner) => true,
         Expr::Optional(inner) | Expr::Paren(inner) => needs_fanout_pass(inner),
         other => needs_path_prepass(other),
     }
@@ -26763,6 +26801,94 @@ fn needs_fanout_pass(expr: &Expr) -> bool {
 /// `Identity | Field | Index | Iterate | Slice` and rejects anything else as
 /// "invalid path component", so a nested `Pipe` emitted by the pre-pass
 /// would break assignment with a message that reads like user error.
+/// Is distributing a `?` across the components of the group it wraps
+/// observationally identical to jq's single abort scope (#2909)?
+///
+/// `(A | B)?` is `try (A | B)`: a failure anywhere inside prunes the **whole
+/// group's** branch and stops the group's own generators. Two sites in this
+/// file instead rewrite it into `A? | B?` -- [`push_path_components`] (#1311)
+/// for the resolver, [`splice_optional_group`] (#1294) for the write walkers
+/// -- which turns one abort scope into N independent per-step ones. Both
+/// rewrites exist to stop the group's `?` leaking onto what *follows* the
+/// group, and both are correct for the pure-navigation groups they were
+/// written for.
+///
+/// They are only correct there. A single-valued chain has exactly one branch,
+/// so pruning at step *k* and aborting the whole group both emit nothing for
+/// it -- the two are indistinguishable. Put a *generator* inside the group
+/// and they part company: the generator resumes past an error a later
+/// component raised, because its own per-step `?` pruned only that step.
+/// Live against jq 1.7.1, all silent:
+///
+/// ```console
+/// $ echo '{"a":{"b":1},"c":[1,2]}' | jq -c 'del((.[] | .[0])?)'
+/// {"a":{"b":1},"c":[1,2]}          # here, before this: {"a":{"b":1},"c":[2]}
+/// $ echo '[{"a":1},5,{"a":3}]' | jq -c '((.[] | .a)?) |= 99'
+/// [{"a":99},5,{"a":3}]             # here, before this: [{"a":99},5,{"a":99}]
+/// ```
+///
+/// So: distribute only when the group cannot fan out. Fewer than two
+/// components has nothing to distribute across in the first place; otherwise
+/// every component must be single-valued. `Iterate`, a computed key, a
+/// comma, `..` -- anything that can produce other than exactly one output --
+/// makes the group unsafe, and it stays one opaque `Optional(Pipe(..))`
+/// element for `resolve_optional_sink` to give jq's own single scope.
+///
+/// Deliberately conservative: a group like `(.[] | .a?)` that happens not to
+/// diverge today is also called unsafe. That only changes *which* correct arm
+/// handles it, never the answer.
+///
+/// Allocation-free: consulted from [`needs_path_prepass`], which is on the
+/// per-call path of every `path`/`del`/`=`/`|=`.
+fn optional_group_is_scope_safe(inner: &Expr) -> bool {
+    /// Count the group's components, stopping as soon as two are seen --
+    /// a group with fewer than two has nothing to distribute across, and is
+    /// safe whatever it contains.
+    fn walk(expr: &Expr, seen: &mut usize, safe: &mut bool) {
+        match expr {
+            Expr::Identity => {}
+            Expr::Pipe(exprs) => {
+                for e in exprs {
+                    walk(e, seen, safe);
+                }
+            }
+            Expr::Paren(inner) => walk(inner, seen, safe),
+            Expr::Optional(inner) => walk(inner, seen, safe),
+            other => {
+                *seen += 1;
+                if !path_component_is_single_valued(other) {
+                    *safe = false;
+                }
+            }
+        }
+    }
+
+    let (mut seen, mut safe) = (0usize, true);
+    walk(inner, &mut seen, &mut safe);
+    seen < 2 || safe
+}
+
+/// One component of a path group: can it produce anything other than exactly
+/// one output?
+///
+/// The single rule both [`optional_group_is_scope_safe`] and its slice
+/// sibling decide by -- `Iterate`, a computed key, a comma, `..`, a call, all
+/// answer `false` by falling through.
+fn path_component_is_single_valued(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. } => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => path_component_is_single_valued(inner),
+        _ => false,
+    }
+}
+
+/// [`optional_group_is_scope_safe`] for a group already flattened into a
+/// component slice -- [`splice_optional_group`]'s own input shape. Same rule,
+/// one definition of the per-component half of it.
+fn optional_group_slice_is_scope_safe(inner: &[Expr]) -> bool {
+    inner.len() < 2 || inner.iter().all(path_component_is_single_valued)
+}
+
 fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
     match expr {
         Expr::Identity => {}
@@ -26772,8 +26898,8 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
             }
         }
         Expr::Paren(inner) => push_path_components(out, inner),
-        // A `?` on a whole multi-component group ((.a[0:1])? | .[0]) needs
-        // each of the group's own components individually scoped with
+        // A `?` on a whole multi-component group ((.a[0:1])? | .[0]) can
+        // need each of the group's own components individually scoped with
         // that `?` -- the same reasoning `splice_optional_group` already
         // applies for `update_path`/`delete_at_path` (#1294) -- rather
         // than being pushed as one opaque `Optional(Pipe(...))` element.
@@ -26783,7 +26909,13 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         // thing falls to "invalid path component" (#1311). Before #1429 the
         // same blindness was shared by `split_at_slice`'s own slice scan
         // and `get_path_mut`'s per-step `Identity | Field | Index` match.
-        Expr::Optional(inner) => {
+        //
+        // #2909: only when [`optional_group_is_scope_safe`] says the rewrite
+        // cannot be observed. A group that can fan out keeps jq's single
+        // abort scope by staying one opaque element, which
+        // `needs_path_prepass`/`needs_fanout_pass` route to
+        // `resolve_optional_sink` -- the arm that was already right.
+        Expr::Optional(inner) if optional_group_is_scope_safe(inner) => {
             let mut group = Vec::new();
             push_path_components(&mut group, inner);
             out.extend(group.into_iter().map(|e| Expr::Optional(Box::new(e))));
@@ -29779,20 +29911,28 @@ fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
         };
     }
     // `depth()`/`last()` are O(1); the O(depth) `to_vec()` flatten only runs
-    // in the `depth() != 1` arm, which is unreached *today* (see below).
+    // in the `depth() != 1` arm.
     let inner_path = if components.depth() == 1 {
         components.last().expect("depth checked").clone()
     } else {
-        // Unreached *today*, and deliberately not a panic: the postfix `?`
-        // attaches to a single path element until #367, so `(.a.b)?`,
-        // `(..)?` and `recurse?` are parse errors, and `E[K]?` — which used
-        // to arrive here with its target's components attached — now goes
-        // to `resolve_index_expr`. #367 reopens it on purpose: `(.a[.k])?`
-        // resolves through the `Paren` arm to `["a","b"]`, two components,
-        // and jq writes `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
-        // synthesize `Expr::Optional` around any expression too, so this
-        // was never an invariant of the type.
-        flatten_components(components.to_vec()) // omni-dev: coverage tolerate-line reason="unreachable today: postfix `?` attaches to a single path element until #367 reopens it, so no path this resolver builds has depth() != 1 here (#2649)"
+        // **Live since #2909.** This arm was annotated "unreached today" on
+        // the reasoning that the postfix `?` attaches to a single path
+        // element until #367, so `(.a.b)?`/`(..)?`/`recurse?` are parse
+        // errors and `E[K]?` goes to `resolve_index_expr`. That held only
+        // while a `?` over a *group* was distributed onto the group's
+        // components before it ever reached a resolver. #2909 stopped doing
+        // that for a group that can fan out -- jq's `?` is one abort scope
+        // over the whole group, not N per-step ones -- so such a group now
+        // arrives here whole, with two or more components under one `?`.
+        // Verified by instrumenting this arm: `((.[] | .a)?) |= 99` and
+        // `[path(.. | ((.[], .a) | .b)?)]` both reach it.
+        //
+        // Which is exactly the shape the old comment predicted #367 would
+        // reopen, and jq's answer for it was already stated there: `(.a[.k])?`
+        // resolves to `["a","b"]` and jq writes `{"a":{"b":5},"k":"b"}`. No
+        // new semantics -- `flatten_components` was always the right answer,
+        // it just had no caller.
+        flatten_components(components.to_vec())
     };
     PathBranch {
         path: PathPrefix::from_components([Expr::Optional(Box::new(inner_path))]),
