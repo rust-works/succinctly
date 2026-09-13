@@ -43028,6 +43028,42 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
             "",
             0,
         ),
+        // A `?//` *in INIT* must not retry past the fork's own escape. The
+        // stop this sink answers is not an ordinary satisfied-consumer stop,
+        // so it is marked non-retryable; without that marking the `?//` took
+        // it for one and ran the fold again, writing `hh` past a
+        // `halt_error` jq reaches once. Both fold spellings, since both
+        // sinks make the same conversion.
+        (
+            r#"{"a":1}"#,
+            r#"[path(foreach (1) as $v ((1 as $x ?// $y | .a); ("h"|halt_error(3)); .))]"#,
+            "",
+            "h",
+            3,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"[path(reduce (1) as $v ((1 as $x ?// $y | .a); ("h"|halt_error(3))))]"#,
+            "",
+            "h",
+            3,
+        ),
+        // A retryable escape in the same position still *does* retry -- the
+        // marking is on the escape's own kind, not on every fork stop.
+        (
+            r#"{"a":1}"#,
+            r#"[path(foreach (1) as $v ((1 as $x ?// $y | .a); ("s"|stderr); .))]"#,
+            "",
+            "ssjq: error (at <stdin>:0): Invalid path expression with result \"s\"\n",
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[first(path(foreach (1) as $v ((1 as $x ?// $y | .a); .; .)))]",
+            "[[\"a\"],[\"a\"]]\n",
+            "",
+            0,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
