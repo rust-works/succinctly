@@ -42976,7 +42976,7 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
         // side effect *does* fire — demand, not suppression.
         (
             r#"{"a":1,"b":2}"#,
-            r#"[limit(2; path(foreach (1) as $i (((.a|stderr), (.b|stderr)); .; .)))]"#,
+            r"[limit(2; path(foreach (1) as $i (((.a|stderr), (.b|stderr)); .; .)))]",
             "[[\"a\"],[\"b\"]]\n",
             "12",
             0,
@@ -42984,7 +42984,7 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
         // A multi-element source with a bound: one fork, one write.
         (
             r#"{"a":1,"b":2}"#,
-            r#"[first(path(foreach (1,2) as $i (((.a|stderr), (.b|stderr)); .; .)))]"#,
+            r"[first(path(foreach (1,2) as $i (((.a|stderr), (.b|stderr)); .; .)))]",
             "[[\"a\"]]\n",
             "1",
             0,
