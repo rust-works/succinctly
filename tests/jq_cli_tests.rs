@@ -43258,6 +43258,19 @@ fn reduce_is_demand_forwarding_2899() -> Result<()> {
             "h".to_string(),
             3,
         ),
+        // #2163's synthetic-`null` INIT-fork divergence, which the per-fork
+        // source drive exposes on more spellings than before: jq's second
+        // fork iterates a synthetic `null`, the `?` swallows that error
+        // before `stderr` runs, so jq writes once; succinctly's second fork
+        // iterates the real document and writes again. Stdout and exit code
+        // agree. Pinned as *our* answer so a future #2163 fix trips here.
+        (
+            r#"{"a":1}"#,
+            r#"reduce ((.[]|stderr)?) as $x ((0,1); .)"#.to_string(),
+            "0\n1\n".to_string(),
+            "11".to_string(),
+            0,
+        ),
         // A plain (non-`?//`) source still cannot be stopped early by either
         // tool: `reduce` emits only its final accumulator, so it must
         // exhaust the source to produce anything at all.

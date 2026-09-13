@@ -5925,7 +5925,26 @@ Both now re-drive SOURCE per INIT fork — `foreach` since #2180 WP3's review, `
 #2899 — against the *real* ambient input every time, which is exactly the half jq does not
 do. (Before #2899 `reduce` differed again: it computed SOURCE's values once, upfront, and
 reused them across every fork, so `[reduce ("s"|stderr) as $x ((0,1); .)]` wrote `s` where
-jq writes `ss`. That half is closed; the synthetic-`null` half is what remains.) That front-end-level agreement (not independent
+jq writes `ss`. That half is closed; the synthetic-`null` half is what remains.)
+
+**#2899 widened this entry's reach**, and the trade is worth stating plainly. `reduce`'s old
+value-caching *accidentally* matched jq on shapes where the only visible difference was
+between "re-drive against the real document" and "re-drive against jq's synthetic `null`" —
+because caching re-drove against nothing at all. Driving per fork correctly is what the `?//`
+fix required, and it exposes the synthetic-`null` gap on those shapes:
+
+```console
+$ echo '{"a":1}' | jq -c 'reduce ((.[]|stderr)?) as $x ((0,1); .)'
+1            # succinctly writes `11`; it wrote `1` before #2899
+```
+
+jq's second fork iterates its synthetic `null`, the `?` swallows that error before `stderr`
+runs, so jq writes once; succinctly's second fork iterates the real `{"a":1}` and writes
+again. Stdout and exit codes are unaffected in every such shape. This is the divergence this
+entry already records, reached by more spellings — not a new one, and not something `reduce`
+had ever deliberately matched.
+
+That front-end-level agreement (not independent
 double-implementation of the fold itself, since both front ends call the same shared
 functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163`
 (`tests/jq_evaluator_parity_tests.rs`) pins.

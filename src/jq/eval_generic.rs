@@ -9075,19 +9075,6 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     resume_from_escape(escape, flow)
 }
 
-/// Generic-evaluator twin of `eval::each_foreach` (#2180 WP3) — see that
-/// function's doc comment for jq's semantics, the stop-as-break state-
-/// threading rule and the oracle rows that pinned it. Everything below the
-/// source is shared code (`eval::foreach_forks`,
-/// `try_foreach_step_alternatives`, `substitute_foreach_steps`), so the two
-/// evaluators cannot drift on the fold itself; only INIT and the source drive
-/// differ, and both differ exactly as this file's eager `Expr::Foreach` arm
-/// already differs from `eval::eval_foreach`'s.
-///
-/// Both routes need the arm and both are exercised by every row: a bare
-/// `first(...)` is intercepted by this file's own native `FirstExpr` arm and
-/// drives `eval_each_generic`, while `isempty(...)` has no native arm here
-/// and reaches `eval.rs`'s `eval_each` instead.
 /// [`eval_each_generic`]'s `reduce` arm (#2899) -- `each_foreach_generic`'s
 /// twin over [`reduce_forks`].
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach_generic`'s parameter list
@@ -9118,7 +9105,20 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // STYLE-0004: the generic evaluator's ambient-threading list
+/// Generic-evaluator twin of `eval::each_foreach` (#2180 WP3) — see that
+/// function's doc comment for jq's semantics, the stop-as-break state-
+/// threading rule and the oracle rows that pinned it. Everything below the
+/// source is shared code (`eval::foreach_forks`,
+/// `try_foreach_step_alternatives`, `substitute_foreach_steps`), so the two
+/// evaluators cannot drift on the fold itself; only INIT and the source drive
+/// differ, and both differ exactly as this file's eager `Expr::Foreach` arm
+/// already differs from `eval::eval_foreach`'s.
+///
+/// Both routes need the arm and both are exercised by every row: a bare
+/// `first(...)` is intercepted by this file's own native `FirstExpr` arm and
+/// drives `eval_each_generic`, while `isempty(...)` has no native arm here
+/// and reaches `eval.rs`'s `eval_each` instead.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `foreach`'s own INIT/source/EXTRACT list
 fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     input: &Expr,
     patterns: &[Pattern],
