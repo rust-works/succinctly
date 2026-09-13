@@ -1576,8 +1576,24 @@ ones). Two different checks are in play, and their coverage differs:
   `test_builtin_contains_empty_argument_never_demands_the_input_1800`. No oracle exists for
   the undecodable variant itself: jq substitutes U+FFFD upstream, so this whole scenario is
   succinctly's own semi-indexing artifact and is reachable through the library API only, not
-  the CLI. `in`/`IN` have the identical shape but evaluate their argument against the decoded
-  input itself, so they keep the eager early return (tracked as #2202).
+  the CLI.
+- **#2202 (decided, not a bug): the rule this leaves for argument-vs-input ordering on an
+  undecodable input.** `in(xs)`/`IN(s)` have the identical shape as `contains`/`inside` but
+  evaluate their argument against the *decoded* input (`eval_owned_multi_keep_partial`/
+  `eval_each_owned` take `&OwnedValue`), so they keep the eager early return rather than
+  #1800's deferral: `in(error("boom"), {"a":1})` and `IN(error("boom"), {"a":1})` both raise
+  the decode failure, not `boom`. This agrees with `in(xs)`'s own desugar,
+  `. as $x | xs | has($x)` — binding `$x` already materializes (every `as` binding does, since
+  #1902), so there is nothing "argument first" to defer to; deferring `in`/`IN` the way
+  `contains` defers would make the builtin disagree with its own definition instead of
+  matching it. There is also no jq oracle for either ordering: every reference document
+  containing an undecodable string is rejected at JSON-parse time, before any filter runs. The
+  rule in one line: an argument that runs against the raw cursor (`contains`/`inside`) lets the
+  argument's own escape win; an argument that runs against the decoded input (`in`/`IN`, and
+  every `as` binding) raises the decode failure first. Like #1800's asymmetry above, this is
+  reachable through the library API only — the CLI's `eval_generic.rs` bridge materializes the
+  input a layer earlier and raises the decode failure uniformly for all three builtins,
+  `contains` included.
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
