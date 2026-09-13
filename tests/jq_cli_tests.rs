@@ -42962,6 +42962,48 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
         assert_eq!(stdout, want_out, "{filter}");
         assert_eq!(stderr, want_err, "{filter}");
     }
+
+    // #2925, the two shapes that still collect -- neither introduced here.
+    // Each row carries jq's answer and ours and asserts they still differ,
+    // so closing either trips this test rather than passing quietly.
+    let big = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(300));
+    for (input, filter, want_out, jq_err, our_err) in [
+        // A document the reindex bridge will not round-trip identically
+        // takes the bridge, which collects -- so the *document* selects the
+        // route, not the filter. The same filter on `{"a":1,"b":2}` is in
+        // the table above, matching jq.
+        (
+            big.as_str(),
+            "[limit(1; path((.a|stderr),(.b|stderr)))]",
+            "[[\"a\"]]\n",
+            "1",
+            "12",
+        ),
+        // The stop reaches the branch producer but not a generator in index
+        // position -- `resolve_index_expr`'s eager key evaluation, the same
+        // function #2032 sits in.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"[limit(1; path(.[("a"|stderr),("b"|stderr)]))]"#,
+            "[[\"a\"]]\n",
+            "a",
+            "ab",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_ne!(
+            our_err, jq_err,
+            "{filter}: this row exists because the two differ -- if they no longer do, \
+             move it into the table above"
+        );
+        assert_eq!(
+            stderr, our_err,
+            "{filter}: #2925's residual changed -- if it closed, move this row into the \
+             table above with jq's own stderr ({jq_err:?})"
+        );
+    }
     Ok(())
 }
 
