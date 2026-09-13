@@ -111,7 +111,21 @@ pub struct Tracked {
 ///   fact that it was never rebuilt*. Sound only while a value-equal
 ///   ambient is necessarily the same node, which a root snapshot against
 ///   its own proper descendants guarantees (a finite tree cannot contain
-///   itself) -- see #2642 for the rebuilt-copy hole this still has.
+///   itself) -- unsound the moment a stage between the binding and the
+///   resolver call *rebuilds* an equal-valued copy, closed by #2642's
+///   `RootWitness`/`demote_rebuilt_markers` (`eval.rs`): every "funnel" call
+///   site that hands an expression from the generic (cursor-based)
+///   evaluator to the owned-value evaluator first demotes any `Snapshot`
+///   marker whose recorded document node doesn't match that call's own root
+///   to `Untracked`, so `Frame::certifies`'s unconditional `Snapshot => true`
+///   never gets a chance to admit the rebuilt copy. Refuse-only by
+///   construction: a marker with no recorded node (or one bound from an
+///   already-owned/synthesized value, with nothing to compare) is always
+///   demoted too, which is why a handful of shapes jq keeps the same `jv`
+///   through (`[.] | .[0]`, `{k:.} | .k`, `. + {}`, `reduce empty as $i
+///   (.; .)`) now refuse instead of silently accepting a copy -- a
+///   documented, accepted residual (#2642's own follow-up), not a new
+///   correctness gap.
 /// - [`Origin::At`] -- the #2042 witness for a binding whose source
 ///   *navigated*, made inside a `path()`/`del()`/assignment resolution: the
 ///   resolver invocation the binding happened in, and the absolute path

@@ -741,11 +741,23 @@ is the revert that established what the other one costs.
    | `path(.a as $y \| .a \| try error("x") catch $y)`        | `["a"]`                     | the handler resolves under an unknown frame and a raising `try` stage does not carry the register — pre-existing: `path(. as $x \| try error("x") catch $x)` refuses too (jq `[]`)                                        |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
 
-   Two related divergences are pre-existing and out of scope for #2042, tracked separately:
-   [#2642](https://github.com/rust-works/succinctly/issues/2642) — the *root* `Origin::Snapshot`
-   marker already fabricates a path across a rebuilt-copy boundary (`. as $x \| {a:1} \|
-   ($x.a) = 9` on `{"a":1}` writes `{"a":9}`, jq refuses) — the same bug class as #1466,
-   reached via a rebuild instead of a sibling; not widened or fixed by #2042. And
+   Two related divergences were pre-existing and out of scope for #2042, tracked separately:
+   **[#2642](https://github.com/rust-works/succinctly/issues/2642), now closed.** The *root*
+   `Origin::Snapshot` marker used to fabricate a path across a rebuilt-copy boundary (`. as $x
+   \| {a:1} \| ($x.a) = 9` on `{"a":1}` wrote `{"a":9}`; jq refuses) — the same bug class as
+   #1466, reached via a rebuild instead of a sibling. Fixed by `RootWitness`/
+   `demote_rebuilt_markers` (`src/jq/eval.rs`): every "funnel" call site handing an expression
+   from the generic (cursor-based) evaluator to the owned-value evaluator now demotes a
+   `Snapshot` marker not proven to name that call's own document node to `Untracked` first, so
+   `Frame::certifies`'s unconditional `Snapshot => true` never gets a chance to admit the
+   rebuilt copy — refuse-only by construction, since the only transition is `Snapshot →
+   Untracked` and `Untracked` never certifies. A documented residual remains: a handful of
+   constructions jq's own reference-counted `jv` passes an embedded node through *without
+   copying it* (`[.] \| .[0]`, `{k:.} \| .k`, `. + {}`, `reduce empty as $i (.; .)`) now refuse
+   rather than silently accept a copy, since succinctly's `OwnedValue`-cloning model has no way
+   to tell "this position embeds the original node" from "this position merely happens to be
+   value-equal" — recovering them (an "owned embed map" recording which positions of a
+   constructed value embed a document node) is tracked as a follow-up, not attempted here. And
    [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
    navigating inside their own jq-level definitions against a *constructed* value inside
    `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and

@@ -26876,6 +26876,131 @@ impl Frame {
     }
 }
 
+/// What a resolver-adjacent boundary's own root actually is (#2642): the
+/// document node the generic evaluator is about to reindex-bridge from, or
+/// `Owned` when there is no such node (an accumulator, a slice, a computed
+/// value with no cursor at all).
+///
+/// `Frame::certifies`'s `Origin::Snapshot => true` arm is sound only when a
+/// value-equal ambient is necessarily the *same node* as the one the marker
+/// was frozen from -- true for a root snapshot against its own proper
+/// descendants (a finite tree cannot contain itself), false the moment a
+/// stage between the binding and the resolver call *rebuilds* an
+/// equal-valued copy (`. as $x | {a:1} | ($x.a) = 9`: jq refuses, since the
+/// `{a:1}` reconstruction is a different node; succinctly wrongly wrote
+/// through it before this fix). `RootWitness` is compared against a
+/// `Snapshot` marker's own `Tracked::node` (`BindOrigin::Node`, #2072) at
+/// [`demote_rebuilt_markers`], *before* the marker ever reaches
+/// `Frame::certifies` -- so this repairs the hole without touching
+/// `Frame`/`Origin`/`resolve_node`'s certification rule at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum RootWitness {
+    /// The reindex bridge's root is this document node.
+    Node { node: usize, document: usize },
+    /// No document node backs the value about to be bridged (an
+    /// accumulator, a synthesized array, a slice, ...).
+    Owned,
+}
+
+impl RootWitness {
+    /// The witness for a funnel call site whose owned value was
+    /// materialized from `cursor` -- `None` (no cursor at all) is
+    /// [`RootWitness::Owned`], matching [`bind_origin_of_cursor`]'s own
+    /// "no cursor, no node" convention.
+    pub(crate) fn of<C: DocumentCursor>(cursor: Option<&C>) -> Self {
+        match cursor {
+            Some(c) => Self::Node {
+                node: c.node_id(),
+                document: c.document_token(),
+            },
+            None => Self::Owned,
+        }
+    }
+}
+
+/// Whether a `Snapshot`-origin marker must be demoted to `Untracked` before
+/// crossing into a resolver invocation rooted at `root` (#2642): its
+/// `Tracked::node` doesn't name `root`'s own document node, so admitting it
+/// by `Frame::certifies`'s unconditional `Snapshot => true` would certify a
+/// rebuilt copy as if it were the original. `null`/`bool` values are exempt
+/// -- jq's `jv_identical` treats those as identical by value regardless of
+/// node, the same carve-out `null_bool_identical` makes elsewhere.
+fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
+    if marker.origin != Origin::Snapshot {
+        return false;
+    }
+    if matches!(marker.value, OwnedValue::Null | OwnedValue::Bool(_)) {
+        return false;
+    }
+    match (&marker.node, root) {
+        (
+            Some(BindOrigin::Node { node, document }),
+            RootWitness::Node {
+                node: root_node,
+                document: root_document,
+            },
+        ) => node != root_node || document != root_document,
+        // No recorded node (a binding made before #2072's cursor-tracking
+        // reached that site), an `Owned`-provenance binding, or an `Owned`
+        // root: none of these can prove the marker *is* this root, so the
+        // safe default demotes -- this can only cost an acceptance jq also
+        // refuses, never invent one, the same one-directional property
+        // `Frame::at = None` already relies on.
+        _ => true,
+    }
+}
+
+/// Rewrite every [`Expr::TrackedVar`] marker in `expr` whose
+/// [`marker_needs_demotion`] against `root` into an [`Origin::Untracked`]
+/// copy (#2642) -- a demotion, never a promotion: `Frame::certifies` already
+/// refuses `Untracked` unconditionally, so this is the only change needed to
+/// stop a rebuilt copy from being admitted, without touching `Frame`,
+/// `Origin`, or `resolve_node`'s certification rule itself.
+///
+/// `Cow::Borrowed` on the common path (no demotable marker anywhere in
+/// `expr`, checked once via [`any_subexpr`] before paying for a rebuild) --
+/// call sites that thread this through `eval_on_owned`/`eval_each_owned`
+/// pass a genuinely arbitrary expression, most of which contain no
+/// `TrackedVar` at all, let alone one needing demotion. `Tracked::node` is
+/// kept on a demoted marker unchanged: the cursor routes (`key`/`path`/
+/// `parent`, #2072) read `node`, never `origin`, and must keep answering.
+/// A marker is memoized by `Rc` pointer (`BTreeMap`, matching
+/// `DeleteTrieBuilder::intern`'s own pointer-keyed memo, `eval.rs`) so `k`
+/// occurrences of one shared marker clone its value once, not `k` times.
+pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> Cow<'e, Expr> {
+    if !any_subexpr(
+        expr,
+        &mut |e| matches!(e, Expr::TrackedVar(marker) if marker_needs_demotion(marker, root)),
+    ) {
+        return Cow::Borrowed(expr);
+    }
+
+    fn demote_walk(
+        expr: &Expr,
+        root: &RootWitness,
+        memo: &mut BTreeMap<usize, Rc<Tracked>>,
+    ) -> Expr {
+        if let Expr::TrackedVar(marker) = expr {
+            if marker_needs_demotion(marker, root) {
+                let key = Rc::as_ptr(marker) as usize;
+                let demoted = memo.entry(key).or_insert_with(|| {
+                    Rc::new(Tracked {
+                        value: marker.value.clone(),
+                        origin: Origin::Untracked,
+                        node: marker.node.clone(),
+                    })
+                });
+                return Expr::TrackedVar(Rc::clone(demoted));
+            }
+            return expr.clone();
+        }
+        map_subexprs(expr, &mut |child| demote_walk(child, root, memo))
+    }
+
+    let mut memo = BTreeMap::new();
+    Cow::Owned(demote_walk(expr, root, &mut memo))
+}
+
 /// Whether resolving `expr` can bind a variable from a navigated position
 /// -- the syntactic gate on [`Frame::enter`]'s `at`. Any `as` counts, and so
 /// does a call whose definition lies outside `expr` (`FuncCall`/
