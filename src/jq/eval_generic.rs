@@ -57,20 +57,20 @@ use super::eval::{
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
     demote_rebuilt_markers, each_path_on_owned, each_recurse_walk, enter_def_call_frame,
-    entries_to_object, eval_each_owned, eval_full as full_eval, eval_reduce_with_values,
-    extract_pattern_bindings, extract_single_pattern_binding, finish_fork_flow,
-    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
-    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, recurse_walk_flow, resolve_computed_slice_bounds,
+    entries_to_object, eval_each_owned, eval_full as full_eval, extract_pattern_bindings,
+    extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
+    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
+    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
+    is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
+    owned_bound_to_i64, owned_to_expr, owned_to_string, pattern_alternatives_var_names,
+    prefer_pending_control, range_max_exceeded_error, range_num, range_values_f64,
+    range_values_int, recurse_walk_flow, reduce_forks, resolve_computed_slice_bounds,
     resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
     slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
     stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses,
-    tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
@@ -7762,8 +7762,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // (`jq_runner.rs`/`yq_runner.rs` route through `eval_generic`),
             // so it has to agree with `eval::eval_reduce`'s own ordering
             // rather than merely resemble it.
-            let (init_values, init_control) =
-                stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            // #2899: INIT is driven through `eval_each_generic` (via
+            // `drive_foreach_expr_generic`) rather than collected, the same
+            // demand-forwarding treatment #2668 gave `foreach` just below --
+            // and the source is driven per INIT fork, which is what jq does
+            // (`[reduce ("s"|stderr) as $x ((0,1); .)]` writes `ss`).
+            //
             // #2642: `update` reruns against the fold's own `OwnedValue`
             // accumulator (INIT's own value, then each step's own result) --
             // never the ambient cursor above, regardless of what `cursor`
@@ -7771,30 +7775,23 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // `RootWitness::of(cursor)` (which would wrongly compare against
             // `.`'s own node instead of the accumulator's).
             let update = demote_rebuilt_markers(update, &RootWitness::Owned);
-            query_result_to_generic::<V>(eval_reduce_with_values::<Vec<u64>, S, _>(
+            let mut outputs: Vec<OwnedValue> = Vec::new();
+            let flow = reduce_forks::<S>(
                 patterns,
                 &update,
-                init_values,
-                init_control,
-                optional,
-                || {
-                    let (input_values, input_control) =
-                        stream_owned_outputs_generic::<S, V>(input, value, optional, cursor);
-                    // `reduce`'s output is single-shot -- it emits only the
-                    // final accumulator, never an intermediate -- so a control
-                    // anywhere in the input stream discards the prefix and
-                    // propagates alone. Mirrors `eval::eval_reduce`'s
-                    // identical arms, `optional` suppression included (a
-                    // decode failure is never suppressed, #1620/#1902, which
-                    // `suppresses` already encodes via `suppress_or_raise`).
-                    match input_control {
-                        None => Ok(input_values),
-                        Some(Control::Error(e)) => Err(suppress_or_raise(e, optional)),
-                        Some(Control::Break(label)) => Err(QueryResult::Break(label)),
-                        Some(Control::Halt(code)) => Err(QueryResult::Halt(code)),
-                    }
+                &mut |per_init| {
+                    drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
                 },
-            ))
+                optional,
+                &mut |per_element| {
+                    drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+                },
+                &mut |v| {
+                    outputs.push(v);
+                    Demand::Continue
+                },
+            );
+            query_result_to_generic::<V>(finish_fork_from_flow::<Vec<u64>>(outputs, flow, optional))
         }
 
         // `foreach`'s twin of the arm above, with `eval::eval_foreach`'s own
@@ -8930,6 +8927,20 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // sentence true (`all(foreach repeat(1) as $x (0; .+1); . > 0)`
         // raises `repeat: maximum iterations exceeded` again, not
         // `foreach`'s own step-budget message).
+        // #2899: `reduce`'s demand-forwarding arm, the twin of `foreach`'s
+        // just below. Without one every `reduce` reached the eager,
+        // collecting route, so a wrapping consumer drained an
+        // already-finished result and its stop never reached a `?//` sitting
+        // in INIT. Same gate as `foreach`, for the same unbounded-stream
+        // reason.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } if !streams_unbounded(input) && !streams_unbounded(init) => each_reduce_generic::<S, V>(
+            input, patterns, init, update, value, optional, cursor, sink,
+        ),
         Expr::Foreach {
             input,
             patterns,
@@ -9078,6 +9089,36 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 /// drives `eval_each_generic`, while `isempty(...)` has no native arm here
 /// and reaches `eval.rs`'s `eval_each` instead.
 #[allow(clippy::too_many_arguments)]
+/// [`eval_each_generic`]'s `reduce` arm (#2899) -- `each_foreach_generic`'s
+/// twin over [`reduce_forks`].
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach_generic`'s parameter list
+fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
+    input: &Expr,
+    patterns: &[Pattern],
+    init: &Expr,
+    update: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    // #2642: same reasoning as the eager `Expr::Reduce` arm -- `update`
+    // reruns against the fold's own accumulator, never the ambient cursor.
+    let update = demote_rebuilt_markers(update, &RootWitness::Owned);
+    reduce_forks::<S>(
+        patterns,
+        &update,
+        &mut |per_init| {
+            drive_foreach_expr_generic::<S, V>(init, &value, optional, cursor, per_init)
+        },
+        optional,
+        &mut |per_element| {
+            drive_foreach_expr_generic::<S, V>(input, &value, optional, cursor, per_element)
+        },
+        &mut |v| sink.push(GenericItem::Owned(v)),
+    )
+}
+
 fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     input: &Expr,
     patterns: &[Pattern],

@@ -5751,6 +5751,20 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // exactly as it did before WP3. Changing which cap fires is a
         // separate decision from this issue's rows; real jq hangs on all of
         // these, so there is no oracle either way (#2014).
+        // #2899: `reduce` gets the same demand-forwarding arm `foreach` has.
+        // Without one it always reached `eval_single`'s collecting path, so a
+        // wrapping consumer drained an already-finished result and its stop
+        // had nowhere live to land -- `[first(reduce (1) as $v ((1 as $x ?//
+        // $y | 1); . + 1))]` answered `[2]` where jq answers `[2,2]`. Gated
+        // exactly like `foreach`'s arm just below, for the same reason.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } if !streams_unbounded(input) && !streams_unbounded(init) => {
+            each_reduce::<W, S>(input, patterns, init, update, value, optional, sink)
+        }
         Expr::Foreach {
             input,
             patterns,
@@ -37648,185 +37662,44 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Each INIT output forks the whole reduce into a fully independent
     // execution over the source (#534): `reduce (1,2) as $x ((10,20); .+$x)`
     // is `13`, `23`, one result per INIT output.
-    let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
-
-    eval_reduce_with_values::<W, S, _>(
-        patterns,
-        update,
-        init_values,
-        init_control,
-        optional,
-        || {
-            // #1902/#1934: to_owned/promote_borrowed, not to_owned_lossy --
-            // an undecodable input element used to silently become `""` instead
-            // of raising. A decode failure is never suppressed by `optional`
-            // (#1620), matching the "drop the prefix, propagate unconditionally"
-            // policy the `Partial` arms below already apply -- but a
-            // *non*-decode-failure conversion error (a #1194 malformed-member
-            // error -- a #1642 collision error is itself tagged as a decode
-            // failure and so is unaffected by this) is an ordinary error like any
-            // other, and `optional` should suppress it the same way the bare
-            // `QueryResult::Error` arm below already does (#1934 item 3: this
-            // used to be unconditionally fatal regardless of `optional`, unlike
-            // that sibling arm). #1934 item 6: this widening -- a malformed
-            // key/collision now raises here where the pre-#1902 unchecked
-            // `to_owned_lossy` silently dropped the offending member -- is
-            // `to_owned`'s own already-established contract from #1755 onward,
-            // not new scope creep specific to `reduce`; #1907 tracks the general
-            // "`to_owned`'s `Err` can carry a non-decode-failure error" question
-            // this arm (and its `eval_foreach`/`eval_as` siblings) are instances
-            // of.
-            //
-            // `reduce`'s own output is always single-shot -- it only ever emits
-            // the final accumulator, never intermediate values (verified against
-            // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
-            // at all, just the error) -- so a `Partial` input stream just extracts
-            // the control and drops the prefix, same as the bare arms below.
-            match eval_single::<W, S>(input, value, optional).materialize_cursor() {
-                QueryResult::One(v) => match to_owned(&v) {
-                    Ok(v) => Ok(vec![v]),
-                    Err(e) => Err(suppress_or_raise(e, optional)),
-                },
-                QueryResult::OneCursor(_) => unreachable!(),
-                QueryResult::Many(vs) => match promote_borrowed(vs) {
-                    Ok(vs) => Ok(vs),
-                    Err((_, e)) => Err(suppress_or_raise(e, optional)),
-                },
-                QueryResult::Owned(v) => Ok(vec![v]),
-                QueryResult::ManyOwned(vs) => Ok(vs),
-                QueryResult::None => Ok(Vec::new()),
-                // #1934 item 2: a decode failure raised directly by `input`'s own
-                // evaluation (not via the checked-conversion arms above) must not
-                // be suppressed by `optional` either, matching `finish_fork`'s
-                // identical guard -- this arm had drifted from it.
-                QueryResult::Error(e) => Err(suppress_or_raise(e, optional)),
-                QueryResult::Break(label) => Err(QueryResult::Break(label)),
-                QueryResult::Halt(code) => Err(QueryResult::Halt(code)),
-                QueryResult::Partial(_prefix, Control::Error(e)) => {
-                    Err(suppress_or_raise(e, optional))
-                }
-                QueryResult::Partial(_prefix, Control::Break(label)) => {
-                    Err(QueryResult::Break(label))
-                }
-                QueryResult::Partial(_prefix, Control::Halt(code)) => Err(QueryResult::Halt(code)),
-            }
-        },
-    )
-}
-
-/// The OwnedValue-domain heart of `reduce EXPR as PATTERN (INIT; UPDATE)`,
-/// once `input`/`INIT` have already been reduced to `Vec<OwnedValue>` --
-/// shared by [`eval_reduce`] (cursor-sourced `input`/`INIT`, the ordinary
-/// case) and the deleted eager path-context evaluator's own `Expr::Reduce` arm
-/// (#1765: `input`/`INIT` sourced from the path-context evaluator instead,
-/// when either needs `key`/`parent`/`file_index` to resolve correctly).
-/// `update` itself is deliberately never routed through path-context
-/// evaluation by either caller -- it runs against the accumulator, a
-/// synthetic value with no real document position, so `key` there already
-/// answers `null` correctly without needing to change (#1765's own scoping).
-///
-/// `input` arrives as a `source` *closure*, not a `Vec`, because jq
-/// evaluates INIT before it ever pulls the source generator (#2440): a
-/// zero-output INIT must leave the source unevaluated, side effects
-/// included. Every caller therefore evaluates INIT eagerly and defers
-/// `input` to this function, which decides whether to run it at all.
-pub(crate) fn eval_reduce_with_values<'a, W, S, F>(
-    patterns: &[Pattern],
-    update: &Expr,
-    init_values: Vec<OwnedValue>,
-    init_control: Option<Control>,
-    optional: bool,
-    source: F,
-) -> QueryResult<'a, W>
-where
-    W: Clone + AsRef<[u64]>,
-    S: EvalSemantics,
-    F: FnOnce() -> Result<Vec<OwnedValue>, QueryResult<'a, W>>,
-{
-    // #2440: INIT has already run by the time this is called, and a
-    // zero-output INIT means the source generator is never pulled at all --
-    // `reduce halt_error as $x (empty; .)` exits 0 in jq 1.7.1, where
-    // evaluating the source first would have halted the process. That is why
-    // `source` is a closure rather than a `Vec`: the short-circuit lives here,
-    // once, instead of at each of the three call sites.
-    if init_values.is_empty() {
-        return finish_fork(Vec::new(), init_control, optional);
-    }
-    let input_values = match source() {
-        Ok(values) => values,
-        Err(escaped) => return escaped,
+    // #2899: INIT and the source are both *driven* now, through the same
+    // strategy pair `eval_foreach` uses -- a demand-forwarding drive, with
+    // an eager fallback for an unbounded stream that has no consumer stop to
+    // end it. `reduce_forks` enforces #2440's ordering structurally:
+    // `drive_source` is only ever called from inside `drive_init`'s own
+    // per-fork callback, so a zero-output INIT leaves the source unevaluated
+    // entirely (`reduce halt_error as $x (empty; .)` exits 0) and INIT's own
+    // escape always outranks the source's.
+    let mut lazy_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
+    };
+    let mut eager_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        drive_eager::<W, S>(init, value.clone(), optional, per_init)
+    };
+    let drive_init: ForeachInitDrive<'_> = if streams_unbounded(init) {
+        &mut eager_drive_init
+    } else {
+        &mut lazy_drive_init
     };
 
-    // Every name any alternative could bind (#1365) -- a name unbound by
-    // whichever alternative actually matches defaults to `null` in UPDATE,
-    // matching `eval_as_pattern`'s identical convention for `. as PATTERN
-    // ?//`.
-    let all_var_names = pattern_alternatives_var_names(patterns);
-
-    // Per input element, this element's UPDATE pre-destructured and
-    // substituted against *every* alternative pattern (`Err` if that
-    // pattern fails to match). Which alternative's bindings apply is
-    // decided purely by destructuring `input_val` -- independent of any
-    // accumulator/INIT fork -- so this whole matrix is hoisted outside the
-    // INIT-fork loop below, restoring the pre-#1365 single-pattern code's
-    // own #695 hoist ("pays for the AST rebuild once per input element,
-    // not N times") generalized across N alternatives. Only the actual
-    // UPDATE *evaluation* (inside the fold loop, via
-    // `try_reduce_step_alternatives`) depends on the accumulator.
-    let invert_dedup = patterns.len() > 1;
-    let substituted_updates_matrix: Vec<Vec<Result<Expr, EvalError>>> = input_values
-        .iter()
-        .map(|input_val| {
-            patterns
-                .iter()
-                .map(|pattern| {
-                    let bindings =
-                        extract_single_pattern_binding::<S>(pattern, input_val, invert_dedup)?;
-                    // #1368: bound and null-filled names never overlap (the
-                    // filter below excludes anything `bindings` already
-                    // covers), so fold order between the two groups can't
-                    // matter -- one `substitute_vars` call via `as_var_refs`
-                    // replaces the old `substitute_bindings` call plus a
-                    // separate manual null-fill loop.
-                    let null_value = OwnedValue::Null;
-                    Ok(substitute_vars(
-                        update,
-                        as_var_refs(&bindings).chain(
-                            all_var_names
-                                .iter()
-                                .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                                .map(|name| (name.as_str(), &null_value)),
-                        ),
-                    ))
-                })
-                .collect()
-        })
-        .collect();
-
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    // Shared across every INIT fork (#695), the same "whole tree, not
-    // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
-    let mut budget = REDUCE_FOREACH_MAX_STEPS;
-    for init_val in init_values {
-        let mut acc = init_val;
-        let mut aborted: Option<Control> = None;
-        for row in &substituted_updates_matrix {
-            let (new_acc, step_control) =
-                try_reduce_step_alternatives::<S>(row, acc, optional, &mut budget);
-            acc = new_acc;
-            if let Some(control) = step_control {
-                aborted = Some(control);
-                break;
-            }
-        }
-        match aborted {
-            Some(control) => return finish_fork(outputs, Some(control), optional),
-            None => outputs.push(acc),
-        }
-    }
+    let mut lazy_drive = |per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    };
+    let mut eager_drive = |per_element: ForeachElementSink<'_>| -> Flow {
+        drive_eager::<W, S>(input, value.clone(), optional, per_element)
+    };
+    let drive: ForeachSourceDrive<'_> = if streams_unbounded(input) {
+        &mut eager_drive
+    } else {
+        &mut lazy_drive
+    };
 
-    finish_fork(outputs, init_control, optional)
+    let flow = reduce_forks::<S>(patterns, update, drive_init, optional, drive, &mut |v| {
+        outputs.push(v);
+        Demand::Continue
+    });
+    finish_fork_from_flow(outputs, flow, optional)
 }
 
 /// Fast path for the handful of expr shapes that dominate the cost of
@@ -39911,6 +39784,128 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     }
 }
 
+/// `reduce`'s demand-driven fork core (#2899) — [`foreach_forks`]'s twin,
+/// and deliberately its structural copy: same `drive_init`/`drive_source`
+/// closures, same out-of-band `ended`/`terminal` slots, same
+/// [`stop_with_downstream`] classification, same terminal adjudication. The
+/// two constructs differ in exactly one place, which is the one place this
+/// function differs: `foreach` emits per UPDATE step, `reduce` emits once
+/// per INIT fork, the accumulator, after the source is exhausted.
+///
+/// Replacing `eval_reduce_with_values` rather than sitting beside it is the
+/// point. That function took INIT as an already-collected `Vec` and the
+/// source as a `FnOnce` returning one, so no consumer's [`Demand::Stop`] had
+/// anywhere to land — which is why #2668 could reshape `foreach_forks` and
+/// still leave `reduce` untouched. Two fixes fall out of the reshape:
+///
+/// * **A `?//` in INIT is no longer materialized past a consumer's stop.**
+///   `[first(reduce (1) as $v ((1 as $x ?// $y | 1); . + 1))]` is jq's
+///   `[2,2]`; it was `[2]`.
+/// * **The source is re-driven per INIT fork, as jq drives it.**
+///   `[reduce ("s"|stderr) as $x ((0,1); .)]` writes `ss` in jq and wrote
+///   `s` here, because the collected source was shared across forks. That
+///   one was not in #2899's own report — #534's "each INIT output forks the
+///   whole reduce into a fully independent execution over the source" was
+///   already the stated rule, and only the *values* were being reused.
+///
+/// Per-element substitution ([`substitute_foreach_steps`], with no EXTRACT)
+/// replaces the hoisted `substituted_updates_matrix`: a demand-driven drive
+/// sees one element at a time and has no matrix to hoist, exactly as #2180
+/// WP3 found for `foreach`. That is a real trade — the matrix amortized the
+/// AST rebuild across INIT forks — but it is not a loss here, because the
+/// source is now re-driven per fork anyway and each fork sees its own
+/// elements.
+pub(crate) fn reduce_forks<S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    drive_init: ForeachInitDrive<'_>,
+    optional: bool,
+    drive_source: ForeachSourceDrive<'_>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    // Lazily computed on the first fork and reused, for the same reason
+    // `foreach_forks` defers it: a zero-output INIT (`reduce halt_error as
+    // $x (empty; .)`, which exits 0) must not pay for a `Vec` build it never
+    // uses, and #2440's short-circuit is structural here rather than an
+    // early return this could sit above.
+    let mut all_var_names: Option<Vec<String>> = None;
+    let invert_dedup = patterns.len() > 1;
+    // Shared across every INIT fork (#695), the same "whole tree, not
+    // per-fork" accounting the collecting version used.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    let mut terminal: Option<Flow> = None;
+
+    let init_flow = drive_init(&mut |init_val| {
+        let all_var_names =
+            all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
+        let mut acc = init_val;
+        // Cleared on entry to every step, not just the first: a `?//` in the
+        // source re-enters this callback after a stop was already reported
+        // (#1519's retry seen from the consuming side), and the later step's
+        // verdict is the one that counts.
+        let mut ended: Option<Flow> = None;
+
+        let flow = drive_source(&mut |input_val| {
+            ended = None;
+            let row: Vec<Result<Expr, EvalError>> = substitute_foreach_steps::<S>(
+                patterns,
+                all_var_names,
+                update,
+                None,
+                &input_val,
+                invert_dedup,
+            )
+            .into_iter()
+            .map(|alternative| alternative.map(|(update, _no_extract)| update))
+            .collect();
+            let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
+            let (new_acc, step_control) =
+                try_reduce_step_alternatives::<S>(&row, step_acc, optional, &mut budget);
+            acc = new_acc;
+            match step_control {
+                None => Demand::Continue,
+                // Through `stop_with_downstream` rather than a bare
+                // assignment, so the escape carries the non-retryable
+                // classification a source-side `?//` must not retry past --
+                // the rule #2180 WP3's own review established for the
+                // identical slot in `foreach_forks`.
+                Some(control) => stop_with_downstream(&mut ended, Flow::Escaped(control)),
+            }
+        });
+
+        match ended.unwrap_or(flow) {
+            // The source ran out: this fork's answer is its accumulator, and
+            // it is the fork's *only* output -- `reduce` emits no
+            // intermediate, which is why a step escape above discards it.
+            Flow::Exhausted => {
+                let final_acc = core::mem::replace(&mut acc, OwnedValue::Null);
+                match sink(final_acc) {
+                    Demand::Continue => Demand::Continue,
+                    Demand::Stop => {
+                        stop_with_downstream(&mut terminal, Flow::Stopped { pending: None })
+                    }
+                }
+            }
+            other => stop_with_downstream(&mut terminal, other),
+        }
+    });
+
+    match terminal {
+        Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
+        Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
+        Some(Flow::Exhausted) => {
+            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream")
+        }
+        None => match init_flow {
+            Flow::Exhausted => finish_fork_flow(None, optional),
+            Flow::Escaped(control) => finish_fork_flow(Some(control), optional),
+            Flow::Stopped { .. } => unreachable!(
+                "drive_init's own per-fork callback always records `terminal` before answering Demand::Stop"
+            ),
+        },
+    }
+}
+
 /// [`finish_fork`] in [`Flow`] terms (#2180 WP3): the outputs are already
 /// delivered by the time a demand-driven fork construct finishes, so only the
 /// trailing control is left to adjudicate — and it is adjudicated by exactly
@@ -40029,6 +40024,35 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
 /// fork -- see [`foreach_forks`], which owns that loop and the reasons it
 /// re-drives rather than replays a recording.
 #[allow(clippy::too_many_arguments)]
+/// [`eval_each`]'s `reduce` arm (#2899) -- [`each_foreach`]'s twin over
+/// [`reduce_forks`], with the same INIT-then-source drive pair and the same
+/// unbounded-stream fallback.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach`'s own parameter list
+fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    input: &Expr,
+    patterns: &[Pattern],
+    init: &Expr,
+    update: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
+    };
+    let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    };
+    reduce_forks::<S>(
+        patterns,
+        update,
+        &mut drive_init,
+        optional,
+        &mut drive,
+        &mut |v| sink(Item::Owned(v)),
+    )
+}
+
 fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     patterns: &[Pattern],

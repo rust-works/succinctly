@@ -43290,9 +43290,9 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
         assert_eq!(stderr, want_err, "{filter}");
     }
 
-    // #2899, the sibling this does *not* close: value-mode `reduce` has no
-    // demand-forwarding dispatch arm at all, so its INIT is still collected.
-    // jq's first fork errors in UPDATE and it never reaches the second.
+    // Value-mode `reduce`'s own INIT, which was #2899's residual when this
+    // test was written and closed with it: jq's first fork errors in UPDATE
+    // and never reaches the second, so no `I` is written.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", r#"[reduce (1) as $i ((.a, ("I"|stderr)); .a)]"#],
         Some(r#"{"a":1}"#),
@@ -43300,8 +43300,8 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
     assert_eq!(code, 5, "stdout: {stdout:?}");
     assert_eq!(stdout, "");
     assert_eq!(
-        stderr, "Ijq: error (at <stdin>:0): Cannot index number with string \"a\"\n",
-        "#2899's residual changed -- jq writes no `I` here; if this closed, move the row up"
+        stderr,
+        "jq: error (at <stdin>:0): Cannot index number with string \"a\"\n"
     );
     Ok(())
 }
