@@ -366,7 +366,7 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 use super::expr::{
     ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
     FuncDefData, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param,
-    Pattern, PatternEntry, StringPart, Tracked,
+    Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -24513,7 +24513,12 @@ fn set_path<S: EvalSemantics>(
         // an array — that is the whole reason jq has a separate sentence for
         // it. An out-of-range range clamps rather than erroring, unlike the
         // `Expr::Index` arm above: `[1,2,3] | .[5:9] = ["x"]` appends.
-        Expr::Slice { start, end, .. } => through_slice(
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => through_slice(
             root,
             *start,
             *end,
@@ -24522,6 +24527,10 @@ fn set_path<S: EvalSemantics>(
                 scalar_noop,
                 container_noop,
                 terminal_write: true,
+                non_integer_bound: slice_has_non_integer_bound(
+                    start_key.as_ref(),
+                    end_key.as_ref(),
+                ),
             },
             // Always `true` -- see the sibling call sites above.
             |sub| {
@@ -24713,7 +24722,13 @@ fn set_path_steps<S: EvalSemantics>(
                 // which the split-based walker also routed through
                 // catch-and-swallow -- delegates unchanged.
                 let (component, optional) = unwrap_path_component(last);
-                if let Expr::Slice { start, end, .. } = component {
+                if let Expr::Slice {
+                    start,
+                    end,
+                    start_key,
+                    end_key,
+                } = component
+                {
                     return through_slice(
                         root,
                         *start,
@@ -24725,6 +24740,10 @@ fn set_path_steps<S: EvalSemantics>(
                             // The slice genuinely is the last path component, so
                             // this call's own `edit` is the write (#1321).
                             terminal_write: true,
+                            non_integer_bound: slice_has_non_integer_bound(
+                                start_key.as_ref(),
+                                end_key.as_ref(),
+                            ),
                         },
                         // Always `true` -- `=`'s RHS is an already-materialized
                         // value, it has no `|= empty` concept (#1877/#1894).
@@ -24956,7 +24975,12 @@ fn set_path_steps<S: EvalSemantics>(
         // `terminal_write` is always `false` here: `steps` is flat and this
         // is not its last element, so there is real path left after the
         // slice for `edit` to navigate (#1321).
-        Expr::Slice { start, end, .. } => through_slice(
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => through_slice(
             root,
             *start,
             *end,
@@ -24965,6 +24989,10 @@ fn set_path_steps<S: EvalSemantics>(
                 scalar_noop,
                 container_noop,
                 terminal_write: false,
+                non_integer_bound: slice_has_non_integer_bound(
+                    start_key.as_ref(),
+                    end_key.as_ref(),
+                ),
             },
             // See the terminal-slice call above for why this is always `true`.
             |sub| {
@@ -25069,6 +25097,24 @@ fn splice_optional_group(inner: &[Expr], rest: &[Expr], here: bool) -> Vec<Expr>
 /// `fn_params_excessive_bools` correctly flag four independent `bool`s
 /// (#1321 added `terminal_write` to the pre-existing three) as too many to
 /// track positionally at each call site.
+/// Does this slice component carry a bound jq never parsed (#2853)?
+///
+/// One definition, consulted by all of [`through_slice`]'s call sites, so
+/// "is this the null-target raw-bound case" cannot answer differently at one
+/// of them -- CLAUDE.md's "duplicated predicates diverge silently".
+///
+/// Deliberately narrow: only [`SliceBoundKey::Raw`] answers `true`. A
+/// `Number` key is #1326's float *spelling* of a perfectly good integer
+/// bound, and treating it as non-integer would turn `.[1.5:] = [9]` into an
+/// error.
+fn slice_has_non_integer_bound(
+    start_key: Option<&SliceBoundKey>,
+    end_key: Option<&SliceBoundKey>,
+) -> bool {
+    matches!(start_key, Some(SliceBoundKey::Raw(_)))
+        || matches!(end_key, Some(SliceBoundKey::Raw(_)))
+}
+
 struct SliceEditFlags {
     /// Whether the slice itself carried a `?` (`.a[0:1]?[0] = 9`) — threaded
     /// into `slice_owned_value`'s own bounds check so a genuinely
@@ -25097,6 +25143,14 @@ struct SliceEditFlags {
     /// the answer, and forcing that same refusal on top would report the
     /// wrong thing (or a spurious error where jq no-ops) either way.
     terminal_write: bool,
+    /// #2853: this component carries a bound jq never parsed, which can only
+    /// happen over a `null` target (see [`SliceBoundKey::Raw`]).
+    ///
+    /// jq's `INDEX` resolves such a path without looking at the descriptor,
+    /// so the refusal lives here, at the write, rather than at resolution --
+    /// and *which* refusal depends on whether anything was actually written,
+    /// exactly as the `String` arm's own `wrote` split does.
+    non_integer_bound: bool,
 }
 
 /// Adapts a caller with no `|= empty` concept (`set_path`'s three
@@ -25130,7 +25184,42 @@ fn through_slice<E: From<EvalError>>(
         scalar_noop,
         container_noop,
         terminal_write,
+        non_integer_bound,
     } = flags;
+    // #2853: a bound jq never parsed. This arm comes first because it is a
+    // property of the *component*, not of `root`'s kind -- and it is
+    // deliberately not gated on `terminal_write`: mid-chain, `edit` is the
+    // inner `set_path_steps`/`update_path_steps`, whose own `wrote` answers
+    // the very same question (`.["x":][0] = 5` raises, `.["x":][0] |= empty`
+    // no-ops).
+    //
+    // `edit` runs *first*, against a throwaway, and its outcome propagates
+    // via `?` before either disposition is decided -- the #1876/#1883 rule
+    // the `String` arm below states at length, and for the same reasons.
+    // Refusing before calling `edit` would discard a `debug`/`stderr` side
+    // effect and replace a genuine error from inside the update filter with
+    // this generic sentence. All three confirmed live against jq 1.7.1 on
+    // input `null`: `.["x":] |= (debug|5)` prints `["DEBUG:",null]` and
+    // *then* raises this; `.["x":] -= 5` raises "null (null) and number (5)
+    // cannot be subtracted" from inside the filter instead; `.["x":] |=
+    // empty` no-ops to `null`.
+    //
+    // The throwaway is `Null`, not `[]`: that DEBUG line prints `null`, so
+    // it is jq's own `INDEX` answer for a null target that the filter sees.
+    if non_integer_bound {
+        let mut throwaway = OwnedValue::Null;
+        let wrote = edit(&mut throwaway)?;
+        return if wrote {
+            // jq's `setpath` parses the descriptor and refuses it.
+            Err(EvalError::slice_indices_not_integers().into())
+        } else {
+            // `|= empty` (#1894): jq's `_modify` falls back to `delpaths`,
+            // which never parses the descriptor at all -- so this no-ops to
+            // `null`, exactly as `del(.["x":])` does. `root` is left
+            // untouched.
+            Ok(true)
+        };
+    }
     match root {
         // yq's slice-write no-op (#1101/#1116's scalar case, widened to a
         // real array/string target by #1142) — live-verified against yq
@@ -25950,7 +26039,12 @@ fn update_path<S: EvalSemantics>(
         // yq mode: real yq's container no-op (#1142) applies here too,
         // unconditional on the operator -- see the Pipe-chain arm's
         // matching comment above for the full rationale.
-        Expr::Slice { start, end, .. } => through_slice(
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => through_slice(
             root,
             *start,
             *end,
@@ -25959,6 +26053,10 @@ fn update_path<S: EvalSemantics>(
                 scalar_noop,
                 container_noop,
                 terminal_write: true,
+                non_integer_bound: slice_has_non_integer_bound(
+                    start_key.as_ref(),
+                    end_key.as_ref(),
+                ),
             },
             // `None`: a slice has no path component to name it (real yq
             // keeps the *container's* position for a slice, jq reports a
@@ -26292,7 +26390,12 @@ fn update_path_steps<S: EvalSemantics>(
                     pos.as_ref(),
                 );
             }
-            Expr::Slice { start, end, .. } => {
+            Expr::Slice {
+                start,
+                end,
+                start_key,
+                end_key,
+            } => {
                 return through_slice(
                     root,
                     *start,
@@ -26306,6 +26409,10 @@ fn update_path_steps<S: EvalSemantics>(
                         // arm inline against the slice `rest` directly, with
                         // no need to allocate the `Pipe` just to check it.
                         terminal_write: rest.iter().all(is_effectively_identity),
+                        non_integer_bound: slice_has_non_integer_bound(
+                            start_key.as_ref(),
+                            end_key.as_ref(),
+                        ),
                     },
                     // `None` for the same reason `update_path`'s own
                     // `Expr::Slice` arm drops the position -- see its comment.
@@ -26883,14 +26990,33 @@ pub(crate) fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedV
 /// silently".
 pub(crate) fn slice_component_value(
     start: Option<i64>,
-    start_key: Option<&NumberKey>,
+    start_key: Option<&SliceBoundKey>,
     end: Option<i64>,
-    end_key: Option<&NumberKey>,
+    end_key: Option<&SliceBoundKey>,
 ) -> OwnedValue {
     slice::literal_component_from_values(
-        start.map_or(OwnedValue::Null, |i| index_component_value(i, start_key)),
-        end.map_or(OwnedValue::Null, |i| index_component_value(i, end_key)),
+        slice_bound_component_value(start, start_key),
+        slice_bound_component_value(end, end_key),
     )
+}
+
+/// One bound of a slice descriptor, rendered.
+///
+/// The key is consulted *first*, and a [`SliceBoundKey::Raw`] answers on its
+/// own regardless of the `i64` side: a bound jq never parsed has no integer
+/// to render from, which is the whole reason it is carried verbatim (#2853,
+/// and see that variant's own invariant). Everything else is
+/// [`index_component_value`]'s existing `None`/`Some` split over an
+/// absent/integer-spelled/float-spelled bound, unchanged and still the single
+/// definition of #1088's per-number rule.
+fn slice_bound_component_value(bound: Option<i64>, key: Option<&SliceBoundKey>) -> OwnedValue {
+    match key {
+        Some(SliceBoundKey::Raw(value)) => (**value).clone(),
+        Some(SliceBoundKey::Number(number)) => {
+            bound.map_or(OwnedValue::Null, |i| index_component_value(i, Some(number)))
+        }
+        None => bound.map_or(OwnedValue::Null, |i| index_component_value(i, None)),
+    }
 }
 
 /// A persistent, structurally-shared path prefix (#701).
@@ -34601,23 +34727,26 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             let kind = SliceTargetKind::of_type_name(owned_type_name(target_value));
             let (start, end) = match kind {
                 // A null target is where the value-mode rule and a
-                // *path* part ways: jq's `INDEX` answers `null`
-                // without reading the bounds, so the path resolves --
-                // `?` or not -- to `{"start":"x","end":2}`, and it is
-                // the write that then refuses it (`null | .[("x"):2]?
-                // = 5` raises "Array/string slice indices must be
-                // integers" in jq 1.7.1; so does `|=`). An
-                // `Expr::Slice` component holds only integers, so a
-                // failed bound on a null target raises that same error
-                // here instead, unsuppressed by `?` -- identical for
-                // every write jq refuses, and wrong only for `path()`
-                // (jq reports the descriptor) and `del()` (jq no-ops
-                // on null). Recorded in
-                // `docs/compliance/jq/limitations.md`; tracked as #2853.
-                SliceTargetKind::Null => match (&s.bound, &e.bound) {
-                    (Ok(start), Ok(end)) => (*start, *end),
-                    (Err(err), _) | (_, Err(err)) => escape!(err.clone().into()),
-                },
+                // *path* part ways: jq's `INDEX` answers `null` without
+                // reading the bounds at all, so the path resolves -- `?`
+                // or not -- even when a bound is something jq never
+                // parsed, and it is the eventual write that refuses it
+                // (`null | .[("x"):2]? = 5` raises "Array/string slice
+                // indices must be integers" in jq 1.7.1; so does `|= 5`;
+                // `del()` and `|= empty` no-op to `null` instead, because
+                // jq's `_modify` falls back to `delpaths`, which never
+                // parses the descriptor).
+                //
+                // #2853: a failed bound therefore rides into the component
+                // verbatim rather than escaping here, carried by
+                // `SliceBoundKey::Raw`, and its `i64` side stays `None` --
+                // there is no integer to navigate with, and over a null
+                // target every navigation answers `null` regardless. The
+                // refusal moves to `through_slice`, which is where jq puts
+                // it. `resolve_computed_slice_bounds` is deliberately not
+                // consulted for this kind: it is the *non*-null rule
+                // (#2546), and it raises.
+                SliceTargetKind::Null => (s.navigable(), e.navigable()),
                 kind => match resolve_computed_slice_bounds::<S>(kind, &s.bound, &e.bound) {
                     Ok(bounds) => bounds,
                     Err(_) if optional => continue,
@@ -34761,16 +34890,24 @@ struct PathSliceBound {
     /// Its classification, with a jq-mode failure carried to the slice step
     /// rather than raised at the pull site (#2546, [`ComputedSliceBound`]).
     bound: ComputedSliceBound,
-    /// The [`NumberKey`] a float-spelled bound preserves in `path()` output
-    /// (#1326).
-    key: Option<NumberKey>,
-    /// The value the generator produced, kept only when `bound` is `Err`
-    /// (review: a large `range(..)` bound in path mode should not hold every
-    /// value twice): jq still renders the descriptor a failed bound sits in
-    /// -- `path((1,2)["x":])` is `Invalid path expression near attempt to
-    /// access element {"start":"x","end":null} of 1` (jq 1.7.1) -- and
-    /// nothing else holds the `"x"` by then.
-    raw: Option<OwnedValue>,
+    /// How this bound is reported in a `{"start":..,"end":..}` descriptor: a
+    /// float-spelled number's own spelling (#1326), or the raw value itself
+    /// when the classification failed.
+    ///
+    /// One field, not the `Option<NumberKey>` + `Option<OwnedValue>` pair it
+    /// replaces (#2853): those two were provably exclusive.
+    /// [`numeric_slice_bound_key`] answers `Some` only for a `Float`/
+    /// `NumberLiteral`, and the value was kept only when
+    /// [`owned_bound_to_i64`] failed, which happens only for a *non*-number
+    /// -- so no bound could ever have had both, and the `unreachable!()` the
+    /// old rendering needed for "failed, but nothing kept" went with them.
+    ///
+    /// jq still renders the descriptor a failed bound sits in --
+    /// `path((1,2)["x":])` is `Invalid path expression near attempt to access
+    /// element {"start":"x","end":null} of 1` (jq 1.7.1) -- and nothing else
+    /// holds the `"x"` by then. Since #2853 the same value also rides into
+    /// the resolved path itself over a `null` target.
+    key: Option<SliceBoundKey>,
 }
 
 impl PathSliceBound {
@@ -34779,7 +34916,6 @@ impl PathSliceBound {
         Self {
             bound: Ok(None),
             key: None,
-            raw: None,
         }
     }
 
@@ -34787,21 +34923,25 @@ impl PathSliceBound {
     /// itself only if the classification failed.
     fn classify(raw: OwnedValue, round: fn(f64) -> f64) -> Self {
         let bound = owned_bound_to_i64(&raw, round);
-        let key = numeric_slice_bound_key(&raw);
-        let raw = bound.is_err().then_some(raw);
-        Self { bound, key, raw }
+        let key = if bound.is_err() {
+            Some(SliceBoundKey::Raw(Box::new(raw)))
+        } else {
+            numeric_slice_bound_key(&raw).map(SliceBoundKey::Number)
+        };
+        Self { bound, key }
     }
 
-    /// What this bound renders as in a `{"start":s,"end":e}` descriptor
-    /// (#1326's spelling-preserving rendering for a resolved number, the
-    /// value itself for a failed classification).
+    /// The `i64` this bound navigates with, if it has one.
+    fn navigable(&self) -> Option<i64> {
+        self.bound.as_ref().ok().copied().flatten()
+    }
+
+    /// What this bound renders as in a `{"start":s,"end":e}` descriptor --
+    /// the same single definition the resolved `Expr::Slice` component is
+    /// rendered through, so a descriptor built here and one rebuilt from the
+    /// component later cannot disagree.
     fn component_value(&self) -> OwnedValue {
-        match (&self.bound, &self.raw) {
-            (Ok(Some(i)), _) => index_component_value(*i, self.key.as_ref()),
-            (Ok(None), _) => OwnedValue::Null,
-            (Err(_), Some(raw)) => raw.clone(),
-            (Err(_), None) => unreachable!("`classify` keeps the value of every failed bound"), // omni-dev: coverage tolerate-line reason="unreachable: `classify` is the only constructor of an `Err` bound and always keeps its value (#2546)"
-        }
+        slice_bound_component_value(self.navigable(), self.key.as_ref())
     }
 }
 
@@ -45437,7 +45577,12 @@ fn delete_path_steps(
             // #1162/#1219/#1321/#1873/#1876/#1883 code review) -- unchanged
             // reasoning, just recursing into `delete_path_steps` on a slice
             // instead of `delete_at_path` on a rebuilt `Expr::Pipe`.
-            Expr::Slice { start, end, .. } => {
+            Expr::Slice {
+                start,
+                end,
+                start_key,
+                end_key,
+            } => {
                 return through_slice(
                     root,
                     *start,
@@ -45447,6 +45592,10 @@ fn delete_path_steps(
                         scalar_noop: false,
                         container_noop: false,
                         terminal_write: yq_mode,
+                        non_integer_bound: slice_has_non_integer_bound(
+                            start_key.as_ref(),
+                            end_key.as_ref(),
+                        ),
                     },
                     |sub| always_wrote(delete_path_steps(sub, rest, optional, yq_mode, true)),
                 )
@@ -85134,7 +85283,7 @@ mod tests {
         let slice_number = Expr::Slice {
             start: Some(1),
             end: Some(3),
-            start_key: Some(NumberKey::Literal(1.5, "1.5".into())),
+            start_key: Some(SliceBoundKey::Number(NumberKey::Literal(1.5, "1.5".into()))),
             end_key: None,
         };
         assert_eq!(
@@ -85294,7 +85443,7 @@ mod tests {
         let trie = one_step_trie(Expr::Slice {
             start: Some(1),
             end: Some(3),
-            start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+            start_key: Some(SliceBoundKey::Number(NumberKey::Literal(1.0, "1.0".into()))),
             end_key: None,
         });
         let err = delete_trie_array(

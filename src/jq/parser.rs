@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
     Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param,
-    Pattern, PatternEntry, Program, StringPart,
+    Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
 
@@ -1264,8 +1264,12 @@ impl<'a> Parser<'a> {
             Bracket::Static(Expr::Slice {
                 start: start_i64,
                 end: end_i64,
-                start_key: start_key.flatten(),
-                end_key: end_key.flatten(),
+                // A *literal* bound can only ever be a number (#1326's
+                // float spelling); `SliceBoundKey::Raw` exists for a
+                // computed bound the resolver carried verbatim over a null
+                // target (#2853), which the parser never produces.
+                start_key: start_key.flatten().map(SliceBoundKey::Number),
+                end_key: end_key.flatten().map(SliceBoundKey::Number),
             })
         }
     }
@@ -8680,7 +8684,7 @@ mod tests {
             Expr::Slice {
                 start: Some(1),
                 end: Some(3),
-                start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+                start_key: Some(SliceBoundKey::Number(NumberKey::Literal(1.0, "1.0".into()))),
                 end_key: None,
             }
         );
@@ -8690,7 +8694,7 @@ mod tests {
                 start: Some(1),
                 end: Some(3),
                 start_key: None,
-                end_key: Some(NumberKey::Literal(3.0, "3.0".into())),
+                end_key: Some(SliceBoundKey::Number(NumberKey::Literal(3.0, "3.0".into()))),
             }
         );
 
@@ -8767,8 +8771,8 @@ mod tests {
             Expr::Slice {
                 start: Some(-3),
                 end: Some(-1),
-                start_key: Some(NumberKey::Float(-3.0)),
-                end_key: Some(NumberKey::Float(-1.0)),
+                start_key: Some(SliceBoundKey::Number(NumberKey::Float(-3.0))),
+                end_key: Some(SliceBoundKey::Number(NumberKey::Float(-1.0))),
             }
         );
         // A non-integral negative float still can't fold -- same as the
