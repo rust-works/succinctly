@@ -36907,9 +36907,6 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }
-        // #2397: the `!optional` route reaches this through
-        // [`eval_owned_pure`] above; this arm remains for the `optional`
-        // one, which that call is gated out of.
         Expr::Builtin(Builtin::ToString) => {
             Some(Ok(Some(OwnedValue::String(owned_to_string::<S>(input)))))
         }
@@ -37174,8 +37171,13 @@ fn eval_owned_navigation<S: EvalSemantics>(
 /// `del(.[] | .score as $y | select($y < 100))` would otherwise reindex
 /// the whole branch per element for a condition that reads none of it --
 /// measured at +21% (7950X) / +31% (M4 Pro) on that shape.
-/// #2397 (item 2): see [`is_pure_chain_link`]'s doc comment for why these
-/// two overlapping purity grammars stay separate rather than sharing a
+/// #2397: no longer consulted at runtime -- [`eval_owned_pure`] is its own
+/// grammar now, and this states the same accept-set as the oracle
+/// `eval_owned_pure_declines_exactly_where_the_old_pre_walk_said_no`
+/// checks the fused form against.
+///
+/// Item 2: see [`is_pure_chain_link`]'s doc comment for why these two
+/// overlapping purity grammars stay separate rather than sharing a
 /// primitive.
 #[cfg(test)]
 fn is_owned_pure_expr(expr: &Expr) -> bool {
@@ -37283,18 +37285,33 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// the reindex bridge (via [`eval_owned_input_reindexed`]) over a matrix of
 /// expressions x values and asserts they agree.
 ///
-/// Returns `None` for anything outside [`is_owned_pure_expr`] — the caller
-/// then falls back to the bridge unchanged. Because every accepted shape is
+/// Returns `None` for anything outside its own grammar, and for a
+/// navigation shape in [`ResultPosition::Fresh`] — the caller then falls
+/// back to the bridge unchanged. (Before #2397 that grammar was stated
+/// separately, as `is_owned_pure_expr`, and checked before this ran; the
+/// two are now one thing, and the old predicate survives `#[cfg(test)]`
+/// only as this function's oracle.) Because every accepted shape is
 /// pure, a partially-completed evaluation that ends in `None` has cost only
 /// wasted work, never a duplicated side effect.
 ///
-/// This function's grammar is *wider* than what
-/// [`is_owned_pure_composite`] actually gates in: navigation arms
-/// (`Identity`/`Field`/`Index`, and a `Pipe` ending in one) are evaluable
-/// here but only ever reached as an operand of something that consumes
-/// their value, never as an expression's own result — see
-/// [`produces_fresh_value`] for the representation reason that separation
-/// exists.
+/// The grammar is *wider* in [`ResultPosition::Operand`] than in
+/// [`ResultPosition::Fresh`]: navigation arms (`Identity`/`Field`/`Index`,
+/// and a `Pipe` ending in one) are evaluable as an operand of something
+/// that consumes their value, and decline as an expression's own result —
+/// see [`produces_fresh_value`] for the representation reason that
+/// separation exists. #2397 moved that split from a pre-walk into the arms
+/// themselves; the rule is unchanged.
+///
+/// `Builtin::ToString` and the literal-RHS `Arithmetic` accumulator shape
+/// are deliberately **not** here, though #2397's own plan proposed folding
+/// them in from [`eval_owned_fast_path`]. Doing so makes them reachable as
+/// operands and as non-final pipe stages, which they never were: it changes
+/// `succinctly yq -n '[0.5+0.5] | .[0] | tostring'` from `1.0` to `1` (a
+/// latent yq-fidelity *fix*, tracked as #2902, but a behaviour change all
+/// the same), and `arith_combine` returns its input verbatim for `. + null`
+/// / `. + 0` / `. + ""`, so an `Arithmetic` arm reachable in `Fresh`
+/// position lets a navigated subvalue escape — precisely what the
+/// representation gate exists to prevent. Both found in review of #2897.
 fn eval_owned_pure<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -37391,45 +37408,33 @@ fn eval_owned_pure<S: EvalSemantics>(
         // otherwise the answer is the right operand's own truthiness.
         Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false),
         Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true),
-        // #2397 step 3: folded in from `eval_owned_fast_path`'s own arms.
-        // Both construct their result, so both are safe in either position
-        // -- there is no navigated subvalue to leak a representation.
-        //
-        // `tostring` (#2543's `Pipe`-of-one shape reaches it through the
-        // `Pipe` arm above now, rather than through a second unwrapping in
-        // the caller).
-        Expr::Builtin(Builtin::ToString) => {
-            Some(Ok(OwnedValue::String(owned_to_string::<S>(input))))
-        }
-        // `. + <literal>` (#2086/#2152), the `reduce`/`foreach` accumulator
-        // idiom. Only the literal-RHS shape `owned_arith_accumulator_shape`
-        // recognizes: a general pure-operand `Arithmetic` arm is *not* in
-        // scope, because its `?`-suppression rules live in
-        // `binary_fanout_core`, which is why the pre-#2397
-        // `is_owned_pure_expr` excluded `Arithmetic` outright. The
-        // `optional == true` case never reaches here (`eval_owned_fast_path`
-        // gates this whole call on `!optional`) and keeps its own arm there.
-        Expr::Arithmetic { .. } => {
-            let (op, rhs) = owned_arith_accumulator_shape(expr)?;
-            Some(arith_combine::<S>(op, input.clone(), rhs))
-        }
         // A pure pipe threads one value stage to stage — `eval_pipe`'s own
         // shape once every stage is single-output (and, per
         // [`is_owned_pure_expr`], once no stage needs path context, which is
         // the branch `eval_pipe` takes *before* threading anything).
         Expr::Pipe(stages) => {
             let (last, rest) = stages.split_last()?;
-            let mut current = input.clone();
+            // No upfront `input.clone()` (review): a pipe whose first stage
+            // this function declines -- `[.] | .[0]`, the single-stage shape
+            // `fold_pipe_stages_sink` emits (#2543) -- used to be rejected
+            // by the pre-walk for free, and cloning the whole owned document
+            // before finding that out would be a regression the benchmark
+            // rows do not cover. Nothing is cloned until a stage actually
+            // produces a value.
+            let mut current: Option<OwnedValue> = None;
             // Only the last stage's result leaves the pipe, so only it
             // inherits `position`; every earlier stage feeds the next one
             // and is an operand by construction.
             for stage in rest {
-                current = match eval_owned_pure::<S>(stage, &current, ResultPosition::Operand)? {
-                    Ok(v) => v,
-                    Err(e) => return Some(Err(e)),
-                };
+                let stage_input = current.as_ref().unwrap_or(input);
+                current = Some(
+                    match eval_owned_pure::<S>(stage, stage_input, ResultPosition::Operand)? {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    },
+                );
             }
-            eval_owned_pure::<S>(last, &current, position)
+            eval_owned_pure::<S>(last, current.as_ref().unwrap_or(input), position)
         }
         _ => None,
     }
@@ -60117,21 +60122,6 @@ mod tests {
                     "operand-position walk disagrees with is_owned_pure_expr for {src:?} on {value:?}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn probe_2397_shapes() {
-        for src in [
-            "1 + 2", "-1", "-(1 + 2)", "1 * 2", "-.a", "1", "(1)", "1 == 2",
-        ] {
-            let e = parse(src).unwrap();
-            println!(
-                "{src:20} owned_pure={} chain_link={} expr={:?}",
-                is_owned_pure_expr(&e),
-                is_pure_chain_link(&e),
-                e
-            );
         }
     }
 
