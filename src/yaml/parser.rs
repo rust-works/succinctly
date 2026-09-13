@@ -578,12 +578,22 @@ struct Parser<'a, const HAS_CR: bool> {
     /// rejects the byte itself at one chokepoint rather than each dispatch
     /// arm needing its own check -- an anchor/tag-prefixed value is refused
     /// before the prefix's own target is even examined, not merely left
-    /// unvalidated. Two shapes bypass that chokepoint's own dispatch and
-    /// carry their own identical gate instead: `--- |`/`--- >`
-    /// (`parse_inline_document_value`'s dedicated fast path) and `?` inside
-    /// a flow mapping (`parse_yaml_flow_mapping_entries` -- `json_strict`'s
-    /// own mapping-entry loop never reaches a `?` in key position, since
-    /// only a `"` starts a valid key there).
+    /// unvalidated. One shape bypasses that chokepoint's own dispatch and
+    /// carries its own identical gate instead: `--- |`/`--- >` (a
+    /// block-scalar indicator right after a document marker,
+    /// `parse_inline_document_value`'s dedicated fast path).
+    ///
+    /// A flow **mapping**'s own key/value positions (under `json_strict`)
+    /// reject the same four bytes too, but via a different mechanism
+    /// (#2777): `parse_json_strict_flow_mapping_entries` requires a key to
+    /// start with `"` and a value to start with `{`/`[`/`"`/a
+    /// `json_strict_token_end` literal, so `?`/`&`/`!`/`*`/`'` in either
+    /// position simply never matches any of those shapes -- there is no
+    /// dedicated gate for them there, only the absence of an arm that would
+    /// accept them. (Before #2777, this position had *no* rejection at all
+    /// for these bytes -- `{"a": &x 5}`/`{&x "a":1}` were silently accepted,
+    /// a pre-existing gap #2777 closed as a side effect of requiring a
+    /// specific key/value shape, not a deliberate new check.)
     json_strict: bool,
 }
 
@@ -6066,32 +6076,25 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// producing a truncated one.
     fn parse_json_strict_flow_mapping_entries(&mut self) -> Result<(), YamlError> {
         loop {
-            // Skip whitespace and any run of `,`/`:` before a key.
+            // Skip whitespace and any run of `,`/`:` before a key, then
+            // decide whether one is even there to parse.
             loop {
                 self.skip_flow_whitespace();
                 match self.peek() {
                     Some(b',' | b':') => self.advance(),
+                    Some(b'}') => return Ok(()),
+                    None => {
+                        return Err(YamlError::UnexpectedEof {
+                            context: "flow mapping",
+                        });
+                    }
                     _ => break,
                 }
             }
-            match self.peek() {
-                Some(b'}') => return Ok(()),
-                None => {
-                    return Err(YamlError::UnexpectedEof {
-                        context: "flow mapping",
-                    });
-                }
-                _ => {}
-            }
 
             // Parse key: must be a JSON string.
-            self.set_ib();
-            self.write_bp_open();
             match self.peek() {
-                Some(b'"') => {
-                    let end = self.parse_double_quoted()?;
-                    self.set_bp_text_end(end);
-                }
+                Some(b'"') => self.parse_json_strict_quoted_node()?,
                 _ => {
                     return Err(if self.json_strict_token_end().is_some() {
                         self.err_unexpected_char(
@@ -6103,7 +6106,6 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                     });
                 }
             }
-            self.write_bp_close();
 
             // Skip whitespace and at most one `,`/`:` before the value.
             self.skip_flow_whitespace();
@@ -6120,13 +6122,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 Some(b'{') => {
                     self.parse_flow_mapping()?;
                 }
-                Some(b'"') => {
-                    self.set_ib();
-                    self.write_bp_open();
-                    let end = self.parse_double_quoted()?;
-                    self.set_bp_text_end(end);
-                    self.write_bp_close();
-                }
+                Some(b'"') => self.parse_json_strict_quoted_node()?,
                 _ => {
                     let start = self.pos;
                     let Some(end) = self.json_strict_token_end() else {
@@ -6146,6 +6142,24 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 }
             }
         }
+    }
+
+    /// Parse a double-quoted string as a complete, self-contained BP node
+    /// -- `set_ib`/`write_bp_open`/`parse_double_quoted`/`set_bp_text_end`/
+    /// `write_bp_close`, in the order `set_bp_text_end` requires (recording
+    /// `self.pos` as the node's start before `parse_double_quoted` moves it
+    /// to the string's end -- `parse_double_quoted` returns the token's own
+    /// *length*, `self.pos - start`, not an absolute position, so its
+    /// return value is deliberately discarded here in favor of `self.pos`).
+    /// Shared by [`Self::parse_json_strict_flow_mapping_entries`]'s key and
+    /// value positions, the only two contexts that reach a JSON string.
+    fn parse_json_strict_quoted_node(&mut self) -> Result<(), YamlError> {
+        self.set_ib();
+        self.write_bp_open();
+        self.parse_double_quoted()?;
+        self.set_bp_text_end(self.pos);
+        self.write_bp_close();
+        Ok(())
     }
 
     /// Where a JSON literal token (`true`/`false`/`null`/a number) would end
@@ -6171,12 +6185,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             return Some(self.pos + 4);
         }
         let mut end = self.pos;
-        while end < self.input.len()
-            && matches!(
-                self.input[end],
-                b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
-            )
-        {
+        while end < self.input.len() && is_json_strict_number_byte(self.input[end]) {
             end += 1;
         }
         if end == self.pos {
@@ -6221,19 +6230,16 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // `? ` is a node marker, not key text: consume it *before* the interest bit
             // is planted, or the indicator and the space after it land inside the key's
             // span. The flow-sequence path has always done it in this order (#402).
+            //
+            // This function only ever runs with `json_strict` unset (#2777's
+            // dispatch in `parse_flow_mapping_inner` routes `json_strict`
+            // input to `parse_json_strict_flow_mapping_entries` instead,
+            // whose own key dispatch already rejects `?` -- it isn't `"`,
+            // and it never scans as a `json_strict_token_end` literal
+            // either), so the `json_strict`-gated rejection #2778 added here
+            // is unreachable; removed rather than left as dead code.
             let explicit = self.looks_like_explicit_flow_key();
             if explicit {
-                // #2778: `?` has no JSON spelling at all -- this is a
-                // structural rejection of the marker itself (real yq's
-                // token scanner never accepts it as a value-start byte,
-                // regardless of what follows), not a key-grammar check, so
-                // it stays in scope even though key *text* grammar (#2777)
-                // does not.
-                if self.json_strict {
-                    return Err(
-                        self.err_unexpected_char(self.pos, "explicit key marker in JSON input")
-                    );
-                }
                 self.advance();
                 self.skip_flow_whitespace();
             }
@@ -7946,6 +7952,18 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
     (i, true)
 }
 
+/// Is `b` a byte that can appear inside a JSON-strict number token -- a
+/// digit, `.`, `e`/`E`, or `+`/`-` (#2777/#2778)? Shared by
+/// [`Parser::json_strict_token_end`] (finding a candidate number token's
+/// extent, before it is known to be well-formed) and
+/// [`json_strict_plain_scalar_ok`] (validating that extent), kept as one
+/// definition so a future change to what counts as a number byte cannot
+/// update one without the other.
+#[inline]
+fn is_json_strict_number_byte(b: u8) -> bool {
+    matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+}
+
 /// Whether `bytes` is a plain scalar token real yq's `-p json` front end
 /// (`goccy/go-json` v0.10.6) would accept, per its two-layer boundary
 /// (#2778's triage plan derives this from the reference's own source):
@@ -7970,10 +7988,7 @@ fn json_strict_plain_scalar_ok(bytes: &[u8]) -> bool {
         Some(b'-' | b'0'..=b'9') => {}
         _ => return false,
     }
-    if !bytes
-        .iter()
-        .all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
-    {
+    if !bytes.iter().all(|b| is_json_strict_number_byte(*b)) {
         return false;
     }
     // Every byte just passed the charset check above, a strict subset of
@@ -8005,13 +8020,15 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
     build_semi_index_impl(input, false)
 }
 
-/// [`build_semi_index`], enforcing JSON's stricter grammar (#2279, #2778)
-/// -- for callers that already know the bytes are JSON and pair this with
+/// [`build_semi_index`], enforcing real yq's own `-p json` grammar (#2279,
+/// #2778, #2777) -- for callers that already know the bytes are JSON and
+/// pair this with
 /// [`YamlIndex::mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
 ///
 /// See `Parser::json_strict` for exactly what this does and does not
-/// tighten (delimiters: sequences only, never mappings; scalar grammar:
-/// values only, never keys, never anchor/tag-prefixed content).
+/// tighten: strict delimiters and scalar grammar in flow *sequences*
+/// (#2279, #2778), but real yq's own lenient token-*pairing* grammar --
+/// not stricter delimiters -- in flow *mappings* (#2777).
 ///
 /// # Errors
 ///

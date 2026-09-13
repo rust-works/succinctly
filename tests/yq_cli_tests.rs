@@ -44810,6 +44810,36 @@ fn json_sourced_flow_mapping_malformed_key_is_an_ordinary_error_2777() -> Result
     Ok(())
 }
 
+/// Code review found this closure was a side effect of #2777's own key/value
+/// shape requirements, not a deliberate new check: before #2777, an anchor
+/// or tag prefixing a flow-mapping *value* under `json_strict`, or an
+/// anchor-prefixed *key*, were both silently accepted (`{"a": &x 5}` ->
+/// `{"a":5}`, `{&x "a":1}` -> `{"a":1}` on pre-#2777 `main`) even though
+/// neither has a JSON spelling at all. `parse_json_strict_flow_mapping_entries`'s
+/// key dispatch (must start with `"`) and value dispatch (must start with
+/// `{`/`[`/`"`/a JSON literal) simply never match `&`/`!`, so they now
+/// error -- confirmed live against yq v4.53.3, which also rejects every one
+/// of these (with unrelated wording, since real yq's own error comes from a
+/// different mechanism -- an unchecked type assertion or a scanner-level
+/// token failure, not a byte-shape check). A *bracket* at key position
+/// (`{[1,2]:3}`, `{{}:2}`) is deliberately excluded here: real yq's own
+/// "any bracket ends the loop" leniency (documented as not reproduced,
+/// above) means it answers `{}` there rather than rejecting -- succinctly's
+/// own clean refusal for that specific shape is a known, intentional
+/// divergence, not something this test should assert matches the oracle.
+#[test]
+fn json_sourced_flow_mapping_anchor_tag_key_now_refuses_2777() -> Result<()> {
+    for input in [r#"{"a": &x 5}"#, r#"{"a": !!str 5}"#, r#"{&x "a":1}"#] {
+        let (stdout, code) =
+            run_yq_stdin(".", input, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 1,
+            "#2777: {input:?} must be rejected with exit 1, got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The gap was never output-shaped: `length` and `keys` answer from the BP
 /// structure too, matching #2279's own coverage rationale for its sibling
 /// delimiter fix.
