@@ -2959,17 +2959,21 @@ and ahead of the target, so every one of those rows raised the slice-indices err
 the DEBUG rows, ran the generator to exhaustion first). Both value-mode evaluators and the
 path-mode resolver now follow jq's order.
 
-One corner of path mode is still open: a non-numeric bound over a **null** target. jq
-resolves that path (`null | path(.["x":])` is `[{"start":"x","end":null}]`, `?` or not) and
-leaves it to the write to refuse it — `= 5` and `|= 5` raise `Array/string slice indices must
-be integers`, `del()` no-ops to `null`. succinctly's `Expr::Slice` path component holds only
-integer bounds, so the resolver raises that same error at resolution instead, unsuppressed by
-`?`: identical for every write jq refuses, wrong only for `path()` (jq reports the descriptor)
-and `del()` (jq answers `null`). Tracked as
-[#2853](https://github.com/rust-works/succinctly/issues/2853).
+The **null**-target corner of that rule was the last piece, closed by
+[#2853](https://github.com/rust-works/succinctly/issues/2853): jq resolves a non-numeric
+bound over `null` into the path verbatim (`null | path(.["x":])` is
+`[{"start":"x","end":null}]`, `?` or not; `path(.[1.5:"y"])` keeps a float spelling and a
+raw bound in one descriptor) and leaves it to the write to refuse. succinctly used to raise
+`Array/string slice indices must be integers` at *resolution*, which matched jq for every
+write it refuses but was wrong for `path()` (jq reports the descriptor) and `del()` (jq
+answers `null`). `Expr::Slice`'s bound keys now carry the raw value, and the refusal happens
+at the write, where jq puts it — so `.["x":] = 5` still raises, `.["x":] -= 5` raises the
+*subtraction* error from inside its own filter, and `.["x":] |= empty` no-ops to `null`
+because jq's `_modify` falls back to `delpaths`, which never parses the descriptor.
 
-The path-mode resolver used to drain each bound generator eagerly before slicing, so
-`path(.[("x",(1|debug)):])` printed a DEBUG line jq never reaches.
+The path-mode resolver used to drain each bound generator eagerly before slicing, so on an
+array target `[1,2] | path(.[("x",(1|debug)):])` printed a DEBUG line jq never reaches (over
+a `null` target both tools print it, since the pair resolves there rather than failing).
 [#2267](https://github.com/rust-works/succinctly/issues/2267) closed that: `S`, `T` and `E`
 are now driven as three nested demand-driven generators, exactly as jq's
 `S as $s | T as $t | E | .[$s:$t]` desugaring pulls them, so `E` runs before the next `t` is

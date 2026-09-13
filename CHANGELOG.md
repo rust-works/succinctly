@@ -139,6 +139,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth countdown runs as ordinary `Int` arithmetic the whole way, not a
   silent float promotion on the very first decrement.
 
+- **A non-numeric slice bound over a `null` target resolves into the path,
+  and is refused at the write** (#2853). jq's `INDEX` opcode answers `null`
+  for a null target *without* reading the slice descriptor's bounds, so the
+  path resolves — `?` or not — even when a bound is something jq never parsed.
+  succinctly raised `Array/string slice indices must be integers` at
+  resolution instead, because `Expr::Slice` carried integer bounds with no
+  room for `"x"`. Captured live from jq 1.7.1 on input `null`:
+
+  | filter | jq 1.7.1 | was |
+  |---|---|---|
+  | `path(.["x":])` | `[{"start":"x","end":null}]` | the integers error |
+  | `path(.[1.5:"y"])` | `[{"start":1.5,"end":"y"}]` | the integers error |
+  | `del(.["x":])` | `null` | the integers error |
+  | `.["x":] \|= empty` | `null` | the integers error |
+  | `.["x":] -= 5` | `null (null) and number (5) cannot be subtracted` | the integers error |
+  | `.["x":] \|= (debug\|5)` | `["DEBUG:",null]`, then the integers error | the error, no DEBUG |
+  | `.["x":] = 5` | the integers error | agreed already |
+
+  `Expr::Slice`'s two key fields widen from `Option<NumberKey>` to
+  `Option<SliceBoundKey>`, which is either #1326's float spelling or the raw
+  value; `size_of::<Expr>()` is unchanged at its pinned 96 bytes. The refusal
+  moves to `through_slice`, running the update filter first so a `debug` side
+  effect or a real error from inside it still surfaces — the same #1876/#1883
+  ordering the string-slice arm already had. yq mode is unaffected: it raises
+  a failed bound at the pull site, so the case never arises there.
+
 - **`E[K]` interleaves its computed key with its target, as jq's own
   desugaring does** (#2267). `resolve_index_expr` drained `K` in full before
   reaching `E` for any key -- the sibling of the slice-bound gap below, and the

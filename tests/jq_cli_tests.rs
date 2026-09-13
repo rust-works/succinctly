@@ -17262,6 +17262,185 @@ fn test_write_paths_resolve_once_per_path_2267() -> Result<()> {
     Ok(())
 }
 
+/// #2853: jq's `INDEX` opcode answers `null` for a null target *without*
+/// reading the slice descriptor's bounds, so a bound jq never parsed
+/// resolves into the path verbatim -- `?` or not -- and only the eventual
+/// write refuses it. succinctly raised `Array/string slice indices must be
+/// integers` at resolution instead, because `Expr::Slice` had nowhere to put
+/// `"x"`.
+///
+/// Every row captured live from jq 1.7.1 on input `null`.
+#[test]
+fn test_null_target_non_numeric_slice_bound_resolves_2853() -> Result<()> {
+    for (filter, expected) in [
+        (r#"path(.["x":])"#, "[{\"start\":\"x\",\"end\":null}]\n"),
+        (r#"path(.["x":]?)"#, "[{\"start\":\"x\",\"end\":null}]\n"),
+        // A float spelling (#1326) and a raw bound in the same descriptor.
+        (r#"path(.[1.5:"y"])"#, "[{\"start\":1.5,\"end\":\"y\"}]\n"),
+        // Non-string raw bounds: the value rides in whatever its kind.
+        (r"path(.[{}:])", "[{\"start\":{},\"end\":null}]\n"),
+        (r"path(.[[]:])", "[{\"start\":[],\"end\":null}]\n"),
+        (r"path(.[true:])", "[{\"start\":true,\"end\":null}]\n"),
+        // The `?`-resumed generator keeps every pair, good bounds included.
+        (
+            r#"[path(.[(0,"x",1):]?)]"#,
+            "[[{\"start\":0,\"end\":null}],[{\"start\":\"x\",\"end\":null}],[{\"start\":1,\"end\":null}]]\n",
+        ),
+        // Full cross product, both sides raw on some pairs.
+        (
+            r#"[path(.[(0,"x"):("y",1)])]"#,
+            "[[{\"start\":0,\"end\":\"y\"}],[{\"start\":0,\"end\":1}],\
+             [{\"start\":\"x\",\"end\":\"y\"}],[{\"start\":\"x\",\"end\":1}]]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.replace(' ', ""), expected.replace(' ', ""), "{filter}");
+    }
+
+    Ok(())
+}
+
+/// #2853: `del()` over such a path answers `null`, because jq's `delpaths`
+/// never parses the descriptor. This needed no code -- the deletion trie
+/// turns the component into `ArrayStep::Slice(None, None)`, and
+/// `null | del(.[0:1])` already no-ops -- so it is pinned as the check that
+/// it stayed that way.
+///
+/// Two different raw descriptors collide on that same trie step
+/// (`del(.["x":], .["y":])`), which is harmless precisely because the
+/// component only ever exists over a `null` target, where every slice
+/// deletes nothing.
+#[test]
+fn test_null_target_non_numeric_slice_bound_deletes_as_noop_2853() -> Result<()> {
+    for (filter, input, expected) in [
+        (r#"del(.["x":])"#, "null", "null"),
+        (r#"del(.["x":]?)"#, "null", "null"),
+        (r#"del(.[(0,"x",1):]?)"#, "null", "null"),
+        (r#"del(.["x":], .["y":])"#, "null", "null"),
+        (r#"del(.a["x":])"#, r#"{"a":null}"#, r#"{"a":null}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    Ok(())
+}
+
+/// #2853: the refusal lives at the write, and *which* refusal depends on
+/// whether anything was written -- jq's `setpath` parses the descriptor and
+/// rejects it, while `_modify`'s fallback to `delpaths` never does.
+///
+/// The `-=` and `debug` rows are the ones that pin the ordering: the update
+/// filter runs *first*, against a throwaway `null`, and its own outcome wins.
+/// Refusing before running it would swallow the DEBUG line and replace a real
+/// arithmetic error with the generic sentence -- the regression #1876/#1883
+/// fixed for the string-slice arm.
+#[test]
+fn test_null_target_non_numeric_slice_bound_refused_at_write_2853() -> Result<()> {
+    const INTEGERS: &str = "Array/string slice indices must be integers";
+
+    for filter in [
+        r#".["x":] = 5"#,
+        r#".["x":] = ["z"]"#,
+        r#".["x":] |= 5"#,
+        r#".["x":] |= ."#,
+        r#".["x":] += 5"#,
+        r#".["x":]? = 5"#,
+        r#".["x":][0] = 5"#,
+        r#".a["x":] = 5"#,
+    ] {
+        let input = if filter.starts_with(".a") {
+            r#"{"a":null}"#
+        } else {
+            "null"
+        };
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(stderr.contains(INTEGERS), "{filter}: stderr: {stderr:?}");
+    }
+
+    // `|= empty` no-ops instead of refusing: `_modify` falls back to
+    // `delpaths`, which never looks at the descriptor.
+    for filter in [
+        r#".["x":] |= empty"#,
+        r#".["x":]? |= empty"#,
+        r#".["x":][0] |= empty"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "null", "{filter}");
+    }
+
+    // The filter runs first: its own error wins over the refusal.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#".["x":] -= 5"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("cannot be subtracted"),
+        "the subtraction error must win over the refusal: stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains(INTEGERS), "stderr: {stderr:?}");
+
+    // ... and its side effects survive, against a throwaway `null` -- not
+    // `[]`, which is what the DEBUG payload pins.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#".["x":] |= (debug|5)"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains(r#"["DEBUG:",null]"#),
+        "the update filter must run before the refusal: stderr: {stderr:?}"
+    );
+    assert!(stderr.contains(INTEGERS), "stderr: {stderr:?}");
+
+    // An outer `try` still catches the refusal.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"try (.["x":] = 5) catch "C""#], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#""C""#);
+
+    Ok(())
+}
+
+/// #2853 (must-not-change): the rows that would break if
+/// `slice_has_non_integer_bound` were widened past `SliceBoundKey::Raw`, or
+/// if the null-target arm leaked to a non-null target.
+#[test]
+fn test_slice_bound_controls_unmoved_2853() -> Result<()> {
+    for (filter, input, expected) in [
+        // A `Number` key is a real integer bound with a float spelling.
+        (r".[1.5:] = [9]", "[1,2,3]", "[1,9]"),
+        (
+            r"path(.[1.0:])",
+            "[1,2,3]",
+            "[{\"start\":1.0,\"end\":null}]",
+        ),
+        (r"path(.[1:2])", "null", "[{\"start\":1,\"end\":2}]"),
+        // NaN/overflow bounds already rendered as `null` and still do.
+        (r"path(.[nan:])", "null", "[{\"start\":null,\"end\":null}]"),
+        // A non-null target still raises at the slice step (#2546).
+        (r#"[.[(0,"x",1):]?]"#, "[1,2]", "[[1,2],[2]]"),
+        // Ordinary slice writes and deletes are untouched.
+        (r".[0:2] = [9]", "[1,2,3]", "[9,3]"),
+        (r".[0:2] |= empty", "[1,2,3]", "[3]"),
+        (r"del(.[0:2])", "[1,2,3]", "[3]"),
+        (r"del(.[0:1])", "null", "null"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    // A non-null target still refuses a non-numeric bound at the slice step.
+    let (_, stderr, code) = run_jq_full(&["-c", r#"path(.["x":])"#], Some("[1,2]"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Array/string slice indices must be integers"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
