@@ -663,6 +663,28 @@ is the revert that established what the other one costs.
    accept-where-jq-refuses cases) would not have been satisfiable while leaving a *known*
    instance of exactly that class in the same subsystem.
 
+   **[#2860](https://github.com/rust-works/succinctly/issues/2860), also closed**: the
+   `identical()` check itself (not `advance`'s carry-forward above) had its own, separate
+   instance of the same class. `FoldRegister::resolve`'s epilogue calls `self.relocate(..)`
+   unconditionally on every branch `resolve_seq`/`resolve_node` returns for UPDATE/EXTRACT,
+   and `relocate`'s `identical()` fallback re-derives trackability from `resolve()`'s own
+   *entry-time* register (`self.value`/`self.frame`) by nothing more than a value-equality
+   check — a tautology whenever the branch's final value is the loop variable itself, which it
+   always is when `$var` is referenced anywhere in the pipe. `path(foreach .a as $v0 (.; $v0;
+   (.zzz \| $v0)))` on `{"a":{"b":1}}` answered `["a"]` where jq raises "Invalid path
+   expression with result {\"b\":1}", and `=`/`\|=`/`del()` through the identical filter wrote
+   to (`{"a":999}`) or deleted from (`{}`) a document jq refuses to touch at all — because
+   `.zzz` (a missing-key access, a genuine navigation step to `null`) already, correctly, left
+   the branch untracked one layer in, in `resolve_seq`'s own finer-grained tracking; `relocate`
+   asked the identical question again with only the stale, pre-navigation register available
+   and answered wrong. Fixed the same way as `advance` above: `identical()` is now gated on
+   `cannot_move_register(expr)` for `expr` the expression just resolved, so it stays available
+   only for the bare-`$var`/arithmetic/construction shapes it exists for, and defers entirely
+   to `resolve_seq`/`resolve_node`'s own already-correct verdict whenever `expr` could have
+   navigated. `resolve_reduce`'s own final-emission call site (which builds its branch directly
+   from the fold's accumulator, not from a `resolve()` call over one expression) keeps
+   `identical()` unconditionally available, unaffected by this gate.
+
    Separately, a variable bound from a *navigated* position (`.a as $y`) used to carry no
    marker at all, so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`, refused too —
    and the naive fix (widen `substitute_var_tracked`'s gate to cover it) reopens the
