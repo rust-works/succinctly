@@ -139,6 +139,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth countdown runs as ordinary `Int` arithmetic the whole way, not a
   silent float promotion on the very first decrement.
 
+- **A `?` over a group that can fan out now gets jq's single abort scope**
+  (#2909). `(A | B)?` is `try (A | B)`: a failure anywhere inside prunes the
+  whole group's branch and stops the group's own generators. Two sites
+  rewrote it into `A? | B?` instead — `push_path_components` (#1311) for the
+  resolver, `splice_optional_group` (#1294) for the write walkers — which is
+  indistinguishable for a single-valued chain but lets a *generator* inside
+  the group resume past an error a later component raised.
+
+  Filed as a side-effect count; it is not. Two of the diverging shapes were
+  silent wrong answers, captured live from jq 1.7.1:
+
+  ```console
+  $ echo '{"a":{"b":1},"c":[1,2]}' | jq -c 'del((.[] | .[0])?)'
+  {"a":{"b":1},"c":[1,2]}          # was: {"a":{"b":1},"c":[2]}
+  $ echo '[{"a":1},5,{"a":3}]' | jq -c '((.[] | .a)?) |= 99'
+  [{"a":99},5,{"a":3}]             # was: [{"a":99},5,{"a":99}]
+  ```
+
+  — an element deleted that jq keeps, and a slot written that jq never
+  reaches. Neither needed `..` or `path()`, both of which the issue's own
+  repro had implicated.
+
+  One predicate now gates both rewrites: distribute only when the group has
+  fewer than two components or every one is single-valued. An unsafe group
+  stays opaque and routes to `resolve_optional_sink`, the arm that was
+  already correct — which is why the issue's three "neighbouring spellings
+  agree" rows agreed. Verified by a 2,400-combination differential sweep
+  against jq 1.7.1 with zero regressions.
+
 - **A non-numeric slice bound over a `null` target resolves into the path,
   and is refused at the write** (#2853). jq's `INDEX` opcode answers `null`
   for a null target *without* reading the slice descriptor's bounds, so the
