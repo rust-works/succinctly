@@ -5337,6 +5337,22 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Pipe(exprs) => eval_each_pipe::<W, S>(exprs, value, optional, sink),
         Expr::Paren(inner) => eval_each::<W, S>(inner, value, optional, sink),
+        // #2693: the `recurse` family streams its visited nodes, so a
+        // bounded consumer stops the walk instead of truncating a finished
+        // 10000-item list -- and, because jq emits a node *before* running
+        // `f` on it, a consumer the node itself satisfies never pays for
+        // that node's children at all. `..` is `Expr::RecursiveDescent`,
+        // a separate arm that already streamed. See [`each_recurse`].
+        Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            // `recurse`/`recurse_down` are `recurse(.[]?)`, the same
+            // desugaring `builtin_recurse` applies.
+            let f = Expr::Optional(Box::new(Expr::Iterate));
+            each_recurse::<W, S>(&f, None, value, sink)
+        }
+        Expr::Builtin(Builtin::RecurseF(f)) => each_recurse::<W, S>(f, None, value, sink),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            each_recurse::<W, S>(f, Some(cond), value, sink)
+        }
         Expr::Builtin(Builtin::PathsFilter(f)) => {
             each_paths_filter::<W, S>(f, value, optional, sink)
         }
@@ -33334,6 +33350,163 @@ fn finish_recurse_walk<'a, W>(
     owned_vec_to_result(outputs)
 }
 
+/// How a [`each_recurse_walk`] traversal ended.
+pub(crate) struct RecurseWalkEnd {
+    /// The stack drained naturally -- neither cut short by
+    /// [`RECURSE_MAX_ITEMS`] nor stopped by the sink. [`finish_recurse_walk`]
+    /// surfaces `pending_error` only in this case.
+    pub(crate) drained: bool,
+    /// An `f`/`cond` escape, deferred by [`queue_recurse_children`] so the
+    /// siblings it already approved still get their own descent (#842/#854).
+    pub(crate) pending_error: Option<EvalEscape>,
+    /// The sink answered [`Demand::Stop`].
+    pub(crate) stopped: bool,
+}
+
+/// The `recurse`-family value-mode walk, with each visited node delivered to
+/// `sink` as it is popped (#2693).
+///
+/// One definition for the two collecting builtins that used to spell the
+/// identical loop out separately (`builtin_recurse_f` and
+/// `builtin_recurse_cond` differed only in the `cond` gate, which
+/// [`eval_recurse_cond`] had already been extracted for) and for
+/// [`each_recurse`], the lazy arm. That matters beyond deduplication: this
+/// loop carries #490's "one output, one child", #635's DFS order, #636's
+/// abort-on-`f`-error, #842/#854's deferred escapes and
+/// [`RECURSE_MAX_ITEMS`]' silent cap, and a lazy copy of it would be a
+/// second place every one of those has to be maintained.
+///
+/// **`f` runs only if the sink still wants more.** That is the whole point
+/// of the sink: jq's `def r: ., (f | r); r;` emits `.` *before* `f` is
+/// evaluated at all, so a consumer satisfied by the node itself never pays
+/// for its children. Collecting inverted that -- every node's `f` ran, up to
+/// the 10000-item cap, whatever the consumer had asked for:
+///
+/// ```console
+/// $ echo '{"a":{"x":1},"b":{"y":2}}' | jq -c \
+///     '[limit(1; recurse((.a|debug), (.b|debug)))]'
+/// [{"a":{"x":1},"b":{"y":2}}]          # zero DEBUG lines; 20000 before #2693
+/// ```
+///
+/// **What this does *not* fix**, and cannot without suspending `f`
+/// mid-stream: jq also stops *between* `f`'s own outputs, since the first
+/// child's whole subtree is traversed before `f` is asked for the second.
+/// Here `f` still runs to completion at the node the bound is reached on, so
+/// `[limit(2; recurse(.[]?|debug))]` writes two DEBUG lines where jq writes
+/// one. That residual is bounded by one node's fan-out (it was the whole
+/// remaining tree before), and `resolve_recurse_sink` has the identical one
+/// on the path side. See #2913.
+pub(crate) fn each_recurse_walk<S: EvalSemantics>(
+    f: &Expr,
+    cond: Option<&Expr>,
+    root: OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> RecurseWalkEnd {
+    let mut emitted = 0usize;
+    let mut stack: Vec<OwnedValue> = vec![root];
+    let mut pending_error: Option<EvalEscape> = None;
+
+    while !stack.is_empty() && emitted < RECURSE_MAX_ITEMS {
+        let current = stack.pop().expect("loop condition checked non-empty");
+        emitted += 1;
+        if sink(current.clone()) == Demand::Stop {
+            return RecurseWalkEnd {
+                drained: false,
+                pending_error,
+                stopped: true,
+            };
+        }
+
+        // Every output of `f` becomes exactly one candidate child, in order
+        // -- a null output is a real value (not "no child"), and an array
+        // output is visited as one node, not spliced into its elements
+        // (#490). An `f` error aborts the whole traversal, matching jq's
+        // `def r: ., (f | r); r;`, where nothing catches an error from `f`
+        // (#636) -- but only after whatever `f` already produced at this node
+        // (kept via `eval_owned_multi_keep_partial`, #842) has had its own
+        // full recursive treatment.
+        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
+
+        // Collected in encounter order, then pushed onto `stack` reversed by
+        // `queue_recurse_children` -- see `resolve_recurse_sink`'s doc
+        // comment (#635) -- so the first entry's whole subtree completes
+        // before the next sibling is reached.
+        let mut next: Vec<OwnedValue> = Vec::new();
+        match cond {
+            None => next.extend(children),
+            // `cond` gates the child, not `current`, and forks once per
+            // truthy output (#627). A `cond` error defers exactly like `f`'s
+            // own (#636, #842) rather than discarding the siblings an
+            // earlier truthy output already approved in this same loop
+            // (#854). No `is_null_current`-style gate: unlike
+            // `resolve_recurse_sink`, this evaluator has no such rule, so
+            // `cond` always gates for real (`gate: true`).
+            Some(cond) => {
+                for child in children {
+                    if let Some(e) = eval_recurse_cond::<S>(cond, &child, true, || {
+                        next.push(child.clone());
+                    }) {
+                        deferred_error = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
+    }
+
+    RecurseWalkEnd {
+        drained: stack.is_empty(),
+        pending_error,
+        stopped: false,
+    }
+}
+
+/// [`eval_each`]'s `recurse`-family arm (#2693): the walk above, delivered
+/// one node at a time so a bounded consumer (`limit`, `first`, `any`,
+/// `isempty`) stops it instead of truncating a finished 10000-item list.
+///
+/// `optional` is not threaded, matching the collecting builtins this
+/// replaces -- see `builtin_recurse_f`'s own note (#1953) for why real jq's
+/// `recurse` has no internal optional-suppression concept.
+fn each_recurse<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    cond: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // #1755: `to_owned`, not `to_owned_lossy` -- an undecodable root must
+    // raise, not silently become `""` and get visited as if it were real.
+    let root = match to_owned(&value) {
+        Ok(v) => v,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let end = each_recurse_walk::<S>(f, cond, root, &mut |v| sink(Item::Owned(v)));
+    recurse_walk_flow(end)
+}
+
+/// Map a [`RecurseWalkEnd`] onto a [`Flow`] -- shared with
+/// `eval_generic`'s own `each_recurse_generic` so the two lazy arms answer a
+/// stop, a cap and a deferred escape identically.
+pub(crate) fn recurse_walk_flow(end: RecurseWalkEnd) -> Flow {
+    if end.stopped {
+        // An escape an earlier node already computed rides out as `pending`,
+        // exactly what that field is for: it was raised before the stop, and
+        // only a consumer that must not drop a halt reads it.
+        return Flow::Stopped {
+            pending: end.pending_error.map(Control::from),
+        };
+    }
+    match (end.drained, end.pending_error) {
+        // `finish_recurse_walk`'s own rule: a deferred escape surfaces only
+        // when the stack drained naturally, never when `RECURSE_MAX_ITEMS`
+        // cut the loop short (#842 review).
+        (true, Some(e)) => Flow::Escaped(Control::from(e)),
+        _ => Flow::Exhausted,
+    }
+}
+
 /// Fan `recurse(f)` / `recurse(f; cond)` out into one branch per visited
 /// node, depth-first. Uses the same explicit stack
 /// `builtin_recurse_f`/`builtin_recurse_cond` do — including the
@@ -40514,33 +40687,16 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
+    // The traversal itself lives in `each_recurse_walk` (#2693), shared with
+    // `builtin_recurse_cond` and with `eval_each`'s lazy arm. This sink
+    // never stops, so the walk is exactly what it always was: every node
+    // visited, `f` run at each, up to `RECURSE_MAX_ITEMS`.
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut stack: Vec<OwnedValue> = vec![root];
-    // Set by `queue_recurse_children` once `f`'s own evaluation at some node
-    // ends in an error/break/halt — see that function's doc comment (#842).
-    let mut pending_error: Option<EvalEscape> = None;
-
-    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
-        let current = stack.pop().unwrap();
-        outputs.push(current.clone());
-
-        // Every output of `f` becomes exactly one stacked child, in order —
-        // a null output is a real value (not "no child"), and an array
-        // output is visited as one node (not spliced into its elements)
-        // (#490). Pushed reversed so the first child stays on top and its
-        // whole subtree completes before the next sibling is reached
-        // (#635) — see `resolve_recurse_sink`'s doc comment for the general
-        // shape this mirrors. An error aborts the whole traversal, same as
-        // jq's `def r: ., (f | r); r;` (#636) — but not until whatever `f`
-        // itself already produced at this node has had its own full
-        // recursive treatment (#842); `eval_owned_multi_keep_partial` keeps
-        // that prefix instead of `eval_owned_multi`'s all-or-nothing
-        // contract, which is right for its other callers but not this one.
-        let (children, deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
-        queue_recurse_children(&mut stack, children, deferred_error, &mut pending_error);
-    }
-
-    finish_recurse_walk(outputs, stack.is_empty(), pending_error)
+    let end = each_recurse_walk::<S>(f, None, root, &mut |v| {
+        outputs.push(v);
+        Demand::Continue
+    });
+    finish_recurse_walk(outputs, end.drained, end.pending_error)
 }
 
 /// Builtin: recurse(f; cond)
@@ -40589,53 +40745,15 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
+    // Same shared traversal as `builtin_recurse_f` (#2693), with `cond`
+    // supplied; an always-`Continue` sink keeps this the collecting walk it
+    // has always been.
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut stack: Vec<OwnedValue> = vec![root];
-    // Set by `queue_recurse_children` once `f` itself ends in an
-    // error/break/halt — see that function's doc comment (#842).
-    let mut pending_error: Option<EvalEscape> = None;
-
-    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
-        let current = stack.pop().unwrap();
-        outputs.push(current.clone());
-
-        // Every output of `f` becomes exactly one candidate child, in order —
-        // a null output is a real value (not "no child"), and an array output
-        // is visited as one node (not spliced into its elements) (#490). An
-        // `f` error aborts the whole traversal, matching jq's `def r: .,
-        // (f | select(cond) | r); r;`, where nothing catches an error from
-        // `f` (#636) — but only after whatever `f` already produced at this
-        // node (kept via `eval_owned_multi_keep_partial`, #842) has had its
-        // own full `cond`-gated recursive treatment, deferred below exactly
-        // like `builtin_recurse_f`.
-        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
-
-        // Collected in encounter order, then pushed onto `stack` reversed —
-        // see `resolve_recurse_sink`'s doc comment (#635) — so the first entry's
-        // whole subtree completes before the next is reached.
-        let mut next: Vec<OwnedValue> = Vec::new();
-        for child in children {
-            // `cond` gates the child, not `current` (see doc comment above).
-            // A `cond` error defers exactly like `f`'s own (#636, #842)
-            // rather than discarding `next`'s already-approved siblings from
-            // earlier in this same loop (#854) — see `eval_recurse_cond`'s
-            // own doc comment (#897) for the shared mechanics, and
-            // `resolve_recurse_sink`'s matching arm for the full jq 1.7.1
-            // confirmation. No `is_null_current`-style gate here: unlike
-            // `resolve_recurse_sink`, this evaluator has no such rule, so `cond`
-            // always gates for real (`gate: true`).
-            if let Some(e) = eval_recurse_cond::<S>(cond, &child, true, || {
-                next.push(child.clone());
-            }) {
-                deferred_error = Some(e);
-                break;
-            }
-        }
-
-        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
-    }
-
-    finish_recurse_walk(outputs, stack.is_empty(), pending_error)
+    let end = each_recurse_walk::<S>(f, Some(cond), root, &mut |v| {
+        outputs.push(v);
+        Demand::Continue
+    });
+    finish_recurse_walk(outputs, end.drained, end.pending_error)
 }
 
 /// Builtin: walk(f) - recursively transform all values.

@@ -56,8 +56,8 @@ use super::eval::{
     boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    demote_rebuilt_markers, enter_def_call_frame, entries_to_object, eval_each_owned,
-    eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings,
+    demote_rebuilt_markers, each_recurse_walk, enter_def_call_frame, entries_to_object,
+    eval_each_owned, eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings,
     extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
     fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
     index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
@@ -65,8 +65,8 @@ use super::eval::{
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
     owned_bound_to_i64, owned_to_expr, owned_to_string, pattern_alternatives_var_names,
     prefer_pending_control, range_max_exceeded_error, range_num, range_values_f64,
-    range_values_int, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
-    select_emits, slice_component_value, slice_object_as_yq_children,
+    range_values_int, recurse_walk_flow, resolve_computed_slice_bounds, resume_from_escape,
+    reverse_length_is_empty, select_emits, slice_component_value, slice_object_as_yq_children,
     slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
     stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
     substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
@@ -8513,6 +8513,26 @@ fn eval_positioned_stage_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// [`eval_each_generic`]'s `recurse`-family arm (#2693) -- the generic twin
+/// of `eval::each_recurse`, over the same shared [`each_recurse_walk`], so
+/// the two evaluators cannot drift on #490/#635/#636/#842/#854's rules or on
+/// `RECURSE_MAX_ITEMS`.
+fn each_recurse_generic<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    cond: Option<&Expr>,
+    value: V,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    // #1755: `to_owned`, not a lossy read -- an undecodable root must raise
+    // rather than be visited as `""`.
+    let root = match to_owned(&value) {
+        Ok(v) => v,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let end = each_recurse_walk::<S>(f, cond, root, &mut |v| sink.push(GenericItem::Owned(v)));
+    recurse_walk_flow(end)
+}
+
 fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -8927,6 +8947,24 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             if cursor.is_some() =>
         {
             each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
+        }
+
+        // #2693: the parameterised `recurse` spellings, and the bare one
+        // with no live cursor to walk, stream their visited nodes through
+        // the owned walker `eval::builtin_recurse_f`/`builtin_recurse_cond`
+        // already use. Without this they fell to the `eval_single` wildcard
+        // below, which builds the whole 10000-item walk before a bounded
+        // consumer can truncate it -- and runs `f` at every one of those
+        // nodes, where jq emits a node *before* evaluating `f` on it and so
+        // never pays for the children of a node its consumer was already
+        // satisfied by.
+        Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            let f = Expr::Optional(Box::new(Expr::Iterate));
+            each_recurse_generic::<S, V>(&f, None, value, sink)
+        }
+        Expr::Builtin(Builtin::RecurseF(f)) => each_recurse_generic::<S, V>(f, None, value, sink),
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            each_recurse_generic::<S, V>(f, Some(cond), value, sink)
         }
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
