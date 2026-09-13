@@ -17611,6 +17611,38 @@ fn test_optional_group_scope_safe_class_still_distributes_2909() -> Result<()> {
     Ok(())
 }
 
+/// #2909 (review finding): the shapes that made an earlier cut of this fix
+/// **overflow the stack**.
+///
+/// That cut gated `splice_optional_group` as well, so an unsafe group stayed
+/// opaque there -- returning `[Optional(Pipe(inner))] ++ rest`, which is the
+/// very list the caller had just decomposed. The walker re-derived the same
+/// `here` and re-entered, forever. It was reachable because the two
+/// scope-safety predicates disagreed about `Identity` and about a
+/// parenthesised sub-pipe, so these groups were *safe* to the routing gate
+/// (kept on the native walker) and *unsafe* to the splice.
+///
+/// There is one predicate now, and the splice is deliberately ungated. These
+/// rows are cheap and would fail loudly (exit 134) if either changes.
+#[test]
+fn test_optional_group_no_unbounded_recursion_2909() -> Result<()> {
+    for (filter, expected) in [
+        (r"del(.a | (. | .[])?)", r#"{"a":{},"c":[1,2]}"#),
+        (r"del(.x | (.[] | .)?)", r#"{"a":{"b":1},"c":[1,2]}"#),
+        (r"del(.x | (. | .[]?)?)", r#"{"a":{"b":1},"c":[1,2]}"#),
+        (r"del(.x | ((.a|.b) | .c)?)", r#"{"a":{"b":1},"c":[1,2]}"#),
+        (r"del(.x | ((.a) | (.b|.c))?)", r#"{"a":{"b":1},"c":[1,2]}"#),
+        (r"(.x | (. | .[])? | .b) |= 9", r#"{"a":{"b":1},"c":[1,2]}"#),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"c":[1,2]}"#))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
