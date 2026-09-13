@@ -44335,6 +44335,145 @@ fn test_foreach_advance_does_not_carry_register_past_a_caught_navigation_2046() 
     Ok(())
 }
 
+/// #2860: `FoldRegister::relocate`'s `identical()` fallback re-derives
+/// trackability from `resolve()`'s own *entry-time* register
+/// (`self.value`/`self.frame`), which is always exactly the loop
+/// variable's own frozen value by construction -- so whenever EXTRACT (or
+/// UPDATE) navigates through a missing-key/out-of-range step and then
+/// references the loop variable again, the branch's final value is still
+/// `$v0` itself, and `identical()`'s value-equality check tautologically
+/// re-certifies it even though `resolve_seq`/`resolve_node`'s own
+/// finer-grained, position-aware tracking already, correctly, marked that
+/// branch untracked one layer in. Confirmed live against jq 1.7.1 on
+/// `{"a":{"b":1}}` before this fix: `path(...)` answered `["a"]` where jq
+/// raises, and `= 999`/`del(...)` on the identical filter silently
+/// corrupted the document (`{"a":999}`/`{}`) where jq refuses to write at
+/// all.
+///
+/// Fixed by gating `identical()` on [`cannot_move_register`] (the same
+/// oracle-verified allowlist [`FoldRegister::advance`]'s own analogous
+/// carry-forward already uses, #2046) -- `identical()` stays available
+/// only for a branch whose *own* expression could not have navigated,
+/// which is exactly the bare-`$var`/arithmetic/construction shape it
+/// exists for; the `if`/`try`-wrapped rows below rule out a narrower
+/// "top-level `Pipe`" gate, since neither is syntactically a `Pipe` at the
+/// point `resolve()` sees `expr`, yet both still navigate somewhere
+/// inside and must still refuse.
+#[test]
+fn test_foreach_extract_navigation_through_missing_key_still_refuses_2860() -> Result<()> {
+    for filter in [
+        "path(foreach .a as $v0 (.; $v0; (.zzz | $v0)))",
+        "path(foreach .a as $v0 (.; $v0; (if true then (.zzz | $v0) else null end)))",
+        "path(foreach .a as $v0 (.; $v0; (try (.zzz | $v0))))",
+        // A *present* key still tautologically re-certified pre-fix (the
+        // branch's value is `$v0` itself regardless of which key it
+        // passed through), so this is included as its own row rather than
+        // assumed to be covered by the missing-key rows above.
+        "path(foreach .a as $v0 (.; $v0; (.b | $v0)))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+        assert_eq!(
+            stdout, "",
+            "`{filter}`: must not emit a path: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(r#"Invalid path expression with result {"b":1}"#),
+            "`{filter}`: stderr: {stderr:?}"
+        );
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    // The array-index twin, on an array rather than an object.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach .a as $v0 (.; $v0; (.[5] | $v0)))"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Invalid path expression with result [1,2]"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2860: the same shape actually reaches a write -- `=`/`|=`/`del()`
+/// through it must refuse rather than silently corrupt the document, the
+/// property the issue's own title is about.
+#[test]
+fn test_foreach_extract_navigation_through_missing_key_refuses_writes_2860() -> Result<()> {
+    for filter in [
+        "(foreach .a as $v0 (.; $v0; (.zzz | $v0))) = 999",
+        "(foreach .a as $v0 (.; $v0; (.zzz | $v0))) |= 999",
+        "del(foreach .a as $v0 (.; $v0; (.zzz | $v0)))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+        assert_eq!(
+            stdout, "",
+            "`{filter}`: must not write/delete: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(r#"Invalid path expression with result {"b":1}"#),
+            "`{filter}`: stderr: {stderr:?}"
+        );
+        assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2860 (must-not-regress): a `null`-source control still correctly
+/// reestablishes -- both `.zzz`'s result and `$v0` are `null` here, and
+/// jq's real `jv_identical` treats every `null` as identical regardless of
+/// position, so this acceptance is genuine, not the tautology the fix
+/// removes. Also pins the non-navigating-literal shape (`5 | $v0`), whose
+/// acceptance comes from `resolve_seq`'s own internal mechanism rather
+/// than `identical()`, and the destructuring-pattern shape, which never
+/// reaches `FoldRegister::relocate`'s `identical()` fallback at all -- none
+/// of these three should be touched by gating `identical()` on
+/// `cannot_move_register`.
+#[test]
+fn test_foreach_extract_wellformed_shapes_unaffected_by_2860() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            r#"{"a":null}"#,
+            "path(foreach .a as $v0 (.; $v0; (.zzz | $v0)))",
+            r#"["a","zzz"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "path(foreach .a as $v0 (.; $v0; (5 | $v0)))",
+            r#"["a"]"#,
+        ),
+        (
+            r#"{"a":[{"b":1}],"x":{"a":[{"b":1}]}}"#,
+            "path(foreach .a as [$v0] (.; $v0; (.x | (.a | $v0))))",
+            "",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        if expected.is_empty() {
+            // The destructuring row refuses for an unrelated reason --
+            // it never reaches `FoldRegister::relocate`'s `identical()`
+            // fallback at all (destructuring uses its own position-aware
+            // `PatternBinding`/`Origin::At` machinery) -- only asserting
+            // that this fix does not change it to a wrong *acceptance*.
+            assert_eq!(stdout, "", "`{filter}`: stderr: {stderr:?}");
+            assert!(
+                stderr.contains(r#"Invalid path expression with result {"b":1}"#),
+                "`{filter}`: stderr: {stderr:?}"
+            );
+            assert_eq!(code, 5, "`{filter}`: stdout: {stdout:?} stderr: {stderr:?}");
+        } else {
+            assert_eq!(code, 0, "`{filter}`: stderr: {stderr:?}");
+            assert_eq!(stdout.trim(), expected, "`{filter}`");
+        }
+    }
+
+    Ok(())
+}
+
 /// #1576 moved every shape `can_use_m2_streaming` admits onto the cursor
 /// streamer, which quietly took the *existing* suite's only coverage of
 /// `print_json`'s own pretty-container, empty-container, `null`/`true`,

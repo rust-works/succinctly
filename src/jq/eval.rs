@@ -30177,9 +30177,56 @@ fn cannot_move_register(expr: &Expr) -> bool {
                 | Builtin::ToJson
         ),
 
-        // Everything else — navigation, `reduce`/`foreach`, `label`, a
-        // function definition or call, `..`, and every builtin not listed
-        // above — is assumed to have moved the register.
+        // #2860: a nested `reduce`/`foreach` whose SOURCE/INIT/UPDATE
+        // (and EXTRACT) all provably never navigate anywhere cannot have
+        // moved a register either -- outer or its own -- so it is safe to
+        // recurse into rather than blanket-refuse. This is a pure widening
+        // in the same direction #2042/#2649 already widened `Expr::As`/
+        // `Expr::AsPattern`: it can only ever turn `false` into `true` for
+        // a construct every part of which already, independently, passes
+        // this same check, never the reverse. Confirmed live: `path(. as
+        // $x | foreach (1) as $i (0; reduce (1) as $j (0; $x)))` on `{"a":
+        // 1}` is jq's `[]` (#1466's own nested-fold snapshot-passthrough
+        // case) -- lost when `FoldRegister::relocate`'s `identical()` was
+        // first gated on this predicate (#2860) before this arm existed,
+        // since a bare `false` here made the outer register's own
+        // `identical()` check ineligible even though nothing anywhere in
+        // the nested fold ever navigated.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => {
+            // #2649's own reasoning: a destructuring pattern performs its
+            // own tracked index steps while matching, which do move the
+            // register (unlike a bare `$var` binding, which performs none).
+            !patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+                && cannot_move_register(input)
+                && cannot_move_register(init)
+                && cannot_move_register(update)
+        }
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => {
+            !patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+                && cannot_move_register(input)
+                && cannot_move_register(init)
+                && cannot_move_register(update)
+                && extract.as_deref().map_or(true, cannot_move_register)
+        }
+
+        // Everything else — navigation, `label`, a function definition or
+        // call, `..`, and every builtin not listed above — is assumed to
+        // have moved the register.
         _ => false,
     }
 }
@@ -30445,9 +30492,20 @@ impl FoldRegister {
                 e,
             )),
         };
+        // #2860: `relocate`'s own `identical()` fallback re-derives
+        // trackability from this call's *entry-time* register
+        // (`self.value`/`self.frame`), which `resolve_seq`/`resolve_node`
+        // may have already correctly moved past (or refused to move past)
+        // while resolving `expr` -- gating it on `cannot_move_register`
+        // is the same "did the expression this branch came from ever
+        // navigate" question [`FoldRegister::advance`] already asks
+        // before trusting its own analogous carry-forward. See
+        // `relocate`'s own doc comment for why a value-equality check
+        // alone (`identical()`'s whole job) cannot substitute for this.
+        let identical_eligible = cannot_move_register(expr);
         match owned {
-            Ok(branches) => Ok(self.relocate(branches)),
-            Err((prefix, e)) => Err((self.relocate(prefix), e)),
+            Ok(branches) => Ok(self.relocate(branches, identical_eligible)),
+            Err((prefix, e)) => Err((self.relocate(prefix, identical_eligible), e)),
         }
     }
 
@@ -30467,19 +30525,58 @@ impl FoldRegister {
     /// `path(reduce (1) as $i (.; {a:.a}))` answered `[]` where jq raises,
     /// and `=`/`|=`/`del()` through it wrote to a document jq leaves
     /// untouched.
+    ///
+    /// **#2860**: value equality alone is still not enough once `branch`
+    /// came from an expression that *could* have navigated -- `self.value`
+    /// is always exactly the register's own frozen value by construction
+    /// (`branch` descends from a `$var` substituted from it), so an
+    /// intervening step that moved *past* the register and merely produced
+    /// an equal-looking value (a missing-key/`null`-absorbing step whose
+    /// result happens to still equal it, or genuinely lands on it) would
+    /// tautologically re-certify here even though `resolve_seq`/
+    /// `resolve_node`'s own finer-grained tracking already, correctly,
+    /// marked it untracked. See [`relocate`](Self::relocate)'s own doc
+    /// comment for the gate that gives this its precondition back.
     fn identical(&self, branch: &PathBranch<'_>) -> bool {
         self.trackable
             && register_identical(&self.value, &self.frame, &branch.value, &branch.snapshot)
     }
 
-    fn relocate<'a>(&self, branches: Vec<PathBranch<'a>>) -> Vec<PathBranch<'a>> {
+    /// `identical_eligible` -- **#2860**: whether `self.identical(&b)`'s
+    /// coarse, position-blind value-equality check is even a valid
+    /// question to ask for the expression `branches` came from. `false`
+    /// whenever [`cannot_move_register`] says that expression could have
+    /// navigated -- in that case, `resolve_seq`/`resolve_node` already had
+    /// a full, position-aware chance to reestablish trackability (the
+    /// `b.trackable == true` arm below, unaffected by this parameter), and
+    /// its verdict must not be second-guessed by a check that only knows
+    /// this call's *entry-time* register, not wherever that expression
+    /// actually navigated -- `self.value` is always exactly `$var`'s own
+    /// frozen value whenever `$var` appears anywhere downstream, so
+    /// `identical()` would otherwise re-certify a branch `resolve_seq`
+    /// already, correctly, refused (`path(foreach .a as $v0 (.; $v0;
+    /// (.zzz | $v0)))` answered `["a"]` instead of raising, and `=`/`|=`/
+    /// `del()` through it corrupted a document jq refuses to touch).
+    ///
+    /// True for [`FoldRegister::resolve`]'s own two callers, gated on the
+    /// expression just resolved; unconditionally `true` at
+    /// [`resolve_reduce`]'s final-emission call site, which builds its
+    /// branch directly from the fold's own accumulator rather than from a
+    /// `resolve()` call and has no single expression to gate on -- see
+    /// that call site's own doc comment for why `identical()` must stay
+    /// available there.
+    fn relocate<'a>(
+        &self,
+        branches: Vec<PathBranch<'a>>,
+        identical_eligible: bool,
+    ) -> Vec<PathBranch<'a>> {
         branches
             .into_iter()
             .map(|b| {
                 if b.trackable {
                     let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
                     PathBranch::new(path, b.value, true)
-                } else if self.identical(&b) {
+                } else if identical_eligible && self.identical(&b) {
                     PathBranch::new(Rc::clone(&self.path), b.value, true)
                 } else {
                     // Demoting must not erase the snapshot mark: a fold
@@ -32129,7 +32226,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // Emitted through the sink as soon as this fork is done, so a
         // terminal consumer's refusal (or a bound's stop) is seen before
         // the next INIT fork ever drives the source (#2235).
-        if emit_branches(reg.relocate(vec![final_branch]), sink) == Demand::Stop {
+        // #2860: `true` unconditionally -- this branch is built directly
+        // from the fold's own accumulator, not from a `resolve()` call
+        // over some expression `cannot_move_register` could ask about, and
+        // `identical()` must stay available here (see this call's own
+        // surrounding doc comment for why a trackable-but-not-at-register
+        // accumulator still needs it).
+        if emit_branches(reg.relocate(vec![final_branch], true), sink) == Demand::Stop {
             return ResolveFlow::Stopped;
         }
     }
@@ -87709,6 +87812,17 @@ mod tests {
                 "path(.a as $y | reduce (1) as $i (.a; 5 | $y))",
                 r#"[["a"]]"#,
             ),
+            // literal-then-fold-untracked-init (#2860): moved here from the
+            // refuse-only matrix -- `cannot_move_register`'s own widening
+            // for a fully navigation-free nested `reduce`/`foreach` (added
+            // alongside the `FoldRegister::relocate` fix #2860 needed) lets
+            // `resolve_seq`'s plain-pipe carrying reestablish through this
+            // stage too, not only a fold's own UPDATE/EXTRACT dispatch.
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | reduce (1) as $i (0; $y))",
+                r#"[["a"]]"#,
+            ),
             // foreach-init-same-node
             (
                 br#"{"a":{"b":1}}"#,
@@ -88159,15 +88273,6 @@ mod tests {
             (
                 br#"{"a":{"b":1}}"#,
                 r#"path(.a as $y | .a | try error("x") catch $y)"#,
-                r#"[["a"]]"#,
-            ),
-            // literal-then-fold-untracked-init: after `5` the register is
-            // only carried, and a fold whose INIT is untracked seeds its own
-            // register from the ambient literal, not the carried one
-            // (pre-existing, as above)
-            (
-                br#"{"a":{"b":1},"c":{"b":1}}"#,
-                "path(.a as $y | .a | 5 | reduce (1) as $i (0; $y))",
                 r#"[["a"]]"#,
             ),
         ];
