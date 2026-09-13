@@ -42896,6 +42896,158 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     Ok(())
 }
 
+/// #2908: `path(f)` is a generator, so a consumer *outside* it can stop `f`.
+///
+/// Both evaluators collected every path before their consumer saw one, so a
+/// bound could only truncate a finished list — and every output of `f` had
+/// already run. This was never fold-specific, which is how the issue was
+/// first framed: a plain comma shows it just as well.
+///
+/// Every row is captured whole from jq 1.7.1 — stdout, stderr and exit code —
+/// so the side-effect count is pinned exactly rather than bounded.
+#[test]
+fn path_results_stream_to_their_consumer_2908() -> Result<()> {
+    let abc = r#"{"a":1,"b":2,"c":3}"#;
+    let probes = "(.a|stderr), (.b|stderr), (.c|stderr)";
+    for (input, filter, want_out, want_err, want_code) in [
+        // A bound outside `path()` now stops the generator inside it.
+        (
+            abc,
+            format!("[limit(1; path({probes}))]"),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            abc,
+            format!("[first(path({probes}))]"),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        // ... and a bound of two takes exactly two, not all three.
+        (
+            abc,
+            format!("[limit(2; path({probes}))]"),
+            "[[\"a\"],[\"b\"]]\n".to_string(),
+            "12".to_string(),
+            0,
+        ),
+        // A `foreach` source is the shape the issue reported: one requested
+        // path used to run every element.
+        (
+            r#"{"a":1}"#,
+            "[limit(1; path(foreach ((1|stderr),(2|stderr),(3|stderr)) as $i (.; .)))]".to_string(),
+            "[[]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            "[first(path(foreach ((1|stderr),(2|stderr),(3|stderr)) as $i (.; .a)))]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        // A `label`/`break` bound reaches it too.
+        (
+            r#"{"a":1}"#,
+            "[label $o | path(foreach ((1|stderr),(2|stderr),(3|stderr)) as $i (.; .a)) | ., break $o]"
+                .to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        // The `?//` row from the issue, which diverged the *other* way
+        // (jq wrote twice, succinctly once): jq's own `limit` break is
+        // retried by the source's `?//` and the retried output lands past
+        // the bound.
+        (
+            "[true,false]",
+            "[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.; .)))]".to_string(),
+            "[[],[]]\n".to_string(),
+            "[true,false][true,false]".to_string(),
+            0,
+        ),
+        // A generator whose *later* output errors: the bound is satisfied
+        // first, so the error is never reached.
+        (
+            r#"{"a":1}"#,
+            r#"[limit(1; path((.a|stderr),error("x")))]"#.to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        // `isempty` distinguishes "the generator ended" from "I stopped it",
+        // so folding a stop into exhaustion answered it twice.
+        (abc, "isempty(path(.a,.b))".to_string(), "false\n".to_string(), String::new(), 0),
+        (abc, "isempty(path(.[]))".to_string(), "false\n".to_string(), String::new(), 0),
+        (
+            abc,
+            "isempty(path(empty))".to_string(),
+            "true\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // #2680's rule, which streaming must not lose: a failing *walk*
+        // still emits what it reached first.
+        (
+            r#"{"a":[{"b":{}},5]}"#,
+            "path((.a[] | .b) | .c[0:1])".to_string(),
+            "[\"a\",0,\"b\",\"c\",{\"start\":0,\"end\":1}]\n".to_string(),
+            "jq: error (at <stdin>:0): Cannot index number with string \"b\"\n".to_string(),
+            5,
+        ),
+        (
+            r#"{"a":[{"b":{}},5]}"#,
+            "first(path((.a[] | .b) | .c[0:1]))".to_string(),
+            "[\"a\",0,\"b\",\"c\",{\"start\":0,\"end\":1}]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // The same prefix rule one level up: a resolved sibling already
+        // emitted survives a later one erroring.
+        (
+            r#"{"a":{"b":1},"c":1}"#,
+            "path(.a.b, .c.d)".to_string(),
+            "[\"a\",\"b\"]\n".to_string(),
+            "jq: error (at <stdin>:0): Cannot index number with string \"d\"\n".to_string(),
+            5,
+        ),
+        (
+            r#"{"a":{"b":1},"c":1}"#,
+            "[path(.a.b, .c.d)]".to_string(),
+            String::new(),
+            "jq: error (at <stdin>:0): Cannot index number with string \"d\"\n".to_string(),
+            5,
+        ),
+        // Pure navigation fan-out already agreed (nothing is observable per
+        // element) and still does — these keep the cursor walk, which this
+        // change deliberately does not touch.
+        (abc, "[limit(1; path(.[]))]".to_string(), "[[\"a\"]]\n".to_string(), String::new(), 0),
+        (
+            r#"{"a":[1,2,3]}"#,
+            "[limit(1; path(.a[]))]".to_string(),
+            "[[\"a\",0]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(.a,.b)]".to_string(),
+            "[[\"a\"],[\"b\"]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
+        assert_eq!(code, want_code, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2693: `recurse(f)`/`recurse(f; cond)` evaluate `f` at a node only if the
 /// consumer still wants more output.
 ///

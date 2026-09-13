@@ -1213,9 +1213,10 @@ succeeds" count for this whole fold-source area dropped from 67 to 3, with no in
 other divergence category.
 
 Seven residual divergences remain in this area (the first five predate
-[#2732](https://github.com/rust-works/succinctly/issues/2732); the second has since been
-narrowed to its consumer half by [#2694](https://github.com/rust-works/succinctly/issues/2694)
-and re-tracked as [#2908](https://github.com/rust-works/succinctly/issues/2908); #2732 closed a
+[#2732](https://github.com/rust-works/succinctly/issues/2732); the second was narrowed to its
+consumer half by [#2694](https://github.com/rust-works/succinctly/issues/2694), re-tracked as
+[#2908](https://github.com/rust-works/succinctly/issues/2908), and that half is now closed too;
+#2732 closed a
 separate, sixth bug in `fold_source_ambient`'s fork-0 arm — a `null`/`bool` document did not reestablish
 against an equal-valued register, `path(reduce .a as $k (.b; .))` on `null` raised where jq
 answers `["b"]` — and classified the two residuals appended below):
@@ -1255,14 +1256,17 @@ answers `["b"]` — and classified the two residuals appended below):
   cannot be taken back from; they run only on `is_pure_navigation`'s closed grammar, which
   has no side effects and no generator to interleave with.
 
-  **The consumer side remains**, a different mechanism under the same original bullet: `path()`
-  itself resolves past what its own consumer asked for, so a bound *outside* it cannot stop the
-  fold. `[limit(1; path(foreach ((1|stderr),(2|stderr),(3|stderr)) as $i (.; .a)))]` on
-  `{"a":1}` writes `1` in jq and `12` here (same for `first(...)` and for a `label`/`break`
-  bound), and `[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.; .)))]` is
-  `[[],[]]` with two writes in jq — its `limit` break is retried by the source's `?//` and the
-  retried output lands past the bound — and `[[]]` with one write here. Tracked as
-  [#2908](https://github.com/rust-works/succinctly/issues/2908).
+  **The consumer side was a different mechanism under the same original bullet, and is
+  closed by [#2908](https://github.com/rust-works/succinctly/issues/2908).** `path()` itself
+  resolved every path before its own consumer saw one, so a bound *outside* it could only
+  truncate a finished list. That was never fold-specific — a plain comma showed it just as
+  well (`[limit(1; path((.a|stderr), (.b|stderr), (.c|stderr)))]` wrote three lines for jq's
+  one) — and the `?//` row diverged the other way, jq writing twice where succinctly wrote
+  once. `each_path_on_owned` now interleaves resolution and walking, so each resolved branch
+  is walked and emitted before the next is asked for, which is jq's own order and what carries
+  the consumer's stop back into the generator. Pure navigation fan-out (`path(.[])`,
+  `path(.a[])`) always agreed — nothing in it is observable per element — and keeps #2061/
+  #2168's no-materialization cursor walk untouched.
 - **`recurse(f)`/`recurse(f; cond)` finishes one node's own `f` before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
@@ -1293,7 +1297,8 @@ answers `["b"]` — and classified the two residuals appended below):
   fan-out here). Values are identical in every case. All three walkers share it, path mode
   included. Tracked as [#2918](https://github.com/rust-works/succinctly/issues/2918), whose
   own text sets out the fork — bounded native recursion with a fallback, versus a pull-based
-  generator protocol that would close this, #2908 and the path-side half together.
+  generator protocol. (#2908, listed there as sharing the class, turned out not to need one:
+  its branches were already produced lazily and only the terminal was collecting them.)
   Bare `..`/`recurse`/
   `recurse_down`, which predates #2235 and was not part of that migration at all, had the
   same gap one level up (no `f`/`cond` to over-fire, but the same "collects the whole
