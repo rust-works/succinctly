@@ -33771,6 +33771,54 @@ fn untrackable_branch_escape(
     }
 }
 
+/// Resolve `target` (`E`) for one pair of a computed index (`E[K]`) or slice
+/// (`E[S:T]`), and reserve room for the branches it produced.
+///
+/// One definition of the block [`resolve_index_expr`] and
+/// [`resolve_slice_expr`] had hand-copied near-identically -- the first copy
+/// arriving with #2139, the second with #2249 -- and which this file's own
+/// "duplicated predicates diverge silently" lesson (#106) names as the shape
+/// to stop before it drifts. Noted as a maintainability concern on #2267 and
+/// extracted there.
+///
+/// Two behaviours ride along, both load-bearing and neither obvious from the
+/// call sites:
+///
+/// * `target`'s own **partial prefix is kept**, not discarded via `?` (#896's
+///   review of `resolve_index_expr`, found independently live in
+///   `resolve_slice_expr` too -- #973 review): `target` can itself be one of
+///   #896's keep-partial sites (`select`, `if`, `getpath`, a computed index),
+///   so its `Err` can carry branches that still need indexing or slicing by
+///   this pair. The escape rides back as the second half of the pair rather
+///   than short-circuiting, so the caller can push those branches first and
+///   raise afterwards.
+/// * The reservation is **per pair**, not once for the whole
+///   `keys x target` / `starts x ends x target` product: `target` is
+///   genuinely re-resolved per pair since #2139/#2249, so its branch count
+///   can differ between pairs. Unlike an upfront reservation (whose `Err`
+///   prefix was empty by construction), a failure here can land on any pair
+///   after the first, with `out` already holding every earlier pair's
+///   output -- so this returns the error for the caller's own `escape!` to
+///   fold that non-empty prefix into, rather than discarding it.
+fn resolve_target_for_pair<'a, S: EvalSemantics>(
+    target: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    frame: &Frame,
+    keep: Keep,
+    out: &mut Vec<PathBranch<'a>>,
+) -> Result<(Vec<PathBranch<'a>>, Option<EvalEscape>), EvalEscape> {
+    let (branches, this_escape) =
+        match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
+    if out.try_reserve(branches.len()).is_err() {
+        return Err(cannot_reserve_cross_product(&[branches.len()]).into());
+    }
+    Ok((branches, this_escape))
+}
+
 /// Resolve `E[K]` in path context, with or without a trailing `?`.
 ///
 /// The two spellings differ in one thing only: what happens when the resolved
@@ -33887,10 +33935,15 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // breaks the frozen-pointer identity regardless of ambient) — so
         // `false` here is provably unobservable, not a real decision
         // (#1591).
+        // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
+        // plus this pair's own `out` reservation, one definition shared with
+        // the sibling resolver -- see its doc comment for the kept-partial-
+        // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
+        // carries, which used to be stated twice here and there.
         let (branches, this_escape) =
-            match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
-                Ok(branches) => (branches, None),
-                Err((prefix, e)) => (prefix, Some(e)),
+            match resolve_target_for_pair::<S>(target, value, trackable, frame, keep, &mut out) {
+                Ok(pair) => pair,
+                Err(control) => escape!(control),
             };
 
         // #843: `target` can also resolve successfully with `trackable:
@@ -33906,21 +33959,6 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // value, not a fixed `keys[0]` — jq's own error names whichever
         // key was actually being navigated when the untracked branch was
         // reached.
-        // Reserved once per key, ahead of that key's own indexing loop,
-        // rather than once for the whole `keys x target` product up front
-        // -- `target`'s own length can vary per key now (#2139, mirroring
-        // `eval_index_expr`'s identical #2032 change). Unlike the old
-        // upfront reservation (guaranteed to fire before `out` held
-        // anything, so its own `Err` prefix was always empty by
-        // construction), a failure here can land on any key after the
-        // first, with `out` already holding every earlier key's output --
-        // `escape!` folds that non-empty prefix in rather than discarding
-        // it, consistent with every other mid-loop failure in this
-        // function.
-        if out.try_reserve(branches.len()).is_err() {
-            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
-        }
-
         for PathBranch {
             path: components,
             value: target_value,
@@ -34208,11 +34246,13 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 return Err($control)
             };
         }
+        // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
+        // plus this pair's own `out` reservation, one definition shared with
+        // the sibling resolver -- see its doc comment for the kept-partial-
+        // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
+        // carries, which used to be stated twice here and there.
         let (branches, this_escape) =
-            match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
-                Ok(branches) => (branches, None),
-                Err((prefix, e)) => (prefix, Some(e)),
-            };
+            resolve_target_for_pair::<S>(target, value, trackable, frame, keep, out)?;
         // #2546: rendered from the bounds' own values, not from a
         // resolved `Expr::Slice` -- a bound whose classification failed
         // has no integer to build one from, and jq still names it here
@@ -34234,9 +34274,6 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // `[10,20,30]` prints `[{"start":1,"end":2}]` (the
         // already-produced `select` branch, sliced) before raising
         // `t`.
-        if out.try_reserve(branches.len()).is_err() {
-            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
-        }
         for PathBranch {
             path: components,
             value: target_value,
