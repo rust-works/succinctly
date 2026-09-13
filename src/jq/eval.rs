@@ -27768,13 +27768,11 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
     let mut dispatched: Option<ResolveFlow> = None;
-    let flow = eval_each_owned::<S>(cond, value, false, &mut |c| {
-        match dispatch(c.is_truthy()) {
-            ResolveFlow::Exhausted => Demand::Continue,
-            other => {
-                dispatched = Some(other);
-                Demand::Stop
-            }
+    let flow = eval_each_owned::<S>(cond, value, false, &mut |c| match dispatch(c.is_truthy()) {
+        ResolveFlow::Exhausted => Demand::Continue,
+        other => {
+            dispatched = Some(other);
+            Demand::Stop
         }
     });
 
@@ -31266,13 +31264,11 @@ fn resolve_bind_source_sink<S: EvalSemantics>(
     }
 
     let mut stashed: Option<ResolveFlow> = None;
-    let flow = eval_each_owned::<S>(source, value, false, &mut |bound| {
-        match bind(bound, None) {
-            ResolveFlow::Exhausted => Demand::Continue,
-            other => {
-                stashed = Some(other);
-                Demand::Stop
-            }
+    let flow = eval_each_owned::<S>(source, value, false, &mut |bound| match bind(bound, None) {
+        ResolveFlow::Exhausted => Demand::Continue,
+        other => {
+            stashed = Some(other);
+            Demand::Stop
         }
     });
     resolve_stream_flow(flow, stashed)
