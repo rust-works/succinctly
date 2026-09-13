@@ -139,6 +139,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth countdown runs as ordinary `Int` arithmetic the whole way, not a
   silent float promotion on the very first decrement.
 
+- **`E[K]` interleaves its computed key with its target, as jq's own
+  desugaring does** (#2267). `resolve_index_expr` drained `K` in full before
+  reaching `E` for any key -- the sibling of the slice-bound gap below, and the
+  one [limitations.md](docs/compliance/jq/limitations.md) already attributed to
+  this issue. jq compiles `E[K]` as `K as $k | E | .[$k]`, so `E` runs before
+  the next `k` is asked for:
+
+  ```console
+  $ echo '{"a":1,"b":2}' | jq -c \
+      'path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))])' 1>/dev/null
+    ka, E, kb, E          # was: ka, kb, E, E
+  ```
+
+  And the stopping half: a key whose `E` escapes means jq never resumes the key
+  generator, so a later key is not merely skipped but never evaluated. Only the
+  ordering moves -- the paths produced, and their order, are unchanged.
+
 - **A computed slice's bounds now interleave with its target, as jq's own
   desugaring does** (#2267). `resolve_slice_expr` (the `path()`/`=`/`|=`/`del()`
   resolver for `E[S:T]`) drained `S` in full, then `T` in full per `s`, and only
