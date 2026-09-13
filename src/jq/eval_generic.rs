@@ -6754,13 +6754,20 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
             cursor,
         );
     }
+    // #2642 review: NOT demoted here, deliberately -- `error($x)` raises a
+    // bound marker's own value verbatim (no rebuild at all), and jq's own
+    // `catch` handler runs against that exact same `jv`, so `path($x)`
+    // inside the handler is legitimately trackable (`. as $x | try
+    // error($x) catch path($x)` is `[]` in jq, confirmed live). Blanket
+    // `Owned` demotion here was tried and reverted: it cannot distinguish
+    // "a genuine rebuild happened" from "the payload IS the marker's own
+    // value, unchanged," and wrongly refused the latter. Left as a known,
+    // narrower gap (a payload that *is* a rebuilt copy still wrongly
+    // certifies here) rather than fixing this specific class under time
+    // pressure -- tracked in the #2642 follow-up.
     let run_catch = |payload: &OwnedValue| -> GenericResult<V> {
         match catch {
-            // #2642: a caught error's payload is never document-backed.
-            Some(catch_expr) => {
-                let catch_expr = demote_rebuilt_markers(catch_expr, &RootWitness::Owned);
-                eval_each_owned_collect::<S, V>(&catch_expr, payload, optional)
-            }
+            Some(catch_expr) => eval_each_owned_collect::<S, V>(catch_expr, payload, optional),
             None => GenericResult::None,
         }
     };
@@ -7637,9 +7644,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // rather than merely resemble it.
             let (init_values, init_control) =
                 stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            // #2642: `update` reruns against the fold's own `OwnedValue`
+            // accumulator (INIT's own value, then each step's own result) --
+            // never the ambient cursor above, regardless of what `cursor`
+            // itself points at, so this is always `Owned`, not
+            // `RootWitness::of(cursor)` (which would wrongly compare against
+            // `.`'s own node instead of the accumulator's).
+            let update = demote_rebuilt_markers(update, &RootWitness::Owned);
             query_result_to_generic::<V>(eval_reduce_with_values::<Vec<u64>, S, _>(
                 patterns,
-                update,
+                &update,
                 init_values,
                 init_control,
                 optional,
@@ -7691,10 +7705,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         } if !streams_unbounded(input) && !streams_unbounded(init) => {
             let (init_values, init_control) =
                 stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            // #2642: `update`/`extract` rerun against the fold's own
+            // `OwnedValue` accumulator, never the ambient cursor -- always
+            // `Owned`, same reasoning as the `Expr::Reduce` arm just above.
+            let update = demote_rebuilt_markers(update, &RootWitness::Owned);
+            let extract = extract
+                .as_deref()
+                .map(|e| demote_rebuilt_markers(e, &RootWitness::Owned));
             let mut outputs: Vec<OwnedValue> = Vec::new();
             let flow = foreach_forks::<S>(
                 patterns,
-                update,
+                &update,
                 extract.as_deref(),
                 init_values,
                 init_control,
@@ -8832,10 +8853,15 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     let (init_values, init_control) =
         stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
 
+    // #2642: same reasoning as the eager `Expr::Foreach` arm above --
+    // `update`/`extract` rerun against the fold's own accumulator, never the
+    // ambient cursor, so this is always `Owned`.
+    let update = demote_rebuilt_markers(update, &RootWitness::Owned);
+    let extract = extract.map(|e| demote_rebuilt_markers(e, &RootWitness::Owned));
     foreach_forks::<S>(
         patterns,
-        update,
-        extract,
+        &update,
+        extract.as_deref(),
         init_values,
         init_control,
         optional,
@@ -9248,9 +9274,12 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
             );
         }
     }
-    // #2642: `payload` is the caught error's own value, never document-backed.
-    let handler = demote_rebuilt_markers(handler, &RootWitness::Owned);
-    eval_each_owned::<S>(&handler, &payload, optional, &mut |o| {
+    // #2642 review: NOT demoted here, deliberately -- see `run_catch`'s
+    // identical sibling comment (`try_single_generic`, same file) for why:
+    // `error($x)` raises a marker's own value verbatim, and jq's `catch`
+    // runs against that same `jv`, so blanket demotion here wrongly refused
+    // a legitimately-trackable case. Left as a narrower, pre-existing gap.
+    eval_each_owned::<S>(handler, &payload, optional, &mut |o| {
         sink.push(GenericItem::Owned(o))
     })
 }
@@ -19031,13 +19060,16 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                 match route {
                     AbsentRestRoute::Constants => {
                         match path_context_resolve_absent_stages::<S, V>(rest, pos) {
+                            // #2642 review: NOT demoted here, deliberately --
+                            // `PathNode::Owned` can carry a live ancestor's
+                            // own value reached through this walk's own
+                            // cursor-native navigation, which a blanket
+                            // `Owned` witness cannot distinguish from a
+                            // genuine rebuild. Left as a narrower,
+                            // pre-existing gap rather than threading `pos`'s
+                            // own identity through under time pressure --
+                            // tracked in the #2642 follow-up.
                             Ok(resolved) => {
-                                // #2642: `owned` is either `null` (an absent
-                                // position) or the deepest live ancestor's
-                                // owned copy -- never this call's own
-                                // document node.
-                                let resolved =
-                                    demote_rebuilt_markers(&resolved, &RootWitness::Owned);
                                 eval_each_owned::<S>(&resolved, &owned, false, &mut |v| {
                                     sink.push(GenericItem::Owned(v))
                                 })
@@ -22442,13 +22474,18 @@ fn owned_identity_values<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    // #2642: no cursor is available at this generic helper's own boundary to
-    // prove `value` is any particular document node -- `Owned` is always the
-    // safe, conservative choice (demotion only ever costs an acceptance jq
-    // also refuses, never invents one).
-    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+    // #2642 review: NOT demoted here, deliberately -- this helper is called
+    // from `eval_owned_identity_stages` (the `Expr::If` condition arm),
+    // which stands at an `OwnedIdentity`-tracked position that can be a
+    // genuine, unrebuilt document node (`id.base`/`id.ancestors`); blanket
+    // `Owned` demotion here doesn't know that and wrongly refuses a
+    // legitimately-trackable case whenever a sibling `key`/`parent`/`path`
+    // read forces this route. Left as a narrower, pre-existing gap (this
+    // call site does not get #2642's fix) rather than threading `id`'s own
+    // identity through under time pressure -- tracked in the #2642
+    // follow-up.
     let mut values = Vec::new();
-    let flow = eval_each_owned::<S>(&expr, value, optional, &mut |v| {
+    let flow = eval_each_owned::<S>(expr, value, optional, &mut |v| {
         values.push(v);
         Demand::Continue
     });
@@ -24099,17 +24136,16 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Break(name) => Flow::Escaped(Control::Break(name.clone())),
         // Nothing to place: the ordinary evaluator raises what these raise.
-        // #2642: `Expr::Error`'s own message expression could still embed a
-        // `Snapshot` marker (`. as $x | {a:1} | error($x)`) -- `Owned` is the
-        // safe, conservative choice with no cursor available here to prove
-        // otherwise.
+        // #2642 review: `Expr::Error`'s own message expression could embed a
+        // `Snapshot` marker, but NOT demoted here, deliberately -- `value`
+        // stands at an `OwnedIdentity`-tracked position that can be a
+        // genuine, unrebuilt document node, which a blanket `Owned` witness
+        // cannot distinguish from a real rebuild. Left as a narrower,
+        // pre-existing gap -- tracked in the #2642 follow-up.
         Expr::Error(_)
         | Expr::Builtin(
             Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
-        ) => {
-            let stage = demote_rebuilt_markers(stage, &RootWitness::Owned);
-            eval_each_owned::<S>(&stage, &value, optional, &mut |_| Demand::Continue)
-        }
+        ) => eval_each_owned::<S>(stage, &value, optional, &mut |_| Demand::Continue),
         _ => {
             let Some(rule) = owned_identity_rule(stage) else {
                 unreachable!("owned_identity_pipe_supported admits ruled stages only")
@@ -24230,22 +24266,20 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         | Expr::AlternativeAssign { .. }
                 ) =>
                 {
+                    // #2642 review: NOT demoted here, deliberately -- same
+                    // reasoning as `owned_identity_values`'s own comment:
+                    // `id` can carry a genuine, unrebuilt document node
+                    // (`id.base`) a blanket `Owned` witness can't see. Left
+                    // as a narrower, pre-existing gap -- tracked in the
+                    // #2642 follow-up.
                     match id.path() {
                         Ok(path) => with_path_base(&path, || {
-                            // #2642: no cursor is readily available for this
-                            // `OwnedIdentity`-tracked stage -- `Owned` is the
-                            // safe, conservative choice.
-                            let stage_expr =
-                                demote_rebuilt_markers(stage_expr, &RootWitness::Owned);
-                            eval_each_owned::<S>(&stage_expr, &value, optional, &mut emit)
+                            eval_each_owned::<S>(stage_expr, &value, optional, &mut emit)
                         }),
                         Err(e) => Flow::Escaped(Control::Error(e)),
                     }
                 }
-                None => {
-                    let stage_expr = demote_rebuilt_markers(stage_expr, &RootWitness::Owned);
-                    eval_each_owned::<S>(&stage_expr, &value, optional, &mut emit)
-                }
+                None => eval_each_owned::<S>(stage_expr, &value, optional, &mut emit),
             };
             match downstream {
                 Some(flow) => flow,

@@ -757,7 +757,20 @@ is the revert that established what the other one costs.
    rather than silently accept a copy, since succinctly's `OwnedValue`-cloning model has no way
    to tell "this position embeds the original node" from "this position merely happens to be
    value-equal" — recovering them (an "owned embed map" recording which positions of a
-   constructed value embed a document node) is tracked as a follow-up, not attempted here. And
+   constructed value embed a document node) is tracked as a follow-up, not attempted here.
+   **Applied at every "funnel" crossing except one deliberately excluded class:** sites inside
+   `eval_owned_identity_stages`/`owned_identity_values`/`try_path_context_absent_sink` (the
+   `OwnedIdentity`/#2072 machinery a `key`/`parent`/`path`/`file_index`-reading sibling stage
+   routes through) do not call `demote_rebuilt_markers` — a blanket `Owned` witness there cannot
+   distinguish "this position is a genuine, unrebuilt document node the identity tracker already
+   knows about" from "this position was rebuilt," and an earlier attempt to demote unconditionally
+   here broke a previously-correct write (`.foo | . as $x | (parent, ($x.a = 9))` used to write
+   through the sibling `parent` read; blanket demotion made it wrongly refuse). Left as a
+   narrower, still-open instance of the same rebuilt-root hole rather than threading the
+   identity tracker's own witness through under time pressure — tracked in the same follow-up.
+   `try . catch`/`error($x)` is the same story: raising a marker's own value verbatim and
+   catching it is not a rebuild, so `run_try_handler_generic`/`try_single_generic`'s `run_catch`
+   also do not demote. And
    [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
    navigating inside their own jq-level definitions against a *constructed* value inside
    `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and
