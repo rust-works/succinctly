@@ -5503,13 +5503,19 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
 /// already carries (`[1,]`, `[,]`, #2262/#2781) to this flag for free,
 /// where `serde_json` was previously the only thing refusing them.
 ///
-/// One behaviour deliberately changes with the serde gate's removal: a
-/// magnitude-overflowing literal (`--argjson x 1e400`) was
-/// `invalid JSON: 1e400` and is now `.inf` -- the same value yq already
-/// answers for an overflow it computes itself (`--argjson x 1e308 '$x * 10'`
-/// is `.inf` today) and consistent with jq mode's own new answer for the
-/// same input (`1E+400`, matching jq 1.7.1). Recorded in
-/// `docs/compliance/yq/limitations.md`.
+/// A magnitude-overflowing literal (`--argjson x 1e400`) stays rejected,
+/// which `serde_json`'s own "number out of range" used to provide for free
+/// and [`has_non_finite_number`] now provides deliberately. **This is the
+/// half of #2052 where the two modes part company** (ADR-0018 rule 2 -- the
+/// mode decides): jq 1.7.1 accepts `1e400` as `1E+400`, so jq mode now does
+/// too, but real yq's own JSON input path refuses it
+/// (`printf '{"a":1e400}' | yq -p json '.a'` is
+/// `strconv.ParseFloat: parsing "1e400": value out of range`, v4.53.3), and
+/// this materializer has nowhere to put an infinity: YAML output would
+/// render `.inf` -- which real yq then cannot read back
+/// (`yq -o=json` on `.inf` is `strconv.ParseFloat: parsing ".inf": invalid
+/// syntax`) -- and `-o=json` would print a silent `null`, exactly the
+/// outcome #1095 added the serde gate to prevent.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
@@ -5519,8 +5525,31 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))?;
     let index = JsonIndex::build(s.as_bytes());
     let cursor = index.root(s.as_bytes());
-    to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0)
-        .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))
+    let value = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0)
+        .map_err(|e| anyhow::anyhow!("invalid JSON: {s}: {e}"))?;
+    if has_non_finite_number(&value) {
+        return Err(anyhow::anyhow!("invalid JSON: {s}: number out of range"));
+    }
+    Ok(value)
+}
+
+/// Whether `value` holds a number too large for `f64` to represent, at any
+/// depth (#2052).
+///
+/// The acceptance half of `parse_json_value`'s overflow rule above: an
+/// `f64` that came from a literal is non-finite only if that literal
+/// overflowed, since the validator has already refused the `Infinity`
+/// spelling itself (#2877). Checked over the materialized value rather than
+/// the source text because the overflow is a property of the conversion,
+/// not of the spelling -- `1e400`, `-1e400` and `1e400000000000` are all
+/// different texts and one outcome.
+fn has_non_finite_number(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Float(f) => !f.is_finite(),
+        OwnedValue::Array(items) => items.iter().any(has_non_finite_number),
+        OwnedValue::Object(map) => map.values().any(has_non_finite_number),
+        _ => false,
+    }
 }
 
 /// Parse variables from command line arguments.

@@ -1885,8 +1885,9 @@ impl OwnedValue {
         // display once). The *only* reason this needs handling here at
         // all: the CLI's own `--argjson`-style "normalize, retry" fix
         // (#1094, `normalize_leading_zero_numbers` in
-        // `src/bin/succinctly/jq_runner.rs`) doesn't reach here -- it's a
-        // CLI-arg-only helper, not wired into this shared conversion, so
+        // `src/bin/succinctly/jq_runner.rs`, deleted by #2052 in favour of
+        // `json::validate::validate_jq_lenient`) never reached here -- it
+        // was a CLI-arg-only helper, not wired into this shared conversion, so
         // the plain document-input path (and `--argjson` too, since it
         // also ends up here) still fell all the way through to the lossy
         // `parse_i64_or_f64` below, losing the leading zero *and* any
