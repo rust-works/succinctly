@@ -267,12 +267,12 @@ pub enum Expr {
         start: Option<i64>,
         /// The end bound every navigation step actually uses.
         end: Option<i64>,
-        /// The number the start bound is reported as, if it kept its own
-        /// spelling.
-        start_key: Option<NumberKey>,
-        /// The number the end bound is reported as, if it kept its own
-        /// spelling.
-        end_key: Option<NumberKey>,
+        /// What the start bound is reported as: its own spelling if it kept
+        /// one (#1326), or the raw value if jq never parsed it (#2853).
+        start_key: Option<SliceBoundKey>,
+        /// What the end bound is reported as: its own spelling if it kept
+        /// one (#1326), or the raw value if jq never parsed it (#2853).
+        end_key: Option<SliceBoundKey>,
     },
 
     /// Iterate all elements: `.[]`
@@ -1861,6 +1861,35 @@ pub enum NumberKey {
     Literal(f64, Box<str>),
 }
 
+/// The spelling a *slice* bound is reported as in a resolved path component.
+///
+/// [`NumberKey`]'s superset, for the one place a bound can be something a
+/// number key cannot represent at all. `Expr::Index`'s own key keeps using
+/// `NumberKey` directly, so [`NumberKey::value`] stays total and
+/// `index_component_value` keeps one definition of #1088's rule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SliceBoundKey {
+    /// A resolved number that kept a spelling of its own (#1326).
+    Number(NumberKey),
+    /// A bound jq never parsed, because the target was `null` (#2853).
+    ///
+    /// jq's `INDEX` opcode answers `null` for a null target *without*
+    /// looking at the slice descriptor's bounds, so a non-numeric bound
+    /// resolves into the path verbatim and only the eventual write refuses
+    /// it. The value goes into the `{"start":..,"end":..}` descriptor as it
+    /// stands.
+    ///
+    /// **Invariant: the `i64` side of a `Raw` bound is always `None`.**
+    /// There is no integer to navigate with -- the bound is not a number --
+    /// and the component only ever exists over a `null` target, where every
+    /// navigation answers `null` regardless of the bounds.
+    ///
+    /// `Box`ed to keep [`Expr`] at its pinned size (#1401): an inline
+    /// `OwnedValue` would grow this enum past `Option<NumberKey>`'s 32
+    /// bytes and every parsed program pays `size_of::<Expr>()`.
+    Raw(Box<OwnedValue>),
+}
+
 impl NumberKey {
     /// The `f64` this key denotes, spelling discarded.
     ///
@@ -2228,7 +2257,7 @@ mod tests {
         let slice_number = Expr::Slice {
             start: Some(1),
             end: Some(3),
-            start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+            start_key: Some(SliceBoundKey::Number(NumberKey::Literal(1.0, "1.0".into()))),
             end_key: None,
         };
         assert!(slice.is_slice());
@@ -2237,7 +2266,8 @@ mod tests {
         // stays `None` rather than getting a synthesized spelling.
         assert!(matches!(
             &slice_number,
-            Expr::Slice { start_key: Some(k), end_key: None, .. } if k.value() == 1.0
+            Expr::Slice { start_key: Some(SliceBoundKey::Number(k)), end_key: None, .. }
+                if k.value() == 1.0
         ));
     }
 
