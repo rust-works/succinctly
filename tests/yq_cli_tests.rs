@@ -46381,3 +46381,25 @@ fn test_drive_slice_bound_yq_mode_still_discards_escaped_prefix_2267() -> Result
 
     Ok(())
 }
+
+/// #2267: the yq-mode classification failure on the *end* bound, reached
+/// from inside the `start` driver's sink rather than from the top of
+/// `resolve_slice_expr`.
+///
+/// yq raises a non-numeric bound at once (`drive_slice_bound`'s own
+/// `EvalTag::Yq` arm) instead of carrying it to the slice step the way jq
+/// does (#2546), so `drive_slice_bound(end, ..)` answers `Err` while the
+/// `start` sink is mid-flight -- a path with no equivalent before #2267,
+/// when both bounds were resolved before the loop began. The sibling
+/// `start`-bound failure exits through the outer match instead and is
+/// pinned by `test_drive_slice_bound_yq_mode_still_discards_escaped_prefix_2267`.
+#[test]
+fn test_drive_slice_bound_yq_mode_end_bound_error_from_start_sink_2267() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#"del(.[(0,1):("x")])"#, "- 1\n- 2\n- 3\n", &[])?;
+    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
+
+    Ok(())
+}
