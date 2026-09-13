@@ -52413,15 +52413,25 @@ fn test_canonical_compact_echo_declines_non_canonical_spans_2608() -> Result<()>
         // Exponent notation: jq always reformats to its own canonical
         // spelling, never an identity echo.
         ("1e2", "1E+2"),
-        // `A` decodes to 'A', which jq's writer always leaves raw --
-        // the source `\u`-escape spelling itself is never canonical, so
-        // this must decode-and-re-encode, not echo the escape verbatim.
-        (r#""A""#, r#""A""#),
     ] {
         let (output, code) = run_jq_stdin(".", input, &["-c"])?;
         assert_eq!(code, 0, "input {input:?}");
         assert_eq!(output.trim(), want, "input {input:?}");
     }
+
+    // `\u0041` decodes to 'A', which jq's writer always leaves raw -- the
+    // source `\u`-escape spelling itself is never canonical, so this must
+    // decode-and-re-encode to `"A"`, not echo the escape verbatim.
+    // Built as a plain string literal with an escaped backslash
+    // (`"\\u0041"`), not the earlier `r#""A""#` this test used to carry
+    // here (#2919 review): that raw string's delimiters mean no backslash
+    // is written at all, so it was already the literal letter `A` in
+    // quotes -- already-canonical, taking the fast path and asserting
+    // nothing about the intended non-canonical-escape case.
+    let escaped_a_input = "\"\\u0041\"";
+    let (output, code) = run_jq_stdin(".", escaped_a_input, &["-c"])?;
+    assert_eq!(code, 0, "input {escaped_a_input:?}");
+    assert_eq!(output.trim(), r#""A""#, "input {escaped_a_input:?}");
 
     // A raw, unescaped DEL byte (0x7f) inside a string: jq's writer
     // always escapes it as the 6-byte sequence backslash, u, 0, 0, 7, f

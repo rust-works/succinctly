@@ -2021,6 +2021,15 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// scanner with it. None delegate to any other; see #1218
 /// for the full survey and why a blanket consolidation needs its own
 /// design pass.
+///
+/// #2608 later added a fifth number-adjacent caller,
+/// `scan_canonical_number` (this file) -- unlike the four above, it is
+/// *not* independent: its span-finding loop has no grammar difference
+/// from `nested_number_span`'s own greedy `[0-9.eE+-]*` run (same
+/// permissive, malformed-shape-absorbing contract this caller also
+/// needs, since a not-canonical span still has to resolve to *one* span
+/// for [`is_jq_canonical_number`] to reject), so it calls that function
+/// directly rather than adding a fifth copy of the loop (#2919 review).
 pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     if i < text.len() && text[i] == b'-' {
@@ -2223,7 +2232,7 @@ use crate::jq::{
     nonfinite_display_string, EvalError, JqSemantics, OwnedValue, YqSemantics,
     MAX_VALUE_TREE_DEPTH,
 };
-use crate::text::utf8::validate_utf8;
+use crate::text::utf8::decode_code_point;
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
 /// *materializing* route already raises for the same scalar, so a document
@@ -2439,27 +2448,48 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   re-render branch directly below it in `stream_json` -- both are keyed
 ///   on `numbers: JsonConvention` alone, and neither is ever invoked with
 ///   ascii intent.
-/// - Duplicate keys: a fresh [`KeyHashes`] per object (never shared across
-///   siblings or nesting, matching one-instance-per-object semantics),
-///   fed each key's *raw source span* (the bytes strictly between its
-///   quotes, undecoded) through [`key_hash`]. That's sound without a
+/// - Duplicate keys: each key's *raw source span* (the bytes strictly
+///   between its quotes, undecoded) is checked against every key already
+///   seen in the same object (never shared across siblings or nesting,
+///   matching one-instance-per-object semantics). That's sound without a
 ///   decode step only because the string check above has *already*
 ///   certified this exact span as jq's own canonical encoding of its
 ///   decoded content -- a fixed, unconditional rule, so it's an injective
 ///   map from decoded string to span, and span equality is decoded-string
-///   equality. `KeyHashes::insert` returning `true` covers both a genuine
+///   equality. Two tiers, mirroring `src/bin/succinctly/jq_runner.rs`'s
+///   own `PAIRWISE_SPAN_SCAN_LIMIT`/`span_fingerprint` split (#2919
+///   review): up to `SMALL_OBJECT_KEY_LIMIT` keys are compared pairwise
+///   via a cheap fingerprint with no allocation at all -- most real
+///   objects never cross that threshold, and [`KeyHashes::insert`]
+///   heap-allocates its table on its very first call, which would
+///   otherwise cost every tiny object a real allocation for no reason.
+///   Past the threshold a real [`KeyHashes`] table takes over, fed each
+///   key through [`key_hash`], and checks `KeyHashes::saturated` right
+///   after every `insert` -- matching every other `KeyHashes` caller in
+///   the tree (`DistinctKeyCursors::next`, `src/jq/document.rs`) -- so it
+///   bails the moment the table can no longer grow instead of paying for
+///   one more doomed string-scan-and-hash first; `insert` degrades to an
+///   unconditional conservative `true` past that point regardless, so
+///   this changes nothing about the answer, only the work spent reaching
+///   it. Either tier's "seen before" answer covers both a genuine
 ///   duplicate key and a bare 64-bit hash collision between two distinct
 ///   keys; both get the same conservative answer here (bail, don't try to
 ///   disambiguate by comparing bytes) since either one means "cannot
 ///   certify this object's span as canonical", not "definitely not
-///   canonical" -- the type's own doc comment describes the same
+///   canonical" -- `KeyHashes`'s own doc comment describes the same
 ///   conservatism for its other callers.
 ///
 /// The safety argument for this whole function is exactly the equivalence
-/// asserted by `is_canonical_compact_jq_span_agrees_with_stream_json_pretty`
-/// in `tests/json_canonical_echo_tests.rs`: `is_canonical_compact_jq_span(d)
-/// == (stream_json_pretty(d, compact, unsorted, JqCompat) == Ok(d))`, swept
-/// over a differential/fuzz corpus that deliberately includes non-ASCII and
+/// this module's own `is_canonical_compact_jq_span_agrees_with_rerender_2608`
+/// and `is_canonical_compact_jq_span_fuzz_2608` tests assert (inline
+/// `#[cfg(test)] mod tests`, this file -- #2919 review: an earlier draft of
+/// this comment cited `is_canonical_compact_jq_span_agrees_with_stream_json_pretty`
+/// in a `tests/json_canonical_echo_tests.rs` that never existed): the
+/// load-bearing direction of `is_canonical_compact_jq_span(d) ==
+/// (stream_json_pretty(d, compact, unsorted, JqCompat) == Ok(d))` -- `true
+/// ==>` round-trips; see those two tests' own doc comments for why the
+/// converse isn't asserted -- swept over a hand-picked corpus plus a
+/// differential/fuzz corpus that deliberately includes non-ASCII and
 /// edge-byte content per `CLAUDE.md`'s fuzz-alphabet rule.
 #[must_use]
 pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
@@ -2507,15 +2537,13 @@ fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<us
 
 /// The number-token rule from `is_canonical_compact_jq_span`'s own doc
 /// comment: the maximal `[-+.eE0-9]*` run is jq's own canonical spelling
-/// iff [`is_jq_canonical_number`] says so.
+/// iff [`is_jq_canonical_number`] says so. The span itself comes from
+/// [`nested_number_span`] (#2919 review) rather than a second,
+/// independently maintained copy of the same greedy character-class loop
+/// -- see `number_literal_end`'s #1218 survey doc comment for why this
+/// caller reuses it instead of counting as a fifth independent scanner.
 fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
-    let mut end = pos;
-    while matches!(
-        bytes.get(end),
-        Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-    ) {
-        end += 1;
-    }
+    let end = nested_number_span(bytes, pos);
     if end == pos || !is_jq_canonical_number(&bytes[pos..end]) {
         return None;
     }
@@ -2547,12 +2575,24 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// - every other byte, ASCII or a UTF-8 lead/continuation byte `>= 0x80`,
 ///   is literal content.
 ///
-/// The whole content span is then validated as UTF-8
-/// ([`validate_utf8`]) -- sound to defer to the end rather than tracking
-/// sequence boundaries during the scan above, because none of `"`, `\`,
-/// or a control/DEL byte can ever appear as a lead or continuation byte of
-/// a UTF-8 sequence (valid or not): every one of those bytes is `< 0x80`
-/// or exactly `0x7F`, and UTF-8 multi-byte bytes are always `>= 0x80`.
+/// UTF-8 validity is checked *inline*, in the same loop below, rather than
+/// as a separate pass over the finished span (#2919 review: an earlier
+/// draft called `validate_utf8` on `content_start..content_end` only after
+/// the loop found the closing quote -- a second full walk of the string's
+/// bytes for the multi-byte-heavy case). That's still sound for exactly
+/// the reason the old deferred check was: none of `"`, `\`, or a
+/// control/DEL byte can ever appear as a lead or continuation byte of a
+/// UTF-8 sequence (valid or not), since every one of those bytes is
+/// `< 0x80` or exactly `0x7F`, and UTF-8 multi-byte bytes are always
+/// `>= 0x80` -- so every byte the loop below classifies as plain "literal
+/// content" is unambiguously either a one-byte ASCII character (`< 0x80`,
+/// no check needed) or the first byte of a multi-byte sequence handed to
+/// [`decode_code_point`], which decodes and bounds-checks the whole
+/// sequence in one call. `decode_code_point` shares its bounds
+/// (`code_point_bounds_violation`) with
+/// [`validate_utf8_scalar`](crate::text::utf8::validate_utf8_scalar)
+/// (#1423), so this can't silently drift from what the separate
+/// `validate_utf8` call it replaces would have decided.
 fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
     debug_assert_eq!(bytes.get(pos), Some(&b'"'));
     let content_start = pos + 1;
@@ -2560,11 +2600,7 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
     loop {
         match *bytes.get(i)? {
             b'"' => {
-                let content_end = i;
-                if validate_utf8(&bytes[content_start..content_end]).is_err() {
-                    return None;
-                }
-                return Some((content_start, content_end, i + 1));
+                return Some((content_start, i, i + 1));
             }
             b'\\' => {
                 let esc = *bytes.get(i + 1)?;
@@ -2598,7 +2634,17 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
                 }
             }
             b if b < 0x20 || b == 0x7F => return None,
-            _ => i += 1,
+            b if b < 0x80 => i += 1,
+            _ => {
+                // A UTF-8 lead byte (`>= 0x80`) -- decode and
+                // bounds-check the whole sequence at once; an invalid one
+                // (truncated, overlong, a surrogate, past Unicode's own
+                // range, or a bare continuation byte misread as a lead)
+                // bails exactly as the separate `validate_utf8` pass this
+                // replaces would have.
+                let (_, len) = decode_code_point(&bytes[i..])?;
+                i += len;
+            }
         }
     }
 }
@@ -2609,23 +2655,106 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
 /// (raw span, undecoded -- see `is_canonical_compact_jq_span`'s own doc
 /// comment for why that's sound) into a fresh per-object [`KeyHashes`] to
 /// bail on any repeat.
+/// Above this many keys, [`scan_canonical_object`] switches from an
+/// allocation-free pairwise key-span scan to a real [`KeyHashes`] table.
+///
+/// Mirrors `src/bin/succinctly/jq_runner.rs`'s own
+/// `PAIRWISE_SPAN_SCAN_LIMIT` (same value, same reasoning -- real objects
+/// are small, and below this a pairwise scan is free while `KeyHashes`
+/// would heap-allocate on its very first `insert`). Kept as its own
+/// constant rather than shared with that one because the dependency only
+/// runs one way -- this `src/json/light.rs` module is part of the library
+/// crate, and `jq_runner.rs` is part of the `succinctly` *binary* crate
+/// that depends on it, so a lib module cannot reference a `bin` target's
+/// private const. If one threshold changes, check whether the other
+/// should too.
+const SMALL_OBJECT_KEY_LIMIT: usize = 16;
+
+/// A cheap discriminator for a key's raw quoted span (`"`...`"`, quotes
+/// included), mirroring `jq_runner.rs`'s own `span_fingerprint`: length
+/// plus the first and last content bytes, packed into one word.
+///
+/// Distinct fingerprints prove distinct keys, so [`scan_canonical_object`]'s
+/// pairwise scan below compares these words first and only falls back to
+/// comparing the spans themselves on a collision.
+#[inline]
+fn object_key_span_fingerprint(quoted: &[u8]) -> u64 {
+    let n = quoted.len();
+    let first = if n > 2 { quoted[1] } else { 0 };
+    let last = if n > 3 { quoted[n - 2] } else { 0 };
+    ((n as u64) << 16) | ((first as u64) << 8) | last as u64
+}
+
 fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'{'));
     let mut i = pos + 1;
     if bytes.get(i) == Some(&b'}') {
         return Some(i + 1);
     }
-    let mut seen_keys = KeyHashes::new();
+    // Small-object fast path (#2919 review): up to `SMALL_OBJECT_KEY_LIMIT`
+    // keys are compared pairwise via a cheap fingerprint, with no
+    // allocation at all. `seen_keys` -- a real `KeyHashes` table -- only
+    // comes into existence once an object turns out to have more keys
+    // than that; see `SMALL_OBJECT_KEY_LIMIT`'s own doc comment.
+    let mut small_spans: [(usize, usize); SMALL_OBJECT_KEY_LIMIT] =
+        [(0, 0); SMALL_OBJECT_KEY_LIMIT];
+    let mut small_fps: [u64; SMALL_OBJECT_KEY_LIMIT] = [0; SMALL_OBJECT_KEY_LIMIT];
+    let mut small_count = 0usize;
+    let mut seen_keys: Option<KeyHashes> = None;
     loop {
         if bytes.get(i) != Some(&b'"') {
             return None;
         }
         let (key_start, key_end, after_key) = scan_json_string_span(bytes, i)?;
-        if seen_keys.insert(key_hash(&bytes[key_start..key_end])) {
-            // A genuine duplicate key, or merely a hash collision -- either
-            // way this object's span cannot be certified canonical (see
-            // this function's own doc comment).
-            return None;
+        if let Some(seen) = seen_keys.as_mut() {
+            // #2919 review: `saturated()` is checked right after `insert`,
+            // matching every other `KeyHashes` caller in the tree
+            // (`DistinctKeyCursors::next`, `src/jq/document.rs`), so this
+            // bails the moment the table can no longer grow instead of
+            // paying for one more doomed string-scan-and-hash first --
+            // `insert` degrades to an unconditional conservative `true`
+            // past that point regardless, so this changes nothing about
+            // the answer, only the work spent reaching it.
+            if seen.insert(key_hash(&bytes[key_start..key_end])) || seen.saturated() {
+                return None;
+            }
+        } else {
+            let fp = object_key_span_fingerprint(&bytes[i..after_key]);
+            let repeat = (0..small_count).any(|j| {
+                let (s, e) = small_spans[j];
+                small_fps[j] == fp && bytes[s..e] == bytes[key_start..key_end]
+            });
+            if repeat {
+                // A genuine duplicate key, or merely a hash collision --
+                // either way this object's span cannot be certified
+                // canonical (see this function's own doc comment).
+                return None;
+            }
+            if small_count < SMALL_OBJECT_KEY_LIMIT {
+                small_fps[small_count] = fp;
+                small_spans[small_count] = (key_start, key_end);
+                small_count += 1;
+            } else {
+                // Overflow past the pairwise limit: build a real table,
+                // seeded from what the pairwise scan already collected.
+                // None of those `small_count` keys can be a duplicate of
+                // each other -- the pairwise scan above already proved
+                // that -- so the only way this seeding loop's `insert`
+                // reports `true` is a bare 64-bit hash collision between
+                // two already-distinct keys, which this whole function
+                // already treats as "bail, don't try to disambiguate"
+                // (see `KeyHashes`'s own doc comment on `insert`).
+                let mut table = KeyHashes::with_capacity(small_count + 1);
+                for &(s, e) in &small_spans[..small_count] {
+                    if table.insert(key_hash(&bytes[s..e])) {
+                        return None;
+                    }
+                }
+                if table.insert(key_hash(&bytes[key_start..key_end])) || table.saturated() {
+                    return None;
+                }
+                seen_keys = Some(table);
+            }
         }
         if bytes.get(after_key) != Some(&b':') {
             return None;
