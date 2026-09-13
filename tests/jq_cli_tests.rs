@@ -43266,7 +43266,7 @@ fn reduce_is_demand_forwarding_2899() -> Result<()> {
         // agree. Pinned as *our* answer so a future #2163 fix trips here.
         (
             r#"{"a":1}"#,
-            r#"reduce ((.[]|stderr)?) as $x ((0,1); .)"#.to_string(),
+            r"reduce ((.[]|stderr)?) as $x ((0,1); .)".to_string(),
             "0\n1\n".to_string(),
             "11".to_string(),
             0,
