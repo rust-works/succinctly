@@ -5362,7 +5362,14 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // cannot disagree about which failures a `?` swallows.
             let owned = match to_owned(&value) {
                 Ok(v) => v,
-                Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+                // #2280: defensive, not a live behaviour change -- exactly as
+                // the generic evaluator's own `Builtin::Path` arm records.
+                // `to_owned`'s only error paths here are all
+                // `is_decode_failure()`-tagged, and `suppresses()` is `false`
+                // for those regardless of `optional`, so a `?` never swallows
+                // one. Kept so the two routes share one predicate rather than
+                // one of them hard-coding the current answer.
+                Err(e) if suppresses(&e, optional) => return Flow::Exhausted, // omni-dev: coverage tolerate-line reason="unreachable today: to_owned's only failures are is_decode_failure()-tagged, and suppresses() answers false for those whatever `optional` is -- the same defensive-but-dead arm eval_generic's own Builtin::Path materialization documents under #2280 (#2908)"
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
             each_path::<W, S>(path_expr, &owned, optional, sink)
@@ -58114,6 +58121,27 @@ mod tests {
             "[first(recurse(empty))]",
             "walk(.)",
             "tostream",
+        ] {
+            query!(
+                &b"\"\xff\xfe\""[..],
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+        }
+    }
+
+    /// #1755's rule on #2908's new lazy `path()` route: an undecodable root
+    /// raises there too, not only through the collecting `builtin_path`.
+    ///
+    /// `limit`/`first` are what reach the `eval_each` arm; the bare spelling
+    /// still takes `builtin_path`, and both must answer the same way.
+    #[test]
+    fn each_path_raises_on_undecodable_root_2908() {
+        for expr in [
+            "limit(1; path(.))",
+            "first(path(.))",
+            "limit(1; path(.a, .b))",
+            "path(.)",
         ] {
             query!(
                 &b"\"\xff\xfe\""[..],
