@@ -557,7 +557,6 @@ fn build_call_graph(
             ..
         } => {
             let body_addr = body.as_ref() as *const Expr as usize;
-            graph.entry(body_addr).or_default();
 
             let outer = scope.len();
             scope.push((name.clone(), params.len(), ScopeHit::Def(body_addr)));
@@ -671,11 +670,19 @@ fn build_call_graph(
                 None => {
                     if let Some(fallback) = builtin_fallback.as_deref() {
                         build_call_graph(fallback, scope, enclosing, graph, roots);
-                    } else {
+                    } else if is_jq_builtin(name, arity) {
                         for a in args {
                             build_call_graph(a, scope, enclosing, graph, roots);
                         }
                     }
+                    // A genuinely unresolvable callee: `check`'s own matching
+                    // branch doesn't check its arguments either (#2037 --
+                    // real jq's compiler never compiles an unresolved call's
+                    // arguments, having nothing to bind them to), so nothing
+                    // in `args` can mark another `def` reachable through
+                    // this call site. Confirmed live: `def h: nosuchfn2;
+                    // nosuchfn(h)` reports only `nosuchfn/1 is not defined`
+                    // in jq 1.7.1, not `nosuchfn2/0` too.
                 }
             }
         }
@@ -703,17 +710,19 @@ fn build_call_graph(
             }
         }
 
-        Expr::Builtin(builtin) => {
-            let kids: Vec<&Expr> = match builtin_kids(builtin) {
-                BuiltinKids::None => Vec::new(),
-                BuiltinKids::One(a) => alloc::vec![a],
-                BuiltinKids::Two(a, b) => alloc::vec![a, b],
-                BuiltinKids::Three(a, b, c) => alloc::vec![a, b, c],
-            };
-            for a in kids {
+        Expr::Builtin(builtin) => match builtin_kids(builtin) {
+            BuiltinKids::None => {}
+            BuiltinKids::One(a) => build_call_graph(a, scope, enclosing, graph, roots),
+            BuiltinKids::Two(a, b) => {
                 build_call_graph(a, scope, enclosing, graph, roots);
+                build_call_graph(b, scope, enclosing, graph, roots);
             }
-        }
+            BuiltinKids::Three(a, b, c) => {
+                build_call_graph(a, scope, enclosing, graph, roots);
+                build_call_graph(b, scope, enclosing, graph, roots);
+                build_call_graph(c, scope, enclosing, graph, roots);
+            }
+        },
     }
 }
 
@@ -747,6 +756,24 @@ fn compute_reachable(graph: &BTreeMap<usize, Vec<usize>>, roots: &[usize]) -> BT
 /// the program and rewrites `ns::f` into a `FuncCall` named `ns::f`, matching
 /// the wrapper it also creates. Running earlier would report every module
 /// function as undefined.
+///
+/// # Correctness caveat for a multi-owner `Expr::Shared`
+///
+/// `build_call_graph`'s reachability graph (#2740) identifies a `def` by
+/// its body's own heap address, computed once, read-only, before this
+/// function's own `&mut`-mutating walk runs. That walk's `Expr::Shared` arm
+/// calls `Rc::make_mut`, which clone-on-writes the wrapped subtree -- new
+/// heap addresses for every `Expr::FuncDef` inside it -- if (and only if)
+/// the `Rc` is not uniquely owned at that point. A multi-owner `Rc` handed
+/// to this function can therefore desync the two: a `def` the graph found
+/// reachable through the *pre-clone* address is checked against the wrong,
+/// *post-clone* one and silently skipped instead. This crate's own three
+/// CLI call sites (`jq_runner.rs`, `yq_runner.rs`) never construct a
+/// multi-owner `Expr::Shared` here -- `Expr::Shared` itself only exists on
+/// an evaluation-time tree to begin with (see the leaf-arm comment on
+/// `check`'s own `Shared` handling), and neither runner calls this
+/// function on one. An external caller of this public API that does is not
+/// guaranteed the identical protection this crate's own callers get.
 pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
     match resolve_func_calls_all(expr).into_iter().next() {
         Some(first) => Err(first),
@@ -1439,6 +1466,22 @@ mod tests {
         assert_eq!(
             resolve("def h: nosuchfn; def use(f): 1; use(h)"),
             Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
+    /// #2740 review: `build_call_graph`'s own arguments-of-an-unresolved-call
+    /// handling must mirror `check`'s (#2037's rule: real jq's compiler
+    /// never compiles an unresolved call's arguments, having no resolved
+    /// callee to bind them to). An early version of this pass didn't
+    /// distinguish that case from the `is_jq_builtin` one and walked `args`
+    /// unconditionally, marking `h` -- and transitively its own
+    /// `nosuchfn2` -- reachable through a call site jq itself never
+    /// compiles. Oracle-verified: jq 1.7.1 reports only `nosuchfn/1`.
+    #[test]
+    fn an_unresolvable_callees_arguments_do_not_mark_anything_reachable() {
+        assert_eq!(
+            resolve("def h: nosuchfn2; nosuchfn(h)"),
+            Err("nosuchfn/1 is not defined".into())
         );
     }
 

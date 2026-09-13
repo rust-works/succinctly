@@ -915,12 +915,14 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         // *particular* name/arity (installing a `DefCall`, binding a
         // `$`-parameter reference) does so with its own guarded arm first and
         // reaches this one only once that guard has already failed.
-        // `builtin_fallback` (#2036) is always `None` by the time any of
-        // this function's callers run -- `resolve.rs`'s compile-time
-        // rewrite consumes it first, over the whole tree, before
-        // evaluation (and so before DefCall installation/param
-        // substitution) ever begins. Recursed into defensively anyway,
-        // matching `args`, rather than assumed away.
+        // `builtin_fallback` (#2036) is `None` by the time any of this
+        // function's callers run for every `def` body `resolve.rs`'s
+        // compile-time pass actually checked -- but #2740 means a body the
+        // reachability pass found unreachable is skipped entirely, so it
+        // can still carry a live, unresolved `builtin_fallback` (that body
+        // is never evaluated either, so this is inert in practice).
+        // Recursed into defensively either way, matching `args`, rather
+        // than assumed away.
         Expr::FuncCall {
             name,
             args,
@@ -1236,6 +1238,16 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(|e| any_subexpr(e, pred)),
 
+        // Ignores `builtin_fallback` (unlike `map_subexprs`'s own `FuncCall`
+        // arm, which recurses into it defensively) -- safe only because
+        // every caller of this predicate runs after `resolve.rs`'s
+        // compile-time pass, which leaves no live `builtin_fallback`
+        // reachable from a `def` it actually checked (#2036 always resolves
+        // it, one way or the other, before returning). #2740 means that no
+        // longer holds for a `def` body the reachability pass skipped
+        // entirely (it may still carry an untouched `builtin_fallback`),
+        // but a skipped body is by definition never evaluated, so this
+        // arm's blind spot is unreachable in practice, not merely unlikely.
         Expr::FuncCall { args, .. } | Expr::NamespacedCall { args, .. } => {
             args.iter().any(|e| any_subexpr(e, pred))
         }
