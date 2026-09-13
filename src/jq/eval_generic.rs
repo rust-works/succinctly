@@ -8995,12 +8995,9 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                     sink,
                 );
             }
-            match each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
+            each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
                 sink.push(GenericItem::Owned(v))
-            }) {
-                None => Flow::Exhausted,
-                Some(e) => Flow::Escaped(Control::from(e)),
-            }
+            })
         }
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
             let f = Expr::Optional(Box::new(Expr::Iterate));
