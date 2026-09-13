@@ -33781,8 +33781,8 @@ fn untrackable_branch_escape(
 /// to stop before it drifts. Noted as a maintainability concern on #2267 and
 /// extracted there.
 ///
-/// Two behaviours ride along, both load-bearing and neither obvious from the
-/// call sites:
+/// One behaviour rides along, load-bearing and not obvious from the call
+/// sites:
 ///
 /// * `target`'s own **partial prefix is kept**, not discarded via `?` (#896's
 ///   review of `resolve_index_expr`, found independently live in
@@ -33792,31 +33792,25 @@ fn untrackable_branch_escape(
 ///   this pair. The escape rides back as the second half of the pair rather
 ///   than short-circuiting, so the caller can push those branches first and
 ///   raise afterwards.
-/// * The reservation is **per pair**, not once for the whole
-///   `keys x target` / `starts x ends x target` product: `target` is
-///   genuinely re-resolved per pair since #2139/#2249, so its branch count
-///   can differ between pairs. Unlike an upfront reservation (whose `Err`
-///   prefix was empty by construction), a failure here can land on any pair
-///   after the first, with `out` already holding every earlier pair's
-///   output -- so this returns the error for the caller's own `escape!` to
-///   fold that non-empty prefix into, rather than discarding it.
+///
+/// **The per-pair `out` reservation deliberately stays at the two call
+/// sites**, even though it too is identical text. `resolve_slice_expr` runs
+/// its #843 `target_is_passthrough` escape *between* the resolve and the
+/// reserve, so folding the reserve in here would hoist it above that escape
+/// and swap which error surfaces when both would fire. That is only
+/// reachable under allocation failure, but this is a refactor: it is not the
+/// place to move an observable ordering, however unlikely the observation.
 fn resolve_target_for_pair<'a, S: EvalSemantics>(
     target: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
     frame: &Frame,
     keep: Keep,
-    out: &mut Vec<PathBranch<'a>>,
-) -> Result<(Vec<PathBranch<'a>>, Option<EvalEscape>), EvalEscape> {
-    let (branches, this_escape) =
-        match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
-            Ok(branches) => (branches, None),
-            Err((prefix, e)) => (prefix, Some(e)),
-        };
-    if out.try_reserve(branches.len()).is_err() {
-        return Err(cannot_reserve_cross_product(&[branches.len()]).into());
+) -> (Vec<PathBranch<'a>>, Option<EvalEscape>) {
+    match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
     }
-    Ok((branches, this_escape))
 }
 
 /// Resolve `E[K]` in path context, with or without a trailing `?`.
@@ -33941,10 +33935,22 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
         // carries, which used to be stated twice here and there.
         let (branches, this_escape) =
-            match resolve_target_for_pair::<S>(target, value, trackable, frame, keep, &mut out) {
-                Ok(pair) => pair,
-                Err(control) => escape!(control),
-            };
+            resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
+
+        // Reserved once per key, ahead of that key's own indexing loop,
+        // rather than once for the whole `keys x target` product up front
+        // -- `target`'s own length can vary per key now (#2139, mirroring
+        // `eval_index_expr`'s identical #2032 change). Unlike the old
+        // upfront reservation (guaranteed to fire before `out` held
+        // anything, so its own `Err` prefix was always empty by
+        // construction), a failure here can land on any key after the
+        // first, with `out` already holding every earlier key's output --
+        // `escape!` folds that non-empty prefix in rather than discarding
+        // it, consistent with every other mid-loop failure in this
+        // function.
+        if out.try_reserve(branches.len()).is_err() {
+            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
+        }
 
         // #843: `target` can also resolve successfully with `trackable:
         // false` through `Builtin::GetPath`'s own deliberate exemption
@@ -34125,9 +34131,15 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // (and `s`s) are not merely skipped -- they are never evaluated, and
     // their side effects never fire. `path((select((true,error("terr")))))
     // [0:((1|debug("t1")),(2|debug("t2")))]` prints `t1` and then `terr` on
-    // jq 1.7.1; `t2` was printed here before this. Same for a consumer that
-    // stops from above: `[first(path(...))]` over a two-`s` bound now
-    // evaluates one `s`, not both.
+    // jq 1.7.1; `t2` was printed here before this.
+    //
+    // Stopping from *above* is a different, still-open gap and is not what
+    // this buys: `[first(path((.|debug("E"))[((0|debug("s0")),(1|debug(
+    // "s1"))):(2|debug("t"))]))]` still evaluates both `s`s here where jq
+    // evaluates only `s0`. This function returns a materialized
+    // `PathResolveResult`, so a consumer's own demand has nothing to travel
+    // down -- closing that needs a sink-shaped `resolve_slice_expr`, which
+    // is #2267's own remaining step 3, not this one.
     //
     // Only the *ordering* moves. Every one of these shapes produced the
     // same path outputs, in the same order, before and after -- the whole
@@ -34252,7 +34264,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
         // carries, which used to be stated twice here and there.
         let (branches, this_escape) =
-            resolve_target_for_pair::<S>(target, value, trackable, frame, keep, out)?;
+            resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
         // #2546: rendered from the bounds' own values, not from a
         // resolved `Expr::Slice` -- a bound whose classification failed
         // has no integer to build one from, and jq still names it here
@@ -34274,6 +34286,9 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // `[10,20,30]` prints `[{"start":1,"end":2}]` (the
         // already-produced `select` branch, sliced) before raising
         // `t`.
+        if out.try_reserve(branches.len()).is_err() {
+            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
+        }
         for PathBranch {
             path: components,
             value: target_value,
@@ -34401,19 +34416,23 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // parked here and raised once both drivers have unwound.
     let mut inner_escape: Option<EvalEscape> = None;
 
-    // `T` (`end`) evaluated fresh for this `s`, not once overall
-    // (#2245). An empty `T` for this `s` contributes nothing and moves
-    // on to the next `s` (verified live: a `T` that's empty only for
-    // `s == 0` still lets `s == 1` run and contribute its own output —
-    // not a whole-function short-circuit the way an entirely-empty `S`
-    // is) -- and `target` is never even touched for an `s` whose `T`
-    // never produces anything. A `T` that errors before producing any
-    // value for this `s` still ends the whole computation immediately
-    // (verified live: `(1,2)[(0,1):(error("boom"))]` raises `boom`
-    // even though `target`, `(1,2)`, is untrackable and would
-    // otherwise have raised its own "Invalid path expression" error
-    // first -- `T`'s own escape wins before `target` is ever reached).
+    // `S` (`start`), the outermost of the three generators, driven one value
+    // at a time so each `s` reaches its own pairs before the next `s` is
+    // asked for. Its own trailing escape is the one this function reports
+    // last (#1528, below), after `E`'s and `T`'s.
     let driven = drive_slice_bound::<S>(start, value, f64::floor, &mut |s| {
+        // `T` (`end`) evaluated fresh for this `s`, not once overall
+        // (#2245). An empty `T` for this `s` contributes nothing and moves
+        // on to the next `s` (verified live: a `T` that's empty only for
+        // `s == 0` still lets `s == 1` run and contribute its own output —
+        // not a whole-function short-circuit the way an entirely-empty `S`
+        // is) -- and `target` is never even touched for an `s` whose `T`
+        // never produces anything. A `T` that errors before producing any
+        // value for this `s` still ends the whole computation immediately
+        // (verified live: `(1,2)[(0,1):(error("boom"))]` raises `boom`
+        // even though `target`, `(1,2)`, is untrackable and would
+        // otherwise have raised its own "Invalid path expression" error
+        // first -- `T`'s own escape wins before `target` is ever reached).
         let ends = drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(
             &s, &e, &mut out,
         ) {
@@ -34528,9 +34547,12 @@ impl PathSliceBound {
 /// still on hand to check.
 ///
 /// Keeps the bound generator's own partial prefix rather than discarding it
-/// on escape (#1517) -- `eval_owned_multi_keep_partial`, not the
-/// discard-prefix `eval_owned_multi`, mirroring `resolve_index_expr`'s
-/// `key`/`key_escape` split for its own (single) generator argument.
+/// on escape (#1517): values already delivered to the sink stay delivered
+/// and the escape is returned alongside them, mirroring
+/// `resolve_index_expr`'s `key`/`key_escape` split for its own (single)
+/// generator argument. The yq arm reaches the same outcome through
+/// `eval_owned_multi_keep_partial`, not the discard-prefix
+/// `eval_owned_multi`.
 ///
 /// #2546: a resolved-but-non-numeric bound (e.g. `"x"` in
 /// `.[(0,1,"x"):(2,3)]`) is not raised here at all in jq mode; it rides to
@@ -34543,8 +34565,9 @@ impl PathSliceBound {
 /// indices must be integers", and `.[(0,1,"x",halt):(2,3)]` still raises
 /// the same error without reaching `halt` -- the bad value meets its
 /// target before the generator's own trailing escape is ever reported).
-/// The generator itself is still drained eagerly here -- #2267's recorded
-/// gap, unchanged by #2546, which made the value-mode twins lazy.
+/// #2267 made this generator demand-driven in jq mode -- see the sink
+/// contract on the function itself. It is still drained eagerly in yq mode,
+/// deliberately, for the reason given there.
 ///
 /// yq mode raises the failure at once, unchanged: real yq parses every
 /// bound before it looks at the target (see [`ComputedSliceBound`]) and
