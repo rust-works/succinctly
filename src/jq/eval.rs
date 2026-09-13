@@ -29828,6 +29828,28 @@ fn untracked_branches(
         .collect()
 }
 
+/// The recurse-family seed both [`resolve_recursive_descent_sink`] and
+/// [`resolve_recurse_sink`] start their stack with: `..`/`recurse`/
+/// `recurse(f)`/`recurse(f;cond)` all share jq's own definition, `def r: .,
+/// (f | r); r;` — the *first* value any of them ever emits is `.` itself, no
+/// navigation performed, so it inherits whatever ambient `(trackable,
+/// snapshot)` the caller already had rather than asserting one
+/// ([`PathBranch::passthrough`]). Every other node in either walk is reached
+/// by genuine descent (structural, or through `f`), which breaks the mark
+/// regardless of ambient — only this one root entry is built this way.
+fn recurse_family_root_seed<'a>(
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+) -> PathBranch<'a> {
+    PathBranch::passthrough(
+        PathPrefix::root(),
+        Cow::Borrowed(value),
+        trackable,
+        snapshot.clone(),
+    )
+}
+
 /// Sink-shaped `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
 /// migration of the parameterised spellings) — delivers one branch per node
 /// in `value`'s tree, self before children, in the same pre-order
@@ -29848,6 +29870,20 @@ fn untracked_branches(
 /// to bare structural descent, whose node count is exactly `value`'s own
 /// tree size — `[path(..)] | length` must equal jq's true count even past
 /// [`RECURSE_MAX_ITEMS`] nodes.
+///
+/// **What this does not close**: a popped node's *entire* set of direct
+/// children is pushed onto `stack` before the loop ever asks `sink` again —
+/// laziness holds *between* levels (an unvisited subtree's own descendants
+/// are never built) but not *within* one node's own fan-out. `path(limit(2;
+/// ..))` against a document whose root is a single wide `Array`/`Object`
+/// still allocates a `PathPrefix`/`PathBranch` for every one of that
+/// root's children before the second one is ever popped, even though only
+/// one is asked for. `path(limit(1; ..))` is unaffected (the very first
+/// `sink` call already stops the walk, before any child is ever pushed),
+/// which is the shape this function's own benchmark measures — see
+/// [#2895](https://github.com/rust-works/succinctly/issues/2895) for
+/// closing the general case via a per-node child cursor instead of an
+/// eagerly-expanded push.
 ///
 /// Every value this function ever visits is a live sub-part of the original
 /// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
@@ -29894,12 +29930,18 @@ fn resolve_recursive_descent_sink<'a>(
     snapshot: &Snapshot,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
-    let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
-        PathPrefix::root(),
-        Cow::Borrowed(value),
-        trackable,
-        snapshot.clone(),
-    )];
+    // Same invariant [`resolve_recurse_sink`] asserts, and the same reason
+    // (#843 review): `trackable`/`snapshot` are threaded as real parameters
+    // rather than just documented in prose so a future refactor of the
+    // shared untracked guard in [`resolve_node_sink`] that lets a value
+    // through that is neither trips this immediately instead of silently
+    // producing a bogus branch.
+    debug_assert!(
+        trackable || snapshot.is_marked(),
+        "resolve_recursive_descent_sink called with trackable=false, snapshot=false; the \
+         untracked recurse-family guard in resolve_node_sink should have caught this first"
+    );
+    let mut stack: Vec<PathBranch<'a>> = vec![recurse_family_root_seed(value, trackable, snapshot)];
 
     while let Some(popped) = stack.pop() {
         let PathBranch {
@@ -29910,19 +29952,9 @@ fn resolve_recursive_descent_sink<'a>(
             register: _,
         } = popped;
         assert_value_tree_depth(prefix.depth());
-        // Every branch on this stack was built from a `Cow::Borrowed` above
-        // and by the `Cow::Borrowed` pushes below -- structural descent
-        // never computes a new value, so this unwraps to `&'a OwnedValue`
-        // unconditionally, the same lifetime `value` itself carries.
-        let current: &'a OwnedValue = match current {
-            Cow::Borrowed(v) => v,
-            Cow::Owned(_) => {
-                unreachable!("resolve_recursive_descent_sink never produces an owned value")
-            }
-        };
         if sink(PathBranch {
             path: Rc::clone(&prefix),
-            value: Cow::Borrowed(current),
+            value: current.clone(),
             trackable: node_trackable,
             snapshot: node_snapshot,
             register: None,
@@ -29930,6 +29962,18 @@ fn resolve_recursive_descent_sink<'a>(
         {
             return ResolveFlow::Stopped;
         }
+        // Deferred past the `sink` call above (needed only for the
+        // descent below, not to deliver `current` itself) -- every branch
+        // on this stack was built from a `Cow::Borrowed` above and by the
+        // `Cow::Borrowed` pushes below, so structural descent never
+        // computes a new value and this unwraps unconditionally, the same
+        // lifetime `value` itself carries.
+        let current: &'a OwnedValue = match current {
+            Cow::Borrowed(v) => v,
+            Cow::Owned(_) => {
+                unreachable!("resolve_recursive_descent_sink never produces an owned value")
+            }
+        };
         match current {
             OwnedValue::Array(items) => {
                 for (i, item) in items.iter().enumerate().rev() {
@@ -33017,16 +33061,10 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     // with this function's recursion, not just streamed delivery of what it
     // already produced in one shot. See limitations.md.
     let mut emitted = 0usize;
-    // The seed is `.` itself -- no navigation -- so it inherits whatever
-    // `value` already was (#1591), same as `resolve_recursive_descent_sink`'s
-    // own root entry. Every subsequent node on the stack comes from `f`, and
-    // that is `child_snapshot`'s own job below, not this seed's.
-    let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
-        PathPrefix::root(),
-        Cow::Borrowed(value),
-        trackable,
-        snapshot.clone(),
-    )];
+    // [`recurse_family_root_seed`] -- every subsequent node on the stack
+    // comes from `f` instead, and that is `child_snapshot`'s own job below,
+    // not this seed's.
+    let mut stack: Vec<PathBranch<'a>> = vec![recurse_family_root_seed(value, trackable, snapshot)];
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;

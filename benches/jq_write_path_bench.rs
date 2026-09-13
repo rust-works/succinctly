@@ -1289,7 +1289,7 @@ fn bench_path_leading_iterate_comma(c: &mut Criterion) {
 
 /// `path(limit(1; ..))` vs `path(limit(1; recurse(.[]?)))` over [`array_doc`]
 /// -- before this issue, bare `..`/`recurse` collected the whole tree
-/// (`push_recursive_branches`) before a bounded consumer ever saw the first
+/// (`resolve_recursive_descent_sink`) before a bounded consumer ever saw the first
 /// branch, while the parameterised sibling already streamed one node at a
 /// time (`resolve_recurse_sink`, #2235). Both spellings answer the same
 /// value (`[]`, the root itself) and should now cost the same regardless of

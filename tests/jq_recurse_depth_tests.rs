@@ -2,7 +2,7 @@
 //!
 //! De-risk step for #626 (threading a `Cow<'a, OwnedValue>` lifetime through
 //! `PathBranch`/`resolve_node` in `src/jq/eval.rs` to kill the O(subtree)
-//! clone-per-node cost in `push_recursive_branches`/`resolve_recurse_sink`).
+//! clone-per-node cost in `resolve_recursive_descent_sink`/`resolve_recurse_sink`).
 //! Every existing recurse/`..` golden fixture nests three levels deep at
 //! most, so nothing today would catch a lifetime bug that only corrupts or
 //! truncates output once recursion goes deeper than a handful of frames.
@@ -61,16 +61,16 @@ fn run_paths(json: &str, filter: &str) -> Vec<String> {
         .collect()
 }
 
-/// Bare `..` — the `push_recursive_branches` path.
+/// Bare `..` — the `resolve_recursive_descent_sink` path.
 #[test]
 fn recursive_descent_correct_at_depth() {
     let json = linear_nest(DEPTH);
     assert_eq!(run_paths(&json, "path(..)"), expected_paths(DEPTH));
 }
 
-/// Bare `recurse` — shares `push_recursive_branches` with `..` (per the
-/// dispatch comment in `resolve_node`), pinned separately in case a future
-/// refactor splits the two.
+/// Bare `recurse` — shares `resolve_recursive_descent_sink` with `..` (per the
+/// dispatch comment in `resolve_node_sink`), pinned separately in case a
+/// future refactor splits the two.
 #[test]
 fn bare_recurse_correct_at_depth() {
     let json = linear_nest(DEPTH);

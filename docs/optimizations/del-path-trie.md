@@ -32,7 +32,7 @@ With `b` branches at depth `d` that is O(b·d), and a match set that grows with 
 ## The fix
 
 Sibling branches under a shared ancestor already share the same `Rc<PathPrefix>` allocation
-for that ancestor — `push_recursive_branches` clones the *same* parent `Rc` into every child
+for that ancestor — `resolve_recursive_descent_sink` clones the *same* parent `Rc` into every child
 (#701), so a `d+1`-branch traversal creates exactly `d` distinct `PathPrefix::Node`s, not
 O(d²). `DeleteTrie` walks each branch's chain leaf-to-root, memoizing already-interned nodes
 by pointer identity, so a branch only does new work for the part of its chain no earlier

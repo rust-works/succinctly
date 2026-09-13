@@ -3,7 +3,7 @@
 [Home](../../) > [Docs](../) > [Optimizations](./) > `del()` root short-circuit
 
 Investigation of [#1651](https://github.com/rust-works/succinctly/issues/1651): #701/PR #1631
-made `push_recursive_branches`'s path-construction O(1) per node (an `Rc<PathPrefix>`
+made `resolve_recursive_descent_sink`'s path-construction O(1) per node (an `Rc<PathPrefix>`
 persistent cons-list replacing a per-node `Vec<Expr>` clone), but `del(..)` on a depth-`d`
 document measured unchanged growth — k≈1.94 before *and* after that fix.
 
@@ -33,7 +33,7 @@ invoked.
 
 ## Why `..`/`recurse` always hit this
 
-`push_recursive_branches` emits the branch for the current node *before* recursing into its
+`resolve_recursive_descent_sink` emits the branch for the current node *before* recursing into its
 children — the root branch is always `out[0]`. `recurse`'s own definition emits `.` regardless
 of what the recursion function does. So every unconditional recursive-descent construct
 (`..`, bare `recurse`, `recurse(f)`, `recurse(f;cond)`) resolves the document root as one of
@@ -105,7 +105,7 @@ common real-world case — most practical uses of `del(.. | select(...))` want t
 *subset* of nodes, not the whole document — and is tracked as a separate, larger follow-up (a
 hash-consed deletion trie built from `Rc<PathPrefix>` pointer identity, giving true amortized
 O(d) for that shape too), matching this file's own established pattern of landing one verified
-O(d²) fix at a time (`push_recursive_branches`'s value clone → #668, its path clone → #701,
+O(d²) fix at a time (`resolve_recursive_descent_sink`'s value clone → #668, its path clone → #701,
 `del()`'s flatten-before-apply cost → this fix).
 
 ## Lessons
