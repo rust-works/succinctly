@@ -45761,6 +45761,41 @@ fn test_yq_int_overflow_wraps_unaffected_by_2631() -> Result<()> {
     Ok(())
 }
 
+/// #2259's jq-mode fix (see `jq_cli_tests.rs`) is shared, mode-generic code
+/// (`path_context_component_each`/`path_context_step_getpath`,
+/// `src/jq/eval_generic.rs`), so yq mode gets it too, behind
+/// `--jq-extensions` (`getpath` itself is gated, #1512). A path-component
+/// *type* mismatch (`true` is never a valid path element, regardless of the
+/// target value) is used here rather than an indexing mismatch, since yq's
+/// own path-context walk is more lenient about indexing a scalar than its
+/// plain `getpath` evaluator (a separate, pre-existing gap, not touched by
+/// this fix) -- confirmed live: `getpath(["a","x"])` on `a: 5` raises
+/// `Cannot index number with string "x"` in yq mode, but the same step
+/// inside a path-context walk (`getpath(["a","x"]) | key`) does not.
+#[test]
+fn test_yq_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result<()> {
+    let input = "a: 5\n";
+    let args = ["-o=json", "-I0", "--jq-extensions"];
+
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"getpath(([true], (debug("side")|["a"]))) | key"#,
+        input,
+        &args,
+    )?;
+    assert_eq!(code, 1, "out={out:?} err={err:?}");
+    assert_eq!(out, "");
+    assert!(
+        !err.contains("DEBUG"),
+        "the second alternative's debug() must never run once the first's walk failed: err={err:?}"
+    );
+    assert!(
+        err.contains("Cannot index object with boolean"),
+        "err={err:?}"
+    );
+
+    Ok(())
+}
+
 /// #2785: real yq's `==`/`!=` between two scalars compares their *text*, with
 /// its wildcard matcher applied to the right-hand operand -- not jq's typed
 /// equality. See `eval::yq_scalar_text_eq`. Every expectation below was
