@@ -39975,6 +39975,39 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
     crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::Repeat(_)))
 }
 
+/// [`eval_each`]'s `reduce` arm (#2899) -- [`each_foreach`]'s twin over
+/// [`reduce_forks`], with the same INIT-then-source drive pair.
+///
+/// Both drives are lazy unconditionally: the unbounded-stream fallback is
+/// the dispatch site's own `!streams_unbounded` guard, which sends such a
+/// `reduce` to the eager `eval_single` route before this function is
+/// reached at all -- exactly how [`each_foreach`] is gated.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach`'s own parameter list
+fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    input: &Expr,
+    patterns: &[Pattern],
+    init: &Expr,
+    update: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
+    };
+    let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
+        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
+    };
+    reduce_forks::<S>(
+        patterns,
+        update,
+        &mut drive_init,
+        optional,
+        &mut drive,
+        &mut |v| sink(Item::Owned(v)),
+    )
+}
+
 /// Demand-forwarding twin of [`eval_foreach`] (#2180 WP3): the source is
 /// driven through [`eval_each`] one element at a time and each step's
 /// EXTRACT (or bare UPDATE) output is pushed straight to `sink`, so a
@@ -40023,36 +40056,7 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
 /// The INIT fan-out loop stays outer, so the source is driven afresh per
 /// fork -- see [`foreach_forks`], which owns that loop and the reasons it
 /// re-drives rather than replays a recording.
-/// [`eval_each`]'s `reduce` arm (#2899) -- [`each_foreach`]'s twin over
-/// [`reduce_forks`], with the same INIT-then-source drive pair and the same
-/// unbounded-stream fallback.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `each_foreach`'s own parameter list
-fn each_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    input: &Expr,
-    patterns: &[Pattern],
-    init: &Expr,
-    update: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
-) -> Flow {
-    let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
-        drive_lazy::<W, S>(init, value.clone(), optional, per_init)
-    };
-    let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
-        drive_lazy::<W, S>(input, value.clone(), optional, per_element)
-    };
-    reduce_forks::<S>(
-        patterns,
-        update,
-        &mut drive_init,
-        optional,
-        &mut drive,
-        &mut |v| sink(Item::Owned(v)),
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's own ambient-threading list
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `foreach`'s own INIT/source/EXTRACT list
 fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &Expr,
     patterns: &[Pattern],
