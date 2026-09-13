@@ -28812,10 +28812,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // through `drain_path_result`, which is byte-identical to the eager
         // result for an always-`Continue` sink -- so this is a missed
         // optimization for a bounded consumer, never a behaviour change.
-        other => drain_path_result(
-            resolve_node_eager::<S>(other, value, trackable, snapshot, frame, keep),
-            sink,
-        ),
+        other => match resolve_node_eager::<S>(other, value, trackable, snapshot, frame, keep) {
+            Some(result) => drain_path_result(result, sink),
+            // #2694: the general leaf shape, which has a lazy form.
+            None => resolve_leaf_sink::<S>(other, value, trackable, snapshot, keep, sink),
+        },
     }
 }
 
@@ -28832,8 +28833,8 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
     snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
-    match expr {
+) -> Option<PathResolveResult<'a>> {
+    Some(match expr {
         Expr::IndexExpr { target, key } => {
             resolve_index_expr::<S>(target, key, value, false, trackable, frame, keep)
         }
@@ -29078,16 +29079,21 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // whole prefix has been built (rule 2), so a non-array output
                 // encountered first supersedes it -- same precedence
                 // `fanout_arg` gives a body error over `trailing`.
-                return path_result(branches, arg_escape.or(escape));
+                return Some(path_result(branches, arg_escape.or(escape)));
             }
             if let Some(e) = escape {
-                return Err((Vec::new(), e));
+                return Some(Err((Vec::new(), e)));
             }
             resolve_leaf::<S>(expr, value, trackable, snapshot, keep)
         }
 
-        other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
-    }
+        // #2694: `None` means "this is the general leaf shape" -- the one
+        // arm with a lazy form. Signalled rather than resolved here so
+        // `resolve_node_sink`'s fall-through can route it to
+        // [`resolve_leaf_sink`] without a second copy of "is this a leaf",
+        // which is exactly the predicate that would drift.
+        _ => return None,
+    })
 }
 
 /// [`resolve_node_sink`]'s `Expr::Optional` arm (`E?`, and `E[K]?`/`E[S:T]?`
@@ -29525,19 +29531,107 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
 /// filter takes below (via the `is_primitive` guard just past it), which is
 /// exactly what makes a bare `catch .` raise `#530`'s classic "with result"
 /// message instead (confirmed live) rather than the "near attempt" one.
-fn resolve_leaf<'a, S: EvalSemantics>(
+/// [`resolve_leaf`]'s general (non-primitive) case, delivered to a sink as
+/// each value is produced rather than collected first (#2694).
+///
+/// **Only a fold source streams.** `keep` is [`Keep::AtMost`] for a
+/// `reduce`/`foreach` SOURCE and [`Keep::First`] for every ordinary
+/// `path()`/`=`/`|=`/`del()` entry, and only the former is both safe and
+/// useful to stream:
+///
+/// - Useful, because that is where the bug is. `drive_fold_source` pulls by
+///   demand, but this arm collected the whole source first, so
+///   `path(first(foreach (inputs | select(.a)) as $i (.; .)))` consumed
+///   *every* remaining input and lost them -- jq leaves the unread ones for
+///   a later `inputs` (live: `[{"a":2},{"a":3}]` there, `[]` here).
+/// - Safe, because `Keep::First`'s own rules are load-bearing for
+///   `path()`/`del()`/`=` (#986/#987/#1872) and one of them cannot survive
+///   streaming as written: on a halt it returns *no* prefix, discarding the
+///   single value the limit-1 sink had already taken. Streamed, that value
+///   has already left. `Keep::First` therefore keeps the collecting path
+///   verbatim -- and loses nothing by it, since its limit is 1 and the
+///   generator is asked for at most one value either way.
+///
+/// The escape policy is [`resolve_leaf`]'s, unchanged: a halt always
+/// escapes and carries the already-delivered prefix; any other trailing
+/// escape propagates (a fold source *is* pulled to exhaustion, so jq does
+/// reach it); a `Stopped`'s `pending` is dropped, because the fold would
+/// not have asked for whatever produced it.
+fn resolve_leaf_sink<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let Keep::AtMost(limit) = keep else {
+        return drain_path_result(
+            resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+            sink,
+        );
+    };
+    // The bounded prefix (untrackable navigation, an untracked `.`, and the
+    // `is_primitive` shapes) produces at most one branch and is shared with
+    // the collecting form rather than restated.
+    if let Some(bounded) = resolve_leaf_bounded::<S>(expr, value, trackable, snapshot) {
+        return drain_path_result(bounded, sink);
+    }
+
+    let mut delivered = 0usize;
+    let mut stopped_by_sink = false;
+    let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+        delivered += 1;
+        let branch = PathBranch::untracked(Cow::Owned(v))
+            .with_register(trackable.then(|| Cow::Borrowed(value)));
+        // `untracked_branches`' own rule, applied one value at a time --
+        // see its doc comment for why the register is recorded here.
+        let demand = sink(branch);
+        if demand == Demand::Stop {
+            stopped_by_sink = true;
+            return Demand::Stop;
+        }
+        if delivered >= limit {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+
+    // Halt first, exactly as the collecting form checks `trailing` first: an
+    // already-triggered halt must never be downgraded into a catchable path
+    // error. Under `Keep::AtMost` the fold has already consumed the values
+    // produced before it and jq streams them, which is what the sink has
+    // just done.
+    match flow {
+        Flow::Escaped(Control::Halt(code))
+        | Flow::Stopped {
+            pending: Some(Control::Halt(code)),
+        } => ResolveFlow::Escaped(EvalEscape::Halt(code)),
+        _ if stopped_by_sink => ResolveFlow::Stopped,
+        Flow::Escaped(control) => ResolveFlow::Escaped(EvalEscape::from(control)),
+        Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
+    }
+}
+
+/// [`resolve_leaf`]'s bounded prefix: the shapes that produce at most one
+/// branch without consuming a generator -- an untrackable navigation
+/// refusal, an untracked `.`, and the `is_primitive` family. `None` means
+/// "the general case", which [`resolve_leaf`] resolves by collecting and
+/// [`resolve_leaf_sink`] streams (#2694). Shared so the two forms cannot
+/// disagree about which shapes never reach the generator at all.
+fn resolve_leaf_bounded<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+) -> Option<PathResolveResult<'a>> {
     if !trackable {
         if let Some(element) = navigation_element(expr) {
-            return Err((
+            return Some(Err((
                 Vec::new(),
                 EvalError::invalid_path_expression_near_access(&element, value).into(),
-            ));
+            )));
         }
         // #2646: the same check for a builtin jq defines *in jq*, in terms
         // of navigation it performs on its own input -- `first` is `.[0]`,
@@ -29567,7 +29661,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                             EvalError::invalid_path_expression_near_iterate(value)
                         }
                     };
-                    return Err((Vec::new(), error.into()));
+                    return Some(Err((Vec::new(), error.into())));
                 }
             }
         }
@@ -29581,12 +29675,12 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // alone would. `Field`/`Index`/`Slice` never reach this arm: the
         // `navigation_element` check above already raised for them.
         if matches!(expr, Expr::Identity) {
-            return Ok(vec![PathBranch::passthrough(
+            return Some(Ok(vec![PathBranch::passthrough(
                 PathPrefix::root(),
                 Cow::Borrowed(value),
                 false,
                 snapshot.clone(),
-            )]);
+            )]));
         }
     }
 
@@ -29629,11 +29723,11 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // evaluation of `expr` already ran the candidate that halted, side
         // effects included, by the time control reaches here.
         if let Some(EvalEscape::Halt(code)) = &trailing {
-            return Err((Vec::new(), EvalEscape::Halt(*code)));
+            return Some(Err((Vec::new(), EvalEscape::Halt(*code))));
         }
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
-        return match values.len() {
+        return Some(match values.len() {
             // No output prunes the branch — unless there never would have
             // been one because evaluating `expr` itself broke/errored (Halt
             // excluded, handled above) before producing anything.
@@ -29667,7 +29761,20 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 EvalError::new("Cannot use a computed index after a multi-output path component")
                     .into(),
             )),
-        };
+        });
+    }
+    None
+}
+
+fn resolve_leaf<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    keep: Keep,
+) -> PathResolveResult<'a> {
+    if let Some(bounded) = resolve_leaf_bounded::<S>(expr, value, trackable, snapshot) {
+        return bounded;
     }
 
     // General non-primitive case (#987): real jq's `path(...)` checks each
