@@ -12409,23 +12409,17 @@ fn yq_join_nonfinite_part(value: &OwnedValue) -> Option<String> {
 /// for that case, and `Int` formatting (`n.to_string()`, matching
 /// `to_json_yq()`'s `format!("{n}")` byte-for-byte) is likewise unaffected.
 ///
-/// This still doesn't fully close #1124's own repro (`(2.0/2) | [.] |
-/// join(",")` still gives `"1.0"`, not real yq's `"1"`): `builtin_join`'s
-/// array branch only ever sees a cursor-backed element, and a *constructed*
-/// array reaches that cursor by round-tripping through `to_json_for_reindex`
-/// first, which bakes the decimal point into synthesized `NumberLiteral`
-/// source text indistinguishable from a genuine document literal -- this
-/// function never actually receives a bare `OwnedValue::Float` for that
-/// case. Tracked separately as #1144 (broadened to cover `@csv`/`@tsv`/
-/// string interpolation too, which share the identical root cause), since
-/// fixing it needs either tagging a reindexed `NumberLiteral` as
-/// non-document-sourced or a cursor-free path for constructed arrays, not a
-/// change here. This function still has real, confirmed effect on
-/// [`yq_join_separator`]'s case (`sep_expr` evaluates directly to an owned
-/// value, with no cursor round-trip in between) and on any element that
-/// genuinely reaches `join` as a bare computed `Float` some other way (e.g.
-/// a document-sourced `.nan`/`.inf` scalar, which `from_number_bytes`
-/// likewise degrades to a bare `Float`, not a `NumberLiteral`).
+/// Until #2902 this did not close #1124's own repro (`(2.0/2) | [.] |
+/// join(",")` gave `"1.0"`, not real yq's `"1"`, tracked as #1144):
+/// `builtin_join`'s array branch only ever sees a cursor-backed element, and
+/// a *constructed* array reaches that cursor by round-tripping through
+/// `to_json_for_reindex` first, which used to bake the decimal point into
+/// synthesized `NumberLiteral` source text indistinguishable from a genuine
+/// document literal, so this function never received a bare
+/// `OwnedValue::Float` for that case. The bridge now hands a computed float
+/// back as a bare `Float`, so the element reaches the `Float` arm here like
+/// [`yq_join_separator`]'s case always did (`sep_expr` evaluates directly
+/// to an owned value, with no cursor round-trip in between).
 fn yq_join_numeric_part(value: &OwnedValue) -> Option<String> {
     match value {
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
@@ -37723,23 +37717,19 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// O(*d*)-sized subtree at each of its *d* nodes — O(*d*²) work to resolve
 /// what is, for these shapes, an O(1) lookup (#491).
 ///
-/// `Builtin::ToString` (`tostring`) is also fast-pathed here, but for
-/// correctness, not just speed (#1054): this is the JSON-input/`-n`-mode
-/// sibling of `eval_generic.rs`'s `eval_on_owned`, which has the same
-/// bypass for the same reason -- without it, `EXPR | tostring` on a
-/// genuinely computed value (e.g. `(1e10*2)`) serializes through
-/// `to_json_for_reindex`'s decimal-only float spelling first, reparses as
-/// a document-sourced-*looking* `NumberLiteral`, and echoes that baked
-/// text verbatim per #1008's literal-preservation rule -- permanently
-/// losing the scientific-notation spelling real yq applies to a computed
-/// float before that round trip ever has a chance to run. `owned_to_string`
-/// is the same function `builtin_tostring` calls directly, so this is
-/// unobservable except in speed for every other value shape.
-///
-/// Narrow on purpose, not exhaustive -- see `eval_on_owned`'s own doc
-/// comment (`eval_generic.rs`) for the exact limitation (only the
-/// immediately-next bare `tostring` is covered) and #1134, which tracks
-/// the general fix neither sibling attempts.
+/// `Builtin::ToString` (`tostring`) is also fast-pathed here -- the
+/// JSON-input/`-n`-mode sibling of `eval_generic.rs`'s `eval_on_owned`
+/// bypass. It was added for correctness (#1054): `EXPR | tostring` on a
+/// genuinely computed value (e.g. `(1e10*2)`) used to serialize through
+/// `to_json_for_reindex`'s decimal-only float spelling first, reparse as a
+/// document-sourced-*looking* `NumberLiteral`, and echo that baked text
+/// verbatim per #1008's literal-preservation rule. Since #2902 the bridge
+/// hands a computed float back as a bare `Float` whatever the surrounding
+/// expression shape (so the shapes #1134 listed -- `EXPR | . | tostring`,
+/// `(tostring)`, `[EXPR] | .[0] | tostring`, `map(tostring)` -- are right
+/// through the round trip too), and this arm is speed-only.
+/// `owned_to_string` is the same function `builtin_tostring` calls
+/// directly, so it is unobservable except in speed for every value shape.
 /// Converts `expr` to an `OwnedValue` directly, without the general
 /// evaluator, succeeding only when every leaf `expr` reaches is already an
 /// `Expr::Literal` -- the shape `substitute_var`'s `Expr::Var` arm (via
@@ -38270,13 +38260,14 @@ fn produces_fresh_value(expr: &Expr) -> bool {
 /// `Builtin::ToString` and the literal-RHS `Arithmetic` accumulator shape
 /// are deliberately **not** here, though #2397's own plan proposed folding
 /// them in from [`eval_owned_fast_path`]. Doing so makes them reachable as
-/// operands and as non-final pipe stages, which they never were: it changes
-/// `succinctly yq -n '[0.5+0.5] | .[0] | tostring'` from `1.0` to `1` (a
-/// latent yq-fidelity *fix*, tracked as #2902, but a behaviour change all
-/// the same), and `arith_combine` returns its input verbatim for `. + null`
-/// / `. + 0` / `. + ""`, so an `Arithmetic` arm reachable in `Fresh`
-/// position lets a navigated subvalue escape — precisely what the
-/// representation gate exists to prevent. Both found in review of #2897.
+/// operands and as non-final pipe stages, which they never were, and
+/// `arith_combine` returns its input verbatim for `. + null` / `. + 0` /
+/// `. + ""`, so an `Arithmetic` arm reachable in `Fresh` position lets a
+/// navigated subvalue escape — precisely what the representation gate
+/// exists to prevent. Found in review of #2897, which also surfaced that
+/// the fold changed `succinctly yq -n '[0.5+0.5] | .[0] | tostring'` from
+/// `1.0` to `1`; that was the bridge re-spelling a computed float, fixed at
+/// its source by #2902, so the two paths now agree there either way.
 fn eval_owned_pure<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -60956,27 +60947,6 @@ mod tests {
         format!("{:?}", normalize(r))
     }
 
-    /// Whether the bridge's serialize-and-reparse changes the *text* of a
-    /// number in `value`: a bare, integral, finite `Float` (`Float(1.0)`)
-    /// goes through `to_json_for_reindex` as `1.0` and comes back as
-    /// `NumberLiteral(Float(1.0), "1.0")`, where the fast path still holds
-    /// the `Float` whose yq text is `1`. That is the bridge's pre-existing
-    /// float re-spelling (`[(0.5+0.5)] | .[0] | tostring` is `"1.0"` here
-    /// and `"1"` in real yq, on `main` before #2785 too), and since #2785
-    /// yq-mode `==`/`!=` compare scalars by text, it now reaches the
-    /// comparison arms as well: `Float(1.0) == 1` is `true` on the fast
-    /// path (correct -- `(0.5+0.5) == 1` is `true` in yq) and `false`
-    /// through the bridge. The yq-mode half of the agreement check skips
-    /// these values rather than pin the bridge's wrong spelling.
-    fn bridge_respells_a_float(value: &OwnedValue) -> bool {
-        match value {
-            OwnedValue::Float(f) => f.is_finite() && f.fract() == 0.0,
-            OwnedValue::Array(items) => items.iter().any(bridge_respells_a_float),
-            OwnedValue::Object(map) => map.values().any(bridge_respells_a_float),
-            _ => false,
-        }
-    }
-
     #[test]
     fn eval_owned_pure_agrees_with_the_reindex_bridge() {
         let values = pure_value_matrix();
@@ -60998,9 +60968,6 @@ mod tests {
                     "jq mode: {src:?} on {value:?} disagrees with the reindex bridge"
                 );
 
-                if bridge_respells_a_float(value) {
-                    continue;
-                }
                 let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
                     &expr, value, false,
                 ));
@@ -61075,9 +61042,6 @@ mod tests {
                             fast, bridge,
                             "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
                         );
-                        if bridge_respells_a_float(value) {
-                            continue;
-                        }
                         let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
                             &expr, value, false,
                         ));
