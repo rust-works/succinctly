@@ -2281,11 +2281,9 @@ impl<V: DocumentValue> LazySeq<V> {
         if self.instructions.is_none() && self.pending.is_empty() {
             if let LazySource::Cursors { cursors, next } = &self.source {
                 let remaining = &cursors[*next..];
-                let mut out = vec_with_capacity(remaining.len());
-                for c in remaining {
-                    out.push(to_owned_cursor(c).map_err(Control::Error)?);
-                }
-                return Ok(OwnedValue::Array(out));
+                return to_owned_all_cursors(remaining)
+                    .map(OwnedValue::Array)
+                    .map_err(Control::Error);
             }
         }
         let items = self.drain_atomic()?;
@@ -5951,8 +5949,41 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     // every `seq` shape via the `Iterator` protocol, not just this one);
     // this covers every other integer index and `last`, checked ahead of
     // the main match so those two arms don't have to repeat the guard.
-    if seq.instructions.is_none() {
-        if let LazySource::Cursors { cursors, next } = &seq.source {
+    if seq.instructions.is_none() && matches!(seq.source, LazySource::Cursors { .. }) {
+        // A nested-pipe stage whose *head* is one of the shapes below:
+        // `.[0].name` parses as one `Expr::Pipe([Index{0}, Field])` handed
+        // to this function as a single stage (`parse_postfix` builds a
+        // `Pipe` chain), so without this it falls straight to the general
+        // `materialize_atomic` path and never reaches the arms below at
+        // all. Peel just the head against this same fast path (recursing
+        // once, moving `seq` itself onward rather than cloning its cursors
+        // into a fresh `LazySeq` -- `seq` already *is* exactly the
+        // untouched, instruction-free `Cursors` source the head needs),
+        // then fold whatever it answers through the rest of the pipe the
+        // ordinary way (`fold_pipe_stages`, #724/#725's own
+        // already-correct "an already-evaluated stage folded through the
+        // rest"). Checked before the borrow below (rather than as a sibling
+        // match arm on it) because moving `seq` on this arm and borrowing
+        // `seq.source` on every other arm can't both live in the same
+        // `match`. Guarded on the head's own shape, not applied
+        // unconditionally: an ordinary nested pipe whose head isn't one of
+        // these (`.foo.bar`) must keep going through the same single
+        // atomic `materialize_atomic` + `eval_on_owned` call it already
+        // does, not a split two-step version of the identical work.
+        if let Expr::Pipe(stages) = unwrap_paren(expr) {
+            if matches!(
+                stages.first().map(unwrap_paren),
+                Some(
+                    Expr::Index { key: None, .. }
+                        | Expr::Builtin(Builtin::Last)
+                        | Expr::Slice { .. }
+                )
+            ) {
+                let (head, rest) = stages.split_first().expect("checked by the guard above");
+                let head_result = fold_lazy_seq_stage::<S, V>(seq, head, optional);
+                return fold_pipe_stages::<S, V>(head_result, rest, optional);
+            }
+        } else if let LazySource::Cursors { cursors, next } = &seq.source {
             let remaining = &cursors[*next..];
             match unwrap_paren(expr) {
                 Expr::Index { idx, key: None } if *idx != 0 => {
@@ -5989,41 +6020,6 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::LazySeq(Box::new(LazySeq::from_cursors(
                         remaining[range].to_vec(),
                     )));
-                }
-                // A nested-pipe stage whose *head* is one of the shapes
-                // above: `.[0].name` parses as one `Expr::Pipe([Index{0},
-                // Field])` handed to this function as a single stage
-                // (`parse_postfix` builds a `Pipe` chain), so without this
-                // it falls straight to the general `materialize_atomic`
-                // path below and never reaches the arms above at all.
-                // Peel just the head against this same fast path
-                // (recursing once), then fold whatever it answers through
-                // the rest of the pipe the ordinary way
-                // (`fold_pipe_stages`, #724/#725's own already-correct
-                // "an already-evaluated stage folded through the rest").
-                // Guarded on the head's own shape, not applied
-                // unconditionally: an ordinary nested pipe whose head
-                // isn't one of these (`.foo.bar`) must keep going through
-                // the same single atomic `materialize_atomic` +
-                // `eval_on_owned` call it already does, not a split
-                // two-step version of the identical work.
-                Expr::Pipe(stages)
-                    if matches!(
-                        stages.first().map(unwrap_paren),
-                        Some(
-                            Expr::Index { key: None, .. }
-                                | Expr::Builtin(Builtin::Last)
-                                | Expr::Slice { .. }
-                        )
-                    ) =>
-                {
-                    let (head, rest) = stages.split_first().expect("checked by the guard above");
-                    let head_result = fold_lazy_seq_stage::<S, V>(
-                        Box::new(LazySeq::from_cursors(remaining.to_vec())),
-                        head,
-                        optional,
-                    );
-                    return fold_pipe_stages::<S, V>(head_result, rest, optional);
                 }
                 _ => {}
             }

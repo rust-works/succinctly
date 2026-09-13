@@ -35008,6 +35008,36 @@ fn test_negative_index_out_of_range_raises_2254() -> Result<()> {
     Ok(())
 }
 
+/// #2254's rule reaches a third dispatch site #2575 added: `fold_lazy_seq_stage`'s
+/// own `Expr::Index` fast path for an instruction-free `LazySeq` (`[.a[]] |
+/// .[-N]`, a `[...]`-constructed array indexed with a literal negative
+/// index). Same error, same magnitude rule, confirmed live against real yq
+/// v4.53.3, which raises identically for the equivalent `.a[-N]` spelling
+/// this test mirrors from `test_negative_index_out_of_range_raises_2254`.
+#[test]
+fn test_negative_index_out_of_range_raises_through_lazy_seq_2575() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("[.a[]] | .[-5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds negative wraparound is unaffected.
+    let (out, code) = run_yq_stdin("[.a[]] | .[-1]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    // Positive out-of-range stays `null`, not an error, same as the plain
+    // `.a[5]` spelling.
+    let (out, code) = run_yq_stdin("[.a[]] | .[5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    Ok(())
+}
+
 /// #2254: unlike a decode failure's own precedent (`is_decode_failure`),
 /// there's no real yq `try`/`catch` syntax to check this against directly --
 /// real yq's lexer rejects `try`/`catch` outright (confirmed live against
