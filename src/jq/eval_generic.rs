@@ -8521,11 +8521,20 @@ fn each_recurse_generic<S: EvalSemantics, V: DocumentValue>(
     f: &Expr,
     cond: Option<&Expr>,
     value: V,
+    cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    // #1755: `to_owned`, not a lossy read -- an undecodable root must raise
-    // rather than be visited as `""`.
-    let root = match to_owned(&value) {
+    // `to_owned_with_cursor`, not bare `to_owned`: the wildcard this arm
+    // replaced reached `eval_single` -> `bridge_ambient_input`, which
+    // materializes through the live cursor when there is one. Only the
+    // cursor route resolves an explicit YAML tag, so reading the value
+    // without it silently un-resolves them -- `!!str 123` came back as the
+    // number `123` and `!!int "9"` as the string `"9"`, where real yq (and
+    // this evaluator's every other arm) answer `"123"` and `9`.
+    //
+    // #1755: still the raising form, not a lossy read -- an undecodable
+    // root must raise rather than be visited as `""`.
+    let root = match to_owned_with_cursor(&value, cursor) {
         Ok(v) => v,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
@@ -8960,11 +8969,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // satisfied by.
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
             let f = Expr::Optional(Box::new(Expr::Iterate));
-            each_recurse_generic::<S, V>(&f, None, value, sink)
+            each_recurse_generic::<S, V>(&f, None, value, cursor, sink)
         }
-        Expr::Builtin(Builtin::RecurseF(f)) => each_recurse_generic::<S, V>(f, None, value, sink),
+        Expr::Builtin(Builtin::RecurseF(f)) => {
+            each_recurse_generic::<S, V>(f, None, value, cursor, sink)
+        }
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
-            each_recurse_generic::<S, V>(f, Some(cond), value, sink)
+            each_recurse_generic::<S, V>(f, Some(cond), value, cursor, sink)
         }
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),

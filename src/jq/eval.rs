@@ -5283,7 +5283,9 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 /// -- #2180 WP2a -- `Alternative`, `And` and `Or`, and -- #2180 WP2b --
 /// `Builtin::Select`, `Negate`, `IndexExpr` (its key only; see
 /// [`each_index_expr`]), `StringInterpolation` (jq mode only; see
-/// [`each_string_parts`]) and `Object`. Everything else falls back to
+/// [`each_string_parts`]) and `Object`, and -- #2693 -- the `recurse` family
+/// (`Builtin::Recurse`/`RecurseDown`/`RecurseF`/`RecurseCond`; see
+/// [`each_recurse`]). Everything else falls back to
 /// `eval_single` + [`drain_result`]. `Paren`
 /// is not optional cosmetics: `isempty(...)` consumes only its own
 /// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
@@ -8183,12 +8185,13 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     //
     // The example above needs an operand that still falls back to eager
     // `eval_single`, since that fallback is the only thing that *produces* a
-    // `pending`. It used `if` until Stage 5 (#1462) gave `Expr::If` a native
-    // lazy arm, then `foreach` until #2180 WP3 gave `Expr::Foreach` one
-    // (both such row pairs moved into
-    // `test_short_circuit_side_effect_shapes_already_match_jq_820` as they
-    // closed). `eval_each` has no `Builtin::Recurse` arm, so `recurse` falls
-    // back the same way this comment has always meant to illustrate.
+    // `pending`. Which operand that is keeps changing as arms land, and each
+    // time the rows pinning it move into
+    // `test_short_circuit_side_effect_shapes_already_match_jq_820`: `if`
+    // until Stage 5 (#1462), `foreach` until #2180 WP3, `recurse` until
+    // #2693 gave the family its own arm. `while` has no lazy arm, so it is
+    // what the current pair uses -- see
+    // `test_short_circuit_side_effect_leaks_820_932_987`.
     if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.

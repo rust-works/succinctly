@@ -46403,3 +46403,59 @@ fn test_drive_slice_bound_yq_mode_end_bound_error_from_start_sink_2267() -> Resu
 
     Ok(())
 }
+
+/// #2693 regression guard: an explicit YAML tag must still resolve when
+/// `recurse` is driven through a *bounded* consumer.
+///
+/// The lazy `recurse` arm #2693 added to the generic evaluator first read its
+/// root with the cursorless `to_owned`, where the eager wildcard it replaced
+/// went through the live cursor. Only the cursor route applies an explicit
+/// tag, so `!!str 123` came back as the number `123`, `!!int "9"` as the
+/// string `"9"`, `!!bool "yes"` as `"yes"` and `!!null ""` as `""` — but
+/// *only* through `first`/`limit`/`nth`/`label`, since bare `recurse` takes
+/// the cursor-guarded arm above it and an unbounded `[recurse(...)]` never
+/// reaches the arm at all. That is why the whole suite stayed green.
+///
+/// Real yq's lexer rejects `recurse(...)` outright (confirmed live against
+/// v4.53.3: `1:2: lexer: invalid input text`), so there is no oracle for the
+/// filter itself — this pins *internal consistency* instead: every route must
+/// agree with `[.]`, whose own answer is byte-identical to real yq's.
+#[test]
+fn recurse_through_a_bound_still_resolves_explicit_tags_2693() -> Result<()> {
+    let doc = "s: !!str 123\nu: !!int \"9\"\nb: !!bool \"yes\"\nn: !!null \"\"\n";
+    // Real yq v4.53.3 answers exactly this for `[.]`.
+    let resolved = r#"[{"s":"123","u":9,"b":true,"n":null}]"#;
+
+    let (stdout, code) = run_yq_stdin("[.]", doc, &["-o=json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), resolved, "the oracle row itself");
+
+    for filter in [
+        "[first(recurse(.[]?))]",
+        "[limit(1; recurse(.[]?))]",
+        "[nth(0; recurse(.[]?))]",
+        "[first(recurse(.[]?; true))]",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}: {stdout}");
+        assert_eq!(
+            stdout.trim_end(),
+            resolved,
+            "{filter}: a bounded recurse must resolve tags exactly as `[.]` does"
+        );
+    }
+
+    // A bound that reaches past the root: the *child* the walk descends to
+    // is tag-resolved too, not just the root the arm materializes.
+    let (stdout, code) = run_yq_stdin(
+        "[limit(2; recurse(.[]?))]",
+        doc,
+        &["--jq-extensions", "-o=json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"[{"s":"123","u":9,"b":true,"n":null},"123"]"#
+    );
+    Ok(())
+}
