@@ -42636,6 +42636,260 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     Ok(())
 }
 
+/// #2694: `resolve_node_sink`'s three remaining *collecting* arms now stream
+/// their generator, so a demand-driven consumer -- a `reduce`/`foreach`
+/// source, pulled one value at a time since #2235 -- stops the generator
+/// instead of paying for every output it never asks for:
+///
+/// 1. the general leaf arm (anything `resolve_node_sink` has no native lazy
+///    form for: arithmetic, comparison, `tostring`, ...);
+/// 2. an `if`/`select` **condition**;
+/// 3. an `as` binding's **source**, on its by-value route.
+///
+/// The visible symptom in all three is a side-effect count: every row's
+/// filter writes one `stderr` line per source element, and jq writes exactly
+/// one. Each row's stdout, stderr and exit code is captured whole from jq
+/// 1.7.1, so the count is pinned exactly rather than bounded.
+///
+/// The second half is the rule streaming must *not* break, and it is the
+/// reason the `Keep::First` leaf form and #2042's two `as`-source witness
+/// routes were deliberately left collecting: a `cond`/source output already
+/// dispatched is never un-emitted by a later one escaping (#896), and a
+/// witness that declines after resolving has to be able to fall back to
+/// by-value evaluation, which a streamed value cannot be taken back from.
+#[test]
+fn path_mode_streams_cond_and_bind_sources_2694() -> Result<()> {
+    let e = |msg: &str| format!("jq: error (at <stdin>:0): {msg}\n");
+    let one = |msg: &str| format!("1{}", e(msg));
+    for (input, filter, want_out, want_err, want_code) in [
+        // 1. The general leaf arm. `+`, `==` and `tostring` all land in it;
+        //    so does the `break`/`halt` trio, which pins that stopping the
+        //    stream does not lose the halt.
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) + 1) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) == 1) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) | tostring) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"[label $o | path(reduce ((.[]|stderr)+0) as $i (.; break $o))]"#,
+            "[]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr)+0) as $i (.; halt_error(3)))"#,
+            String::new(),
+            "1[1,2,3]\n".to_string(),
+            3,
+        ),
+        // 2. An `if`/`select` condition. The third row's `cond` is truthy
+        //    only on the *second* element, so the write count is 2, not 1 --
+        //    a bound of one output is not the same thing as one `cond` pull.
+        (
+            "[1,2,3]",
+            r#"path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce (select((.[]|stderr) == 1)) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce (if (.[]|stderr)>1 then . else empty end) as $i (.; error("u")))"#,
+            String::new(),
+            format!("12{}", e("u")),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"[label $o | path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; break $o))]"#,
+            "[]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; halt_error(3)))"#,
+            String::new(),
+            "1[1,2,3]\n".to_string(),
+            3,
+        ),
+        // 3. An `as` binding's source, by-value route -- including a source
+        //    that fans out per binding and one that filters bindings out.
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) as $x | $x) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) as $x | $x, $x) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) as $x | select($x != 2) | $x) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"[label $o | path(reduce ((.[]|stderr) as $x | $x) as $i (.; break $o))]"#,
+            "[]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce ((.[]|stderr) as $x | $x) as $i (.; halt_error(3)))"#,
+            String::new(),
+            "1[1,2,3]\n".to_string(),
+            3,
+        ),
+        // The prefix an escape must not retract (#896/#842): a branch a
+        // truthy `cond` output or a successful binding already produced
+        // survives a *later* output of that same generator erroring or
+        // halting.
+        (
+            "[1,2,3]",
+            r#"path(select((true, error("x"))))"#,
+            "[]\n".to_string(),
+            e("x"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(if (true, error("x")) then . else empty end)"#,
+            "[]\n".to_string(),
+            e("x"),
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"path((.a, error("x")) as $y | .a | $y)"#,
+            "[\"a\"]\n".to_string(),
+            e("x"),
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"path((1, halt_error(3)) as $x | .a)"#,
+            "[\"a\"]\n".to_string(),
+            "{\"a\":1}\n".to_string(),
+            3,
+        ),
+        // The fork itself, unbounded: still one dispatch per `cond` output,
+        // and still `select_emits`' own per-arm state for yq (#1613) rather
+        // than the stream's.
+        (
+            "[1,2,3]",
+            "[path(if (true,true) then . else empty end)]",
+            "[[],[]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            "[path(select((false,false)))]",
+            "[]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            "[path(select((true,true)))]",
+            "[[],[]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // #2042's witness routes are untouched: they still resolve the
+        // source in path position (so `$y` carries an origin and binding it
+        // back is the marker's own node, which `path()` then refuses), and
+        // still decline to the by-value route where the resolver refuses.
+        (
+            r#"{"a":{"b":1}}"#,
+            "path(.a as $y | $y)",
+            String::new(),
+            e(r#"Invalid path expression with result {"b":1}"#),
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "path((.a | .b) as $w | $w)",
+            String::new(),
+            e("Invalid path expression with result 1"),
+            5,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            "path(.a as $y | .a)",
+            "[\"a\"]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(.a as $y | .b)",
+            "[\"b\"]\n".to_string(),
+            String::new(),
+            0,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+
+    // The leaf arm's *data loss*, which is what makes this a correctness fix
+    // rather than only a side-effect-count one: `inputs` is a generator whose
+    // unconsumed documents stay readable. Collecting the source drained all
+    // three, so the later `[inputs]` saw nothing. Captured from jq 1.7.1.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "path(first(foreach (inputs | select(.a)) as $i (.; .))), [inputs]",
+        ],
+        Some("{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n[{\"a\":2},{\"a\":3}]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
 /// #1872: `Keep::AtMost` makes a fold source's leaves keep every output, so
 /// the count-bounded resolutions must narrow that bound rather than forward
 /// it -- otherwise `first(range(2000000000))` inside a navigating source
