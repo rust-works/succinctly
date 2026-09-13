@@ -1274,33 +1274,42 @@ answers `["b"]` — and classified the two residuals appended below):
   `{"a":[1,2]}` is `[]` in both, jq's own path-restoring `FORK`/`BACKTRACK` at the exit
   boundary). But jq's `gen_reduce` bytecode is `DUPN, source, …` with no `SUBEXP` around it,
   so *inside* a step the register genuinely sits where SOURCE left it — the same per-step
-  position `foreach` already models. Exit codes and every value agree; only the mid-step
-  error message can differ:
+  position `foreach` already models. Every *outcome* agrees — exit code, whether a value is
+  produced at all, whether a write goes through (never, on either side, for this shape) — and
+  only the error message's own wording differs, including a value it happens to quote from
+  wherever each side's own model of the register landed:
   ```
   $ echo '{"a":1}' | jq -c 'path(reduce .[] as $k (.; .a))'
   jq: error: Invalid path expression near attempt to access element "a" of {"a":1}
   $ echo '{"a":1}' | succinctly jq -c 'path(reduce .[] as $k (.; .a))'
   jq: error: Invalid path expression with result 1
   ```
+  Wrapping the navigating step in `try`/`catch` does not change this into a genuine output
+  divergence either — confirmed live that jq's own `try` here does not prevent `path()`'s
+  outer check from raising too, just with the *caught* value quoted instead:
+  `path(reduce .[] as $k (.; try .a catch "x"))` on `{"a":1}` is jq's `Invalid path expression
+  with result "x"`, exit 5; succinctly's `Invalid path expression with result 1`, exit 5 — the
+  identical message-wording-only pattern, not a new case where one side succeeds.
   Both exit 5. Modelling the mid-step position too needs a dual provenance per step ("at the
   per-step register" *and* "still identical to the persistent one") without regressing the
   `[]` case above — recorded rather than built, since the exit code and value already match
   and only wording differs.
-- **`foreach` + `getpath` on a `getpath` call whose position `EXTRACT` continues from is
-  pointer-aliased in real jq, which this evaluator's snapshot model cannot see
+- **`foreach` + `getpath` on a `getpath` call whose position `EXTRACT` continues from is a
+  genuine value divergence, not message-only
   ([#2732](https://github.com/rust-works/succinctly/issues/2732)'s Shape 3, out of that
   issue's own scope; tracked separately as
-  [#2896](https://github.com/rust-works/succinctly/issues/2896)).** jq's `_jq_path_append`
-  (the C function backing `getpath`) silently returns its argument value unchanged when the
-  input is not itself intact, and that returned value happens to be *pointer-identical* to
-  `value_at_path` left by SOURCE — so a later step in the same EXTRACT continues from SOURCE's
-  own position through `getpath`, transparently. `path(foreach .[] as $k (.; getpath(["a"]);
-  .b))` on `{"a":{"b":2}}` is `["a","b"]` in jq; succinctly refuses. The `reduce` spelling of
-  the identical shape already agrees with jq (`with result 1`, the persistent-register
-  position restored) — this is `getpath` specifically inheriting a *value*, not a path, so
-  succinctly's own path-provenance model (`PathBranch::trackable`/`snapshot`) has nothing to
-  key off; jq's own C-level pointer identity is not something an owned-value model can
-  reproduce without `getpath` growing its own register-threading, unlike the ordinary
+  [#2896](https://github.com/rust-works/succinctly/issues/2896)).** Confirmed live:
+  `path(foreach .[] as $k (.; getpath(["a"]); .b))` on `{"a":{"b":2}}` is `["a","b"]` in jq;
+  succinctly refuses. The `reduce` spelling of the identical shape already agrees with jq
+  (`with result 1`, the persistent-register position restored). The mechanism is *hypothesized*
+  rather than independently verified against jq's own C source: `getpath` inherits SOURCE's own
+  position transparently there, which is consistent with jq's C-implemented `_jq_path_append`
+  returning its argument value unchanged (and therefore pointer-identical to `value_at_path`)
+  whenever the input is not itself intact -- but #2896 is the issue to re-derive or correct that
+  mechanism, not this one. What is confirmed regardless of the exact mechanism: `getpath`
+  inherits a *value* here, not a path, so succinctly's own path-provenance model
+  (`PathBranch::trackable`/`snapshot`) has nothing to key off without `getpath` growing its own
+  register-threading, unlike the ordinary
   `Field`/`Index` steps every other divergence in this section is about.
 
 ## Duplicate object keys collapse, except under `--preserve-input`

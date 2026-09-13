@@ -31859,13 +31859,21 @@ struct FoldSourceAmbient<'v> {
 impl FoldSourceAmbient<'_> {
     /// Whether a trackable SOURCE branch's own path is *relative to*
     /// `reg_path` rather than absolute, so [`drive_fold_source`] has to
-    /// rebase it. Only ever true on a `null`-ambient fork whose register
-    /// sits somewhere other than the root -- on the first fork the ambient
-    /// is the document itself, which is only ever at the register when the
-    /// register is the root, so `trackable && reg_path.depth() > 0` is
-    /// false there by construction (a trackable first-fork ambient implies
-    /// `reg_path` is already the root). Derived here rather than stored on
-    /// the struct, so [`fold_source_ambient`]'s two constructors can't drift
+    /// rebase it. `reg_path.depth() > 0` -- the register sits somewhere
+    /// other than the root -- is exactly that condition, on *any* trackable
+    /// fork: the later, `null`-ambient forks reach it because their own
+    /// ambient carries no path of its own to be absolute *in*, and (#2732)
+    /// the first fork can now reach it too, when the document itself
+    /// reestablishes against the register by `null`/`bool` kind-equality
+    /// rather than by sharing its path -- `path(reduce .a as $k (.b; .))`
+    /// on `null` has `reg_path = ["b"]` (INIT's own navigation) at the very
+    /// fork whose document-ambient ("null" at the true root) is trackable
+    /// via that new clause, so SOURCE's own resolved path (`.a`'s `["a"]`)
+    /// still needs rebasing onto `["b"]` exactly as a later fork's would.
+    /// The single `trackable && reg_path.depth() > 0` condition already
+    /// covers both origins of `trackable` correctly without needing to
+    /// know which one produced it. Derived here rather than stored on the
+    /// struct, so [`fold_source_ambient`]'s two constructors can't drift
     /// out of sync with it.
     fn relocate_base<'r>(&self, reg_path: &'r Rc<PathPrefix>) -> Option<&'r Rc<PathPrefix>> {
         (self.trackable && reg_path.depth() > 0).then_some(reg_path)
@@ -31945,23 +31953,45 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
         );
         let (path_trackable, path_snapshot) = reg.branch_provenance(Some(&doc_branch));
         // #2732: `branch_provenance` alone answers only "is `.` still
-        // *where* the register is" -- a pure path comparison, blind to the
-        // one case jq's own `jv_identical` still admits despite the paths
-        // disagreeing: a `null`/`bool` document is identical to a
-        // `null`/`bool` register regardless of position (the same
-        // `null_bool_identical` clause the *later*-fork arm below already
-        // ORs in). Fork 0 never applied it, so `path(reduce .a as $k (.b;
-        // .))` on `null` -- register `null` at `.b`, document `null` at
-        // root, no path match -- fell through to a raised
-        // untracked-navigation error before jq's own kind check ever runs.
-        // jq-mode only: real yq's lexer rejects `reduce`/`foreach`/`path`
-        // outright, and yq's own scalar no-op convention makes a widened
-        // acceptance here the *wrong* direction for that mode (#2161/#2632's
-        // own precedent for this exact gate).
+        // *where* the register is" -- a pure path comparison, blind to
+        // every other case jq's own `jv_identical` still admits despite
+        // the paths disagreeing (review: the full [`register_identical`]
+        // below, not only its `null_bool_identical` clause -- a
+        // snapshot-marked document whose origin happens to still certify
+        // against `reg.frame` is an equally legitimate reestablishment,
+        // the same rule the *later*-fork arm below already ORs in for its
+        // own always-`Snapshot::No` ambient). The most commonly reachable
+        // instance is a `null`/`bool` document identical to a `null`/
+        // `bool` register regardless of position: `path(reduce .a as $k
+        // (.b; .))` on `null` -- register `null` at `.b`, document `null`
+        // at root, no path match -- fell through to a raised
+        // untracked-navigation error before jq's own kind check ever ran.
+        // jq-mode only (review, #2732): real *yq*'s own lexer rejects a bare
+        // `reduce`/`foreach`/`path(...)` filter outright, but succinctly's
+        // own yq mode reaches this exact code unconditionally through an
+        // assignment target (`.a |= reduce .b[] as $x (0; .+$x)` needs no
+        // `--jq-extensions`, since only the *`path(...)` call syntax* is
+        // gated, not `reduce`/`foreach` themselves -- `src/jq/parser.rs`'s
+        // `reject_unless_jq_extensions_at`). So this gate is live, reachable
+        // yq-mode behavior, not defensive dead code: yq's own scalar no-op
+        // convention (#1181, the same reasoning #2044's write-side carve-out
+        // above already applies) makes a widened acceptance here the
+        // *wrong* direction for that mode, with no real-yq oracle to verify
+        // it against either way.
         let source_trackable = path_trackable
             || (S::TAG == EvalTag::Jq
                 && reg.trackable
                 && register_identical(&reg.value, &reg.frame, value, snapshot));
+        // The widened acceptance above answers a *value*-identity question
+        // independent of `doc_branch`'s own path-derived snapshot, so
+        // `path_snapshot` (unconditionally `doc_branch`'s own marker,
+        // regardless of which disjunct produced `source_trackable`) is
+        // still the right answer to pair it with: every consumer of this
+        // struct's `snapshot` field reads it only through
+        // `PathBranch::passthrough`, which itself zeroes `snapshot` to
+        // `Snapshot::No` whenever `trackable` holds (#1573) -- so a
+        // trackable-via-the-new-disjunct branch cannot leak a stale,
+        // unrelated `Snapshot::Marked` regardless.
         return FoldSourceAmbient {
             value,
             trackable: source_trackable,
@@ -31975,6 +32005,20 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     // "does the register recognise a `null`", which is a *value* question
     // `register_identical` owns. `snapshot: false` -- a freshly-substituted
     // `null` is not a frozen `$var` binding.
+    //
+    // **Unlike fork 0's #2732 gate above, this call is not gated on
+    // `S::TAG` (review, #2732)** -- pre-existing from #2388, predating that
+    // fix. Left as-is rather than widened to match: this ambient is always
+    // literally `null` (never a `bool`, unlike fork 0's real document), and
+    // `null` has no scalar-navigation ambiguity for yq's own no-op
+    // convention to disagree with jq about the way a `bool`/other scalar
+    // would -- the #2044 write-side carve-out this gate mirrors is about
+    // navigating *through* a scalar, which a later fork's `null` ambient
+    // never does (it seeds SOURCE's own next element, nothing navigates
+    // it). Not re-verified against real yq's own oracle as part of this
+    // fix; flagged here rather than silently left inconsistent so a future
+    // audit of this area starts from an accurate account instead of
+    // assuming both gates cover the same risk.
     let at_register =
         reg.trackable && register_identical(&reg.value, &reg.frame, null, &Snapshot::No);
     FoldSourceAmbient {
@@ -32115,11 +32159,17 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // mid-step; `reduce`'s `[]` above is jq's own path-restoring
         // `FORK`/`BACKTRACK` at the *exit* boundary, not evidence that
         // navigation never happened in between. The two agree at every
-        // exit code and every value; only the *mid-step* error message can
-        // differ (`path(reduce .[] as $k (.; .a))` on `{"a":1}`: jq's
-        // "near attempt to access element \"a\" of {\"a\":1}" -- position
+        // *outcome* -- exit code, whether a value is produced, whether a
+        // write goes through -- and only the *mid-step* error message's
+        // own wording differs, including a value it happens to quote
+        // (`path(reduce .[] as $k (.; .a))` on `{"a":1}`: jq's "near
+        // attempt to access element \"a\" of {\"a\":1}" -- position
         // restored -- versus this resolver's own "with result 1" -- the
-        // fold's persistent position -- both exit 5). Modelling the
+        // fold's persistent position -- both exit 5, neither a value-
+        // producing success `try`/`catch` can turn into one: `path(reduce
+        // .[] as $k (.; try .a catch "x"))` on the same document is jq's
+        // own "Invalid path expression with result \"x\"", still exit 5,
+        // just quoting the caught value instead). Modelling the
         // mid-step position too would need a dual provenance per step
         // ("at the per-step register" *and* "still identical to the
         // persistent one") without breaking the `[]` case above; recorded
