@@ -16616,56 +16616,95 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
 /// (`path(getpath(["c",{"start":0,"end":1}]))` is that descriptor). Real
 /// yq's lexer rejects `getpath`, so in yq mode this is an extension behind
 /// `--jq-extensions` (#1512) following the same model.
+/// Walks one already-produced `getpath` path (an `OwnedValue::Array` of
+/// components) from `pos`, appending every resulting position to `out` --
+/// [`path_context_step_getpath`]'s per-output body, extracted so it can run
+/// inside that function's lazy sink (#2259) as well as, previously, its
+/// eager `for path in paths` loop.
+fn path_context_getpath_walk_one<S: EvalSemantics, V: DocumentValue>(
+    path: OwnedValue,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    let OwnedValue::Array(components) = path else {
+        return Err(Control::Error(EvalError::path_must_be_array()));
+    };
+    let mut current = vec![pos.clone()];
+    for component in components {
+        let mut next = Vec::new();
+        for cpos in &current {
+            match path_component_step_expr(&component) {
+                Some(step) => path_context_step_generic::<S, V>(&step, cpos, &mut next)?,
+                None if matches!(component, OwnedValue::Object(_)) => {
+                    let value: Rc<OwnedValue> = match &cpos.node {
+                        PathNode::At(c) => Rc::new(to_owned_cursor(c).map_err(Control::Error)?),
+                        PathNode::Absent => Rc::new(OwnedValue::Null),
+                        PathNode::Owned(v) => Rc::clone(v),
+                    };
+                    let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::tracked_value(
+                        OwnedValue::Array(vec![component.clone()]),
+                    ))));
+                    let (values, control) = owned_identity_values::<S>(&segment, &value, false);
+                    path_context_push_owned_children(
+                        cpos,
+                        values
+                            .into_iter()
+                            .map(|v| (Some(component.clone()), v))
+                            .collect(),
+                        &mut next,
+                    );
+                    if let Some(control) = control {
+                        return Err(control);
+                    }
+                }
+                None => {
+                    return Err(Control::Error(EvalError::cannot_index(
+                        path_node_type_name::<V>(&cpos.node),
+                        &component,
+                    )))
+                }
+            }
+        }
+        current = next;
+    }
+    out.append(&mut current);
+    Ok(())
+}
+
+/// `getpath(EXPR)` as one path-context step (#2258), pulling `EXPR`'s
+/// path-argument generator lazily, one path at a time, through
+/// [`path_context_component_each`] (#2259): a walk failure on path N now
+/// stops the generator before path N+1 is ever produced, matching real jq's
+/// own `EXPR as $p | body` desugaring (`fanout_arg`'s doc comment,
+/// `src/jq/eval.rs`) and succinctly's own plain (non-path-context)
+/// `builtin_getpath`. Before this, the whole generator was drained up front
+/// (`path_context_component_values`) and walked in a *second* pass, so a
+/// later path's side effects (`debug`, `halt_error`, ...) fired even when an
+/// earlier path had already failed to navigate -- confirmed live against
+/// `/usr/bin/jq` 1.7.1: `getpath((["a","x"], (debug("side")|["a"])))` on
+/// `{"a":5}` never prints the `DEBUG` line, since `["a","x"]`'s walk fails
+/// first and the generator is never pulled again.
+///
+/// A walk failure is reported directly (bypassing
+/// [`path_context_component_escape`], which only ranks the *generator's
+/// own* trailing escape against output already produced) -- unchanged from
+/// before this fix, since a bad component was always a hard stop, never
+/// something the generator itself raised.
 fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
     path_expr: &Expr,
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
     let produced_from = out.len();
-    let (paths, paths_control) = path_context_component_values::<S, V>(path_expr, pos);
-    for path in paths {
-        let OwnedValue::Array(components) = path else {
-            return Err(Control::Error(EvalError::path_must_be_array()));
-        };
-        let mut current = vec![pos.clone()];
-        for component in components {
-            let mut next = Vec::new();
-            for cpos in &current {
-                match path_component_step_expr(&component) {
-                    Some(step) => path_context_step_generic::<S, V>(&step, cpos, &mut next)?,
-                    None if matches!(component, OwnedValue::Object(_)) => {
-                        let value: Rc<OwnedValue> = match &cpos.node {
-                            PathNode::At(c) => Rc::new(to_owned_cursor(c).map_err(Control::Error)?),
-                            PathNode::Absent => Rc::new(OwnedValue::Null),
-                            PathNode::Owned(v) => Rc::clone(v),
-                        };
-                        let segment = Expr::Builtin(Builtin::GetPath(Box::new(
-                            Expr::tracked_value(OwnedValue::Array(vec![component.clone()])),
-                        )));
-                        let (values, control) = owned_identity_values::<S>(&segment, &value, false);
-                        path_context_push_owned_children(
-                            cpos,
-                            values
-                                .into_iter()
-                                .map(|v| (Some(component.clone()), v))
-                                .collect(),
-                            &mut next,
-                        );
-                        if let Some(control) = control {
-                            return Err(control);
-                        }
-                    }
-                    None => {
-                        return Err(Control::Error(EvalError::cannot_index(
-                            path_node_type_name::<V>(&cpos.node),
-                            &component,
-                        )))
-                    }
-                }
-            }
-            current = next;
+    let mut walk_error: Option<Control> = None;
+    let paths_control = path_context_component_each::<S, V>(path_expr, pos, &mut |path| {
+        match path_context_getpath_walk_one::<S, V>(path, pos, out) {
+            Ok(()) => Demand::Continue,
+            Err(control) => stop_with_escape(&mut walk_error, control),
         }
-        out.append(&mut current);
+    });
+    if let Some(control) = walk_error {
+        return Err(control);
     }
     paths_control.map_or(Ok(()), |c| {
         Err(path_context_component_escape::<S, V>(out, produced_from, c))
@@ -16934,36 +16973,82 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
 }
 
-/// Every value a computed component takes at `pos` (#2471).
+/// Every value a computed component takes at `pos` (#2471), pulled lazily
+/// one at a time through `sink` -- the twin [`path_context_component_values`]
+/// is now built from (#2259). A `key`/`path` inside the component is a
+/// constant for this position, and is rewritten by the same
+/// [`path_context_resolve_constants`] the absent route and the owned
+/// identity pipe use. A live position evaluates the component against its
+/// own cursor; an absent one evaluates it against the `null` it holds,
+/// which is what the owned identity pipe does with the same component.
 ///
-/// A `key`/`path` inside the component is a constant for this position, and
-/// is rewritten by the same [`path_context_resolve_constants`] the absent
-/// route and the owned identity pipe use. A live position evaluates the
-/// component against its own cursor; an absent one evaluates it against the
-/// `null` it holds, which is what the owned identity pipe does with the same
-/// component.
-fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
+/// Both the `PathNode::At` arm ([`eval_each_generic`]) and the
+/// `Absent`/`Owned` arms ([`eval_each_owned`]) were already `Demand`-driven
+/// lazy sinks underneath -- this function's own job is only to convert each
+/// pulled item to an `OwnedValue` (stopping the pull on a decode failure,
+/// same as [`stream_owned_outputs_generic`]) and forward `sink`'s own
+/// `Demand` back into the pull, so a caller that stops early (e.g. a
+/// `getpath` walk that just failed) genuinely halts the generator instead of
+/// only discarding what it already produced.
+fn path_context_component_each<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
-) -> (Vec<OwnedValue>, Option<Control>) {
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Control> {
     // `path_context_component_walkable` keeps the constant-only gate, so no
     // `parent` can appear in a component.
     let expr = match path_context_resolve_at_pos::<S, V>(expr, pos) {
         Ok(e) => e,
-        Err(e) => return (Vec::new(), Some(Control::Error(e))),
+        Err(e) => return Some(Control::Error(e)),
     };
-    // spine 2416 (walk residue): a component that halts or breaks is no
-    // longer refused -- the step carries a `Control`, so `.c[halt] | key`
-    // exits silently and `.[break $out] | key` unwinds to its label here
-    // exactly as they did on the eager route (#2495). The values produced
-    // *before* the escape are real output (`.[("a","b",halt)] | key` prints
-    // both keys and then halts, #1897), so they come back alongside it and
-    // every caller takes them before reporting the escape.
     match &pos.node {
-        PathNode::At(c) => stream_owned_outputs_generic::<S, V>(&expr, c.value(), false, Some(*c)),
-        PathNode::Absent => owned_identity_values::<S>(&expr, &OwnedValue::Null, false),
-        PathNode::Owned(v) => owned_identity_values::<S>(&expr, v, false),
+        PathNode::At(c) => {
+            let mut decode_err: Option<Control> = None;
+            let flow = eval_each_generic::<S, V>(&expr, c.value(), false, Some(*c), &mut |item| {
+                match generic_item_into_owned(item) {
+                    Ok(owned) => sink(owned),
+                    Err(control) => stop_with_escape(&mut decode_err, control),
+                }
+            });
+            decode_err.or(match flow {
+                Flow::Exhausted | Flow::Stopped { .. } => None,
+                Flow::Escaped(control) => Some(control),
+            })
+        }
+        PathNode::Absent => match eval_each_owned::<S>(&expr, &OwnedValue::Null, false, sink) {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        },
+        PathNode::Owned(v) => match eval_each_owned::<S>(&expr, v, false, sink) {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        },
     }
+}
+
+/// Every value a computed component takes at `pos` (#2471), collected eagerly
+/// -- for the callers that only ever need the whole list (a bound, a
+/// condition, an index/slice target), not lazy per-output stopping. Built on
+/// [`path_context_component_each`], the same generator each of those already
+/// pulls from lazily underneath.
+///
+/// spine 2416 (walk residue): a component that halts or breaks is no longer
+/// refused -- the step carries a `Control`, so `.c[halt] | key` exits
+/// silently and `.[break $out] | key` unwinds to its label here exactly as
+/// they did on the eager route (#2495). The values produced *before* the
+/// escape are real output (`.[("a","b",halt)] | key` prints both keys and
+/// then halts, #1897), so they come back alongside it and every caller takes
+/// them before reporting the escape.
+fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let mut values = Vec::new();
+    let control = path_context_component_each::<S, V>(expr, pos, &mut |v| {
+        values.push(v);
+        Demand::Continue
+    });
+    (values, control)
 }
 
 /// The literal navigation step that takes `component`, or `None` for a value

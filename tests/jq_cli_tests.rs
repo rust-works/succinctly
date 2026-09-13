@@ -52390,3 +52390,101 @@ fn test_int_arith_within_exact_f64_range_or_already_overflowing_unaffected_2631(
     }
     Ok(())
 }
+
+/// #2259: `getpath(EXPR)`'s path-context arm (reached whenever a downstream
+/// `key`/`parent`/`path`/`file_index` forces path-context routing) used to
+/// drain `EXPR`'s whole path-argument generator up front and walk each path
+/// in a second pass, so a *later* path's side effects fired even when an
+/// *earlier* path's walk had already failed -- something real jq never lets
+/// happen, since it pulls the generator lazily one path at a time
+/// (`EXPR as $p | body`, `fanout_arg`'s own doc comment in `src/jq/eval.rs`).
+/// `key`/`path` with no argument are succinctly extensions (real jq: `key/0
+/// is not defined`), so the oracle for these is the plain `getpath(...)`
+/// spelling (no `| key`) -- confirmed to already agree with succinctly on
+/// every filter below with `| key` stripped -- plus agreement with
+/// succinctly's own plain, non-path-context `getpath` (`builtin_getpath`,
+/// which never had this bug).
+#[test]
+fn test_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result<()> {
+    // The issue's own repro: `["a","x"]`'s walk fails (`.a` is `5`, not an
+    // object) before the second alternative's `debug("side")` ever runs.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"getpath((["a","x"], (debug("side")|["a"]))) | key"#,
+        r#"{"a":5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("DEBUG"),
+        "the second alternative's debug() must never run once the first's walk failed: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(r#"Cannot index number with string "x""#),
+        "stderr={stderr:?}"
+    );
+
+    // A `halt_error` alternative that *precedes* the failing walk must still
+    // fire and win (its own exit code, its own banner) -- the generator
+    // never gets far enough to reach the failing second path at all.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"getpath(((halt_error|["a"]), ["a","x"])) | key"#,
+        r#"{"a":5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), r#"{"a":5}"#);
+
+    // The same `halt_error`, but *after* the failing walk: it must never
+    // fire -- the generator is stopped by the first path's failure before
+    // it is ever pulled again.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"getpath((["a","x"], (halt_error|["a"]))) | key"#,
+        r#"{"a":5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains(r#""a":5"#),
+        "halt_error after the failing walk must never run: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(r#"Cannot index number with string "x""#),
+        "stderr={stderr:?}"
+    );
+
+    // A successful path's output must survive a *later* path's failure, and
+    // a path after the failure must never be pulled at all (no `late`
+    // debug line).
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"getpath((["a"], ["a","x"], (debug("late")|["a"]))) | key"#,
+        r#"{"a":5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""a""#);
+    assert!(
+        !stderr.contains("late"),
+        "a path after the failing one must never be pulled: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(r#"Cannot index number with string "x""#),
+        "stderr={stderr:?}"
+    );
+
+    // Plain (no `| key`) spelling, live-verified to agree with
+    // `/usr/bin/jq` 1.7.1 (see this test's own doc comment): no side effect
+    // observable on either side once an earlier path has already failed.
+    for filter in [
+        r#"getpath((["a","x"], (debug("side")|["a"])))"#,
+        r#"getpath((["a"], ["a","x"], (debug("late")|["a"])))"#,
+    ] {
+        let (_, stderr, code) = run_jq_stdin_streams(filter, r#"{"a":5}"#, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}`: stderr={stderr:?}");
+        assert!(!stderr.contains("DEBUG"), "`{filter}`: stderr={stderr:?}");
+    }
+
+    Ok(())
+}
