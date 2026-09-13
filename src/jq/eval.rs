@@ -28934,10 +28934,15 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             }
         }
 
-        // Every remaining shape still resolves eagerly and reaches the sink
-        // through `drain_path_result`, which is byte-identical to the eager
-        // result for an always-`Continue` sink -- so this is a missed
-        // optimization for a bounded consumer, never a behaviour change.
+        // Two fall-throughs, not one. A shape `resolve_node_eager` still
+        // answers for resolves eagerly and reaches the sink through
+        // `drain_path_result`, which is byte-identical to the eager result
+        // for an always-`Continue` sink -- so an un-lazified arm is a missed
+        // optimization for a bounded consumer, never a behaviour change. The
+        // general leaf shape is the one `resolve_node_eager` declines
+        // (`None`), because it has a lazy form of its own (#2694); routing it
+        // by that answer rather than by a second "is this a leaf" predicate
+        // here is what keeps the two from drifting apart.
         other => match resolve_node_eager::<S>(other, value, trackable, snapshot, frame, keep) {
             Some(result) => drain_path_result(result, sink),
             // #2694: the general leaf shape, which has a lazy form.
@@ -29638,25 +29643,6 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
     (Vec::new(), EvalError::invalid_path_expression(value).into())
 }
 
-/// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
-/// component if it is one of the four primitives `walk_path` understands
-/// bare (`Identity`/`Field`/`Index`/`Slice`), and otherwise treat it as a
-/// plain value-producing filter that is not a path expression at all —
-/// raising jq's `Invalid path expression` on its first output (#530). Zero
-/// outputs still prunes silently either way, matching `path(empty)` → `[]`.
-///
-/// `trackable == false` (#843) additionally makes `Field`/`Index`/`Slice`
-/// raise the "near attempt to access element ... of ..." error immediately,
-/// *before* either sink below ever runs — so this fires even where the
-/// underlying access would merely be an ordinary type error (confirmed
-/// live: `path(try (.a, error("oops")) catch .foo)` on a caught *string*
-/// reports "near attempt to access element \"foo\" of \"oops\"", never the
-/// ordinary "Cannot index string with string \"foo\""). `Identity` is
-/// deliberately left out of that early check — it performs no navigation at
-/// all, so it falls through to the same eval-then-check path a non-primitive
-/// filter takes below (via the `is_primitive` guard just past it), which is
-/// exactly what makes a bare `catch .` raise `#530`'s classic "with result"
-/// message instead (confirmed live) rather than the "near attempt" one.
 /// [`resolve_leaf`]'s general (non-primitive) case, delivered to a sink as
 /// each value is produced rather than collected first (#2694).
 ///
@@ -29901,6 +29887,32 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
     None
 }
 
+/// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
+/// component if it is one of the four primitives `walk_path` understands
+/// bare (`Identity`/`Field`/`Index`/`Slice`), and otherwise treat it as a
+/// plain value-producing filter that is not a path expression at all —
+/// raising jq's `Invalid path expression` on its first output (#530). Zero
+/// outputs still prunes silently either way, matching `path(empty)` → `[]`.
+///
+/// The first of those two halves lives in [`resolve_leaf_bounded`] since
+/// #2694, shared verbatim with [`resolve_leaf_sink`] so the collecting and
+/// streaming forms cannot disagree about which shapes never reach a
+/// generator at all; this function is the second half, and answers for the
+/// first by delegating.
+///
+/// `trackable == false` (#843) additionally makes `Field`/`Index`/`Slice`
+/// raise the "near attempt to access element ... of ..." error immediately,
+/// *before* any generator is asked for a value — so this fires even where
+/// the underlying access would merely be an ordinary type error (confirmed
+/// live: `path(try (.a, error("oops")) catch .foo)` on a caught *string*
+/// reports "near attempt to access element \"foo\" of \"oops\"", never the
+/// ordinary "Cannot index string with string \"foo\""). `Identity` is
+/// deliberately left out of that early check — it performs no navigation at
+/// all, so it falls through to the same eval-then-check path a non-primitive
+/// filter takes (via [`resolve_leaf_bounded`]'s own `is_primitive` guard),
+/// which is exactly what makes a bare `catch .` raise `#530`'s classic "with
+/// result" message instead (confirmed live) rather than the "near attempt"
+/// one.
 fn resolve_leaf<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
