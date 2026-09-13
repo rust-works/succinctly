@@ -1163,19 +1163,36 @@ that path.** Every plain (unquoted) scalar under `json_strict` now costs a byte-
 plus an `f64` parse it did not pay before -- CI's `perf-guard.py` (issue #1523) measured
 `users_yq_keys_unsorted` (a `keys_unsorted` query over a 2MB `-p json`-detected fixture,
 mostly numeric fields) at +13.5% instructions (x86_64) / +12.5% (ARM64-Linux) against
-`main`, both over the 5% regression-guard threshold; every other query in that suite —
-including plain `jq`-mode queries over the identical `.json` fixture, which never reach
-`YamlIndex` at all — measured within ±0.1%, cleanly isolating the cost to `json_strict`
-itself rather than anything shared. `check_json_strict_scalar`/`json_strict_plain_scalar_ok`
-carry `#[inline]` (dispatched from a dozen call sites) as the one free win available;
-skipping the redundant `str::from_utf8` re-validation after the charset check would remove
-more, but needs `unsafe`, which this crate forbids (`-D unsafe-code`) -- so the real
-remaining cost is inherent to the validation work itself, not an implementation gap.
-Accepted per ADR-0018 (fidelity over performance is the default; a performance cost is not
-among the rule's carve-outs for declining to match the reference) -- CI's `Perf Regression
-Guard` is deliberately outside the merge queue's own required-checks subset, precisely so a
-real, understood, narrowly-scoped correctness cost like this one does not block merging the
-correctness fix that causes it.
+`main`, both over the 5% regression-guard threshold when #2778 landed; every other query in
+that suite — including plain `jq`-mode queries over the identical `.json` fixture, which
+never reach `YamlIndex` at all — measured within ±0.1%, cleanly isolating the cost to
+`json_strict` itself rather than anything shared. `check_json_strict_scalar`/
+`json_strict_plain_scalar_ok` carry `#[inline]` (dispatched from a dozen call sites) as the
+one free win available; skipping the redundant `str::from_utf8` re-validation after the
+charset check would remove more, but needs `unsafe`, which this crate forbids
+(`-D unsafe-code`) -- so the real remaining cost is inherent to the validation work itself,
+not an implementation gap. Accepted per ADR-0018 (fidelity over performance is the default; a
+performance cost is not among the rule's carve-outs for declining to match the reference) --
+CI's `Perf Regression Guard` is deliberately outside the merge queue's own required-checks
+subset, precisely so a real, understood, narrowly-scoped correctness cost like this one does
+not block merging the correctness fix that causes it.
+
+**#2777 recovered most of that cost, as a side effect, not a deliberate optimization pass.**
+The same `users_yq_keys_unsorted` benchmark measured **-10.8% instructions (ARM64-Linux) /
+-10.4% (x86_64)** against #2777's own merge-base (both again over the 5% threshold, this time
+in the improving direction), landing within ~1% of the pre-#2778 baseline. Mechanism:
+`parse_json_strict_flow_mapping_entries` (#2777) is a dedicated loop for JSON-sourced flow
+mappings, replacing the generic YAML flow-mapping loop (`parse_yaml_flow_mapping_entries`,
+still used for genuine YAML) that `json_strict` input used to route through. That generic
+loop's own per-entry overhead -- `looks_like_explicit_flow_key`'s lookahead, `parse_flow_key`'s
+broader anchor/tag/alias/nested-container/unquoted-key dispatch -- was paid on every key even
+though almost none of it can ever fire under `json_strict` (a JSON-sourced key is either a
+`"` or a rejection, never an anchor or a bareword); the dedicated loop's key check is a single
+`self.peek() == Some(b'"')`. `keys_unsorted` is exactly the shape most exposed to this (all key
+parsing, comparatively little value parsing), which is why this query moved and the others in
+the suite (identity-shaped, value-heavy) stayed within noise both times. Not chased further as
+a deliberate optimization -- it fell out of writing the grammar-correct implementation the
+natural way.
 
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
