@@ -26750,12 +26750,17 @@ fn needs_fanout_pass(expr: &Expr) -> bool {
 ///
 /// `Iterate`, a computed key, a comma, `..`, a call -- anything that can fan
 /// out or vanish -- answers `false` by falling through.
+///
+/// No `Optional`/`Paren` arm, and not recursive: its one caller
+/// ([`walk_optional_group`]) has already looked through both wrappers by the
+/// time it asks, so such an arm would be dead code. An earlier cut had one
+/// and patch coverage flagged it as unreached, which is what confirmed the
+/// wrappers can never arrive here.
 fn path_component_is_single_valued(expr: &Expr) -> bool {
-    match expr {
-        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. } => true,
-        Expr::Optional(inner) | Expr::Paren(inner) => path_component_is_single_valued(inner),
-        _ => false,
-    }
+    matches!(
+        expr,
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
+    )
 }
 
 /// [`optional_group_is_scope_safe`]'s walk: count the group's real components
