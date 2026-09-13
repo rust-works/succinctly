@@ -1,12 +1,12 @@
-//! Depth-scaling benchmark for `push_recursive_branches`/`resolve_recurse_sink`'s
+//! Depth-scaling benchmark for `resolve_recursive_descent_sink`/`resolve_recurse_sink`'s
 //! per-node clone cost (#668), split out of #675.
 //!
 //! `jq_recurse_depth_bench`'s query, `.. | .[.k]?`, does **not** reach
-//! `push_recursive_branches`/`resolve_recurse_sink` (`src/jq/eval.rs`): bare `..`
+//! `resolve_recursive_descent_sink`/`resolve_recurse_sink` (`src/jq/eval.rs`): bare `..`
 //! in value position dispatches to `eval_recursive_descent`/
 //! `collect_recursive`, which clones a cheap `StandardJson` cursor per node,
 //! not the materialized `OwnedValue` — see that benchmark's own corrected
-//! docstring. `push_recursive_branches`/`resolve_recurse_sink` are reachable only
+//! docstring. `resolve_recursive_descent_sink`/`resolve_recurse_sink` are reachable only
 //! through `resolve_node`, which `resolve_dynamic_indexes` calls solely when
 //! `needs_path_prepass` is true — true for `..`/`recurse` themselves, so only
 //! a *path-context* use (`path(..)`, `path(recurse(...))`, `=`, `|=`,
@@ -14,11 +14,11 @@
 //!
 //! **Why `del(..)`, not `path(..)`.** `path(..)`, the more obvious trigger,
 //! turns out to be a poor isolator: `builtin_path` calls
-//! `resolve_dynamic_indexes` (which drives `push_recursive_branches`) and
+//! `resolve_dynamic_indexes` (which drives `resolve_recursive_descent_sink`) and
 //! *then* re-walks every one of the `depth + 1` resolved paths from the
 //! document root via `walk_path`/`step_into`. That second pass was measured
 //! (`temp_probe`-style, not checked in) to cost **~250x**
-//! `push_recursive_branches`'s own share at depth 400 (1.9s vs 7-8ms) and to
+//! `resolve_recursive_descent_sink`'s own share at depth 400 (1.9s vs 7-8ms) and to
 //! scale worse than quadratically — so a `path(..)` benchmark would be
 //! dominated by `walk_path`, not by the function #668 targets, near-invisible
 //! to that fix, and would repeat exactly the mistake #675 was filed to
@@ -36,7 +36,7 @@
 //! `del(..)` instead reaches `resolve_del_path_branches` and then applies
 //! `delete_at_path`/`DeleteTrie` directly to the already-resolved static
 //! paths — no second walk of the original tree — so its cost tracks
-//! `push_recursive_branches`'s own share closely.
+//! `resolve_recursive_descent_sink`'s own share closely.
 //!
 //! #701 found the depth-400 point in the list below panicking
 //! (`nesting depth exceeds limit of 384`, from `to_owned_at_depth`,
@@ -52,7 +52,7 @@
 //! `eval_slice_bound` (#626/#670's already-fixed target).
 //!
 //! On the linear-nesting document below (one child per level, depth `d`),
-//! `push_recursive_branches` visits `d + 1` nodes pre-order and clones the
+//! `resolve_recursive_descent_sink` visits `d + 1` nodes pre-order and clones the
 //! full subtree rooted at each: the node at depth `i` clones a subtree of
 //! size `O(d - i)`. Summed over all nodes, that's `O(d^2)` — the signature
 //! #668 targets. `resolve_dynamic_indexes`, `del(..)`'s sole consumer of this
@@ -61,10 +61,10 @@
 //! value that was sitting there), so that clone cost is pure waste — exactly
 //! the waste #668 describes.
 //!
-//! **#1651 update.** #701 made `push_recursive_branches`'s *path* half O(1)
+//! **#1651 update.** #701 made `resolve_recursive_descent_sink`'s *path* half O(1)
 //! per node (an `Rc<PathPrefix>` cons-list replacing a `Vec<Expr>` clone),
 //! but this benchmark's growth exponent stayed k≈1.94 regardless — because
-//! `del(..)`'s own consumer, not `push_recursive_branches`, still flattened
+//! `del(..)`'s own consumer, not `resolve_recursive_descent_sink`, still flattened
 //! that O(1)-to-construct chain back down to an owned `Vec<Expr>`
 //! (`resolve_dynamic_indexes`'s `assemble`) and then *again* to
 //! `Vec<DeleteStep>` (`builtin_del`'s `flatten_delete_path`) — once per
@@ -74,7 +74,7 @@
 //! which reports the document root as `DelPaths::Root` (true for `..`/bare
 //! `recurse`/`recurse(f)`/`recurse(f;cond)` unconditionally, since each
 //! emits self before recursing into children) and skips both flattens. This
-//! benchmark now exercises only `push_recursive_branches`'s own O(d) branch
+//! benchmark now exercises only `resolve_recursive_descent_sink`'s own O(d) branch
 //! construction (still real work — every node's path is still resolved) —
 //! its growth exponent should read ~k≈1 post-fix.
 //!
@@ -131,7 +131,7 @@ fn bench_recurse_clone_depth(c: &mut Criterion) {
         // collapses the whole document to `null` — confirmed against real
         // jq (`jq 'del(..)'`) — regardless of depth. A different result
         // would mean this fixture stopped exercising the full `d + 1`-node
-        // fan-out `push_recursive_branches` walks.
+        // fan-out `resolve_recursive_descent_sink` walks.
         let cursor = index.root(&json);
         let probe: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert!(

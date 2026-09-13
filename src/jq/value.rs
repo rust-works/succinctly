@@ -54,7 +54,7 @@ use super::expr::Literal;
 /// wrong in the *other* direction: 256 does not clear
 /// `tests/jq_recurse_depth_tests.rs`'s deliberately-pinned depth-300
 /// correctness capability for `path(..)`/`path(recurse)` (#626's de-risk
-/// step for `push_recursive_branches`/`resolve_recurse`), which that test
+/// step for `resolve_recursive_descent_sink`/`resolve_recurse`), which that test
 /// exercises via the library's own `eval()` entry point and which routes
 /// through `eval.rs`'s own `to_owned` — a real, tested capability of this
 /// crate's public API, independent of whether the `succinctly` CLI binary's

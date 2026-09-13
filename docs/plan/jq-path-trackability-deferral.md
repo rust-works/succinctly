@@ -255,7 +255,7 @@ current `main`, so treat these as lower bounds rather than an exhaustive audit:
 | Lines mentioning `PathBranch`/`PathResolveResult` | 33                              |
 
 Known constructors needing a deliberate value include the `Iterate` fan-out, `Select`/
-type-filter passthrough, `resolve_against_cow`'s two `.map` closures, `push_recursive_branches`,
+type-filter passthrough, `resolve_against_cow`'s two `.map` closures, `resolve_recursive_descent_sink`,
 `resolve_index_expr`'s post-target push, `apply_static_tail`, and `resolve_catch`/
 `resolve_recurse`'s stack-init lines. Stage 1 is small in *concept*; it is not a small diff.
 
