@@ -56,21 +56,21 @@ use super::eval::{
     boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    demote_rebuilt_markers, each_recurse_walk, enter_def_call_frame, entries_to_object,
-    eval_each_owned, eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings,
-    extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
-    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
-    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
-    is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_expr, owned_to_string, pattern_alternatives_var_names,
-    prefer_pending_control, range_max_exceeded_error, range_num, range_values_f64,
-    range_values_int, recurse_walk_flow, resolve_computed_slice_bounds, resume_from_escape,
-    reverse_length_is_empty, select_emits, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    demote_rebuilt_markers, each_path_on_owned, each_recurse_walk, enter_def_call_frame,
+    entries_to_object, eval_each_owned, eval_full as full_eval, eval_reduce_with_values,
+    extract_pattern_bindings, extract_single_pattern_binding, finish_fork_flow,
+    finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
+    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
+    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
+    range_values_f64, range_values_int, recurse_walk_flow, resolve_computed_slice_bounds,
+    resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
+    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses,
+    tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
@@ -8967,6 +8967,41 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // nodes, where jq emits a node *before* evaluating `f` on it and so
         // never pays for the children of a node its consumer was already
         // satisfied by.
+        // #2908: `path(f)` is a generator, so a consumer satisfied by the
+        // first path must be able to stop `f`. The guard mirrors the eager
+        // arm's own two gates rather than restating the decision: a
+        // cursor-navigable expression keeps `path_walk_generic` (pure
+        // navigation, nothing observable per output, and the #2061/#2168
+        // route that avoids materializing the document at all), and a
+        // document the reindex bridge would not round-trip identically
+        // keeps the bridge. What is left is exactly the shape whose `f` can
+        // have side effects.
+        Expr::Builtin(Builtin::Path(path_expr))
+            if !(cursor.is_some() && path_expr_is_cursor_navigable(path_expr)) =>
+        {
+            // #2642: demote any marker not proven to be `cursor`'s own node
+            // before resolving, exactly as the eager arm does.
+            let root = RootWitness::of(cursor.as_ref());
+            let demoted = demote_rebuilt_markers(path_expr, &root);
+            // #2280: `optional` suppresses a decode failure into no output.
+            let owned = match to_owned_with_cursor(&value, cursor) {
+                Ok(v) => v,
+                Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+                Err(e) => return Flow::Escaped(Control::Error(e)),
+            };
+            if !reindex_bridge_is_identity(&owned) {
+                return drain_result_generic(
+                    eval_single::<S, V>(expr, value, optional, cursor),
+                    sink,
+                );
+            }
+            match each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
+                sink.push(GenericItem::Owned(v))
+            }) {
+                None => Flow::Exhausted,
+                Some(e) => Flow::Escaped(Control::from(e)),
+            }
+        }
         Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
             let f = Expr::Optional(Box::new(Expr::Iterate));
             each_recurse_generic::<S, V>(&f, None, value, cursor, sink)
