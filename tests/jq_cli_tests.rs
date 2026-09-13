@@ -44474,6 +44474,38 @@ fn test_foreach_extract_wellformed_shapes_unaffected_by_2860() -> Result<()> {
     Ok(())
 }
 
+/// #2860 (review, known residual): `cannot_move_register`'s gate is
+/// *syntactic* -- it requires every branch of an `if`/`try` to be
+/// navigation-free, not only the one actually taken. Gating `identical()`
+/// on it (this issue's own fix) therefore costs a refusal whenever a
+/// navigating branch sits *unreached* alongside a safe one, even though the
+/// register genuinely never moved on the path actually executed: jq
+/// accepts `path(. as $x | foreach (1,2) as $i (0; (if false then .a else
+/// $x end); .))` (`[]` twice), and so does succinctly's own pre-#2860
+/// `identical()` (which had no gate to consult `expr`'s shape at all) --
+/// but post-#2860, the untaken `.a` arm alone is enough to disable
+/// `identical()` here, so this now refuses. Same shape #2046's own
+/// "Scope limit, deliberately not closed" already accepts for a `$var`
+/// reference nested *directly* inside `if`/`try` with no register threaded
+/// at all (`docs/compliance/jq/limitations.md`); this is that scope limit
+/// reasserting itself through `identical()`'s new gate rather than a fresh
+/// defect. Refuse-only, the established safe direction throughout this
+/// subsystem's history -- a write through the identical filter fails
+/// rather than corrupting anything (jq's own `99`; succinctly raises).
+/// Pinned as a known residual rather than silently left uncovered.
+#[test]
+fn test_foreach_extract_untaken_branch_navigation_is_a_known_residual_2860() -> Result<()> {
+    let filter = "path(. as $x | foreach (1,2) as $i (0; (if false then .a else $x end); .))";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(stdout, "", "known residual: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":{"b":1}}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1576 moved every shape `can_use_m2_streaming` admits onto the cursor
 /// streamer, which quietly took the *existing* suite's only coverage of
 /// `print_json`'s own pretty-container, empty-container, `null`/`true`,

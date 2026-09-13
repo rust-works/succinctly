@@ -685,6 +685,22 @@ is the revert that established what the other one costs.
    from the fold's accumulator, not from a `resolve()` call over one expression) keeps
    `identical()` unconditionally available, unaffected by this gate.
 
+   **Known residual of #2860's own fix, refuse-only**: `cannot_move_register` is a *syntactic*
+   allowlist — for `if`/`try` it requires every branch to be navigation-free, not only the one
+   actually taken (deliberately conservative for its two pre-existing callers, `resolve_seq`'s
+   own carrying and `advance`'s above, where a wrong `false` only ever costs a refusal there
+   too). Gating `identical()` on it inherits that same conservatism, so a navigating branch
+   sitting *unreached* alongside a safe one now also costs a refusal here, even when the
+   register genuinely never moved on the path actually executed: `path(. as $x \| foreach
+   (1,2) as $i (0; (if false then .a else $x end); .))` is jq's `[]` twice — the `else` branch
+   never navigates — but succinctly now refuses, where the pre-#2860 unconditional `identical()`
+   happened to accept it. Not a fresh gap: it is the identical "scope limit, deliberately not
+   closed" already accepted just above for a `$var` referenced directly inside `if`/`try` with
+   no register threaded in at all — #2860's fix reaches it through a different door (a gate
+   that didn't exist before) rather than opening a new one. A write through the affected filter
+   fails rather than corrupting anything (jq's own `99`; succinctly raises), the same safe
+   direction every entry in this section keeps to.
+
    Separately, a variable bound from a *navigated* position (`.a as $y`) used to carry no
    marker at all, so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`, refused too —
    and the naive fix (widen `substitute_var_tracked`'s gate to cover it) reopens the

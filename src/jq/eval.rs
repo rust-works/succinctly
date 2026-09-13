@@ -30010,6 +30010,14 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
+/// Three call sites consult it: `resolve_seq`'s own per-stage carrying
+/// (`stage_preserves_register`, the original #1573 use), `FoldRegister::
+/// advance`'s carry-forward across UPDATE into EXTRACT (#2046), and
+/// `FoldRegister::relocate`'s `identical_eligible` gate (#2860) -- all three
+/// ask the identical question ("could this expression's own execution have
+/// moved jq's real register") of a different expression, so one definition
+/// serves all three rather than one per call site.
+///
 /// An allowlist, and deliberately a *syntactic* one: the answer has to be
 /// "no" for every shape this resolver cannot see inside. jq's register
 /// moves on any `INDEX` its bytecode executes in the stage's own extent —
@@ -30075,6 +30083,19 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// `path(. as $x | (def f: 5; f) | $x)`, which jq answers `[]` and this
 /// refuses: one more refusal on a shape nothing writes, versus a rule that
 /// has to be right about every `def` anyone does write.
+/// Shared by every binding form's own `cannot_move_register` arm
+/// (`Expr::AsPattern`, `Expr::Reduce`, `Expr::Foreach`): `false` the moment
+/// any alternative destructures (`{...}`/`[...]`), since matching one
+/// performs its own tracked index steps that move the register — a bare
+/// `$var` (`Pattern::Var`) or an alternation of only those performs none.
+/// One definition rather than the identical inline check copied at each
+/// call site.
+fn patterns_all_bare(patterns: &[Pattern]) -> bool {
+    !patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+}
+
 fn cannot_move_register(expr: &Expr) -> bool {
     match expr {
         // Nothing here reads the document's structure at all.
@@ -30146,14 +30167,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // alternative destructures, this is `false` outright; otherwise
         // fall through to the body exactly like `As`.
         Expr::AsPattern { patterns, body, .. } => {
-            if patterns
-                .iter()
-                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
-            {
-                false
-            } else {
-                cannot_move_register(body)
-            }
+            patterns_all_bare(patterns) && cannot_move_register(body)
         }
 
         // `error` raises; it navigates nothing. Its message expression is
@@ -30201,9 +30215,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             // #2649's own reasoning: a destructuring pattern performs its
             // own tracked index steps while matching, which do move the
             // register (unlike a bare `$var` binding, which performs none).
-            !patterns
-                .iter()
-                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+            patterns_all_bare(patterns)
                 && cannot_move_register(input)
                 && cannot_move_register(init)
                 && cannot_move_register(update)
@@ -30215,9 +30227,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
             update,
             extract,
         } => {
-            !patterns
-                .iter()
-                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+            patterns_all_bare(patterns)
                 && cannot_move_register(input)
                 && cannot_move_register(init)
                 && cannot_move_register(update)
