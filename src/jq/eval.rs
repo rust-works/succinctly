@@ -27738,22 +27738,62 @@ fn emit_passthrough<'a>(
 }
 
 /// Sink-shaped `Select`/`If` "fork on cond, dispatch per output" step —
-/// the sink twin of the eager `resolve_cond_fork` it replaces (#1023).
+/// the sink twin of the eager `resolve_cond_fork` it replaces (#1023),
+/// pulling `cond` one output at a time (#2694).
+///
 /// `dispatch` reports its own [`ResolveFlow`] rather than an optional
 /// escape, so a stop and an escape stay structurally distinct, and the
-/// `cond`-level escape still fires only once the loop drains naturally.
-fn resolve_cond_fork_sink(
-    cond_outputs: Vec<OwnedValue>,
-    cond_escape: Option<EvalEscape>,
+/// `cond`-level escape still fires only once `cond` drains naturally. The
+/// first `dispatch` answer that is not [`ResolveFlow::Exhausted`] ends the
+/// fork *and stops pulling `cond`* — the difference from the collecting
+/// form, which had already run `cond` to exhaustion before the first
+/// `dispatch` call and so fired every one of its side effects up front.
+/// Under a demand-driven consumer (a fold source, #2235) that was visible:
+/// `path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; error("u")))`
+/// wrote `123` to stderr where jq writes `1`.
+///
+/// Two rules are unchanged from the collecting form and are load-bearing:
+///
+/// * a `cond` output already dispatched is never un-emitted by a *later*
+///   `cond` output escaping — `path(select((true, error("x"))))` prints
+///   `[]` and then raises, confirmed against jq 1.7.1 (#896); streaming
+///   preserves this for free, since the branch is delivered before `cond`
+///   is asked again.
+/// * a [`Control::Halt`] is not downgraded into a catchable escape, and
+///   outranks whatever `dispatch` was reporting — the same ordering
+///   [`resolve_leaf_sink`] applies, and for the same reason.
+fn resolve_cond_fork_stream<S: EvalSemantics>(
+    cond: &Expr,
+    value: &OwnedValue,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
-    for c in cond_outputs {
+    let mut dispatched: Option<ResolveFlow> = None;
+    let flow = eval_each_owned::<S>(cond, value, false, &mut |c| {
         match dispatch(c.is_truthy()) {
-            ResolveFlow::Exhausted => {}
-            other => return other,
+            ResolveFlow::Exhausted => Demand::Continue,
+            other => {
+                dispatched = Some(other);
+                Demand::Stop
+            }
         }
+    });
+
+    if let Flow::Escaped(Control::Halt(code))
+    | Flow::Stopped {
+        pending: Some(Control::Halt(code)),
+    } = flow
+    {
+        return ResolveFlow::Escaped(EvalEscape::Halt(code));
     }
-    flow_result(cond_escape)
+    if let Some(other) = dispatched {
+        return other;
+    }
+    match flow {
+        Flow::Escaped(control) => ResolveFlow::Escaped(EvalEscape::from(control)),
+        // `Stopped` without a stashed `dispatched` is unreachable: this
+        // sink answers `Demand::Stop` only when it sets that field.
+        Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
+    }
 }
 
 /// `.[]`'s own path-branch construction (#1850), emitted one element at a
@@ -28214,7 +28254,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // unchanged or prune it, exactly like `Optional` above but driven by a
         // predicate instead of an error.
         //
-        // `cond` runs through `eval_owned_multi_keep_partial`, not
+        // `cond` streams through `resolve_cond_fork_stream`, not
         // `eval_owned_multi`/`eval_owned_expr`, and republishes `value` once
         // per truthy output rather than collapsing every output into one
         // always-truthy array (#628, mirroring #627's
@@ -28241,9 +28281,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `eval_fanout`. `cond` is still walked to completion, so a later
         // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
-            let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
             let mut already_emitted = false;
-            resolve_cond_fork_sink(cond_outputs, escape, |truthy| {
+            resolve_cond_fork_stream::<S>(cond, value, |truthy| {
                 if select_emits::<S>(truthy, &mut already_emitted) {
                     emit_passthrough(value, trackable, snapshot, sink)
                 } else {
@@ -28273,7 +28312,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // evaluated at all, so a non-path `else` that is never reached
         // raises nothing (matches jq).
         //
-        // `cond` runs through `eval_owned_multi_keep_partial`, not
+        // `cond` streams through `resolve_cond_fork_stream`, not
         // `eval_owned_multi`/`eval_owned_expr`, and forks once per output
         // rather than collapsing every output into one always-truthy array
         // (#628, mirroring #627): confirmed against jq 1.7.1,
@@ -28289,13 +28328,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             cond,
             then_branch,
             else_branch,
-        } => {
-            let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
-            resolve_cond_fork_sink(cond_outputs, escape, |truthy| {
-                let branch = if truthy { then_branch } else { else_branch };
-                resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
-            })
-        }
+        } => resolve_cond_fork_stream::<S>(cond, value, |truthy| {
+            let branch = if truthy { then_branch } else { else_branch };
+            resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
+        }),
         // `E?` (bare postfix `?`, sugar for `try E`, #2235): streams through
         // `resolve_node_sink` rather than collecting via `resolve_node`
         // first, so a `?`-wrapped generator (`.[]?`, `(f)?`) interleaves its
