@@ -17478,6 +17478,139 @@ fn test_null_target_non_numeric_slice_bound_nested_empty_update_2853() -> Result
     Ok(())
 }
 
+/// #2909: `(A | B)?` is `try (A | B)` -- one abort scope over the whole
+/// group. succinctly distributed the `?` onto each component (`A? | B?`),
+/// which is indistinguishable for a single-valued chain but lets a
+/// *generator* inside the group resume past an error a later component
+/// raised.
+///
+/// Filed as a side-effect count; it is not. Two of these rows are silent
+/// wrong answers -- an element deleted that jq keeps, and a slot written
+/// that jq never reaches. Every expectation captured live from jq 1.7.1.
+#[test]
+fn test_optional_group_has_one_abort_scope_2909() -> Result<()> {
+    for (filter, input, expected) in [
+        // The severe pair: output diverged, silently.
+        (
+            r"del((.[] | .[0])?)",
+            r#"{"a":{"b":1},"c":[1,2]}"#,
+            r#"{"a":{"b":1},"c":[1,2]}"#,
+        ),
+        (
+            r"((.[] | .a)?) |= 99",
+            r#"[{"a":1},5,{"a":3}]"#,
+            r#"[{"a":99},5,{"a":3}]"#,
+        ),
+        // Duplicated path outputs.
+        (
+            r"[path(.. | ((.[], .a) | .b)?)]",
+            r#"{"a":{"b":1},"c":[1,2]}"#,
+            r#"[["a","b"]]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    // The issue's own repro, and the `.`-piped form that shows `..` was
+    // never the trigger: `stderr` must fire once, not once per element.
+    for filter in [
+        r"[path(.. | (.[]|stderr|.+0)?)]",
+        r"[path(. | (.[]|stderr|.+0)?)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[true,false]"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "{filter}");
+        assert_eq!(
+            stderr, "true",
+            "{filter}: the group's error must stop `.[]`, so only the first \
+             element reaches `stderr`"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2909 (must-not-change): the three spellings that already matched jq,
+/// which is what localised the bug to the two distributing rewrites rather
+/// than to `?` or to `.[]`. `path((...)?)` with no enclosing pipe reaches
+/// `resolve_optional_sink` directly -- the arm the fix routes the others
+/// into -- so it is the reference behaviour, not just a control.
+#[test]
+fn test_optional_group_neighbouring_spellings_unmoved_2909() -> Result<()> {
+    for filter in [
+        r"[(.[]|stderr|.+0)?]",
+        r"[.. | (.[]|stderr|.+0)?]",
+        r"[path((.[]|stderr|.+0)?)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[true,false]"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "{filter}");
+        assert_eq!(stderr, "true", "{filter}");
+    }
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r"((.[] | .a)?) = 99"],
+        Some(r#"[{"a":1},5,{"a":3}]"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#"[{"a":99},5,{"a":3}]"#);
+
+    Ok(())
+}
+
+/// #2909 (must-not-change): the gate's lower edge -- the pure-primitive
+/// groups #1294 and #1311 added the distributing rewrites *for*.
+///
+/// These are the direct guard on `optional_group_is_scope_safe` staying
+/// narrow: widen it and every row here starts routing through the resolver
+/// instead of the native walker, and #1311's own "invalid path component"
+/// failure comes back.
+#[test]
+fn test_optional_group_scope_safe_class_still_distributes_2909() -> Result<()> {
+    for (filter, input, expected) in [
+        // #1311's own test shape.
+        (
+            r"((.a[0:1])? | .[0]) = 9",
+            r#"{"a":[1,2,3]}"#,
+            r#"{"a":[9,2,3]}"#,
+        ),
+        (r"del((.a[0:1])?)", r#"{"a":[1,2,3]}"#, r#"{"a":[2,3]}"#),
+        // Multi-component, all single-valued: still distributed.
+        (r"[path((.a|.b)?)]", r#"{"a":{"b":1}}"#, r#"[["a","b"]]"#),
+        (r"(.a|.b) = 9", r#"{"a":{"b":1}}"#, r#"{"a":{"b":9}}"#),
+        (r"del((.a|.b)?)", r#"{"a":{"b":1}}"#, r#"{"a":{}}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    // #1294's own shape, and its `path()` sibling: the group's `?` must
+    // still not leak onto what follows the group, so a failure *after* the
+    // group is raised rather than swallowed. These are the rows that fail if
+    // the fix over-corrects into scoping the `?` too widely.
+    for (filter, input, message) in [
+        (
+            r"(.a|.c)[0] = 9",
+            r#"{"a":{"c":1}}"#,
+            "Cannot index number with number",
+        ),
+        (
+            r"[path((.a|.b)? | .c)]",
+            r#"{"a":{"b":1}}"#,
+            r#"Cannot index number with string "c""#,
+        ),
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stderr: {stderr:?}");
+        assert!(stderr.contains(message), "{filter}: stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
