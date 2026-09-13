@@ -1,22 +1,32 @@
 {
   "ARM64-Linux": {
-    "arrays_first_map_iterate": 111093246,
-    "arrays_identity": 594206439,
-    "arrays_map_iterate": 1119002742,
-    "users_identity": 289260562,
-    "users_keys_unsorted": 44366766,
-    "users_yq_keys_unsorted": 73403543,
-    "wide_identity": 467107189,
-    "wide_keys_unsorted": 290310316
+    "arrays_first_map_iterate": 111094564,
+    "arrays_identity": 594203387,
+    "arrays_map_iterate": 1134865401,
+    "users_assign_scores": 1097804780,
+    "users_del_bound_select": 1315449204,
+    "users_del_select": 1273361279,
+    "users_identity": 289257457,
+    "users_keys_unsorted": 44363584,
+    "users_path_walk": 268790008,
+    "users_yq_del_select": 2663041899,
+    "users_yq_keys_unsorted": 73985720,
+    "wide_identity": 467103831,
+    "wide_keys_unsorted": 290306959
   },
   "x86_64": {
-    "arrays_first_map_iterate": 121074952,
-    "arrays_identity": 659510931,
-    "arrays_map_iterate": 1161373631,
-    "users_identity": 354091314,
-    "users_keys_unsorted": 66354067,
-    "users_yq_keys_unsorted": 81210364,
-    "wide_identity": 578688312,
-    "wide_keys_unsorted": 345792588
+    "arrays_first_map_iterate": 121082995,
+    "arrays_identity": 659513876,
+    "arrays_map_iterate": 1179791400,
+    "users_assign_scores": 1213858577,
+    "users_del_bound_select": 1419475247,
+    "users_del_select": 1381419034,
+    "users_identity": 354094230,
+    "users_keys_unsorted": 66356979,
+    "users_path_walk": 314254982,
+    "users_yq_del_select": 3290140229,
+    "users_yq_keys_unsorted": 82751672,
+    "wide_identity": 578691186,
+    "wide_keys_unsorted": 345795217
   }
 }
