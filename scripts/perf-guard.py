@@ -45,7 +45,8 @@ under `keys_unsorted` alone) -- so this covers both queries against both a
 `wide` (many top-level keys, no nesting) and a `users` (typical small-record)
 shape, plus an `arrays` shape (no objects, isolates whether a regression is
 object-specific) and one `yq`-mode query (the shared evaluator's cost is
-otherwise unverified in yq mode at all).
+otherwise unverified in yq mode at all) -- #2655 adds a second yq-mode row,
+see below.
 
 #2655 added a second class the original set missed entirely: every query
 above it reads only, so none exercises `resolve_node`/`resolve_node_sink`
@@ -176,7 +177,7 @@ DEFAULT_THRESHOLD = 5.0
 # absorbed a similar ~10% cost for the same reason (#1677's `,`/`:`
 # delimiter check) without ever needing an entry here, simply because it
 # isn't one of `QUERIES` above; `wide_keys_unsorted` doesn't have that
-# option; it's one of the six tracked queries, so its accepted cost needs an
+# option; it's one of the tracked queries, so its accepted cost needs an
 # explicit, narrower threshold instead of silently failing forever.
 #
 # Measured live on this repo's own CI runners (not a pinned bench box --
@@ -209,7 +210,8 @@ EPILOG = (
     "(typical small-record) shape, plus an `arrays` shape (no objects, "
     "isolates whether a regression is object-specific) and one `yq`-mode "
     "query (the shared evaluator's cost is otherwise unverified in yq mode "
-    "at all). #2655 added path-mode coverage on top of that: del()/=/"
+    "at all) -- #2655 adds a second yq-mode row below. #2655 also added "
+    "path-mode coverage on top of that: del()/=/"
     "path(...) and an as binding, in both jq mode (four `users_*` rows) and "
     "yq mode (`users_yq_del_select`, since yq-mode writes take a different "
     "route than jq-mode ones) -- every row before #2655 read only, so a "
