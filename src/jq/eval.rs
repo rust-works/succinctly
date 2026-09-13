@@ -36182,7 +36182,43 @@ fn resolve_terminal<'a, S: EvalSemantics>(
     near_iterate: bool,
     skip_untracked: bool,
 ) -> PathResolveResult<'a> {
+    // An always-`Continue` sink over the streaming form below, so the two
+    // cannot disagree on the untracked-branch refusal or on #2691's retry
+    // rule -- the write-side callers (`=`, `|=`, `del()`) want every branch
+    // and have nothing to stop for.
     let mut kept: Vec<PathBranch<'a>> = Vec::new();
+    let flow = resolve_terminal_sink::<S>(expr, input, near_iterate, skip_untracked, &mut |b| {
+        kept.push(b);
+        Demand::Continue
+    });
+    match flow {
+        Err(e) => Err((kept, e)),
+        Ok(()) => Ok(kept),
+    }
+}
+
+/// [`resolve_terminal`], delivering each accepted branch to `sink` as it is
+/// resolved rather than collecting them all first (#2908).
+///
+/// `path()` is the only caller that can stop: a consumer outside it
+/// (`limit`, `first`, a `label`/`break`) is satisfied after some number of
+/// paths, and jq never resumes the generator that was producing them. While
+/// this sink always answered `Continue`, that stop could not reach the
+/// producer, so every multi-output generator inside `path()` ran to
+/// exhaustion -- `[limit(1; path((.a|stderr), (.b|stderr), (.c|stderr)))]`
+/// wrote three lines where jq writes one, and a `foreach` source ran every
+/// element for one requested path.
+///
+/// The refusal rule is unchanged and still takes precedence: an untracked
+/// branch records the violation and stops, and that is an error for the
+/// whole call however much the downstream consumer had already accepted.
+fn resolve_terminal_sink<'a, S: EvalSemantics>(
+    expr: &Expr,
+    input: &'a OwnedValue,
+    near_iterate: bool,
+    skip_untracked: bool,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> Result<(), EvalEscape> {
     let mut violation: Option<EvalEscape> = None;
     // The retry generation current when this sink last refused a branch,
     // `Some` only between that refusal and the next invocation -- see the
@@ -36237,13 +36273,12 @@ fn resolve_terminal<'a, S: EvalSemantics>(
                 refused_at = Some(terminal_retry::current());
                 return Demand::Stop;
             }
-            kept.push(branch);
-            Demand::Continue
+            sink(branch)
         },
     );
     match (violation, flow) {
-        (Some(e), _) | (None, ResolveFlow::Escaped(e)) => Err((kept, e)),
-        (None, ResolveFlow::Exhausted | ResolveFlow::Stopped) => Ok(kept),
+        (Some(e), _) | (None, ResolveFlow::Escaped(e)) => Err(e),
+        (None, ResolveFlow::Exhausted | ResolveFlow::Stopped) => Ok(()),
     }
 }
 
@@ -36408,8 +36443,30 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     input: &OwnedValue,
     defer_trailing_iterate: bool,
 ) -> Result<Vec<Expr>, (Vec<Expr>, EvalEscape)> {
+    // An always-`Continue` sink over the streaming form below; the
+    // write-side callers want every resolved expression.
+    let mut out = Vec::new();
+    match resolve_dynamic_indexes_sink::<S>(expr, input, defer_trailing_iterate, &mut |e| {
+        out.push(e);
+        Demand::Continue
+    }) {
+        Ok(()) => Ok(out),
+        Err(e) => Err((out, e)),
+    }
+}
+
+/// [`resolve_dynamic_indexes`], delivering each resolved path expression to
+/// `sink` as it is produced (#2908) -- what lets `path()` stop a generator
+/// its own consumer is already done with.
+fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    defer_trailing_iterate: bool,
+    sink: &mut dyn FnMut(Expr) -> Demand,
+) -> Result<(), EvalEscape> {
     if !needs_path_prepass(expr) {
-        return Ok(vec![expr.clone()]);
+        sink(expr.clone());
+        return Ok(());
     }
 
     /// Is this a bare trailing iterate — `Expr::Iterate` or
@@ -36480,10 +36537,9 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     let skip_untracked = S::TAG == EvalTag::Yq;
 
     if trailing.is_empty() {
-        return match resolve_terminal::<S>(expr, input, false, skip_untracked) {
-            Ok(branches) => Ok(assemble_path_branches(branches)),
-            Err((prefix, e)) => Err((assemble_path_branches(prefix), e)),
-        };
+        return resolve_terminal_sink::<S>(expr, input, false, skip_untracked, &mut |b| {
+            sink(assemble_one_branch(&b))
+        });
     }
     trailing.reverse();
 
@@ -36491,19 +36547,9 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    match resolve_terminal::<S>(&reduced_expr, input, true, skip_untracked) {
-        Ok(branches) => Ok(assemble_path_branches(branches)
-            .into_iter()
-            .map(|e| append_trailing(e, &trailing))
-            .collect()),
-        Err((prefix, e)) => Err((
-            assemble_path_branches(prefix)
-                .into_iter()
-                .map(|e| append_trailing(e, &trailing))
-                .collect(),
-            e,
-        )),
-    }
+    resolve_terminal_sink::<S>(&reduced_expr, input, true, skip_untracked, &mut |b| {
+        sink(append_trailing(assemble_one_branch(&b), &trailing))
+    })
 }
 
 /// Drop any `Expr::Optional` wrapper a resolved path component still
