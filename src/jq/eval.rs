@@ -50600,16 +50600,27 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         // only builds a `DefCall` whose `args.len()` equals `params.len()`),
         // and if one ever did, leaving the body unsubstituted is the old
         // behaviour, not a panic.
-        let mut params_and_args = params.iter().zip(args.iter());
-        let Some((first_param, first_arg)) = params_and_args.next() else {
+        // #2633: one walk carrying every parameter, not one walk per
+        // parameter. `Expr::Shared`'s own opaque arm is what makes the two
+        // equivalent -- a substituted argument is never descended into, so
+        // no parameter can be substituted into another's argument whether
+        // the walks are sequential or simultaneous.
+        let subs: Vec<ParamSubst<'_>> = params
+            .iter()
+            .zip(args.iter())
+            .map(|(param, arg)| ParamSubst {
+                name: param.name(),
+                arg: Expr::Shared(Rc::new(arg.clone())),
+                scope: SubstScope::for_param(param),
+            })
+            .collect();
+        if subs.is_empty() {
             return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
-        };
-        let mut result =
-            substitute_func_param(body, first_param, &Expr::Shared(Rc::new(first_arg.clone())));
-        for (param, arg) in params_and_args {
-            result = substitute_func_param(&result, param, &Expr::Shared(Rc::new(arg.clone())));
         }
-        return result;
+        if subs.len() > MAX_COMBINED_PARAM_SUBSTS {
+            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+        }
+        return substitute_func_params_impl(body, &subs, ScopeMask::start(&subs));
     }
 
     // `None` until the first substitution, so that one rebuilds `body`
@@ -50618,7 +50629,12 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     // which seeding this loop with `body.clone()` would put straight back
     // (once per recursion level, for a recursive `def` that also duplicates a
     // parameter name).
-    let mut result: Option<Expr> = None;
+    // #2633: the same fold, collected into one walk. Each distinct name
+    // contributes a bare-winner entry and, if any occurrence is `$`-style, a
+    // dollar-winner entry; the two rewrite provably disjoint node sets (a
+    // `Var` consults only the dollar mask, a bare `FuncCall` only the bare
+    // mask), which is why they can share a pass rather than needing two.
+    let mut subs: Vec<ParamSubst<'_>> = Vec::new();
     let mut substituted_names: Vec<&str> = Vec::new();
     for param in params {
         let name = param.name();
@@ -50639,13 +50655,93 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
             // unwrapping keeps a malformed one from taking the process down.
             continue; // omni-dev: coverage tolerate-line reason="unreachable: `name` was just read from `params`, so the zip over (params, args) has a matching pair unless args is shorter than params, which install_def_calls' own arity guard rules out (#2560)"
         };
+        subs.push(ParamSubst {
+            name,
+            arg: Expr::Shared(Rc::new(bare_arg.clone())),
+            scope: BARE_NAMESPACE_ONLY,
+        });
+
+        if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
+            subs.push(ParamSubst {
+                name,
+                arg: Expr::Shared(Rc::new(dollar_arg.clone())),
+                scope: DOLLAR_NAMESPACE_ONLY,
+            });
+        }
+    }
+    if subs.is_empty() {
+        return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: `params` is non-empty here (bind_def_call's own guard) and its first entry is never skipped, so at least one substitution always ran (#2560)"
+    }
+    if subs.len() > MAX_COMBINED_PARAM_SUBSTS {
+        return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: needs more than 64 distinct-name entries; see the non-duplicate path's own note (#2633)"
+    }
+    substitute_func_params_impl(body, &subs, ScopeMask::start(&subs))
+}
+
+/// [`ScopeMask`]'s one-bit-per-substitution `u64`.
+const MAX_COMBINED_PARAM_SUBSTS: usize = 64;
+
+/// The pre-#2633 fold: [`substitute_func_param`] once per parameter, over
+/// the result of the last.
+///
+/// Two roles. It is [`bind_def_call_params`]' fallback past
+/// [`MAX_COMBINED_PARAM_SUBSTS`], so the mask's width is a performance
+/// ceiling rather than a correctness limit. And it is the differential
+/// oracle `combined_param_substitution_matches_the_sequential_fold_2633`
+/// checks the combined walk against over the whole capture-hygiene corpus --
+/// the six recorded fixes this function family carries (#2077, #2141, #2283,
+/// #2555, #2560, #2726) plus #2737's deliberately-unfixed gap are pinned by
+/// behaviour tests, but "one walk does what N walks did" is a claim about
+/// the rewrite itself and wants its own structural check.
+fn sequential_param_substitution(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
+    let has_duplicate_names = params
+        .iter()
+        .enumerate()
+        .any(|(i, p)| params[i + 1..].iter().any(|q| q.name() == p.name()));
+
+    if !has_duplicate_names {
+        let mut result: Option<Expr> = None;
+        for (param, arg) in params.iter().zip(args.iter()) {
+            result = Some(substitute_func_param(
+                result.as_ref().unwrap_or(body),
+                param,
+                &Expr::Shared(Rc::new(arg.clone())),
+            ));
+        }
+        return result.unwrap_or_else(|| body.clone());
+    }
+
+    // #2560's own two-pass-per-distinct-name shape, not a plain fold: with a
+    // duplicated name the bare and `$` namespaces resolve to *different*
+    // occurrences, which one sequential pass per parameter cannot express
+    // (it would let the first substitution's `Shared` node hide the second
+    // from the namespace that should win). Reproduced verbatim here because
+    // an oracle that models only the easy path is not an oracle -- the first
+    // run of the differential test below caught exactly that mistake.
+    let mut result: Option<Expr> = None;
+    let mut substituted_names: Vec<&str> = Vec::new();
+    for param in params {
+        let name = param.name();
+        if substituted_names.contains(&name) {
+            continue;
+        }
+        substituted_names.push(name);
+
+        let by_name = || {
+            params
+                .iter()
+                .zip(args.iter())
+                .filter(|(p, _)| p.name() == name)
+        };
+        let Some((_, bare_arg)) = by_name().next_back() else {
+            continue;
+        };
         let mut substituted = substitute_func_param_impl(
             result.as_ref().unwrap_or(body),
             name,
             &Expr::Shared(Rc::new(bare_arg.clone())),
             BARE_NAMESPACE_ONLY,
         );
-
         if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
             substituted = substitute_func_param_impl(
                 &substituted,
@@ -50656,9 +50752,7 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         }
         result = Some(substituted);
     }
-    // `unwrap_or_else`: same unreachable arity mismatch as the `else` arms
-    // above -- every distinct name substitutes at least once otherwise.
-    result.unwrap_or_else(|| body.clone()) // omni-dev: coverage tolerate-line reason="unreachable: `params` is non-empty here (bind_def_call's own guard) and its first entry is never skipped, so at least one substitution always ran (#2560)"
+    result.unwrap_or_else(|| body.clone())
 }
 
 /// Evaluate an `Expr::DefCall` in the plain evaluator (#1371).
@@ -51126,11 +51220,11 @@ fn sibling_frame_charge(frames: u32, position: u32, in_recursive_body: bool) -> 
 /// `AsPattern` hoisted their own single shadow conditions to match guards in
 /// #2095 so their non-shadowed case falls through to [`map_subexprs`]'s
 /// (`src/jq/walk.rs`) shared unconditional-recursion arm instead.
-fn subst_in_scope(e: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
+fn subst_in_scope(e: &Expr, subs: &[ParamSubst<'_>], scope: ScopeMask) -> Expr {
     if scope.is_empty() {
         e.clone()
     } else {
-        substitute_func_param_impl(e, param, arg, scope)
+        substitute_func_params_impl(e, subs, scope)
     }
 }
 
@@ -51232,25 +51326,132 @@ impl SubstScope {
             bare: true,
         }
     }
+}
 
-    fn without_dollar(self) -> Self {
-        Self {
-            dollar: false,
-            ..self
+/// One parameter's worth of a combined substitution (#2633).
+///
+/// `bind_def_call_params` used to fold [`substitute_func_param`] once per
+/// parameter, so an N-parameter `def` rebuilt its whole body N times -- once
+/// per recursion level, since `install_def_calls` makes a fresh `DefCall`
+/// (and so a fresh `BoundBody`) at every level. Measured on an M4 Pro at
+/// depth 1200 with the body size held constant at 60 nodes: 144 ms at one
+/// parameter, 184 ms at five (+27%), 193 ms at nine. Carrying every
+/// parameter through one walk removes that term.
+///
+/// `arg` is always `Expr::Shared`-wrapped, the same capture-hygiene
+/// precondition [`substitute_func_param_impl`] asserts (#2096/#2077).
+struct ParamSubst<'a> {
+    name: &'a str,
+    arg: Expr,
+    scope: SubstScope,
+}
+
+/// Which substitutions in a `&[ParamSubst]` are still live at the current
+/// node, one bit per slice index (#2633).
+///
+/// The per-parameter twin of [`SubstScope`], which it replaces *only* for
+/// threading -- each parameter still starts from its own `SubstScope`, and
+/// each binder still narrows the two namespaces independently. A mask rather
+/// than a filtered `Vec` because a binder arm has to narrow on every descent:
+/// clearing a bit is two integer ops and no allocation, where rebuilding a
+/// slice would allocate once per binder per level.
+///
+/// `u64` bounds the combined walk to 64 parameters;
+/// [`bind_def_call_params`] falls back to the sequential fold above that, so
+/// the bound is a performance ceiling rather than a limit on what compiles.
+#[derive(Clone, Copy)]
+struct ScopeMask {
+    /// Bit `i` set: `subs[i]`'s `$name` references still resolve to its
+    /// argument. Cleared by a binder that rebinds that `$name` for real.
+    dollar: u64,
+    /// Bit `i` set: `subs[i]`'s bare `name` references still resolve to its
+    /// argument. Cleared only by a *filter*-namespace binder.
+    bare: u64,
+}
+
+impl ScopeMask {
+    /// The mask every substitution starts in: each parameter's own
+    /// [`SubstScope::for_param`] answer, one bit per index.
+    fn start(subs: &[ParamSubst<'_>]) -> Self {
+        let mut mask = Self { dollar: 0, bare: 0 };
+        for (i, sub) in subs.iter().enumerate() {
+            if sub.scope.dollar {
+                mask.dollar |= 1 << i;
+            }
+            if sub.scope.bare {
+                mask.bare |= 1 << i;
+            }
         }
+        mask
     }
 
-    fn without_bare(self) -> Self {
-        Self {
-            bare: false,
-            ..self
-        }
-    }
-
-    /// Nothing left to rewrite -- every reference this substitution could
-    /// have claimed is now bound by something nearer.
+    /// Nothing left to rewrite anywhere in this subtree -- the combined
+    /// twin of [`SubstScope::is_empty`], and the same short-circuit
+    /// [`subst_in_scope`] applies.
     fn is_empty(self) -> bool {
-        !self.dollar && !self.bare
+        self.dollar == 0 && self.bare == 0
+    }
+
+    /// Clear the `dollar` bit of every substitution `binds` accepts --
+    /// an `as`/`reduce`/`foreach`/`?//` binder, which binds a *variable* and
+    /// so can shadow `$name` and never a bare `name`, however it is spelled
+    /// (#2555).
+    fn without_dollar_where(self, subs: &[ParamSubst<'_>], binds: impl Fn(&str) -> bool) -> Self {
+        Self {
+            dollar: self.dollar & !Self::bits_where(subs, binds),
+            ..self
+        }
+    }
+
+    /// Clear the `bare` bit of every substitution `binds` accepts -- a
+    /// nested `def`'s own matching parameter, or a nested zero-argument
+    /// `def` of the name.
+    fn without_bare_where(self, subs: &[ParamSubst<'_>], binds: impl Fn(&str) -> bool) -> Self {
+        Self {
+            bare: self.bare & !Self::bits_where(subs, binds),
+            ..self
+        }
+    }
+
+    fn bits_where(subs: &[ParamSubst<'_>], binds: impl Fn(&str) -> bool) -> u64 {
+        let mut bits = 0;
+        for (i, sub) in subs.iter().enumerate() {
+            if binds(sub.name) {
+                bits |= 1 << i;
+            }
+        }
+        bits
+    }
+
+    /// The argument of the first substitution named `name` whose bit is set
+    /// in `namespace`, if any.
+    ///
+    /// "First" is unambiguous in both of [`bind_def_call_params`]' paths: on
+    /// the no-duplicate path the names are distinct, and on the duplicate
+    /// path a name contributes at most one bare-namespace entry and at most
+    /// one dollar-namespace entry, which are consulted through disjoint
+    /// masks (a `Var` reads `dollar`, a bare `FuncCall` reads `bare`) -- the
+    /// `debug_assert` below pins that.
+    fn resolve<'s>(
+        namespace: u64,
+        subs: &'s [ParamSubst<'_>],
+        name: &str,
+    ) -> Option<&'s ParamSubst<'s>> {
+        let mut found: Option<&ParamSubst<'_>> = None;
+        for (i, sub) in subs.iter().enumerate() {
+            if namespace & (1 << i) != 0 && sub.name == name {
+                debug_assert!(
+                    found.is_none(),
+                    "two live substitutions share the name {name:?} in one namespace -- \
+                     bind_def_call_params' duplicate path must give a name at most one \
+                     bare entry and at most one dollar entry (#2633)"
+                );
+                found = Some(sub);
+                #[cfg(not(debug_assertions))]
+                break;
+            }
+        }
+        found
     }
 }
 
@@ -51290,10 +51491,10 @@ fn substitute_func_param(expr: &Expr, param: &Param, arg: &Expr) -> Expr {
     substitute_func_param_impl(expr, param.name(), arg, SubstScope::for_param(param))
 }
 
-fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
+fn substitute_func_params_impl(expr: &Expr, subs: &[ParamSubst<'_>], scope: ScopeMask) -> Expr {
     debug_assert!(
-        matches!(arg, Expr::Shared(_)),
-        "substitute_func_param's capture-hygiene argument (#2096) requires `arg` to be \
+        subs.iter().all(|s| matches!(s.arg, Expr::Shared(_))),
+        "substitute_func_param's capture-hygiene argument (#2096) requires every `arg` to be \
          Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named binder \
          in `expr` (#2077)"
     );
@@ -51310,14 +51511,17 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
         // Gated on `scope.dollar`, the variable namespace -- the bare
         // `FuncCall` arm below reads `scope.bare` instead, and the two
         // narrow on different binders (#2555).
-        Expr::Var(name) if scope.dollar && name == param => arg.clone(),
+        Expr::Var(name) => match ScopeMask::resolve(scope.dollar, subs, name) {
+            Some(sub) => sub.arg.clone(),
+            None => expr.clone(),
+        },
         // #2727: `Expr::Error` used to stop here with `msg.clone()`,
         // unconditionally opaque, so a `def` parameter referenced inside
         // `error(...)`'s message was never substituted. No longer
         // special-cased: it now falls through to the catch-all below,
         // reaching `map_subexprs`'s own `Expr::Error` arm, which already
         // recurses into the message.
-        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg, scope)),
+        Expr::Builtin(b) => Expr::Builtin(substitute_func_params_in_builtin(b, subs, scope)),
         // #2141: `expr`/`input`/`init` (evaluated in the *outer* scope)
         // always keep the ambient scope, and `body`/`update`/`extract` (the
         // bound-scope child) only ever clear its `dollar` half. An
@@ -51326,17 +51530,12 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
         // (#2555: that asymmetry is now in the flags rather than implicit in
         // the bare arm firing unconditionally).
         Expr::As { expr, var, body } => Expr::As {
-            expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
+            expr: Box::new(substitute_func_params_impl(expr, subs, scope)),
             var: var.clone(),
-            body: Box::new(substitute_func_param_impl(
+            body: Box::new(substitute_func_params_impl(
                 body,
-                param,
-                arg,
-                if var == param {
-                    scope.without_dollar()
-                } else {
-                    scope
-                },
+                subs,
+                scope.without_dollar_where(subs, |name| var == name),
             )),
         },
         Expr::Reduce {
@@ -51345,13 +51544,11 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             init,
             update,
         } => {
-            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
-                scope.without_dollar()
-            } else {
-                scope
-            };
+            let bound_scope = scope.without_dollar_where(subs, |name| {
+                patterns.iter().any(|p| pattern_binds_var(p, name))
+            });
             Expr::Reduce {
-                input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
+                input: Box::new(substitute_func_params_impl(input, subs, scope)),
                 // #2873 review: a computed key runs against the pattern's
                 // own current node *before* the pattern's bindings take
                 // effect, so it sees `scope` (the outer, unbound scope),
@@ -51363,12 +51560,12 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
                     .iter()
                     .map(|p| {
                         map_pattern_subexprs(p, &mut |e| {
-                            substitute_func_param_impl(e, param, arg, scope)
+                            substitute_func_params_impl(e, subs, scope)
                         })
                     })
                     .collect(),
-                init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
-                update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
+                init: Box::new(substitute_func_params_impl(init, subs, scope)),
+                update: Box::new(substitute_func_params_impl(update, subs, bound_scope)),
             }
         }
         Expr::Foreach {
@@ -51378,28 +51575,26 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             update,
             extract,
         } => {
-            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
-                scope.without_dollar()
-            } else {
-                scope
-            };
+            let bound_scope = scope.without_dollar_where(subs, |name| {
+                patterns.iter().any(|p| pattern_binds_var(p, name))
+            });
             Expr::Foreach {
-                input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
+                input: Box::new(substitute_func_params_impl(input, subs, scope)),
                 // #2873 review: see the identical `Expr::Reduce` arm's
                 // comment just above.
                 patterns: patterns
                     .iter()
                     .map(|p| {
                         map_pattern_subexprs(p, &mut |e| {
-                            substitute_func_param_impl(e, param, arg, scope)
+                            substitute_func_params_impl(e, subs, scope)
                         })
                     })
                     .collect(),
-                init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
-                update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
+                init: Box::new(substitute_func_params_impl(init, subs, scope)),
+                update: Box::new(substitute_func_params_impl(update, subs, bound_scope)),
                 extract: extract
                     .as_deref()
-                    .map(|e| Box::new(substitute_func_param_impl(e, param, arg, bound_scope))),
+                    .map(|e| Box::new(substitute_func_params_impl(e, subs, bound_scope))),
             }
         }
         Expr::AsPattern {
@@ -51407,23 +51602,21 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             patterns,
             body,
         } => {
-            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
-                scope.without_dollar()
-            } else {
-                scope
-            };
+            let bound_scope = scope.without_dollar_where(subs, |name| {
+                patterns.iter().any(|p| pattern_binds_var(p, name))
+            });
             Expr::AsPattern {
-                expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
+                expr: Box::new(substitute_func_params_impl(expr, subs, scope)),
                 // #2873 review: see `Expr::Reduce`'s identical comment above.
                 patterns: patterns
                     .iter()
                     .map(|p| {
                         map_pattern_subexprs(p, &mut |e| {
-                            substitute_func_param_impl(e, param, arg, scope)
+                            substitute_func_params_impl(e, subs, scope)
                         })
                     })
                     .collect(),
-                body: Box::new(substitute_func_param_impl(body, param, arg, bound_scope)),
+                body: Box::new(substitute_func_params_impl(body, subs, bound_scope)),
             }
         }
         Expr::FuncDef {
@@ -51451,8 +51644,8 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // applied to one and not the other the way #2737 itself
             // happened (the check below was added to `then_scope` alone by
             // #2077 and stayed missing from `body_scope` for years).
-            let self_shadow_scope = if name == param && params.is_empty() {
-                scope.without_bare()
+            let self_shadow_scope = if params.is_empty() {
+                scope.without_bare_where(subs, |param| name == param)
             } else {
                 scope
             };
@@ -51498,23 +51691,21 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // `params.is_empty()` rules out -- so there is no double-clear
             // to reason about, only three independent ways to reach
             // `without_bare()`/`without_dollar()` (idempotent either way).
-            let mut body_scope = self_shadow_scope;
-            if params.iter().any(|p| p.name() == param) {
-                body_scope = body_scope.without_bare();
-            }
-            if params_bind_dollar(params, param) {
-                body_scope = body_scope.without_dollar();
-            }
+            let body_scope = self_shadow_scope
+                .without_bare_where(subs, |param| params.iter().any(|p| p.name() == param))
+                .without_dollar_where(subs, |param| params_bind_dollar(params, param));
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
-                body: Box::new(subst_in_scope(body, param, arg, body_scope)),
-                then: Box::new(subst_in_scope(then, param, arg, then_scope)),
+                body: Box::new(subst_in_scope(body, subs, body_scope)),
+                then: Box::new(subst_in_scope(then, subs, then_scope)),
                 // Rebuilt above, so any cache is stale (#2094).
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args, .. } if scope.bare && name == param && args.is_empty() => {
+        Expr::FuncCall { name, args, .. }
+            if args.is_empty() && ScopeMask::resolve(scope.bare, subs, name).is_some() =>
+        {
             // In jq, function parameters are bare identifiers that parse as
             // zero-arg FuncCalls. This is a reference to the parameter.
             //
@@ -51522,7 +51713,10 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
             // *filter*-namespace binder (a nested `def`, or a nested def's
             // own matching parameter) can shadow this, never an `as`/
             // `reduce`/`foreach` binder, however that binder is spelled.
-            arg.clone()
+            ScopeMask::resolve(scope.bare, subs, name)
+                .expect("the match guard just resolved this name in the bare namespace")
+                .arg
+                .clone()
         }
 
         // #2095: every remaining variant's recursive-structural-child
@@ -51534,9 +51728,24 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
         // for the full variant-by-variant justification, including the arms
         // above that stay explicit here instead of ever reaching it.
         _ => map_subexprs(expr, &mut |sub| {
-            substitute_func_param_impl(sub, param, arg, scope)
+            substitute_func_params_impl(sub, subs, scope)
         }),
     }
+}
+
+fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
+    substitute_func_params_impl(
+        expr,
+        &[ParamSubst {
+            name: param,
+            arg: arg.clone(),
+            scope,
+        }],
+        ScopeMask {
+            dollar: u64::from(scope.dollar),
+            bare: u64::from(scope.bare),
+        },
+    )
 }
 
 /// Expand function calls in a builtin expression.
@@ -51571,14 +51780,13 @@ fn install_def_calls_in_builtin(
 /// (`select`'s own `$g` was wrongly re-substituted with `f`'s argument,
 /// `999`, instead of staying `1` from the enclosing `1 as $g`) where jq
 /// 1.7.1 answers `null`.
-fn substitute_func_param_in_builtin(
+fn substitute_func_params_in_builtin(
     builtin: &Builtin,
-    param: &str,
-    arg: &Expr,
-    scope: SubstScope,
+    subs: &[ParamSubst<'_>],
+    scope: ScopeMask,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
-        substitute_func_param_impl(e, param, arg, scope)
+        substitute_func_params_impl(e, subs, scope)
     })
 }
 
@@ -51971,6 +52179,140 @@ mod tests {
     /// `test_duplicate_named_param_*_2560` family). Each expectation below
     /// is what jq 1.7.1 answers for the equivalent program.
     ///
+    /// #2633: one combined walk must produce structurally the same body the
+    /// pre-#2633 per-parameter fold did, over the whole capture-hygiene
+    /// corpus this function family has accumulated.
+    ///
+    /// The behaviour of each individual fix is pinned by its own test; what
+    /// this adds is the claim the rewrite itself makes -- that carrying N
+    /// parameters through one walk, with a bitmask narrowed per binder,
+    /// rewrites exactly the nodes N sequential walks did. `Expr: PartialEq`
+    /// makes that checkable directly rather than through observed output,
+    /// so a mask bit cleared one binder too early or too late fails here
+    /// even when no test query happens to reach the difference.
+    ///
+    /// `sequential_param_substitution` is kept in the tree for this (it is
+    /// also the >64-parameter fallback), so the oracle is the real prior
+    /// implementation rather than a re-derivation of it.
+    #[test]
+    fn combined_param_substitution_matches_the_sequential_fold_2633() {
+        let bare = |n: &str| Param::Bare(n.to_string());
+        let dollar = |n: &str| Param::Dollar(n.to_string());
+        let call = |n: &str| Expr::FuncCall {
+            name: n.to_string(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+        let var = |n: &str| Expr::Var(n.to_string());
+        let int = |n: i64| Expr::Literal(Literal::Int(n));
+        let pair = |a: Expr, b: Expr| Expr::Array(Box::new(Expr::Comma(vec![a, b])));
+
+        // Bodies spanning every binder the walk narrows at, plus the arms
+        // that must stay opaque.
+        let bodies: Vec<Expr> = vec![
+            // Plain references, both namespaces.
+            call("a"),
+            var("a"),
+            pair(call("a"), var("a")),
+            pair(call("b"), var("b")),
+            // #2141: an `as` binder clears only the dollar namespace.
+            Expr::As {
+                expr: Box::new(int(1)),
+                var: "a".to_string(),
+                body: Box::new(pair(call("a"), var("a"))),
+            },
+            // A binder for a *different* name narrows nothing.
+            Expr::As {
+                expr: Box::new(int(1)),
+                var: "z".to_string(),
+                body: Box::new(pair(call("a"), var("a"))),
+            },
+            // #2077/#2555/#2737: a nested zero-arg def of the name shadows
+            // the bare namespace in `then` *and* in its own `body`, and
+            // never the dollar namespace.
+            Expr::FuncDef {
+                name: "a".to_string(),
+                params: Vec::new(),
+                body: Box::new(pair(call("a"), var("a"))),
+                then: Box::new(pair(call("a"), var("a"))),
+                bound: FuncDefBound::default(),
+            },
+            // #2283/#2555: a nested def whose own parameter matches --
+            // bare-style shadows bare only, `$`-style shadows both.
+            Expr::FuncDef {
+                name: "h".to_string(),
+                params: vec![bare("a")],
+                body: Box::new(pair(call("a"), var("a"))),
+                then: Box::new(pair(call("a"), var("a"))),
+                bound: FuncDefBound::default(),
+            },
+            Expr::FuncDef {
+                name: "h".to_string(),
+                params: vec![dollar("a")],
+                body: Box::new(pair(call("a"), var("a"))),
+                then: Box::new(pair(call("a"), var("a"))),
+                bound: FuncDefBound::default(),
+            },
+            // #2141: reduce/foreach binders, including a computed key in the
+            // pattern, which is evaluated in the *outer* scope (#2873).
+            Expr::Reduce {
+                input: Box::new(pair(call("a"), var("a"))),
+                patterns: vec![Pattern::Var("a".to_string())],
+                init: Box::new(pair(call("a"), var("a"))),
+                update: Box::new(pair(call("a"), var("a"))),
+            },
+            Expr::Foreach {
+                input: Box::new(var("a")),
+                patterns: vec![Pattern::Var("a".to_string())],
+                init: Box::new(var("a")),
+                update: Box::new(var("a")),
+                extract: Some(Box::new(pair(call("a"), var("a")))),
+            },
+            Expr::AsPattern {
+                expr: Box::new(var("a")),
+                patterns: vec![Pattern::Var("a".to_string()), Pattern::Var("b".to_string())],
+                body: Box::new(pair(call("a"), var("b"))),
+            },
+            // #2727: a parameter inside `error(...)`'s message.
+            Expr::Error(Some(Box::new(call("a")))),
+            // #2096/#2077: an already-`Shared` node stays opaque, so a later
+            // parameter can never reach into an earlier one's argument.
+            Expr::Shared(Rc::new(pair(call("a"), var("a")))),
+            // A builtin argument is ordinary nesting, not a scope boundary.
+            Expr::Builtin(Builtin::Select(Box::new(pair(call("a"), var("a"))))),
+        ];
+
+        // Parameter lists: distinct names, duplicate names in both orders,
+        // three-way duplicates, and the `$`/bare spellings that decide which
+        // namespace each entry owns.
+        let param_sets: Vec<Vec<Param>> = vec![
+            vec![bare("a")],
+            vec![dollar("a")],
+            vec![bare("a"), bare("b")],
+            vec![dollar("a"), bare("b")],
+            vec![bare("a"), dollar("b")],
+            vec![bare("a"), dollar("a")],
+            vec![dollar("a"), bare("a")],
+            vec![bare("a"), bare("a")],
+            vec![dollar("a"), dollar("a")],
+            vec![bare("a"), dollar("a"), bare("a")],
+            vec![bare("a"), bare("b"), dollar("a"), bare("c")],
+        ];
+
+        for body in &bodies {
+            for params in &param_sets {
+                let args: Vec<Expr> = (0..params.len())
+                    .map(|i| int(i64::try_from(i).expect("small index") + 1))
+                    .collect();
+                assert_eq!(
+                    bind_def_call_params(body, params, &args),
+                    sequential_param_substitution(body, params, &args),
+                    "combined walk diverged from the sequential fold\n  body: {body:?}\n  params: {params:?}"
+                );
+            }
+        }
+    }
+
     /// The `$`-first/bare-last row is the one that pins the two winners
     /// apart: `$a` must still resolve to the *leading* `$`-style
     /// parameter's argument (the trailing bare parameter creates no
