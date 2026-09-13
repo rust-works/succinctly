@@ -152,15 +152,15 @@ impl YamlIndex<Vec<u64>> {
     /// pairing the parse with [`mark_json_sourced`](Self::mark_json_sourced)
     /// so the two can never drift apart (#2279).
     ///
-    /// Prefer this over `build` + `mark_json_sourced`: the JSON grammar
-    /// rules real yq enforces for `-p json` (flow-sequence delimiters
+    /// Prefer this over `build` + `mark_json_sourced`: the grammar rules
+    /// real yq enforces for `-p json` (flow-sequence delimiters
     /// `[1,]`/`[,1]`/`[1,,2]` (#2279); scalar grammar at every value
-    /// position, `True`/`.5`/`+1`/a bare `- 1`/`a: 1` (#2778)) can only be
-    /// applied while parsing, so a caller that marks the index afterwards
-    /// has already accepted the malformed input. See `Parser::json_strict`
-    /// for the exact scope — delimiters: sequences only, never mappings;
-    /// scalar grammar: values only, never keys, never anchor/tag-prefixed
-    /// content.
+    /// position, `True`/`.5`/`+1`/a bare `- 1`/`a: 1` (#2778); flow-mapping
+    /// token-*pairing*, not stricter delimiters -- `{"a":1 "b":2}`,
+    /// `{,}`, `{"a" 1}` (#2777)) can only be applied while parsing, so a
+    /// caller that marks the index afterwards has already accepted the
+    /// malformed input. See `Parser::json_strict` for the exact scope of
+    /// each.
     ///
     /// # Errors
     ///
