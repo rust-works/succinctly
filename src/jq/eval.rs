@@ -27860,11 +27860,7 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
 ///    jq never resumes a generator its consumer has finished with.
 /// 3. otherwise the generator's own terminal control, or exhaustion.
 fn resolve_stream_flow(flow: Flow, stashed: Option<ResolveFlow>) -> ResolveFlow {
-    if let Flow::Escaped(Control::Halt(code))
-    | Flow::Stopped {
-        pending: Some(Control::Halt(code)),
-    } = flow
-    {
+    if let Some(code) = flow_halt_code(&flow) {
         return ResolveFlow::Escaped(EvalEscape::Halt(code));
     }
     if let Some(other) = stashed {
@@ -27875,6 +27871,27 @@ fn resolve_stream_flow(flow: Flow, stashed: Option<ResolveFlow>) -> ResolveFlow 
         // `Stopped` with no `stashed` answer is unreachable: these sinks
         // answer `Demand::Stop` only when they set it.
         Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
+    }
+}
+
+/// The exit code of a halt this flow is carrying — whether it escaped bare,
+/// or was left pending on a [`Flow::Stopped`] by an eager fallback that had
+/// already computed it before the sink was satisfied.
+///
+/// One definition for the three path-mode sites that must not downgrade a
+/// halt into a catchable path error ([`resolve_leaf`], [`resolve_leaf_sink`],
+/// [`resolve_stream_flow`]); each spelled the same two-alternative pattern
+/// out separately before #2694, which is exactly the shape CLAUDE.md's
+/// "duplicated predicates diverge silently" note is about. `resolve_leaf`
+/// reaches both alternatives, so this is one predicate with real coverage
+/// rather than three with partial.
+fn flow_halt_code(flow: &Flow) -> Option<i32> {
+    match flow {
+        Flow::Escaped(Control::Halt(code))
+        | Flow::Stopped {
+            pending: Some(Control::Halt(code)),
+        } => Some(*code),
+        _ => None,
     }
 }
 
@@ -29698,9 +29715,16 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         let demand = sink(branch);
         if demand == Demand::Stop {
             stopped_by_sink = true;
-            return Demand::Stop;
         }
-        if delivered >= limit {
+        // Two independent reasons to stop, folded into one answer: the
+        // sink asked, or this leaf has delivered its own `keep` bound.
+        // Only the first is reachable with today's bounded consumers --
+        // `resolve_bounded_sink` (limit/first) and the nth arm both answer
+        // `Demand::Stop` from `sink(branch)` on the very branch that
+        // reaches the count they narrowed `keep` to. The second is kept
+        // because honouring `keep` is this function's own contract with
+        // #1872, not something to inherit from whoever is downstream.
+        if demand == Demand::Stop || delivered >= limit {
             Demand::Stop
         } else {
             Demand::Continue
@@ -29712,12 +29736,13 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     // error. Under `Keep::AtMost` the fold has already consumed the values
     // produced before it and jq streams them, which is what the sink has
     // just done.
+    if let Some(code) = flow_halt_code(&flow) {
+        return ResolveFlow::Escaped(EvalEscape::Halt(code));
+    }
+    if stopped_by_sink {
+        return ResolveFlow::Stopped;
+    }
     match flow {
-        Flow::Escaped(Control::Halt(code))
-        | Flow::Stopped {
-            pending: Some(Control::Halt(code)),
-        } => ResolveFlow::Escaped(EvalEscape::Halt(code)),
-        _ if stopped_by_sink => ResolveFlow::Stopped,
         Flow::Escaped(control) => ResolveFlow::Escaped(EvalEscape::from(control)),
         Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
     }
@@ -29832,7 +29857,7 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // evaluation of `expr` already ran the candidate that halted, side
         // effects included, by the time control reaches here.
         if let Some(EvalEscape::Halt(code)) = &trailing {
-            return Some(Err((Vec::new(), EvalEscape::Halt(*code))));
+            return Some(Err((Vec::new(), EvalEscape::Halt(*code)))); // omni-dev: coverage tolerate-line reason="unreachable: `is_primitive` admits only Identity/Field/Index/Slice, and of those only a Slice's computed bounds can halt -- all four have their own arm in `resolve_node_sink`/`resolve_node_eager`, so none reaches this function. Pre-existing; #2694 only wrapped the return in `Some` (#2694)"
         }
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
@@ -29866,6 +29891,7 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
             // that invariant ever changes, mirroring the resolver's existing
             // "no general bytecode path tracking" wording (#412).
             _ => Err((
+                // omni-dev: coverage tolerate-line reason="unreachable, as this arm's own comment above says: indexing or slicing a value yields zero or one result, so `is_primitive` never produces more than one -- kept as a named error rather than a panic. Pre-existing; #2694 only wrapped the enclosing return in `Some` (#2694)"
                 Vec::new(),
                 EvalError::new("Cannot use a computed index after a multi-output path component")
                     .into(),
@@ -29940,14 +29966,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // before this sink was satisfied) must never be downgraded into a
     // catchable path error, matching the primitive branch's identical rule
     // above.
-    let halt = match &flow {
-        Flow::Escaped(Control::Halt(code))
-        | Flow::Stopped {
-            pending: Some(Control::Halt(code)),
-        } => Some(*code),
-        _ => None,
-    };
-    if let Some(code) = halt {
+    if let Some(code) = flow_halt_code(&flow) {
         // Under `Keep::First` the prefix stays empty, exactly as before
         // #1872: this arm is reached with at most one already-produced
         // value, and `path(...)`'s own consumers never saw it. Under
