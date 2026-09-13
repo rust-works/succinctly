@@ -3925,15 +3925,46 @@ paid only by a key spelled like a number, bool or null. A complex `? [a, b]` key
 explicitly tagged key and a key whose bytes do not decode keep the display-string route,
 unchanged from #2763.
 
+**The canonical-spelling gate.** `OwnedValue` keeps no text of its own for a null, a
+bool, or a non-canonical integer -- `~`, `True` and `01` all resolve to the same
+`Null`/`Bool(true)`/`Int(1)` their canonical spellings `null`/`true`/`1` do. Retyping
+every retypable spelling regardless would therefore materialize the *same* key for two
+document members that are distinct in yq (`null: a` and `~: b`), and reassembling them
+(`from_entries`, `with_entries`) would silently collapse one member into the other -- a
+real regression an earlier draft of this fix shipped and #2804's review caught live
+against the oracle. So a key only actually retypes when [`yq_scalar_text`] of its
+resolved value reproduces the raw spelling byte-for-byte (`key_owned_value_spells_
+canonically`); a non-canonical spelling falls back to the display string instead, the
+same route an explicitly tagged or complex key already takes. Confirmed live against
+v4.53.3 on `null: a\n~: b\n` and `1: a\n01: b\n`: `with_entries(.)` and
+`to_entries | from_entries` keep both members on both tools, and
+`[.[] | select(key == 1)]` matches only the `1:` member on both, `01:` included.
+
 Three residuals, each captured live from v4.53.3:
 
-- **The spelling is gone** ([#2802](https://github.com/rust-works/succinctly/issues/2802)).
-  `OwnedValue` keeps no text for a null, a bool or a non-canonical integer, so a `~` key
-  prints `null` where yq prints `~` (`keys`, `[.[] | key | tostring]`), a `01` key compares
-  and prints as `1` (`select(key == 1)` on a document with both `1:` and `01:` matches
-  both; yq only the first), and `to_entries | from_entries` on a mapping holding both a
-  `null:` and a `~:` key collapses them into one member -- the same class as `~ | tostring`
-  printing `"null"` for a value.
+- **The spelling is gone, and readers now disagree about the type too**
+  ([#2802](https://github.com/rust-works/succinctly/issues/2802)). A non-canonically
+  spelled key (`01`, `~`, `True`, ...) stays on the display-string route once
+  *eagerly materialized* into an `OwnedValue` (`key_owned_value`: `keys`, `to_entries`,
+  `with_entries`, a `select(key == ...)`/comparison read via a live cursor), so it never
+  loses another member on `from_entries`/`with_entries` -- but it also never gains the
+  type there: `keys`/`to_entries | map(.key)` print `"01"`/`"~"`/`"True"` rather than
+  `1`/`null`/`true`. **The gate only reaches eager materialization, not every cursor
+  read**, so two different readers of the identical key now answer differently:
+  `keys | map(tag)`/`[keys[] | tag]`/`[.[] | key | tag]` (a `tag` read straight off a
+  still-live *lazy* key cursor, not an already-materialized `OwnedValue`) answers the
+  fully-resolved `!!null`/`!!int`/`!!bool` for a `01`/`~`/`True` key, matching yq -- while
+  `to_entries | map(.key | tag)` (the key is already a plain object field by that point,
+  no cursor left) answers the gated `!!str`. Likewise `[.[] | key]` (array construction
+  directly over `.[] | key`, nothing else reading `key` in between) still prints the
+  fully-resolved `null`/`1`/`true`, matching yq, where `keys` on the identical document
+  prints the gated string. `select(key == null)` inherits the gated side's answer: real
+  yq's `!!null`-vs-`!!null` rule is type-based (matches `~:` regardless of spelling), but
+  a gated `~:` materializes as `OwnedValue::String("~")`, which fails that check -- so
+  `select(key == null)` on a document holding both `null:` and `~:` answers only the
+  `null:` member's value here, where yq answers both. Fully resolving either gap needs
+  `OwnedValue` to carry the source spelling the way `NumberLiteral` already does for a
+  float, which is #2802's own scope.
 - **The path register stays a string** ([#2801](https://github.com/rust-works/succinctly/issues/2801)).
   yq's `path` types an `!!int` key as an integer component -- `[.[] | path]` on `1: x` is
   `[[1]]` there and `[["1"]]` here -- and nothing else; `getpath`/`setpath`/`del` read the

@@ -72,9 +72,10 @@ use super::eval::{
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
     yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, ComputedSliceBound, Control,
-    Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachElementSink,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, SliceTargetKind, YqSemantics,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, SliceTargetKind,
+    YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -1715,7 +1716,8 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// The value a mapping key materializes as (#2785): its display string for
 /// every key that can only be a string, and the ordinary scalar resolution
 /// -- `to_owned_cursor`, tag lookup included -- for a key spelled like a
-/// number, bool or null, which real yq keeps as an `!!int`/`!!bool`/
+/// number, bool or null *and* whose spelling is the canonical rendering of
+/// that resolved value, which real yq keeps as an `!!int`/`!!bool`/
 /// `!!null`/`!!float` node through `key`, `keys` and `to_entries`.
 ///
 /// The owned twin of the walk's key-node emission
@@ -1727,6 +1729,23 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// carries an explicit tag, a decode-failure fallback spelling
 /// (#1247/#1642), or is a complex key (which decodes to `""`) -- the three
 /// cases `key_node_spells` refuses a node for.
+///
+/// **The canonical-spelling gate (#2785 regression, #2802):** `OwnedValue`
+/// cannot keep a non-canonical spelling's text -- `~`, `01` and `True` all
+/// resolve to the same `Null`/`Int(1)`/`Bool(true)` as their canonical
+/// spellings `null`/`1`/`true`. Retyping both members of a document holding
+/// e.g. `null: a` and `~: b` would therefore materialize the *same*
+/// `OwnedValue::Null` key for each, and `entries_to_object`'s
+/// `IndexMap<String, _>` would silently collapse them into one entry on the
+/// next `from_entries`/`with_entries` -- real yq loses no member on this
+/// input. So a retypable spelling only actually retypes when
+/// [`yq_scalar_text`] of the resolved value reproduces `display`
+/// byte-for-byte; otherwise it falls back to the display string, same as an
+/// explicitly tagged or complex key. `1`, `true`, `null`, `1.5` and `-3`
+/// retype; `01`, `~`, `True`, `NULL` and `+4` stay strings until #2802 can
+/// carry their own text -- matching yq's own resolved *type* either way
+/// (both become the same node), only differing in this reader's
+/// materialization for the spellings `OwnedValue` cannot distinguish.
 ///
 /// `None` is `key_display_string`'s own `None`: a key the format's grammar
 /// rejects outright (#1194), which the caller raises on.
@@ -1740,7 +1759,27 @@ pub(crate) fn key_owned_value<V: DocumentValue, C: DocumentCursor>(
     if is_fallback || !key_spelling_may_retype(&display) || key_cursor.explicit_tag().is_some() {
         return Ok(Some(OwnedValue::String(display.into_owned())));
     }
-    to_owned_cursor(key_cursor).map(Some)
+    let owned = to_owned_cursor(key_cursor)?;
+    Ok(Some(
+        if key_owned_value_spells_canonically(&owned, &display) {
+            owned
+        } else {
+            OwnedValue::String(display.into_owned())
+        },
+    ))
+}
+
+/// The canonical-spelling check [`key_owned_value`] and
+/// [`path_context_item_to_owned`]'s `OneCursorValue` arm both gate a
+/// retypable key on: whether `owned` -- the scalar its cursor resolved to
+/// -- is spelled `display` when rendered the same way `tostring`/`==`
+/// would render it ([`yq_scalar_text`], #2785's own text-equality rule).
+/// `owned` is always a scalar here (a key's cursor never resolves to a
+/// container), so `yq_scalar_text` never actually answers `None`; the
+/// fallback exists only so a future caller passing something else fails
+/// closed (stays a string) instead of panicking.
+fn key_owned_value_spells_canonically(owned: &OwnedValue, display: &str) -> bool {
+    yq_scalar_text::<YqSemantics>(owned).is_some_and(|text| text == display)
 }
 
 /// [`effective_keys`](super::document::effective_keys) with each key
@@ -15497,7 +15536,13 @@ fn path_context_item_to_owned<V: DocumentValue>(
         // #2785: a key spelled like a number, bool or null is the one that
         // takes the ladder -- it is a typed node in real yq (`1: x` is an
         // `!!int` key), and `to_owned_with_cursor` resolves it the same way
-        // the member's *value* would resolve, tag lookup included.
+        // the member's *value* would resolve, tag lookup included. But only
+        // when that spelling is the *canonical* rendering of the resolved
+        // value (`key_owned_value_spells_canonically`, its owned twin's own
+        // doc comment has the full rationale): otherwise two differently
+        // spelled keys sharing one canonical value (`null:`/`~:`) would
+        // retype into the same `OwnedValue` and collapse together on the
+        // next `from_entries`/`with_entries`.
         GenericItem::OneCursorValue(c, v) => match v.as_str() {
             Some(s) if !key_spelling_may_retype(&s) => {
                 debug_assert!(
@@ -15507,11 +15552,19 @@ fn path_context_item_to_owned<V: DocumentValue>(
                 );
                 Ok(OwnedValue::String(s.into_owned()))
             }
-            // A retypable spelling, or (unreachable through the gate above)
-            // a non-string token: materialized the ordinary way rather than
-            // asserted, so a future walk arm emitting this shape for
-            // something else is merely slower, never wrong.
-            _ => to_owned_with_cursor(&v, Some(c)),
+            Some(s) => {
+                let owned = to_owned_with_cursor(&v, Some(c))?;
+                Ok(if key_owned_value_spells_canonically(&owned, &s) {
+                    owned
+                } else {
+                    OwnedValue::String(s.into_owned())
+                })
+            }
+            // Unreachable through the gate above: a non-string token,
+            // materialized the ordinary way rather than asserted, so a
+            // future walk arm emitting this shape for something else is
+            // merely slower, never wrong.
+            None => to_owned_with_cursor(&v, Some(c)),
         },
         GenericItem::Owned(o) => Ok(o),
         GenericItem::One(_)
@@ -20576,10 +20629,38 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // every other construct that threads this result on reads the key's
         // own metadata. `cursor_slot`'s scan already holds the key cursor;
         // `key_node_spells` is the same string/tag check the walk applies.
+        //
+        // #2785 regression guard: `key_node_spells` alone says nothing about
+        // *which* type a retypable-looking key resolves to, so handing back
+        // the bare cursor unconditionally would let it retype freely once
+        // some later consumer (`==`, `-o=json` collection, ...) resolves it
+        // via the ordinary cursor route -- the same collision
+        // `key_owned_value` guards against (its own doc comment has the
+        // rationale), reached here through a different call site
+        // (`select(key == 1)` matching a sibling `01:` too, confirmed live
+        // against yq v4.53.3). Gated on `key_spelling_may_retype` first
+        // (not just `key_owned_value`'s own `String` vs. typed result):
+        // `key_owned_value` answers `String` for an *ordinary* string key
+        // too, and unconditionally reading that as "no node" broke
+        // `line`/`tag`/... for every string-keyed member (caught by
+        // `key_node_metadata_2763`'s own regression suite) -- only a
+        // spelling the ladder could actually retype needs the extra check.
         Builtin::Key if cursor.is_some() => match cursor_slot(&cursor.expect("guarded")) {
             Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
-                OwnedValue::String(s) if key_node_spells(&key_cursor, &key_cursor.value(), s) => {
+                OwnedValue::String(s)
+                    if key_node_spells(&key_cursor, &key_cursor.value(), s)
+                        && !key_spelling_may_retype(s) =>
+                {
                     GenericResult::OneCursor(key_cursor)
+                }
+                OwnedValue::String(s) if key_node_spells(&key_cursor, &key_cursor.value(), s) => {
+                    match key_owned_value(&key_cursor.value(), &key_cursor) {
+                        Ok(Some(OwnedValue::String(_)) | None) => {
+                            GenericResult::Owned(OwnedValue::String(s.clone()))
+                        }
+                        Ok(Some(_)) => GenericResult::OneCursor(key_cursor),
+                        Err(e) => GenericResult::Error(e),
+                    }
                 }
                 _ => GenericResult::Owned(key),
             },
@@ -23544,13 +23625,39 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         // pipe from that node, exactly as `continue_owned_identity_ancestor`
         // hands `parent` back; a `Pairs` tail keeps the owned position.
         Expr::Builtin(Builtin::Key) => {
+            // #2785 regression guard: same canonical-spelling gate as
+            // `eval_builtin`'s `Builtin::Key if cursor.is_some()` arm (its
+            // own doc comment has the rationale) -- this is the owned-
+            // identity pipe's independent copy of the same `cursor_slot`/
+            // `key_node_spells` decision (`.[] | key` leaves the cursor
+            // domain here, so it never reaches that other arm), and without
+            // the same guard it retypes a non-canonically-spelled key
+            // unconditionally, which is exactly the collision
+            // `key_owned_value` exists to prevent. Gated on
+            // `key_spelling_may_retype` first, same as that arm: an
+            // *ordinary* string key also gets `String` back from
+            // `key_owned_value` (correctly, not as a failed retype), so
+            // consulting it for every string key rather than just a
+            // retypable-looking one dropped the key node for every
+            // string-keyed member (caught by `key_node_metadata_2763`'s own
+            // regression suite: `.a | tostring | key | line`).
             let key_node = match (id.key_node, id.ancestors.as_slice(), id.base) {
                 (false, [], Some(c)) => match cursor_slot(&c) {
                     Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
                         OwnedValue::String(s)
-                            if key_node_spells(&key_cursor, &key_cursor.value(), s) =>
+                            if key_node_spells(&key_cursor, &key_cursor.value(), s)
+                                && !key_spelling_may_retype(s) =>
                         {
                             Some(key_cursor)
+                        }
+                        OwnedValue::String(s)
+                            if key_node_spells(&key_cursor, &key_cursor.value(), s) =>
+                        {
+                            match key_owned_value(&key_cursor.value(), &key_cursor) {
+                                Ok(Some(OwnedValue::String(_)) | None) => None,
+                                Ok(Some(_)) => Some(key_cursor),
+                                Err(e) => return Flow::Escaped(Control::Error(e)),
+                            }
                         }
                         _ => None,
                     },
