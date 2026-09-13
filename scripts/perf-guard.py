@@ -131,6 +131,27 @@ QUERIES = [
     # it does not run.
     ("arrays_first_map_iterate", "arrays", "2mb", "jq", "first(map(length) | .[])"),
     ("arrays_map_iterate", "arrays", "2mb", "jq", "map(length) | .[]"),
+    # #2655: path-mode rows. Every query above reads only -- none exercises
+    # `resolve_node`/`resolve_node_sink` (`src/jq/eval.rs`) or anything under
+    # it, so a regression confined to that resolver (like #2042's own
+    # +21-33%) passes this guard at -0.0% no matter how large. Four rows on
+    # the existing `users`/`2mb` fixture, each naming the resolver path it
+    # watches:
+    ("users_del_select", "users", "2mb", "jq", "del(.users[] | select(.score < 100))"),
+    (
+        "users_del_bound_select",
+        "users",
+        "2mb",
+        "jq",
+        "del(.users[] | .score as $y | select($y < 100))",
+    ),
+    ("users_assign_scores", "users", "2mb", "jq", "(.users[] | .score) = 1"),
+    ("users_path_walk", "users", "2mb", "jq", "[path(.users[] | .age)] | length"),
+    # yq-mode writes take a different route (`evaluate_yaml_cursor` -> the
+    # DOM path in `src/bin/succinctly/yq_runner.rs`) than jq-mode `del()`
+    # above -- `users_yq_keys_unsorted` is this matrix's only yq row and it
+    # only reads.
+    ("users_yq_del_select", "users", "2mb", "yq", "del(.users[] | select(.score < 100))"),
 ]
 
 IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
