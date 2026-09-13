@@ -17441,6 +17441,43 @@ fn test_slice_bound_controls_unmoved_2853() -> Result<()> {
     Ok(())
 }
 
+/// #2853 (review finding): `|= empty` with the slice **nested**, which the
+/// first round of tests missed by only ever exercising it as the whole path
+/// -- the one shape with no enclosing consumer of `through_slice`'s `bool`.
+///
+/// That `bool` is not "did this call succeed", it is "did a real value reach
+/// this slot": the ancestor that may have auto-vivified a `Null` on the way
+/// in reads it to decide whether to keep that slot or undo it. Reporting a
+/// write that never happened kept a vivified `{"a":null}` where jq answers
+/// `null`, and -- the severe row -- silently *undid* an already-completed
+/// delete in a two-path fan-out.
+#[test]
+fn test_null_target_non_numeric_slice_bound_nested_empty_update_2853() -> Result<()> {
+    for (filter, input, expected) in [
+        (r#".a["x":] |= empty"#, "null", "null"),
+        (r#".a["x":]? |= empty"#, "null", "null"),
+        (r#".a["x":][0] |= empty"#, "null", "null"),
+        (r#".a["x":][0:1] |= empty"#, "null", "null"),
+        (r#".a["x":].c |= empty"#, "null", "null"),
+        (r#".a.b["x":] |= empty"#, "null", "null"),
+        // A slice component nested inside another one.
+        (r#".["x":]["y":] |= empty"#, "null", "null"),
+        // The severe one: `.a` is genuinely deleted by the first path, and
+        // the second must not resurrect it.
+        (
+            r#"(.a, .a["x":]) |= empty"#,
+            r#"{"a":null,"b":1}"#,
+            r#"{"b":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// #2248, `resolve_slice_expr`'s identical sibling to
 /// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
 /// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints

@@ -25187,7 +25187,21 @@ fn through_slice<E: From<EvalError>>(
         non_integer_bound,
     } = flags;
     // #2853: a bound jq never parsed. This arm comes first because it is a
-    // property of the *component*, not of `root`'s kind -- and it is
+    // property of the *component*, not of `root`'s kind.
+    //
+    // Deliberately *not* narrowed to `matches!(root, OwnedValue::Null)`, even
+    // though the component can only be produced over a null target. A slot
+    // can stop being null between resolution and write -- `{"a":null} |
+    // (.a, .a["x":]) = 5` -- and jq, which re-reads the kind, answers
+    // `Cannot index number with object` there where this answers the
+    // integers error. Falling through instead would be far worse than a
+    // wrong sentence: a `Raw` bound carries `start: None, end: None`, which
+    // every arm below reads as *the whole slice*, so an array target would
+    // be silently spliced. The message gap is pre-existing in effect --
+    // before #2853 the resolver raised this same error for this same
+    // program -- and is tracked separately (#2927).
+    //
+    // It is also
     // deliberately not gated on `terminal_write`: mid-chain, `edit` is the
     // inner `set_path_steps`/`update_path_steps`, whose own `wrote` answers
     // the very same question (`.["x":][0] = 5` raises, `.["x":][0] |= empty`
@@ -25214,10 +25228,23 @@ fn through_slice<E: From<EvalError>>(
             Err(EvalError::slice_indices_not_integers().into())
         } else {
             // `|= empty` (#1894): jq's `_modify` falls back to `delpaths`,
-            // which never parses the descriptor at all -- so this no-ops to
-            // `null`, exactly as `del(.["x":])` does. `root` is left
-            // untouched.
-            Ok(true)
+            // which never parses the descriptor at all -- so this no-ops,
+            // exactly as `del(.["x":])` does. `root` is left untouched.
+            //
+            // `Ok(false)`, not `Ok(true)` -- the same answer the `Null` arm
+            // below gives, and for the same reason. The `bool` is not "did
+            // this call succeed", it is "did a real value reach this slot",
+            // and the ancestor that may have auto-vivified a `Null` on the
+            // way in reads it to decide whether to strand that slot or undo
+            // it. Reporting `true` here claimed a write that never happened:
+            // `null | .a["x":] |= empty` kept the `{"a":null}` the walk had
+            // vivified where jq answers `null`, and -- worse --
+            // `{"a":null,"b":1} | (.a, .a["x":]) |= empty` silently *undid*
+            // the completed delete of `.a`, answering `{"b":1,"a":null}`
+            // where jq answers `{"b":1}`. Found in review; the tests only
+            // covered the slice-as-whole-path shape, which is the one shape
+            // with no enclosing consumer of this `bool`.
+            Ok(false)
         };
     }
     match root {
