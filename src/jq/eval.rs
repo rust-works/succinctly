@@ -27760,8 +27760,8 @@ fn emit_passthrough<'a>(
 ///   preserves this for free, since the branch is delivered before `cond`
 ///   is asked again.
 /// * a [`Control::Halt`] is not downgraded into a catchable escape, and
-///   outranks whatever `dispatch` was reporting — the same ordering
-///   [`resolve_leaf_sink`] applies, and for the same reason.
+///   outranks whatever `dispatch` was reporting — see [`resolve_stream_flow`],
+///   which decides that for every streaming arm.
 fn resolve_cond_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
@@ -27778,6 +27778,26 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
         }
     });
 
+    resolve_stream_flow(flow, dispatched)
+}
+
+/// The verdict of a path-mode arm that pulled a generator through
+/// [`eval_each_owned`] and stopped it the moment a downstream consumer
+/// answered anything but [`ResolveFlow::Exhausted`] (#2694).
+///
+/// `stashed` is that consumer's answer, if it ever gave one. The ordering:
+///
+/// 1. a [`Control::Halt`] the generator itself raised wins outright -- it
+///    is not catchable, so downgrading it into a `Stopped` or into a
+///    catchable [`EvalEscape::Error`] would be wrong. [`resolve_leaf_sink`]
+///    states the same rule at length, and [`Flow::Stopped`]'s own doc
+///    comment names `resolve_leaf` as the consumer that must keep a
+///    `pending` halt rather than drop it.
+/// 2. otherwise `stashed`: it is *why* the generator was stopped, so
+///    whatever the generator was still holding is never reached, exactly as
+///    jq never resumes a generator its consumer has finished with.
+/// 3. otherwise the generator's own terminal control, or exhaustion.
+fn resolve_stream_flow(flow: Flow, stashed: Option<ResolveFlow>) -> ResolveFlow {
     if let Flow::Escaped(Control::Halt(code))
     | Flow::Stopped {
         pending: Some(Control::Halt(code)),
@@ -27785,13 +27805,13 @@ fn resolve_cond_fork_stream<S: EvalSemantics>(
     {
         return ResolveFlow::Escaped(EvalEscape::Halt(code));
     }
-    if let Some(other) = dispatched {
+    if let Some(other) = stashed {
         return other;
     }
     match flow {
         Flow::Escaped(control) => ResolveFlow::Escaped(EvalEscape::from(control)),
-        // `Stopped` without a stashed `dispatched` is unreachable: this
-        // sink answers `Demand::Stop` only when it sets that field.
+        // `Stopped` with no `stashed` answer is unreachable: these sinks
+        // answer `Demand::Stop` only when they set it.
         Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
     }
 }
@@ -28444,47 +28464,38 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `FirstExpr`/`IndexExpr` — then resolve the substituted body. This
         // needs no new environment-threading in the resolver.
         //
-        // Uses `eval_owned_expr_fork` rather than `eval_owned_multi`: the
-        // latter discards whatever prefix a partially-produced bind stream
-        // already yielded before an error/break/halt (#694's "abort the
-        // whole expression" contract, correct for computed keys but wrong
-        // here), so a source that binds `$x` once and *then* fails never
-        // even ran `body` for that one successful binding. Confirmed live:
-        // `path((1, halt_error(3)) as $x | .a)` on `{"a":1}` prints `["a"]`
-        // before halting — the `$x=1` iteration's own `body` resolution
-        // completing — not nothing.
+        // The source streams (#2694) rather than being collected first, so
+        // its side effects interleave with `body`'s resolution — and, under
+        // a demand-driven consumer, a source value nothing asks for is never
+        // produced at all. Either way the prefix survives an escape, unlike
+        // `eval_owned_multi`, which discards whatever a partially-produced
+        // bind stream already yielded (#694's "abort the whole expression"
+        // contract, correct for computed keys but wrong here): a source that
+        // binds `$x` once and *then* fails still runs `body` for that one
+        // successful binding. Confirmed live: `path((1, halt_error(3)) as $x
+        // | .a)` on `{"a":1}` prints `["a"]` before halting — the `$x=1`
+        // iteration's own `body` resolution completing — not nothing.
         //
         // #2042: the source is resolved in path position too (see
-        // [`resolve_bind_source`]) so a binding from a navigated position
+        // [`resolve_bind_source_witness`]) so a binding from a navigated position
         // gets an `Origin::At` marker carrying where it was bound. That
         // resolution is a witness only -- jq evaluates an `as` source with
         // path tracking suspended (`subexp_nest > 0`), so the source never
         // moves the register (`path(.a as $y | .b)` is `["b"]`) and never
         // raises a path error of its own; the body still resolves against
         // this arm's own `value`, `trackable` and `frame`, exactly as before.
-        Expr::As { expr, var, body } => {
-            let (bound_values, trailing) =
-                resolve_bind_source::<S>(expr, body, var, value, trackable, frame);
-            for (bound, origin) in bound_values {
+        Expr::As { expr, var, body } => resolve_bind_source_sink::<S>(
+            expr,
+            body,
+            var,
+            value,
+            trackable,
+            frame,
+            &mut |bound, origin| {
                 let substituted = substitute_bound_var_at(expr, body, var, &bound, origin, None);
-                match resolve_node_sink::<S>(
-                    &substituted,
-                    value,
-                    trackable,
-                    snapshot,
-                    frame,
-                    keep,
-                    sink,
-                ) {
-                    ResolveFlow::Exhausted => {}
-                    other => return other,
-                }
-            }
-            match trailing {
-                None => ResolveFlow::Exhausted,
-                Some(control) => ResolveFlow::Escaped(control.into()),
-            }
-        }
+                resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
+            },
+        ),
         // #2649: `SRC as PATTERN | body`, jq's destructuring bind. Like `As`
         // above, jq evaluates SRC with tracking suspended, so the source
         // itself never moves the register -- but the *pattern* is compiled
@@ -31085,12 +31096,23 @@ struct FoldSourceValue {
     register_path: Option<Rc<PathPrefix>>,
 }
 
-/// Evaluate an `as`-binding's source in path position, for
-/// `resolve_node`'s `Expr::As` arm (#2042): each bound value paired with
-/// the [`Origin`] its marker should carry -- `Some(Origin::At { .. })` when
-/// the source navigated to a real path from a provable position, `None`
-/// otherwise (the caller then applies the pre-#2042 `is_identity_passthrough`
-/// rule, which is what a plain `. as $x` still gets).
+/// What a witness route resolved an `as` source to: the bound values, each
+/// paired with the [`Origin`] its marker should carry, plus the trailing
+/// [`Control`] the resolution ended in (#2042).
+type BindSourceWitness = (Vec<(OwnedValue, Option<Origin>)>, Option<Control>);
+
+/// Resolve an `as`-binding's source in path position, for
+/// `resolve_node_sink`'s `Expr::As` arm (#2042): each bound value paired
+/// with the [`Origin`] its marker should carry -- `Some(Origin::At { .. })`
+/// when the source navigated to a real path from a provable position.
+///
+/// `None` is "no witness applies": the source binds by value, with no
+/// origin, and [`resolve_bind_source_sink`] evaluates it there (streaming
+/// it, which is why this function returns the decision rather than taking a
+/// `by_value` fallback closure). A pair whose `Origin` is `None` is a
+/// per-element decline *within* a witness that did apply; the caller then
+/// applies the pre-#2042 `is_identity_passthrough` rule to it, which is what
+/// a plain `. as $x` still gets.
 ///
 /// The path-mode resolution is a **witness, not the evaluation**: real jq
 /// runs an `as` source with path tracking suspended, so it never moves the
@@ -31106,8 +31128,8 @@ struct FoldSourceValue {
 ///   position; anything else -- `try`, `?`, `//`, `select`, a construction,
 ///   a builtin -- binds by value, with no origin, exactly as before #2042.
 ///   On that grammar the resolver's one refusal is a slice of a non-array
-///   (`.a[1:2]` on a string, which jq allows), and the fallback re-runs
-///   the source by value with nothing to repeat; any other escape keeps
+///   (`.a[1:2]` on a string, which jq allows), and the `None` it answers
+///   re-runs the source by value with nothing to repeat; any other escape keeps
 ///   the resolver's own prefix and escape, whose partial-prefix contract
 ///   already mirrors `eval_owned_expr_fork`'s (`path((.a, error("x")) as
 ///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
@@ -31121,57 +31143,53 @@ struct FoldSourceValue {
 ///   but the head (`(.c | $y | .b) as $w`) falls to the ordinary
 ///   resolution below, which certifies it against the ambient position
 ///   -- a refusal where jq answers, listed with the refuse-only rows.
-fn resolve_bind_source<S: EvalSemantics>(
+fn resolve_bind_source_witness<S: EvalSemantics>(
     source: &Expr,
     body: &Expr,
     var: &str,
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
-) -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>) {
-    let by_value = || {
-        let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
-        (values.into_iter().map(|v| (v, None)).collect(), control)
-    };
+) -> Option<BindSourceWitness> {
     if S::TAG != EvalTag::Jq || !var_reaches_path_position(body, var) {
-        return by_value();
+        return None;
     }
     if let Some((marker, rest)) = marker_headed(source) {
         if let Origin::At { invocation, path } = &marker.origin {
             if rest.is_empty() {
-                return (
+                return Some((
                     vec![(marker.value.clone(), Some(marker.origin.clone()))],
                     None,
-                );
+                ));
             }
             let rest = Expr::Pipe(rest);
             if !is_pure_navigation(&rest) {
-                return by_value();
+                return None;
             }
             let rerooted = Frame::at(*invocation, Rc::clone(&path.0));
-            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted, by_value);
+            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted);
         }
     }
     if !trackable || frame.at.is_none() {
-        return by_value();
+        return None;
     }
     let (pure_navigation, navigates) = classify_navigation(source);
     if !pure_navigation || !navigates {
-        return by_value();
+        return None;
     }
-    resolve_bind_source_in::<S>(source, value, trackable, frame, by_value)
+    resolve_bind_source_in::<S>(source, value, trackable, frame)
 }
 
-/// [`resolve_bind_source`]'s path-mode resolution proper, against `value`
-/// sitting at `frame`; `by_value` is the fallback for an untracked
-/// navigation the resolver refuses but jq's suspended tracking evaluates.
+/// [`resolve_bind_source_witness`]'s path-mode resolution proper, against
+/// `value` sitting at `frame`. `None` is "the witness declines" -- an
+/// untracked navigation the resolver refuses but jq's suspended tracking
+/// evaluates -- which sends the caller to the by-value route.
 fn resolve_bind_source_in<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
-    by_value: impl Fn() -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>),
-) -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>) {
+) -> Option<BindSourceWitness> {
     let bind = |b: PathBranch<'_>| {
         let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
             frame.origin_at(&b.path)
@@ -31188,20 +31206,76 @@ fn resolve_bind_source_in<S: EvalSemantics>(
         frame,
         Keep::AtMost(usize::MAX),
     ) {
-        Ok(branches) => (branches.into_iter().map(bind).collect(), None),
+        Ok(branches) => Some((branches.into_iter().map(bind).collect(), None)),
         // Either of the resolver's own refusal kinds is an artefact here
         // (jq raises no path error inside a source at all), and on the
         // witness grammar it always escapes -- nothing in it catches.
         Err((_, EvalEscape::Error(e)))
             if e.is_untracked_navigation_error() || e.is_invalid_path_expression() =>
         {
-            by_value()
+            None
         }
-        Err((prefix, escape)) => (
+        Err((prefix, escape)) => Some((
             prefix.into_iter().map(bind).collect(),
             Some(Control::from(escape)),
-        ),
+        )),
     }
+}
+
+/// Drive an `as`-binding's source, delivering each `(value, origin)` pair to
+/// `bind` as it is produced and stopping the source the moment `bind`
+/// answers anything but [`ResolveFlow::Exhausted`] (#2694).
+///
+/// **Only the by-value route streams**, and it is the only route that can
+/// reach a generator with side effects. The two #2042 witness routes
+/// ([`resolve_bind_source_witness`]) stay collecting for a reason that is
+/// not an oversight: each may still *decline* after the resolver has
+/// already produced branches, and fall back to evaluating the source by
+/// value instead -- a decision that cannot be taken back once a value has
+/// been streamed to `bind`. Nothing is deferred by collecting them either,
+/// since a witness only ever runs on [`is_pure_navigation`]'s closed
+/// grammar of `.`/`.foo`/`.[i]`/`.[a:b]`/pipes, which has no side effects
+/// and no generator to interleave with.
+///
+/// The by-value route is where the streaming is observable: with a
+/// demand-driven consumer (a fold source, #2235) `path(reduce
+/// ((.[]|stderr) as $x | $x) as $i (.; error("u")))` writes `1` to stderr
+/// in jq, where collecting the source first wrote `123`.
+fn resolve_bind_source_sink<S: EvalSemantics>(
+    source: &Expr,
+    body: &Expr,
+    var: &str,
+    value: &OwnedValue,
+    trackable: bool,
+    frame: &Frame,
+    bind: &mut dyn FnMut(OwnedValue, Option<Origin>) -> ResolveFlow,
+) -> ResolveFlow {
+    if let Some((values, trailing)) =
+        resolve_bind_source_witness::<S>(source, body, var, value, trackable, frame)
+    {
+        for (bound, origin) in values {
+            match bind(bound, origin) {
+                ResolveFlow::Exhausted => {}
+                other => return other,
+            }
+        }
+        return match trailing {
+            None => ResolveFlow::Exhausted,
+            Some(control) => ResolveFlow::Escaped(control.into()),
+        };
+    }
+
+    let mut stashed: Option<ResolveFlow> = None;
+    let flow = eval_each_owned::<S>(source, value, false, &mut |bound| {
+        match bind(bound, None) {
+            ResolveFlow::Exhausted => Demand::Continue,
+            other => {
+                stashed = Some(other);
+                Demand::Stop
+            }
+        }
+    });
+    resolve_stream_flow(flow, stashed)
 }
 
 /// The path register as a destructuring pattern walks it (#2649) -- jq's
@@ -31591,7 +31665,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     // A subexp: evaluated by value, never a path witness (jq's
-    // `subexp_nest > 0` -- the same rule `resolve_bind_source`'s
+    // `subexp_nest > 0` -- the same rule `resolve_bind_source_witness`'s
     // `by_value` follows).
     let (sources, trailing) = eval_owned_expr_fork::<S>(source, value, false);
     let head = unwrap_paren(source);
@@ -31784,7 +31858,7 @@ fn pattern_binding_name(binding: &PatternBinding) -> &str {
 }
 
 /// Whether every node of `source` is one the resolver walks exactly as the
-/// value evaluator does -- the closed grammar gating [`resolve_bind_source`]'s
+/// value evaluator does -- the closed grammar gating [`resolve_bind_source_witness`]'s
 /// path-mode witness (#2042 review). Real jq runs an `as` source with path
 /// tracking suspended, so the witness is only sound where the resolver can
 /// neither raise, catch, nor repeat anything value evaluation would not:
@@ -31846,7 +31920,7 @@ fn is_navigation_node(e: &Expr) -> bool {
 }
 
 /// Whether `source` is pure navigation *and* navigates at all, computed in
-/// one traversal instead of two: [`resolve_bind_source`]'s only call site
+/// one traversal instead of two: [`resolve_bind_source_witness`]'s only call site
 /// needs both together (`is_pure_navigation(source) && navigates(source)`,
 /// the "does this source navigate anywhere a plain value binding wouldn't"
 /// question) and, on a source that *is* pure navigation -- the common case
@@ -31880,7 +31954,7 @@ fn classify_navigation(source: &Expr) -> (bool, bool) {
 }
 
 /// Whether `$var` can reach a position `resolve_node` dispatches on in
-/// `body` -- the demand gate on [`resolve_bind_source`]'s witness (#2042
+/// `body` -- the demand gate on [`resolve_bind_source_witness`]'s witness (#2042
 /// review). A marker is only ever consulted by the resolver's own
 /// `Expr::TrackedVar` arm (and the register/fold rules fed from it), so a
 /// body that uses `$var` purely in value position -- `select($y < 100)`,
@@ -36047,7 +36121,7 @@ fn is_identity_passthrough(expr: &Expr) -> bool {
         Expr::Identity => true,
         // #2042: only a marker frozen from `.` itself is a passthrough of
         // `.`; one bound from a navigated position is that *node*, and a
-        // binding from it inherits its origin instead (`resolve_bind_source`).
+        // binding from it inherits its origin instead (`resolve_bind_source_witness`).
         Expr::TrackedVar(marker) => matches!(marker.origin, Origin::Snapshot),
         Expr::If {
             then_branch,
@@ -36164,7 +36238,7 @@ pub(crate) fn substitute_bound_var_from(
 /// what a navigated sibling binding would have gotten. Otherwise an
 /// explicit `origin` (the #2042 witness: a navigated source resolved
 /// *inside* a `path()`/`del()`/assignment invocation, from
-/// [`resolve_bind_source`]) is kept as-is. With neither but a `node` (the
+/// [`resolve_bind_source_witness`]) is kept as-is. With neither but a `node` (the
 /// #2072 witness: a navigated source outside any resolver invocation), the
 /// marker is `Origin::Untracked` -- carried for the cursor routes only,
 /// never certified by `resolve_node`. With none of the three this is a
@@ -56279,7 +56353,7 @@ mod tests {
     }
 
     /// #2180: `is_pure_navigation`'s marker-headed call site
-    /// (`resolve_bind_source`), which decides whether `($y | rest) as $w`
+    /// (`resolve_bind_source_witness`), which decides whether `($y | rest) as $w`
     /// may bind the *node* `rest` reaches or has to fall back to binding by
     /// value. Both verdicts matter: `.b` is on the closed navigation
     /// grammar, `.b | length` is not. Outputs captured live from jq 1.7.1.
@@ -89403,7 +89477,7 @@ mod tests {
     /// against jq 1.7.1) and only a passthrough snapshot is certified against
     /// the ambient position. #2042's `Origin::At` is the resolver's own
     /// bind-time path witness, made only inside a resolver invocation
-    /// (`resolve_bind_source`); this test is what keeps the #1466 class
+    /// (`resolve_bind_source_witness`); this test is what keeps the #1466 class
     /// closed for a binding made outside one.
     #[test]
     fn test_origin_bearing_binding_keeps_the_resolver_contract_2072() {
