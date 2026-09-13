@@ -3788,7 +3788,7 @@ Pinned in `test_nested_short_circuit_consumer_hides_the_stop_2180` and
 `test_short_circuit_side_effect_shapes_already_match_jq_820` (`tests/jq_cli_tests.rs`), and both
 positions are back in `scripts/jq-alt-retry-oracle-sweep.sh`'s `W_ENTRIES`.
 
-**`reduce`'s own INIT has the identical bug and is *not* fixed by #2668 — filed as a follow-up.**
+**`reduce`'s own INIT has the identical bug and is *not* fixed by #2668 — filed as #2899.**
 `[first(reduce (1) as $v ((1 as $x ?// $y \| 1); . + 1))]` is jq's `[2,2]`, `succinctly jq`'s
 `[2]`, the same class as `foreach`'s own INIT row above (confirmed live; `reduce`'s own UPDATE is
 unaffected — its construct has no per-step visible output, so #2668's UPDATE fix already covers it

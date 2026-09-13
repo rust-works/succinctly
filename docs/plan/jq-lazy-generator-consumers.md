@@ -1560,15 +1560,19 @@ the reasoning behind each placement:
       the source per fork anyway, side effects included (`[foreach (1, ("B"|stderr)) as $x
       ((0,100); .+1)]` writes `B` twice), so the "behaviour change" the recording was protecting
       was itself the divergence. `foreach_forks` re-drives.
-    - **Two positions inside `foreach` are left eager on purpose, and the sweep deliberately does
-      not carry them.** A `?//` in **UPDATE** (`[first(foreach (1) as $v (0; . + G))]` is `[1,1]`
-      in jq, `[1]` here) needs `fold_step_via_accumulator_or_fork` reshaped into a sink, and that
-      helper is shared with `reduce`'s own O(n) accumulator fix (#2157) — its outputs are
-      simultaneously the fold's next state. A `?//` in **INIT** (`[2,2]` in jq, `[2]` here) would
-      mean making jq's outermost loop (#534) lazy, which also has to stay ahead of the source
-      (#2440). Both are pinned as CLI rows rather than swept, so the sweep keeps its
-      0-unexpected/0-known contract; see
-      [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md).
+    - **Two positions inside `foreach` were left eager on purpose, and the sweep deliberately did
+      not carry them — closed by #2668.** A `?//` in **UPDATE** (`[first(foreach (1) as $v (0; . +
+      G))]` is `[1,1]` in jq, `[1]` before the fix) needed `fold_step_via_accumulator_or_fork`
+      reshaped into a sink (`fold_step_each`), and that helper is shared with `reduce`'s own O(n)
+      accumulator fix (#2157) — its outputs are simultaneously the fold's next state. A `?//` in
+      **INIT** (`[2,2]` in jq, `[2]` before the fix) meant making jq's outermost loop (#534) lazy,
+      which also has to stay ahead of the source (#2440) — `foreach_forks` itself now takes a
+      `ForeachInitDrive` closure instead of a pre-collected `Vec`. Both rows are back in the sweep
+      (`foreach-update`/`foreach-init` in `W_ENTRIES`, 861/0/0). `reduce`'s own INIT has the
+      identical bug and is *not* closed by #2668 — `reduce` has no native, demand-forwarding
+      dispatch arm at all, so nothing ever drives it through a live sink regardless of this
+      reshape; see [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md) for the
+      residual and the follow-up it needs.
 
     **WP3's review** (`/code-review high` over its three commits) found two correctness defects,
     a memory regression and a duplicated core. Both sweeps stay green (819/490, 0 unexpected /
