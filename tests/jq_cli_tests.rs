@@ -32530,6 +32530,22 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // #2668: `foreach`'s INIT, moved here from the same test -- INIT is
+        // now driven through `foreach_forks`'s own `ForeachInitDrive` sink,
+        // so a consumer's stop reaches INIT's own generator before its
+        // second output (the `stderr` write) is ever produced, and `first`
+        // never explores the second fork it would have seeded. Matches jq
+        // 1.7.1, which also writes nothing.
+        (
+            &[
+                "-cn",
+                r#"first(foreach (1) as $x ((0, ("I"|stderr)); .+1))"#,
+            ],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
         // `limit(n)` pulls exactly `n` values, so a side effect sitting at
         // position `n` IS reached. Stopping at the first would suppress it.
         (
@@ -33931,26 +33947,6 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // ---- #2668's residual: `foreach`'s INIT -------------------------
-        // #2668 drove `foreach`'s UPDATE through `fold_step_each` (its own
-        // row moved to `test_short_circuit_side_effect_shapes_already_match_jq_820`);
-        // INIT stays eager, so a side effect there still fires where jq
-        // never reaches it. INIT's fan-out is jq's outermost loop (#534)
-        // and it must be evaluated before the source is ever pulled
-        // (#2440), so `each_foreach` collects it exactly as `eval_foreach`
-        // does. `first` never explores the second fork, and jq never
-        // evaluates the INIT output that would have seeded it. Captured
-        // live against jq 1.7.1, which writes nothing.
-        (
-            &[
-                "-cn",
-                r#"first(foreach (1) as $x ((0, ("I"|stderr)); .+1))"#,
-            ],
-            None,
-            "1\n",
-            "I",
-            0,
-        ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry ------
         // `Flow::Stopped { pending }` is dropped by every lazy consumer but
         // one: `binary_fanout_each` has two operands and so can be handed
@@ -35363,22 +35359,24 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             "[false,false]",
             "matches jq -- the `?//` sits in UPDATE",
         ),
-        // ==== #2668's residual: `foreach`'s INIT position ====
-        // Still diverging, deliberately: INIT's fan-out is jq's outermost
-        // loop (#534) and must be evaluated before the source is pulled at
-        // all (#2440), so making it demand-driven means the fork loop
-        // itself becomes a sink over INIT's own outputs -- a larger change
-        // than UPDATE's, split out. Recorded in
-        // `docs/compliance/jq/limitations.md`.
+        // ==== #2668: `foreach`'s INIT position -- CLOSED ====
+        // INIT's fan-out is jq's outermost loop (#534) and must be
+        // evaluated before the source is pulled at all (#2440), so
+        // `foreach_forks` itself became a sink over INIT's own outputs
+        // (`ForeachInitDrive`) rather than a `Vec` collected up front --
+        // the fork loop's own per-fork verdict now forwards a consumer's
+        // stop back out as `Demand::Stop`, reaching a `?//` bind inside
+        // INIT the same way it already reached the source, UPDATE and
+        // EXTRACT.
         (
             format!("[first(foreach (1) as $v (({G}); .+1; .))]"),
-            "[2]",
-            "jq: [2,2] -- the `?//` sits in INIT",
+            "[2,2]",
+            "matches jq -- the `?//` sits in INIT",
         ),
         (
             format!("[isempty(foreach (1) as $v (({G}); .+1; .))]"),
-            "[false]",
-            "jq: [false,false] -- the `?//` sits in INIT",
+            "[false,false]",
+            "matches jq -- the `?//` sits in INIT",
         ),
         // ==== Confirmed correct, deliberately out of scope (#2180 §4) ====
         // A break cannot re-enter an already-collected array/fold, and

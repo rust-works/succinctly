@@ -38329,13 +38329,8 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // as $x (error("init"); .)` reports `init`, not the source's `in`, and
     // `foreach halt_error as $x (empty; .)` exits 0 without halting, because
     // a zero-output INIT never pulls the source at all -- [`foreach_forks`]
-    // returns on its own `init_values.is_empty()` guard before `drive` is
-    // ever called.
-    //
-    // #1902: `stream_outputs` gives INIT the same checked conversion
-    // (`to_owned`/`promote_borrowed`, not `to_owned_lossy`) the
-    // source gets below, folding a bare `Error`/`Break`/`Halt` into
-    // `init_control` with an empty prefix.
+    // never calls `drive_source` at all unless `drive_init` calls its own
+    // per-fork callback at least once.
     //
     // Each INIT output forks the whole foreach into a fully independent
     // execution over the source (#534): `[foreach (1,2) as $x ((10,20);
@@ -38344,8 +38339,54 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // side effects included (`[foreach (1, ("B"|stderr)) as $x ((0,100);
     // .+1)]` writes `B` twice, captured live), which is why `drive` below is
     // an `FnMut` called once per fork rather than a recording replayed.
-    let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
+    //
+    // #2668: INIT is driven the same demand-forwarding-with-bounded-fallback
+    // way the source already is just below, and for the identical reason --
+    // `[first(foreach (1) as $v (({G}); .+1; .))]` (`{G}` = `1 as $x ?// $y |
+    // 1`) is jq's `[2,2]`: the outer consumer's stop has to reach INIT's own
+    // generator, and with it any `?//` bind sitting inside it, the same way
+    // it already reaches EXTRACT, UPDATE and the source (#2180, #2668).
+    let mut lazy_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        // Tracked out-of-band for the usual reason (#1902): the sink can
+        // only answer `Demand`, so an undecodable INIT output's error has
+        // to be recorded beside it, folding into the drive's terminator
+        // with the already-iterated prefix standing in front of it.
+        let mut escape: Option<Control> = None;
+        let flow = eval_each::<W, S>(init, value.clone(), optional, &mut |item| match item
+            .into_owned()
+        {
+            Ok(v) => per_init(v),
+            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+        });
+        // Raw, not suppressed: `foreach_forks` adjudicates INIT's own
+        // trailing escape against the ambient `?` once, the same reason the
+        // source's own `lazy_drive` below leaves it raw.
+        resume_from_escape(escape, flow)
+    };
+    // The bounded fallback for an unbounded INIT (`foreach repeat(1) as $x
+    // ((0,100); .+1)`-shaped queries): same reasoning as the source's own
+    // `eager_drive` below, and gated identically (`eval_each_generic`'s twin
+    // arm and both eager `eval_generic.rs` arms all gate `Expr::Foreach` on
+    // `!streams_unbounded(init)` too, so an unbounded INIT reaches this
+    // fallback exactly as an unbounded source reaches its own).
+    let mut eager_drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        let (values, control) =
+            stream_outputs(eval_single::<W, S>(init, value.clone(), optional).materialize_cursor());
+        for v in values {
+            if per_init(v) == Demand::Stop {
+                return Flow::Exhausted;
+            }
+        }
+        match control {
+            Some(control) => Flow::Escaped(control),
+            None => Flow::Exhausted,
+        }
+    };
+    let drive_init: ForeachInitDrive<'_> = if streams_unbounded(init) {
+        &mut eager_drive_init
+    } else {
+        &mut lazy_drive_init
+    };
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // The demand-driven strategy: one element at a time, so the fold's own
@@ -38403,8 +38444,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         patterns,
         update,
         extract,
-        init_values,
-        init_control,
+        drive_init,
         optional,
         drive,
         &mut |v| {
@@ -38493,21 +38533,29 @@ pub(crate) type ForeachElementSink<'a> = &'a mut dyn FnMut(OwnedValue) -> Demand
 /// source itself ended.
 pub(crate) type ForeachSourceDrive<'a> = &'a mut dyn FnMut(ForeachElementSink<'_>) -> Flow;
 
+/// How [`foreach_forks`] pulls INIT: called exactly once, handing each INIT
+/// output to the callback in order and reporting how INIT's own generator
+/// ended -- the same shape as [`ForeachSourceDrive`], one level further out
+/// (#2668).
+pub(crate) type ForeachInitDrive<'a> =
+    &'a mut dyn FnMut(&mut dyn FnMut(OwnedValue) -> Demand) -> Flow;
+
 /// **The** `foreach` fold, shared by every entry point (#2180 WP3, reshaped
-/// by its review): INIT's fan-out outermost (#534), one step per source
-/// element, every EXTRACT (or bare UPDATE) output pushed to `sink` as it is
-/// produced.
+/// by its review; INIT reshaped again by #2668): INIT's fan-out outermost
+/// (#534), one step per source element, every EXTRACT (or bare UPDATE)
+/// output pushed to `sink` as it is produced.
 ///
-/// `drive_source` is handed a per-element callback and calls it once per
-/// source element, in order, returning how the source itself ended.
-/// [`each_foreach`], `each_foreach_generic` and both eager callers pass a
-/// closure that drives the source expression through
-/// [`eval_each`]/`eval_each_generic`; [`eval_foreach`] passes an
-/// `eval_single`-collecting one instead for an unbounded source, and says why
-/// at its own doc comment. That is the entire difference between the four:
-/// there is one step loop, and it is this one (#768/#822 -- a second copy
-/// would be free to drift on `?//` state threading, which is exactly the rule
-/// #1365/#1458/#1519/#2180 keep amending).
+/// `drive_init` and `drive_source` share one shape ([`ForeachInitDrive`]/
+/// [`ForeachSourceDrive`]): handed a per-output callback, each calls it once
+/// per output its own generator produces, in order, and reports how that
+/// generator ended. [`each_foreach`], `each_foreach_generic` and both eager
+/// callers pass closures driving INIT/the source through
+/// [`eval_each`]/`eval_each_generic`; [`eval_foreach`] passes
+/// `eval_single`-collecting ones instead for an unbounded INIT/source, and
+/// says why at its own doc comment. That is the entire difference between
+/// the four: there is one fork loop, and it is this one (#768/#822 -- a
+/// second copy would be free to drift on `?//` state threading, which is
+/// exactly the rule #1365/#1458/#1519/#2180/#2668 keep amending).
 ///
 /// **Every INIT fork drives the source afresh.** jq re-evaluates the source
 /// generator per fork, side effects included -- `[foreach (1, ("B"|stderr))
@@ -38521,15 +38569,25 @@ pub(crate) type ForeachSourceDrive<'a> = &'a mut dyn FnMut(ForeachElementSink<'_
 /// memory for the duration of a fold whose entire point is not to do that,
 /// even in the overwhelmingly common single-INIT case.
 ///
-/// The step's own verdict outranks the source's: a step that escaped, or that
-/// the consumer stopped, aborts the fork whatever `drive_source` goes on to
-/// report, mirroring the pre-#2180 `aborted.or_else(|| input_control)`
-/// precedence exactly. And a fork that ends in either never lets the next one
+/// The step's own verdict outranks the source's, and a *fork's* own verdict
+/// (which folds in the step's) outranks INIT's own: a step or fork that
+/// escaped, or that the consumer stopped, aborts the whole construct
+/// whatever `drive_source`/`drive_init` go on to report, mirroring the
+/// pre-#2180 `aborted.or_else(|| input_control)` precedence one level
+/// further out. And an abort at either level never lets the next fork
 /// start -- jq's `break` unwinds past every untried INIT output
 /// (`[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` is `[1,2]`, the
-/// `100` fork never attempted). `pending` is dropped on a stop for the reason
-/// every other lazy consumer drops it -- it belongs to an eager fallback jq
-/// would never have reached.
+/// `100` fork never attempted; #2668 extends this one level further,
+/// `[first(foreach (1) as $v ((1 as $x ?// $y | 1); .+1; .))]` is jq's
+/// `[2,2]` -- the outer stop reaches INIT's own `?//`). `pending` is dropped
+/// on a stop for the reason every other lazy consumer drops it -- it belongs
+/// to an eager fallback jq would never have reached.
+///
+/// `#2440`'s "zero INIT outputs means the source is never pulled at all"
+/// now falls out structurally rather than needing its own guard: the source
+/// is only ever driven from *inside* `drive_init`'s own per-output callback,
+/// so a `drive_init` that never calls it (INIT produced nothing) never
+/// drives the source either.
 ///
 /// The budget is charged across every fork, not per fork (#695), the same
 /// "whole tree, not per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
@@ -38538,24 +38596,23 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     patterns: &[Pattern],
     update: &Expr,
     extract: Option<&Expr>,
-    init_values: Vec<OwnedValue>,
-    init_control: Option<Control>,
+    drive_init: ForeachInitDrive<'_>,
     optional: bool,
     drive_source: ForeachSourceDrive<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    // #2440: with zero INIT forks the source generator is never pulled at
-    // all -- `foreach halt_error as $x (empty; .)` exits 0 in jq 1.7.1,
-    // where evaluating the source first would have halted the process.
-    if init_values.is_empty() {
-        return finish_fork_flow(init_control, optional);
-    }
-
     let all_var_names = pattern_alternatives_var_names(patterns);
     let invert_dedup = patterns.len() > 1;
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
 
-    for init_val in init_values {
+    // The one thing a fork's own callback can't report through its
+    // `Demand`-only return: which terminal (a consumer's `Stopped`, or an
+    // `Escaped` with a specific `Control`) actually ended the whole
+    // construct -- recorded out-of-band, the same pattern the per-element
+    // callback just below uses for `ended`, one level further out.
+    let mut terminal: Option<Flow> = None;
+
+    let init_flow = drive_init(&mut |init_val| {
         let mut state = init_val;
         // Recorded out-of-band for the usual reason: the per-element callback
         // can only answer `Demand`, so "why did the fold stop" has to be kept
@@ -38605,16 +38662,31 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         });
 
         match ended.unwrap_or(flow) {
-            Flow::Exhausted => {}
-            Flow::Stopped { .. } => return Flow::Stopped { pending: None },
-            Flow::Escaped(control) => return finish_fork_flow(Some(control), optional),
+            Flow::Exhausted => Demand::Continue,
+            other => {
+                terminal = Some(other);
+                Demand::Stop
+            }
         }
-    }
+    });
 
-    // Reached once every INIT fork (there is at least one, per the
-    // `init_values.is_empty()` guard above) ran to completion without
-    // aborting -- the only trailing control left to apply is INIT's own.
-    finish_fork_flow(init_control, optional)
+    match terminal {
+        // A fork's own escape/stop ends everything -- INIT's own trailing
+        // control (if it goes on to have one) is moot, jq's `break` having
+        // already unwound past every untried INIT output.
+        Some(flow) => flow,
+        // No fork ever aborted -- `init_flow` is INIT's own generator's raw
+        // terminal (never `Stopped`: our own callback above only answers
+        // `Demand::Stop` after recording `terminal`), the same trailing
+        // control the old `init_control` parameter carried.
+        None => match init_flow {
+            Flow::Exhausted => finish_fork_flow(None, optional),
+            Flow::Escaped(control) => finish_fork_flow(Some(control), optional),
+            Flow::Stopped { .. } => unreachable!(
+                "drive_init's own per-fork callback always records `terminal` before answering Demand::Stop"
+            ),
+        },
+    }
 }
 
 /// [`finish_fork`] in [`Flow`] terms (#2180 WP3): the outputs are already
@@ -38725,13 +38797,11 @@ pub(crate) fn streams_unbounded(expr: &Expr) -> bool {
 /// captured from the pinned oracle, and none needed the stop rule and the
 /// `break` rule to differ.
 ///
-/// Two positions deliberately stay eager, and both are recorded as residuals
-/// in `docs/compliance/jq/limitations.md`: **INIT** (its fan-out is jq's
-/// outermost loop, #534, and it must be evaluated before the source is ever
-/// pulled, #2440 — so it is collected here, exactly as [`eval_foreach`]
-/// collects it) and **UPDATE** (driving it demands reshaping
-/// [`fold_step_each`], which `reduce`'s own O(n)
-/// accumulator fix shares).
+/// #2668: INIT no longer stays eager here either -- it is driven through
+/// [`eval_each`] exactly like the source just below, since this function is
+/// only ever reached (via [`eval_each`]'s own `Expr::Foreach` dispatch arm)
+/// when the caller has already checked `!streams_unbounded(init)`, the same
+/// guard that lets the source's own drive below skip an eager fallback.
 ///
 /// The INIT fan-out loop stays outer, so the source is driven afresh per
 /// fork -- see [`foreach_forks`], which owns that loop and the reasons it
@@ -38748,12 +38818,24 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     // INIT first, source second (#2440), and with the same checked
-    // conversion [`eval_foreach`] gives it (#1902) -- a zero-output INIT
-    // leaves the source unevaluated entirely, side effects included, which is
-    // why `foreach halt_error as $x (empty; .)` exits 0. `foreach_forks`
-    // enforces that ordering by returning before it ever calls `drive`.
-    let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
+    // conversion (#1902) as the source's own drive below -- a zero-output
+    // INIT leaves the source unevaluated entirely, side effects included,
+    // which is why `foreach halt_error as $x (empty; .)` exits 0.
+    // `foreach_forks` enforces that ordering structurally: `drive_source` is
+    // only ever called from *inside* `drive_init`'s own per-output callback.
+    let mut drive_init = |per_init: &mut dyn FnMut(OwnedValue) -> Demand| -> Flow {
+        let mut escape: Option<Control> = None;
+        let flow = eval_each::<W, S>(init, value.clone(), optional, &mut |item| match item
+            .into_owned()
+        {
+            Ok(v) => per_init(v),
+            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+        });
+        // Raw: `foreach_forks` owns the `suppresses` decision -- see
+        // [`eval_foreach`]'s own drive for why suppressing here would be
+        // wrong.
+        resume_from_escape(escape, flow)
+    };
 
     let mut drive = |per_element: ForeachElementSink<'_>| -> Flow {
         // Tracked out-of-band for the usual reason: the sink can only answer
@@ -38779,8 +38861,7 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         patterns,
         update,
         extract,
-        init_values,
-        init_control,
+        &mut drive_init,
         optional,
         &mut drive,
         &mut |v| sink(Item::Owned(v)),

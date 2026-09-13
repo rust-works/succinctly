@@ -7703,8 +7703,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             update,
             extract,
         } if !streams_unbounded(input) && !streams_unbounded(init) => {
-            let (init_values, init_control) =
-                stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            // #2668: INIT is driven through `eval_each_generic` (via
+            // `drive_foreach_init_generic`) rather than collected by
+            // `stream_owned_outputs_generic`, the same demand-forwarding
+            // treatment the source already gets just below.
+            //
             // #2642: `update`/`extract` rerun against the fold's own
             // `OwnedValue` accumulator, never the ambient cursor -- always
             // `Owned`, same reasoning as the `Expr::Reduce` arm just above.
@@ -7717,8 +7720,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 patterns,
                 &update,
                 extract.as_deref(),
-                init_values,
-                init_control,
+                &mut |per_init| {
+                    drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, per_init)
+                },
                 optional,
                 &mut |per_element| {
                     drive_foreach_source_generic::<S, V>(
@@ -8824,6 +8828,27 @@ fn drive_foreach_source_generic<S: EvalSemantics, V: DocumentValue>(
     resume_from_escape(escape, flow)
 }
 
+/// The generic evaluator's own `foreach` INIT drive (#2668), shared by its
+/// demand-forwarding `each_foreach_generic` and its eager `Expr::Foreach`
+/// arm just above -- [`drive_foreach_source_generic`]'s twin, one level
+/// further out. Called exactly once, unlike that sibling.
+fn drive_foreach_init_generic<S: EvalSemantics, V: DocumentValue>(
+    init: &Expr,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    per_init: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(init, value.clone(), optional, cursor, &mut |item| {
+        match generic_item_into_owned(item) {
+            Ok(v) => per_init(v),
+            Err(control) => stop_with_escape(&mut escape, control),
+        }
+    });
+    resume_from_escape(escape, flow)
+}
+
 /// Generic-evaluator twin of `eval::each_foreach` (#2180 WP3) — see that
 /// function's doc comment for jq's semantics, the stop-as-break state-
 /// threading rule and the oracle rows that pinned it. Everything below the
@@ -8849,10 +8874,9 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    // INIT first, source second (#2440), same as the eager arm above it.
-    let (init_values, init_control) =
-        stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
-
+    // INIT first, source second (#2440), same as the eager arm above it --
+    // #2668: both now driven through `eval_each_generic`.
+    //
     // #2642: same reasoning as the eager `Expr::Foreach` arm above --
     // `update`/`extract` rerun against the fold's own accumulator, never the
     // ambient cursor, so this is always `Owned`.
@@ -8862,8 +8886,9 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
         patterns,
         &update,
         extract.as_deref(),
-        init_values,
-        init_control,
+        &mut |per_init| {
+            drive_foreach_init_generic::<S, V>(init, &value, optional, cursor, per_init)
+        },
         optional,
         &mut |per_element| {
             drive_foreach_source_generic::<S, V>(input, &value, optional, cursor, per_element)

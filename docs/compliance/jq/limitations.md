@@ -3707,29 +3707,54 @@ that pins `binary_fanout_each`'s inner/outer `Flow::Stopped { pending }` asymmet
 *produces* a `pending`, so it used `if` until #1462, `foreach` until WP3, and now `recurse`, which
 `eval_each` has no arm for. The asymmetry itself is unchanged.
 
-**What still diverges: `foreach`'s UPDATE and its INIT, and only those.** Two positions inside
-`foreach` are still evaluated eagerly, so a `?//` bind in either never sees the stop, and a side
-effect in either fires where jq never reaches it. Confirmed live under both wrappers:
+**`foreach`'s UPDATE and INIT no longer diverge either — #2668 closed both.** `fold_step_each`
+(`src/jq/eval.rs`) replaced `fold_step_via_accumulator_or_fork`: a sink-shaped helper delivering
+each UPDATE output to a callback as it is produced, instead of collecting them into a `Vec`
+first. In `try_foreach_step_alternatives`, EXTRACT (or the implicit identity push) now runs from
+*inside* that callback, so a consumer's `Demand::Stop` reaches UPDATE's own generator — and any
+`?//` bind inside it — before it produces anything further. `try_reduce_step_alternatives` wraps
+the same helper in a collecting-last sink, since `reduce`'s own UPDATE has no per-step visible
+output for a consumer to stop after (confirmed unaffected both before and after this change) —
+sharing one dispatch with `foreach`'s fast path is the only reason it changed at all.
 
-| filter                                                                     | jq 1.7.1        | succinctly jq |
-|----------------------------------------------------------------------------|-----------------|---------------|
-| `[first(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]` (UPDATE)       | `[1,1]`         | `[1]`         |
-| `[isempty(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]`              | `[false,false]` | `[false]`     |
-| `[first(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]` (INIT)        | `[2,2]`         | `[2]`         |
-| `[isempty(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]`             | `[false,false]` | `[false]`     |
-| `first(foreach (1) as $x (0; (.+1, ("U"\|stderr)); .))` (stderr in UPDATE) | no write        | writes `U`    |
-| `first(foreach (1) as $x ((0, ("I"\|stderr)); .+1))` (stderr in INIT)      | no write        | writes `I`    |
+INIT's own fan-out (#534: each INIT output is an independent run over the source) still has to
+run before the source is ever pulled (#2440), but no longer needs a `Vec` to do it: `foreach_forks`
+itself takes a `ForeachInitDrive` closure (the same shape as its existing `ForeachSourceDrive`,
+one level further out) instead of a pre-collected `init_values`/`init_control` pair, and the whole
+fork loop is now `drive_init`'s own per-fork callback — `#2440`'s "zero INIT outputs ⇒ source
+never pulled" falls out structurally (the source is only ever driven from *inside* that callback),
+rather than needing its own `is_empty()` guard. `each_foreach`/`each_foreach_generic` and both
+eager entry points build `drive_init` from `eval_each`/`eval_each_generic`, exactly mirroring how
+they already build `drive_source`. Confirmed live under both wrappers:
 
-Both are deliberate. Driving **UPDATE** means reshaping `fold_step_via_accumulator_or_fork`,
-which `reduce`'s own O(n) accumulator fix (#2157) shares, and whose outputs are simultaneously
-the fold's next state — a separate change from WP3's rows. **INIT** is jq's outermost loop
-(#534: each INIT output is an independent run over the source) and must be evaluated before the
-source is ever pulled (#2440: `foreach halt_error as $x (empty; .)` exits 0), so `foreach_forks`
-collects it and returns before its source drive is ever called. The rows above are pinned in
-`test_nested_short_circuit_consumer_hides_the_stop_2180` and
-`test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`); they are
-deliberately *not* in `scripts/jq-alt-retry-oracle-sweep.sh`, which reports 0 unexpected and 0
-known over 819 cases and would lose that contract if permanent divergences were swept.
+| filter                                                                     | jq 1.7.1 and `succinctly jq` |
+|----------------------------------------------------------------------------|-------------------------------|
+| `[first(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]` (UPDATE)       | `[1,1]`                       |
+| `[isempty(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]`              | `[false,false]`               |
+| `[first(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]` (INIT)        | `[2,2]`                       |
+| `[isempty(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]`             | `[false,false]`               |
+| `first(foreach (1) as $x (0; (.+1, ("U"\|stderr)); .))` (stderr in UPDATE) | no write                      |
+| `first(foreach (1) as $x ((0, ("I"\|stderr)); .+1))` (stderr in INIT)      | no write                      |
+
+Pinned in `test_nested_short_circuit_consumer_hides_the_stop_2180` and
+`test_short_circuit_side_effect_shapes_already_match_jq_820` (`tests/jq_cli_tests.rs`), and both
+positions are back in `scripts/jq-alt-retry-oracle-sweep.sh`'s `W_ENTRIES`.
+
+**`reduce`'s own INIT has the identical bug and is *not* fixed by #2668 — filed as a follow-up.**
+`[first(reduce (1) as $v ((1 as $x ?// $y \| 1); . + 1))]` is jq's `[2,2]`, `succinctly jq`'s
+`[2]`, the same class as `foreach`'s own INIT row above (confirmed live; `reduce`'s own UPDATE is
+unaffected — its construct has no per-step visible output, so #2668's UPDATE fix already covers it
+by sharing `fold_step_each`). Unlike `foreach`, `reduce` has no native, demand-forwarding dispatch
+arm at all: neither `eval_each` (`src/jq/eval.rs`) nor `eval_each_generic` (`src/jq/eval_generic.rs`)
+has an `Expr::Reduce` case, so `first(reduce(...))` always reaches `eval_reduce`/`eval_reduce_with_values`
+through the fully-eager, collecting `eval_single` path and drains the (already complete) result
+afterward — confirmed live: `first(reduce (1,2,("X"\|stderr),4) as $x (0; .+$x))` writes `X` in
+*both* jq and here, since neither ever gets to stop the source early for a plain (non-`?//`)
+reduce. Reshaping `eval_reduce_with_values` to take a `ForeachInitDrive`-shaped closure, the way
+#2668 reshaped `foreach_forks`, therefore cannot by itself change `first(reduce(...))`'s answer —
+nothing ever calls it through a live sink. Actually closing this gap needs a new `each_reduce`-
+style dispatch arm (mirroring `each_foreach`/`each_foreach_generic`) added to both evaluators
+first, a materially larger change than a plumbing reshape, and out of scope for #2668 itself.
 
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
