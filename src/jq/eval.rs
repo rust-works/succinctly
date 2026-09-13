@@ -39894,7 +39894,7 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
         Some(Flow::Escaped(control)) => finish_fork_flow(Some(control), optional),
         Some(Flow::Exhausted) => {
-            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream")
+            unreachable!("the per-fork match above never routes Exhausted into stop_with_downstream") // omni-dev: coverage tolerate-line reason="unreachable by construction: the per-fork match only ever hands stop_with_downstream a non-Exhausted flow, so `terminal` can never hold Exhausted. `foreach_forks`' identical arm is 0-hit for the same reason and is only unflagged because it predates this diff (#2899)"
         }
         None => match init_flow {
             Flow::Exhausted => finish_fork_flow(None, optional),
