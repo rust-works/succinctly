@@ -27089,7 +27089,7 @@ pub(crate) enum PathPrefix {
         /// Components from `Root` to here, inclusive. `Root` = 0. Keeps
         /// [`PathPrefix::depth`] O(1) without walking the chain — this is
         /// what keeps `assert_value_tree_depth` O(1) per node in
-        /// `push_recursive_branches`.
+        /// `resolve_recursive_descent_sink`/`resolve_recurse_sink`.
         depth: usize,
     },
 }
@@ -28305,21 +28305,49 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Optional(inner) => {
             resolve_optional_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
-        // `recurse(f)`/`recurse(f; cond)` (#2235): the parameterised
-        // spellings have no static shortcut the way bare `..`/`recurse` do
-        // (`f` is arbitrary, so the queue has to run) — always `trackable`
-        // here too, same guard as the bare spellings just below in
-        // `resolve_node_eager`. `resolve_recurse_sink` itself asserts this
-        // rather than re-deriving it (#843 review). Streams each visited
-        // node to `sink` as it is popped, so a bounded consumer no longer
-        // pays for nodes past the ones it actually asked for — see that
-        // function's own doc comment for what this does, and does not,
-        // close.
-        Expr::Builtin(Builtin::RecurseF(_) | Builtin::RecurseCond(_, _))
-            if !trackable && !snapshot.is_marked() =>
-        {
+        // Every recurse-family spelling (`..`, bare `recurse`/`recurse_down`,
+        // `recurse(f)`, `recurse(f; cond)`) shares jq's own recursive
+        // definition `def r: ., (f | r); r;` — the *first* value any of them
+        // ever emits is `.` itself, zero navigation performed, so an
+        // untracked value (#843) is refused right here before any of the
+        // walks below even start (`#530`'s classic "with result" case). One
+        // shared guard arm for all five spellings, rather than one copy per
+        // spelling reaching this function — CLAUDE.md's own "duplicated
+        // predicates diverge silently" note (from #106) — folded in by
+        // #2696, which gave the bare spellings (`..`/`recurse`/
+        // `recurse_down`) their own native sink arm below; previously only
+        // the parameterised pair had one here; the bare spellings' guard
+        // lived a second time in `resolve_node_eager`.
+        //
+        // `&& !snapshot` (#1591): a deferred `$x` snapshot must still reach
+        // the walks below (which then correctly emit *self* with the mark
+        // intact, via each walk's own seed) rather than being refused here
+        // before `f`/`cond` are ever evaluated.
+        Expr::RecursiveDescent
+        | Expr::Builtin(
+            Builtin::Recurse
+            | Builtin::RecurseDown
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(_, _),
+        ) if !trackable && !snapshot.is_marked() => {
             ResolveFlow::Escaped(recurse_untracked_error(value).1)
         }
+        // `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
+        // migration of the parameterised pair just below): no `f`/`cond`
+        // means no static shortcut is needed the way the parameterised pair
+        // requires the queue to run — see `resolve_recursive_descent_sink`'s
+        // own doc comment for the full mechanism and what it closes.
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            resolve_recursive_descent_sink(value, trackable, snapshot, sink)
+        }
+        // `recurse(f)`/`recurse(f; cond)` (#2235): the parameterised
+        // spellings have no static shortcut the way bare `..`/`recurse` do
+        // (`f` is arbitrary, so the queue has to run). `resolve_recurse_sink`
+        // itself asserts trackability rather than re-deriving it (#843
+        // review). Streams each visited node to `sink` as it is popped, so a
+        // bounded consumer no longer pays for nodes past the ones it
+        // actually asked for — see that function's own doc comment for what
+        // this does, and does not, close.
         Expr::Builtin(Builtin::RecurseF(f)) => {
             resolve_recurse_sink::<S>(f, None, value, trackable, snapshot, frame, keep, sink)
         }
@@ -28814,57 +28842,12 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             resolve_slice_expr::<S>(target, start, end, value, false, trackable, frame, keep)
         }
 
-        // Every spelling here (`..`, bare `recurse`/`recurse(f)`/
-        // `recurse(f;cond)`) shares jq's own recursive definition
-        // `def r: ., (f | r); r;` — the *first* value it ever emits is `.`
-        // itself, zero navigation performed. Against an untracked value
-        // (#843) that first output is already the whole answer: it is
-        // exactly the no-navigation case `#530`'s classic "with result"
-        // message covers. One shared guard arm for all four spellings,
-        // ahead of their specific-handling arms below, rather than one
-        // `if !trackable` copy per spelling — CLAUDE.md's own "duplicated
-        // predicates diverge silently" note (from #106: three copies of one
-        // predicate, one of them quadratic) is exactly the failure mode a
-        // fourth near-identical copy here would risk. Since this arm's
-        // guard is checked first, none of the recurse-specific arms below
-        // ever run the fan-out (or even evaluate `f`/`cond`) once untracked
-        // — confirmed live, `path(try (.a, error([1,2,3])) catch ..)` *and*
-        // `catch recurse(.[0])` both report "Invalid path expression with
-        // result [1,2,3]", not a "near attempt" message.
-        //
-        // `&& !snapshot` (#1591): mirrors `getpath([])`'s own identical
-        // carve-out just below — a deferred `$x` snapshot must reach the
-        // recurse-specific arms below (which then correctly emit *self*
-        // with the mark intact, via `resolve_recurse_sink`'s seed or
-        // `resolve_recursive_descent`'s root patch) rather than being
-        // refused here before `f`/`cond` are ever even evaluated. Confirmed
-        // live, `path(. as $x | reduce (1) as $i (0; $x | ..))` on
-        // `{"a":1}` is `[[]]` in jq, not a refusal.
-        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
-            if !trackable && !snapshot.is_marked() =>
-        {
-            Err(recurse_untracked_error(value))
-        }
-
-        // `..` fans out to every node in the tree (pre-order, self before
-        // children), so each needs its own Field/Index chain rather than the
-        // verbatim `RecursiveDescent` the static-leaf arm below would
-        // otherwise store — the very case #412 was filed for.
-        //
-        // Bare `recurse` *is* `..` — jq defines it as `recurse(.[]?)` and
-        // `[recurse]` and `[..]` agree output for output, so this arm
-        // handles both spellings identically. Sharing `..`'s resolver rather
-        // than routing `.[]?` through `resolve_recurse_sink` is both simpler and
-        // what keeps the components bare: resolving under a `?` wraps each
-        // one in `Expr::Optional`, which the walkers that *write*
-        // (`set_path_steps`, `update_path`, `delete_at_path`) then have to
-        // unwrap. They do, but there is no reason to make them.
-        //
-        // Reached only when `trackable` — the guard arm above already
-        // caught every recurse-family spelling otherwise.
-        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
-            Ok(resolve_recursive_descent(value, trackable, snapshot))
-        }
+        // #2696: `..`/bare `recurse`/`recurse_down` (and, since #2235, the
+        // parameterised pair) now have their own native sink arms in
+        // `resolve_node_sink`, guard included — see that function's dispatch
+        // for the full rationale. Every one of them is intercepted there
+        // before this fallback is ever reached, so there is no arm for any
+        // recurse-family spelling here any more.
 
         // #844: a frozen variable snapshot from a statically-verified
         // identity-passthrough `as`-binding (see `is_identity_passthrough`
@@ -29845,99 +29828,131 @@ fn untracked_branches(
         .collect()
 }
 
-/// Fan `..` out into one branch per node in `value`'s tree, self before
-/// children in the same pre-order `collect_recursive` uses for the value-only
-/// `..`, so `path(..)`-derived branches visit values in the same order
-/// `[.. ]` would output them.
+/// Sink-shaped `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
+/// migration of the parameterised spellings) — delivers one branch per node
+/// in `value`'s tree, self before children, in the same pre-order
+/// `collect_recursive` uses for the value-only `..`, as soon as each is
+/// reached, instead of collecting the whole tree first
+/// (`resolve_recursive_descent`/`push_recursive_branches`, removed by this
+/// change). A bounded consumer (`limit`, `first`, an enclosing fold's own
+/// early stop) now stops the walk instead of paying to build every remaining
+/// branch just to discard it: `path(limit(1; ..))`'s peak memory drops from
+/// ~3x the parameterised sibling's (the whole tree, materialized as
+/// `PathBranch`es, before the first one is ever read) to matching it.
 ///
-/// `trackable`/`snapshot` (#1591) are the ambient state on `value` itself —
-/// `trackable` threads uniformly through `push_recursive_branches` (see its
-/// own doc comment: the guard that admits this call at all only ever lets
-/// a *trackable* or a *deferred-snapshot* value through, and structural
-/// descent can't change which one `value` was). `snapshot` is different:
-/// `..`'s own *first* output is `.` — no navigation at all — so it inherits
-/// whatever `value` already was (mirroring `resolve_recurse_sink`'s own seed),
-/// but every other node in the tree is reached by genuine Field/Index
-/// descent, which breaks the mark regardless of ambient —
-/// `push_recursive_branches` never sees `snapshot` at all, so it keeps
-/// building every branch with `PathBranch::new`'s hardcoded `false` for
-/// those, and only the one root entry is patched afterward.
-fn resolve_recursive_descent<'a>(
+/// There is no user filter here — only structural descent into `Array`/
+/// `Object` — so this walk can never escape (no `f`/`cond` to raise an
+/// error) and has no [`RECURSE_MAX_ITEMS`] cap, unlike
+/// [`resolve_recurse_sink`]: that cap belongs to the *parameterised*
+/// spellings, whose queue can grow without bound from an arbitrary `f`, not
+/// to bare structural descent, whose node count is exactly `value`'s own
+/// tree size — `[path(..)] | length` must equal jq's true count even past
+/// [`RECURSE_MAX_ITEMS`] nodes.
+///
+/// Every value this function ever visits is a live sub-part of the original
+/// top-level `value`, so every branch can borrow directly (`Cow::Borrowed`)
+/// instead of deep-cloning its remaining subtree — an O(1) pointer copy per
+/// node instead of the O(subtree)-per-node cost that made the collecting
+/// version O(d²) on a depth-`d` linear-nesting document (#668). `prefix` is a
+/// [`PathPrefix`] — extending it per child is O(1) (a refcount bump plus one
+/// new node), not an O(depth) `Vec<Expr>` clone (#701).
+///
+/// `trackable` threads unchanged through the whole descent (#1591): every
+/// node here, self included, is either genuinely reachable via a real path
+/// or none of them are — the caller's own untracked guard (in
+/// [`resolve_node_sink`]) only ever lets a *trackable* or a
+/// *deferred-snapshot* value through, and structural descent from an
+/// untracked value can never regain trackability. `snapshot` is different:
+/// `..`'s own *first* output is `.` — no navigation at all — so the root
+/// alone inherits whatever `value` already was (mirroring
+/// `resolve_recurse_sink`'s own seed, via [`PathBranch::passthrough`]); every
+/// other node in the tree is reached by genuine Field/Index descent, which
+/// breaks the mark regardless of ambient (plain [`PathBranch::new`], same as
+/// the collecting version's own "only the root gets patched" rule).
+///
+/// Children are collected in encounter order, then pushed onto an explicit
+/// `stack` reversed — same shape [`resolve_recurse_sink`] uses — so the
+/// first child popped is the next one visited, and its whole subtree
+/// completes before the second child is even reached. An explicit stack
+/// rather than native recursion caps native stack use at O(depth ×
+/// fan-out) instead of O(depth) call frames each holding a full sibling
+/// iterator; `assert_value_tree_depth(prefix.depth())` still panics past
+/// [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH) levels of
+/// nesting (#1021, following #1005's precedent) exactly as the collecting
+/// version did — `prefix` still grows by exactly one component per descent
+/// from this function's own root seed, so its depth still doubles as the
+/// walk's depth with no extra bookkeeping needed.
+/// `tests/jq_recurse_depth_tests.rs` already pins a depth-300 correctness
+/// floor through this exact spelling (#626/#661) — well under the 384
+/// ceiling — and
+/// `resolve_recursive_descent_sink_panics_past_nesting_depth_limit_1021`
+/// pins the panic itself (retargeted from the deleted
+/// `push_recursive_branches`).
+fn resolve_recursive_descent_sink<'a>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
-) -> Vec<PathBranch<'a>> {
-    let mut out = Vec::new();
-    push_recursive_branches(&PathPrefix::root(), value, trackable, &mut out);
-    if snapshot.is_marked() {
-        if let Some(root) = out.first_mut() {
-            root.snapshot = snapshot.clone();
-        }
-    }
-    out
-}
-
-/// There is no user filter here — only structural descent into `Array`
-/// /`Object` — so every value this function ever visits is a live sub-part
-/// of the *original* top-level `value` `resolve_recursive_descent` was
-/// called with. That makes the lifetime uniform throughout the whole
-/// recursion, so every branch can borrow directly (`Cow::Borrowed`) instead
-/// of deep-cloning its remaining subtree: an O(1) pointer copy per node
-/// instead of the O(subtree)-per-node cost that made this function (and its
-/// `..`/bare-`recurse` callers) O(d²) on a depth-`d` linear-nesting document
-/// (#668). `prefix` is a [`PathPrefix`] — extending it per child is O(1) (a
-/// refcount bump plus one new node), not the O(depth) `Vec<Expr>` clone this
-/// function used to pay once for its own branch and again per child (#701).
-///
-/// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
-/// levels of nesting (#1021, following #1005's precedent) — `prefix` already
-/// grows by exactly one component per descent from its sole call site
-/// (`resolve_recursive_descent`, starting at [`PathPrefix::root`]), so its
-/// depth doubles as the recursion depth with no extra parameter needed.
-/// `tests/jq_recurse_depth_tests.rs` already pins a depth-300 correctness
-/// floor through this exact function (#626/#661) — well under the 384
-/// ceiling.
-fn push_recursive_branches<'a>(
-    prefix: &Rc<PathPrefix>,
-    value: &'a OwnedValue,
-    trackable: bool,
-    out: &mut Vec<PathBranch<'a>>,
-) {
-    assert_value_tree_depth(prefix.depth());
-    // `trackable` threads unchanged through the whole descent (#1591): every
-    // node here, self included, is either genuinely reachable via a real
-    // path or none of them are — a starting point the recurse-family guard
-    // let through *only because it's a deferred snapshot* (`!trackable &&
-    // snapshot`, see that guard's own doc comment) is untracked, and
-    // structural descent from an untracked value can never regain
-    // trackability. This was hardcoded `true` before #1591, which was sound
-    // only because the guard used to admit nothing else.
-    out.push(PathBranch::new(
-        Rc::clone(prefix),
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
+        PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
-    ));
-    match value {
-        OwnedValue::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                let path = PathPrefix::extend(
-                    prefix,
-                    Expr::Index {
-                        idx: i as i64,
-                        key: None,
-                    },
-                );
-                push_recursive_branches(&path, item, trackable, out);
+        snapshot.clone(),
+    )];
+
+    while let Some(popped) = stack.pop() {
+        let PathBranch {
+            path: prefix,
+            value: current,
+            trackable: node_trackable,
+            snapshot: node_snapshot,
+            register: _,
+        } = popped;
+        assert_value_tree_depth(prefix.depth());
+        // Every branch on this stack was built from a `Cow::Borrowed` above
+        // and by the `Cow::Borrowed` pushes below -- structural descent
+        // never computes a new value, so this unwraps to `&'a OwnedValue`
+        // unconditionally, the same lifetime `value` itself carries.
+        let current: &'a OwnedValue = match current {
+            Cow::Borrowed(v) => v,
+            Cow::Owned(_) => {
+                unreachable!("resolve_recursive_descent_sink never produces an owned value")
             }
+        };
+        if sink(PathBranch {
+            path: Rc::clone(&prefix),
+            value: Cow::Borrowed(current),
+            trackable: node_trackable,
+            snapshot: node_snapshot,
+            register: None,
+        }) == Demand::Stop
+        {
+            return ResolveFlow::Stopped;
         }
-        OwnedValue::Object(map) => {
-            for (k, v) in map {
-                let path = PathPrefix::extend(prefix, Expr::Field(k.clone()));
-                push_recursive_branches(&path, v, trackable, out);
+        match current {
+            OwnedValue::Array(items) => {
+                for (i, item) in items.iter().enumerate().rev() {
+                    let path = PathPrefix::extend(
+                        &prefix,
+                        Expr::Index {
+                            idx: i as i64,
+                            key: None,
+                        },
+                    );
+                    stack.push(PathBranch::new(path, Cow::Borrowed(item), node_trackable));
+                }
             }
+            OwnedValue::Object(map) => {
+                for (k, v) in map.iter().rev() {
+                    let path = PathPrefix::extend(&prefix, Expr::Field(k.clone()));
+                    stack.push(PathBranch::new(path, Cow::Borrowed(v), node_trackable));
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+    ResolveFlow::Exhausted
 }
 
 /// Resolve `expr` against a value that may be borrowed from the original
@@ -33003,8 +33018,8 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     // already produced in one shot. See limitations.md.
     let mut emitted = 0usize;
     // The seed is `.` itself -- no navigation -- so it inherits whatever
-    // `value` already was (#1591), same as `resolve_recursive_descent`'s own
-    // root entry. Every subsequent node on the stack comes from `f`, and
+    // `value` already was (#1591), same as `resolve_recursive_descent_sink`'s
+    // own root entry. Every subsequent node on the stack comes from `f`, and
     // that is `child_snapshot`'s own job below, not this seed's.
     let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
         PathPrefix::root(),
@@ -35396,9 +35411,10 @@ enum DelPaths<'a> {
     /// The document root itself was one of the resolved paths (#1651).
     ///
     /// `..`/bare `recurse`/`recurse(f)`/`recurse(f;cond)` all emit it
-    /// unconditionally (`push_recursive_branches` pushes the current node
-    /// before recursing into children, and `recurse`'s own definition emits
-    /// `.` regardless of what `f` does). Deleting the root subsumes every
+    /// unconditionally (`resolve_recursive_descent_sink` delivers the
+    /// current node to `sink` before pushing its children, and `recurse`'s
+    /// own definition emits `.` regardless of what `f` does). Deleting the
+    /// root subsumes every
     /// other resolved path — [`DeleteTrie::root_is_terminal`] and
     /// `delete_at_path`'s `Expr::Identity` arm both already collapse the
     /// whole value to `null` on exactly this condition — so the remaining
@@ -42089,8 +42105,8 @@ impl DeleteTrieNode {
 ///
 /// The trie is O(d) amortized instead, because sibling branches under a
 /// shared ancestor literally share the same `Rc<PathPrefix>` allocation for
-/// that ancestor: `push_recursive_branches` clones the *same* parent `Rc`
-/// into every child, so a `d+1`-branch traversal creates exactly `d`
+/// that ancestor: `resolve_recursive_descent_sink` clones the *same* parent
+/// `Rc` into every child, so a `d+1`-branch traversal creates exactly `d`
 /// distinct `PathPrefix::Node`s, not O(d²). Interning by pointer identity
 /// (see [`DeleteTrieBuilder::intern`]) means each branch only does new work
 /// for the part of its chain no earlier branch already walked, and the apply
@@ -42324,8 +42340,8 @@ impl DeleteTrieBuilder {
     /// (or the root) is reached, then create the missing nodes root-ward.
     ///
     /// Iterative rather than recursive on purpose: a `PathPrefix` chain is
-    /// only depth-bounded when `push_recursive_branches` built it, and a
-    /// long *static* prefix ahead of a computed key (`del(.a.a.a…a[.k])`)
+    /// only depth-bounded when `resolve_recursive_descent_sink` built it, and
+    /// a long *static* prefix ahead of a computed key (`del(.a.a.a…a[.k])`)
     /// has no such bound.
     ///
     /// That removes the overflow from *interning* only — it does not make
@@ -86697,26 +86713,53 @@ mod tests {
     /// depth guard at all before this issue -- `prefix.len()` doubles as the
     /// recursion depth, so no new parameter was needed, just the assertion.
     /// `tests/jq_recurse_depth_tests.rs` already pins a depth-300
-    /// correctness floor through this exact function (#626/#661), well
-    /// under the 384 ceiling asserted here.
+    /// correctness floor through this exact spelling (#626/#661), well
+    /// under the 384 ceiling asserted here. Retargeted at
+    /// `resolve_recursive_descent_sink` by #2696, which replaced
+    /// `push_recursive_branches` with a lazy, sink-shaped walk carrying the
+    /// identical `assert_value_tree_depth` guard.
     #[test]
-    fn push_recursive_branches_panics_past_nesting_depth_limit_1021() {
+    fn resolve_recursive_descent_sink_panics_past_nesting_depth_limit_1021() {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut out = Vec::new();
-        push_recursive_branches(&PathPrefix::root(), &under, true, &mut out);
+        let flow = resolve_recursive_descent_sink(&under, true, &Snapshot::No, &mut |branch| {
+            out.push(branch);
+            Demand::Continue
+        });
+        assert!(matches!(flow, ResolveFlow::Exhausted), "{flow:?}");
         assert_eq!(out.len(), MAX_VALUE_TREE_DEPTH);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut out = Vec::new();
-            push_recursive_branches(&PathPrefix::root(), &over, true, &mut out);
+            resolve_recursive_descent_sink(&over, true, &Snapshot::No, &mut |_| Demand::Continue)
         }));
         assert!(
             result.is_err(),
-            "push_recursive_branches should panic at MAX_VALUE_TREE_DEPTH"
+            "resolve_recursive_descent_sink should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// #2696: bare `..`/`recurse`/`recurse_down` used to collect the whole
+    /// tree (`push_recursive_branches`) before a bounded consumer ever saw
+    /// the first branch, unlike the parameterised pair's own sink
+    /// (`resolve_recurse_sink`, #2235). There is no CLI-observable side
+    /// effect to catch a regression back to eager collection the way
+    /// `test_recurse_f_max_items_truncation_suppresses_a_pending_error_842`'s
+    /// siblings do for `recurse(f)` -- a demand count is the only direct way
+    /// to pin this. A 1,000-node value with a sink that stops after the
+    /// first branch (the seed itself) must be called exactly once.
+    #[test]
+    fn resolve_recursive_descent_sink_stops_after_first_demand_2696() {
+        let value = linear_array_nest(1000);
+        let mut calls = 0usize;
+        let flow = resolve_recursive_descent_sink(&value, true, &Snapshot::No, &mut |_| {
+            calls += 1;
+            Demand::Stop
+        });
+        assert!(matches!(flow, ResolveFlow::Stopped), "{flow:?}");
+        assert_eq!(calls, 1);
     }
 
     /// #1021: `walk_impl` (backs `walk(f)`) had no depth guard at all
@@ -90041,13 +90084,13 @@ mod tests {
             // one output from `.a`'s own genuinely-navigated child (which
             // no longer matches `$x` and *should* still refuse; see
             // `test_resolve_recurse_sink_field_navigation_into_snapshot_wording_gap_1591`).
-            // The shared recurse-family untracked guard (`resolve_node`'s
+            // The shared recurse-family untracked guard (`resolve_node_sink`'s
             // own `RecursiveDescent | Recurse | RecurseDown | RecurseF |
             // RecurseCond` arm) used to refuse *any* untracked value
             // unconditionally, before `resolve_recurse_sink`'s own seed or
-            // `resolve_recursive_descent`'s root patch ever got a chance to
-            // recognise a deferred snapshot — closed by loosening the guard
-            // to `!trackable && !snapshot`, the same carve-out
+            // `resolve_recursive_descent_sink`'s own root seed ever got a
+            // chance to recognise a deferred snapshot — closed by loosening
+            // the guard to `!trackable && !snapshot`, the same carve-out
             // `getpath([])`'s guard already needed.
             "path(. as $x | reduce (1) as $i (0; $x | limit(1; ..)))",
         ] {
