@@ -42863,6 +42863,74 @@ fn path_mode_streams_cond_and_bind_sources_2694() -> Result<()> {
             String::new(),
             0,
         ),
+        // A halt raised by the generator itself, in each of the three arms:
+        // it is never downgraded into a catchable path error, and it beats
+        // whatever the downstream consumer had already answered. The two
+        // `cond` rows deliver their branch first (jq prints `[]` before
+        // exiting 3) even though the sink's own answer was a stop -- the
+        // `Keep::First` consumer was already satisfied by the truthy output.
+        (
+            "[1,2,3]",
+            "path(.[halt_error(3):])",
+            String::new(),
+            "[1,2,3]\n".to_string(),
+            3,
+        ),
+        (
+            "[1,2,3]",
+            "path(.[(1,halt_error(3)):])",
+            "[{\"start\":1,\"end\":null}]\n".to_string(),
+            "[1,2,3]\n".to_string(),
+            3,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(select((true, halt_error(3))))",
+            "[]\n".to_string(),
+            "{\"a\":1}\n".to_string(),
+            3,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(if (true, halt_error(3)) then . else empty end)",
+            "[]\n".to_string(),
+            "{\"a\":1}\n".to_string(),
+            3,
+        ),
+        // A bound between the fold and the leaf (`limit`/`first`/`nth`)
+        // narrows `Keep::AtMost`, so the leaf's own stream stops at the
+        // bound rather than at the fold's demand. `nth(1; ...)` skips one
+        // element before emitting, so it costs two writes, not one.
+        (
+            "[1,2,3]",
+            r#"path(reduce (limit(2; (.[]|stderr)+0)) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce (first((.[]|stderr)+0)) as $i (.; error("u")))"#,
+            String::new(),
+            one("u"),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            r#"path(reduce (nth(1; (.[]|stderr)+0)) as $i (.; error("u")))"#,
+            String::new(),
+            format!("12{}", e("u")),
+            5,
+        ),
+        // `getpath`'s argument escaping with no output at all still reaches
+        // the leaf arm's own escape return rather than falling through.
+        (
+            r#"{"a":1}"#,
+            r#"path(getpath(error("x")))"#,
+            String::new(),
+            e("x"),
+            5,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
