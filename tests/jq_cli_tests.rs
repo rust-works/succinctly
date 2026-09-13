@@ -32597,6 +32597,39 @@ type SideEffectCase = (
 #[test]
 fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
     let cases: &[SideEffectCase] = &[
+        // #2693: the `recurse` pair, moved here from
+        // `test_short_circuit_side_effect_leaks_820_932_987`, where it held
+        // the `binary_fanout_each` inner/outer `pending` asymmetry while
+        // `recurse` was still the eager fallback that produced one.
+        //
+        // Giving the `recurse` family a demand-forwarding arm removed that
+        // `pending` at the source rather than changing how it is consumed:
+        // jq emits a node *before* evaluating `f` on it, so a consumer the
+        // node itself satisfies never runs `f`, never reaches the
+        // `halt_error`, and has no halt to keep or drop. Both spellings now
+        // raise the path error with no stderr, exactly as jq 1.7.1 does --
+        // including the second, which used to write a stray `x` jq never
+        // writes.
+        (
+            &[
+                "-cn",
+                r#"path((0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result false",
+            5,
+        ),
+        (
+            &[
+                "-cn",
+                r#"path(1 == (0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)))"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result false",
+            5,
+        ),
         // #2669: the eager `and`/`or` route, moved here from
         // `test_short_circuit_side_effect_leaks_820_932_987`.
         //
@@ -34103,20 +34136,20 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         // one: `binary_fanout_each` has two operands and so can be handed
         // two `pending`s, and it keeps the *inner* (left) operand's while
         // dropping the *outer* (right) one's -- see `Flow::Stopped`'s own
-        // doc comment. #2180 WP3 gave `Expr::Foreach` a demand-forwarding
-        // arm, which removed the eager fallback the pair that used to pin
-        // this asymmetry depended on (those rows moved to
-        // `test_short_circuit_side_effect_shapes_already_match_jq_820`), so
-        // these two took over: `eval_each` has no `Builtin::Recurse` arm, so
-        // `recurse` still reaches the eager fallback that *produces* a
-        // `pending`. Both captured live against jq 1.7.1, which raises the
+        // doc comment. Pinning that needs an operand still reaching the
+        // eager fallback, since the fallback is what *produces* a `pending`,
+        // and this pair keeps being handed on as arms land: `if` until #1462,
+        // `foreach` until #2180 WP3, `recurse` until #2693 (each set of rows
+        // moving to `test_short_circuit_side_effect_shapes_already_match_jq_820`
+        // as it started matching). `while` has no lazy arm, so it holds the
+        // pair now. Both captured live against jq 1.7.1, which raises the
         // path error with no stderr in either spelling.
         //
         // Inner (left) operand keeps its `pending`: the halt wins outright.
         (
             &[
                 "-cn",
-                r#"path((0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)"#,
+                r#"path((0 | while(true; if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)"#,
             ],
             None,
             "",
@@ -34130,7 +34163,7 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         (
             &[
                 "-cn",
-                r#"path(1 == (0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)))"#,
+                r#"path(1 == (0 | while(true; if . < 1 then .+1 else ("x"|halt_error(3)) end)))"#,
             ],
             None,
             "",
