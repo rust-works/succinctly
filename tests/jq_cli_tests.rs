@@ -32896,6 +32896,41 @@ type SideEffectCase = (
 #[test]
 fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
     let cases: &[SideEffectCase] = &[
+        // #2903: path-mode `foreach`/`reduce` resolve INIT by demand, moved
+        // here from `test_short_circuit_side_effect_leaks_820_932_987`.
+        //
+        // #2668 gave *value*-mode `foreach`'s INIT a demand-forwarding
+        // drive but could not reach `resolve_foreach`, which has its own
+        // fold loop (`FoldRegister`/`drive_fold_source`) and does not call
+        // `foreach_forks` -- an explicitly anticipated gap in #2668's own
+        // triage plan. Before #2668 both evaluators collected INIT eagerly
+        // and so agreed with each other; afterwards path-mode disagreed
+        // with value-mode as well as with jq. Both now run each INIT fork's
+        // whole fold before asking INIT for the next output, so a consumer
+        // satisfied by an earlier fork never pays for a later one. jq
+        // writes nothing for either spelling, confirmed live against 1.7.1.
+        (
+            &[
+                "-c",
+                r#"first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))"#,
+            ],
+            Some(r#"{"a":1}"#),
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
+        // `resolve_reduce`'s own copy of the same loop, which the issue did
+        // not name but which diverged identically.
+        (
+            &[
+                "-c",
+                r#"first(path(reduce (1) as $i ((.a, ("I"|stderr)); .)))"#,
+            ],
+            Some(r#"{"a":1}"#),
+            "[\"a\"]\n",
+            "",
+            0,
+        ),
         // #2693: the `recurse` pair, moved here from
         // `test_short_circuit_side_effect_leaks_820_932_987`, where it held
         // the `binary_fanout_each` inner/outer `pending` asymmetry while
@@ -34409,27 +34444,6 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // ---- #2668 review finding, filed as #2903 -------------------------
-        // `resolve_foreach` (path-mode `foreach`, reached via
-        // `path(foreach(...))`) has its own separate fold loop
-        // (`FoldRegister`/`drive_fold_source`) that #2668 did not touch --
-        // an explicitly anticipated risk in #2668's own triage plan, which
-        // checked it does not call `foreach_forks` and left it alone on
-        // that basis. Before #2668 both evaluators collected INIT eagerly
-        // and agreed with each other; #2668 fixed only value-mode, so
-        // path-mode now disagrees with value-mode too, on top of its own
-        // unchanged divergence from jq. Captured live against jq 1.7.1,
-        // which writes nothing.
-        (
-            &[
-                "-c",
-                r#"first(path(foreach (1) as $i ((.a, ("I"|stderr)); .; .)))"#,
-            ],
-            Some(r#"{"a":1}"#),
-            "[\"a\"]\n",
-            "I",
-            0,
-        ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry ------
         // `Flow::Stopped { pending }` is dropped by every lazy consumer but
         // one: `binary_fanout_each` has two operands and so can be handed
