@@ -18948,6 +18948,41 @@ fn test_yq_break_desugars_to_a_shadowable_error_call_2687() -> Result<()> {
     Ok(())
 }
 
+/// #2840: `label`'s own error re-raise desugars the same way #2687 desugars
+/// `break $x` -- both a shadowable call to `error/0`, resolved by
+/// `resolve_func_calls`, shared verbatim between `jq_runner.rs` and
+/// `yq_runner.rs`. Mirrors
+/// `test_label_error_reraise_is_a_shadowable_error_call_2840` in
+/// `jq_cli_tests.rs`. Extension-on-extension, no oracle: `label`/`break`/
+/// `def` are all ungated succinctly extensions in yq mode.
+#[test]
+fn test_yq_label_error_reraise_is_a_shadowable_error_call_2840() -> Result<()> {
+    let doc = "a: 1\n";
+    for (filter, want) in [
+        (
+            r#"label $a | ((def f: break $a; def error: "S"; label $b | (1, f, 2)), 3)"#,
+            "1\n\"S\"\n3",
+        ),
+        (
+            r"label $a | ((def f: break $a; label $b | (1, f, 2)), 3)",
+            "1",
+        ),
+        (
+            r#"def error: (10,20); label $out | (1, error("x"), 2)"#,
+            "1\n10\n20",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "#2840: `{filter}` -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "#2840: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2740: `resolve_func_calls` is shared verbatim between `jq_runner.rs` and
 /// `yq_runner.rs` -- mirrors `test_undefined_name_inside_never_called_def_compiles_2740`/
 /// `test_undefined_name_inside_a_called_def_still_a_compile_error_2740`

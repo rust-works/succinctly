@@ -7892,6 +7892,118 @@ fn test_break_shadowed_by_def_error_sees_ambient_input_not_jqs_sentinel_2687() -
     Ok(())
 }
 
+/// #2840: real jq's `label $x | BODY` catches every escape leaving `BODY`
+/// that isn't its own break sentinel and re-raises it through
+/// `gen_call("error", gen_noop())`, resolved by ordinary lexical scope at
+/// the label's own position -- the same desugaring #2687 gave `break $x`,
+/// but for the label's own catch-all re-raise instead. A `def error:` in
+/// scope there therefore intercepts a non-matching `break` of an *outer*
+/// label too, not just `error(...)`. Every row verified live against jq
+/// 1.7.1.
+#[test]
+fn test_label_error_reraise_is_a_shadowable_error_call_2840() -> Result<()> {
+    for (filter, want_stdout) in [
+        // A non-matching break of an outer label, shadowed by an inner
+        // label's own `def error:` -- the break never reaches $a.
+        (
+            r#"label $a | ((def f: break $a; def error: "S"; label $b | (1, f, 2)), 3)"#,
+            "1\n\"S\"\n3\n",
+        ),
+        // Unshadowed: the break unwinds all the way, 3 never runs.
+        (
+            r"label $a | ((def f: break $a; label $b | (1, f, 2)), 3)",
+            "1\n",
+        ),
+        // The shadowing def's input is the raised payload, not the
+        // ambient `.`.
+        (
+            r#""IN" | (def error: .; label $out | (1, error("x"), 2))"#,
+            "1\n\"x\"\n",
+        ),
+        // Multi-output def: every output becomes an ordinary extra value.
+        (
+            r#"def error: (10,20); label $out | (1, error("x"), 2)"#,
+            "1\n10\n20\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want_stdout, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // A def that itself raises propagates through the re-raise.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"def error: error("R"); label $out | (1, error("x"), 2)"#,
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert!(stderr.contains('R'), "stderr: {stderr:?}");
+    assert_eq!(code, 5);
+
+    // `halt`/`halt_error` are never intercepted.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"def error: "S"; label $out | (1, halt_error, 2)"#],
+        Some(r#""boom""#),
+    )?;
+    assert_eq!(stdout, "1\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    assert_eq!(code, 5);
+
+    // In path position, the intercepted value becomes jq's ordinary
+    // "Invalid path expression" error.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"def error: "S"; path(label $out | error("x"))"#],
+        Some("null"),
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
+/// #2840's second facet: the label's synthetic `error/0` re-raise call
+/// site is a real call site to the compiler, so it makes an otherwise-
+/// unreferenced `def error:` reachable -- exactly as #2687 already made
+/// `break $x`'s desugared call site do. Every row verified live against jq
+/// 1.7.1.
+#[test]
+fn test_label_reraise_call_site_makes_def_error_reachable_2840() -> Result<()> {
+    // Reachable only through the label's own re-raise call site.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def error: bogus; label $out | 1"], None)?;
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("bogus/0 is not defined"), "{stderr:?}");
+    assert_eq!(code, 3);
+
+    // Unreachable: no label anywhere reaches this def.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def error: bogus; 1"], None)?;
+    assert_eq!(stdout, "1\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0);
+
+    // The def is unreachable transitively too -- `g` itself is never
+    // called, so its own label's re-raise call site is never reached.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "def error: bogus; def g: label $x | 1; 1"], None)?;
+    assert_eq!(stdout, "1\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0);
+
+    // Flip: `g` is called, so its label's re-raise call site (and through
+    // it, `error`) is reachable.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "def error: bogus; def g: label $x | 1; g"], None)?;
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("bogus/0 is not defined"), "{stderr:?}");
+    assert_eq!(code, 3);
+
+    Ok(())
+}
+
 #[test]
 fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
     // A `break $label` raised from inside `while`/`foreach`/`repeat`'s
