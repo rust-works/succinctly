@@ -214,8 +214,37 @@ DEFAULT_THRESHOLD = 5.0
 # comment for the +16%-to-noise fix that predates this). 10% leaves headroom
 # above the observed ARM64 number while still catching a *further*
 # regression on top of this one.
+#
+# `users_keys_unsorted` (#2878): the same row, for the opposite reason -- a
+# drift that is *faster*, on one architecture only. The guard is `abs(drift)`,
+# so direction is irrelevant to whether an override is needed (see 9d555f3f0,
+# which corrected exactly that misreading).
+#
+# #2878 routed the CLI's document splitter through `find_json_escape`, whose
+# `"`/`\`/`< 0x20` predicate is the control-character rule it had to add
+# anyway, replacing a byte-at-a-time scalar loop. Measured by this guard on
+# its own runners against the PR's merge-base (#1582), the two architectures
+# disagree in sign:
+#
+#            users_keys_unsorted   wide_keys_unsorted   users_identity
+#   ARM64          -8.2%                 -1.9%              -1.3%
+#   x86_64         +2.2%                 +0.7%              +0.4%
+#
+# NEON wins the scan; x86_64's movemask path costs slightly more than the
+# scalar loop it replaced, on a fixture whose strings are short (the `users`
+# shape is small records). `users_keys_unsorted` is the smallest query in the
+# matrix, so it shows the largest relative swing in both directions. Only the
+# ARM64 number exceeds `DEFAULT_THRESHOLD`; 10% clears it with headroom while
+# still catching a further move on top of it, in either direction.
+#
+# **Remove this entry once `main` has moved past #2878.** Both overrides here
+# are permanent loosenings of a row whose only job is to be watched -- with
+# `--baseline-binary` on every PR and push run the checked-in file is never
+# consulted, so once the merge-base includes #2878 this row reads ~0% again
+# and the override only blinds it. Tracked by the follow-up filed on #2878.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
+    "users_keys_unsorted": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
