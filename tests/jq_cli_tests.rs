@@ -53728,22 +53728,23 @@ fn test_large_int_literal_rounds_to_17_digits_before_f64_arith_2906() -> Result<
     Ok(())
 }
 
-/// #2906: the same literal-to-double rule applies when an `Int` is widened
-/// for `==`/`!=` and the ordering operators, so a literal compares equal to
-/// the double jq's own arithmetic produced from it. Two literals still
-/// compare exactly (`869389897822472004 == 869389897822472000` stays
-/// `false`, as in jq's `decNumberCompare`). Captured live against
-/// `/usr/bin/jq` 1.7.1.
+/// #2906: jq's comparison (`jvp_number_cmp`) has two rules. A literal
+/// against a *computed* double widens the literal through the same
+/// 17-digit rounding arithmetic uses, so a literal compares equal to the
+/// double jq's own arithmetic produced from it. Two *literals* compare
+/// exactly as decimals (`decNumberCompare`) -- no rounding on either side,
+/// so `869389897822472004` is unequal to the float literal `...1936.0`
+/// (its own rounded double) but equal to `...2004.0`, whatever double that
+/// spelling parses to. Captured live against `/usr/bin/jq` 1.7.1.
 ///
-/// Only the binary operators are pinned here. `sort`/`unique`/`min`/`max`
-/// on an array built in the filter cross the reindex bridge, which
-/// re-parses the computed double `869389897822472000` as an *integer*
-/// literal, and from then on it compares exactly against the real literal
-/// (`[869389897822472004, (869389897822472000+0), 5] | sort` is
-/// `[5,869389897822472000,869389897822472004]` here and
-/// `[5,869389897822472004,869389897822472000]` in jq -- identical before
-/// and after #2906, a separate bridge gap tracked as #2938 and recorded in
-/// `docs/compliance/jq/limitations.md`).
+/// Only the binary operators are pinned for the literal-vs-computed rule.
+/// `sort`/`unique`/`min`/`max` on an array built in the filter cross the
+/// reindex bridge, which re-parses the computed double `869389897822472000`
+/// as an *integer* literal, and from then on it compares exactly against
+/// the real literal -- identical before and after #2906, a separate bridge
+/// gap tracked as #2938 (see `..._characterize_preexisting_bug_2906`).
+/// Literal-vs-literal pairs survive the bridge unchanged, so they are
+/// pinned through the ordering builtins too.
 #[test]
 fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()> {
     for (filter, want) in [
@@ -53764,10 +53765,116 @@ fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()
             "[(869389897822472000+0) < 869389897822472004, 869389897822472004 < 869389897822472100]",
             "[false,true]",
         ),
+        // Two literals: exact decimals. `...1936.0` is the literal's own
+        // rounded double and `...2064.0` is its nearest double; neither is
+        // equal to it, while `...2004.0` is.
+        ("869389897822472004 == 869389897822471936.0", "false"),
+        ("869389897822472004 == 869389897822472064.0", "false"),
+        ("869389897822472004 == 869389897822472004.0", "true"),
+        ("869389897822472004 > 869389897822471936.5", "true"),
+        ("869389897822472004 < 869389897822472000.5", "false"),
+        ("9007199254740993 == 9007199254740992.0", "false"),
+        ("1.00000000000000001 == 1.0", "false"),
+        ("0.1 == 0.10", "true"),
+        ("1e999 < 1e1000", "true"),
+        (
+            "[869389897822472004, 869389897822471936.5] | sort",
+            "[869389897822471936.5,869389897822472004]",
+        ),
+        (
+            "[869389897822472004.0, 869389897822472004] | unique",
+            "[869389897822472004.0]",
+        ),
+        (
+            "[869389897822472004, 869389897822471936.0] | unique",
+            "[869389897822471936.0,869389897822472004]",
+        ),
+        ("[1.50, 1.5] | unique", "[1.50]"),
+        ("[869389897822472004] | bsearch(869389897822471936.0)", "-1"),
+        ("[869389897822472004.0] | index(869389897822472004)", "0"),
+        ("869389897822471936.0 | IN(869389897822472004)", "false"),
+        (
+            "[869389897822472004, 869389897822471936.0] | group_by(.) | length",
+            "2",
+        ),
+        (
+            "[869389897822472004, 869389897822471936.5, (869389897822472000+0)] | min",
+            "869389897822471936.5",
+        ),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
         assert_eq!(output.trim(), want, "`{filter}`");
+    }
+
+    // The same literal pairs arriving as document input, through the
+    // generic evaluator.
+    let (output, code) = run_jq_stdin(
+        "[.a == .b, .a == .c, .a > .c, .a > .d, ([.a, .d] | sort)]",
+        r#"{"a":869389897822472004,"b":869389897822472004.0,"c":869389897822471936.0,"d":869389897822471936.5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[true,false,true,true,[869389897822471936.5,869389897822472004]]"
+    );
+    Ok(())
+}
+
+/// #2906 left three same-mechanism gaps open (tracked as #2936, #2937 and
+/// #2938); this pins their *current* answers so a later change cannot move
+/// them unnoticed, and so the eventual fixes have a test to flip. Each
+/// row's jq 1.7.1 answer is in the comment; succinctly's output was
+/// verified identical before and after #2906.
+#[test]
+fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()> {
+    for (filter, current, jq_says) in [
+        // #2938: the reindex bridge re-parses the computed double
+        // `869389897822472000` as an integer literal, which then compares
+        // exactly (`000 < 004`) instead of equal to the literal.
+        (
+            "[869389897822472004, (869389897822472000+0), 5] | sort",
+            "[5,869389897822472000,869389897822472004]",
+            "[5,869389897822472004,869389897822472000]",
+        ),
+        (
+            "[5, 869389897822472004, (869389897822472000+0)] | max",
+            "869389897822472004",
+            "869389897822472000",
+        ),
+        // #2936: a >17-digit float literal is parsed with one correct
+        // rounding, not jq's 17-digit pre-rounding.
+        (
+            "2.7293109604053567083 + 0",
+            "2.729310960405357",
+            "2.7293109604053565",
+        ),
+        // #2937: the math builtins widen with a bare cast, and the floor
+        // family (and `length`) print exact digits where jq has a double.
+        (
+            "869389897822472004 | sqrt",
+            "932410798.8555647",
+            "932410798.8555645",
+        ),
+        (
+            "869389897822472004 | floor",
+            "869389897822472064",
+            "869389897822472000",
+        ),
+        (
+            "869389897822472004 | length",
+            "869389897822472004",
+            "869389897822472000",
+        ),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(
+            output.trim(),
+            current,
+            "`{filter}` moved -- if it now prints {jq_says} (jq's answer), update this row and close the tracked issue"
+        );
     }
     Ok(())
 }

@@ -5814,13 +5814,33 @@ For an `i64` the two conversions differ only when the magnitude is at least `10^
 intermediate rounding is the identity and `n as f64` was already right — everything in
 `[2^53, 10^17)` behaved correctly before this fix. `jq_literal_int_to_f64`
 (`src/jq/value.rs`) implements the rounding with integer arithmetic only, and jq mode uses
-it wherever an `Int` is widened for `+`/`-`/`*`/`/`/`%`, for `==`, and for ordering
-(`<`, `sort`, `unique`, `group_by`, `min`/`max`, `bsearch`), in both evaluators;
-`%` additionally follows `binop_mod`'s truncate-the-double model, so
-`869389897822472004 % 1000` is `936` (jq) rather than the exact `4`, and
-`9007199254740993 % 2` is `0`. yq mode is untouched: real yq's `int64` arithmetic is
-exact (`869389897822472004 + 944331` is `869389897823416335` there, as it always was
-here), so its widening stays a plain cast (`EvalSemantics::INT_LITERAL_ROUNDS_TO_17_DIGITS`).
+it wherever an `Int` is widened for `+`/`-`/`*`/`/`/`%`, in both evaluators; `%`
+additionally follows `binop_mod`'s truncate-the-double model, so `869389897822472004 %
+1000` is `936` (jq) rather than the exact `4`, and `9007199254740993 % 2` is `0`.
+
+Comparison follows `jvp_number_cmp`, which has two rules (`jq_numeric_cmp`, behind
+jq-mode `==` and every ordering consumer — `<`, `sort`, `unique`, `group_by`, `min`/`max`,
+`bsearch`): a literal against a *computed* double widens the literal through the same
+17-digit rounding, so `869389897822472004 == (869389897822472004 + 0)` is `true`; two
+*literals* compare exactly as decimals (`decNumberCompare`), with no rounding on either
+side, so `869389897822472004 == 869389897822471936.0` is `false` while `869389897822472004
+== 869389897822472004.0` is `true`, `9007199254740993 == 9007199254740992.0` is `false`
+(previously a recorded divergence), and `1.00000000000000001 == 1.0` is `false`. The
+mode-blind `PartialEq` on `OwnedValue` keeps the old plain-cast widening: the yq
+presentation layer relies on it (comment alignment across a `|=` matches a yq-mode `Int`
+against the plain-cast double yq's own arithmetic produced), and a review round caught
+that routing it through the jq rounding moved yq comments onto the wrong elements. yq mode
+is otherwise untouched: real yq's `int64` arithmetic is exact (`869389897822472004 +
+944331` is `869389897823416335` there, as it always was here), so its widening stays a
+plain cast (`EvalSemantics::DECNUMBER_LITERALS`).
+
+Two things #2906 makes *visible* without changing: jq's `dtoi` on exactly `2^63` is a C
+cast that saturates on the arm64 oracle (`as i64` does the same) but is undefined
+behaviour and yields `INT64_MIN` on x86_64 jq, so `9223372036854775807 % 10` is `7` on the
+pin and `-8` there; and jq parses `-x % y` as `-(x % y)` (unary minus binds looser than
+`%`) where succinctly parses `(-x) % y`, a pre-existing precedence gap that only shows at
+this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
+and data-sourced spellings agree on `-8`).
 
 **Still open, same mechanism, out of #2906's scope** (tracked as #2936, #2937 and #2938):
 a *float* literal with more than 17 significant digits, or an integer literal beyond
@@ -5829,13 +5849,12 @@ a *float* literal with more than 17 significant digits, or an integer literal be
 through the number-materialisation funnels, not just the arithmetic (#2936); the math
 builtins (`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cast
 (`869389897822472004 | sqrt` is `932410798.8555645` in jq, `…647` here); and
-`floor`/`ceil`/`round`/`trunc` of such a value print their exact integer digits where jq
-prints the double (`869389897822472000`) (both #2937). Two *literals* compared against each other are
-still widened here where jq compares them exactly as decimals (`9007199254740993 ==
-9007199254740992.0`, `numeric_repr_eq`'s own doc comment). And a computed double that
-crosses the reindex bridge into a document-input builtin (`sort`, `unique`, `min`, `max`,
-`group_by` on an array built in the filter) is re-parsed from its printed digits as an
-*integer* literal, so it then compares exactly against a real literal instead of equal:
+`floor`/`ceil`/`round`/`trunc` (and `length`, which is `fabs(jv_number_value(x))` in jq)
+of such a value print their exact integer digits where jq prints the double
+(`869389897822472000`) (all #2937). And a computed double that crosses the reindex bridge
+into a document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array
+built in the filter) is re-parsed from its printed digits as an *integer* literal, so it
+then compares exactly against a real literal instead of equal:
 `[869389897822472004, (869389897822472000+0), 5] | sort` is
 `[5,869389897822472000,869389897822472004]` here and
 `[5,869389897822472004,869389897822472000]` in jq (stable, the two are equal there) —

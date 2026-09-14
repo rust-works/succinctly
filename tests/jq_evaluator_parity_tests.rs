@@ -807,22 +807,22 @@ fn test_parity_number_literal_reaches_numeric_arg_builtins_387() {
 fn test_parity_number_literal_ordering_agrees_with_equality_387() {
     // `compare_values`'s first cut at a `NumberLiteral` ordering arm tried an
     // exact `i64` comparison before falling back to `f64`, while `==`
-    // (`OwnedValue::PartialEq`) always widens a mixed pair to `f64`. Above
+    // (`OwnedValue::PartialEq`) always widened a mixed pair to `f64`. Above
     // 2^53 the two representations of "the same number" disagree about
     // whether an `i64` round-trips through `f64` exactly, so `==` and `>`
     // could both report `true` for the same pair -- e.g. `sort`/`unique`
     // disagreeing with `==` about whether two values are the same number.
-    // This is an internal-consistency property, not a jq-parity one: this
-    // crate already documents (`OwnedValue`'s `PartialEq` doc comment) that it
-    // widens to `f64` here where jq 1.7 keeps full decimal precision, so `==`
-    // itself already diverges from jq for this pair -- what must not diverge
-    // is `==` from `>`/`<`/`sort` about the *same* values.
+    // The property is internal consistency: `==` must never diverge from
+    // `>`/`<`/`sort` about the *same* values. Since #2906 both go through
+    // jq's own rule (`jq_numeric_cmp`: two literals compare exactly as
+    // decimals), so the answers below are also jq 1.7.1's own -- captured
+    // live: `false`, `true`, `false`.
     let json = br"[9007199254740993, 9007199254740992.0]";
     for filter in [".[0] == .[1]", ".[0] > .[1]", ".[0] < .[1]"] {
         assert_parity(json, filter);
     }
-    assert_eq!(as_strs(&full_outputs(json, ".[0] == .[1]")), ["true"]);
-    assert_eq!(as_strs(&full_outputs(json, ".[0] > .[1]")), ["false"]);
+    assert_eq!(as_strs(&full_outputs(json, ".[0] == .[1]")), ["false"]);
+    assert_eq!(as_strs(&full_outputs(json, ".[0] > .[1]")), ["true"]);
     assert_eq!(as_strs(&full_outputs(json, ".[0] < .[1]")), ["false"]);
 }
 

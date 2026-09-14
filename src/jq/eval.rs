@@ -71,12 +71,15 @@ pub enum EvalTag {
 pub trait EvalSemantics: Copy + Default {
     /// If true, integer overflow wraps (yq). If false, converts to float (jq).
     const OVERFLOW_WRAPS: bool;
-    /// If true (jq), an `Int` widened to `f64` for arithmetic or ordering is
-    /// treated as a decNumber *literal* and rounded to 17 significant
-    /// decimal digits before the double conversion, matching jq 1.7.1's
-    /// `jvp_literal_number_to_double` (#2906, `jq_literal_int_to_f64`). If
-    /// false (yq), the widening is a plain cast.
-    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool;
+    /// If true (jq), numbers follow jq 1.7.1's decNumber literal model
+    /// (#2906): every parsed number is an exact decimal *literal*, two
+    /// literals compare exactly (`jq_numeric_cmp`), and a literal widened to
+    /// `f64` for arithmetic or for comparison against a computed double is
+    /// first rounded to 17 significant decimal digits
+    /// (`jvp_literal_number_to_double`, `jq_literal_int_to_f64`). If false
+    /// (yq), integers are plain `int64`s and the widening is a plain cast.
+    /// jq-only by definition -- not an independently tunable knob.
+    const DECNUMBER_LITERALS: bool;
     /// If true, division by zero returns infinity (yq). If false, returns error (jq).
     const DIV_BY_ZERO_IS_INFINITY: bool;
     /// If true (yq), `has()`/`in()`'s array-index arm accepts *any* negative
@@ -313,7 +316,7 @@ pub struct JqSemantics;
 
 impl EvalSemantics for JqSemantics {
     const OVERFLOW_WRAPS: bool = false;
-    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool = true;
+    const DECNUMBER_LITERALS: bool = true;
     const DIV_BY_ZERO_IS_INFINITY: bool = false;
     const NEGATIVE_INDEX_IN_HAS: bool = false;
     const MOD_TRUNCATES_FLOATS: bool = true;
@@ -347,7 +350,7 @@ pub struct YqSemantics;
 
 impl EvalSemantics for YqSemantics {
     const OVERFLOW_WRAPS: bool = true;
-    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool = false;
+    const DECNUMBER_LITERALS: bool = false;
     const DIV_BY_ZERO_IS_INFINITY: bool = true;
     const NEGATIVE_INDEX_IN_HAS: bool = true;
     const MOD_TRUNCATES_FLOATS: bool = false;
@@ -377,9 +380,9 @@ use super::expr::{
     Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
-    assert_value_tree_depth, infinite_float_preview_text, int_to_f64, is_infinity_sentinel,
-    is_nan_sentinel, jq_literal_int_to_f64, numeric_repr_cmp, owned_value_eq, NumberRepr,
-    OwnedValue,
+    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, int_to_f64,
+    is_infinity_sentinel, is_nan_sentinel, jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp,
+    owned_value_eq, NumberRepr, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -8862,12 +8865,11 @@ fn jq_checked_int_arith(
     f64_op: impl FnOnce(f64, f64) -> f64,
 ) -> OwnedValue {
     match checked_op(a, b) {
-        Some(result)
-            if jq_int_within_exact_f64_range(a)
-                && jq_int_within_exact_f64_range(b)
-                && jq_int_within_exact_f64_range(result) =>
-        {
-            OwnedValue::Int(result)
+        // Both operands exact: the exact `i64` result is what the double
+        // arithmetic would compute, and `jq_f64_backed_int` decides whether
+        // it stays an `Int` or becomes jq's double past 2^53.
+        Some(result) if jq_int_within_exact_f64_range(a) && jq_int_within_exact_f64_range(b) => {
+            jq_f64_backed_int(result)
         }
         _ => OwnedValue::Float(f64_op(jq_literal_int_to_f64(a), jq_literal_int_to_f64(b))),
     }
@@ -9598,29 +9600,23 @@ fn arith_mod<S: EvalSemantics>(
                 } else {
                     Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
                 }
-            } else if S::OVERFLOW_WRAPS {
-                // yq behavior: exact int64 remainder.
+            } else if !S::MOD_TRUNCATES_FLOATS
+                || (jq_int_within_exact_f64_range(a) && jq_int_within_exact_f64_range(b))
+            {
+                // yq: exact int64 remainder. jq: the same whenever both
+                // operands are exact doubles -- the literal rounding is the
+                // identity there, the `intmax_t` truncation round-trips, and
+                // `|a % b| < |b| <= 2^53` keeps the result an exact `Int`
+                // (#2906). `wrapping_rem`: `i64::MIN % -1` must not panic.
                 Ok(OwnedValue::Int(a.wrapping_rem(b)))
             } else {
-                // jq behavior (#2906): `binop_mod` truncates each operand's
-                // *double* -- for a literal, the 17-digit-rounded one -- to
-                // `intmax_t` with a saturating cast (`dtoi`), takes the
-                // remainder, and holds the result as a double again. `as
-                // i64` is the same saturating truncation. The divisor
-                // cannot truncate to zero here (a nonzero `i64` never rounds
-                // to zero), but `% -1` must short-circuit to `0` exactly as
-                // jq does rather than trip `i64::MIN % -1`.
-                let (ai, bi) = (
-                    jq_literal_int_to_f64(a) as i64,
-                    jq_literal_int_to_f64(b) as i64,
-                );
-                if bi == 0 {
-                    Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
-                } else if bi == -1 {
-                    Ok(OwnedValue::Int(0))
-                } else {
-                    Ok(jq_f64_backed_int(ai.wrapping_rem(bi)))
-                }
+                // jq (#2906): `binop_mod` is `dtoi(a) % dtoi(b)` on the
+                // operands' *doubles* -- a literal's 17-digit-rounded one --
+                // with the remainder held as a double again, which is
+                // exactly `mod_floats`' truncating model. (`dtoi` saturates
+                // like `as i64` on the arm64 oracle; the C cast of exactly
+                // 2^63 is undefined behaviour and differs on x86_64 jq.)
+                mod_floats::<S>(int_to_f64::<S>(a), int_to_f64::<S>(b), &left, &right)
             }
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
@@ -9779,20 +9775,29 @@ fn compare_values_at_depth<S: EvalSemantics>(
     match (left, right) {
         (OwnedValue::Null, OwnedValue::Null) => Ordering::Equal,
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.cmp(b),
-        // Every numeric pairing -- `Int`, `Float`, or `NumberLiteral` in any
-        // combination -- compares by parsed value through one dispatch;
-        // ordering never looks at a literal's source text.
-        // `numeric_repr_cmp` uses the same `(Int,Int)`/`(Float,Float)`/mixed
-        // pairing `==` uses (`numeric_repr_eq`), so ordering can't disagree
-        // with equality about the same pair (see its doc comment), and its
-        // mixed arms widen an `Int` under `S`'s number model (#2906).
+        // Same-variant pairs order the same way under every number model,
+        // and are the hot case for a sort of computed values.
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => a.cmp(b),
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => cmp_f64(*a, *b),
+        // Every other numeric pairing follows the mode's own number model
+        // (#2906): jq's decNumber rule (`jq_numeric_cmp` -- two literals
+        // exactly, a literal against a computed double through the 17-digit
+        // rounding; the same function `owned_value_eq` uses, so ordering
+        // can't disagree with `==` about a pair), or yq's plain widening
+        // (`numeric_repr_cmp`, the same dispatch as `numeric_repr_eq`).
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
-        ) => match (left.number_repr(), right.number_repr()) {
-            (Some(a), Some(b)) => numeric_repr_cmp::<S>(a, b),
-            _ => Ordering::Equal,
-        },
+        ) => {
+            if S::DECNUMBER_LITERALS {
+                jq_numeric_cmp(left, right).expect("both operands are numbers")
+            } else {
+                let (Some(a), Some(b)) = (left.number_repr(), right.number_repr()) else {
+                    unreachable!("number_repr is Some for every numeric variant")
+                };
+                numeric_repr_cmp(a, b)
+            }
+        }
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
             for (av, bv) in a.iter().zip(b.iter()) {
@@ -43071,8 +43076,8 @@ fn delete_paths_sorted<S: EvalSemantics>(
     mut value: OwnedValue,
     paths: &[&[OwnedValue]],
     start: usize,
-    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
+    let yq_mode = S::TAG == EvalTag::Yq;
     debug_assert!(
         paths.iter().all(|p| p.len() > start),
         "every path in a run is longer than the depth it is grouped at"
@@ -43093,7 +43098,7 @@ fn delete_paths_sorted<S: EvalSemantics>(
         if paths[i].len() == start + 1 {
             del_keys.push(key);
         } else {
-            value = delete_paths_under::<S>(value, key, &paths[i..j], start + 1, yq_mode)?;
+            value = delete_paths_under::<S>(value, key, &paths[i..j], start + 1)?;
         }
         i = j;
     }
@@ -43107,8 +43112,8 @@ fn delete_paths_under<S: EvalSemantics>(
     key: &OwnedValue,
     paths: &[&[OwnedValue]],
     start: usize,
-    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
+    let yq_mode = S::TAG == EvalTag::Yq;
     match value {
         OwnedValue::Object(mut entries) => match key {
             OwnedValue::String(name) => {
@@ -43117,7 +43122,7 @@ fn delete_paths_under<S: EvalSemantics>(
                     // jq leaves an existing key where it was, and `IndexMap`
                     // would move it to the end after a `shift_remove`.
                     let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = delete_paths_sorted::<S>(old, paths, start, yq_mode)?;
+                    *slot = delete_paths_sorted::<S>(old, paths, start)?;
                 }
                 Ok(OwnedValue::Object(entries))
             }
@@ -43142,9 +43147,7 @@ fn delete_paths_under<S: EvalSemantics>(
             OwnedValue::Object(desc) => {
                 let range = SliceBounds::from_descriptor(desc)?.resolve(arr.len());
                 let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                let OwnedValue::Array(items) =
-                    delete_paths_sorted::<S>(sub, paths, start, yq_mode)?
-                else {
+                let OwnedValue::Array(items) = delete_paths_sorted::<S>(sub, paths, start)? else {
                     unreachable!("deleting from an array yields an array")
                 };
                 arr.splice(range, items);
@@ -43171,12 +43174,11 @@ fn delete_paths_under<S: EvalSemantics>(
                 match resolve_delete_index(key, arr.len()) {
                     DeleteIndexResolution::InRange(index) => {
                         let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
-                        arr[index] = delete_paths_sorted::<S>(old, paths, start, yq_mode)?;
+                        arr[index] = delete_paths_sorted::<S>(old, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
                         pad_with_nulls(&mut arr, index)?;
-                        arr[index] =
-                            delete_paths_sorted::<S>(OwnedValue::Null, paths, start, yq_mode)?;
+                        arr[index] = delete_paths_sorted::<S>(OwnedValue::Null, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
                 }
@@ -49277,7 +49279,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     root_deleted = true;
                     OwnedValue::Null
                 } else {
-                    delete_paths_sorted::<S>(v, core::slice::from_ref(&path), 0, true)?
+                    delete_paths_sorted::<S>(v, core::slice::from_ref(&path), 0)?
                 };
             }
             Ok(v)
@@ -49291,7 +49293,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => to_owned(value),
             Some([]) => Ok(OwnedValue::Null),
             // STYLE-0012: see the note above `root_deleted`.
-            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted::<S>(v, &paths, 0, false)),
+            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted::<S>(v, &paths, 0)),
         }
     };
     match result {

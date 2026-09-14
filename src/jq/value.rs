@@ -218,13 +218,14 @@ pub(crate) fn jq_literal_int_to_f64(n: i64) -> f64 {
     }
 }
 
-/// Widen an `Int` operand to `f64` under `S`'s number model: jq's
-/// literal rounding ([`jq_literal_int_to_f64`]) when
-/// `EvalSemantics::INT_LITERAL_ROUNDS_TO_17_DIGITS`, otherwise the plain
-/// cast real yq's `int64`-to-`float64` conversion amounts to.
+/// Widen an `Int` operand to `f64` for *arithmetic* under `S`'s number
+/// model: jq's literal rounding ([`jq_literal_int_to_f64`]) when
+/// `EvalSemantics::DECNUMBER_LITERALS`, otherwise the plain cast real yq's
+/// `int64`-to-`float64` conversion amounts to. (jq-mode comparison has its
+/// own rule, [`jq_numeric_cmp`]: two literals never widen at all.)
 #[inline]
 pub(crate) fn int_to_f64<S: EvalSemantics>(n: i64) -> f64 {
-    if S::INT_LITERAL_ROUNDS_TO_17_DIGITS {
+    if S::DECNUMBER_LITERALS {
         jq_literal_int_to_f64(n)
     } else {
         n as f64
@@ -2718,18 +2719,19 @@ pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
 /// - Objects compare order-insensitively (`IndexMap`'s own `PartialEq`), as in jq.
 ///
 /// Known divergence: above 2^53 a mixed `Int`/`Float` comparison widens the
-/// integer to `f64`, whereas jq 1.7 compares two *literals* exactly as
-/// decimals. So `9007199254740993 == 9007199254740992.0` is `true` here and
-/// `false` in jq. Every value representable exactly as an `f64` agrees. The
-/// widening itself follows jq's own literal-to-double rule
-/// ([`jq_literal_int_to_f64`], #2906), so an `Int` literal against a
-/// *computed* `Float` -- `869389897822472004 == (869389897822472004 + 0)`
-/// -- agrees with jq.
+/// integer to `f64` with a plain cast, whereas jq 1.7 compares two
+/// *literals* exactly as decimals and a literal against a computed double
+/// through its 17-digit rounding. So `9007199254740993 == 9007199254740992.0`
+/// is `true` here and `false` in jq. Every value representable exactly as an
+/// `f64` agrees.
 ///
-/// This is jq's rule only, and needs no `EvalSemantics`: yq's own equality
-/// (`STRICT_NUMERIC_EQUALITY`) never widens a mixed pair at all --
-/// [`owned_value_eq`] routes every yq-mode numeric pair to
-/// [`numeric_repr_eq_strict`] before this can run.
+/// This mode-blind widening is the rule behind `OwnedValue`'s `PartialEq`,
+/// which the yq presentation layer also relies on (`align_by_value` in the
+/// CLI matches a yq-mode `Int` against the plain-cast double yq's own
+/// arithmetic produced, and `owned_value_align_hash` must agree with it).
+/// jq-mode `==` does **not** stop here: [`owned_value_eq`] routes a jq-mode
+/// numeric pair through [`jq_numeric_cmp`] (#2906), and a yq-mode one
+/// through [`numeric_repr_eq_strict`].
 ///
 /// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
 /// source text -- two spellings of the same number (`1.0` and `1e0`) are
@@ -2738,8 +2740,8 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
         (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
-        (NumberRepr::Int(a), NumberRepr::Float(b)) => jq_literal_int_to_f64(a) == b,
-        (NumberRepr::Float(a), NumberRepr::Int(b)) => a == jq_literal_int_to_f64(b),
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => (a as f64) == b,
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => a == (b as f64),
     }
 }
 
@@ -2797,14 +2799,19 @@ fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
         }
         // Every other pairing (Null/Bool/String, Int/Float/NumberLiteral,
         // and any type mismatch) has no further nesting to thread through.
-        // Only checked only when *both* operands are numeric under strict
-        // mode; a number-vs-non-number comparison (already `false` either
-        // way) and every jq-mode comparison fall straight through to the
-        // ordinary widening `PartialEq`.
+        // A numeric pair takes the mode's own number model -- yq's strict
+        // never-widen rule, or jq's decNumber rule (#2906: two literals
+        // compare exactly, a literal against a computed double through the
+        // 17-digit rounding); a number-vs-non-number comparison (already
+        // `false` either way) and everything non-numeric fall straight
+        // through to the ordinary `PartialEq`.
         _ => {
-            if S::STRICT_NUMERIC_EQUALITY {
-                if let (Some(x), Some(y)) = (a.number_repr(), b.number_repr()) {
+            if let (Some(x), Some(y)) = (a.number_repr(), b.number_repr()) {
+                if S::STRICT_NUMERIC_EQUALITY {
                     return numeric_repr_eq_strict(x, y);
+                }
+                if S::DECNUMBER_LITERALS {
+                    return jq_numeric_cmp(a, b) == Some(core::cmp::Ordering::Equal);
                 }
             }
             a == b
@@ -2862,20 +2869,209 @@ pub(crate) fn cmp_f64(a: f64, b: f64) -> core::cmp::Ordering {
 ///
 /// The NaN rule (#421) is centralized in [`cmp_f64`], not repeated here.
 ///
-/// Unlike [`numeric_repr_eq`], ordering runs in both modes (`sort`, `min`,
-/// `max`, `<` all reach it under yq too), so the mixed-pair widening is
-/// mode-forked through [`int_to_f64`]: jq's literal rounding
-/// ([`jq_literal_int_to_f64`], #2906) in jq mode, the plain cast in yq mode.
-pub(crate) fn numeric_repr_cmp<S: EvalSemantics>(
-    a: NumberRepr,
-    b: NumberRepr,
-) -> core::cmp::Ordering {
+/// Like [`numeric_repr_eq`], this is the mode-blind plain widening: yq-mode
+/// ordering uses it as is, while jq-mode ordering (`compare_values`) uses
+/// [`jq_numeric_cmp`] for any pair that is not `Int`/`Int` or
+/// `Float`/`Float` (#2906).
+pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Ordering {
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a.cmp(&b),
         (NumberRepr::Float(a), NumberRepr::Float(b)) => cmp_f64(a, b),
-        (NumberRepr::Int(a), NumberRepr::Float(b)) => cmp_f64(int_to_f64::<S>(a), b),
-        (NumberRepr::Float(a), NumberRepr::Int(b)) => cmp_f64(a, int_to_f64::<S>(b)),
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => cmp_f64(a as f64, b),
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => cmp_f64(a, b as f64),
     }
+}
+
+/// Compare two number literals exactly, by their decimal digits, the way
+/// jq's `jvp_number_cmp` compares two decNumber literals
+/// (`decNumberCompare`, #2906): neither side is converted to `f64`, so
+/// `869389897822472004` vs `869389897822472004.0` is `Equal` and
+/// `869389897822472004` vs `869389897822471936.5` is `Greater`, whatever
+/// doubles those spellings round to. Accepts every spelling the literal
+/// paths store (RFC 8259 numbers plus #1171's `.5`/`-.5` leniency); `-0`
+/// and `0` are equal.
+pub(crate) fn cmp_decimal_literals(a: &str, b: &str) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    let (a_negative, a_digits, a_exponent) = decompose_decimal_literal(a);
+    let (b_negative, b_digits, b_exponent) = decompose_decimal_literal(b);
+    let sign = |negative: bool, digits: &[u8]| -> i8 {
+        if digits.is_empty() {
+            0
+        } else if negative {
+            -1
+        } else {
+            1
+        }
+    };
+    let (a_sign, b_sign) = (sign(a_negative, &a_digits), sign(b_negative, &b_digits));
+    if a_sign != b_sign {
+        return a_sign.cmp(&b_sign);
+    }
+    if a_sign == 0 {
+        return Ordering::Equal;
+    }
+    // Same nonzero sign: the magnitude with its leading digit further left
+    // is larger; at the same position, the digit strings (no leading or
+    // trailing zeros) order lexicographically, a proper prefix being smaller.
+    let a_lead = a_digits.len() as i128 + a_exponent;
+    let b_lead = b_digits.len() as i128 + b_exponent;
+    let magnitude = a_lead.cmp(&b_lead).then_with(|| a_digits.cmp(&b_digits));
+    if a_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    }
+}
+
+/// `(negative, significant digits, exponent)` with value
+/// `digits * 10^exponent`, the digits stripped of leading and trailing
+/// zeros (empty means zero). Parsing stops at the first byte that is not
+/// part of a number, so a stray suffix cannot panic.
+fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let negative = match bytes.first() {
+        Some(b'-') => {
+            i = 1;
+            true
+        }
+        Some(b'+') => {
+            i = 1;
+            false
+        }
+        _ => false,
+    };
+    let mut digits = Vec::new();
+    let mut exponent: i128 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        digits.push(bytes[i]);
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            digits.push(bytes[i]);
+            exponent -= 1;
+            i += 1;
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        let exponent_negative = match bytes.get(i) {
+            Some(b'-') => {
+                i += 1;
+                true
+            }
+            Some(b'+') => {
+                i += 1;
+                false
+            }
+            _ => false,
+        };
+        let mut e: i128 = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            // Saturate far beyond any exponent a literal can hold, so an
+            // absurdly long exponent still orders correctly without
+            // overflowing the arithmetic above.
+            e = (e * 10 + i128::from(bytes[i] - b'0')).min(1 << 62);
+            i += 1;
+        }
+        exponent += if exponent_negative { -e } else { e };
+    }
+    let leading_zeros = digits.iter().take_while(|d| **d == b'0').count();
+    digits.drain(..leading_zeros);
+    while digits.last() == Some(&b'0') {
+        digits.pop();
+        exponent += 1;
+    }
+    (negative, digits, exponent)
+}
+
+/// jq's own number comparison (`jvp_number_cmp`, `src/jv.c`), behind
+/// jq-mode `==` and ordering (#2906): two *literals* compare exactly as
+/// decimals (`decNumberCompare`), while any pair involving a *computed*
+/// double compares as doubles, a literal converted through the same
+/// 17-digit rounding arithmetic uses ([`jq_literal_int_to_f64`]). `None`
+/// unless both operands are numbers.
+///
+/// A `NumberLiteral` (either repr) and a bare `Int` are literals (the
+/// invariant [`jq_literal_int_to_f64`] documents); a bare `Float` is
+/// computed. Two literals are ordered by their correctly-rounded doubles
+/// first -- rounding is monotonic, so a strict double order *is* the exact
+/// order -- and only a double tie falls through to the digit comparison,
+/// so sorting document floats pays for text only when two values' doubles
+/// coincide (byte-equal spellings short-circuit). A `Float` literal with
+/// more than 17 significant digits is still widened by its parsed double
+/// rather than jq's rounded one (#2936).
+pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Ordering> {
+    use core::cmp::Ordering;
+
+    struct Literal<'a> {
+        double: f64,
+        int: Option<i64>,
+        text: Option<&'a str>,
+    }
+    enum Side<'a> {
+        Literal(Literal<'a>),
+        Computed(f64),
+    }
+    fn side(value: &OwnedValue) -> Option<Side<'_>> {
+        Some(match value {
+            OwnedValue::Int(n) => Side::Literal(Literal {
+                double: *n as f64,
+                int: Some(*n),
+                text: None,
+            }),
+            OwnedValue::NumberLiteral(NumberRepr::Int(n), text) => Side::Literal(Literal {
+                double: *n as f64,
+                int: Some(*n),
+                text: Some(text),
+            }),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Side::Literal(Literal {
+                double: *f,
+                int: None,
+                text: Some(text),
+            }),
+            OwnedValue::Float(f) => Side::Computed(*f),
+            _ => return None,
+        })
+    }
+    fn to_double(literal: &Literal<'_>) -> f64 {
+        match literal.int {
+            Some(n) => jq_literal_int_to_f64(n),
+            None => literal.double,
+        }
+    }
+    fn text<'a>(literal: &'a Literal<'a>) -> Cow<'a, str> {
+        match (literal.text, literal.int) {
+            (Some(text), _) => Cow::Borrowed(text),
+            (None, Some(n)) => Cow::Owned(n.to_string()),
+            (None, None) => unreachable!("a literal without text always carries an i64"),
+        }
+    }
+    fn cmp_literals(a: &Literal<'_>, b: &Literal<'_>) -> Ordering {
+        if let (Some(x), Some(y)) = (a.int, b.int) {
+            return x.cmp(&y);
+        }
+        match cmp_f64(a.double, b.double) {
+            Ordering::Equal => {
+                let (a_text, b_text) = (text(a), text(b));
+                if a_text == b_text {
+                    Ordering::Equal
+                } else {
+                    cmp_decimal_literals(&a_text, &b_text)
+                }
+            }
+            strict => strict,
+        }
+    }
+
+    Some(match (side(left)?, side(right)?) {
+        (Side::Literal(a), Side::Literal(b)) => cmp_literals(&a, &b),
+        (Side::Literal(a), Side::Computed(b)) => cmp_f64(to_double(&a), b),
+        (Side::Computed(a), Side::Literal(b)) => cmp_f64(a, to_double(&b)),
+        (Side::Computed(a), Side::Computed(b)) => cmp_f64(a, b),
+    })
 }
 
 impl OwnedValue {
@@ -3599,9 +3795,11 @@ mod tests {
                 OwnedValue::from_number_literal("9007199254740993"),
                 OwnedValue::Float(9007199254740992.0),
             ),
-            // #2906: an 18-digit `Int` literal against the double jq's own
-            // literal rounding produces for it (not the exact integer's
-            // nearest double, `869389897822472064.0`).
+            // An 18-digit `Int` literal against the double jq's own literal
+            // rounding produces for it: *unequal* under the mode-blind plain
+            // widening (`PartialEq`, `numeric_repr_cmp`), which is the pair
+            // both must agree on; jq-mode `==` answers separately through
+            // `jq_numeric_cmp` (#2906, tested below).
             (
                 OwnedValue::from_number_literal("869389897822472004"),
                 OwnedValue::Float(869389897822471936.0),
@@ -3617,11 +3815,118 @@ mod tests {
                 "numeric_repr_eq disagrees with OwnedValue::eq for {a:?} vs {b:?}"
             );
             assert_eq!(
-                numeric_repr_cmp::<JqSemantics>(ra, rb) == core::cmp::Ordering::Equal,
+                numeric_repr_cmp(ra, rb) == core::cmp::Ordering::Equal,
                 are_eq,
                 "numeric_repr_cmp disagrees with OwnedValue::eq for {a:?} vs {b:?}"
             );
         }
+    }
+
+    /// #2906: `cmp_decimal_literals` is jq's `decNumberCompare` on two
+    /// literal spellings -- exact, so doubles never enter into it.
+    #[test]
+    fn test_cmp_decimal_literals_is_exact_2906() {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        for (a, b, want) in [
+            ("869389897822472004", "869389897822472004.0", Equal),
+            ("869389897822472004", "869389897822471936.5", Greater),
+            ("869389897822472004", "869389897822472000.5", Greater),
+            ("869389897822472004", "869389897822472004.5", Less),
+            ("9007199254740993", "9007199254740992.0", Greater),
+            ("1.00000000000000001", "1.0", Greater),
+            ("1.0", "1", Equal),
+            ("1.50", "1.5", Equal),
+            ("1e2", "100", Equal),
+            ("1E+2", "99.999999999999999999", Greater),
+            ("0.1", "1e-1", Equal),
+            (".5", "0.5", Equal),
+            ("-.5", "-0.5", Equal),
+            ("-0", "0", Equal),
+            ("0.0", "-0.0e5", Equal),
+            ("-1", "1", Less),
+            ("-2", "-10", Greater),
+            ("-2.5", "-2.25", Less),
+            ("12", "123", Less),
+            ("123", "12", Greater),
+            ("1e999", "1e1000", Less),
+            ("1e-400", "0", Greater),
+            ("-1e-400", "0", Less),
+            ("1e999999999999999999999", "2e999999999999999999999", Less),
+        ] {
+            assert_eq!(cmp_decimal_literals(a, b), want, "{a} vs {b}");
+            assert_eq!(cmp_decimal_literals(b, a), want.reverse(), "{b} vs {a}");
+        }
+    }
+
+    /// #2906: jq-mode number comparison -- two literals exactly, a literal
+    /// against a computed double through the 17-digit rounding. Every
+    /// expectation was captured live against `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn test_jq_numeric_cmp_literal_pairs_exact_and_computed_pairs_rounded_2906() {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        let lit = OwnedValue::from_number_literal;
+        let computed = |f: f64| OwnedValue::Float(f);
+        // `869389897822472004 + 0` in jq: the literal rounds to ...000, whose
+        // nearest double is ...1936.
+        let sum = computed(869389897822471936.0);
+        for (a, b, want) in [
+            // literal vs computed: widen through the literal rounding
+            (lit("869389897822472004"), sum.clone(), Equal),
+            (OwnedValue::Int(869389897822472004), sum.clone(), Equal),
+            (lit("869389897822472000"), sum.clone(), Equal),
+            (lit("869389897822472100"), sum.clone(), Greater),
+            (lit("869389897822471936.0"), sum.clone(), Equal),
+            // literal vs literal: exact decimals, no rounding on either side
+            (
+                lit("869389897822472004"),
+                lit("869389897822471936.0"),
+                Greater,
+            ),
+            (
+                lit("869389897822472004"),
+                lit("869389897822472004.0"),
+                Equal,
+            ),
+            (
+                lit("869389897822472004"),
+                lit("869389897822471936.5"),
+                Greater,
+            ),
+            (
+                lit("869389897822472004"),
+                lit("869389897822472000.5"),
+                Greater,
+            ),
+            (lit("869389897822472004"), lit("869389897822472064.0"), Less),
+            (
+                OwnedValue::Int(869389897822472004),
+                lit("869389897822472004.0"),
+                Equal,
+            ),
+            (lit("9007199254740993"), lit("9007199254740992.0"), Greater),
+            (lit("1.00000000000000001"), lit("1.0"), Greater),
+            (lit("1.50"), lit("1.5"), Equal),
+            (lit("1e999"), lit("1e1000"), Less),
+            (OwnedValue::Int(3), lit("3.0"), Equal),
+            (OwnedValue::Int(3), OwnedValue::Int(4), Less),
+            // computed vs computed, and the NaN rule
+            (computed(1.5), computed(1.5), Equal),
+            (computed(f64::NAN), computed(f64::NAN), Less),
+            (lit("1"), computed(f64::NAN), Greater),
+            (computed(-0.0), lit("0"), Equal),
+        ] {
+            assert_eq!(jq_numeric_cmp(&a, &b), Some(want), "{a:?} vs {b:?}");
+            assert_eq!(
+                owned_value_eq::<JqSemantics>(&a, &b),
+                want == Equal,
+                "jq-mode == disagrees with jq_numeric_cmp for {a:?} vs {b:?}"
+            );
+        }
+        assert_eq!(jq_numeric_cmp(&OwnedValue::Null, &OwnedValue::Int(1)), None);
+        assert_eq!(
+            jq_numeric_cmp(&lit("1"), &OwnedValue::String("1".into())),
+            None
+        );
     }
 
     /// #2906: jq converts an integer literal to a double by first rounding
@@ -3675,45 +3980,17 @@ mod tests {
         }
     }
 
-    /// Hand-round the decimal spelling of `n` to 17 significant digits
-    /// (half-even) and parse the result -- an independent, string-based
-    /// route to the same double [`jq_literal_int_to_f64`] computes with
-    /// integer arithmetic, mirroring jq's own `decNumberToString` +
-    /// `strtod` shape.
+    /// Round the decimal spelling of `n` to 17 significant digits and parse
+    /// the result -- an independent, string-based route to the same double
+    /// [`jq_literal_int_to_f64`] computes with integer arithmetic, mirroring
+    /// jq's own `decNumberToString` + `strtod` shape. `core`'s `{:.16e}`
+    /// formatter rounds an integer's coefficient half-even, exactly the
+    /// decNumber rule.
     fn round_decimal_string_to_17_digits(n: i64) -> f64 {
-        let digits: Vec<u8> = n.unsigned_abs().to_string().into_bytes();
-        if digits.len() <= 17 {
-            return n as f64;
-        }
-        let (kept, dropped) = digits.split_at(17);
-        let mut kept: Vec<u8> = kept.to_vec();
-        let first_dropped = dropped[0];
-        let rest_nonzero = dropped[1..].iter().any(|d| *d != b'0');
-        let last_kept_odd = (kept[16] - b'0') % 2 == 1;
-        let round_up =
-            first_dropped > b'5' || (first_dropped == b'5' && (rest_nonzero || last_kept_odd));
-        let mut exponent = dropped.len();
-        if round_up {
-            let mut i = 16;
-            loop {
-                if kept[i] == b'9' {
-                    kept[i] = b'0';
-                    if i == 0 {
-                        kept.insert(0, b'1');
-                        kept.pop();
-                        exponent += 1;
-                        break;
-                    }
-                    i -= 1;
-                } else {
-                    kept[i] += 1;
-                    break;
-                }
-            }
-        }
         let sign = if n < 0 { "-" } else { "" };
-        let text = format!("{sign}{}e{exponent}", String::from_utf8(kept).unwrap());
-        text.parse::<f64>().unwrap()
+        format!("{sign}{:.16e}", n.unsigned_abs())
+            .parse::<f64>()
+            .unwrap()
     }
 
     /// #2906: property check of [`jq_literal_int_to_f64`] over seeded
@@ -3723,20 +4000,15 @@ mod tests {
     /// on, monotonicity, and yq mode's untouched plain cast.
     #[test]
     fn test_jq_literal_int_to_f64_properties_2906() {
-        // xorshift64*, seeded; no external crate needed here.
-        let mut state: u64 = 0x2906_2906_2906_2906;
-        let mut next = || {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        };
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        let mut rng = ChaCha8Rng::seed_from_u64(0x2906_2906_2906_2906);
         let mut previous: Option<(i64, f64)> = None;
         for i in 0..20_000 {
             // Spread the samples across the 18/19-digit band and below it,
             // rather than letting a uniform u64 land past 10^18 nearly every
             // time.
-            let raw = next();
+            let raw = rng.next_u64();
             let n = match i % 4 {
                 0 => (raw % 1_000_000_000_000_000_000) as i64,
                 1 => (raw % 100_000_000_000_000_000) as i64 + 100_000_000_000_000_000,
