@@ -1728,9 +1728,12 @@ fn materialize_lazy_keys<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     let mut keys = effective_key_values(fields, collapse)?;
     if sorted {
-        // Object keys are always strings, so the mode-forked numeric arms
-        // of `compare_values` (#2906) are unreachable here and no `S` is
-        // threaded through this streaming entry point.
+        // `sorted` is only ever `true` in jq mode: the yq parser lowers
+        // `keys` to `Builtin::KeysUnsorted` (real yq returns keys in
+        // document order), so this streaming entry point -- which has no
+        // `S` of its own -- never sorts under yq semantics, and jq's number
+        // model (#2906) is the only one it can need. (YAML keys are typed,
+        // so "keys are always strings" would be the wrong reason.)
         keys.sort_by(compare_values::<JqSemantics>);
     }
     Ok(OwnedValue::Array(keys))
