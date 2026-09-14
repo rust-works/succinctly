@@ -24889,7 +24889,7 @@ fn test_top_level_def_still_outranks_an_included_one_2865() -> Result<()> {
 ///
 /// With `inner`'s `g/0` in scope, `def g: if . == 0 then "base" else (. - 1 |
 /// g) end;` still recurses into itself and reaches `"base"`; without the
-/// `visible_defs_for` exclusion it would answer `42` on the first step.
+/// `visible_deps_for` exclusion it would answer `42` on the first step.
 ///
 /// The arity half: a dependency `g/1` alongside an own `g/0` leaves both
 /// reachable from the same body (`["own0","dep1arg"]`). Both captured live
@@ -25610,12 +25610,77 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     Ok(())
 }
 
+/// #2962: the documented boundary of #2865's mechanism -- a dependency is
+/// wrapped *inside* the including def's own `Expr::FuncDef`, so that def's
+/// name and parameters are enclosing binders for it, and a name the
+/// dependency reaches on its own can be captured.
+///
+/// Pinned rather than fixed, and recorded in
+/// `docs/compliance/jq/limitations.md` as a still-open gap (no ADR-0018
+/// rule-4 condition applies). Not a regression: every shape needs a
+/// transitive `include`, which did not work at all before #2865 -- `main`
+/// answers `g/0 is not defined` / `k/0 is not defined` for each. Closing it
+/// needs a targeted rename of the excluded dependency or #2951's sealed
+/// module scope; this test is what makes a change to the mechanism visible.
+///
+/// **When #2962 lands, these assertions become jq's own answers**: `7`,
+/// exit 3 with `b/0 is not defined`, and `[7,[42]]`.
+#[test]
+fn test_dependency_capture_by_the_including_defs_scope_2962() -> Result<()> {
+    // 1. The self-(name, arity) exclusion strands a dependency that another
+    //    kept dependency still calls. jq answers 7.
+    let (_, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner", "def c: 7;\ndef g: c;\n"),
+            (
+                "mid",
+                "include \"inner\";\ndef c: if . == 0 then g else (. - 1 | c) end;\n",
+            ),
+        ],
+        &["-nc", r#"include "mid"; 0 | c"#],
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+
+    // 2. A parameter satisfies a name the dependency left undefined, so a
+    //    program jq rejects with `b/0 is not defined` (exit 3) answers here.
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("gb", "def g: b;\n"),
+            ("hb", "include \"gb\";\ndef h(b): g;\ndef q: h(99);\n"),
+        ],
+        &["-nc", r#"include "hb"; q"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "99");
+
+    // 3. A parameter captures a dependency reached only indirectly. `h`'s own
+    //    `g` is correctly the parameter; `k`'s `g` should still be 42.
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner3", "def g: 42;\ndef k: [g];\n"),
+            (
+                "h3",
+                "include \"inner3\";\ndef h($g): [g, k];\ndef q: h(7);\n",
+            ),
+        ],
+        &["-nc", r#"include "h3"; q"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[7,[7]]");
+
+    Ok(())
+}
+
 /// #2865 (plan step 6): a chain of modules does not multiply in size.
 ///
 /// Wrapping every dependency into every exported body compounds down a chain,
 /// because each level's bodies already carry the level below: unfiltered, a
 /// 3-module x 40-def chain measured 359 MB peak RSS against jq's 2.5 MB, and
-/// a fourth level would have been tens of gigabytes. `visible_defs_for`'s
+/// a fourth level would have been tens of gigabytes. `visible_deps_for`'s
 /// referenced-closure filter (jq's own `block_bind_referenced` rule) is what
 /// keeps it flat.
 ///
