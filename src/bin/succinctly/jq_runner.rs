@@ -166,6 +166,20 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
     None
 }
 
+/// Whether a **data** import's file (`{module_path}.json`) exists anywhere on
+/// the search path (#2865).
+///
+/// `.json`, not `.jq`: a data import reads a JSON file, and the unconditional
+/// `.jq` suffix rule (#2702) is a module-import rule. Confirmed live against
+/// jq 1.7.1, which resolves `import "data" as $d;` to `data.json` and reports
+/// `module not found: data` when there is none.
+fn data_file_exists(search_path: &[PathBuf], module_path: &str) -> bool {
+    let data_file = format!("{module_path}.json");
+    search_path
+        .iter()
+        .any(|base| base.join(&data_file).is_file())
+}
+
 /// Extract a module's function definitions and stamp every `$__loc__` in
 /// each def's body with that module's own canonical (symlink-resolved)
 /// path (#2774) -- confirmed live against jq 1.7.1, and the same shape a
@@ -379,6 +393,14 @@ struct ModuleDef {
 /// earlier siblings, so the closure widens through its
 /// [`ModuleDef::source`] -- the unbound body, whose free names are the real
 /// reference graph.
+///
+/// The widened set therefore selects **siblings only**. Dependencies are
+/// selected by the body's own *direct* references, because a `local` sibling
+/// already carries every dependency it needs: filtering the innermost
+/// dependency block by the widened set instead materializes each of those
+/// subtrees twice, which doubles per module level. A chain of two-def modules
+/// calling one another (`def MnA: M(n-1)B; def MnB: MnA;`) cost 111 MB at 13
+/// levels that way, against jq's 2.5 MB, and grew from there.
 fn visible_defs_for(
     siblings: &[ModuleDef],
     deps: &FuncDefList,
@@ -403,7 +425,13 @@ fn visible_defs_for(
         .map(|sibling| sibling.name.as_str())
         .collect();
 
-    let mut wanted = called_func_names(body);
+    // The body's own direct references, kept separate from the widened set
+    // below: a `local` sibling already wraps every dependency *it* needs, so
+    // filtering the innermost dependency block by the widened set materializes
+    // each of those subtrees a second time, doubling per module level. The
+    // innermost block exists for this body alone.
+    let directly_called = called_func_names(body);
+    let mut wanted = directly_called.clone();
     let mut keep = vec![false; siblings.len()];
 
     // Fixed point over the siblings only: pulling one in can name an earlier
@@ -455,7 +483,7 @@ fn visible_defs_for(
         .chain(
             deps.iter()
                 .filter(|(dep_name, dep_params, _)| {
-                    !excluded(dep_name, dep_params.len()) && wanted.contains(dep_name)
+                    !excluded(dep_name, dep_params.len()) && directly_called.contains(dep_name)
                 })
                 .cloned(),
         )
@@ -709,7 +737,21 @@ impl ModuleLoader {
         // the two -- skipping on *resolvability* instead would have silently
         // swallowed a genuinely missing module, which jq reports and exits 3
         // for. Data imports themselves remain unimplemented (#2956).
-        for import in program.imports.iter().filter(|import| !import.data) {
+        for import in &program.imports {
+            if import.data {
+                // A data import contributes no defs, but jq still *resolves*
+                // it: with no `nodatafile.json` anywhere on the search path,
+                // `import "nodatafile" as $d;` reports `module not found:
+                // nodatafile` and exits 3, exactly as a missing module does.
+                // Check the same thing so a typo is not silently swallowed,
+                // without implementing the binding itself (#2956).
+                if !data_file_exists(&self.search_path, &import.path) {
+                    return Err(ModuleLoadError::NotFound {
+                        module_path: import.path.clone(),
+                    });
+                }
+                continue;
+            }
             let namespace = &import.alias;
             defs.extend(
                 self.load_module(&import.path)?
