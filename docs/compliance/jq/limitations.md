@@ -5846,7 +5846,7 @@ compiler/libc is an open question, not a claim to build on (flag for whoever clo
 this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
 and data-sourced spellings agree on `-8`).
 
-**Still open, same mechanism, out of #2906's scope** (tracked as #2936, #2937 and #2938):
+**Still open, same mechanism, out of #2906's scope** (tracked as #2936 and #2937):
 a *float* literal with more than 17 significant digits, or an integer literal beyond
 `i64`, is still parsed with one correct rounding (`2.7293109604053567083 + 0` is
 `2.7293109604053565` in jq, `2.729310960405357` here) — closing it needs the mode plumbed
@@ -5855,16 +5855,15 @@ builtins (`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cas
 (`869389897822472004 | sqrt` is `932410798.8555645` in jq, `…647` here); and
 `floor`/`ceil`/`round`/`trunc` (and `length`, which is `fabs(jv_number_value(x))` in jq)
 of such a value print their exact integer digits where jq prints the double
-(`869389897822472000`) (all #2937). And a computed double that crosses the reindex bridge
-into a document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array
-built in the filter) is re-parsed from its printed digits as an *integer* literal, so it
-then compares exactly against a real literal instead of equal:
-`[869389897822472004, (869389897822472000+0), 5] | sort` is
-`[5,869389897822472000,869389897822472004]` here and
-`[5,869389897822472004,869389897822472000]` in jq (stable, the two are equal there) —
-identical before and after this fix, since the comparator is right and the bridge is what
-changes the operand (#2938). The `range` entry above and the unary-minus entry (#2357) are
-unaffected — both stay on the exact `i64` path they document.
+(`869389897822472000`) (all #2937). A third gap this fix's review found — the reindex
+bridge re-parsing a computed double's printed digits as an *integer* literal before a
+document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array built in
+the filter), so that it then compared exactly against a real literal instead of equal —
+was filed as #2938 and closed by #2902 landing first: the bridge now hands a computed
+float back as a bare `Float`, so `[869389897822472004, (869389897822472000+0), 5] | sort`
+is jq's `[5,869389897822472004,869389897822472000]` here too. The `range` entry above and
+the unary-minus entry (#2357) are unaffected — both stay on the exact `i64` path they
+document.
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 
