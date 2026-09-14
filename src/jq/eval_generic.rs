@@ -23052,13 +23052,14 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
             // for the jq-vs-yq, attached-vs-detached rule this shares with
             // `owned_identity_step`'s literal-bound arm and
             // `owned_identity_computed_step`'s computed-bound arm.
-            Some(if !owned_identity_slice_is_tracked::<S, V>(id, value) {
-                id.clone()
-            } else {
+            let tracked = owned_identity_slice_is_tracked::<S, V>(id, value); // omni-dev: coverage tolerate-line reason="unreachable: this `Slice` rule's own two execution paths both exclude `Expr::Slice` before ever reaching `owned_identity_placed_by` -- `eval_owned_identity_stages`'s catch-all only runs a stage `owned_identity_nav_supported` refused, and `owned_identity_leaving_cursor` (`identity_from_first`, eval_generic.rs:10724) only runs a stage `path_context_is_navigational` refused -- and both predicates admit `Expr::Slice` (`owned_identity_nav_supported`/`path_context_is_navigational_at` each list `Expr::Slice { .. } => true`), so a bare slice is always resolved by `owned_identity_step`'s own arm first. Kept in `owned_identity_rule`'s match for exhaustiveness/symmetry with the rule table's other entries, the same reason #2072's `Bound` arm above is kept unreachable-by-construction (#2966's review of #2834)"
+            Some(if tracked {
                 id.child(
                     &Rc::new(value.clone()),
                     slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
                 )
+            } else {
+                id.clone()
             })
         }
         OwnedIdentityRule::Detaches => Some(OwnedIdentity::detached()),
