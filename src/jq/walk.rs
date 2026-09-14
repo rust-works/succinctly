@@ -1488,22 +1488,13 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
 /// (`eval_generic::bridge_ambient_input`) is not deciding about, so they keep
 /// their materialization rather than have this predicate reason about them.
 ///
-/// **This list is fail-open, which is the opposite of the discipline the rest
-/// of this module uses, and that is a known weakness rather than a choice.**
-/// `node_reads_ambient` is exhaustive over `Expr` with no wildcard so a new
-/// variant is a compile error, and its `Builtin` arm is a negative allowlist
-/// so a new builtin defaults to "reads" — both fail *safe*. Here a builtin
-/// nobody adds to this list defaults to "does not escape", i.e. to the
-/// wrong-answer direction. `Builtin` has 209 variants, so the fail-closed
-/// reshape (an exhaustive match, one decision per variant) is its own change
-/// with its own review; it is tracked as #2791.
+/// Both the Expr and Builtin matches are exhaustive (#2791): adding a
+/// variant forces an explicit decision here. A false answer can replace a
+/// real document with null, so an unknown channel must never silently fall
+/// into the non-escaping group. The existing classifications are unchanged.
 ///
-/// The concrete cost of the fail-open shape is already on record: an
-/// adversarial review of #2790 found five siblings of listed entries missing
-/// from the first version of this list — `path` (the no-argument, yq-native
-/// spelling of `path(f)`), `paths(f)`, `file_index`, `tag` and `kind` — none
-/// of which could be turned into a wrong answer, but all of which were
-/// omitted on day one. They are listed below now.
+/// In particular, the #2790 review's five initially missed siblings remain
+/// escaping: no-argument path, paths(f), file_index, tag, and kind.
 ///
 /// `needs_path_context` in `eval.rs` answers a related question and is
 /// deliberately *not* reused: it is superlinear on recursive definitions, and
@@ -1514,43 +1505,288 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
 /// that runs per evaluation.
 fn stage_escapes_own_input(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| match e {
-        // An unresolved call carries no body to inspect, exactly as
-        // `node_reads_ambient` treats it.
+        // An unresolved call carries no body to inspect. Resolved DefCall
+        // bodies are visited by the shared traversal instead.
         Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => true,
-        Expr::Builtin(b) => matches!(
-            b,
-            // `input`/`inputs`/`input_line_number` (`uses_input_builtins`).
-            Builtin::Input
-                | Builtin::Inputs
-                | Builtin::InputLineNumber
-                // Cursor metadata (`uses_cursor_metadata_builtins`).
-                | Builtin::Line
-                | Builtin::Column
-                | Builtin::DocumentIndex
-                | Builtin::Anchor
-                | Builtin::Style
-                | Builtin::LineComment
-                | Builtin::HeadComment
-                | Builtin::FootComment
-                | Builtin::AtOffset(_)
-                | Builtin::AtPosition(_, _)
-                // Path tracking and traversal context.
-                | Builtin::Key
-                | Builtin::Parent
-                | Builtin::ParentN(_)
-                | Builtin::Path(_)
-                | Builtin::PathNoArg
-                | Builtin::Paths
-                | Builtin::PathsFilter(_)
-                | Builtin::LeafPaths
-                | Builtin::GetPath(_)
-                // Invocation context (which file, which node), not a value
-                // read -- the #2790 review's remaining three.
-                | Builtin::FileIndex
-                | Builtin::Tag
-                | Builtin::Kind
-        ),
-        _ => false,
+        Expr::Builtin(b) => match b {
+            // Input-stream state, cursor metadata and path context can
+            // bypass the rebound value. Preserve the conservative path
+            // classification even when a particular invocation is local.
+            Builtin::GetPath(_)
+            | Builtin::Path(_)
+            | Builtin::PathNoArg
+            | Builtin::Parent
+            | Builtin::ParentN(_)
+            | Builtin::Paths
+            | Builtin::PathsFilter(_)
+            | Builtin::LeafPaths
+            | Builtin::Tag
+            | Builtin::Anchor
+            | Builtin::Style
+            | Builtin::Kind
+            | Builtin::Key
+            | Builtin::Line
+            | Builtin::Column
+            | Builtin::DocumentIndex
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment
+            | Builtin::FileIndex
+            | Builtin::Input
+            | Builtin::Inputs
+            | Builtin::InputLineNumber
+            | Builtin::AtOffset(_)
+            | Builtin::AtPosition(_, _) => true,
+
+            // These operate on the rebound value or expose their argument
+            // expressions to any_subexpr. Updates (including sort_keys and
+            // del) modify that rebound root; debug/stderr/halt_error emit it.
+            // Environment, clock, randomness and load may consult external
+            // state, but do not recover the original document. SplitDoc's
+            // formatting signal does not change its identity-value behavior.
+            Builtin::Type
+            | Builtin::IsNull
+            | Builtin::IsBoolean
+            | Builtin::IsNumber
+            | Builtin::IsString
+            | Builtin::IsArray
+            | Builtin::IsObject
+            | Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+            | Builtin::Length
+            | Builtin::Utf8ByteLength
+            | Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::Has(_)
+            | Builtin::In(_)
+            | Builtin::UpperIn(_)
+            | Builtin::UpperInSrc(_, _)
+            | Builtin::Select(_)
+            | Builtin::Empty
+            | Builtin::Map(_)
+            | Builtin::MapValues(_)
+            | Builtin::Add
+            | Builtin::Any
+            | Builtin::AnyF(_)
+            | Builtin::AnyCond(_, _)
+            | Builtin::All
+            | Builtin::AllF(_)
+            | Builtin::AllCond(_, _)
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::MinBy(_)
+            | Builtin::MaxBy(_)
+            | Builtin::AsciiDowncase
+            | Builtin::AsciiUpcase
+            | Builtin::Ltrimstr(_)
+            | Builtin::Rtrimstr(_)
+            | Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::Split(_)
+            | Builtin::Join(_)
+            | Builtin::Contains(_)
+            | Builtin::Inside(_)
+            | Builtin::First
+            | Builtin::Last
+            | Builtin::Nth(_)
+            | Builtin::Reverse
+            | Builtin::Flatten
+            | Builtin::FlattenDepth(_)
+            | Builtin::GroupBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::ToEntries
+            | Builtin::FromEntries
+            | Builtin::WithEntries(_)
+            | Builtin::ToString
+            | Builtin::ToNumber
+            | Builtin::ToJson
+            | Builtin::FromJson
+            | Builtin::Explode
+            | Builtin::Implode
+            | Builtin::Test(_)
+            | Builtin::Indices(_)
+            | Builtin::Index(_)
+            | Builtin::Rindex(_)
+            | Builtin::UpperIndex(_)
+            | Builtin::UpperIndexStream(_, _)
+            | Builtin::ToJsonStream
+            | Builtin::FromJsonStream
+            | Builtin::ToStream
+            | Builtin::FromStream(_)
+            | Builtin::TruncateStream(_)
+            | Builtin::Recurse
+            | Builtin::RecurseF(_)
+            | Builtin::RecurseCond(_, _)
+            | Builtin::Walk(_)
+            | Builtin::IsValid(_)
+            | Builtin::SetPath(_, _)
+            | Builtin::DelPaths(_)
+            | Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Pow(_, _)
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Atan2(_, _)
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+            | Builtin::Infinite
+            | Builtin::Nan
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::IsFinite
+            | Builtin::Debug
+            | Builtin::DebugMsg(_)
+            | Builtin::Halt
+            | Builtin::Stderr
+            | Builtin::HaltError
+            | Builtin::HaltErrorCode(_)
+            | Builtin::Env
+            | Builtin::EnvVar(_)
+            | Builtin::EnvObject(_)
+            | Builtin::StrEnv(_)
+            | Builtin::NullLit
+            | Builtin::Trim
+            | Builtin::Ltrim
+            | Builtin::Rtrim
+            | Builtin::Transpose
+            | Builtin::BSearch(_)
+            | Builtin::ModuleMeta
+            | Builtin::Pick(_)
+            | Builtin::Omit(_)
+            | Builtin::Shuffle
+            | Builtin::Pivot
+            | Builtin::SplitDoc
+            | Builtin::SortKeys(_)
+            | Builtin::SortKeysOneLevel
+            | Builtin::Del(_)
+            | Builtin::Now
+            | Builtin::Abs
+            | Builtin::Builtins
+            | Builtin::Normals
+            | Builtin::Finites
+            | Builtin::Limit(_, _)
+            | Builtin::FirstStream(_)
+            | Builtin::LastStream(_)
+            | Builtin::NthStream(_, _)
+            | Builtin::IsEmpty(_)
+            | Builtin::RecurseDown
+            | Builtin::Gmtime
+            | Builtin::Localtime
+            | Builtin::Mktime
+            | Builtin::Strftime(_)
+            | Builtin::Strptime(_)
+            | Builtin::Todate
+            | Builtin::Fromdate
+            | Builtin::Todateiso8601
+            | Builtin::Fromdateiso8601
+            | Builtin::TestFlags(_, _)
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(_, _)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(_, _)
+            | Builtin::Sub(_, _)
+            | Builtin::SubFlags(_, _, _)
+            | Builtin::Gsub(_, _)
+            | Builtin::GsubFlags(_, _, _)
+            | Builtin::Scan(_)
+            | Builtin::ScanFlags(_, _)
+            | Builtin::SplitRegex(_, _)
+            | Builtin::Splits(_)
+            | Builtin::SplitsFlags(_, _)
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+            | Builtin::Trunc
+            | Builtin::ToBoolean
+            | Builtin::Skip(_, _)
+            | Builtin::FromUnix
+            | Builtin::ToUnix
+            | Builtin::Tz(_)
+            | Builtin::Load(_) => false,
+        },
+        // Each node's own input is rebound. Child expressions are inspected
+        // by this same any_subexpr walk, including resolved function bodies,
+        // update expressions, and nested builtin arguments.
+        Expr::Identity
+        | Expr::Field(..)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::IndexExpr { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Optional(..)
+        | Expr::Pipe(..)
+        | Expr::Comma(..)
+        | Expr::Array(..)
+        | Expr::Object(..)
+        | Expr::Literal(..)
+        | Expr::RecursiveDescent
+        | Expr::Paren(..)
+        | Expr::Arithmetic { .. }
+        | Expr::Negate(..)
+        | Expr::Compare { .. }
+        | Expr::And(..)
+        | Expr::Or(..)
+        | Expr::Not
+        | Expr::Alternative(..)
+        | Expr::If { .. }
+        | Expr::Try { .. }
+        | Expr::Error(..)
+        | Expr::StringInterpolation(..)
+        | Expr::Format(..)
+        | Expr::As { .. }
+        | Expr::Var(..)
+        | Expr::TrackedVar(..)
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Reduce { .. }
+        | Expr::Foreach { .. }
+        | Expr::Limit { .. }
+        | Expr::FirstExpr(..)
+        | Expr::LastExpr(..)
+        | Expr::NthExpr { .. }
+        | Expr::Until { .. }
+        | Expr::While { .. }
+        | Expr::Repeat(..)
+        | Expr::Range { .. }
+        | Expr::Label { .. }
+        | Expr::Break(..)
+        | Expr::AsPattern { .. }
+        | Expr::FuncDef { .. }
+        | Expr::Shared(..)
+        | Expr::DefCall { .. }
+        | Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::MetaAssign { .. } => false,
     })
 }
 

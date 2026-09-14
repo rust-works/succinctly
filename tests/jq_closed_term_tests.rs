@@ -218,6 +218,23 @@ const READING: &[&str] = &[
     "1 | file_index",
     "1 | tag",
     "1 | kind",
+    // #2791: cover the remaining explicit escape channels and escapes
+    // nested inside otherwise-local builtins and rebound loop stages.
+    "1 | input_line_number",
+    "1 | document_index",
+    "1 | anchor",
+    "1 | style",
+    "1 | line_comment",
+    "1 | head_comment",
+    "1 | foot_comment",
+    "1 | at_offset(0)",
+    "1 | at_position(0; 0)",
+    "1 | parent(1)",
+    "1 | map(parent)",
+    "1 | del(parent)",
+    "1 | load(input)",
+    "reduce (1,2) as $x (0; input)",
+    "[foreach (1,2) as $x (0; .; parent)]",
     // An unresolved call carries no body to inspect.
     "1 | f",
     // A reading first stage keeps the whole pipe reading, at any depth.
