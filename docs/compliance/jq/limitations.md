@@ -6244,7 +6244,7 @@ whole document that a streaming arm never read, and the M2 path was gated to kee
 from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
 records the 19 rows that moved away from jq and the spelling rule it left in place.
 
-### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687)
+### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687, #2840)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
 as a primitive — its parser desugars `break $x` into a named call to `error/0`
@@ -6297,25 +6297,52 @@ process down (no rule-4 condition), so the order reaches step 2 (closer match) �
 this row would add to every break site, shadowed or not, makes the narrower fix (#2687 itself,
 closing the *shadowing* gap) the one taken, with this payload detail recorded rather than chased.
 
-A second, related gap is **not** covered by #2687 or this entry: `label`'s own error re-raise
-(when a caught escape isn't a matching `Control::Break`) is *also* `gen_call("error",
-gen_noop())` in jq, resolved at the **label's** lexical position — so a shadowing `def error:`
-also intercepts an uncaught `error(...)`/division-by-zero/etc. escaping through a `label` block,
-which succinctly does not reproduce at all:
+**Closed by #2840.** `label`'s own error re-raise (when a caught escape isn't a matching
+`Control::Break`) is *also* `gen_call("error", gen_noop())` in jq, resolved at the **label's**
+lexical position — so a shadowing `def error:` also intercepts an uncaught
+`error(...)`/division-by-zero/etc. escaping through a `label` block, and a non-matching
+`break` of an *outer* label too. Fixed by an AST rewrite at `resolve.rs`'s `check`/
+`build_call_graph` time (`in_scope(scope, "error", 0)` at the label rewrites its body to
+`try BODY catch <call to error/0>` — the same runtime semantics every evaluator arm already
+gives `try`/`catch`, so no evaluator arm changed), rather than the fallthrough-rewrite-in-six-
+places approach originally filed: `Expr::Try`'s catch arm already binds the raised payload as
+`.`, catches a `Control::Break` of any label (#562), preserves the already-emitted prefix, and
+declines `Halt`/uncatchable errors, in every arm that walks `Expr::Label`.
+
+**Break-payload divergence, extended.** The `{"__jq":N}`-vs-`null` payload gap this entry
+already documents for a *directly* shadowed `break $x` applies identically to a break
+intercepted through #2840's re-raise (`def error: .; label $a | (def f: break $a; label $b | f)`
+sees `null` where jq sees the sentinel) — the same #562 choice, not a new divergence.
+
+**New, narrower gap found while fixing #2840: a shadowing `def error:` can catch a `break`
+that real jq's compiler would reject outright.** A shadowing `def error:` is in scope at
+every `break $x` lexically inside its own label's body too, so an *unshadowed* `break $x`
+constructed the ordinary way (lexically inside the label whose `def error:` shadows it) can
+never reach this re-raise as a `Control::Break` — #2687 already shadows it directly. The only
+way to construct one that does is a `def f: break $x;` declared *outside* the label's lexical
+scope entirely, then called from inside it:
 
 ```console
-$ jq            -nc 'def error: "S"; label $out | (1, error("x"), 2)'
-1
+$ jq            -nc 'def error: "S"; def f: break $x; label $x | f'
+jq: error: $*label-x is not defined at <top-level>, line 1:
+def error: "S"; def f: break $x; label $x | f
+jq: 1 compile error
+$ succinctly jq -nc 'def error: "S"; def f: break $x; label $x | f'
 "S"
-$ succinctly jq -nc 'def error: "S"; label $out | (1, error("x"), 2)'
-1
-jq: error (at <unknown>): x
 ```
 
-Filed as [#2840](https://github.com/rust-works/succinctly/issues/2840) — a materially larger
-change (`eval_label`/`each_label`/`each_label_generic` and both owned-identity/path-context
-`Label` arms would each need their non-matching-escape fallthrough routed through a resolvable
-call), out of #2687's stated scope.
+Real jq's own label scoping is lexical at compile time — `break $x` is only valid textually
+inside `label $x | ...`, so `def f: break $x;` (declared *before* the label, where `$x` is
+not yet in scope) fails to compile regardless of whether `f` is ever actually called from
+inside the label, and regardless of any shadowing `def error:`. succinctly has no such
+compile-time label-scope check: `break $x` resolves purely by label name at runtime (confirmed
+unshadowed too: `def f: break $x; label $x | f` compiles and runs silently, exit 0, no output,
+where jq rejects it identically at compile time), so a `def` declared anywhere can name any
+label reachable when it happens to run. This is what lets the break reach #2840's re-raise
+here (unlike #2687's own directly-lexical shape, where the shadow always intercepts it before
+it becomes a `Control::Break` at all) — not a bug in the re-raise itself, but a pre-existing
+absence of jq's own compile-time scope check, predating both #2687 and #2840. Filed as
+[#2964](https://github.com/rust-works/succinctly/issues/2964) rather than chased here.
 
 ### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
 

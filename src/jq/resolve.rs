@@ -477,8 +477,22 @@ fn build_call_graph(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => {
+        | Expr::Repeat(inner) => {
+            build_call_graph(inner, scope, enclosing, graph, roots);
+        }
+
+        // #2840: this pass runs on the pristine, pre-`check` tree (see
+        // `resolve_func_calls_all`'s doc comment), so `check`'s own
+        // `Expr::Label` rewrite hasn't happened yet -- the synthetic
+        // `error/0` call site it will insert has to be marked reachable
+        // here independently, mirroring `Expr::FuncCall`'s own
+        // `reach_in_scope` -> `record_edge` shape, so a `def error:` only
+        // reachable through a shadowed label (`def error: bogus; label
+        // $out | 1`) is still compiled and reported like any other call.
+        Expr::Label { body: inner, .. } => {
+            if let Some(ScopeHit::Def(target)) = reach_in_scope(scope, "error", 0) {
+                record_edge(target, graph);
+            }
             build_call_graph(inner, scope, enclosing, graph, roots);
         }
 
@@ -996,8 +1010,36 @@ fn check(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => check(inner, scope, errors, reachable),
+        | Expr::Repeat(inner) => check(inner, scope, errors, reachable),
+
+        // #2840: real jq's `label $x | BODY` intercepts every escape that
+        // isn't its own `{"__jq":N}` break sentinel and re-raises it
+        // through a synthetic call to `error/0` (`gen_call("error",
+        // gen_noop())` in `parser.y`), resolved by ordinary lexical scope
+        // at the label's own position -- so a `def error:` in scope there
+        // shadows the re-raise exactly like any other call. That is
+        // already `try BODY catch error`'s own semantics, an expression
+        // every evaluator arm that walks `Expr::Label` already evaluates
+        // correctly -- so the fix is this AST rewrite at check time, not a
+        // change to any evaluator. Gated on `in_scope` so a program with no
+        // `def error` in scope here parses to the exact `Expr::Label` node
+        // it always has, byte-identical AST, zero evaluator cost (mirrors
+        // #2687's `break $x` -> `error/0` desugaring's own
+        // shadowable-or-untouched gate).
+        Expr::Label { name: _, body } => {
+            check(body, scope, errors, reachable);
+            if in_scope(scope, "error", 0) {
+                let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
+                **body = Expr::Try {
+                    expr: Box::new(old_body),
+                    catch: Some(Box::new(Expr::FuncCall {
+                        name: "error".to_string(),
+                        args: Vec::new(),
+                        builtin_fallback: None,
+                    })),
+                };
+            }
+        }
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
