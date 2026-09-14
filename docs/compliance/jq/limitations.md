@@ -6416,18 +6416,23 @@ blocks, so it does not. Measured at #2865's own head (Apple M-series, release):
 | chain                            | succinctly peak RSS | jq peak RSS |
 |----------------------------------|---------------------|-------------|
 | 6 levels x 40 defs, 1 call each  | 10 MB               | 2.5 MB      |
-| 8 levels x 6 defs, 3 calls each  | 98 MB               | 2.6 MB      |
-| 14 levels x 4 defs, 2 calls each | 382 MB              | 2.6 MB      |
+| 8 levels x 6 defs, 3 calls each  | 91 MB               | 2.6 MB      |
+| 14 levels x 4 defs, 2 calls each | 361 MB              | 2.6 MB      |
 
 The referenced-closure filter (jq's own `block_bind_referenced` rule, in
 `visible_defs_for`) flattens the one-call-each shape completely — without it the
 6 x 40 row was 359 MB rather than 10 MB — but it cannot flatten a genuinely wide closure,
 because that closure is itself exponential. Every row above produces the **correct**
-answer; this is a scalability limit of AST inlining, not a wrong result. It needs a
-*chain of modules* to appear: a module's own defs are spliced into each other in their
-`local` form (body plus dependencies, no siblings), which stays linear however many
-siblings each one calls, so a directive-free module is bound exactly as cheaply as
-before #2865. Tracked as
+answer; this is a scalability limit of AST inlining, not a wrong result. Two things keep
+it confined to genuinely wide closures rather than merely deep ones, both found by
+review after a first attempt got them wrong: a module's own defs are spliced into each
+other in their `local` form (body plus dependencies, no siblings), so a directive-free
+module is bound exactly as cheaply as before #2865 however many siblings each def calls;
+and the innermost dependency block is selected by a def's *direct* references rather than
+the closure widened through its siblings, since a `local` sibling already carries the
+dependencies it needs. Without the second, a chain of two-def modules calling one another
+cost 111 MB at 13 levels and tens of gigabytes beyond; with it, 21 levels is 10 MB and a
+7-level 40-def chain is 12 MB. Tracked as
 [#2955](https://github.com/rust-works/succinctly/issues/2955), whose most promising fix is
 splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
 introduced) instead of by clone.

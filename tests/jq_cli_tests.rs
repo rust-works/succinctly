@@ -25473,6 +25473,32 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "7");
 
+    // A data import whose file is missing is still jq's own error, byte for
+    // byte: jq resolves `<path>.json` and reports `module not found` with
+    // exit 3 when there is none, so skipping the *binding* must not also skip
+    // the resolution check.
+    std::fs::write(
+        temp_dir.path().join("dmiss.jq"),
+        "import \"nodatafile\" as $d;\ndef h: 7;\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "dmiss"; h"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: nodatafile"),
+        "stderr: {stderr:?}"
+    );
+
     // A missing *namespace* import, by contrast, is still jq's own clear
     // error -- the skip keys on `Import::data`, not on whether the path
     // happens to resolve, so an unresolvable `import "m" as m;` is not
@@ -25571,6 +25597,42 @@ fn test_transitive_include_chain_does_not_blow_up_2865() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     // `f0_11` is 11, and each of the 3 levels above it adds 1.
     assert_eq!(stdout.trim_end(), (DEFS - 1 + LEVELS - 1).to_string());
+
+    // The shape above has no *intra*-module calls, which hid a second
+    // doubling found in review: the innermost dependency block was filtered by
+    // the closure widened through kept siblings, so every dependency a sibling
+    // already carried in its own `local` wrap was materialized a second time
+    // -- 111 MB at 13 levels of the two-def module below, growing to tens of
+    // gigabytes, against jq's 2.5 MB. Filtering dependencies by the body's
+    // *direct* references instead keeps it flat (9 MB at 13, 10 MB at 21).
+    const MINI_LEVELS: usize = 21;
+    let mut mini: Vec<(String, String)> = vec![(
+        "mini0".to_string(),
+        "def m0a: 1;\ndef m0b: m0a;\n".to_string(),
+    )];
+    for level in 1..MINI_LEVELS {
+        mini.push((
+            format!("mini{level}"),
+            format!(
+                "include \"mini{}\";\ndef m{level}a: m{}b;\ndef m{level}b: m{level}a;\n",
+                level - 1,
+                level - 1
+            ),
+        ));
+    }
+    let borrowed: Vec<(&str, &str)> = mini
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let filter = format!(
+        r#"include "mini{}"; m{}b"#,
+        MINI_LEVELS - 1,
+        MINI_LEVELS - 1
+    );
+    let (stdout, stderr, code) = run_jq_with_modules(&borrowed, &["-nc", &filter])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
     Ok(())
 }
 
