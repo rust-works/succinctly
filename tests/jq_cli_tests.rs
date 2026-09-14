@@ -53676,6 +53676,172 @@ fn test_int_arith_within_exact_f64_range_or_already_overflowing_unaffected_2631(
     Ok(())
 }
 
+/// #2906: jq converts an integer *literal* to a double by first rounding
+/// its decimal digits to 17 significant digits (half-even,
+/// `jvp_literal_number_to_double` in jq's `src/jv.c`), then rounding that
+/// to the nearest double -- so an 18/19-digit literal can land on a
+/// different double than `i64 as f64` gives, and every arithmetic result
+/// built on it differs. `%` follows jq's `binop_mod` (each operand's double
+/// truncated to `intmax_t`). Every expectation was captured live against
+/// `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_large_int_literal_rounds_to_17_digits_before_f64_arith_2906() -> Result<()> {
+    for (filter, want) in [
+        // The issue's own repro: the literal rounds to 869389897822472000,
+        // whose nearest double is ...1936 (tie to even), not the exact
+        // integer's nearest double ...2064 -- so the sum is ...6300, not
+        // ...6400.
+        ("869389897822472004 + 944331", "869389897823416300"),
+        ("869389897822472004 + 944331 + 1", "869389897823416300"),
+        ("869389897822472004 * 2", "1738779795644944000"),
+        ("869389897822472004 / 3", "289796632607490600"),
+        ("869389897822472004 % 1000", "936"),
+        ("869389897822472004 % 7", "1"),
+        ("1000 % 869389897822472004", "1000"),
+        // Below 10^17 the literal is already jq's double, but `%` still
+        // truncates that double, not the exact integer.
+        ("9007199254740993 % 2", "0"),
+        // Ties resolve to the even kept digit; carries propagate.
+        ("123456789012345675 + 0", "123456789012345680"),
+        ("123456789012345685 + 0", "123456789012345680"),
+        ("123456789012345665 + 0", "123456789012345660"),
+        ("100000000000000015 + 0", "100000000000000020"),
+        ("999999999999999995 + 0", "1e+18"),
+        // 19 digits round in units of 100; the second's 17-digit
+        // intermediate ...6600 then rounds to the double ...6512.
+        ("1234567890123456750 + 0", "1234567890123456800"),
+        ("1234567890123456650 + 0", "1234567890123456500"),
+        // `tonumber` and `fromjson` yield literals too.
+        (
+            "\"869389897822472004\" | tonumber + 944331",
+            "869389897823416300",
+        ),
+        (
+            "\"869389897822472004\" | fromjson + 944331",
+            "869389897823416300",
+        ),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2906: the same literal-to-double rule applies when an `Int` is widened
+/// for `==`/`!=` and the ordering operators, so a literal compares equal to
+/// the double jq's own arithmetic produced from it. Two literals still
+/// compare exactly (`869389897822472004 == 869389897822472000` stays
+/// `false`, as in jq's `decNumberCompare`). Captured live against
+/// `/usr/bin/jq` 1.7.1.
+///
+/// Only the binary operators are pinned here. `sort`/`unique`/`min`/`max`
+/// on an array built in the filter cross the reindex bridge, which
+/// re-parses the computed double `869389897822472000` as an *integer*
+/// literal, and from then on it compares exactly against the real literal
+/// (`[869389897822472004, (869389897822472000+0), 5] | sort` is
+/// `[5,869389897822472000,869389897822472004]` here and
+/// `[5,869389897822472004,869389897822472000]` in jq -- identical before
+/// and after #2906, a separate bridge gap recorded in
+/// `docs/compliance/jq/limitations.md`).
+#[test]
+fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()> {
+    for (filter, want) in [
+        ("(869389897822472004+0) == (869389897822472000+0)", "true"),
+        ("(869389897822472004+0) != (869389897822472000+0)", "false"),
+        ("869389897822472004 == (869389897822472004+0)", "true"),
+        ("869389897822472004 == (869389897822472000+0)", "true"),
+        ("869389897822472004 == 869389897822472000", "false"),
+        (
+            "[869389897822472004 < (869389897822472004+0), 869389897822472004 > (869389897822472004+0)]",
+            "[false,false]",
+        ),
+        (
+            "[869389897822472004 <= (869389897822472000+0), 869389897822472004 >= (869389897822472000+0)]",
+            "[true,true]",
+        ),
+        (
+            "[(869389897822472000+0) < 869389897822472004, 869389897822472004 < 869389897822472100]",
+            "[false,true]",
+        ),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2906: document input, `--argjson`, and the generic (stdin) evaluator
+/// reach the same arithmetic as `-n` program literals, including a
+/// negative literal arriving as data (unaffected by the separate #2357
+/// unary-minus divergence). Captured live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Result<()> {
+    let (output, code) = run_jq_stdin(". + 944331", "869389897822472004", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "869389897823416300");
+
+    let (output, code) = run_jq_stdin(
+        "[.[0] + .[1], .[2] + .[1], .[0]]",
+        "[869389897822472004, 944331, -869389897822472004]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "[869389897823416300,-869389897821527600,869389897822472004]"
+    );
+
+    let (output, code) = run_jq_stdin(
+        "reduce .[] as $x (0; . + $x)",
+        "[869389897822472004, 944331]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "869389897823416300");
+
+    let (output, code) = run_jq_null(
+        "[$a, $a + 944331]",
+        &["-c", "--argjson", "a", "869389897822472004"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[869389897822472004,869389897823416300]");
+    Ok(())
+}
+
+/// #2906 must-not-regress companion: a literal that is only *displayed*
+/// keeps its exact spelling, 17-or-fewer-digit literals are unchanged (the
+/// rounding is the identity below 10^17), genuine `i64` overflow still goes
+/// through the pre-existing float path, and the #2357 unary-minus
+/// divergence (succinctly keeps the exact value) is untouched. jq's answers
+/// captured live against `/usr/bin/jq` 1.7.1 except where noted.
+#[test]
+fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() -> Result<()> {
+    for (filter, want) in [
+        ("869389897822472004", "869389897822472004"),
+        ("869389897822472004 | tostring", "\"869389897822472004\""),
+        ("[869389897822472004] | tojson", "\"[869389897822472004]\""),
+        ("10000000000000005 + 0", "10000000000000004"),
+        ("99999999999999999 + 0", "1e+17"),
+        ("100000000000000000 + 0", "1e+17"),
+        ("9223372036854775807 + 1", "9223372036854776000"),
+        (
+            "9223372036854775807 + 9223372036854775807",
+            "18446744073709552000",
+        ),
+        // #2357: real jq prints -869389897822472000 here; succinctly's
+        // documented divergence keeps the exact literal, and this fix must
+        // not change that (see `docs/compliance/jq/limitations.md`).
+        ("0 | -869389897822472004", "-869389897822472004"),
+    ] {
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2259: `getpath(EXPR)`'s path-context arm (reached whenever a downstream
 /// `key`/`parent`/`path`/`file_index` forces path-context routing) used to
 /// drain `EXPR`'s whole path-argument generator up front and walk each path

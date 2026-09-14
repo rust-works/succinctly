@@ -45771,6 +45771,30 @@ fn test_yq_int_overflow_wraps_unaffected_by_2631() -> Result<()> {
     Ok(())
 }
 
+/// #2906's fix (jq mode only, see `jq_cli_tests.rs`) rounds an integer
+/// literal to 17 significant decimal digits before widening it to `f64`,
+/// and routes `%` through jq's truncate-the-double model -- both gated on
+/// `S::INT_LITERAL_ROUNDS_TO_17_DIGITS`/`S::OVERFLOW_WRAPS`. Real yq's
+/// `int64` arithmetic is exact, and every value here was captured live
+/// against yq v4.53.3.
+#[test]
+fn test_yq_large_int_arith_stays_exact_unaffected_by_2906() -> Result<()> {
+    let input = "a: 869389897822472004\nb: 944331\n";
+    for (filter, want) in [
+        (".a + .b", "869389897823416335"),
+        (".a - .b", "869389897821527673"),
+        (".a * 2", "1738779795644944008"),
+        (".a % 1000", "4"),
+        (".a == .a + 0", "true"),
+        ("[.a, .b] | sort", "[944331,869389897822472004]"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}` out={out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2259's jq-mode fix (see `jq_cli_tests.rs`) is shared, mode-generic code
 /// (`path_context_component_each`/`path_context_step_getpath`,
 /// `src/jq/eval_generic.rs`), so yq mode gets it too, behind

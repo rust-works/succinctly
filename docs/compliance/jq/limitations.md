@@ -5775,45 +5775,73 @@ itself a rule-4 condition — the condition being invoked here is 4(c), inherite
 `range` entry above, not re-derived from consistency alone.) Pinned by
 `test_unary_minus_destroys_literal_preservation_2357` (`tests/jq_cli_tests.rs`).
 
-### Large-integer `+`/`-` past `2^53` can still round to a different `f64` than real jq even after #2631's fix — no carve-out; recorded as a still-open gap (#2906)
+### Large-integer arithmetic past `2^53` — closed for `i64` literals: jq rounds a literal to 17 decimal digits *before* the double conversion (#2906)
 
 #2631 fixed a fast-path bug where an exact, non-overflowing `i64` `+`/`-`/`*` result past
 `2^53` was kept as `OwnedValue::Int` and printed via its own exact digits, bypassing
-`jq_bare_float_display`'s shortest-round-trip formatting entirely. The fix (`eval.rs`'s
-`jq_checked_int_arith`) now falls back to jq's own `f64` model — `a as f64 op b as f64` —
-whenever either operand or the exact result exceeds `2^53`, which is a strict improvement
-(that fallback matches jq in the large majority of cases where it wasn't reachable at all
-before). It is not a complete fix, though: differential fuzzing against `/usr/bin/jq` 1.7.1
-found real jq's own `+`/`-` sometimes rounds to a *different* double than plain
-`a as f64 op b as f64`, even with **both operands non-negative** (so unrelated to the
-separate unary-minus divergence recorded above):
+`jq_bare_float_display`'s shortest-round-trip formatting entirely. Its fallback — `a as f64
+op b as f64` — still disagreed with real jq on a residual few percent of random 18/19-digit
+operands, even with both operands non-negative:
 
 ```console
 $ jq  -n '869389897822472004 + 944331'    # 869389897823416300
-$ sjq -n '869389897822472004 + 944331'    # 869389897823416400
+$ sjq -n '869389897822472004 + 944331'    # 869389897823416400  (before #2906)
 ```
 
-Both tools agree the *exact* integer sum is `869389897823416335`; the divergence is in
-which double each implementation's addition produces. A 400-case-per-operator random
-sample (both operands drawn from a wide magnitude range, `f64(a) op f64(b)` vs. the exact
-integer sum cast to `f64` once, each compared against jq's live answer) found neither
-model predicts jq in ~4% of cases for `+`/`-` and ~4% for `*`, while the naive
-per-operand-cast model (what `jq_checked_int_arith` falls back to) is right in the
-remaining ~96% — see #2906 for the full breakdown. This is almost certainly jq's own
-decNumber-backed literal preservation interacting with plain `f64` arithmetic in some
-mixed, not-fully-naive way that hasn't been traced to jq's C source, rather than a
-tie-break or formatting question `jq_bare_float_display` could resolve on its own — #2542's
-tie-break mechanism only ever acts on an already-odd trailing digit, and every case found
-here already has an even last digit on both sides.
+An earlier revision of this entry recorded that residue as an open gap on the theory that
+jq must be doing arbitrary-precision decimal arithmetic. It is not; the earlier analysis
+modelled the *operands* as exact integers, and that was the mistake. jq 1.7.1 keeps every
+parsed number — program text, document input, `tonumber`, `fromjson`, `--argjson` — as an
+exact `decNumber` literal and converts it to a double only when arithmetic first reads it,
+in `jvp_literal_number_to_double` (`src/jv.c`): `decNumberReduce` under a
+`DEC_INIT_DECIMAL64` context whose `digits` is raised to 17 (`DEC_NUBMER_DOUBLE_PRECISION`,
+round-half-even), then `decNumberToString`, then a correctly-rounded `strtod`. That is a
+*double* rounding — the literal's decimal value is first rounded to 17 significant decimal
+digits, and only that shorter number is rounded to the nearest double — and it lands on a
+different double than the exact integer's nearest one whenever the 17-digit intermediate
+sits across a rounding boundary. `869389897822472004` (18 digits) becomes
+`869389897822472000`, whose nearest double is `869389897822471936` (a tie, resolved to
+even); the exact integer's nearest double is `869389897822472064`. Every binary operator
+then runs plain `double` arithmetic on those values, `%` truncates each of them to
+`intmax_t` (`dtoi`, saturating) before taking the remainder, and a *computed* number is a
+plain double that is never re-rounded. Modelled that way, jq's answer was reproduced on
+100% of 1200 random `+`/`-`/`*`/`/` cases, 200 input-sourced cases including negatives and
+over-`i64` values, and 100 program-literal negatives (the "no model explains it" bucket
+was 0).
 
-Recorded here rather than fixed because closing it fully would mean replicating jq's actual
-arbitrary-precision decimal arithmetic model for `+`/`-` (and, per the ~4% mul figure above,
-possibly `*` too) — a real decNumber-equivalent dependency, not a formatting-path change —
-and no model tried so far explains 100% of cases even as a starting point. This does not fit
-ADR-0018 rule 4's four named conditions (the output is readable, nothing is corrupted, the
-process doesn't die), so per rule 4 it is recorded as a still-open gap rather than a settled
-divergence, matching this file's own "`foreach`/`reduce`'s INIT-fork re-entry" entry above.
-`jq_checked_int_arith`'s own doc comment in `src/jq/eval.rs` links back here.
+For an `i64` the two conversions differ only when the magnitude is at least `10^17` (18 or
+19 digits): below that a decimal integer has at most 17 significant digits, so the
+intermediate rounding is the identity and `n as f64` was already right — everything in
+`[2^53, 10^17)` behaved correctly before this fix. `jq_literal_int_to_f64`
+(`src/jq/value.rs`) implements the rounding with integer arithmetic only, and jq mode uses
+it wherever an `Int` is widened for `+`/`-`/`*`/`/`/`%`, for `==`, and for ordering
+(`<`, `sort`, `unique`, `group_by`, `min`/`max`, `bsearch`), in both evaluators;
+`%` additionally follows `binop_mod`'s truncate-the-double model, so
+`869389897822472004 % 1000` is `936` (jq) rather than the exact `4`, and
+`9007199254740993 % 2` is `0`. yq mode is untouched: real yq's `int64` arithmetic is
+exact (`869389897822472004 + 944331` is `869389897823416335` there, as it always was
+here), so its widening stays a plain cast (`EvalSemantics::INT_LITERAL_ROUNDS_TO_17_DIGITS`).
+
+**Still open, same mechanism, out of #2906's scope** (tracked as follow-up issues):
+a *float* literal with more than 17 significant digits, or an integer literal beyond
+`i64`, is still parsed with one correct rounding (`2.7293109604053567083 + 0` is
+`2.7293109604053565` in jq, `2.729310960405357` here) — closing it needs the mode plumbed
+through the number-materialisation funnels, not just the arithmetic; the math builtins
+(`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cast
+(`869389897822472004 | sqrt` is `932410798.8555645` in jq, `…647` here); and
+`floor`/`ceil`/`round`/`trunc` of such a value print their exact integer digits where jq
+prints the double (`869389897822472000`). Two *literals* compared against each other are
+still widened here where jq compares them exactly as decimals (`9007199254740993 ==
+9007199254740992.0`, `numeric_repr_eq`'s own doc comment). And a computed double that
+crosses the reindex bridge into a document-input builtin (`sort`, `unique`, `min`, `max`,
+`group_by` on an array built in the filter) is re-parsed from its printed digits as an
+*integer* literal, so it then compares exactly against a real literal instead of equal:
+`[869389897822472004, (869389897822472000+0), 5] | sort` is
+`[5,869389897822472000,869389897822472004]` here and
+`[5,869389897822472004,869389897822472000]` in jq (stable, the two are equal there) —
+identical before and after this fix, since the comparator is right and the bridge is what
+changes the operand. The `range` entry above and the unary-minus entry (#2357) are
+unaffected — both stay on the exact `i64` path they document.
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 
