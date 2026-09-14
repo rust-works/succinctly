@@ -24758,6 +24758,461 @@ fn test_include_appends_jq_suffix_unconditionally_2702() -> Result<()> {
     Ok(())
 }
 
+/// #2865: write each `(name, contents)` pair as `<name>.jq` in a fresh temp
+/// dir and run `succinctly jq -L <dir> <args...>`.
+///
+/// The multi-file sibling of [`run_jq_with_module`], which every transitive-
+/// `include` case needs: the whole point is a module that itself names
+/// another one. Same `TempDir`-outlives-the-spawn and raw-`Command` shape,
+/// for the same reasons its doc comment gives.
+fn run_jq_with_modules(modules: &[(&str, &str)], args: &[&str]) -> Result<(String, String, i32)> {
+    let temp_dir = tempfile::tempdir()?;
+    for (name, contents) in modules {
+        let path = temp_dir.path().join(format!("{name}.jq"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, contents)?;
+    }
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["jq", "-L"]).arg(temp_dir.path()).args(args);
+            command
+        },
+        None,
+    )?;
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        code,
+    ))
+}
+
+/// #2865: a module's own `include` is processed transitively -- the third
+/// module's defs are available to the second module's body.
+///
+/// `ModuleLoader` used to read only `program.expr` from a loaded module's
+/// parse, discarding the `Program`'s own `includes`/`imports`, so `h`'s
+/// reference to `g` was genuinely undefined by the time resolve ran.
+///
+/// Both rows captured live from jq 1.7.1.
+#[test]
+fn test_module_include_is_transitive_2865() -> Result<()> {
+    let modules = [
+        ("inner", "def g: 42;\n"),
+        ("outer", "include \"inner\";\ndef h: g;\n"),
+    ];
+
+    let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "outer"; h"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42");
+
+    // A module's own `import` is processed the same way, under its namespace.
+    let imports = [
+        ("inner", "def g: 42;\n"),
+        ("impouter", "import \"inner\" as i;\ndef h: i::g;\n"),
+    ];
+    let (stdout, stderr, code) =
+        run_jq_with_modules(&imports, &["-nc", r#"include "impouter"; h"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42");
+
+    Ok(())
+}
+
+/// #2865: a transitively included def is **not** re-exported to the includer.
+///
+/// The load-bearing half of why the fix wraps each exported def's *body*
+/// rather than splicing the dependency into the exported chain -- splicing
+/// would make `g` visible here, where jq reports a compile error.
+#[test]
+fn test_transitive_include_does_not_leak_to_the_includer_2865() -> Result<()> {
+    let modules = [
+        ("inner", "def g: 42;\n"),
+        ("outer", "include \"inner\";\ndef h: g;\n"),
+    ];
+    let (_, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "outer"; g"#])?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(stderr.contains("g/0 is not defined"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2865: inside a module, a dependency **outranks the module's own
+/// same-name sibling** -- and that sibling is still what the module exports.
+///
+/// Both rows captured live from jq 1.7.1, and both are surprising enough to
+/// be worth stating: `h` answers `42`, not the `7` sitting one line above it.
+/// The same collision at the *top level* goes the other way (a filter's own
+/// def wins), because a filter's defs bind at parse time; that row is locked
+/// separately below so the two cannot be conflated.
+#[test]
+fn test_module_dependency_outranks_own_sibling_but_is_not_exported_2865() -> Result<()> {
+    let modules = [
+        ("inner", "def g: 42;\n"),
+        ("shadow", "include \"inner\";\ndef g: 7;\ndef h: g;\n"),
+    ];
+
+    let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "shadow"; h"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "42",
+        "dependency must beat the own sibling"
+    );
+
+    let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"include "shadow"; g"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "7", "the module still exports its own g");
+
+    Ok(())
+}
+
+/// #2865: the top-level direction of the same collision, unchanged by this
+/// fix and locked because the fix moves the code that decides it.
+///
+/// `include "inner"; def g: 7; g` answers `7` in jq -- the filter's own def
+/// wins -- where the module-internal collision above answers `42`.
+#[test]
+fn test_top_level_def_still_outranks_an_included_one_2865() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[("inner", "def g: 42;\n")],
+        &["-nc", r#"include "inner"; def g: 7; g"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "7");
+    Ok(())
+}
+
+/// #2865: a def's own recursive call binds to **itself**, not to a
+/// same-named dependency -- and the rule is arity-scoped.
+///
+/// With `inner`'s `g/0` in scope, `def g: if . == 0 then "base" else (. - 1 |
+/// g) end;` still recurses into itself and reaches `"base"`; without the
+/// `deps_excluding_self` filter it would answer `42` on the first step.
+///
+/// The arity half: a dependency `g/1` alongside an own `g/0` leaves both
+/// reachable from the same body (`["own0","dep1arg"]`). Both captured live
+/// from jq 1.7.1.
+#[test]
+fn test_module_def_self_recursion_beats_dependency_per_arity_2865() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner", "def g: 42;\n"),
+            (
+                "recself",
+                "include \"inner\";\ndef g: if . == 0 then \"base\" else (. - 1 | g) end;\n",
+            ),
+        ],
+        &["-nc", r#"include "recself"; 1 | g"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""base""#);
+
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner1", "def g(x): \"dep1arg\";\n"),
+            (
+                "arity",
+                "include \"inner1\";\ndef g: \"own0\";\ndef h: g;\ndef i2: g(1);\n",
+            ),
+        ],
+        &["-nc", r#"include "arity"; [h, i2]"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"["own0","dep1arg"]"#);
+
+    Ok(())
+}
+
+/// #2865: among several `include`s *inside a module*, the last-declared one
+/// wins a name collision -- the same rule #2682 established for the top
+/// level, which is why both now go through the one `wrap_defs` ordering.
+#[test]
+fn test_last_declared_include_wins_inside_a_module_2865() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("pa", "def foo: \"pa\";\n"),
+            ("pb", "def foo: \"pb\";\n"),
+            ("twoinc", "include \"pa\";\ninclude \"pb\";\ndef h: foo;\n"),
+        ],
+        &["-nc", r#"include "twoinc"; h"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""pb""#);
+    Ok(())
+}
+
+/// #2865: a nested `include` resolves against the **global search path
+/// only**, never the including module's own directory.
+///
+/// `sub/usedeep.jq` saying `include "deep"` fails even with `sub/deep.jq`
+/// sitting right beside it, and succeeds once `sub` is itself on the search
+/// path -- so reusing the search path verbatim is the faithful implementation
+/// as well as the simple one. Both rows captured live from jq 1.7.1, and the
+/// not-found case reports jq's own `module not found:` shape.
+#[test]
+fn test_nested_include_uses_the_global_search_path_only_2865() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(temp_dir.path().join("sub"))?;
+    std::fs::write(temp_dir.path().join("sub/deep.jq"), "def d: 99;\n")?;
+    std::fs::write(
+        temp_dir.path().join("sub/usedeep.jq"),
+        "include \"deep\";\ndef ud: d;\n",
+    )?;
+
+    let run = |extra_lib: bool| {
+        let temp_path = temp_dir.path().to_path_buf();
+        spawn_with_signal_retry(
+            move || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(&temp_path);
+                if extra_lib {
+                    command.arg("-L").arg(temp_path.join("sub"));
+                }
+                command.args(["-nc", r#"include "sub/usedeep"; ud"#]);
+                command
+            },
+            None,
+        )
+    };
+
+    let (output, code) = run(false)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: deep"),
+        "stderr: {stderr:?}"
+    );
+
+    let (output, code) = run(true)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "99");
+
+    Ok(())
+}
+
+/// #2865: a three-level chain, and a diamond where one module includes both
+/// another module and that module's own dependency.
+///
+/// The diamond is the case a naive memo-plus-recursion gets wrong by loading
+/// `inner` twice into incompatible scopes; `84` is `g + h` with both reaching
+/// the same `42`. Both captured live from jq 1.7.1.
+#[test]
+fn test_transitive_include_chain_and_diamond_2865() -> Result<()> {
+    let base = [
+        ("inner", "def g: 42;\n"),
+        ("outer", "include \"inner\";\ndef h: g;\n"),
+        ("mid", "include \"inner\";\ndef m: g;\n"),
+        ("top", "include \"mid\";\ndef t: m;\n"),
+        (
+            "dia",
+            "include \"inner\";\ninclude \"outer\";\ndef dd: g + h;\n",
+        ),
+    ];
+
+    let (stdout, stderr, code) = run_jq_with_modules(&base, &["-nc", r#"include "top"; t"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42", "three-level chain");
+
+    let (stdout, stderr, code) = run_jq_with_modules(&base, &["-nc", r#"include "dia"; dd"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "84", "diamond");
+
+    Ok(())
+}
+
+/// #2865: a module cycle is reported and terminates.
+///
+/// **A deliberate ADR-0018 rule-4 divergence**, under the explicit "matching
+/// would take the host process down" carve-out: real jq 1.7.1 does not
+/// diagnose this at all, it recurses until it dies --
+/// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with nothing on
+/// either stream, and a self-including module does the same. So there is no
+/// reference output to match; what this test pins is that succinctly leaves
+/// through the same exit-3 `jq: 1 compile error` door as the other two
+/// compile-error kinds, and that it leaves at all.
+///
+/// The third row is why detection keys on the *resolved* file rather than the
+/// module path as written: `alia.jq` including `"./alia"` is the same cycle
+/// under two spellings.
+#[test]
+fn test_module_cycle_is_a_compile_error_not_a_hang_2865() -> Result<()> {
+    for (modules, filter, want_chain) in [
+        (
+            vec![
+                ("ca", "include \"cb\";\ndef a: 1;\n"),
+                ("cb", "include \"ca\";\ndef b: 2;\n"),
+            ],
+            r#"include "ca"; a"#,
+            "ca -> cb -> ca",
+        ),
+        (
+            vec![("selfinc", "include \"selfinc\";\ndef s: 5;\n")],
+            r#"include "selfinc"; s"#,
+            "selfinc -> selfinc",
+        ),
+        (
+            vec![("alia", "include \"./alia\";\ndef q: 3;\n")],
+            r#"include "alia"; q"#,
+            "alia -> ./alia",
+        ),
+        (
+            vec![
+                ("ia", "import \"ib\" as b;\ndef x: 1;\n"),
+                ("ib", "import \"ia\" as a;\ndef y: 2;\n"),
+            ],
+            r#"include "ia"; x"#,
+            "ia -> ib -> ia",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", filter])?;
+        assert_eq!(code, 3, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        assert!(
+            stderr.contains(&format!("module cycle detected: {want_chain}")),
+            "{filter}: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2865 / #2774: `$__loc__` inside a **transitively** included def still
+/// reports the innermost module's own path, not the module that included it.
+///
+/// The regression this fix could most easily have caused silently:
+/// `stamp_loc_file` overwrites `file` unconditionally, so binding a module's
+/// dependencies before stamping its own defs would re-stamp the inner
+/// module's already-correct `$__loc__` with the outer module's path.
+#[test]
+fn test_loc_in_a_transitively_included_def_names_the_inner_module_2865() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("locinner.jq"), "def li: $__loc__;\n")?;
+    std::fs::write(
+        temp_dir.path().join("locouter.jq"),
+        "include \"locinner\";\ndef lo: li;\n",
+    )?;
+    // The `TempDir` path can itself sit under a symlink (`/var` -> `/private/var`
+    // on macOS), and `$__loc__` reports the canonical path -- compare against
+    // the canonicalised dir, the same way #2774's own tests do.
+    let canonical = std::fs::canonicalize(temp_dir.path())?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "locouter"; lo"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!(
+            r#"{{"file":"{}","line":1}}"#,
+            canonical.join("locinner.jq").display()
+        )
+    );
+    Ok(())
+}
+
+/// #2865 (risk R3): a transitively included name must **not** join the
+/// shadow-candidate set `unqualified_def_names` seeds the main filter's
+/// re-parse with -- it is not visible unqualified at the top level, so
+/// `length` there is still the builtin.
+///
+/// Stated as a test because the "helpful" edit that adds transitive names to
+/// that set would break nothing else visibly.
+///
+/// The first element pins the residual gap in the other direction, filed as
+/// **#2950**: the dependency's `length` *should* shadow inside the module
+/// body (jq answers `"dep-length"`), but a module's own source is parsed with
+/// no shadow-candidate seeding, so the call lowers to the builtin and answers
+/// `0` (`null | length`). Update this row when #2950 lands.
+#[test]
+fn test_transitive_names_do_not_seed_top_level_shadow_candidates_2865() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("shlen", "def length: \"dep-length\";\n"),
+            ("usesh", "include \"shlen\";\ndef h: length;\n"),
+        ],
+        &["-nc", r#"include "usesh"; [h, ([1,2]|length)]"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0,2]");
+
+    // ...while a module's *own* def still shadows for its includer (#2395),
+    // which this fix must not have disturbed.
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[("ownlen", "def length: \"own-length\";\n")],
+        &["-nc", r#"include "ownlen"; [1,2] | length"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""own-length""#);
+
+    Ok(())
+}
+
+/// #2865 (plan step 6): a chain of modules does not multiply in size.
+///
+/// Wrapping every dependency into every exported body compounds down a chain,
+/// because each level's bodies already carry the level below: unfiltered, a
+/// 3-module x 40-def chain measured 359 MB peak RSS against jq's 2.5 MB, and
+/// a fourth level would have been tens of gigabytes. `deps_excluding_self`'s
+/// referenced-closure filter (jq's own `block_bind_referenced` rule) is what
+/// keeps it flat.
+///
+/// Deliberately modest -- 4 levels x 12 defs, which the unfiltered build
+/// could not have completed in any reasonable time or memory, while the
+/// filtered one is instant. A wall-clock assertion would be a flake on a
+/// loaded CI box; completing at all is the signal.
+#[test]
+fn test_transitive_include_chain_does_not_blow_up_2865() -> Result<()> {
+    const LEVELS: usize = 4;
+    const DEFS: usize = 12;
+
+    let mut modules: Vec<(String, String)> = Vec::new();
+    let mut base = String::new();
+    for i in 0..DEFS {
+        base.push_str(&format!("def f0_{i}: {i};\n"));
+    }
+    modules.push(("chain0".to_string(), base));
+    for level in 1..LEVELS {
+        let mut contents = format!("include \"chain{}\";\n", level - 1);
+        for i in 0..DEFS {
+            contents.push_str(&format!("def f{level}_{i}: f{}_{i} + 1;\n", level - 1));
+        }
+        modules.push((format!("chain{level}"), contents));
+    }
+
+    let borrowed: Vec<(&str, &str)> = modules
+        .iter()
+        .map(|(name, contents)| (name.as_str(), contents.as_str()))
+        .collect();
+    let filter = format!(
+        r#"include "chain{}"; f{}_{}"#,
+        LEVELS - 1,
+        LEVELS - 1,
+        DEFS - 1
+    );
+    let (stdout, stderr, code) = run_jq_with_modules(&borrowed, &["-nc", &filter])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    // `f0_11` is 11, and each of the 3 levels above it adds 1.
+    assert_eq!(stdout.trim_end(), (DEFS - 1 + LEVELS - 1).to_string());
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.

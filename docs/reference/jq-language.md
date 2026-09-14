@@ -309,6 +309,22 @@ as opposed to a trailing same-line comment) are not implemented at all.
 - [x] `~/.jq` auto-loading (file or directory)
 - [x] `namespace::func` - Namespaced function calls
 - [x] Parameterized functions in modules
+- [x] Transitive `include`/`import` — a module's own directives are processed too (#2865)
+
+A module's dependencies are bound into the bodies of the defs that module
+exports, not spliced into its exported chain, which is what real jq does:
+a transitively included name is visible *inside* the module and is **not**
+re-exported to whoever included it, and it outranks a same-named sibling
+def in that module (while the module still exports its own). A def's own
+recursive call binds to itself rather than to a same-named dependency,
+per (name, arity). See
+[jq Limitations](../compliance/jq/limitations.md#three-module-scoping-quirks-that-are-matched-and-read-as-bugs-2865)
+for the full table and the two scoping gaps that remain open.
+
+An `include` cycle is reported as `module cycle detected: a -> b -> a`
+(exit 3) — a deliberate ADR-0018 rule-4 divergence, since real jq
+segfaults instead; see
+[jq Limitations](../compliance/jq/limitations.md#a-module-include-cycle-is-a-compile-error-where-jq-segfaults--accepted-divergence-adr-0018-rule-4-2865).
 
 ### Succinctly Extensions
 These are succinctly-specific extensions not available in standard jq or yq:

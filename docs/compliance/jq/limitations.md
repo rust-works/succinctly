@@ -6288,6 +6288,75 @@ change (`eval_label`/`each_label`/`each_label_generic` and both owned-identity/p
 `Label` arms would each need their non-matching-escape fallthrough routed through a resolvable
 call), out of #2687's stated scope.
 
+### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
+
+[#2865](https://github.com/rust-works/succinctly/issues/2865) made a module's own
+`include`/`import` directives load transitively, which makes a cycle between two modules
+reachable for the first time. Real jq 1.7.1 does not diagnose one at all — it recurses
+until the process dies:
+
+```console
+$ cat ca.jq
+include "cb";
+def a: 1;
+$ cat cb.jq
+include "ca";
+def b: 2;
+
+$ jq -L . -n 'include "ca"; a'; echo "exit=$?"
+exit=139                       # SIGSEGV, nothing on stdout or stderr
+
+$ succinctly jq -L . -n 'include "ca"; a'; echo "exit=$?"
+jq: error: module cycle detected: ca -> cb -> ca
+
+jq: 1 compile error
+exit=3
+```
+
+A module that includes itself behaves the same way in jq (`exit=139`), and reports
+`module cycle detected: selfinc -> selfinc` here.
+
+This is the **cleanest** of ADR-0018 rule 4's carve-outs rather than a policy stretch:
+the rule permits refusing the reference's behaviour where "matching would take the host
+process down," and matching here means exactly a SIGSEGV. There is no reference *output*
+to be faithful to — jq writes nothing to either stream — so the only open question was
+which shape to leave through, and the answer is the one the other two compile-error kinds
+already use (`jq: N compile error`, exit 3, per "Undefined functions and arity
+mismatches" above).
+
+Detection keys on the **resolved** file rather than the module path as written, so one
+module reachable under two spellings still closes a cycle
+(`alia.jq` containing `include "./alia"` reports `alia -> ./alia`); the chain in the
+message keeps the spellings, since those are what the source actually says. It cannot use
+the module memo cache as its guard: a module is absent from that cache for exactly as long
+as its own dependencies are loading, which is precisely the window in which a cycle closes.
+
+`test_module_cycle_is_a_compile_error_not_a_hang_2865` (`tests/jq_cli_tests.rs`) pins all
+four shapes (two-module cycle, self-include, aliased spelling, `import`-side cycle).
+
+### Three module-scoping quirks that *are* matched, and read as bugs (#2865)
+
+Not divergences — recorded here because the next person to touch `ModuleLoader` will
+otherwise read them as ones, and because the self-recursion filter in
+`deps_excluding_self` has no other explanation. All three captured live against jq 1.7.1,
+with `inner.jq` = `def g: 42;`:
+
+| Case                                                                     | jq, and succinctly                                                                                               |
+|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| Module is `include "inner"; def g: 7; def h: g;` — what does `h` answer? | **`42`** — the dependency is innermost, so it beats the module's own same-name sibling one line above            |
+| ...and what does that module still *export* as `g`?                      | `7` — its own def                                                                                                |
+| Same collision at the **top level**: `include "inner"; def g: 7; g`      | `7` — the **opposite** way, because a filter's own defs bind at parse time before the module block is spliced in |
+| A def's own recursive call, with a same-named dependency in scope        | binds to **itself**: `def g: if . == 0 then "base" else (. - 1 \                                                 |
+
+Two further module-scope gaps found while closing #2865 are genuine and still open, filed
+rather than recorded as divergences: a dependency named after a builtin cannot shadow that
+builtin *inside* the module body, because a module's own source is parsed with no
+shadow-candidate seeding
+([#2950](https://github.com/rust-works/succinctly/issues/2950)); and a module body can see
+names it should not — `~/.jq`'s defs, and sibling `include`d modules' defs in a
+declaration-order-dependent way — because every module is inlined into one flat def chain
+([#2951](https://github.com/rust-works/succinctly/issues/2951)).
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
