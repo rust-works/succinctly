@@ -24006,9 +24006,16 @@ fn resolves_to_one_inert_path(expr: &Expr) -> bool {
             resolves_to_one_inert_path(target) && is_inert_single_value(key)
         }
         Expr::SliceExpr { target, start, end } => {
-            resolves_to_one_inert_path(target)
-                && start.as_deref().is_none_or(is_inert_single_value)
-                && end.as_deref().is_none_or(is_inert_single_value)
+            // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
+            // is 1.73 and `Option::is_none_or` is stable since 1.82, which
+            // `clippy::incompatible_msrv` rejects -- the same substitution
+            // `jq_seq_reader.rs`/`yq_runner.rs` already make.
+            #[allow(clippy::unnecessary_map_or)]
+            {
+                resolves_to_one_inert_path(target)
+                    && start.as_deref().map_or(true, is_inert_single_value)
+                    && end.as_deref().map_or(true, is_inert_single_value)
+            }
         }
         _ => false,
     }
@@ -24058,9 +24065,15 @@ fn is_inert_single_value(expr: &Expr) -> bool {
 /// where resolving the second `.a` against the *written* document would
 /// have read back `5` and raised `Cannot index object with number`. jq pays
 /// nothing for the separation (its values are refcounted and `setpath`
-/// copies on write); here it costs one document clone, which is why the
-/// call site keeps every static path on the eager route that does not need
-/// it.
+/// copies on write); here it costs one document clone.
+///
+/// **Measured** (Apple M-series, release, 1.5 MB / 200,000-element array,
+/// peak RSS): `.[(0,1)] = 0` goes 74.8 MB -> 88.5 MB, **+18%**. That is the
+/// price of the interleave, and it is charged only where the interleave is
+/// observable: [`assignment_path_needs_streaming`] keeps `.[$k] = 0` on the
+/// eager route (58.9 MB -> 57.5 MB, unchanged), and a static path,
+/// `del(...)` and `|=` are untouched either way. Reducing it further needs
+/// structural sharing in `OwnedValue`, which no gate here substitutes for.
 fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'a, W>,
@@ -29783,9 +29796,9 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
     Some(match expr {
         // #2267: `E[K]`/`E[S:T]` are native `resolve_node_sink` arms now --
         // intercepted there before this fallback is ever reached, the same
-        // way #2696 moved the recurse family out. Their collecting forms
-        // survive only as `collect_resolved` adapters for the callers that
-        // genuinely want the whole list.
+        // way #2696 moved the recurse family out. Their collecting forms had
+        // no caller left once both arms moved and are gone entirely;
+        // `resolve_node` is the one collector, via [`collect_resolved`].
 
         // #2696: `..`/bare `recurse`/`recurse_down` (and, since #2235, the
         // parameterised pair) now have their own native sink arms in
@@ -34805,7 +34818,7 @@ fn untrackable_branch_escape(
 }
 
 /// Resolve `target` (`E`) for one pair of a computed index (`E[K]`) or slice
-/// (`E[S:T]`), and reserve room for the branches it produced.
+/// (`E[S:T]`).
 ///
 /// One definition of the block [`resolve_index_expr_sink`] and
 /// [`resolve_slice_expr_sink`] had hand-copied near-identically -- the first copy
@@ -34826,13 +34839,14 @@ fn untrackable_branch_escape(
 ///   than short-circuiting, so the caller can push those branches first and
 ///   raise afterwards.
 ///
-/// **The per-pair `out` reservation deliberately stays at the two call
-/// sites**, even though it too is identical text. `resolve_slice_expr` runs
-/// its #843 `target_is_passthrough` escape *between* the resolve and the
-/// reserve, so folding the reserve in here would hoist it above that escape
-/// and swap which error surfaces when both would fire. That is only
-/// reachable under allocation failure, but this is a refactor: it is not the
-/// place to move an observable ordering, however unlikely the observation.
+/// There is no per-pair reservation left to share or to keep at the call
+/// sites (#2267): both resolvers stream their branches to a sink instead of
+/// accumulating them, so the cross-product refusal lives in
+/// [`collect_resolved`] now. The ordering hazard that kept the old
+/// reservation out of this helper -- `resolve_slice_expr_sink`'s #843
+/// `target_is_passthrough` escape running *between* the resolve and the
+/// reserve, so hoisting the reserve would swap which error surfaced -- went
+/// with it.
 fn resolve_target_for_pair<'a, S: EvalSemantics>(
     target: &Expr,
     value: &'a OwnedValue,
@@ -35009,11 +35023,12 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     // breaks the frozen-pointer identity regardless of ambient) — so
     // `false` here is provably unobservable, not a real decision
     // (#1591).
-    // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
-    // plus this pair's own `out` reservation, one definition shared with
-    // the sibling resolver -- see its doc comment for the kept-partial-
-    // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
-    // carries, which used to be stated twice here and there.
+    // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution,
+    // one definition shared with the sibling resolver -- see its doc
+    // comment for the kept-partial-prefix (#896) rule it carries, which
+    // used to be stated twice here and there. The per-pair reservation
+    // that used to sit alongside it is gone; nothing accumulates in
+    // either resolver any more.
     let key_escape = drive_index_key::<S>(key, value, &mut |k| {
         // The shared exit every escape arm below funnels through, so parking
         // the escape and stopping the driver can't drift between arms.
@@ -35393,11 +35408,12 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
                 return Err($control)
             };
         }
-        // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution
-        // plus this pair's own `out` reservation, one definition shared with
-        // the sibling resolver -- see its doc comment for the kept-partial-
-        // prefix (#896) and per-pair-reservation (#2139/#2249) rules it
-        // carries, which used to be stated twice here and there.
+        // `resolve_target_for_pair` (#2267): `target`'s per-pair resolution,
+        // one definition shared with the sibling resolver -- see its doc
+        // comment for the kept-partial-prefix (#896) rule it carries, which
+        // used to be stated twice here and there. The per-pair reservation
+        // that used to sit alongside it is gone; nothing accumulates in
+        // either resolver any more.
         let (branches, this_escape) =
             resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
         // #2546: rendered from the bounds' own values, not from a

@@ -149,6 +149,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at all (neither does jq), and one that keeps everything still gets a
   catchable error rather than an abort.
 
+  **Cost, measured rather than assumed.** The streaming route keeps two
+  documents where the eager one kept one — the generator must resolve
+  against an unmutated document while the writes accumulate elsewhere, which
+  is jq's own separation and is observable — so on a 1.5 MB / 200,000-element
+  array `.[(0,1)] = 0` goes from 74.8 MB to 88.5 MB peak RSS, **+18%**. It is
+  charged only where the interleave is observable at all: a path that
+  provably resolves to one path inertly stays on the eager route, so
+  `.[$k] = 0` is unchanged (58.9 MB → 57.5 MB), as are a static path,
+  `del(...)` and `|=`. Reducing it further needs structural sharing in
+  `OwnedValue` rather than a better gate.
+
   Two neighbouring shapes are deliberately unchanged. jq re-resolving the
   path once per right-hand-side output stays open — it is unfixable while
   `collect_rhs_outputs` is eager, was measured at 87 regressions against 69
