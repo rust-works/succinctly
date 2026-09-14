@@ -424,18 +424,24 @@ fn empty_container_gap_error<V: DocumentValue>(
     }
 }
 
-/// `cursor` is the cursor pointing at `value` itself, when the caller has
-/// one. Every recursive call below passes one (`field.value_cursor` /
-/// `elem_cursor` -- already resolved for an unrelated reason and otherwise
-/// discarded), so `None` only ever reaches this function through
-/// [`to_owned`]'s own depth-0 entry point, the one caller with no cursor to
-/// give: the true top level. #2358 threaded this through specifically so
-/// #2211's `container_gap_ok` (a stray `,` with *zero* real children,
-/// `{,}`/`[,]`) can close for every *nested* container the way
-/// `to_owned_cursor_at_depth` always could -- see the `match cursor` below.
-/// The true top level keeps the same documented gap
-/// `jq_runner::standard_json_to_jq_value` has for the identical reason:
-/// there is no cursor to reconstruct once nothing was ever given.
+/// Materializes a value while retaining a container cursor when available.
+///
+/// `Option` is structurally required by the bare-value `to_owned` entry
+/// point (#2846): `DocumentValue` has no cursor-recovery operation, and
+/// JSON's `JsonFields`/`JsonElements` retain only an optional child cursor.
+/// Their constructors discard the container cursor; an empty container's
+/// `None` retains neither source text nor index, so even its opening
+/// bracket cannot be recovered. This differs from #2781's yq-runner call
+/// site, which already held the root cursor.
+///
+/// Every container-recursive call supplies its already-resolved child
+/// cursor, closing the nested `{,}`/`[,]` gap (#2358). Only the bare-value
+/// entry point lacks a cursor for a container. The scalar fallbacks in
+/// `to_owned_cursor_at_depth` and `to_owned_with_comments_at_depth` may
+/// also pass `None` at any depth, harmlessly: scalar conversion never
+/// consults this parameter. Do not replace the recursive calls with
+/// `to_owned_cursor_at_depth`: its tag resolution and number
+/// canonicalization deliberately differ from this value-domain walk.
 fn to_owned_at_depth<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,

@@ -1993,6 +1993,18 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<Owne
     result
 }
 
+/// Retains an optional container cursor because the bare-value entry point
+/// cannot reconstruct one (#2846). `JsonFields::from_object_cursor` and
+/// `JsonElements::from_array_cursor` retain only `first_child()`: an empty
+/// container stores `None`, with no source text, index, or parent position.
+/// Thus a bare `[]` and `[,]` (likewise `{}` and `{,}`) contain the same
+/// navigation state. Recovering a parent from a nonempty child would not
+/// close the zero-child gap this parameter exists to check.
+///
+/// Both recursive call sites retain their already-resolved child cursor.
+/// Keep `Option` at this shared boundary for the genuinely cursorless
+/// `to_owned` caller; unlike the yq runner's #2781 call site, it cannot
+/// supply a root cursor without changing the value representation or API.
 fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     cursor: Option<&JsonCursor<'_, W>>,
