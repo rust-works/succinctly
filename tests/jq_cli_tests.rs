@@ -49893,6 +49893,50 @@ fn test_jq_length_of_a_number_is_unaffected_2453() -> Result<()> {
     Ok(())
 }
 
+/// #2830: downstream control must stop each owned-identity driver without
+/// being caught/retried by its body or pulling another output. `path` in
+/// the rest forces identity tracking; a plain error alone can take a
+/// cursor-native route and miss these drivers (#2782).
+#[test]
+fn test_owned_identity_rest_escape_drivers_agree_2830() -> Result<()> {
+    // `tostring` forces an owned value before the scope; without it the
+    // try-handler case can stay on the cursor route and miss its store.
+    for entry in [".a", ".a | tostring"] {
+        for body in [
+            "(label $scope | key)",
+            "(try key catch .)",
+            "(try error(\"inner\") catch key)",
+            "limit(2; (key,key))",
+            "(key // 9)",
+        ] {
+            for (filter, expected_code, expected_error) in [
+                (
+                    format!("{entry} | {body} | (path,error(\"downstream\"))"),
+                    5,
+                    "jq: error (at <stdin>:0): downstream\n",
+                ),
+                (format!("{entry} | {body} | (path,halt_error(7))"), 7, "a"),
+                (
+                    format!("label $out | {entry} | {body} | (path,break $out)"),
+                    0,
+                    "",
+                ),
+                (
+                    format!("first({entry} | {body} | (path,error(\"unreached\")))"),
+                    0,
+                    "",
+                ),
+            ] {
+                let (out, err, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
+                assert_eq!(out, "[\"a\"]\n", "{filter}: {err}");
+                assert_eq!(code, expected_code, "{filter}: {err}");
+                assert_eq!(err, expected_error, "{filter}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// #2495: the jq-mode counterpart of
 /// `yq_cli_tests::test_owned_identity_pipe_carries_control_and_prefix_2495`
 /// -- see that test's own doc comment for the full mechanism (a shared
@@ -55563,50 +55607,6 @@ fn test_raw_control_character_rejected_on_every_input_path_2878() -> Result<()> 
                     code, 0,
                     "byte 0x{byte:02X} is not a C0 control and must be accepted by {args:?}"
                 );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// #2830: downstream control must stop each owned-identity driver without
-/// being caught/retried by its body or pulling another output. `path` in
-/// the rest forces identity tracking; a plain error alone can take a
-/// cursor-native route and miss these drivers (#2782).
-#[test]
-fn test_owned_identity_rest_escape_drivers_agree_2830() -> Result<()> {
-    // `tostring` forces an owned value before the scope; without it the
-    // try-handler case can stay on the cursor route and miss its store.
-    for entry in [".a", ".a | tostring"] {
-        for body in [
-            "(label $scope | key)",
-            "(try key catch .)",
-            "(try error(\"inner\") catch key)",
-            "limit(2; (key,key))",
-            "(key // 9)",
-        ] {
-            for (filter, expected_code, expected_error) in [
-                (
-                    format!("{entry} | {body} | (path,error(\"downstream\"))"),
-                    5,
-                    "jq: error (at <stdin>:0): downstream\n",
-                ),
-                (format!("{entry} | {body} | (path,halt_error(7))"), 7, "a"),
-                (
-                    format!("label $out | {entry} | {body} | (path,break $out)"),
-                    0,
-                    "",
-                ),
-                (
-                    format!("first({entry} | {body} | (path,error(\"unreached\")))"),
-                    0,
-                    "",
-                ),
-            ] {
-                let (out, err, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
-                assert_eq!(out, "[\"a\"]\n", "{filter}: {err}");
-                assert_eq!(code, expected_code, "{filter}: {err}");
-                assert_eq!(err, expected_error, "{filter}");
             }
         }
     }
