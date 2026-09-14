@@ -28263,6 +28263,61 @@ enum ResolveFlow {
     Escaped(EvalEscape),
 }
 
+/// Collect a sink-shaped resolver back into a [`PathResolveResult`], for
+/// the callers that still want the whole list.
+///
+/// **Where the cross-product refusal lives now (#2267 step 3).**
+/// `resolve_index_expr`/`resolve_slice_expr` used to reserve into their own
+/// `out` once per key/pair, turning an allocation failure into a catchable
+/// error rather than an abort -- ADR-0018's "would take the host process
+/// down" exception, the one ground on which this codebase is allowed to
+/// refuse what jq does (jq has no such guard; `cannot_reserve_cross_product`'s
+/// own doc comment records that it "just keeps producing output"). Once
+/// those resolvers stream, they have no accumulator to reserve into, so the
+/// guard moves here, to whoever actually accumulates -- and it changes shape
+/// with the move: an up-front refusal of a whole product becomes per-branch
+/// growth.
+///
+/// Both halves of that trade are deliberate:
+///
+/// - **A consumer that keeps nothing can no longer be refused at all.**
+///   `eval_assign`'s streaming write applies each path and drops it, so
+///   there is no product to allocate and nothing to refuse -- it now
+///   completes on shapes that previously raised. That is strictly closer to
+///   jq, which completes on them too.
+/// - **A consumer that keeps everything is still refused, just later.** The
+///   `try_reserve` below runs per branch, so a genuine OOM still surfaces as
+///   a catchable `EvalEscape` rather than aborting the process, which is the
+///   property the exception was granted for. What is lost is only the
+///   *earliness*: a product that would have been refused before producing
+///   anything is now refused partway in, after the branches that did fit
+///   were already delivered. Since those branches are delivered to a sink
+///   that is free to discard them, and since the refusal still arrives as an
+///   error on the same call, no caller can observe a difference beyond when
+///   the side effects of resolving the earlier branches fire -- and firing
+///   them is what jq does.
+fn collect_resolved<'a>(
+    resolve: impl FnOnce(&mut dyn FnMut(PathBranch<'a>) -> Demand) -> ResolveFlow,
+) -> PathResolveResult<'a> {
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+    let mut reserve_failed = false;
+    let flow = resolve(&mut |branch| {
+        if out.try_reserve(1).is_err() {
+            reserve_failed = true;
+            return Demand::Stop;
+        }
+        out.push(branch);
+        Demand::Continue
+    });
+    if reserve_failed {
+        return Err((out, cannot_reserve_cross_product(&[1]).into()));
+    }
+    match flow {
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
+        ResolveFlow::Escaped(e) => Err((out, e)),
+    }
+}
+
 /// Deliver an already-materialized [`PathResolveResult`] to a sink,
 /// checking demand between branches — the fallback for every arm
 /// [`resolve_node_sink`] has no native lazy form for yet.
@@ -28731,15 +28786,9 @@ fn resolve_node<'a, S: EvalSemantics>(
     frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
-    let mut out = Vec::new();
-    let flow = resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, &mut |b| {
-        out.push(b);
-        Demand::Continue
-    });
-    match flow {
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
-        ResolveFlow::Escaped(e) => Err((out, e)),
-    }
+    collect_resolved(|sink| {
+        resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
+    })
 }
 
 /// Resolve one path node against one value, yielding a branch per output.
@@ -29449,6 +29498,21 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             }
         }
 
+        // #2267: both computed-navigation resolvers drive their own
+        // generators (`K`/`S`/`T`) and re-resolve `target` per pair, so a
+        // native arm here is what lets a bounded consumer's demand reach
+        // those generators -- and, for `eval_assign`'s streaming write,
+        // what makes a failed write stop the key/bound generator instead
+        // of merely discarding paths it has already fired side effects to
+        // produce.
+        Expr::IndexExpr { target, key } => {
+            resolve_index_expr_sink::<S>(target, key, value, false, trackable, frame, keep, sink)
+        }
+
+        Expr::SliceExpr { target, start, end } => resolve_slice_expr_sink::<S>(
+            target, start, end, value, false, trackable, frame, keep, sink,
+        ),
+
         // Two fall-throughs, not one. A shape `resolve_node_eager` still
         // answers for resolves eagerly and reaches the sink through
         // `drain_path_result`, which is byte-identical to the eager result
@@ -29481,13 +29545,11 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
     keep: Keep,
 ) -> Option<PathResolveResult<'a>> {
     Some(match expr {
-        Expr::IndexExpr { target, key } => {
-            resolve_index_expr::<S>(target, key, value, false, trackable, frame, keep)
-        }
-
-        Expr::SliceExpr { target, start, end } => {
-            resolve_slice_expr::<S>(target, start, end, value, false, trackable, frame, keep)
-        }
+        // #2267: `E[K]`/`E[S:T]` are native `resolve_node_sink` arms now --
+        // intercepted there before this fallback is ever reached, the same
+        // way #2696 moved the recurse family out. Their collecting forms
+        // survive only as `collect_resolved` adapters for the callers that
+        // genuinely want the whole list.
 
         // #2696: `..`/bare `recurse`/`recurse_down` (and, since #2235, the
         // parameterised pair) now have their own native sink arms in
@@ -29806,13 +29868,14 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     match inner {
-        Expr::IndexExpr { target, key } => drain_path_result(
-            resolve_index_expr::<S>(target, key, value, true, trackable, frame, keep),
-            sink,
-        ),
-        Expr::SliceExpr { target, start, end } => drain_path_result(
-            resolve_slice_expr::<S>(target, start, end, value, true, trackable, frame, keep),
-            sink,
+        // #2267: streamed, not drained -- `.[K]?`/`.[S:T]?` carry the same
+        // per-key/per-pair generators as their non-optional spellings, so a
+        // consumer's demand has to reach them identically.
+        Expr::IndexExpr { target, key } => {
+            resolve_index_expr_sink::<S>(target, key, value, true, trackable, frame, keep, sink)
+        }
+        Expr::SliceExpr { target, start, end } => resolve_slice_expr_sink::<S>(
+            target, start, end, value, true, trackable, frame, keep, sink,
         ),
         _ => {
             let bare_navigation_primitive = matches!(
@@ -34449,7 +34512,7 @@ fn type_filter_matches(builtin: &Builtin, value: &OwnedValue) -> bool {
 /// around it, or the empty/no-op `Expr::pipe` that a leading `.[EXPR]`/
 /// `.[S:T]` attaches as its `target`; see `push_bracket` in `parser.rs`).
 ///
-/// Used only by [`resolve_index_expr`]/[`resolve_slice_expr`] to decide, for
+/// Used only by [`resolve_index_expr_sink`]/[`resolve_slice_expr_sink`] to decide, for
 /// an untracked `value` (#843), whether *this* indexing/slicing step is the
 /// first real navigation attempted — raised here, using the actual computed
 /// key/bounds, rather than deferred to `target`'s own resolution. When
@@ -34476,8 +34539,9 @@ fn is_passthrough_target(target: &Expr) -> bool {
 }
 
 /// The shared "#843 (the caller's own trackability context) OR #986 (this
-/// specific branch's own untrackability)" check both [`resolve_index_expr`]
-/// and [`resolve_slice_expr`] run against each of `target`'s resolved
+/// specific branch's own untrackability)" check both
+/// [`resolve_index_expr_sink`] and [`resolve_slice_expr_sink`] run against
+/// each of `target`'s resolved
 /// branches, immediately before that branch is navigated further (indexed
 /// or sliced) -- #2248. One shared definition, not two hand-copied call
 /// sites, so the two can't drift apart (this file's own "duplicated
@@ -34507,8 +34571,8 @@ fn untrackable_branch_escape(
 /// Resolve `target` (`E`) for one pair of a computed index (`E[K]`) or slice
 /// (`E[S:T]`), and reserve room for the branches it produced.
 ///
-/// One definition of the block [`resolve_index_expr`] and
-/// [`resolve_slice_expr`] had hand-copied near-identically -- the first copy
+/// One definition of the block [`resolve_index_expr_sink`] and
+/// [`resolve_slice_expr_sink`] had hand-copied near-identically -- the first copy
 /// arriving with #2139, the second with #2249 -- and which this file's own
 /// "duplicated predicates diverge silently" lesson (#106) names as the shape
 /// to stop before it drifts. Noted as a maintainability concern on #2267 and
@@ -34596,7 +34660,25 @@ fn drive_index_key<S: EvalSemantics>(
 ///   reached, and `5 | .a[empty] = 9` is `5` rather than an error.
 /// - The key stream is outer and the target stream inner, so
 ///   `path(.[("a","b")])` emits `["a"]` then `["b"]`.
-fn resolve_index_expr<'a, S: EvalSemantics>(
+///
+/// Delivers each resolved branch to `sink` as it is produced (#2267 step 3)
+/// — there is no collecting form of this resolver any more; a caller that
+/// wants the whole list goes through [`resolve_node`], which collects for
+/// every arm at once.
+///
+/// The last of the three generators in `K as $k | E | .[$k]` to become
+/// demand-driven. #2139 made `E` re-resolve per key and #2922 made the two
+/// interleave; what was still missing is the *consumer's* own demand
+/// reaching back down here, so a bounded consumer -- `first`/`limit`, or
+/// `eval_assign`'s streaming write, which stops at the first path whose
+/// write fails to validate -- leaves the key generator un-resumed rather
+/// than merely discarding what it already produced. That is the difference
+/// between jq's `reduce path(...) as $p (.; setpath($p; ...))` firing `E`'s
+/// side effect once and firing it once per key.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `sink` joins the seven
+                                     // parameters this resolver's own navigation needs; the alternative is a
+                                     // struct whose fields are all threaded ambients of one call.
+fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     target: &Expr,
     key: &Expr,
     value: &'a OwnedValue,
@@ -34604,7 +34686,8 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     trackable: bool,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     // Keeps `key`'s partial prefix (not `eval_owned_multi`'s all-or-nothing)
     // for the same reason as `Select`/`If`/`GetPath`'s argument — #842/#854's
     // precedent, independently live here too (#896). Confirmed against jq
@@ -34634,11 +34717,15 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     //
     // Only the ordering moves: every one of these shapes produced the same
     // path outputs, in the same order, before and after.
-    let mut out: Vec<PathBranch<'a>> = Vec::new();
     // The escape that aborts the whole call, raised once the driver has
     // unwound -- `target`'s own, or the #843 refusal below. Neither can
     // travel out through the sink, whose answer is a [`Demand`].
     let mut target_escape: Option<EvalEscape> = None;
+    // Whether the *consumer's* sink asked to stop. Distinct from
+    // `target_escape`: a stop is not an error, and per [`ResolveFlow::Stopped`]
+    // it discards whatever trailing escape the generators had already
+    // computed, so the two cannot share one slot.
+    let mut stopped = false;
     let mut first_key = true;
 
     // The two structural "is this target trackable" checks (#843/#986) run
@@ -34693,10 +34780,11 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // carries, which used to be stated twice here and there.
     let key_escape = drive_index_key::<S>(key, value, &mut |k| {
         // The shared exit every escape arm below funnels through, so parking
-        // the escape and stopping the driver can't drift between arms --
-        // `out` is folded in as the `Partial`-equivalent prefix by
-        // `path_result` at the end, exactly as this macro's pre-#2267 form
-        // (`return Err((out, ..))`) did at each site.
+        // the escape and stopping the driver can't drift between arms.
+        // Nothing is folded in as a prefix any more: every branch produced
+        // before the escape has already reached `sink`, which is
+        // [`ResolveFlow`]'s own "never un-emit" rule and exactly what the
+        // pre-#2267 `Err((out, ..))` tuple existed to reproduce.
         macro_rules! escape {
             ($control:expr) => {{
                 target_escape = Some($control);
@@ -34731,20 +34819,14 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         let (branches, this_escape) =
             resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
 
-        // Reserved once per key, ahead of that key's own indexing loop,
-        // rather than once for the whole `keys x target` product up front
-        // -- `target`'s own length can vary per key now (#2139, mirroring
-        // `eval_index_expr`'s identical #2032 change). Unlike the old
-        // upfront reservation (guaranteed to fire before `out` held
-        // anything, so its own `Err` prefix was always empty by
-        // construction), a failure here can land on any key after the
-        // first, with `out` already holding every earlier key's output --
-        // `escape!` folds that non-empty prefix in rather than discarding
-        // it, consistent with every other mid-loop failure in this
-        // function.
-        if out.try_reserve(branches.len()).is_err() {
-            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
-        }
+        // No per-key reservation here any more (#2267 step 3). A streaming
+        // resolver has no accumulator of its own to reserve into -- that is
+        // the point of it -- so the cross-product refusal moves to whoever
+        // actually accumulates, which is [`collect_resolved`]'s own
+        // per-branch `try_reserve`. A consumer that keeps nothing
+        // (`eval_assign`'s streaming write) now allocates nothing to refuse,
+        // which is also real jq's own shape: it has no such guard and just
+        // keeps producing. See [`collect_resolved`] for the full argument.
 
         // #843: `target` can also resolve successfully with `trackable:
         // false` through `Builtin::GetPath`'s own deliberate exemption
@@ -34851,7 +34933,10 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
                 },
             );
             // Untracked targets were rejected above.
-            out.push(PathBranch::new(path, next_value, true));
+            if sink(PathBranch::new(path, next_value, true)) == Demand::Stop {
+                stopped = true;
+                return Demand::Stop;
+            }
         }
         // jq compiles `E[K]` as `K as $k | E | .[$k]` — target inner, key
         // outer — so when `target` itself escapes, that escape fires
@@ -34867,14 +34952,21 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         }
         Demand::Continue
     });
+    // A consumer's own stop outranks both trailing escapes, and discards
+    // them: once it is satisfied jq never resumes the generator, so an
+    // error the producer had already reached is never raised (see
+    // [`ResolveFlow::Stopped`]). Checked first for that reason.
+    if stopped {
+        return ResolveFlow::Stopped;
+    }
     // `target_escape` first: see the comment above for why jq's evaluation
     // order surfaces it ahead of `key_escape`.
-    path_result(out, target_escape.or(key_escape))
+    flow_result(target_escape.or(key_escape))
 }
 
 /// Resolve `E[S:T]` in path context, with or without a trailing `?`.
 ///
-/// The two spellings differ in one thing only, same as [`resolve_index_expr`]:
+/// The two spellings differ in one thing only, same as [`resolve_index_expr_sink`]:
 /// what happens when the resolved bounds cannot be applied to the container
 /// they reached. `E[S:T]` propagates that failure; `E[S:T]?` prunes just
 /// that branch, because a failure to *slice* is exactly what `?` covers.
@@ -34888,10 +34980,21 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
 /// - `?` covers only the final application of the resolved bounds to the
 ///   target, never `S`/`T`'s own evaluation nor a resolved-but-non-numeric
 ///   bound (`Array/string slice indices must be integers` is not swallowed
-///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
+///   either) — unlike [`resolve_index_expr_sink`]'s `key_to_path_component`,
 ///   whose optional-gated type check is *not* the shape to copy here.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
-fn resolve_slice_expr<'a, S: EvalSemantics>(
+///
+/// Delivers each resolved branch to `sink` as it is produced (#2267 step 3)
+/// — [`resolve_index_expr_sink`]'s sibling, and the same rule. As there,
+/// there is no collecting form left; [`resolve_node`] is the one collector.
+///
+/// This is the "stopping from *above*" gap this function's own body comment
+/// named as still open: `[first(path((.|debug("E"))[((0|debug("s0")),(1|
+/// debug("s1"))):(2|debug("t"))]))]` evaluated both `s`s where jq evaluates
+/// only `s0`, because a materialized `PathResolveResult` gave the consumer's
+/// demand nothing to travel down. It travels down `sink` now.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) and `sink` (#2267) join
+                                     // `trackable`/`snapshot`, all threaded ambients of one call.
+fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
     end: &Option<Box<Expr>>,
@@ -34900,7 +35003,8 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     trackable: bool,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     // #2267: `S`, `T` and `E` are driven as three *nested* generators, in
     // exactly the shape jq's own desugaring names -- not as two eagerly
     // drained `Vec`s with `E` resolved inside them. Each bound is consumed
@@ -34970,25 +35074,17 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // later pair's genuinely untracked branch through unchecked, the same
     // real data-corruption shape #2139's own first draft had.
     //
-    // **Residual, known gap, not fixed here (#2267)**: every pair is still
-    // resolved eagerly into `out` before any caller (`set_path`/
-    // `eval_update`) applies a single write, unlike jq's own lazy `reduce
-    // path(...) as $p (.; setpath($p; ...))`, which pulls one path at a
-    // time and stops the moment a write fails to validate -- so a
-    // downstream write failure on an early pair can't retroactively
-    // "undo" a later pair's own side effects the way jq's short-circuit
-    // does. Confirmed live: `(.|stderr)[(0,1):(2,3)] = 99` (assigning a
-    // non-array to a slice, which `setpath` always rejects) fires
-    // `stderr` once on real jq (fails before the 2nd pair is ever
-    // resolved) but all 4 times here (every pair already resolved, side
-    // effects included, before the write-time type check ever runs).
-    // `del()`/`|=` have no equivalent write-time short-circuit and match
-    // jq's per-pair count exactly either way -- this is specific to a
-    // write operator whose downstream application can itself fail
-    // partway through a multi-pair batch, not a general property of this
-    // fix. See #2267 for the full analysis and why it's a separate,
-    // larger architectural question (interleaving resolution with write
-    // application) rather than folded into this fix.
+    // The write-application interleave (#2267 step 3) is what `sink` now
+    // carries: each pair's branch is delivered as it is resolved, so
+    // `eval_assign` can apply its write and answer [`Demand::Stop`] on the
+    // first one that fails to validate -- jq's own `reduce path(...) as $p
+    // (.; setpath($p; ...))`, which never asks for a later path. Confirmed
+    // live: `(.|stderr)[(0,1):(2,3)] = 99` (assigning a non-array to a
+    // slice, which `setpath` always rejects) fires `stderr` once on real jq
+    // and once here; it fired all 4 times before, every pair having been
+    // resolved -- side effects included -- before the write-time type check
+    // ever ran. `del()`/`|=` have no equivalent write-time short-circuit and
+    // matched jq's per-pair count either way, before and after.
     //
     // A second, separate side-effect-ordering gap exists too (also #2267,
     // predating this fix -- not introduced or widened by it): `ends` above
@@ -35002,13 +35098,19 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // comment doesn't read as a complete account of every eager-vs-lazy
     // gap in this function.
     //
-    // No upfront `starts.len() * ends.len() * target.len()` reservation
-    // baseline (#2245, mirroring #2225): none of `ends.len()`, `target`'s
-    // own branch count is known before the loop starts. The per-pair
-    // `try_reserve` call inside the loop still protects every real
-    // allocation; only the upfront-baseline optimization is gone, not the
-    // overflow protection itself.
-    let mut out: Vec<PathBranch<'a>> = Vec::new();
+    // No reservation here at all any more (#2267 step 3): a streaming
+    // resolver has no accumulator of its own, so the overflow protection
+    // moves to whoever accumulates -- [`collect_resolved`]'s per-branch
+    // `try_reserve`. See its doc comment for what that trade costs and why
+    // it is the faithful shape. (#2245's own note that no upfront
+    // `starts.len() * ends.len() * target.len()` baseline is computable is
+    // now moot rather than merely unimplemented.)
+    //
+    // Whether the *consumer's* sink asked to stop -- not an error, and per
+    // [`ResolveFlow::Stopped`] it discards whatever trailing escape the
+    // three generators had already computed, so it cannot share
+    // `inner_escape`'s slot.
+    let mut stopped = false;
 
     // #843: same rule as `resolve_index_expr` above, for a slice's bounds
     // instead of an index's key -- computed once, not per pair (review):
@@ -35043,10 +35145,14 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // whole call: `target`'s own trailing escape is raised right after the
     // branches it did produce are pushed, which is what the pre-#2267
     // `target_escape`/`break` pair did one loop out.
+    //
+    // `Ok(Demand::Stop)` is the third outcome the `Result` alone could not
+    // express: the consumer is satisfied, which is neither an escape nor a
+    // reason to keep driving.
     let resolve_pair = |s: &PathSliceBound,
                         e: &PathSliceBound,
-                        out: &mut Vec<PathBranch<'a>>|
-     -> Result<(), EvalEscape> {
+                        sink: &mut dyn FnMut(PathBranch<'a>) -> Demand|
+     -> Result<Demand, EvalEscape> {
         macro_rules! escape {
             ($control:expr) => {
                 return Err($control)
@@ -35080,9 +35186,6 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // `[10,20,30]` prints `[{"start":1,"end":2}]` (the
         // already-produced `select` branch, sliced) before raising
         // `t`.
-        if out.try_reserve(branches.len()).is_err() {
-            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
-        }
         for PathBranch {
             path: components,
             value: target_value,
@@ -35199,12 +35302,14 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 },
             );
             // Untracked targets were rejected above.
-            out.push(PathBranch::new(path, Cow::Owned(next_value), true));
+            if sink(PathBranch::new(path, Cow::Owned(next_value), true)) == Demand::Stop {
+                return Ok(Demand::Stop);
+            }
         }
         if let Some(control) = this_escape {
             escape!(control);
         }
-        Ok(())
+        Ok(Demand::Continue)
     };
 
     // The first escape raised from inside either sink -- `E`'s own, `T`'s
@@ -35230,15 +35335,19 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // even though `target`, `(1,2)`, is untrackable and would
         // otherwise have raised its own "Invalid path expression" error
         // first -- `T`'s own escape wins before `target` is ever reached).
-        let ends = drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(
-            &s, &e, &mut out,
-        ) {
-            Ok(()) => Demand::Continue,
-            Err(control) => {
-                inner_escape = Some(control);
-                Demand::Stop
-            }
-        });
+        let ends =
+            drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(&s, &e, sink)
+            {
+                Ok(Demand::Continue) => Demand::Continue,
+                Ok(Demand::Stop) => {
+                    stopped = true;
+                    Demand::Stop
+                }
+                Err(control) => {
+                    inner_escape = Some(control);
+                    Demand::Stop
+                }
+            });
         let ends_escape = match ends {
             Ok(escape) => escape,
             Err(control) => {
@@ -35258,7 +35367,10 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // escape -- `target`'s escape, reached while producing the very
         // first output, aborts before `end`'s generator is ever resumed
         // to reach its own.
-        if inner_escape.is_some() {
+        // A consumer's stop unwinds the outer `s` generator too, and
+        // outranks `end`'s own trailing escape for the same reason
+        // `inner_escape` does: nothing is resumed after it.
+        if stopped || inner_escape.is_some() {
             return Demand::Stop;
         }
         if let Some(control) = ends_escape {
@@ -35269,17 +35381,25 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     });
     let starts_escape = match driven {
         Ok(escape) => escape,
-        Err(control) => return Err((out, control)),
+        Err(control) => return ResolveFlow::Escaped(control),
     };
     if let Some(control) = inner_escape {
-        return Err((out, control));
+        return ResolveFlow::Escaped(control);
+    }
+    // A consumer's own stop discards every trailing escape, `start`'s
+    // included -- once it is satisfied jq never resumes the generator, so
+    // an escape the producer had already reached is never raised (see
+    // [`ResolveFlow::Stopped`]). Checked before `starts_escape` for that
+    // reason.
+    if stopped {
+        return ResolveFlow::Stopped;
     }
     // #1528: `start`'s own trailing escape info still has to reach the
     // final result -- a successful loop doesn't mean `start` itself didn't
-    // escape after producing `out`'s own values. `target`'s and `end`'s
+    // escape after producing the branches it did. `target`'s and `end`'s
     // own escapes are both handled per-`s` above, via `escape!`, so
     // reaching here means neither ever fired.
-    path_result(out, starts_escape)
+    flow_result(starts_escape)
 }
 
 /// One computed slice bound in path context -- see [`drive_slice_bound`].
@@ -35364,7 +35484,7 @@ impl PathSliceBound {
 ///
 /// #2546: a resolved-but-non-numeric bound (e.g. `"x"` in
 /// `.[(0,1,"x"):(2,3)]`) is not raised here at all in jq mode; it rides to
-/// [`resolve_slice_expr`]'s per-branch slice step as a
+/// [`resolve_slice_expr_sink`]'s per-branch slice step as a
 /// [`ComputedSliceBound`] and is ruled on there, after the target's kind
 /// and under the branch's own `?` -- see that type's doc comment for the
 /// jq-1.7.1 rows. That subsumes #2385's fix (the converted prefix ahead of
