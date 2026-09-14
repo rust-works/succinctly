@@ -3780,8 +3780,7 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     crate::jq_seq_reader::value_ranges(s.as_bytes())
         .into_iter()
         .filter_map(|(start, end)| {
-            // #2295: checked, not the bare materializer -- `seq_value_is_valid`
-            // (above, via the reader) already filters malformed values, but
+            // #2295: the sequence reader already checks the grammar, but
             // retain the checked materializer as defense in depth.
             json_bytes_to_owned_value_checked(&s.as_bytes()[start..end])
                 .ok()
@@ -3903,28 +3902,36 @@ fn seq_pending_token_is_terminated(
     }
 }
 
-/// Whether one value out of a `--seq` record is legal JSON, allowing the
-/// same leading-zero form (`007e5`) `--seq` has accepted since #1243, the
-/// same lone-low-surrogate escape (`\uDC00`-`\uDFFF`) `--argjson` accepts
-/// since #2012 (code review: strict RFC 8259 validation -- `validate::validate`
-/// then, `serde_json` at the `--argjson` gate of the day -- rejects a lone low
-/// surrogate, so without this, a `--seq` record real jq accepts
-/// [confirmed live: `printf '\x1e"\udc00"\n' | jq --seq -c '.'` =>
-/// `"�"`, exit 0] silently vanished instead, the exact leniency gap
-/// #2012 fixed for `--argjson` reappearing one function over), and the
-/// same leading/trailing decimal-point forms (`.5`, `1.e5`) `--argjson`
-/// accepts since #2240 -- all three from
-/// [`validate::validate_jq_lenient`]'s own accept-set since #2052, rather
-/// than from a text-rewriting retry enumerated separately here.
+/// Checks a scanned token for the trailing-record EOF location diagnostic.
 ///
-/// Normalization is needed *here* and only here: the value-building side
-/// ([`json_bytes_to_owned_value_checked`], reached once a record is judged
-/// valid) already reads `0007` as `7`, substitutes U+FFFD for a lone low
-/// surrogate, and preserves a leading/trailing-dot literal's own spelling
-/// on its own -- so it needs no fallback of its own for any of the three
-/// leniencies.
+/// The ordinary path keeps `validate_jq_lenient`'s number and escape
+/// accept-set (#1243/#2012/#2240/#2052). Its recursive validator stops at
+/// 128 containers, though the actual sequence reader accepts deeper values
+/// (#2672). On that specific error, retry with the reader's bounded,
+/// iterative parser rather than widening the standalone stack guard or
+/// mistaking a depth limit for malformed input.
 fn seq_value_is_valid(value_text: &str) -> bool {
-    validate::validate_jq_lenient(value_text.as_bytes()).is_ok()
+    match validate::validate_jq_lenient(value_text.as_bytes()) {
+        Ok(()) => true,
+        Err(error)
+            if matches!(
+                error.kind,
+                validate::ValidationErrorKind::NestingTooDeep { .. }
+            ) =>
+        {
+            // Frame this isolated token as a complete record. Require the
+            // entire token: recovery can yield a valid suffix of malformed
+            // input, and merely finding a value would accept that suffix.
+            // Pending-number termination in the real stream is still
+            // checked separately by `seq_record_ends_unresolved`.
+            let record = format!("\x1e{value_text} ");
+            matches!(
+                crate::jq_seq_reader::value_ranges(record.as_bytes()).as_slice(),
+                [(1, end)] if *end == value_text.len() + 1
+            )
+        }
+        Err(_) => false,
+    }
 }
 
 /// Whether `raw`'s trailing `--seq` record (RFC 7464, everything after the
@@ -3974,10 +3981,9 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     // yields nothing. `\x1e"a" 2` yields `"a"` and still leaves real jq
     // without an EOF position, because its trailing `2` never resolved
     // (#1542); asking "did it yield anything" got that backwards and broke
-    // two location tests. `seq_record_scan`'s rules decide both, including
-    // the ambiguous trailing bare number this function used to ask about
-    // separately -- now rule 3, applied per value. Scanned on `tail`
-    // (untrimmed) so that rule can see the terminating whitespace.
+    // two location tests. `seq_record_ends_unresolved` checks the final
+    // ambiguous trailing bare number per value on the untrimmed `tail`,
+    // preserving any terminating whitespace.
     // `false`: this is the stream's trailing record by construction, so its
     // end is real EOF, never an RS byte.
     seq_record_ends_unresolved(tail, false)

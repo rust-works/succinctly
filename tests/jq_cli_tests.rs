@@ -32177,6 +32177,77 @@ fn test_jq_slurp_multi_file_multi_value_json_1541() -> Result<()> {
     Ok(())
 }
 
+/// #2672: EOF location uses the sequence reader's depth rules, not the
+/// standalone validator's lower 128-container cap. Expectations captured
+/// from jq 1.7.1; object nesting also consumes key frames in its parser.
+#[test]
+fn test_seq_slurp_deep_trailing_record_location_2672() -> Result<()> {
+    let array = "[".repeat(200) + "0" + &"]".repeat(200);
+    let cases = [
+        (
+            "array at validator boundary",
+            "[".repeat(128) + "0" + &"]".repeat(128),
+            Some(0),
+        ),
+        (
+            "array beyond validator boundary",
+            "[".repeat(129) + "0" + &"]".repeat(129),
+            Some(0),
+        ),
+        ("deep array", array.clone(), Some(0)),
+        (
+            "deep mixed container",
+            "[".repeat(129) + r#"{"a":0}"# + &"]".repeat(129),
+            Some(0),
+        ),
+        ("deep array with newline", format!("{array}\n"), Some(1)),
+        ("pending trailing number", format!("{array} 2"), None),
+        ("terminated trailing number", format!("{array} 2 "), Some(0)),
+        (
+            "deep malformed comma",
+            "[".repeat(129) + "0," + &"]".repeat(129),
+            None,
+        ),
+        (
+            "deep malformed escape",
+            "[".repeat(129) + r#""\q""# + &"]".repeat(129),
+            None,
+        ),
+        (
+            "truncated deep array",
+            array[..array.len() - 1].to_string(),
+            None,
+        ),
+        (
+            "over reader array limit",
+            "[".repeat(257) + &"]".repeat(257),
+            None,
+        ),
+        (
+            "over reader object limit",
+            r#"{"a":"#.repeat(200) + "0" + &"}".repeat(200),
+            None,
+        ),
+    ];
+    for (why, value, line) in cases {
+        let input = format!("\x1e{value}");
+        let (stdout, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[&input])?;
+        assert_eq!(stdout, "", "{why}: {stderr}");
+        assert_eq!(code, 5, "{why}: {stderr}");
+        let location = line.map_or_else(
+            || "<unknown>".to_string(),
+            |line| format!("{}:{line}", paths[0]),
+        );
+        assert_eq!(
+            stderr.lines().last(),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "{why}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #1542: `--seq --slurp`'s EOF marker is `<unknown>`, not a resolved
 /// position, when the stream's *own last* record leaves real jq's
 /// incremental parser with nothing to point at -- either genuinely
