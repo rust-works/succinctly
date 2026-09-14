@@ -10366,7 +10366,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 6: Type Conversions
         Builtin::ToString => builtin_tostring::<W, S>(value, optional),
-        Builtin::ToNumber => builtin_tonumber::<W>(value, optional),
+        Builtin::ToNumber => builtin_tonumber::<W, S>(value, optional),
         Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
         Builtin::FromJson => builtin_fromjson::<W, S>(value, optional),
 
@@ -15646,7 +15646,7 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tonumber - convert string to number
-fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
+fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -15658,7 +15658,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::from_number_bytes(n.raw_bytes()))
         }
         StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => match tonumber_from_str(cow.as_ref()) {
+            Ok(cow) => match tonumber_from_str(cow.as_ref(), S::TAG == EvalTag::Yq) {
                 Ok(n) => QueryResult::Owned(n),
                 Err(_) if optional => QueryResult::None,
                 Err(e) => e.into(),
@@ -15681,7 +15681,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
 /// Kept in one place because the two evaluators previously had *different*
 /// wording here — "cannot parse 'a' as number" against "cannot convert 'a' to
 /// number" — which is exactly the drift #356 is about.
-pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
+pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, EvalError> {
     // jq's JSON parser skips surrounding whitespace, so `" 1 "` is 1.
     let trimmed = s.trim();
     // Materialize a JSON-shaped number as a `NumberLiteral` so it keeps its
@@ -15747,11 +15747,20 @@ pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
     if let Ok(f) = trimmed.parse::<f64>() {
         return Ok(OwnedValue::Float(f));
     }
-    // Mode-blind on purpose: this call only distinguishes "valid JSON but
-    // not a number" from "not valid JSON at all" for a nicer error message,
-    // never returns the parsed value, so `fromjson`'s jq/yq surrogate-mode
-    // split (#2008) has nothing to plumb through here.
-    if parse_complete_json(trimmed, false).is_ok() {
+    // Mode-*sensitive*, despite only picking between two error messages and
+    // never returning the parsed value. It was mode-blind while the only
+    // jq/yq split in `parse_complete_json` was `fromjson`'s surrogate one
+    // (#2008), which errors in both modes and so could never change this
+    // verdict. #2878's control-character rule can: a string like
+    // `["a<TAB>b"]` is "valid JSON" to yq and "not valid JSON at all" to jq,
+    // and each oracle's own wording follows its own answer --
+    //   jq 1.7.1: Invalid string: control characters ... must be escaped
+    //   yq 4.53.3: cannot convert node value [...] of tag !!str to number
+    // -- which are this crate's `invalid_numeric_literal` and
+    // `cannot_parse_as_number` branches respectively. Passing `false` here
+    // regardless would hand yq mode jq's answer (verified: it flips yq's
+    // message to the wrong family).
+    if parse_complete_json(trimmed, yq_mode).is_ok() {
         Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
             s.to_string(),
         )))
@@ -16130,6 +16139,22 @@ fn parse_json_string_value(
                     c => return Err(format!("invalid escape sequence: \\{}", c as char)),
                 }
                 *pos += 1;
+            }
+            c if c < 0x20 && !yq_mode => {
+                // #2878: a raw, unescaped control character is rejected by
+                // real jq everywhere, `fromjson` included:
+                //   jq -nc '"[\"a\tb\"]" | fromjson'
+                //   -> Invalid string: control characters from U+0000
+                //      through U+001F must be escaped
+                // Gated on `yq_mode` because real yq *accepts* it here and
+                // answers `["a\tb"]` (confirmed live against yq v4.53.3) --
+                // the mode decides, not the format (ADR-0018). Same
+                // per-mode split precedent as the surrogate arms above
+                // (#2008/#2013). `0x7F` is deliberately not covered: jq's
+                // own check is on a signed char, so DEL passes it.
+                return Err(format!(
+                    "Invalid string: control character 0x{c:02X} from U+0000 through U+001F must be escaped"
+                ));
             }
             c => {
                 // Regular character - handle UTF-8
