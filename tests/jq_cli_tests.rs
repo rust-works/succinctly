@@ -53742,7 +53742,7 @@ fn test_large_int_literal_rounds_to_17_digits_before_f64_arith_2906() -> Result<
 /// (`[869389897822472004, (869389897822472000+0), 5] | sort` is
 /// `[5,869389897822472000,869389897822472004]` here and
 /// `[5,869389897822472004,869389897822472000]` in jq -- identical before
-/// and after #2906, a separate bridge gap recorded in
+/// and after #2906, a separate bridge gap tracked as #2938 and recorded in
 /// `docs/compliance/jq/limitations.md`).
 #[test]
 fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()> {
