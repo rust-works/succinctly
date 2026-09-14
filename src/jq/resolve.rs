@@ -57,6 +57,7 @@
 //! binds: jq's `def f($a): …` desugars to `def f(a): a as $a | …`, which
 //! leaves `a` callable at arity 0 regardless of which spelling was written.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
