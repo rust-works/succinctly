@@ -55707,3 +55707,64 @@ fn test_tonumber_control_character_message_family_is_jq_mode_only_2878() -> Resu
     );
     Ok(())
 }
+
+/// #2934: counts bind outside the body, and downstream demand stops both generators.
+#[test]
+fn test_skip_count_generators_2934() -> Result<()> {
+    for (filter, expected) in [
+        ("[skip((0,1);10,20,30)]", "[10,20,30,20,30]\n"),
+        ("[skip((1,1);10,20)]", "[20,20]\n"),
+        ("[skip(.counts[];.values[])]", "[10,20,30,20,30]\n"),
+        (r#"[skip(empty;error("BODY"))]"#, "[]\n"),
+        (
+            r#"[first(skip((0,("COUNT"|stderr));10,("BODY"|stderr)))]"#,
+            "[10]\n",
+        ),
+        (
+            r#"[limit(2;skip(1;10,20,30,("TAIL"|stderr)))]"#,
+            "[20,30]\n",
+        ),
+        (
+            r#"[isempty(skip((0,error("COUNT"));10,error("BODY")))]"#,
+            "[false]\n",
+        ),
+        ("[label $out | skip((0,break $out);10,20)]", "[10,20]\n"),
+    ] {
+        for prefix in ["", ". as $input | "] {
+            let query = format!("{prefix}{filter}");
+            let (out, err, code) = run_jq_full(
+                &["-c", &query],
+                Some(r#"{"counts":[0,1],"values":[10,20,30]}"#),
+            )?;
+            assert_eq!(
+                (out.as_str(), err.as_str(), code),
+                (expected, "", 0),
+                "{query}"
+            );
+        }
+    }
+    for (filter, expected, message) in [
+        (r#"skip((0,error("COUNT"));10,20)"#, "10\n20\n", "COUNT"),
+        (
+            "first(skip(-1;10,20))",
+            "",
+            "skip doesn't support negative count",
+        ),
+        (
+            "skip((0,-1);10,20)",
+            "10\n20\n",
+            "skip doesn't support negative count",
+        ),
+        (r#"skip((0,("LATE"|stderr));error("BODY"))"#, "", "BODY"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(out, expected, "{filter}");
+        assert_eq!(code, 5, "{filter}: {err}");
+        assert!(err.contains(message), "{filter}: {err}");
+        assert!(!err.contains("LATE"), "{filter}: {err}");
+    }
+    let (out, err, code) =
+        run_jq_full(&["-cn", r#"skip((0,("COUNT"|halt_error(7)));10,20)"#], None)?;
+    assert_eq!((out.as_str(), err.as_str(), code), ("10\n20\n", "COUNT", 7));
+    Ok(())
+}

@@ -5694,6 +5694,9 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::NthExpr { n, expr: inner } | Expr::Builtin(Builtin::NthStream(n, inner)) => {
             each_nth::<W, S>(n, inner, value, optional, sink)
         }
+        Expr::Builtin(Builtin::Skip(n, inner)) => {
+            each_skip::<W, S>(n, inner, value, optional, sink)
+        }
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
             each_isempty::<W, S>(inner, value, optional, sink)
         }
@@ -6632,8 +6635,8 @@ fn each_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// exactly as it does inside [`each_limit`]'s inner sink.
 ///
 /// Only [`ArgFanout::All`] is modelled: every yq gate is deliberately eager
-/// (see [`fanout_arg`]'s own doc comment), and `nth` is jq-only -- real yq's
-/// lexer rejects it -- so no gated caller can reach this.
+/// (see [`fanout_arg`]'s own doc comment). `nth` is jq-only, and `skip`
+/// uses full fan-out in both modes as a jq extension.
 fn fanout_arg_each<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
     arg_expr: &Expr,
     value: StandardJson<'_, W>,
@@ -6715,6 +6718,35 @@ fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
         take_at_index::<W, S>(expr, value.clone(), optional, n, true, sink)
+    })
+}
+
+/// Skip each count's prefix while forwarding downstream demand to both generators.
+fn each_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    fanout_arg_each::<W, S, _>(n_expr, value.clone(), optional, |count| {
+        let mut remaining = match classify_skip_n(count) {
+            Ok(n) => n,
+            Err(error) => return Flow::Escaped(Control::Error(error)),
+        };
+        let mut escape = None;
+        let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
+            if remaining > 0 {
+                remaining -= 1;
+                return Demand::Continue;
+            }
+            // Like the eager skip, only materialize outputs that survive the prefix.
+            match item.into_owned() {
+                Ok(value) => sink(Item::Owned(value)),
+                Err(error) => stop_with_escape(&mut escape, Control::Error(error)),
+            }
+        });
+        resume_from_escape(escape, flow)
     })
 }
 
@@ -15821,49 +15853,21 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n. jq 1.8's own `def skip($n; expr): if $n > 0 then ...
-    // elif $n == 0 then expr else error("skip doesn't support negative
-    // count") end` -- a genuinely negative count silently became index 0
-    // (skipping nothing) here instead of erroring (#983; `null` already
-    // fell through to the catch-all below and erred, just with different
-    // message text).
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match n_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                // Built directly from `num.as_i64()`/`as_f64()` rather than
-                // `to_owned_lossy(&v)` (a #1879 review finding): `to_owned_lossy` routes
-                // a `StandardJson::Number` through `from_number_bytes`,
-                // which re-validates the digit span and boxes a copy of the
-                // source text into `OwnedValue::NumberLiteral` -- allocation
-                // and work `classify_skip_n` immediately throws away, since
-                // its match arms only read the parsed `Int`/`Float`. This
-                // still preserves exact integer precision past `f64`'s
-                // 53-bit mantissa (the #1879 fix `to_owned_lossy` was introduced
-                // for), since `as_i64()` is tried first, same as `to_owned_lossy`
-                // itself does internally.
-                let owned = match num.as_i64() {
-                    Ok(i) => OwnedValue::Int(i),
-                    Err(_) => OwnedValue::Float(num.as_f64().unwrap_or(f64::NAN)),
-                };
-                match classify_skip_n(owned) {
-                    Ok(n) => n,
-                    Err(e) => return QueryResult::Error(e),
-                }
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(
-            owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
-        ) => match classify_skip_n(owned) {
+    fanout_arg::<W, S, _>(n_expr, value.clone(), optional, ArgFanout::All, |count| {
+        let n = match classify_skip_n(count) {
             Ok(n) => n,
-            Err(e) => return QueryResult::Error(e),
-        },
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
+            Err(error) => return QueryResult::Error(error),
+        };
+        skip_with_n::<W, S>(n, expr, value.clone(), optional)
+    })
+}
 
+fn skip_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n: usize,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Evaluate expr and skip first n results. #1989: each of these three
     // arms used bare `to_owned_lossy` -- an undecodable string in a real,
     // navigated `expr` output silently became "" instead of raising, with
@@ -92328,6 +92332,21 @@ mod tests {
             &b"\"\xff\xfe\""[..],
             "skip(0; .)",
             QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    #[test]
+    fn test_streaming_skip_decode_checks_2934() {
+        for filter in ["first(skip(0; .))", "first(skip(0; .))?"] {
+            query!(
+                &b"\"\xff\xfe\""[..], filter,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+        }
+        query!(
+            &b"[\"\xff\xfe\",\"good\"]"[..],
+            "first(skip(1; .[]))",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "good")
         );
     }
 

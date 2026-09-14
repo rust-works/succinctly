@@ -47009,3 +47009,29 @@ fn positional_read_materializes_and_drops_yaml_formatting_2803() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn test_skip_count_generators_extension_2934() -> Result<()> {
+    for (filter, expected) in [
+        ("[skip((0,1);10,20,30)]", "[10,20,30,20,30]\n"),
+        ("[skip(.counts[];.values[])]", "[10,20,30,20,30]\n"),
+        (r#"[skip(empty;error("BODY"))]"#, "[]\n"),
+        (
+            r#"[first(skip((0,error("COUNT"));10,error("BODY")))]"#,
+            "[10]\n",
+        ),
+        (r#"[limit(2;skip(1;10,20,30,error("TAIL")))]"#, "[20,30]\n"),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(
+            filter,
+            "counts: [0, 1]\nvalues: [10, 20, 30]\n",
+            &["--jq-extensions", "-o=json", "-I", "0"],
+        )?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
