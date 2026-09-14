@@ -25344,6 +25344,65 @@ fn test_module_own_def_chain_does_not_blow_up_2865() -> Result<()> {
     Ok(())
 }
 
+/// #2865 (PR review, round 3): a name this def excludes stays excluded for
+/// the siblings spliced alongside it.
+///
+/// The exclusions are decided on the *including* def's behalf, but a sibling
+/// spliced in `local` form carries its own references outward into that same
+/// scope -- where the excluded name resolves to whatever displaced it. Both
+/// shapes are regressions against `main`, which splices flat:
+///
+/// - a parameter displacing a sibling that another sibling calls
+///   (`def f: 1; def k: f; def h(f): k;` -- jq says `h(99)` is `1`, the
+///   `local` splice said `99`), in both parameter spellings;
+/// - an in-module redefinition (`def h: "first"; def g: h; def h: "second-" +
+///   g;` -- jq says `"second-first"`, the `local` splice recursed into the
+///   second `h` until it hit the depth cap).
+///
+/// Both are fixed by splicing the sibling's *sealed* form when it names
+/// something excluded. The equivalent top-level filters have always answered
+/// correctly, and are included as controls.
+#[test]
+fn test_excluded_sibling_name_stays_excluded_for_other_siblings_2865() -> Result<()> {
+    for (module, filter, want) in [
+        (
+            "def f: 1;\ndef k: f;\ndef h(f): k;\n",
+            r#"include "m"; h(99)"#,
+            "1",
+        ),
+        (
+            "def f: 1;\ndef k: f;\ndef h($f): [k, $f];\n",
+            r#"include "m"; h(7)"#,
+            "[1,7]",
+        ),
+        (
+            "def h: \"first\";\ndef g: h;\ndef h: \"second-\" + g;\n",
+            r#"include "m"; h"#,
+            r#""second-first""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_with_modules(&[("m", module)], &["-nc", filter])?;
+        assert_eq!(code, 0, "{module}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{module}");
+    }
+
+    // Controls: the same programs written as one filter, which never went
+    // through the module loader and have always matched jq.
+    for (filter, want) in [
+        ("def f: 1; def k: f; def h(f): k; h(99)", "1"),
+        (
+            r#"def h: "first"; def g: h; def h: "second-" + g; h"#,
+            r#""second-first""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// #2865 (PR review, round 2): a dependency reached only from a **computed
 /// destructuring key** survives the referenced-closure filter.
 ///

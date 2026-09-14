@@ -6363,7 +6363,7 @@ as its own dependencies are loading, which is precisely the window in which a cy
 `test_module_cycle_is_a_compile_error_not_a_hang_2865` (`tests/jq_cli_tests.rs`) pins all
 four shapes (two-module cycle, self-include, aliased spelling, `import`-side cycle).
 
-### Five module-scoping rules that *are* matched, and read as bugs (#2865)
+### Seven module-scoping rules that *are* matched, and read as bugs (#2865)
 
 Not divergences — recorded here because the next person to touch `ModuleLoader` will
 otherwise read them as ones, and because the exclusions in `visible_defs_for` have no
@@ -6385,8 +6385,18 @@ other explanation. All captured live against jq 1.7.1, with `inner.jq` = `def g:
    dependency or a sibling named `g` in scope, and `def f($g): [$g, g]` answers `[7,7]`
    — a `$`-spelled parameter binds the bare call-site namespace too.
 
+6. **An excluded name stays excluded for the siblings spliced alongside it.** In
+   `def f: 1; def k: f; def h(f): k;`, `h(99)` answers `1` — `k`'s `f` is the module's
+   `f`, not `h`'s parameter, even though the parameter displaces `f` for `h`'s own body.
+7. **An in-module redefinition does not capture an earlier sibling's call.** In
+   `def h: "first"; def g: h; def h: "second-" + g;`, `h` answers `"second-first"` —
+   `g`'s `h` is the first one, bound where `g` was declared.
+
 Rule 4 is why an exported def's body is *not* wrapped in a dependency matching its own
 (name, arity), and rule 5 is why it is not wrapped in one matching any of its parameters.
+Rules 6 and 7 are why a sibling that *names* one of those excluded defs is spliced in its
+own fully-bound form rather than the cheaper one — the exclusion is decided for the
+including def, and a sibling carries its references outward into that same scope.
 Rules 1-3 are why the wrap goes around each exported def's **body** rather than being
 spliced into the module's exported chain.
 
