@@ -9600,23 +9600,24 @@ fn arith_mod<S: EvalSemantics>(
                 } else {
                     Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
                 }
-            } else if !S::MOD_TRUNCATES_FLOATS
-                || (jq_int_within_exact_f64_range(a) && jq_int_within_exact_f64_range(b))
+            } else if S::MOD_TRUNCATES_FLOATS
+                && !(jq_int_within_exact_f64_range(a) && jq_int_within_exact_f64_range(b))
             {
+                // jq (#2906): `binop_mod` is `dtoi(a) % dtoi(b)` on the
+                // operands' *doubles* -- a literal's 17-digit-rounded one --
+                // with the remainder held as a double again, which is
+                // exactly `mod_floats`' truncating model. (`dtoi` saturates
+                // like `as i64` on the arm64 oracle; a C cast of exactly
+                // 2^63 is undefined behaviour, so this is unverified on
+                // x86_64 jq -- not live-tested there.)
+                mod_floats::<S>(int_to_f64::<S>(a), int_to_f64::<S>(b), &left, &right)
+            } else {
                 // yq: exact int64 remainder. jq: the same whenever both
                 // operands are exact doubles -- the literal rounding is the
                 // identity there, the `intmax_t` truncation round-trips, and
                 // `|a % b| < |b| <= 2^53` keeps the result an exact `Int`
                 // (#2906). `wrapping_rem`: `i64::MIN % -1` must not panic.
                 Ok(OwnedValue::Int(a.wrapping_rem(b)))
-            } else {
-                // jq (#2906): `binop_mod` is `dtoi(a) % dtoi(b)` on the
-                // operands' *doubles* -- a literal's 17-digit-rounded one --
-                // with the remainder held as a double again, which is
-                // exactly `mod_floats`' truncating model. (`dtoi` saturates
-                // like `as i64` on the arm64 oracle; the C cast of exactly
-                // 2^63 is undefined behaviour and differs on x86_64 jq.)
-                mod_floats::<S>(int_to_f64::<S>(a), int_to_f64::<S>(b), &left, &right)
             }
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {

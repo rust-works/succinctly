@@ -5835,9 +5835,13 @@ is otherwise untouched: real yq's `int64` arithmetic is exact (`8693898978224720
 plain cast (`EvalSemantics::DECNUMBER_LITERALS`).
 
 Two things #2906 makes *visible* without changing: jq's `dtoi` on exactly `2^63` is a C
-cast that saturates on the arm64 oracle (`as i64` does the same) but is undefined
-behaviour and yields `INT64_MIN` on x86_64 jq, so `9223372036854775807 % 10` is `7` on the
-pin and `-8` there; and jq parses `-x % y` as `-(x % y)` (unary minus binds looser than
+cast that saturates on the arm64 oracle (`as i64` does the same), so
+`9223372036854775807 % 10` is `7` on the pin -- but the cast is undefined behaviour in C,
+and **the x86_64 case is not live-verified**: no x86_64 jq 1.7.1 was available to capture
+this session, so whether it saturates the same way there, yields `INT64_MIN`, or differs by
+compiler/libc is an open question, not a claim to build on (flag for whoever closes
+#2936/#2937/#2938 with x86_64 hardware in reach); and jq parses `-x % y` as `-(x % y)`
+(unary minus binds looser than
 `%`) where succinctly parses `(-x) % y`, a pre-existing precedence gap that only shows at
 this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
 and data-sourced spellings agree on `-8`).

@@ -2928,19 +2928,15 @@ pub(crate) fn cmp_decimal_literals(a: &str, b: &str) -> core::cmp::Ordering {
 /// zeros (empty means zero). Parsing stops at the first byte that is not
 /// part of a number, so a stray suffix cannot panic.
 fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
-    let bytes = text.as_bytes();
+    // Sign-stripping and exponent-digit parsing/saturation each already have
+    // exactly one implementation elsewhere in this module
+    // ([`strip_leading_sign`], [`parse_literal_exponent`]/[`ExpParse`]) --
+    // reuse both instead of adding a third copy of either (#2906 code
+    // review; see [`strip_leading_sign`]'s own doc comment for why that
+    // pattern keeps getting reintroduced).
+    let (negative, rest) = strip_leading_sign(text);
+    let bytes = rest.as_bytes();
     let mut i = 0;
-    let negative = match bytes.first() {
-        Some(b'-') => {
-            i = 1;
-            true
-        }
-        Some(b'+') => {
-            i = 1;
-            false
-        }
-        _ => false,
-    };
     let mut digits = Vec::new();
     let mut exponent: i128 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -2956,27 +2952,22 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
         }
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        i += 1;
-        let exponent_negative = match bytes.get(i) {
-            Some(b'-') => {
-                i += 1;
-                true
-            }
-            Some(b'+') => {
-                i += 1;
-                false
-            }
-            _ => false,
-        };
-        let mut e: i128 = 0;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            // Saturate far beyond any exponent a literal can hold, so an
-            // absurdly long exponent still orders correctly without
-            // overflowing the arithmetic above.
-            e = (e * 10 + i128::from(bytes[i] - b'0')).min(1 << 62);
-            i += 1;
+        let exp_start = i + 1;
+        let mut j = exp_start;
+        if matches!(bytes.get(j), Some(b'-' | b'+')) {
+            j += 1;
         }
-        exponent += if exponent_negative { -e } else { e };
+        let digits_start = j;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        // No digits at all (`1e`, `1e+`) contributes nothing, matching the
+        // rest of this function's "stop at the first byte that isn't part
+        // of a number" leniency -- `parse_literal_exponent` only runs once
+        // there's an actual digit string for it to parse and saturate.
+        if j > digits_start {
+            exponent += parse_literal_exponent(&rest[exp_start..j]).value();
+        }
     }
     let leading_zeros = digits.iter().take_while(|d| **d == b'0').count();
     digits.drain(..leading_zeros);
@@ -3005,6 +2996,25 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
 /// rather than jq's rounded one (#2936).
 pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Ordering> {
     use core::cmp::Ordering;
+
+    // Two int-bearing operands (bare `Int`, or a `NumberLiteral` carrying an
+    // int repr -- the shape every parsed-JSON integer takes) always end up
+    // at `cmp_literals`'s own `x.cmp(&y)` fast path below regardless of
+    // text or magnitude, so check for that pairing directly rather than
+    // building a `Literal`/`Side` for each operand (and a wasted `as f64`
+    // cast per side) first. This is the hot case: document numbers are
+    // always `NumberLiteral`, so ordinary `sort`/`unique`/`group_by`/
+    // `min`/`max`/`bsearch` over a plain JSON integer array hits it on
+    // every comparison (#2906 code review).
+    fn literal_int(value: &OwnedValue) -> Option<i64> {
+        match value {
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(*n),
+            _ => None,
+        }
+    }
+    if let (Some(a), Some(b)) = (literal_int(left), literal_int(right)) {
+        return Some(a.cmp(&b));
+    }
 
     struct Literal<'a> {
         double: f64,
