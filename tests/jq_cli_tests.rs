@@ -51828,44 +51828,54 @@ fn test_strenv_rewind_keeps_empty_parens_a_syntax_error_2807() -> Result<()> {
     Ok(())
 }
 
-/// #2807 (review): the residual this fix does **not** close -- `limit`, `nth`
-/// and `skip` parse their first argument with the comma-restricted
-/// `parse_pipe_no_comma_with_booleans`, so a comma there leaves the
-/// already-parsed prefix out of step with the real argument text and nothing
-/// can be handed over. Those calls still reach
-/// `retry_shadow_candidate_as_generic_call` and still spend the budget, so 65
-/// of them are still rejected where jq 1.7.1 answers `130`.
-///
-/// Characterization, not an endorsement: this is a residual of #2807's class,
-/// not a regression -- the pre-#2807 parser rejected these at every count, and
-/// 64 still pass here. Tracked as #2863; when that lands these rows flip to
-/// jq's answers.
+/// #2863: comma arguments must not spend the shadow retry budget, either
+/// across many independent calls or down a nested call chain. Expectations
+/// captured from jq 1.7.1, including `skip` defined here as a user function.
 #[test]
-fn test_comma_restricted_first_arg_still_spends_the_retry_budget_2807() -> Result<()> {
+fn test_comma_first_arg_does_not_spend_retry_budget_2863() -> Result<()> {
     for kw in ["nth", "limit", "skip"] {
-        let within = format!(
-            "def {kw}(a;b): a; [{}] | length",
-            vec![format!("{kw}(1,2;3)"); 64].join(",")
-        );
-        let (stdout, stderr, code) = run_jq_full(&["-c", &within], Some("null"))?;
-        assert_eq!(code, 0, "{kw} x64: stdout: {stdout:?} stderr: {stderr:?}");
-        assert_eq!(stdout.trim_end(), "128", "{kw} x64");
-
-        let past = format!(
-            "def {kw}(a;b): a; [{}] | length",
-            vec![format!("{kw}(1,2;3)"); 65].join(",")
-        );
-        let (stdout, stderr, code) = run_jq_full(&["-c", &past], Some("null"))?;
-        assert_eq!(code, 3, "{kw} x65: stdout: {stdout:?} stderr: {stderr:?}");
-        // `nth`/`skip` report the hand-over helper's own separator
-        // complaint, `limit` its dedicated parser's -- both are the raw
-        // `original_err` the exhausted budget lets through, which is the
-        // property under test, not the wording.
-        assert!(
-            stderr.contains("parse error"),
-            "{kw} x65: stderr: {stderr:?}"
-        );
+        for count in [64, 65, 300] {
+            let filter = format!(
+                "def {kw}(a;b): a; [{}] | length",
+                vec![format!("{kw}(1,2;3)"); count].join(",")
+            );
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+            assert_eq!(code, 0, "{kw} x{count}: {stderr}");
+            assert_eq!(stdout.trim_end(), (2 * count).to_string(), "{kw} x{count}");
+            assert_eq!(stderr, "", "{kw} x{count}");
+        }
+        let mut nested = "1".to_string();
+        for _ in 0..30 {
+            nested = format!("{kw}({nested},2;3)");
+        }
+        let filter = format!("def {kw}(a;b): a; [{nested}]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(code, 0, "{kw} depth 30: {stderr}");
+        let expected = format!("[1{}]", ",2".repeat(30));
+        assert_eq!(stdout.trim_end(), expected, "{kw} depth 30");
+        assert_eq!(stderr, "", "{kw} depth 30");
     }
+    Ok(())
+}
+
+/// #2863: full first-argument grammar keeps jq's fan-out and pipe precedence.
+#[test]
+fn test_comma_count_arguments_match_jq_2863() -> Result<()> {
+    for (filter, expected) in [
+        ("[limit(1,2; 10,20,30)]", "[10,10,20]"),
+        ("[nth(0,1; 10,20,30)]", "[10,20]"),
+        ("[nth(1,2)]", "[20,30]"),
+        ("[limit(1,2|.+1; 10,20,30)]", "[10,20,10,20,30]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[10,20,30]"))?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+        assert_eq!(stderr, "", "{filter}");
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[limit(1,2)]"], Some("null"))?;
+    assert_eq!(code, 3, "{stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("limit/1 is not defined"), "{stderr}");
     Ok(())
 }
 
