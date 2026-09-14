@@ -57219,6 +57219,32 @@ mod tests {
         );
     }
 
+    /// #1908 audit: `. as $doc | .a |= $doc.b`'s update-filter evaluation
+    /// (`update_path`'s `Expr::Identity` arm -> `eval_owned_multi_first` ->
+    /// `collect_owned`, `to_owned_lossy`-based) reads a document leaf
+    /// (`$doc.b`) *other than* the path being updated -- confirmed live:
+    /// raises rather than silently writing `"\u{FFFD}"` into the document.
+    #[test]
+    fn test_update_path_multi_first_raises_on_decode_failure_1908() {
+        query!(
+            b"{\"a\":1,\"b\":\"\xff\xfe\"}",
+            ". as $doc | .a |= $doc.b",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data is unaffected.
+        query!(
+            br#"{"a":1,"b":"ok"}"#,
+            ". as $doc | .a |= $doc.b",
+            QueryResult::Owned(v) => {
+                let OwnedValue::Object(fields) = v else { panic!("not an object: {v:?}") };
+                assert_eq!(fields.get("a"), Some(&OwnedValue::String("ok".to_string())));
+                assert_eq!(fields.get("b"), Some(&OwnedValue::String("ok".to_string())));
+            }
+        );
+    }
+
     /// #2022: object construction's computed-key slot fed its key generator's
     /// output through `stream_outputs_lossy` (bare `to_owned_lossy`, via `collect_owned`),
     /// silently substituting `""` for an undecodable key instead of raising --
