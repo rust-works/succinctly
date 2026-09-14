@@ -23419,9 +23419,7 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
             any_truthy = true;
             match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
                 Flow::Escaped(control) => {
-                    mark_nonretryable_escape(&control);
-                    rest_escape = Some(control);
-                    Flow::Stopped { pending: None }
+                    stop_owned_identity_rest_escape(&mut rest_escape, control)
                 }
                 other => other,
             }
@@ -23806,6 +23804,17 @@ fn eval_owned_identity_spliced<S: EvalSemantics, V: DocumentValue>(
     eval_owned_identity_stages::<S, V>(&stages, value, id, optional, tail)
 }
 
+/// Keep a downstream escape outside the body's scope and stop its driver.
+///
+/// #2180 WP3 review: answering `Flow::Stopped` must carry the same
+/// non-retryable classification as `Demand::Stop`. Delegate the store and
+/// classification to `stop_with_escape`; each caller retains its own rule
+/// for recovering the saved escape after the body stops (#2830).
+fn stop_owned_identity_rest_escape(slot: &mut Option<Control>, control: Control) -> Flow {
+    stop_with_escape(slot, control);
+    Flow::Stopped { pending: None }
+}
+
 /// `body`'s stages run from `(value, id)`, with `rest` continued from each
 /// output -- and the body's own escape kept apart from one raised in `rest`:
 /// `Ok(flow)` is the body's, `Err(control)` is `rest`'s. What `try`,
@@ -23832,16 +23841,7 @@ fn eval_owned_identity_scoped<S: EvalSemantics, V: DocumentValue>(
             optional,
             tail.reborrow(),
         ) {
-            Flow::Escaped(control) => {
-                // #2180 WP3 review: this stage stashes an escape and
-                // signals `Stopped` rather than answering `Demand::Stop`,
-                // so it carries the same non-retryable classification
-                // `eval::stop_with_escape` applies -- see
-                // `eval::mark_nonretryable_escape`.
-                mark_nonretryable_escape(&control);
-                rest_escape = Some(control);
-                Flow::Stopped { pending: None }
-            }
+            Flow::Escaped(control) => stop_owned_identity_rest_escape(&mut rest_escape, control),
             other => other,
         }),
     );
@@ -23907,16 +23907,7 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
             optional,
             tail.reborrow(),
         ) {
-            Flow::Escaped(control) => {
-                // #2180 WP3 review: this stage stashes an escape and
-                // signals `Stopped` rather than answering `Demand::Stop`,
-                // so it carries the same non-retryable classification
-                // `eval::stop_with_escape` applies -- see
-                // `eval::mark_nonretryable_escape`.
-                mark_nonretryable_escape(&control);
-                rest_escape = Some(control);
-                Flow::Stopped { pending: None }
-            }
+            Flow::Escaped(control) => stop_owned_identity_rest_escape(&mut rest_escape, control),
             other => other,
         }),
     );
@@ -23958,14 +23949,7 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 Flow::Escaped(control) => {
-                    // #2180 WP3 review: this stage stashes an escape and
-                    // signals `Stopped` rather than answering `Demand::Stop`,
-                    // so it carries the same non-retryable classification
-                    // `eval::stop_with_escape` applies -- see
-                    // `eval::mark_nonretryable_escape`.
-                    mark_nonretryable_escape(&control);
-                    rest_escape = Some(control);
-                    Flow::Stopped { pending: None }
+                    stop_owned_identity_rest_escape(&mut rest_escape, control)
                 }
                 stopped => {
                     rest_stopped = Some(stopped);
