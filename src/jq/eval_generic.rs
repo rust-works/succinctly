@@ -20987,7 +20987,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // -- see `OwnedValue::from_document_float`.
                 GenericResult::Owned(OwnedValue::from_document_float(f))
             } else if let Some(s) = value.as_str() {
-                match tonumber_from_str(s.as_ref()) {
+                match tonumber_from_str(s.as_ref(), S::TAG == EvalTag::Yq) {
                     Ok(n) => GenericResult::Owned(n),
                     Err(_) if optional => GenericResult::None,
                     Err(e) => GenericResult::Error(e),
