@@ -23253,6 +23253,51 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(early_return) => return early_return,
     };
 
+    // #2267: jq's `=` is `_assign(paths; $value)`, i.e. `reduce path(paths)
+    // as $p (.; setpath($p; $value))` -- a genuinely lazy pipeline that
+    // pulls *one* path, applies its write, and only then asks for the next.
+    // A write that fails validation ends the `reduce` before the generator
+    // is ever resumed, so the side effects `path_expr` would have fired
+    // producing the later paths never fire at all:
+    //
+    // ```console
+    // $ echo '[10,20,30]' | jq -c '(.|stderr)[(0,1):(2,3)] = 99' 1>/dev/null
+    //   [10,20,30]                     <- once; was 4 times here
+    // $ echo null | jq -c '(.|stderr)[(-1,-2)] = 1' 1>/dev/null
+    //   null                           <- once; was twice here
+    // ```
+    //
+    // Three conditions, each of them load-bearing:
+    //
+    // - **jq mode only.** yq resolves its left side first and vivifies it
+    //   (#2481/#1412), so its paths are already resolved by
+    //   `yq_prepare_assign_targets` before the right side even runs; there
+    //   is no generator left here to stop. Real yq also has no `path()`,
+    //   no `stderr`/`debug`, and rejects a computed comma bound outright,
+    //   so none of these orderings are expressible through its surface.
+    // - **A single RHS output.** jq binds `$value` as the *outer*
+    //   generator and re-runs `path(paths)` per output. Re-resolving per
+    //   output is a separate change (this issue's step 2) that was
+    //   implemented, measured at 87 regressions against 69 fixes, and
+    //   backed out: `collect_rhs_outputs` is eager where jq's RHS is lazy,
+    //   so it fires the target for outputs a downstream consumer never
+    //   pulls (`first((.|debug("E"))["a"] = (1,2))` is one `E` on jq, two
+    //   with that change). One RHS output means one output document, so
+    //   there is nothing for `first`/`limit` to truncate and none of that
+    //   class is reachable -- see `limitations.md` and the holdout test.
+    // - **A computed path.** `needs_path_prepass` false means the
+    //   expression *is* its own single static path: no generator, no side
+    //   effects, and nothing a later path could observe. Streaming it would
+    //   be indistinguishable except for the extra document copy below, so
+    //   the static case keeps the eager route unchanged.
+    if S::TAG == EvalTag::Jq && rhs_values.len() == 1 && needs_path_prepass(path_expr) {
+        debug_assert!(
+            yq_targets.is_none(),
+            "jq mode never prepares yq assign targets (#2481)"
+        );
+        return eval_assign_streaming::<W, S>(path_expr, &input, rhs_values, terminal, optional);
+    }
+
     // Resolve computed keys against the *original* document, before any
     // write, then apply them to every RHS output in turn: `.[("a","b")] =
     // (1,2)` assigns both keys per output, forking into two whole documents
@@ -23911,6 +23956,115 @@ pub(crate) fn yq_assign_rhs_document<S: EvalSemantics>(
     };
     let targets = yq_assign_targets_from::<S>(input.clone(), paths, value_expr, scalar_slice_noop)?;
     Ok(targets.rhs_document().cloned())
+}
+
+/// `eval_assign`'s demand-driven write loop (#2267): resolve one path,
+/// apply its write, and stop the path generator the moment a write fails.
+///
+/// jq's `reduce path(paths) as $p (.; setpath($p; $value))`, transposed
+/// from this evaluator's own resolve-every-path-then-write-them-all shape.
+/// Only reached under the three conditions stated at the call site; in
+/// particular `rhs_values` always holds exactly one output here, which is
+/// why there is no RHS fork left to do and the result is a single document.
+///
+/// **Two documents, not one.** `pristine` is what the path generator
+/// resolves against and must stay unmutated for the whole call; `result` is
+/// what the writes accumulate into. That is jq's own separation -- `reduce`
+/// evaluates its source against the outer `.` while the accumulator moves
+/// underneath it -- and it is observable, not a formality: on
+/// `{"a":"b","b":1}`, `.[(.a,.a)] = 5` is `{"a":"b","b":5}` in jq 1.7.1,
+/// where resolving the second `.a` against the *written* document would
+/// have read back `5` and raised `Cannot index object with number`. jq pays
+/// nothing for the separation (its values are refcounted and `setpath`
+/// copies on write); here it costs one document clone, which is why the
+/// call site keeps every static path on the eager route that does not need
+/// it.
+fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: &StandardJson<'a, W>,
+    rhs_values: Vec<OwnedValue>,
+    terminal: Option<Control>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // #1953: a non-decode-failure `to_owned` error respects `optional` like
+    // every other fallible step at this boundary; only a genuine decode
+    // failure is unconditional. Same rule as the eager arm this replaces.
+    let pristine = match to_owned(input) {
+        Ok(pristine) => pristine,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    let value = rhs_values
+        .into_iter()
+        .next()
+        .expect("caller gated on exactly one RHS output");
+    let mut result = pristine.clone();
+    // The first write that failed, parked because the sink's own answer is
+    // a [`Demand`] and cannot carry it out.
+    let mut write_escape: Option<EvalEscape> = None;
+
+    // `alias_identity::redirect_paths`/`mirror_after_write`, which the eager
+    // route applies around this loop, are yq-only (#1351): no alias table is
+    // ever installed in jq mode, so both are no-ops on this path and are
+    // deliberately absent rather than streamed. The gate above is what keeps
+    // that true.
+    debug_assert!(
+        !alias_identity::active(),
+        "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
+    );
+
+    let resolved = resolve_dynamic_indexes_sink::<S>(path_expr, &pristine, false, &mut |path| {
+        // `false, false` for the two yq no-op flags, as the eager route's
+        // own `yq_noop` computes to in jq mode.
+        //
+        // Cloned for *every* path, including the last. The eager route
+        // moves the value into its final path (`is_last_path`), which a
+        // streaming producer cannot know without looking ahead -- and
+        // looking ahead is precisely what must not happen here, since
+        // resolving path N+1 before writing path N is the divergence this
+        // function exists to fix. The cost is exactly one extra clone per
+        // call, on a route already gated to computed paths.
+        match set_path::<S>(&mut result, &path, value.clone(), false, false) {
+            Ok(()) => Demand::Continue,
+            Err(e) => {
+                write_escape = Some(EvalEscape::from(e));
+                Demand::Stop
+            }
+        }
+    });
+
+    // A resolution escape discards everything, writes included -- the eager
+    // arm's `Err((_, escape))` did the same with its already-resolved
+    // prefix, and jq's `reduce` likewise discards its accumulator when the
+    // source generator raises.
+    if let Err(escape) = resolved {
+        return match escape {
+            EvalEscape::Error(_) if optional => QueryResult::None,
+            escape => escape.into(),
+        };
+    }
+    // A failed write is atomic for the whole call, exactly as
+    // `fork_rhs_over_paths` makes it atomic per RHS output: with one output
+    // there is no strictly-earlier document to survive it.
+    if let Some(escape) = write_escape {
+        return match escape {
+            EvalEscape::Error(_) if optional => owned_vec_to_result(Vec::new()),
+            other => partial(Vec::new(), other.into()),
+        };
+    }
+
+    let docs = vec![result];
+    match terminal {
+        None => owned_vec_to_result(docs),
+        Some(Control::Error(e)) => {
+            if optional {
+                owned_vec_to_result(docs)
+            } else {
+                partial(docs, Control::Error(e))
+            }
+        }
+        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+        Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
+    }
 }
 
 /// Shared RHS-fork loop for `eval_assign`/`eval_compound_assign`/
