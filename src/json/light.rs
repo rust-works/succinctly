@@ -6344,8 +6344,7 @@ mod tests {
             assert_eq!(
                 string_literal_end(doc, 0),
                 Some(doc.len()),
-                "{:?} is one whole string literal",
-                core::str::from_utf8(doc).unwrap()
+                "{doc:?} is one whole string literal"
             );
         }
     }
