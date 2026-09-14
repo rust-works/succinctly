@@ -2990,24 +2990,41 @@ closed the same way: `path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))])`
 `ka, kb, E, E` where jq prints `ka, E, kb, E`, and a key whose target escaped still
 evaluated the *next* key, which jq never reaches.
 
-**Still open, tracked on #2267.** A write that fails partway through a multi-path
-assignment does not stop the path producer: jq's
-`reduce path(paths) as $p (.; setpath($p; $v))` pulls one path, applies its write, and
-abandons the reduce on the first failure, so a later path's target side effects never
-fire. `echo '[10,20,30]' | jq -c '(.|stderr)[(0,1):(2,3)] = 99'` writes the document to
-stderr once on jq 1.7.1 and four times here. Closing it needs `Expr::IndexExpr`/
-`Expr::SliceExpr` to become native `resolve_node_sink` arms rather than
-`resolve_node_eager` ones -- they currently produce every branch before any reaches a
-write sink.
+Both are now native `resolve_node_sink` arms (#2267), which closed the last piece of the
+same rule in the other direction: a *consumer's* demand reaches those generators too.
+`[first(path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|debug("t"))]))]`
+evaluated both `s`s here where jq 1.7.1 evaluates only `s0`; both now stop after the
+first. The collecting forms have no callers left and are gone — `resolve_node` is the one
+collector, and the cross-product refusal moved with it, from an up-front refusal of a
+whole product to per-branch growth in `collect_resolved`. A consumer that keeps nothing
+can no longer be refused at all, which is also jq's own behaviour (it has no such guard);
+one that keeps everything is still refused, and a genuine OOM still arrives as a catchable
+error rather than an abort, which is the property
+[ADR-0018](../../adrs/adr-0018.md)'s "would take the host process down" exception was
+granted for.
 
-Related, and **not separable from it**: jq re-resolves an assignment's path once per
+The write side followed: an assignment now applies each write as its path resolves, so the
+first write that fails validation stops the path generator, exactly as jq's
+`reduce path(paths) as $p (.; setpath($p; $v))` abandons the reduce and never asks for a
+later path. `echo '[10,20,30]' | jq -c '(.|stderr)[(0,1):(2,3)] = 99'` wrote the document
+to stderr four times here and once on jq 1.7.1; both write it once now, as do
+`echo null | jq -c '(.|stderr)[(-1,-2)] = 1'` (the index spelling of the same gate). The
+path generator resolves against the document as it was, not the one the writes accumulate
+into — jq's `reduce` evaluates its source against the outer `.` — which is observable:
+`{"a":"b","b":1} | .[(.a,.a)] = 5` is `{"a":"b","b":5}`, where resolving the second `.a`
+against the written document would read back `5` and raise.
+
+**Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
 so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
-this fires it twice. That cannot be fixed on its own while `collect_rhs_outputs` is
-eager -- re-resolving per output then fires the target for outputs a downstream consumer
-never pulls, which is *worse*: `first((.|debug("E"))["a"] = (1,2))` would fire `E` twice
-where jq fires it once, and with `input` in the path it changes stdout. Both halves are
-the same mechanism and have to land together.
+this fires it twice. It cannot be fixed while `collect_rhs_outputs` is eager --
+re-resolving per output then fires the target for outputs a downstream consumer never
+pulls, which is *worse*: it was implemented, measured at 87 regressions against 69 fixes
+on a 5,000-shape sweep, and backed out. `first((.|debug("E"))["a"] = (1,2))` fires `E`
+twice under it where jq fires it once, and with `input` in the path it changes stdout;
+`first((.|stderr)["a"] = (1,2))` is pinned as a holdout so a re-attempt fails loudly. The
+streaming write above is deliberately gated to a *single* RHS output for the same reason —
+one output means one output document, so none of that class is reachable from it.
 
 ## Reading a path is indexing
 

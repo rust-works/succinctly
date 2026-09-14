@@ -127,6 +127,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An assignment applies each write as its path resolves, stopping on the
+  first failure** (#2267). jq's `=` is
+  `reduce path(paths) as $p (.; setpath($p; $value))` — one path pulled, its
+  write applied, and only then the next — so a write that fails validation
+  ends the reduce before the path generator is resumed, and the side effects
+  producing the later paths never fire. This resolved every path first:
+  `echo '[10,20,30]' | succinctly jq -c '(.|stderr)[(0,1):(2,3)] = 99'`
+  wrote the document to stderr four times where jq 1.7.1 writes it once, and
+  `echo null | succinctly jq -c '(.|stderr)[(-1,-2)] = 1'` twice where jq
+  writes it once. Both match now.
+
+  Getting there made `E[K]`/`E[S:T]` native `resolve_node_sink` arms — the
+  last two `resolve_node_eager` ones — which closes the same rule in the
+  other direction: a bounded consumer's demand now reaches those generators,
+  so `[first(path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|debug(
+  "t"))]))]` evaluates only `s0`, as on jq, instead of both `s`s. The
+  cross-product refusal moved with the collecting form into
+  `collect_resolved`, from an up-front refusal of a whole product to
+  per-branch growth: a consumer that keeps nothing can no longer be refused
+  at all (neither does jq), and one that keeps everything still gets a
+  catchable error rather than an abort.
+
+  Two neighbouring shapes are deliberately unchanged. jq re-resolving the
+  path once per right-hand-side output stays open — it is unfixable while
+  `collect_rhs_outputs` is eager, was measured at 87 regressions against 69
+  fixes, and is held off by gating the streaming write to a single RHS
+  output. `.[..] |= f` with a failing slice write still fires four times
+  where jq fires once; that is `eval_update`'s own route and is filed
+  separately.
+
 - **A slice off a detached literal no longer fabricates a `key`/`path`/`parent`
   position, in jq mode** (#2834). `OwnedIdentity`'s shared navigation arm
   extended a detached identity's ancestors unconditionally, so
