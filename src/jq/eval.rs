@@ -28552,14 +28552,14 @@ fn collect_resolved<'a>(
     let mut reserve_failed = false;
     let flow = resolve(&mut |branch| {
         if out.try_reserve(1).is_err() {
-            reserve_failed = true;
-            return Demand::Stop;
+            reserve_failed = true; // omni-dev: coverage tolerate-line reason="reachable only on a genuine allocation failure: `Vec::try_reserve(1)` on a vector that has spare capacity, or can grow, cannot fail -- this is the whole purpose of the branch, converting an OOM into a catchable error rather than an abort (ADR-0018's 'would take the host process down' exception). The pre-#2267 form of the same guard, `out.try_reserve(branches.len())` in `resolve_index_expr`/`resolve_slice_expr`, was 0-hit for the identical reason (#2267)"
+            return Demand::Stop; // omni-dev: coverage tolerate-line reason="see the line above -- the `Demand::Stop` half of the same allocation-failure-only branch (#2267)"
         }
         out.push(branch);
         Demand::Continue
     });
     if reserve_failed {
-        return Err((out, cannot_reserve_cross_product(&[1]).into()));
+        return Err((out, cannot_reserve_cross_product(&[1]).into())); // omni-dev: coverage tolerate-line reason="reachable only when the `try_reserve` above failed, i.e. only on a genuine allocation failure (#2267)"
     }
     match flow {
         ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
@@ -56268,6 +56268,43 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let path_expr = Expr::Identity;
+        let value_expr = Expr::Literal(Literal::Int(5));
+        for optional in [true, false] {
+            match eval_assign::<Vec<u64>, JqSemantics>(
+                &path_expr,
+                &value_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale shared by all of these
+    /// per-site tests. This is #2267's streaming write, which has its own
+    /// `to_owned` of the input and so its own copy of the rule.
+    ///
+    /// The path has to be one `assignment_path_needs_streaming` admits --
+    /// a computed key that can fan out -- or `eval_assign` takes the eager
+    /// route and this site is never reached at all. `Expr::Identity` (what
+    /// the sibling test above uses) would do exactly that.
+    #[test]
+    fn test_eval_assign_streaming_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(r#".[("a","b")]"#).expect("parse");
+        assert!(
+            assignment_path_needs_streaming(&path_expr),
+            "this test is only meaningful if the path actually streams"
+        );
         let value_expr = Expr::Literal(Literal::Int(5));
         for optional in [true, false] {
             match eval_assign::<Vec<u64>, JqSemantics>(
