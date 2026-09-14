@@ -46813,3 +46813,136 @@ fn test_tonumber_reports_one_error_family_in_yq_mode_2878() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2803: a positional builtin inside a `range` bound resolves on *every*
+/// route, not only the ones the generic evaluator owns.
+///
+/// #2698 gave `range` a native cursor-threaded arm and registered it in
+/// `needs_path_context`/`path_context_single_native`, which fixed the direct
+/// spelling. It did not register `Expr::Range` in the three gates that decide
+/// whether a pipe may stay on a position-aware route at all, so every
+/// *other* spelling answered `false` there, was refused the owned-identity
+/// and absent routes, and fell back to `eval.rs`'s `each_range` -- which has
+/// no cursor parameter and stubs the read to its no-cursor default.
+///
+/// That made the same expression answer differently depending on the
+/// surrounding spelling, which is the ADR-0021 "silent fallback" class: the
+/// user cannot see which route a spelling took.
+///
+/// Each row below is one such route. `.a | key` is `"a"` (length 1), so
+/// every row's bound is `range(0; 1)` once the read resolves, and every
+/// answer should contain the single value `0`.
+#[test]
+fn range_bound_positional_builtin_resolves_on_every_route_2803() -> Result<()> {
+    let doc = "a: {b: 1, c: 2}\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (filter, want, route) in [
+        // Already correct before #2803 -- the direct route #2698 fixed, kept
+        // here so a regression in it fails beside the rows it explains.
+        (".a | [(key|length)]", "[1]", "direct read, no range"),
+        (
+            ".a | [range(0;(key|length))]",
+            "[0]",
+            "direct range (#2698)",
+        ),
+        (
+            ".a | .b = [range(0;(key|length))]",
+            r#"{"b":[0],"c":2}"#,
+            "assignment RHS",
+        ),
+        (
+            r#".a | "\([range(0;(key|length))])""#,
+            r#""[0]""#,
+            "string interpolation",
+        ),
+        (
+            ".a | map_values([range(0;(key|length))])",
+            r#"{"b":[0],"c":[0]}"#,
+            "map_values body",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2803 [{route}]: `{filter}` -- a stubbed bound answers as if \
+             `key` were absent, so the range is empty"
+        );
+    }
+
+    // The absent-key walk is its own route: `.zz` does not exist, and its
+    // `key` is still `"zz"` (length 2), so the bound fans out twice. A
+    // stubbed read makes this `[]`, which is why it is asserted separately
+    // from the rows above rather than folded into them.
+    let (out, code) = run_yq_stdin(".zz | [range(0;(key|length))]", doc, &args)?;
+    assert_eq!(
+        (out.trim(), code),
+        ("[0,1]", 0),
+        "#2803 [absent-key walk]: `.zz | key` is \"zz\", so the bound is 2"
+    );
+
+    Ok(())
+}
+
+/// #2803 in jq mode, where the same gap presents as an **error** rather than
+/// a quietly empty range.
+///
+/// The stub differs per mode: `root_path_context_placeholder` yields
+/// `QueryResult::None` in yq mode (so the bound vanishes and the range is
+/// empty) but a `null` placeholder in jq mode -- and `range(null)` raises
+/// "Range bounds must be numeric". Both are the same missing route; only the
+/// symptom differs, so jq mode needs its own rows rather than being assumed
+/// to follow yq's.
+///
+/// Verified these spellings actually depend on the gate: with the
+/// `Expr::Range` arm removed from `path_context_resolvable`, both rows here
+/// raise instead of answering.
+#[test]
+fn range_bound_positional_builtin_resolves_in_jq_mode_2803() -> Result<()> {
+    // `.d[1] | key` is the index 1, so each bound is `range(1)` -> one value.
+    let doc = r#"{"d":[{"z":1},{"z":2}]}"#;
+
+    for (filter, want, route) in [
+        (
+            ".d[1] | .z = [range(key)]",
+            r#"{"z":[0]}"#,
+            "assignment RHS",
+        ),
+        (
+            r#".d[1] | "\([range(key)])""#,
+            r#""[0]""#,
+            "string interpolation",
+        ),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2803 [jq mode, {route}]: `{filter}` -- a stubbed `key` is `null`              in jq mode, so the bound raises rather than answering"
+        );
+    }
+    Ok(())
+}
+
+/// #2803 for a positional builtin other than `key`: the fix is in the shared
+/// route gates, not in anything `key`-specific.
+///
+/// `.a.b` is on line 1, so `range(line)` yields exactly one value. This row
+/// was already correct before #2803 (it is the direct route #2698 fixed) and
+/// is kept as a non-regression companion to the rows above -- it does not
+/// itself prove the gate change.
+#[test]
+fn range_bound_line_builtin_still_resolves_2803() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".a.b | [range(line)]",
+        "a: {b: 1}\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(
+        (out.trim(), code),
+        ("[0]", 0),
+        "#2803: `line` inside a range bound"
+    );
+    Ok(())
+}

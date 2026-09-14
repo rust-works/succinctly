@@ -18577,6 +18577,20 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         Expr::Compare { left, right, .. } => sub(left) && sub(right),
         Expr::And(left, right) | Expr::Or(left, right) => sub(left) && sub(right),
         Expr::Negate(inner) => sub(inner),
+        // #2803: every bound of a `range` is evaluated at the stage's own
+        // input, exactly like an arithmetic operand above, so a read inside
+        // one resolves against this position. #2698 gave `range` a native
+        // cursor-threaded arm in this evaluator and registered it in
+        // `needs_path_context`/`path_context_single_native`, but left this
+        // gate (and its two siblings below) unaware of it -- so a pipe whose
+        // range bound reads position answered `false` here, was refused the
+        // owned-identity and absent routes, and fell back to `eval.rs`'s
+        // `each_range`, which has no cursor parameter at all and stubs the
+        // read. That is the whole bug: not a missing position frame in
+        // `eval.rs`, but a missing diversion *away* from it.
+        Expr::Range { from, to, step } => {
+            sub(from) && to.as_deref().map_or(true, sub) && step.as_deref().map_or(true, sub)
+        }
         // #2473 (gate reason 3 of spine 2416): every key and value expression
         // of an object literal is evaluated at the stage's own input, exactly
         // like `Expr::Array`'s inner expression above, so a read inside one
@@ -19141,6 +19155,16 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         Expr::Try { expr, catch } => Expr::Try {
             expr: boxed(expr)?,
             catch: catch.as_deref().map(boxed).transpose()?,
+        },
+        // #2803: the rewriter's half of `path_context_resolvable`'s own
+        // `Expr::Range` arm -- one rewrite per bound, so `range(0; key|length)`
+        // at a resolved position comes out with no path context left in it.
+        // The two halves must stay in step; see
+        // `path_context_absent_resolution_clears_path_context_2416`.
+        Expr::Range { from, to, step } => Expr::Range {
+            from: boxed(from)?,
+            to: to.as_deref().map(boxed).transpose()?,
+            step: step.as_deref().map(boxed).transpose()?,
         },
         Expr::If {
             cond,
