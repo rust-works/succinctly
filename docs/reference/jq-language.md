@@ -317,8 +317,9 @@ a transitively included name is visible *inside* the module and is **not**
 re-exported to whoever included it, and it outranks a same-named sibling
 def in that module (while the module still exports its own). A def's own
 recursive call binds to itself rather than to a same-named dependency,
-per (name, arity). See
-[jq Limitations](../compliance/jq/limitations.md#five-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
+per (name, arity), and a module's own defs keep the bindings they were
+written under however the def that calls them is declared. See
+[jq Limitations](../compliance/jq/limitations.md#seven-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
 for the full table and the two scoping gaps that remain open.
 
 An `include` cycle is reported as `module cycle detected: a -> b -> a`

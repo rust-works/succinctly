@@ -6356,18 +6356,23 @@ other explanation. All captured live against jq 1.7.1, with `inner.jq` = `def g:
    dependency or a sibling named `g` in scope, and `def f($g): [$g, g]` answers `[7,7]`
    — a `$`-spelled parameter binds the bare call-site namespace too.
 
-6. **An excluded name stays excluded for the siblings spliced alongside it.** In
-   `def f: 1; def k: f; def h(f): k;`, `h(99)` answers `1` — `k`'s `f` is the module's
-   `f`, not `h`'s parameter, even though the parameter displaces `f` for `h`'s own body.
-7. **An in-module redefinition does not capture an earlier sibling's call.** In
-   `def h: "first"; def g: h; def h: "second-" + g;`, `h` answers `"second-first"` —
-   `g`'s `h` is the first one, bound where `g` was declared.
+6. **A module's own def keeps the bindings it was written under**, whatever the def
+   that calls it declares. `def f: 1; def k: f; def h(f): k;` answers `1` for `h(99)` —
+   `k`'s `f` is the module's, not `h`'s parameter. `def h: "first"; def g: h; def h:
+   "second-" + g;` answers `"second-first"` — `g`'s `h` is the first one. `def a: length;
+   def h(length): a;` answers `2` for `h(9)` on `[1,2]` — `a`'s `length` is the builtin.
+7. **...including when the name is defined nowhere.** `def a: b; def h(b): a;` is
+   `b/0 is not defined`, exit 3, not something `h`'s parameter can satisfy.
 
 Rule 4 is why an exported def's body is *not* wrapped in a dependency matching its own
-(name, arity), and rule 5 is why it is not wrapped in one matching any of its parameters.
-Rules 6 and 7 are why a sibling that *names* one of those excluded defs is spliced in its
-own fully-bound form rather than the cheaper one — the exclusion is decided for the
-including def, and a sibling carries its references outward into that same scope.
+(name, arity), and rule 5 is why it is not wrapped in one matching any of its parameters —
+both scoped to a name the body calls *directly*, since a dependency reached only through
+another one is bound where that one was written and is not the def's own to shadow.
+Rules 6 and 7 are why a module's own defs are not wrapped into each other at all: they are
+emitted as siblings in the top-level chain, exactly as a filter's own defs are, and jq's
+lexical rule relates them there. Nesting a copy of one inside another's body puts it under
+scopes it was never written in, and rule 6's third row shows sealing cannot repair that —
+a call to a builtin is free in every pre-bound form of the copy.
 Rules 1-3 are why the wrap goes around each exported def's **body** rather than being
 spliced into the module's exported chain.
 
@@ -6394,16 +6399,12 @@ The referenced-closure filter (jq's own `block_bind_referenced` rule, in
 `visible_defs_for`) flattens the one-call-each shape completely — without it the
 6 x 40 row was 359 MB rather than 10 MB — but it cannot flatten a genuinely wide closure,
 because that closure is itself exponential. Every row above produces the **correct**
-answer; this is a scalability limit of AST inlining, not a wrong result. Two things keep
-it confined to genuinely wide closures rather than merely deep ones, both found by
-review after a first attempt got them wrong: a module's own defs are spliced into each
-other in their `local` form (body plus dependencies, no siblings), so a directive-free
-module is bound exactly as cheaply as before #2865 however many siblings each def calls;
-and the innermost dependency block is selected by a def's *direct* references rather than
-the closure widened through its siblings, since a `local` sibling already carries the
-dependencies it needs. Without the second, a chain of two-def modules calling one another
-cost 111 MB at 13 levels and tens of gigabytes beyond; with it, 21 levels is 10 MB and a
-7-level 40-def chain is 12 MB. Tracked as
+answer; this is a scalability limit of AST inlining, not a wrong result. It needs a
+*chain of modules* to appear, and a wide one: only dependencies are wrapped into a body,
+so a module with no `include`/`import` is bound exactly as cheaply as before #2865
+however many of its own defs call each other (a 24-def Fibonacci module is 9 MB, against
+`main`'s 9 MB), and a chain whose defs call one def apiece stays flat (21 levels of a
+two-def module is 9 MB; a 7-level 40-def chain is 12 MB). Tracked as
 [#2955](https://github.com/rust-works/succinctly/issues/2955), whose most promising fix is
 splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
 introduced) instead of by clone.
