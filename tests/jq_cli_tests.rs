@@ -25303,12 +25303,24 @@ fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<(
 /// `main`, and not the (disclosed, module-chain) shape of #2955. One pass over
 /// the body, with no widening, is both correct and linear.
 ///
-/// 24 defs would have been minutes and hundreds of gigabytes on the widening
-/// version, and is instant now; asserting completion is the signal, since a
-/// wall-clock bound would flake on a loaded CI box.
+/// A second round of review found the single-callee chain above too weak a
+/// lock: the *sealed* form of each def was being spliced where a sibling was
+/// needed, nesting a full copy of every earlier sibling inside every later
+/// one. That only shows when a def calls **more than one** earlier sibling,
+/// so the second shape below is a Fibonacci chain -- merely `include`d, never
+/// called, since the blow-up happens at load time. It reached 190 MB at 18
+/// defs, 4.1 GB at 24 and 32 GB at 28, against a flat 14.5 MB on `main`.
+/// Splicing the `local` form (body plus dependencies, no siblings) keeps it
+/// linear, because the chain a sibling lands in already supplies the earlier
+/// siblings.
+///
+/// Asserting completion rather than a wall-clock bound, which would flake on
+/// a loaded CI box.
 #[test]
 fn test_module_own_def_chain_does_not_blow_up_2865() -> Result<()> {
     const DEFS: usize = 24;
+
+    // One callee per def.
     let mut module = String::from("def f0: 0;\n");
     for i in 1..DEFS {
         module.push_str(&format!("def f{i}: f{} + 1;\n", i - 1));
@@ -25317,6 +25329,18 @@ fn test_module_own_def_chain_does_not_blow_up_2865() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(&[("chain", &module)], &["-nc", &filter])?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), (DEFS - 1).to_string());
+
+    // Two callees per def, and no directives at all in the module. Loading it
+    // is the whole test -- `1` never calls any of them.
+    let mut fib = String::from("def f0: 0;\ndef f1: 1;\n");
+    for i in 2..DEFS {
+        fib.push_str(&format!("def f{i}: f{} + f{};\n", i - 1, i - 2));
+    }
+    let (stdout, stderr, code) =
+        run_jq_with_modules(&[("fib", &fib)], &["-nc", r#"include "fib"; 1"#])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
     Ok(())
 }
 
@@ -25390,8 +25414,33 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "7");
 
-    // A missing *include*, by contrast, is still the clear error jq reports --
-    // `module_resolves` is deliberately not applied there.
+    // A missing *namespace* import, by contrast, is still jq's own clear
+    // error -- the skip keys on `Import::data`, not on whether the path
+    // happens to resolve, so an unresolvable `import "m" as m;` is not
+    // swallowed (jq exits 3 with `module not found` here too).
+    std::fs::write(
+        temp_dir.path().join("badimp.jq"),
+        "import \"nosuchmod\" as m;\ndef q: 1;\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "badimp"; q"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: nosuchmod"),
+        "stderr: {stderr:?}"
+    );
+
+    // ...and so is a missing `include`.
     std::fs::write(
         temp_dir.path().join("bad.jq"),
         "include \"nosuchmod\";\ndef h: 7;\n",

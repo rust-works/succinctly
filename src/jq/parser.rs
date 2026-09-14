@@ -6845,13 +6845,14 @@ impl<'a> Parser<'a> {
         self.consume_keyword("as");
         self.skip_ws();
 
-        // Parse the alias (optionally prefixed with $)
-        let alias = if self.peek() == Some('$') {
+        // Parse the alias (optionally prefixed with $). The `$` is what
+        // distinguishes a *data* import from a module import, so record it
+        // rather than just consuming it (#2865) -- `Import::data`.
+        let data = self.peek() == Some('$');
+        if data {
             self.next();
-            self.parse_ident()?
-        } else {
-            self.parse_ident()?
-        };
+        }
+        let alias = self.parse_ident()?;
 
         self.skip_ws();
 
@@ -6874,6 +6875,7 @@ impl<'a> Parser<'a> {
         Ok(Import {
             path,
             alias,
+            data,
             metadata,
         })
     }

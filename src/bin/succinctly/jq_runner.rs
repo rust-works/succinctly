@@ -285,33 +285,40 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
     names
 }
 
-/// The defs a module's exported def can actually reach, in [`wrap_defs`]
-/// order: its module's own earlier siblings and its module's dependencies,
-/// minus everything that must not capture a name in this body, minus
-/// everything nothing in the body transitively calls (#2865).
+/// One of a module's own defs, in the two bound forms the loader needs
+/// (#2865).
 ///
-/// ### Why `siblings` is here at all
-///
-/// Every def's body has to be resolved in **its own module's scope**, which
-/// means a def handed to another module must already be self-contained --
-/// its sibling references cannot be left to find their target in whatever
-/// chain it lands in. With `inner.jq` = `def g: 42; def k: g;` and
-/// `outer.jq` = `include "inner"; def g: k;`, jq answers `42`: `k`'s `g` is
-/// `inner`'s. Wrapping only dependencies left `k`'s `g` to resolve outwards
-/// into `outer`'s own `g`, which is `k` -- unbounded recursion where jq
-/// returns a number. Carrying the siblings closes that by construction, and
-/// makes every exported body independent of its wrap site.
-///
-/// Only siblings declared *before* the def are in scope, which is also what
-/// makes this terminate: `def x: 1; def y: x; def x: 2;` binds `y`'s `x` to
-/// the first one, inside a module exactly as at the top level.
+/// The split is what keeps binding from growing exponentially. A def has to
+/// be **sealed** before it leaves its module -- carrying everything it
+/// references, so it resolves the same wherever it is spliced -- but a def
+/// spliced as a *sibling*, into another def of the same module, must not be:
+/// the chain it lands in already supplies the module's earlier siblings, in
+/// the right lexical order. Splicing the sealed form there instead nests a
+/// full copy of each sibling inside every later one, which for a module whose
+/// defs each call two earlier siblings doubles per def.
+struct ModuleDef {
+    name: String,
+    params: Vec<Param>,
+    /// The def's body exactly as parsed, binding nothing. The reference
+    /// graph is read off *this*, never off a bound form -- a bound body has
+    /// already captured names internally, so re-deriving from it re-adds
+    /// what it has satisfied and pulls in the whole preceding sibling set.
+    source: Expr,
+    /// The body wrapped in the module's own **dependencies** only. What gets
+    /// spliced when this def is needed as a sibling.
+    local: Expr,
+}
+
+/// The defs one of a module's own defs can actually reach, in [`wrap_defs`]
+/// order: the module's earlier siblings (in their `local` form) and the
+/// module's dependencies, minus everything that must not capture a name in
+/// this body, minus everything the body never transitively calls (#2865).
 ///
 /// ### Ordering
 ///
-/// `siblings` first, `deps` second, so a dependency ends up **innermost** and
-/// beats a same-named sibling -- jq's answer for a module written
-/// `include "inner"; def g: 7; def h: g;` is `42`, not the `7` one line
-/// above.
+/// Siblings first, dependencies second, so a dependency ends up **innermost**
+/// and beats a same-named sibling -- jq's answer for a module written
+/// `include "inner"; def g: 7; def h: g;` is `42`, not the `7` one line above.
 ///
 /// ### The three exclusions
 ///
@@ -328,34 +335,25 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 ///   the parameter's every use.
 /// - **Anything nothing in the body transitively calls.** jq's own
 ///   `block_bind_referenced` rule, and here a sizing requirement rather than
-///   a micro-optimisation: wrapping unconditionally compounds down a chain,
-///   because each level's bodies already carry the level below. Measured on a
-///   synthetic chain of 40-def modules where each def calls one def from the
-///   level below, resolving one def at the top: 9 MB peak RSS at one module,
-///   18 MB at two, **359 MB** at three (jq: 2.5 MB), and a fourth level would
-///   have been tens of gigabytes. Filtered, the same chain is 10 MB and a
-///   five-level one 11.6 MB. It is a *mitigation*, not a cure -- a module
-///   whose defs each call several defs below still compounds; see
-///   [`docs/compliance/jq/limitations.md`].
+///   a micro-optimisation: without it a synthetic chain of 40-def modules
+///   cost 359 MB peak RSS at three levels (jq: 2.5 MB) and would have been
+///   tens of gigabytes at four. It is a mitigation, not a cure -- see
+///   `docs/compliance/jq/limitations.md` and #2955.
 ///
 /// Dropping an unreferenced def is unobservable: nothing resolves to it, and
 /// jq agrees an unreferenced dependency whose own body calls an undefined
 /// function is an error in neither tool.
 ///
-/// **One pass over the body suffices, with no transitive widening**, and the
-/// widening version was actively harmful: every candidate here is already
-/// bound, so its own references are satisfied *inside* its body and it needs
-/// nothing further from this scope. Re-deriving names from a bound body
-/// therefore re-adds what it has already captured, which pulls in the whole
-/// preceding sibling set and doubles the body per def -- a module with **no
-/// `include` at all** and 20 chained defs (`def f0: 0; def f1: f0 + 1; ...`)
-/// reached 13 GB of resident memory, against milliseconds before #2865
-/// touched this code. Correctness rests on that self-containment, which is
-/// why siblings are taken from the bound list; the cost is the one under
-/// "Anything nothing in the body transitively calls" above, and is tracked as
-/// #2955.
+/// ### Why the closure widens over siblings but not dependencies
+///
+/// A dependency arrives **sealed** from its own module, so it needs nothing
+/// further from this scope and contributes nothing to the closure. A sibling
+/// arrives in `local` form and does still reach outward for the module's
+/// earlier siblings, so the closure widens through its
+/// [`ModuleDef::source`] -- the unbound body, whose free names are the real
+/// reference graph.
 fn visible_defs_for(
-    siblings: &FuncDefList,
+    siblings: &[ModuleDef],
     deps: &FuncDefList,
     name: &str,
     params: &[Param],
@@ -363,18 +361,54 @@ fn visible_defs_for(
 ) -> FuncDefList {
     let param_names: BTreeSet<&str> = params.iter().map(Param::name).collect();
     let arity = params.len();
-    let candidates: Vec<&(String, Vec<Param>, Expr)> = siblings.iter().chain(deps.iter()).collect();
+    let excluded = |cand_name: &str, cand_params: usize| {
+        (cand_name == name && cand_params == arity)
+            || (cand_params == 0 && param_names.contains(cand_name))
+    };
 
-    let wanted = called_func_names(body);
+    let mut wanted = called_func_names(body);
+    let mut keep = vec![false; siblings.len()];
 
-    candidates
-        .into_iter()
-        .filter(|(cand_name, cand_params, _)| {
-            let excluded = (cand_name == name && cand_params.len() == arity)
-                || (cand_params.is_empty() && param_names.contains(cand_name.as_str()));
-            !excluded && wanted.contains(cand_name)
+    // Fixed point over the siblings only: pulling one in can name an earlier
+    // sibling not yet scanned. Bounded and linear -- each sibling is admitted
+    // at most once, and widening reads its unbound `source`, never a bound
+    // body.
+    loop {
+        let mut grew = false;
+        for (i, sibling) in siblings.iter().enumerate() {
+            if keep[i] || excluded(&sibling.name, sibling.params.len()) {
+                continue;
+            }
+            if wanted.contains(&sibling.name) {
+                keep[i] = true;
+                let before = wanted.len();
+                wanted.extend(called_func_names(&sibling.source));
+                grew |= wanted.len() != before;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    siblings
+        .iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(sibling, _)| {
+            (
+                sibling.name.clone(),
+                sibling.params.clone(),
+                sibling.local.clone(),
+            )
         })
-        .cloned()
+        .chain(
+            deps.iter()
+                .filter(|(dep_name, dep_params, _)| {
+                    !excluded(dep_name, dep_params.len()) && wanted.contains(dep_name)
+                })
+                .cloned(),
+        )
         .collect()
 }
 
@@ -552,21 +586,42 @@ impl ModuleLoader {
         self.loading.pop();
         let deps = deps?;
 
-        // `bound` doubles as the sibling list: walking the module's defs in
-        // declaration order means def `i` sees exactly `bound[..i]`, the same
-        // lexical rule a filter's own defs follow. Siblings are taken from
-        // `bound` rather than from `own` deliberately -- an *already bound*
-        // sibling carries its own dependencies inside its body, so splicing it
-        // into a later def's wrap keeps it self-contained. The unbound form
-        // would arrive with its references still looking outward, into a chain
-        // that no longer has them.
-        let mut bound: FuncDefList = Vec::with_capacity(own.len());
-        for (name, params, body) in own {
-            let visible = visible_defs_for(&bound, &deps, &name, &params, &body);
-            let wrapped = wrap_defs(body, visible);
-            bound.push((name, params, wrapped));
-        }
-        Ok(bound)
+        // Two passes, for the reason [`ModuleDef`] gives. First each def's
+        // `local` form -- its body wrapped in the module's dependencies alone,
+        // which is what a *sibling* splice needs, since the chain it lands in
+        // already carries the module's earlier siblings.
+        let locals: Vec<ModuleDef> = own
+            .into_iter()
+            .map(|(name, params, body)| {
+                let dep_wrap = visible_defs_for(&[], &deps, &name, &params, &body);
+                let local = wrap_defs(body.clone(), dep_wrap);
+                ModuleDef {
+                    name,
+                    params,
+                    source: body,
+                    local,
+                }
+            })
+            .collect();
+
+        // Then the sealed form that leaves the module: each def wrapped in the
+        // siblings declared *before* it plus the dependencies, so it resolves
+        // identically wherever it is later spliced. Walking in declaration
+        // order means def `i` sees exactly `locals[..i]` -- the same lexical
+        // rule a filter's own defs follow.
+        Ok(locals
+            .iter()
+            .enumerate()
+            .map(|(i, def)| {
+                let visible =
+                    visible_defs_for(&locals[..i], &deps, &def.name, &def.params, &def.source);
+                (
+                    def.name.clone(),
+                    def.params.clone(),
+                    wrap_defs(def.source.clone(), visible),
+                )
+            })
+            .collect())
     }
 
     /// Every def one module's own `include`/`import` directives bring into
@@ -585,19 +640,6 @@ impl ModuleLoader {
     /// `hj/0 is not defined` even with `def hj: 1234;` in `~/.jq`). They still
     /// leak in today through the top-level chain -- a separate, pre-existing
     /// gap this fix neither widens nor closes.
-    /// Whether `module_path` names a file the search path can actually
-    /// resolve (#2865).
-    ///
-    /// Used only to skip a module's own *data* imports, which cannot be
-    /// distinguished from namespace imports on the `Import` node itself --
-    /// see the call site. Deliberately not applied to `include`s: a missing
-    /// `include` is a genuine error jq reports too, and silently skipping one
-    /// would swap a clear `module not found` for a later, unexplained
-    /// `is not defined`.
-    fn module_resolves(&self, module_path: &str) -> bool {
-        resolve_module_in(&self.search_path, module_path).is_some()
-    }
-
     fn module_dep_defs(&mut self, program: &Program) -> Result<FuncDefList, ModuleLoadError> {
         let mut defs: FuncDefList = Vec::new();
 
@@ -613,17 +655,14 @@ impl ModuleLoader {
         //
         // A *data* import (`import "f" as $d;`, which binds a `$`-variable to
         // the file's parsed JSON rather than a namespace of defs) contributes
-        // no defs and must be skipped: `parse_import` drops the `$`, so
-        // `Import` cannot tell the two apart, and loading one as a module
-        // fails with `module not found`. Before #2865 a module declaring one
-        // was simply ignored; making it fatal would be a regression, and a
-        // directive that binds a variable has no business in a *def*
-        // dependency list either way. Data imports remain unimplemented at the
-        // top level too (#2956) -- unchanged here.
-        for import in &program.imports {
-            if !self.module_resolves(&import.path) {
-                continue;
-            }
+        // no defs, and resolving one as a module reports `module not found`
+        // where jq reads `<path>.json`. Before #2865 a module's own imports
+        // were never looked at, so declaring one was harmless; processing them
+        // transitively made it fatal. `Import::data` (#2865) is what separates
+        // the two -- skipping on *resolvability* instead would have silently
+        // swallowed a genuinely missing module, which jq reports and exits 3
+        // for. Data imports themselves remain unimplemented (#2956).
+        for import in program.imports.iter().filter(|import| !import.data) {
             let namespace = &import.alias;
             defs.extend(
                 self.load_module(&import.path)?
