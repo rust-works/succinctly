@@ -63,6 +63,16 @@ pub struct ModuleLoader {
     loaded_modules: BTreeMap<String, FuncDefList>,
     /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
     auto_loaded_defs: FuncDefList,
+    /// The modules whose own dependencies are currently being loaded, as
+    /// `(resolved canonical file, module path as written)`, outermost first
+    /// (#2865).
+    ///
+    /// The cycle guard, and it has to be separate from `loaded_modules`: a
+    /// module is *absent* from that cache for exactly as long as its own
+    /// dependencies are loading, which is precisely the window in which a
+    /// cycle closes. Keyed on the resolved file rather than the written path
+    /// so `include "./m"` inside `m.jq` is still caught.
+    loading: Vec<(PathBuf, String)>,
 }
 
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
@@ -76,6 +86,24 @@ pub(crate) enum ModuleLoadError {
     /// then the usual `jq: 1 compile error` trailer. Confirmed live against
     /// jq 1.7.1, byte-for-byte.
     NotFound { module_path: String },
+    /// A module's own `include`/`import` chain leads back to a module already
+    /// being loaded (`ca` includes `cb` includes `ca`, or a module including
+    /// itself).
+    ///
+    /// **A deliberate ADR-0018 rule-4 divergence** (#2865), under the explicit
+    /// "matching would take the host process down" carve-out: real jq 1.7.1
+    /// does not diagnose this at all, it recurses until it dies --
+    /// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with no output on
+    /// either stream, and a self-including module does the same. Reproducing
+    /// that faithfully is not an option, so succinctly reports the cycle and
+    /// leaves through the same `jq: 1 compile error` / exit 3 door as the other
+    /// two compile-error kinds.
+    ///
+    /// `chain` is the module paths **as written in the `include`/`import`
+    /// directives**, from the outermost module in the cycle through to the
+    /// repeat that closed it (`["ca", "cb", "ca"]`); detection itself keys on
+    /// the *resolved* file, so two spellings of one module still close a cycle.
+    Cycle { chain: Vec<String> },
     /// The module could not be read, or its own contents failed to parse.
     /// jq's shape for this case additionally names the resolved *absolute*
     /// path and echoes the module's own source line -- #2703's fix does not
@@ -99,6 +127,11 @@ fn report_module_load_error(e: &ModuleLoadError) {
     match e {
         ModuleLoadError::NotFound { module_path } => {
             eprintln!("jq: error: module not found: {module_path}");
+            eprintln!();
+            eprintln!("jq: 1 compile error");
+        }
+        ModuleLoadError::Cycle { chain } => {
+            eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
             eprintln!();
             eprintln!("jq: 1 compile error");
         }
@@ -153,6 +186,144 @@ fn extract_and_stamp_func_defs(expr: &Expr, resolved_path: PathBuf) -> FuncDefLi
         .collect()
 }
 
+/// Wrap `expr` in one `Expr::FuncDef` per entry of `defs`, so that `defs`'
+/// **last** entry ends up innermost -- the one jq's innermost-first scoping
+/// resolves a name to -- and its first entry outermost.
+///
+/// One definition of that ordering rule (#2865). It used to be written out
+/// three times in [`ModuleLoader::process_program`] (includes, `~/.jq`,
+/// imports) and this fix adds a fourth site inside the module loader itself;
+/// four copies of "which end wins" is exactly the duplicated-predicate trap
+/// `CLAUDE.md` calls out, and the copies are individually correct only by
+/// inspection.
+fn wrap_defs(mut expr: Expr, defs: FuncDefList) -> Expr {
+    for (name, params, body) in defs.into_iter().rev() {
+        expr = Expr::FuncDef {
+            name,
+            params,
+            body: Box::new(body),
+            then: Box::new(expr),
+            bound: FuncDefBound::default(),
+        };
+    }
+    expr
+}
+
+/// Every function name called anywhere inside `expr`, including inside nested
+/// def bodies (#2865).
+///
+/// **Names only, deliberately not (name, arity).** A module's own source is
+/// parsed by plain `jq::parse_program` with no shadow-candidate seeding, so a
+/// call site inside it can still be carrying #2036's un-resolved
+/// `shadow_fallback`, and such a node holds an empty `args` by construction --
+/// its arity reads 0 whatever it really is. Keying on the name alone
+/// over-keeps a little (a dependency `g/1` survives when only `g/0` is
+/// called) where keying on arity could silently *drop* a dependency a call
+/// genuinely needs, turning a program that compiles into a compile error.
+/// The self-recursion filter in [`deps_excluding_self`] still keys on
+/// (name, arity), where it has to: there the exact pair is the semantics.
+///
+/// `any_subexpr` with a predicate that never answers `true` is a full
+/// traversal -- the "must not rely on visiting every node" caveat in its doc
+/// comment is about short-circuiting, which cannot happen here.
+fn called_func_names(expr: &Expr) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    succinctly::jq::walk::any_subexpr(expr, &mut |node| {
+        match node {
+            Expr::FuncCall { name, .. } => {
+                names.insert(name.clone());
+            }
+            Expr::NamespacedCall {
+                namespace, name, ..
+            } => {
+                names.insert(format!("{namespace}::{name}"));
+            }
+            _ => {}
+        }
+        false
+    });
+    names
+}
+
+/// The dependencies a def's body can actually reach: `deps` minus any entry
+/// that would capture the def's own recursive calls, minus any entry nothing
+/// in the body transitively calls (#2865).
+///
+/// ### The self-recursion filter
+///
+/// jq binds a def's own name inside its own body before it binds a dependency
+/// of the same name, and the match is on **(name, arity)**, not name alone --
+/// so a dependency `g/1` survives when wrapping an own `g/0`, and both stay
+/// reachable from that body.
+///
+/// ### The referenced-closure filter, and why it is not optional
+///
+/// This is jq's own `block_bind_referenced` rule, and here it is a
+/// **correctness-adjacent sizing requirement, not a micro-optimisation**:
+/// wrapping every dependency into every exported body multiplies down a
+/// chain, because each level's bodies already carry the level below. Measured
+/// on a synthetic chain of 3 modules x 40 defs (Apple M-series, release
+/// build), resolving one def at the top:
+///
+/// | chain depth              | peak RSS | wall  |
+/// |--------------------------|----------|-------|
+/// | 1 module (no wrapping)   |    9 MB  | 0.00s |
+/// | 2 modules (one wrap)     |   18 MB  | 0.01s |
+/// | 3 modules (two wraps)    |  359 MB  | 0.28s |
+/// | jq 1.7.1, same 3 modules |  2.5 MB  | 0.00s |
+///
+/// A fourth level would be tens of gigabytes. With the filter the same
+/// 3-module chain is flat, because each `c_i` calls exactly one `b_i`.
+///
+/// Dropping an unreferenced dependency is unobservable: it is reachable from
+/// nothing, so no name resolves to it, and jq agrees an unreferenced
+/// dependency whose own body calls an undefined function is an error in
+/// neither tool. The closure is seeded from the body and widened through the
+/// body of every dependency it pulls in, which over-approximates (a
+/// dependency's body was already bound at its own load, so some of its names
+/// are satisfied internally) -- over-approximating only keeps something
+/// harmless, while under-approximating would drop something needed.
+fn deps_excluding_self(deps: &FuncDefList, name: &str, arity: usize, body: &Expr) -> FuncDefList {
+    let mut wanted = called_func_names(body);
+    let mut keep = vec![false; deps.len()];
+
+    // Fixed point: pulling a dependency in can widen `wanted` past
+    // dependencies already scanned, so rescan until a pass adds nothing.
+    loop {
+        let mut grew = false;
+        for (i, (dep_name, dep_params, dep_body)) in deps.iter().enumerate() {
+            if keep[i] || (dep_name == name && dep_params.len() == arity) {
+                continue;
+            }
+            if wanted.contains(dep_name) {
+                keep[i] = true;
+                let before = wanted.len();
+                wanted.extend(called_func_names(dep_body));
+                grew |= wanted.len() != before;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    deps.iter()
+        .zip(keep)
+        .filter_map(|(dep, keep)| keep.then(|| dep.clone()))
+        .collect()
+}
+
+/// `path` resolved through the filesystem, falling back to `path` itself.
+///
+/// `canonicalize` can fail (a module deleted between resolving and reading it,
+/// a race no real program depends on); a non-canonical key only weakens the
+/// cycle guard's aliasing coverage, it never turns a legal program into an
+/// error, so falling back is strictly better than failing a load that already
+/// succeeded.
+fn canonical_or_self(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 impl ModuleLoader {
     /// Create a new module loader with the given search paths.
     pub fn new(library_paths: &[PathBuf]) -> Self {
@@ -198,6 +369,7 @@ impl ModuleLoader {
             search_path,
             loaded_modules: BTreeMap::new(),
             auto_loaded_defs,
+            loading: Vec::new(),
         }
     }
 
@@ -209,34 +381,156 @@ impl ModuleLoader {
     /// does not pay for a deep clone of every def body it is about to drop
     /// (#2395). [`Self::load_module`] is this plus that clone, for callers
     /// that need an owned copy.
+    ///
+    /// The defs handed back are the module's **own** defs only, each with its
+    /// module's dependencies already wrapped around its body (#2865) -- so a
+    /// transitively included name is visible to the module that included it
+    /// and to nobody else. See [`Self::load_and_bind_module`] for why that
+    /// shape, rather than splicing the dependencies into the exported chain,
+    /// is what real jq does.
     fn ensure_module_loaded(&mut self, module_path: &str) -> Result<&FuncDefList, ModuleLoadError> {
-        // `entry` rather than `get`-then-insert: the borrow checker cannot
-        // see that an early `return` of `get`'s borrow ends it, so the
-        // `contains_key` spelling would need an unreachable `expect` on the
-        // re-lookup. The key allocation on the cached path is one short
-        // module-path string, against the file read and parse it replaces.
-        match self.loaded_modules.entry(module_path.to_string()) {
-            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                // Resolve the module path
-                let file_path =
-                    resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
-                        ModuleLoadError::NotFound {
-                            module_path: module_path.to_string(),
-                        }
-                    })?;
-
-                // Read and parse the module
-                let contents = std::fs::read_to_string(&file_path)
-                    .with_context(|| format!("failed to read module: {}", file_path.display()))?;
-
-                let program = jq::parse_program(&contents).map_err(|e| {
-                    anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
-                })?;
-
-                Ok(entry.insert(extract_and_stamp_func_defs(&program.expr, file_path)))
-            }
+        // `contains_key` -> load -> `insert` -> re-`get`, rather than the
+        // `entry` spelling this used to have (#2865). `entry` holds a mutable
+        // borrow of `loaded_modules` across the whole load, which the loader
+        // now has to be able to re-enter to pull in the module's own
+        // dependencies -- so the `expect` on the re-lookup that the old doc
+        // comment here was written to avoid comes back, as the cost of
+        // recursion being possible at all. It is genuinely unreachable: the
+        // insert immediately above it is unconditional on this path.
+        if !self.loaded_modules.contains_key(module_path) {
+            let defs = self.load_and_bind_module(module_path)?;
+            self.loaded_modules.insert(module_path.to_string(), defs);
         }
+
+        Ok(self
+            .loaded_modules
+            .get(module_path)
+            .expect("just inserted above, or already present"))
+    }
+
+    /// Read, parse and bind one module: its own defs, each wrapped in whatever
+    /// its own `include`/`import` directives bring into scope (#2865).
+    ///
+    /// ### Why wrap each *body* rather than splice into the exported chain
+    ///
+    /// The issue's own suggested fix ("apply `process_program` recursively")
+    /// gets three of jq's rows wrong at once. Wrapping the bodies buys all of
+    /// them from one mechanism, with no special-casing (every row captured
+    /// live against jq 1.7.1, fixtures `inner.jq` = `def g: 42;`):
+    ///
+    /// - `include "outer"; h` where `outer.jq` is `include "inner"; def h: g;`
+    ///   answers `42` -- the dependency is visible inside the module.
+    /// - `include "outer"; g` is a **compile error**: the dependency is *not*
+    ///   re-exported to the includer, which splicing into the chain would do.
+    /// - where the module is `include "inner"; def g: 7; def h: g;`, `h`
+    ///   answers **`42`, not `7`** -- the dependency is innermost, so it beats
+    ///   the module's own same-name sibling. (At the top level the same
+    ///   collision goes the *other* way, since a filter's own defs bind at
+    ///   parse time; that row already passes and is unchanged.)
+    /// - ...while that module's own `g` is still what it exports: `7`.
+    ///
+    /// ### The self-recursion filter
+    ///
+    /// [`deps_excluding_self`] drops any dependency whose **(name, arity)**
+    /// matches the def being wrapped, because jq binds a def's own recursive
+    /// call to itself before it binds the dependency: with `inner`'s `g/0` in
+    /// scope, `def g: if . == 0 then "base" else (. - 1 | g) end;` still
+    /// answers `"base"`, not `42`. It is arity-scoped, not name-scoped -- a
+    /// dependency `g/1` alongside an own `g/0` leaves both reachable.
+    ///
+    /// ### Search-path resolution
+    ///
+    /// A nested `include` resolves against the global search path only, never
+    /// the including module's own directory -- `sub/usedeep.jq` saying
+    /// `include "deep"` reports `module not found: deep` even with `deep.jq`
+    /// sitting next to it. So reusing the search path verbatim is both the
+    /// simple implementation and the faithful one.
+    fn load_and_bind_module(&mut self, module_path: &str) -> Result<FuncDefList, ModuleLoadError> {
+        // Resolve the module path
+        let file_path = resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
+            ModuleLoadError::NotFound {
+                module_path: module_path.to_string(),
+            }
+        })?;
+
+        let canonical = canonical_or_self(&file_path);
+        if self.loading.iter().any(|(seen, _)| *seen == canonical) {
+            let mut chain: Vec<String> = self
+                .loading
+                .iter()
+                .map(|(_, as_written)| as_written.clone())
+                .collect();
+            chain.push(module_path.to_string());
+            return Err(ModuleLoadError::Cycle { chain });
+        }
+
+        // Read and parse the module
+        let contents = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("failed to read module: {}", file_path.display()))?;
+
+        let program = jq::parse_program(&contents).map_err(|e| {
+            anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+        })?;
+
+        // Stamp `$__loc__` BEFORE wrapping, never after: `stamp_loc_file`
+        // overwrites `file` unconditionally, so a wrap-then-stamp order would
+        // silently re-stamp an inner module's already-correct `$__loc__` with
+        // *this* module's path, regressing #2774.
+        let own = extract_and_stamp_func_defs(&program.expr, file_path);
+
+        self.loading.push((canonical, module_path.to_string()));
+        let deps = self.module_dep_defs(&program);
+        self.loading.pop();
+        let deps = deps?;
+
+        Ok(own
+            .into_iter()
+            .map(|(name, params, body)| {
+                let visible = deps_excluding_self(&deps, &name, params.len(), &body);
+                let body = wrap_defs(body, visible);
+                (name, params, body)
+            })
+            .collect())
+    }
+
+    /// Every def one module's own `include`/`import` directives bring into
+    /// that module's scope, in [`wrap_defs`] order (last entry innermost, so
+    /// last-declared wins).
+    ///
+    /// Declaration order is what produces that: a later `include` is appended
+    /// later, so it lands nearer the end and therefore nearer the body --
+    /// matching jq, where a module with `include "pa"; include "pb";` and both
+    /// defining `foo` resolves `foo` to `pb`'s. That is the same rule
+    /// [`Self::process_program`] documents for the top level, which is why
+    /// both go through `wrap_defs`.
+    ///
+    /// `~/.jq` is deliberately **not** included here: its defs are not visible
+    /// inside a module body in real jq (`def uh: hj;` in a module reports
+    /// `hj/0 is not defined` even with `def hj: 1234;` in `~/.jq`). They still
+    /// leak in today through the top-level chain -- a separate, pre-existing
+    /// gap this fix neither widens nor closes.
+    fn module_dep_defs(&mut self, program: &Program) -> Result<FuncDefList, ModuleLoadError> {
+        let mut defs: FuncDefList = Vec::new();
+
+        for include in &program.includes {
+            defs.extend(self.load_module(&include.path)?);
+        }
+
+        // Namespaced exactly as `process_program` does it, and left as
+        // `ns::name` for the single `rewrite_namespaced_calls` pass at the end
+        // of `process_program` to pick up: these bodies are spliced into the
+        // tree before that pass runs, so a `NamespacedCall` inside a module
+        // body is rewritten along with every other one.
+        for import in &program.imports {
+            let namespace = &import.alias;
+            defs.extend(
+                self.load_module(&import.path)?
+                    .into_iter()
+                    .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body)),
+            );
+        }
+
+        Ok(defs)
     }
 
     /// Load a module and return an owned copy of its function definitions
@@ -306,29 +600,13 @@ impl ModuleLoader {
         for include in program.includes.iter().rev() {
             let defs = self.load_module(&include.path)?;
             // Wrap expression with function definitions from the included module
-            for (name, params, body) in defs.into_iter().rev() {
-                expr = Expr::FuncDef {
-                    name,
-                    params,
-                    body: Box::new(body),
-                    then: Box::new(expr),
-                    bound: FuncDefBound::default(),
-                };
-            }
+            expr = wrap_defs(expr, defs);
         }
 
         // `~/.jq`'s own defs: lowest priority of the two unqualified
         // sources (loses to any `include`d module of the same name, but
         // still beats a name that was never `include`d at all).
-        for (name, params, body) in self.auto_loaded_defs.clone().into_iter().rev() {
-            expr = Expr::FuncDef {
-                name,
-                params,
-                body: Box::new(body),
-                then: Box::new(expr),
-                bound: FuncDefBound::default(),
-            };
-        }
+        expr = wrap_defs(expr, self.auto_loaded_defs.clone());
 
         // Process imports (definitions available under namespace::)
         // Load modules and add their functions with namespace prefixes
@@ -337,16 +615,11 @@ impl ModuleLoader {
             let namespace = &import.alias;
 
             // Add each function with a namespaced name (namespace::funcname)
-            for (name, params, body) in defs.into_iter().rev() {
-                let namespaced_name = format!("{namespace}::{name}");
-                expr = Expr::FuncDef {
-                    name: namespaced_name,
-                    params,
-                    body: Box::new(body),
-                    then: Box::new(expr),
-                    bound: FuncDefBound::default(),
-                };
-            }
+            let defs = defs
+                .into_iter()
+                .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body))
+                .collect();
+            expr = wrap_defs(expr, defs);
         }
 
         // Transform NamespacedCall expressions to regular FuncCall expressions
