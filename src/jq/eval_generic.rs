@@ -1728,7 +1728,10 @@ fn materialize_lazy_keys<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     let mut keys = effective_key_values(fields, collapse)?;
     if sorted {
-        keys.sort_by(compare_values);
+        // Object keys are always strings, so the mode-forked numeric arms
+        // of `compare_values` (#2906) are unreachable here and no `S` is
+        // threaded through this streaming entry point.
+        keys.sort_by(compare_values::<JqSemantics>);
     }
     Ok(OwnedValue::Array(keys))
 }
@@ -6282,7 +6285,7 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         Ok(keys) => keys,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
-    keys.sort_by(compare_values);
+    keys.sort_by(compare_values::<S>);
     drive_pipe_elements_generic::<S, V>(
         keys.into_iter().map(|k| Ok(GenericItem::Owned(k))),
         rest,
@@ -14843,8 +14846,8 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// been flattened to equal `OwnedValue`s, whereas the cursors this returns
 /// still point at distinct document positions that can print differently
 /// (two mappings with the same collapsed form but different duplicate keys).
-fn sort_keyed_elements<V: DocumentValue>(keyed: &mut [(OwnedValue, V::Cursor)]) {
-    keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(OwnedValue, V::Cursor)]) {
+    keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
 }
 
 /// Whether `path(expr)` can be resolved by walking cursors instead of
@@ -20631,7 +20634,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // comment above for why).
             let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             sort_family_array_generic::<S, _>(cursors, key, optional, |mut keyed| {
-                sort_keyed_elements::<V>(&mut keyed);
+                sort_keyed_elements::<S, V>(&mut keyed);
                 if dedup {
                     // `owned_value_eq::<S>`, not `compare_values(..) ==
                     // Equal`: the sort above stays widening, but two
@@ -20700,11 +20703,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             let winner = if matches!(builtin, Builtin::Min | Builtin::MinBy(_)) {
                 keyed
                     .into_iter()
-                    .min_by(|(a, _), (b, _)| compare_values(a, b))
+                    .min_by(|(a, _), (b, _)| compare_values::<S>(a, b))
             } else {
                 keyed
                     .into_iter()
-                    .max_by(|(a, _), (b, _)| compare_values(a, b))
+                    .max_by(|(a, _), (b, _)| compare_values::<S>(a, b))
             };
             match winner {
                 Some((_, cursor)) => GenericResult::OneCursor(cursor),
@@ -23025,13 +23028,15 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
                 OwnedValue::Array(items) => items
                     .iter()
                     .position(|item| {
-                        crate::jq::eval::compare_values(item, output) == core::cmp::Ordering::Equal
+                        crate::jq::eval::compare_values::<S>(item, output)
+                            == core::cmp::Ordering::Equal
                     })
                     .map(|i| OwnedValue::Int(i as i64)),
                 OwnedValue::Object(map) => map
                     .iter()
                     .find(|(_, item)| {
-                        crate::jq::eval::compare_values(item, output) == core::cmp::Ordering::Equal
+                        crate::jq::eval::compare_values::<S>(item, output)
+                            == core::cmp::Ordering::Equal
                     })
                     .map(|(k, _)| OwnedValue::String(k.clone())),
                 _ => None,

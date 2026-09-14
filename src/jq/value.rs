@@ -153,6 +153,84 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     }
 }
 
+/// Convert an integer *literal* to `f64` the way real jq 1.7.1 does (#2906).
+///
+/// jq keeps every parsed number -- program text, document input,
+/// `tonumber`, `fromjson`, `--argjson` -- as an exact `decNumber` literal,
+/// and converts it to a double only when arithmetic first reads it
+/// (`jvp_literal_number_to_double`, `src/jv.c`): `decNumberReduce` under a
+/// `DEC_INIT_DECIMAL64` context whose `digits` is raised to 17
+/// (`DEC_NUBMER_DOUBLE_PRECISION`, round-half-even), `decNumberToString`,
+/// then a correctly-rounded `strtod`. That is a *double* rounding: the
+/// literal's decimal value is first rounded to 17 significant decimal
+/// digits, and only that shorter number is rounded to the nearest double.
+/// A plain `n as f64` rounds the exact integer once, and the two disagree
+/// whenever the 17-digit intermediate sits on the other side of a
+/// double's rounding boundary -- `869389897822472004` (18 digits) becomes
+/// `869389897822472000`, whose nearest double is `869389897822471936`
+/// (a tie, resolved to even), where the exact integer's nearest double is
+/// `869389897822472064`.
+///
+/// A decimal integer below `10^17` has at most 17 significant digits, so
+/// the intermediate rounding is the identity there and this is exactly
+/// `n as f64`; only 18- and 19-digit magnitudes are ever changed. The
+/// rounding unit is `10` for 18 digits and `100` for 19 (an `i64`'s
+/// magnitude is at most `2^63`, 19 digits), the tie rule is half-even on
+/// the kept digit, and `q * unit` cannot overflow a `u64` (at most
+/// `2^63 + 100`). The final `u64 as f64` is Rust's correctly-rounded
+/// integer-to-float conversion, which is what `strtod` produces for a
+/// decimal string of at most 17 digits, so no float arithmetic happens
+/// before the last step.
+///
+/// **This treats every jq-mode `Int` as a literal.** That is sound for the
+/// `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
+/// anything past `2^53` (`jq_checked_int_arith`, #2631) and `%` does the
+/// same (`jq_f64_backed_int`); an `Int` that came *from* a double
+/// (`floor`/`ceil`/`round`/`trunc`, `%`'s truncating operands) is exactly
+/// representable, and for such values this function is provably the
+/// identity -- doubles are at least 16 apart on `[10^17, 10^18)` and at
+/// least 128 apart above `10^18`, while the 17-digit rounding moves a
+/// value by at most 5 or 50, so it rounds straight back to the double it
+/// started as; unary minus and `length` produce the exact negation or
+/// magnitude of a literal, and this function is sign-symmetric; and the
+/// reindex bridge re-bakes an `Int` as a `NumberLiteral` of the same
+/// value. The one exact-`i64` producer past `2^53` that is *not* a literal
+/// is `range`, which stays on its documented exact walk
+/// (`docs/compliance/jq/limitations.md`).
+///
+/// yq mode never calls this: real yq's arithmetic is exact `int64`, so its
+/// `Int`-to-`f64` widening stays a plain cast (`int_to_f64`).
+pub(crate) fn jq_literal_int_to_f64(n: i64) -> f64 {
+    const TEN_POW_17: u64 = 100_000_000_000_000_000;
+    const TEN_POW_18: u64 = 1_000_000_000_000_000_000;
+    let magnitude = n.unsigned_abs();
+    if magnitude < TEN_POW_17 {
+        return n as f64;
+    }
+    let unit = if magnitude < TEN_POW_18 { 10 } else { 100 };
+    let (quotient, remainder) = (magnitude / unit, magnitude % unit);
+    let round_up = remainder > unit / 2 || (remainder == unit / 2 && quotient & 1 == 1);
+    let rounded = ((quotient + u64::from(round_up)) * unit) as f64;
+    if n < 0 {
+        -rounded
+    } else {
+        rounded
+    }
+}
+
+/// Widen an `Int` operand to `f64` under `S`'s number model: jq's
+/// literal rounding ([`jq_literal_int_to_f64`]) when
+/// `EvalSemantics::INT_LITERAL_ROUNDS_TO_17_DIGITS`, otherwise the plain
+/// cast real yq's `int64`-to-`float64` conversion amounts to.
+#[inline]
+pub(crate) fn int_to_f64<S: EvalSemantics>(n: i64) -> f64 {
+    if S::INT_LITERAL_ROUNDS_TO_17_DIGITS {
+        jq_literal_int_to_f64(n)
+    } else {
+        n as f64
+    }
+}
+
 /// Canonicalize a non-exponent literal's insignificant leading zero/`+`
 /// (#1224, mirroring #1180's identical fix for the exponent-notation
 /// mantissa path -- `split_mantissa`/`normalize_extreme_literal_mantissa`
@@ -2640,9 +2718,18 @@ pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
 /// - Objects compare order-insensitively (`IndexMap`'s own `PartialEq`), as in jq.
 ///
 /// Known divergence: above 2^53 a mixed `Int`/`Float` comparison widens the
-/// integer to `f64`, whereas jq 1.7 retains the decimal literal. So
-/// `9007199254740993 == 9007199254740992.0` is `true` here and `false` in jq.
-/// Every value representable exactly as an `f64` agrees.
+/// integer to `f64`, whereas jq 1.7 compares two *literals* exactly as
+/// decimals. So `9007199254740993 == 9007199254740992.0` is `true` here and
+/// `false` in jq. Every value representable exactly as an `f64` agrees. The
+/// widening itself follows jq's own literal-to-double rule
+/// ([`jq_literal_int_to_f64`], #2906), so an `Int` literal against a
+/// *computed* `Float` -- `869389897822472004 == (869389897822472004 + 0)`
+/// -- agrees with jq.
+///
+/// This is jq's rule only, and needs no `EvalSemantics`: yq's own equality
+/// (`STRICT_NUMERIC_EQUALITY`) never widens a mixed pair at all --
+/// [`owned_value_eq`] routes every yq-mode numeric pair to
+/// [`numeric_repr_eq_strict`] before this can run.
 ///
 /// `NumberLiteral` compares purely on its parsed [`NumberRepr`], never on the
 /// source text -- two spellings of the same number (`1.0` and `1e0`) are
@@ -2651,8 +2738,8 @@ pub(crate) fn numeric_repr_eq(a: NumberRepr, b: NumberRepr) -> bool {
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
         (NumberRepr::Float(a), NumberRepr::Float(b)) => a == b,
-        (NumberRepr::Int(a), NumberRepr::Float(b)) => (a as f64) == b,
-        (NumberRepr::Float(a), NumberRepr::Int(b)) => a == (b as f64),
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => jq_literal_int_to_f64(a) == b,
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => a == jq_literal_int_to_f64(b),
     }
 }
 
@@ -2774,12 +2861,20 @@ pub(crate) fn cmp_f64(a: f64, b: f64) -> core::cmp::Ordering {
 /// `unique`/`group_by` disagreeing with `==` about the same two numbers.
 ///
 /// The NaN rule (#421) is centralized in [`cmp_f64`], not repeated here.
-pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Ordering {
+///
+/// Unlike [`numeric_repr_eq`], ordering runs in both modes (`sort`, `min`,
+/// `max`, `<` all reach it under yq too), so the mixed-pair widening is
+/// mode-forked through [`int_to_f64`]: jq's literal rounding
+/// ([`jq_literal_int_to_f64`], #2906) in jq mode, the plain cast in yq mode.
+pub(crate) fn numeric_repr_cmp<S: EvalSemantics>(
+    a: NumberRepr,
+    b: NumberRepr,
+) -> core::cmp::Ordering {
     match (a, b) {
         (NumberRepr::Int(a), NumberRepr::Int(b)) => a.cmp(&b),
         (NumberRepr::Float(a), NumberRepr::Float(b)) => cmp_f64(a, b),
-        (NumberRepr::Int(a), NumberRepr::Float(b)) => cmp_f64(a as f64, b),
-        (NumberRepr::Float(a), NumberRepr::Int(b)) => cmp_f64(a, b as f64),
+        (NumberRepr::Int(a), NumberRepr::Float(b)) => cmp_f64(int_to_f64::<S>(a), b),
+        (NumberRepr::Float(a), NumberRepr::Int(b)) => cmp_f64(a, int_to_f64::<S>(b)),
     }
 }
 
@@ -2891,8 +2986,12 @@ fn owned_value_eq_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
         (OwnedValue::Int(a), OwnedValue::Int(b)) => a == b,
         (OwnedValue::Float(a), OwnedValue::Float(b)) => a == b,
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => (*a as f64) == *b,
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => *a == (*b as f64),
+        (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+            numeric_repr_eq(NumberRepr::Int(*a), NumberRepr::Float(*b))
+        }
+        (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+            numeric_repr_eq(NumberRepr::Float(*a), NumberRepr::Int(*b))
+        }
         (OwnedValue::NumberLiteral(a, _), OwnedValue::NumberLiteral(b, _)) => {
             numeric_repr_eq(*a, *b)
         }
@@ -3500,6 +3599,13 @@ mod tests {
                 OwnedValue::from_number_literal("9007199254740993"),
                 OwnedValue::Float(9007199254740992.0),
             ),
+            // #2906: an 18-digit `Int` literal against the double jq's own
+            // literal rounding produces for it (not the exact integer's
+            // nearest double, `869389897822472064.0`).
+            (
+                OwnedValue::from_number_literal("869389897822472004"),
+                OwnedValue::Float(869389897822471936.0),
+            ),
         ];
         for (a, b) in pairs {
             let are_eq = a == b;
@@ -3511,10 +3617,167 @@ mod tests {
                 "numeric_repr_eq disagrees with OwnedValue::eq for {a:?} vs {b:?}"
             );
             assert_eq!(
-                numeric_repr_cmp(ra, rb) == core::cmp::Ordering::Equal,
+                numeric_repr_cmp::<JqSemantics>(ra, rb) == core::cmp::Ordering::Equal,
                 are_eq,
                 "numeric_repr_cmp disagrees with OwnedValue::eq for {a:?} vs {b:?}"
             );
+        }
+    }
+
+    /// #2906: jq converts an integer literal to a double by first rounding
+    /// its decimal digits to 17 significant digits (half-even), then
+    /// rounding that to the nearest double. Every expectation here is the
+    /// double real jq 1.7.1 prints for `<literal> + 0`, compared bit-exact.
+    #[test]
+    fn test_jq_literal_int_to_f64_rounds_to_17_decimal_digits_2906() {
+        let cases: [(i64, f64); 16] = [
+            // Below 10^17 the 17-digit rounding is the identity.
+            (0, 0.0),
+            (9007199254740993, 9007199254740992.0),
+            (10000000000000005, 10000000000000004.0),
+            (99999999999999999, 100000000000000000.0),
+            // 10^17 itself and a tie that rounds to the even kept digit.
+            (100000000000000000, 100000000000000000.0),
+            (100000000000000005, 100000000000000000.0),
+            (100000000000000015, 100000000000000020.0),
+            // The issue's own operand: 18 digits, rounds to ...000, whose
+            // nearest double is ...1936 (tie to even), not the exact
+            // integer's nearest double ...2064.
+            (869389897822472004, 869389897822471936.0),
+            // Ties on an odd/even kept digit.
+            (123456789012345675, 123456789012345680.0),
+            (123456789012345665, 123456789012345660.0),
+            (123456789012345685, 123456789012345680.0),
+            // Carry across every digit: 18 digits become 10^18.
+            (999999999999999995, 1000000000000000000.0),
+            // 19 digits round in units of 100.
+            (1234567890123456750, 1234567890123456800.0),
+            (1234567890123456650, 1234567890123456600.0),
+            (i64::MAX, 9223372036854775808.0),
+            (i64::MIN, -9223372036854775808.0),
+        ];
+        for (n, want) in cases {
+            let got = jq_literal_int_to_f64(n);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "jq_literal_int_to_f64({n}) = {got}, want {want}"
+            );
+            // `0` negates to `-0.0` (a different bit pattern) and `i64::MIN`
+            // has no negation, so those two only check the positive side.
+            if let Some(negated) = n.checked_neg().filter(|_| n != 0) {
+                assert_eq!(
+                    jq_literal_int_to_f64(negated).to_bits(),
+                    (-want).to_bits(),
+                    "jq_literal_int_to_f64 is not sign-symmetric at {n}"
+                );
+            }
+        }
+    }
+
+    /// Hand-round the decimal spelling of `n` to 17 significant digits
+    /// (half-even) and parse the result -- an independent, string-based
+    /// route to the same double [`jq_literal_int_to_f64`] computes with
+    /// integer arithmetic, mirroring jq's own `decNumberToString` +
+    /// `strtod` shape.
+    fn round_decimal_string_to_17_digits(n: i64) -> f64 {
+        let digits: Vec<u8> = n.unsigned_abs().to_string().into_bytes();
+        if digits.len() <= 17 {
+            return n as f64;
+        }
+        let (kept, dropped) = digits.split_at(17);
+        let mut kept: Vec<u8> = kept.to_vec();
+        let first_dropped = dropped[0];
+        let rest_nonzero = dropped[1..].iter().any(|d| *d != b'0');
+        let last_kept_odd = (kept[16] - b'0') % 2 == 1;
+        let round_up =
+            first_dropped > b'5' || (first_dropped == b'5' && (rest_nonzero || last_kept_odd));
+        let mut exponent = dropped.len();
+        if round_up {
+            let mut i = 16;
+            loop {
+                if kept[i] == b'9' {
+                    kept[i] = b'0';
+                    if i == 0 {
+                        kept.insert(0, b'1');
+                        kept.pop();
+                        exponent += 1;
+                        break;
+                    }
+                    i -= 1;
+                } else {
+                    kept[i] += 1;
+                    break;
+                }
+            }
+        }
+        let sign = if n < 0 { "-" } else { "" };
+        let text = format!("{sign}{}e{exponent}", String::from_utf8(kept).unwrap());
+        text.parse::<f64>().unwrap()
+    }
+
+    /// #2906: property check of [`jq_literal_int_to_f64`] over seeded
+    /// pseudo-random `i64`s spanning every magnitude -- against the
+    /// independent string-based rounding above, sign symmetry, the
+    /// "already a double, so a no-op" lemma the helper's soundness rests
+    /// on, monotonicity, and yq mode's untouched plain cast.
+    #[test]
+    fn test_jq_literal_int_to_f64_properties_2906() {
+        // xorshift64*, seeded; no external crate needed here.
+        let mut state: u64 = 0x2906_2906_2906_2906;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut previous: Option<(i64, f64)> = None;
+        for i in 0..20_000 {
+            // Spread the samples across the 18/19-digit band and below it,
+            // rather than letting a uniform u64 land past 10^18 nearly every
+            // time.
+            let raw = next();
+            let n = match i % 4 {
+                0 => (raw % 1_000_000_000_000_000_000) as i64,
+                1 => (raw % 100_000_000_000_000_000) as i64 + 100_000_000_000_000_000,
+                2 => raw as i64,
+                _ => (raw % 1_000_000_000_000_000_000) as i64 + 1_000_000_000_000_000_000,
+            };
+            let got = jq_literal_int_to_f64(n);
+            assert_eq!(
+                got.to_bits(),
+                round_decimal_string_to_17_digits(n).to_bits(),
+                "integer and string roundings disagree at {n}"
+            );
+            if let Some(negated) = n.checked_neg().filter(|_| n != 0) {
+                assert_eq!(
+                    jq_literal_int_to_f64(negated).to_bits(),
+                    (-got).to_bits(),
+                    "not sign-symmetric at {n}"
+                );
+            }
+            let as_double = n as f64;
+            if as_double as i64 == n {
+                assert_eq!(
+                    got.to_bits(),
+                    as_double.to_bits(),
+                    "an exactly representable {n} must round to itself"
+                );
+            }
+            assert_eq!(
+                int_to_f64::<YqSemantics>(n).to_bits(),
+                as_double.to_bits(),
+                "yq mode must stay a plain cast at {n}"
+            );
+            assert_eq!(int_to_f64::<JqSemantics>(n).to_bits(), got.to_bits());
+            if let Some((prev_n, prev_got)) = previous {
+                if prev_n <= n {
+                    assert!(prev_got <= got, "not monotone: {prev_n} -> {n}");
+                } else {
+                    assert!(prev_got >= got, "not monotone: {prev_n} -> {n}");
+                }
+            }
+            previous = Some((n, got));
         }
     }
 

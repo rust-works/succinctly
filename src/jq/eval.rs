@@ -71,6 +71,12 @@ pub enum EvalTag {
 pub trait EvalSemantics: Copy + Default {
     /// If true, integer overflow wraps (yq). If false, converts to float (jq).
     const OVERFLOW_WRAPS: bool;
+    /// If true (jq), an `Int` widened to `f64` for arithmetic or ordering is
+    /// treated as a decNumber *literal* and rounded to 17 significant
+    /// decimal digits before the double conversion, matching jq 1.7.1's
+    /// `jvp_literal_number_to_double` (#2906, `jq_literal_int_to_f64`). If
+    /// false (yq), the widening is a plain cast.
+    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool;
     /// If true, division by zero returns infinity (yq). If false, returns error (jq).
     const DIV_BY_ZERO_IS_INFINITY: bool;
     /// If true (yq), `has()`/`in()`'s array-index arm accepts *any* negative
@@ -307,6 +313,7 @@ pub struct JqSemantics;
 
 impl EvalSemantics for JqSemantics {
     const OVERFLOW_WRAPS: bool = false;
+    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool = true;
     const DIV_BY_ZERO_IS_INFINITY: bool = false;
     const NEGATIVE_INDEX_IN_HAS: bool = false;
     const MOD_TRUNCATES_FLOATS: bool = true;
@@ -340,6 +347,7 @@ pub struct YqSemantics;
 
 impl EvalSemantics for YqSemantics {
     const OVERFLOW_WRAPS: bool = true;
+    const INT_LITERAL_ROUNDS_TO_17_DIGITS: bool = false;
     const DIV_BY_ZERO_IS_INFINITY: bool = true;
     const NEGATIVE_INDEX_IN_HAS: bool = true;
     const MOD_TRUNCATES_FLOATS: bool = false;
@@ -369,8 +377,9 @@ use super::expr::{
     Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
-    is_nan_sentinel, numeric_repr_cmp, owned_value_eq, NumberRepr, OwnedValue,
+    assert_value_tree_depth, infinite_float_preview_text, int_to_f64, is_infinity_sentinel,
+    is_nan_sentinel, jq_literal_int_to_f64, numeric_repr_cmp, owned_value_eq, NumberRepr,
+    OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -8796,6 +8805,23 @@ fn jq_int_within_exact_f64_range(value: i64) -> bool {
     value.unsigned_abs() <= (1u64 << 53)
 }
 
+/// Wrap a jq-mode integer *result* the way real jq holds it -- as a double.
+/// Within `f64`'s exact-integer range an `Int` is that same double and
+/// prints identically, so it stays exact; past it the value is stored as
+/// the `Float` jq would compute (`r as f64`, one correct rounding, matching
+/// C's `(double)intmax`), so it prints through
+/// [`jq_bare_float_display`]'s shortest-round-trip formatting rather than
+/// its own exact digits (#2631, #2906), and never becomes an exact `Int`
+/// past `2^53` that [`jq_literal_int_to_f64`] would later mistake for a
+/// literal.
+fn jq_f64_backed_int(result: i64) -> OwnedValue {
+    if jq_int_within_exact_f64_range(result) {
+        OwnedValue::Int(result)
+    } else {
+        OwnedValue::Float(result as f64)
+    }
+}
+
 /// Compute a jq-mode `i64`/`i64` `+`/`-`/`*` the way real jq's own,
 /// always-`f64` arithmetic would (#2631): only keep the exact `i64` result
 /// when **both operands and the result** are within `f64`'s exact-integer
@@ -8817,15 +8843,14 @@ fn jq_int_within_exact_f64_range(value: i64) -> bool {
 /// range -- no separate proof is needed once every value in play is
 /// individually exact.
 ///
-/// This deliberately does *not* attempt to correct for jq's separate,
-/// pre-existing decNumber-literal-preservation quirks once `f64_op` is
-/// reached (documented in
-/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
-/// and tracked as #2906) -- matching those exactly would mean replicating
-/// jq's full arbitrary-precision decimal arithmetic model, not just
-/// deciding when to trust an exact `i64` shortcut over it. Out of scope
-/// for #2631, which is specifically about the exact-integer-result
-/// bypassing the float formatter entirely, described above.
+/// The operands handed to `f64_op` are widened with
+/// [`jq_literal_int_to_f64`], not a bare `as f64` (#2906): both are
+/// literals in jq's number model, and jq rounds a literal to 17
+/// significant decimal digits *before* converting it to a double, which
+/// lands on a different double than the exact integer's nearest one for
+/// some 18- and 19-digit values (`869389897822472004 + 944331` is
+/// `869389897823416300` in jq, `869389897823416400` with a bare cast).
+/// Below `2^53` the two agree, so the exact fast path above is unaffected.
 ///
 /// yq mode never calls this: `S::OVERFLOW_WRAPS` gates every call site to
 /// this function's own jq-only branch, since yq's wrapping arithmetic has
@@ -8844,7 +8869,7 @@ fn jq_checked_int_arith(
         {
             OwnedValue::Int(result)
         }
-        _ => OwnedValue::Float(f64_op(a as f64, b as f64)),
+        _ => OwnedValue::Float(f64_op(jq_literal_int_to_f64(a), jq_literal_int_to_f64(b))),
     }
 }
 
@@ -8929,8 +8954,12 @@ fn arith_add<S: EvalSemantics>(
                         Ok(jq_checked_int_arith(a, b, i64::checked_add, |x, y| x + y))
                     }
                 }
-                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 + b)),
-                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a + b as f64)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                    Ok(OwnedValue::Float(int_to_f64::<S>(a) + b))
+                }
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                    Ok(OwnedValue::Float(a + int_to_f64::<S>(b)))
+                }
                 (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
                 _ => unreachable!("both operands already confirmed numeric by the guard above"),
             }
@@ -9021,8 +9050,12 @@ fn arith_sub<S: EvalSemantics>(
                         Ok(jq_checked_int_arith(a, b, i64::checked_sub, |x, y| x - y))
                     }
                 }
-                (OwnedValue::Int(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a as f64 - b)),
-                (OwnedValue::Float(a), OwnedValue::Int(b)) => Ok(OwnedValue::Float(a - b as f64)),
+                (OwnedValue::Int(a), OwnedValue::Float(b)) => {
+                    Ok(OwnedValue::Float(int_to_f64::<S>(a) - b))
+                }
+                (OwnedValue::Float(a), OwnedValue::Int(b)) => {
+                    Ok(OwnedValue::Float(a - int_to_f64::<S>(b)))
+                }
                 (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a - b)),
                 _ => unreachable!("both operands already confirmed numeric by the guard above"),
             }
@@ -9176,10 +9209,10 @@ fn arith_mul<S: EvalSemantics>(
                     }
                 }
                 (_, _, Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
-                    Ok(OwnedValue::Float(a as f64 * b))
+                    Ok(OwnedValue::Float(int_to_f64::<S>(a) * b))
                 }
                 (_, _, Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
-                    Ok(OwnedValue::Float(a * b as f64))
+                    Ok(OwnedValue::Float(a * int_to_f64::<S>(b)))
                 }
                 (_, _, Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
                     Ok(OwnedValue::Float(a * b))
@@ -9486,27 +9519,27 @@ fn arith_div<S: EvalSemantics>(
             if b == 0 {
                 if S::DIV_BY_ZERO_IS_INFINITY {
                     // yq behavior: return infinity
-                    Ok(OwnedValue::Float(a as f64 / b as f64))
+                    Ok(OwnedValue::Float(int_to_f64::<S>(a) / int_to_f64::<S>(b)))
                 } else {
                     // jq behavior: error
                     Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
                 }
             } else {
-                Ok(OwnedValue::Float(a as f64 / b as f64))
+                Ok(OwnedValue::Float(int_to_f64::<S>(a) / int_to_f64::<S>(b)))
             }
         }
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
             if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
             } else {
-                Ok(OwnedValue::Float(a as f64 / b))
+                Ok(OwnedValue::Float(int_to_f64::<S>(a) / b))
             }
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
             if b == 0 && !S::DIV_BY_ZERO_IS_INFINITY {
                 Err(EvalError::divisor_is_zero(&left, &right, BinOp::Divide))
             } else {
-                Ok(OwnedValue::Float(a / b as f64))
+                Ok(OwnedValue::Float(a / int_to_f64::<S>(b)))
             }
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
@@ -9565,18 +9598,39 @@ fn arith_mod<S: EvalSemantics>(
                 } else {
                     Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
                 }
-            } else {
+            } else if S::OVERFLOW_WRAPS {
+                // yq behavior: exact int64 remainder.
                 Ok(OwnedValue::Int(a.wrapping_rem(b)))
+            } else {
+                // jq behavior (#2906): `binop_mod` truncates each operand's
+                // *double* -- for a literal, the 17-digit-rounded one -- to
+                // `intmax_t` with a saturating cast (`dtoi`), takes the
+                // remainder, and holds the result as a double again. `as
+                // i64` is the same saturating truncation. The divisor
+                // cannot truncate to zero here (a nonzero `i64` never rounds
+                // to zero), but `% -1` must short-circuit to `0` exactly as
+                // jq does rather than trip `i64::MIN % -1`.
+                let (ai, bi) = (
+                    jq_literal_int_to_f64(a) as i64,
+                    jq_literal_int_to_f64(b) as i64,
+                );
+                if bi == 0 {
+                    Err(EvalError::divisor_is_zero(&left, &right, BinOp::Modulo))
+                } else if bi == -1 {
+                    Ok(OwnedValue::Int(0))
+                } else {
+                    Ok(jq_f64_backed_int(ai.wrapping_rem(bi)))
+                }
             }
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Float(b))) => {
             mod_floats::<S>(a, b, &left, &right)
         }
         (Some(NumberRepr::Int(a)), Some(NumberRepr::Float(b))) => {
-            mod_floats::<S>(a as f64, b, &left, &right)
+            mod_floats::<S>(int_to_f64::<S>(a), b, &left, &right)
         }
         (Some(NumberRepr::Float(a)), Some(NumberRepr::Int(b))) => {
-            mod_floats::<S>(a, b as f64, &left, &right)
+            mod_floats::<S>(a, int_to_f64::<S>(b), &left, &right)
         }
         _ => Err(EvalError::binary_op(&left, &right, BinOp::Modulo)),
     }
@@ -9602,8 +9656,9 @@ fn mod_floats<S: EvalSemantics>(
         if bi == 0 {
             Err(EvalError::divisor_is_zero(left, right, BinOp::Modulo))
         } else {
-            // wrapping_rem: i64::MIN % -1 must not panic.
-            Ok(OwnedValue::Int(ai.wrapping_rem(bi)))
+            // wrapping_rem: i64::MIN % -1 must not panic. jq holds the
+            // remainder as a double, so past 2^53 it is a `Float` (#2906).
+            Ok(jq_f64_backed_int(ai.wrapping_rem(bi)))
         }
     } else if b == 0.0 && !S::DIV_BY_ZERO_IS_INFINITY {
         Err(EvalError::divisor_is_zero(left, right, BinOp::Modulo))
@@ -9659,10 +9714,10 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
     match op {
         CompareOp::Eq => owned_value_eq::<S>(left, right),
         CompareOp::Ne => !owned_value_eq::<S>(left, right),
-        CompareOp::Lt => compare_values(left, right) == core::cmp::Ordering::Less,
-        CompareOp::Le => compare_values(left, right) != core::cmp::Ordering::Greater,
-        CompareOp::Gt => compare_values(left, right) == core::cmp::Ordering::Greater,
-        CompareOp::Ge => compare_values(left, right) != core::cmp::Ordering::Less,
+        CompareOp::Lt => compare_values::<S>(left, right) == core::cmp::Ordering::Less,
+        CompareOp::Le => compare_values::<S>(left, right) != core::cmp::Ordering::Greater,
+        CompareOp::Gt => compare_values::<S>(left, right) == core::cmp::Ordering::Greater,
+        CompareOp::Ge => compare_values::<S>(left, right) != core::cmp::Ordering::Less,
     }
 }
 
@@ -9691,8 +9746,11 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
 /// left-to-right) and `unique`'s/`unique_by`'s `dedup_by` only compares
 /// adjacent elements, so neither has any panic surface at all. See
 /// `test_sort_many_nans_does_not_panic_421`.
-pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp::Ordering {
-    compare_values_at_depth(left, right, 0)
+pub(crate) fn compare_values<S: EvalSemantics>(
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> core::cmp::Ordering {
+    compare_values_at_depth::<S>(left, right, 0)
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
@@ -9702,7 +9760,7 @@ pub(crate) fn compare_values(left: &OwnedValue, right: &OwnedValue) -> core::cmp
 /// `repeat` build up at query-evaluation time bypasses #998's
 /// document-input guards entirely: no adversarial document is involved,
 /// only enough loop iterations to grow the accumulator past the limit.
-fn compare_values_at_depth(
+fn compare_values_at_depth<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
     depth: usize,
@@ -9721,25 +9779,24 @@ fn compare_values_at_depth(
     match (left, right) {
         (OwnedValue::Null, OwnedValue::Null) => Ordering::Equal,
         (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a.cmp(b),
-        (OwnedValue::Int(a), OwnedValue::Int(b)) => a.cmp(b),
-        (OwnedValue::Float(a), OwnedValue::Float(b)) => cmp_f64(*a, *b),
-        (OwnedValue::Int(a), OwnedValue::Float(b)) => cmp_f64(*a as f64, *b),
-        (OwnedValue::Float(a), OwnedValue::Int(b)) => cmp_f64(*a, *b as f64),
-        // A `NumberLiteral` operand compares by its parsed value, exactly
-        // like `Int`/`Float` -- ordering never looks at the source text.
-        // `numeric_repr_cmp` dispatches on the same `(Int,Int)`/`(Float,Float)`/
-        // mixed pairing `==` uses (`numeric_repr_eq`), so ordering can't
-        // disagree with equality about the same pair (see its doc comment).
-        (OwnedValue::NumberLiteral(..), _) | (_, OwnedValue::NumberLiteral(..)) => {
-            match (left.number_repr(), right.number_repr()) {
-                (Some(a), Some(b)) => numeric_repr_cmp(a, b),
-                _ => Ordering::Equal,
-            }
-        }
+        // Every numeric pairing -- `Int`, `Float`, or `NumberLiteral` in any
+        // combination -- compares by parsed value through one dispatch;
+        // ordering never looks at a literal's source text.
+        // `numeric_repr_cmp` uses the same `(Int,Int)`/`(Float,Float)`/mixed
+        // pairing `==` uses (`numeric_repr_eq`), so ordering can't disagree
+        // with equality about the same pair (see its doc comment), and its
+        // mixed arms widen an `Int` under `S`'s number model (#2906).
+        (
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+        ) => match (left.number_repr(), right.number_repr()) {
+            (Some(a), Some(b)) => numeric_repr_cmp::<S>(a, b),
+            _ => Ordering::Equal,
+        },
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
             for (av, bv) in a.iter().zip(b.iter()) {
-                match compare_values_at_depth(av, bv, depth + 1) {
+                match compare_values_at_depth::<S>(av, bv, depth + 1) {
                     Ordering::Equal => continue,
                     other => return other,
                 }
@@ -9758,7 +9815,7 @@ fn compare_values_at_depth(
                 other => return other,
             }
             for k in a_keys {
-                match compare_values_at_depth(&a[k], &b[k], depth + 1) {
+                match compare_values_at_depth::<S>(&a[k], &b[k], depth + 1) {
                     Ordering::Equal => continue,
                     other => return other,
                 }
@@ -10235,8 +10292,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::All => builtin_all::<W, S>(value, optional),
         Builtin::AllF(cond) => builtin_all_f::<W, S>(cond, value, optional),
         Builtin::AllCond(gen, cond) => builtin_all_cond::<W, S>(gen, cond, value, optional),
-        Builtin::Min => builtin_min::<W>(value, optional),
-        Builtin::Max => builtin_max::<W>(value, optional),
+        Builtin::Min => builtin_min::<W, S>(value, optional),
+        Builtin::Max => builtin_max::<W, S>(value, optional),
         Builtin::MinBy(f) => builtin_min_by::<W, S>(f, value, optional),
         Builtin::MaxBy(f) => builtin_max_by::<W, S>(f, value, optional),
 
@@ -10293,7 +10350,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
         Builtin::Unique => builtin_unique::<W, S>(value, optional),
         Builtin::UniqueBy(f) => builtin_unique_by::<W, S>(f, value, optional),
-        Builtin::Sort => builtin_sort::<W>(value, optional),
+        Builtin::Sort => builtin_sort::<W, S>(value, optional),
         Builtin::SortBy(f) => builtin_sort_by::<W, S>(f, value, optional),
 
         // Phase 5: Object Functions
@@ -11832,7 +11889,7 @@ fn builtin_all_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: min
-fn builtin_min<W: Clone + AsRef<[u64]>>(
+fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -11849,7 +11906,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
                 return QueryResult::Owned(OwnedValue::Null);
             }
 
-            let min = items.into_iter().min_by(compare_values).unwrap();
+            let min = items.into_iter().min_by(compare_values::<S>).unwrap();
             QueryResult::Owned(min)
         }
         // #1755: a decode failure on the scalar itself must raise
@@ -11862,7 +11919,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: max
-fn builtin_max<W: Clone + AsRef<[u64]>>(
+fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -11877,7 +11934,7 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
                 return QueryResult::Owned(OwnedValue::Null);
             }
 
-            let max = items.into_iter().max_by(compare_values).unwrap();
+            let max = items.into_iter().max_by(compare_values::<S>).unwrap();
             QueryResult::Owned(max)
         }
         // #1755: same reasoning as builtin_min's own scalar arm above.
@@ -12005,7 +12062,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_del`'s doc comment for the shared reasoning.
             let (_, v) = keyed
                 .into_iter()
-                .min_by(|(a, _), (b, _)| compare_values(a, b))
+                .min_by(|(a, _), (b, _)| compare_values::<S>(a, b))
                 .unwrap();
             let min = match to_owned(&v) {
                 Ok(v) => v,
@@ -12073,7 +12130,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_min_by`'s sibling comment above.
             let (_, v) = keyed
                 .into_iter()
-                .max_by(|(a, _), (b, _)| compare_values(a, b))
+                .max_by(|(a, _), (b, _)| compare_values::<S>(a, b))
                 .unwrap();
             let max = match to_owned(&v) {
                 Ok(v) => v,
@@ -13227,7 +13284,8 @@ fn flatten_owned_at_depth<S: EvalSemantics>(
     for item in items {
         match item {
             OwnedValue::Array(inner)
-                if compare_values(&depth, &OwnedValue::Int(0)) != core::cmp::Ordering::Equal =>
+                if compare_values::<S>(&depth, &OwnedValue::Int(0))
+                    != core::cmp::Ordering::Equal =>
             {
                 let next_depth = arith_sub::<S>(depth.clone(), OwnedValue::Int(1))?;
                 result.extend(flatten_owned_at_depth::<S>(
@@ -13280,7 +13338,7 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // text with no yq oracle behind it.
                 ref other
                     if S::TAG == EvalTag::Jq
-                        && compare_values(other, &OwnedValue::Int(0))
+                        && compare_values::<S>(other, &OwnedValue::Int(0))
                             == core::cmp::Ordering::Less =>
                 {
                     return QueryResult::Error(EvalError::new(
@@ -13384,7 +13442,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
 
             // Group consecutive items with same key
             let mut groups: Vec<OwnedValue> = Vec::new();
@@ -13466,7 +13524,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut items = to_owned_vec_or_suppress!(elements, optional);
 
             // Sort first (jq's unique returns sorted unique values)
-            items.sort_by(compare_values);
+            items.sort_by(compare_values::<S>);
 
             // Remove consecutive duplicates. `owned_value_eq::<S>`, not
             // `compare_values(..) == Equal` (#950 review, same reasoning
@@ -13558,7 +13616,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
 
             // Remove consecutive duplicates by key. `owned_value_eq::<S>`,
             // not `compare_values(..) == Equal` (#950 review, same
@@ -13592,7 +13650,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: sort - sort array
-fn builtin_sort<W: Clone + AsRef<[u64]>>(
+fn builtin_sort<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -13603,7 +13661,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
             // #2327: to_owned_vec_or_suppress!, not a bare match -- see
             // `builtin_del`'s doc comment for the shared reasoning.
             let mut items = to_owned_vec_or_suppress!(elements, optional);
-            items.sort_by(compare_values);
+            items.sort_by(compare_values::<S>);
             QueryResult::Owned(OwnedValue::Array(items))
         }
         // #1755: a decode failure on the scalar itself must raise
@@ -13663,7 +13721,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result))
@@ -42239,7 +42297,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("Invalid path in streaming format"));
         };
         let path_len = OwnedValue::Int(path.len() as i64);
-        if compare_values(&path_len, &depth) == core::cmp::Ordering::Greater {
+        if compare_values::<S>(&path_len, &depth) == core::cmp::Ordering::Greater {
             // Reachable non-number depths here are only null/bool (jq order:
             // null < bool < number < ...), never string/array/object, since
             // a number never sorts above those. Both null and bool slice as
@@ -43009,7 +43067,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// simultaneous, so each index resolves against the length the array had
 /// *before* any sibling was removed. `delpaths([[-1],[-2]])` is `[10,20]`, not
 /// the `[10,30]` that deleting one at a time gives (#398).
-fn delete_paths_sorted(
+fn delete_paths_sorted<S: EvalSemantics>(
     mut value: OwnedValue,
     paths: &[&[OwnedValue]],
     start: usize,
@@ -43024,7 +43082,8 @@ fn delete_paths_sorted(
     while i < paths.len() {
         let key = &paths[i][start];
         let mut j = i + 1;
-        while j < paths.len() && compare_values(&paths[j][start], key) == core::cmp::Ordering::Equal
+        while j < paths.len()
+            && compare_values::<S>(&paths[j][start], key) == core::cmp::Ordering::Equal
         {
             j += 1;
         }
@@ -43034,7 +43093,7 @@ fn delete_paths_sorted(
         if paths[i].len() == start + 1 {
             del_keys.push(key);
         } else {
-            value = delete_paths_under(value, key, &paths[i..j], start + 1, yq_mode)?;
+            value = delete_paths_under::<S>(value, key, &paths[i..j], start + 1, yq_mode)?;
         }
         i = j;
     }
@@ -43043,7 +43102,7 @@ fn delete_paths_sorted(
 
 /// Recurse into the child of `value` under `key`. A key that names nothing is
 /// a no-op, as it is in jq — `{"a":1} | delpaths([["b","c"]])` is `{"a":1}`.
-fn delete_paths_under(
+fn delete_paths_under<S: EvalSemantics>(
     value: OwnedValue,
     key: &OwnedValue,
     paths: &[&[OwnedValue]],
@@ -43058,7 +43117,7 @@ fn delete_paths_under(
                     // jq leaves an existing key where it was, and `IndexMap`
                     // would move it to the end after a `shift_remove`.
                     let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = delete_paths_sorted(old, paths, start, yq_mode)?;
+                    *slot = delete_paths_sorted::<S>(old, paths, start, yq_mode)?;
                 }
                 Ok(OwnedValue::Object(entries))
             }
@@ -43083,7 +43142,8 @@ fn delete_paths_under(
             OwnedValue::Object(desc) => {
                 let range = SliceBounds::from_descriptor(desc)?.resolve(arr.len());
                 let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                let OwnedValue::Array(items) = delete_paths_sorted(sub, paths, start, yq_mode)?
+                let OwnedValue::Array(items) =
+                    delete_paths_sorted::<S>(sub, paths, start, yq_mode)?
                 else {
                     unreachable!("deleting from an array yields an array")
                 };
@@ -43111,11 +43171,12 @@ fn delete_paths_under(
                 match resolve_delete_index(key, arr.len()) {
                     DeleteIndexResolution::InRange(index) => {
                         let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
-                        arr[index] = delete_paths_sorted(old, paths, start, yq_mode)?;
+                        arr[index] = delete_paths_sorted::<S>(old, paths, start, yq_mode)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
                         pad_with_nulls(&mut arr, index)?;
-                        arr[index] = delete_paths_sorted(OwnedValue::Null, paths, start, yq_mode)?;
+                        arr[index] =
+                            delete_paths_sorted::<S>(OwnedValue::Null, paths, start, yq_mode)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
                 }
@@ -49173,7 +49234,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // time instead of handing the whole (sorted) batch to
     // `delete_paths_sorted` in one call.
     if S::TAG != EvalTag::Yq {
-        paths.sort_by(compare_values);
+        paths.sort_by(compare_values::<S>);
     }
 
     // Every survivor of the `retain` is an array, so this only re-borrows.
@@ -49216,7 +49277,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     root_deleted = true;
                     OwnedValue::Null
                 } else {
-                    delete_paths_sorted(v, core::slice::from_ref(&path), 0, true)?
+                    delete_paths_sorted::<S>(v, core::slice::from_ref(&path), 0, true)?
                 };
             }
             Ok(v)
@@ -49230,7 +49291,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             None => to_owned(value),
             Some([]) => Ok(OwnedValue::Null),
             // STYLE-0012: see the note above `root_deleted`.
-            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, false)),
+            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted::<S>(v, &paths, 0, false)),
         }
     };
     match result {
@@ -50347,7 +50408,7 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         // Real yq has no `bsearch` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
-        |x| bsearch_one_target::<W>(value.clone(), x, optional),
+        |x| bsearch_one_target::<W, S>(value.clone(), x, optional),
     )
 }
 
@@ -50356,7 +50417,7 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// Takes `value` by value because the array arm consumes the element cursor by
 /// move; the fan-out loop clones the cursor per iteration.
-fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
+fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     x: OwnedValue,
     optional: bool,
@@ -50412,7 +50473,7 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
         // copy that used to live here lacked `(Array, Array)` and
         // `(Object, Object)` arms, so every pair of containers compared Equal
         // and `bsearch` reported absent values as found (#384).
-        match compare_values(&elements[mid as usize], &x) {
+        match compare_values::<S>(&elements[mid as usize], &x) {
             core::cmp::Ordering::Equal => return QueryResult::Owned(OwnedValue::Int(mid)),
             core::cmp::Ordering::Less => lo = mid + 1,
             core::cmp::Ordering::Greater => hi = mid - 1,
@@ -87556,14 +87617,14 @@ mod tests {
         let under_a = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let under_b = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         assert_eq!(
-            compare_values(&under_a, &under_b),
+            compare_values::<JqSemantics>(&under_a, &under_b),
             core::cmp::Ordering::Equal
         );
 
         let over_a = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            compare_values(&over_a, &over_b)
+            compare_values::<JqSemantics>(&over_a, &over_b)
         }));
         assert!(
             result.is_err(),
