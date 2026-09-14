@@ -4298,6 +4298,26 @@ The context that makes the loss survivable is the one #2168's entry states: succ
 already diverges on this whole class of document through `.` itself, deliberately, and a
 user who wants jq's rejection has `--validate` and `succinctly json validate`.
 
+**A raw control character is the one fault in this class that is caught document-wide
+(#2878), and it is not an exception to the rule above.** "A filter validates only what it
+materializes" governs the *filter*; it has never described the **document splitter**, which
+runs on every input ahead of any filter and already rejected an unterminated string or
+container there (`[1,2,` and `"unterminated` both exit 5 under `1+1`, matching jq). #2878
+added an unescaped `U+0000`-`U+001F` inside a string to that same splitter class, so
+`1+1` on `["a<TAB>b"]` now exits 5 as jq does, rather than answering `2`.
+
+It is affordable where up-front validation is not for the reason that section's cost
+argument turns on: `find_json_values` already inspects every byte of every string, so the
+rule rides a scan the input pays for anyway — no "second index-building pass". It is also
+the *stricter*, jq-matching direction, so it recovers fidelity in this table rather than
+spending more of it.
+
+The resulting asymmetry is real and deliberate: a raw control character is caught
+document-wide, while a malformed *member* still is not (`{invalid}` stays at exit 0 under
+`1+1`, where jq exits 5 — the row above). The line between them is the same cost-driven one
+this section already draws. `0x7F` is on the accepting side of it in both tools, since jq's
+own check compares a signed char.
+
 **The materializing flag routes still validate whatever the filter — down to `-s` and
 `-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)
 for `-S`/`-a`/`-C`.** `-S` (sort keys), `-a` (ASCII output) and `-C` (color) used to force
