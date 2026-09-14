@@ -4961,9 +4961,18 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult
 /// The `OwnedValue`-collecting analog of [`push_truthiness`]: pushes every
 /// output `result` produced into `out`, returning any terminating `Control`
 /// instead of collapsing to the first output the way [`result_to_owned`]
-/// does. Used by [`eval_binary_fanout`] (#768) to fork an arithmetic/
-/// comparison operand into all of its outputs, mirroring how `push_truthiness`
-/// already forks `and`/`or`'s operands.
+/// does.
+///
+/// #768 introduced this for [`eval_binary_fanout`]'s own arithmetic/
+/// comparison operand fork, mirroring how `push_truthiness` already forks
+/// `and`/`or`'s operands -- #1972 (`test_binary_fanout_raises_on_operand_decode_failure_1972`,
+/// this module's own tests) later moved `eval_binary_fanout` onto
+/// [`binary_fanout_each`]'s checked `Item::into_owned` instead, so this
+/// function's real caller today is [`eval_owned_multi_keep_partial`]
+/// (`in(xs)`, `limit`, pattern alternatives, `if`/`select` conditions,
+/// `resolve_leaf`'s general leaf case) -- #1908 audit, this doc comment
+/// having gone stale after #1972 landed is exactly the kind of drift that
+/// audit exists to catch.
 fn push_owned_values_lossy<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     out: &mut Vec<OwnedValue>,
@@ -57219,13 +57228,26 @@ mod tests {
         );
     }
 
-    /// #1908 audit: `. as $doc | .a |= $doc.b`'s update-filter evaluation
-    /// (`update_path`'s `Expr::Identity` arm -> `eval_owned_multi_first` ->
-    /// `collect_owned`, `to_owned_lossy`-based) reads a document leaf
-    /// (`$doc.b`) *other than* the path being updated -- confirmed live:
-    /// raises rather than silently writing `"\u{FFFD}"` into the document.
+    /// #1908 audit: `update_path`'s `Expr::Identity` arm calls
+    /// `eval_owned_multi_first(filter_expr, root)` with `root: &mut
+    /// OwnedValue` -- by the time `update_path` runs, the whole document is
+    /// already a fully-materialized `OwnedValue` (`eval_update`'s own
+    /// top-level entry, via the checked, non-lossy conversion #1902/#1934
+    /// already cover), never a borrowed cursor. So `eval_owned_multi_first`
+    /// -> `collect_owned`'s `to_owned_lossy` arms are exercised by every
+    /// `|=` here, but can never actually meet undecodable *bytes* at this
+    /// call site: there is no borrowed cursor left to be lossy about by the
+    /// time this code runs, structurally the same "fed exclusively by an
+    /// already-owned document" reasoning `to_owned_lossy`'s own doc comment
+    /// gives the reindex-bridge sites, not a new individually-justified
+    /// value-reading risk. Confirmed live: `. as $doc | .a |= $doc.b` on a
+    /// document where `.b` is undecodable UTF-8 raises `decode_failure` --
+    /// from the eager `. as $doc` bind materializing the *whole* document
+    /// up front (verified independently: `. as $doc | 1`, whose body never
+    /// references `$doc` at all, raises the identical error), not from
+    /// `collect_owned` itself, which never sees the raw bytes.
     #[test]
-    fn test_update_path_multi_first_raises_on_decode_failure_1908() {
+    fn test_update_path_identity_arm_root_is_always_owned_1908() {
         query!(
             b"{\"a\":1,\"b\":\"\xff\xfe\"}",
             ". as $doc | .a |= $doc.b",
