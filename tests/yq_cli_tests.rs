@@ -46834,31 +46834,40 @@ fn test_tonumber_reports_one_error_family_in_yq_mode_2878() -> Result<()> {
 /// answer should contain the single value `0`.
 #[test]
 fn range_bound_positional_builtin_resolves_on_every_route_2803() -> Result<()> {
-    let doc = "a: {b: 1, c: 2}\n";
+    // `aa` (length 2) for the container and `bbb` (length 3) for a member,
+    // deliberately *different* lengths: with a uniform `a`/`b`/`c` document
+    // every key is length 1, so the `map_values` row below would pass whether
+    // the bound resolved at the container's key or at each member's own
+    // (#2803 review). Here they disagree, so only the right one passes.
+    let doc = "aa: {bbb: 1, c: 2}\n";
     let args = ["-o=json", "-I=0", "--jq-extensions"];
 
     for (filter, want, route) in [
         // Already correct before #2803 -- the direct route #2698 fixed, kept
         // here so a regression in it fails beside the rows it explains.
-        (".a | [(key|length)]", "[1]", "direct read, no range"),
+        (".aa | [(key|length)]", "[2]", "direct read, no range"),
         (
-            ".a | [range(0;(key|length))]",
-            "[0]",
+            ".aa | [range(0;(key|length))]",
+            "[0,1]",
             "direct range (#2698)",
         ),
         (
-            ".a | .b = [range(0;(key|length))]",
-            r#"{"b":[0],"c":2}"#,
+            ".aa | .bbb = [range(0;(key|length))]",
+            r#"{"bbb":[0,1],"c":2}"#,
             "assignment RHS",
         ),
         (
-            r#".a | "\([range(0;(key|length))])""#,
-            r#""[0]""#,
+            r#".aa | "\([range(0;(key|length))])""#,
+            r#""[0,1]""#,
             "string interpolation",
         ),
+        // Discriminating on purpose: each member's bound resolves at that
+        // member's *own* key (`bbb` -> 3, `c` -> 1), not at the container's
+        // (`aa` -> 2). All three lengths differ, so a bound resolved at the
+        // wrong position cannot produce this answer.
         (
-            ".a | map_values([range(0;(key|length))])",
-            r#"{"b":[0],"c":[0]}"#,
+            ".aa | map_values([range(0;(key|length))])",
+            r#"{"bbb":[0,1,2],"c":[0]}"#,
             "map_values body",
         ),
     ] {
@@ -46919,7 +46928,8 @@ fn range_bound_positional_builtin_resolves_in_jq_mode_2803() -> Result<()> {
         assert_eq!(
             (out.trim(), code),
             (want, 0),
-            "#2803 [jq mode, {route}]: `{filter}` -- a stubbed `key` is `null`              in jq mode, so the bound raises rather than answering"
+            "#2803 [jq mode, {route}]: `{filter}` -- a stubbed `key` is `null` in \
+             jq mode, so the bound raises rather than answering"
         );
     }
     Ok(())
@@ -46944,5 +46954,58 @@ fn range_bound_line_builtin_still_resolves_2803() -> Result<()> {
         ("[0]", 0),
         "#2803: `line` inside a range bound"
     );
+    Ok(())
+}
+
+/// #2803 (review): resolving a positional read materializes the node, and a
+/// range-wrapped read is no exception -- it now behaves like every other
+/// spelling rather than being the one that kept YAML formatting by accident.
+///
+/// A pipe carrying a positional read takes the owned-identity route, which
+/// rebuilds the node it emits, so anchors, aliases, comments, flow style and
+/// quoting are lost. That is pre-existing and not specific to `range`:
+/// measured against `main`, `if false then [(key|length)] else . end`,
+/// `... [(key|length)+1] ...` and bare `... (key) ...` all already lose them,
+/// whether or not the branch executes.
+///
+/// `range`-wrapped reads were the sole exception, and only because they were
+/// *broken*: refused the position-aware route, they fell back to the eager
+/// evaluator, which preserved the formatting and answered wrongly -- the very
+/// bug #2803 reports. Joining the correct route necessarily joins this cost.
+///
+/// Pinned here rather than left implicit, because it is the one user-visible
+/// behaviour this fix changes beyond the answers it corrects.
+#[test]
+fn positional_read_materializes_and_drops_yaml_formatting_2803() -> Result<()> {
+    let doc = "top:\n  d: &x {p: 1}  # anchor comment\n  e: *x\n  f: \"q\"\n";
+    let args = ["--jq-extensions"];
+
+    // The baseline: no positional read anywhere, so the node streams from the
+    // cursor and everything survives. This row is what makes the rows below
+    // evidence of the *read*, not of `if`/`range` themselves.
+    let (out, code) = run_yq_stdin(".top | if false then [range(0;1)] else . end", doc, &args)?;
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("&x") && out.contains("*x") && out.contains("# anchor comment"),
+        "a constant bound must not materialize; got:\n{out}"
+    );
+
+    // Every spelling that carries a positional read materializes, including
+    // the two that already did so on `main` -- listed together so a future
+    // change that restores preservation for one of them has to explain why
+    // the others differ.
+    for filter in [
+        ".top | if false then [range(0;(key|length))] else . end",
+        ".top | if false then [(key|length)] else . end",
+        ".top | if false then [(key|length)+1] else . end",
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert!(
+            !out.contains("&x") && !out.contains("# anchor comment"),
+            "`{filter}`: a resolved positional read rebuilds the node, so the \
+             anchor and comment are expected to be gone; got:\n{out}"
+        );
+    }
     Ok(())
 }
