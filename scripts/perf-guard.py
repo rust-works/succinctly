@@ -136,6 +136,7 @@ FIXTURE_SEED = 20260101
 # and reuses it, rather than regenerating an identical file per row.
 QUERIES = [
     ("wide_keys_unsorted", "wide", "2mb", "jq", "keys_unsorted"),
+    ("wide_escaped_keys_unsorted", "wide-escaped-keys", "2mb", "jq", "keys_unsorted"),
     ("wide_identity", "wide", "2mb", "jq", "."),
     ("users_keys_unsorted", "users", "2mb", "jq", "keys_unsorted"),
     ("users_identity", "users", "2mb", "jq", "."),
