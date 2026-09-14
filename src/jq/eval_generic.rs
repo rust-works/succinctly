@@ -19159,8 +19159,17 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // #2803: the rewriter's half of `path_context_resolvable`'s own
         // `Expr::Range` arm -- one rewrite per bound, so `range(0; key|length)`
         // at a resolved position comes out with no path context left in it.
-        // The two halves must stay in step; see
-        // `path_context_absent_resolution_clears_path_context_2416`.
+        //
+        // The two halves must stay in step: the gate promising to resolve a
+        // shape the rewriter cannot rewrite leaves an unresolved `key` for
+        // the `other` arm below, which only a `debug_assert!` catches -- so
+        // in a release build it would evaluate rather than fail.
+        // `range_bound_positional_builtin_resolves_on_every_route_2803` and
+        // its jq-mode sibling are what hold them together: deleting this arm
+        // makes both fail (on that assert). Deliberately *not*
+        // `path_context_absent_resolution_clears_path_context_2416`, whose
+        // filter list is hard-coded with no `range` row and stays green
+        // without this arm (#2803 review).
         Expr::Range { from, to, step } => Expr::Range {
             from: boxed(from)?,
             to: to.as_deref().map(boxed).transpose()?,
