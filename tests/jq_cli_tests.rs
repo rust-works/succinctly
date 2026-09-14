@@ -17342,6 +17342,193 @@ fn test_resolve_index_expr_target_escape_stops_key_generator_2267() -> Result<()
     Ok(())
 }
 
+/// #2267: an assignment applies each write as its path resolves, so the
+/// first write that fails validation stops the path generator -- jq's own
+/// `reduce path(paths) as $p (.; setpath($p; $value))` never asks for a
+/// later path, and the side effects producing it would have fired never
+/// fire.
+///
+/// The slice spelling (repro A on the issue), captured live from jq 1.7.1:
+/// assigning a non-array to an array slice is a failure `setpath` always
+/// raises, on the very first `(s, t)` pair, so `stderr` fires once out of
+/// the four pairs the cross product would have produced.
+#[test]
+fn test_assign_write_failure_stops_slice_pair_generator_2267() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.|stderr)[(0,1):(2,3)] = 99"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a failed write emits no document");
+    // Count, not just content: the divergence was 4 firings where jq has 1,
+    // and both spellings produce the identical error message either way.
+    let fired = stderr.matches("[10,20,30]").count();
+    assert_eq!(
+        fired, 1,
+        "target fired {fired} times, jq 1.7.1 fires 1: stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("A slice of an array can only be assigned another array"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2267: the index spelling of the same rule (repro B on the issue), whose
+/// existence the issue asked for and did not assume -- `path(.[-1])` on
+/// `null` resolves fine and only `setpath` rejects it, which is what
+/// isolates the write-time gate from the resolution-time one.
+///
+/// jq 1.7.1 fires `stderr` once for the two keys; this fired twice.
+#[test]
+fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"(.|stderr)[(-1,-2)] = 1"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    let fired = stderr.matches("null").count();
+    assert_eq!(
+        fired, 1,
+        "target fired {fired} times, jq 1.7.1 fires 1: stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Out of bounds negative array index"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2267: a *successful* multi-path write still applies every path and
+/// still fires the target once per path. The short-circuit above is a
+/// property of a failing write, not of streaming -- without this, a fix
+/// that simply stopped after the first path would pass both tests above.
+#[test]
+fn test_assign_streams_every_path_when_writes_succeed_2267() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"(.|stderr)[("a","b")] = 1"#], Some("{}"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
+    assert_eq!(
+        stderr.matches("{}").count(),
+        2,
+        "jq 1.7.1 fires the target once per path: stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2267: the path generator resolves against the document as it was, not
+/// against the one the writes are accumulating into -- jq's `reduce`
+/// evaluates its source against the outer `.` while the accumulator moves
+/// underneath it.
+///
+/// Observable, not a formality: resolving the second `.a` against the
+/// *written* document would read back `5` and raise `Cannot index object
+/// with number`. jq 1.7.1 answers `{"a":"b","b":5}`.
+#[test]
+fn test_assign_streaming_resolves_against_the_unwritten_document_2267() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#".[(.a,.a)] = 5"#], Some(r#"{"a":"b","b":1}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":\"b\",\"b\":5}\n");
+
+    Ok(())
+}
+
+/// #2267: a bounded consumer's demand now reaches the computed-navigation
+/// generators themselves -- the "stopping from above" gap
+/// `resolve_slice_expr`'s own body comment recorded as still open, closed by
+/// giving `E[K]`/`E[S:T]` native `resolve_node_sink` arms.
+///
+/// Both rows captured live from jq 1.7.1. Before this, every `s`/`k` was
+/// evaluated regardless of how few paths the consumer asked for.
+#[test]
+fn test_bounded_consumer_stops_computed_path_generators_2267() -> Result<()> {
+    for (filter, input, expected_stdout, absent) in [
+        (
+            r#"[first(path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|debug("t"))]))]"#,
+            "[10,20,30]",
+            "[[{\"start\":0,\"end\":2}]]\n",
+            "s1",
+        ),
+        (
+            r#"[first(path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))]))]"#,
+            r#"{"a":1,"b":2}"#,
+            "[[\"a\"]]\n",
+            "kb",
+        ),
+        // `limit(1; ...)` is the same stop through a different consumer.
+        (
+            r#"[limit(1; path((.|debug("E"))[("a"|debug("ka")),("b"|debug("kb"))]))]"#,
+            r#"{"a":1,"b":2}"#,
+            "[[\"a\"]]\n",
+            "kb",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, expected_stdout, "{filter}");
+        assert!(
+            !stderr.contains(absent),
+            "{filter}: `{absent}` must never be evaluated: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2267 (must-not-change): the three conditions gating the streaming write,
+/// each pinned by the shape that would take the eager route if it were
+/// dropped.
+///
+/// A static path has no generator to stop, a multi-output RHS must keep the
+/// eager route (step 2's backed-out regression class), and `|=`/`del()`/
+/// `path()` do not go through `eval_assign` at all. Every expectation here
+/// is jq 1.7.1's, and every one of them also held before the streaming
+/// write existed -- that is the point of the test.
+#[test]
+fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<()> {
+    for (filter, input, expected_stdout, expected_fired) in [
+        // Static path: one path, no prepass, eager route.
+        (r#"(.|stderr).a = 5"#, r#"{"a":1}"#, "{\"a\":5}\n", 1),
+        // Multi-output RHS: eager route, and still the *pre-existing*
+        // twice-not-four-times count step 2 would have changed (#2267's own
+        // `limitations.md` entry), deliberately unchanged here.
+        (
+            r#"(.|stderr)[("a","b")] = (1,2)"#,
+            "{}",
+            "{\"a\":1,\"b\":1}\n{\"a\":2,\"b\":2}\n",
+            2,
+        ),
+        // `+=`/`//=` route through `eval_update_multi`, not `eval_assign`.
+        (
+            r#"(.|stderr)[("a","b")] += 1"#,
+            r#"{"a":1,"b":2}"#,
+            "{\"a\":2,\"b\":3}\n",
+            2,
+        ),
+        (
+            r#"(.|stderr)[("a","b")] //= 7"#,
+            r#"{"a":null,"b":2}"#,
+            "{\"a\":7,\"b\":2}\n",
+            2,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout, expected_stdout, "{filter}");
+        let fired = stderr.matches(input).count();
+        assert_eq!(
+            fired, expected_fired,
+            "{filter}: target fired {fired} times, expected {expected_fired}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2267 (must-not-change): the write paths whose target must still be
 /// resolved exactly once per path -- not once per (RHS output x path).
 ///
@@ -45055,6 +45242,25 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             "jq: error (at <stdin>:0): Cannot index number with string \"d\"\n".to_string(),
             5,
         ),
+        // #2267: a generator in *index* position, which #2925 recorded as
+        // one of two shapes that still collected after #2908. `E[K]`/
+        // `E[S:T]` are native `resolve_node_sink` arms now, so the stop
+        // reaches the key and bound generators too. Both rows captured live
+        // from jq 1.7.1; both wrote every generator's side effect before.
+        (
+            r#"{"a":1,"b":2}"#,
+            r#"[limit(1; path(.[("a"|stderr),("b"|stderr)]))]"#.to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "a".to_string(),
+            0,
+        ),
+        (
+            "[1,2,3]",
+            r#"[limit(1; path(.[(0|stderr):((1|stderr),(2|stderr))]))]"#.to_string(),
+            "[[{\"start\":0,\"end\":1}]]\n".to_string(),
+            "01".to_string(),
+            0,
+        ),
         // Pure navigation fan-out already agreed (nothing is observable per
         // element) and still does — these keep the cursor walk, which this
         // change deliberately does not touch.
@@ -45080,9 +45286,10 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
         assert_eq!(stderr, want_err, "{filter}");
     }
 
-    // #2925, the two shapes that still collect -- neither introduced here.
-    // Each row carries jq's answer and ours and asserts they still differ,
-    // so closing either trips this test rather than passing quietly.
+    // #2925's remaining shape -- the second one it recorded (a generator in
+    // index position) closed with #2267 and is in the table above now. This
+    // row carries jq's answer and ours and asserts they still differ, so
+    // closing it trips this test rather than passing quietly.
     let big = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(300));
     for (input, filter, want_out, jq_err, our_err) in [
         // A document the reindex bridge will not round-trip identically
@@ -45095,16 +45302,6 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             "[[\"a\"]]\n",
             "1",
             "12",
-        ),
-        // The stop reaches the branch producer but not a generator in index
-        // position -- `resolve_index_expr`'s eager key evaluation, the same
-        // function #2032 sits in.
-        (
-            r#"{"a":1,"b":2}"#,
-            r#"[limit(1; path(.[("a"|stderr),("b"|stderr)]))]"#,
-            "[[\"a\"]]\n",
-            "a",
-            "ab",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
