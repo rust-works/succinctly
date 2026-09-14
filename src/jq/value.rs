@@ -2966,7 +2966,16 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
         // of a number" leniency -- `parse_literal_exponent` only runs once
         // there's an actual digit string for it to parse and saturate.
         if j > digits_start {
-            exponent += parse_literal_exponent(&rest[exp_start..j]).value();
+            // `parse_literal_exponent` saturates an over-long exponent to
+            // `i128::MIN`/`MAX`; clamp far beyond any exponent a double can
+            // distinguish so the digit-count and fraction adjustments around
+            // it cannot overflow (a debug-build panic on
+            // `1e<45 digits> == 2e<45 digits>`, which reaches this comparison
+            // because both doubles are infinite).
+            const EXPONENT_CLAMP: i128 = 1 << 100;
+            exponent += parse_literal_exponent(&rest[exp_start..j])
+                .value()
+                .clamp(-EXPONENT_CLAMP, EXPONENT_CLAMP);
         }
     }
     let leading_zeros = digits.iter().take_while(|d| **d == b'0').count();
@@ -3862,6 +3871,23 @@ mod tests {
             ("1e-400", "0", Greater),
             ("-1e-400", "0", Less),
             ("1e999999999999999999999", "2e999999999999999999999", Less),
+            // Exponents too long for `i128` saturate; the fraction and
+            // digit-count adjustments must not overflow around them.
+            (
+                "1.5e999999999999999999999999999999999999999999999",
+                "2e999999999999999999999999999999999999999999999",
+                Less,
+            ),
+            (
+                "1.5e-999999999999999999999999999999999999999999999",
+                "0",
+                Greater,
+            ),
+            (
+                "-0.25e-999999999999999999999999999999999999999999999",
+                "0",
+                Less,
+            ),
         ] {
             assert_eq!(cmp_decimal_literals(a, b), want, "{a} vs {b}");
             assert_eq!(cmp_decimal_literals(b, a), want.reverse(), "{b} vs {a}");
