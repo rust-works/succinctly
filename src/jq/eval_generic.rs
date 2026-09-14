@@ -22423,10 +22423,26 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
         Expr::Slice { .. } | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
             let (children, control) = owned_nav_children::<S>(expr, value, optional);
             let parent = Rc::new(value.clone());
+            // #2834: a slice component -- jq mode only, `owned_nav_children`
+            // already answers `None` for yq -- is tracked only when the
+            // sliced value has a position of its own. `path("x" | .[0:1])`
+            // raises "Invalid path expression" in real jq, the same as any
+            // other navigation off a detached literal, while `path(null |
+            // .[0:1])` succeeds (`null` is always addressable, the rule
+            // `setpath`/`|=` rely on to create an absent field). This
+            // extension downgrades that error to silent omission -- the
+            // same downgrade a bare literal with no further navigation
+            // already gets (`.a | 1 | key` is empty, not an error) -- rather
+            // than fabricating a component for a value the slice can't
+            // actually be traced back to. Field/Index/Iterate are
+            // unaffected: yq's own `[1,2,3] | .[0] | path` is `[0]` even
+            // from a detached root, and jq's `path(null | .a)` is `["a"]`.
+            let untracked_slice =
+                matches!(expr, Expr::Slice { .. }) && id.base.is_none() && !value.is_null();
             out.extend(children.into_iter().map(|(component, v)| {
                 let vid = match component {
-                    Some(component) => id.child(&parent, component),
-                    None => id.clone(),
+                    Some(component) if !untracked_slice => id.child(&parent, component),
+                    _ => id.clone(),
                 };
                 (v, vid)
             }));
@@ -23001,14 +23017,28 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
             else {
                 unreachable!("Slice is assigned to Expr::Slice only")
             };
-            Some(if S::TAG == EvalTag::Yq {
-                id.clone()
-            } else {
-                id.child(
-                    &Rc::new(value.clone()),
-                    slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
-                )
-            })
+            // #2834: jq's own `path(f)` reports the slice's `{start,end}`
+            // component only when `value` has a position of its own --
+            // `path("x" | .[0:1])` raises "Invalid path expression" in
+            // real jq, the same as any other navigation off a detached
+            // literal, while `path(null | .[0:1])` succeeds (`null` is
+            // always addressable, the rule `setpath`/`|=` rely on to
+            // create an absent field). This extension downgrades that
+            // error to silent omission -- the same downgrade a bare
+            // literal with no further navigation already gets (`.a | 1 |
+            // key` is empty, not an error) -- rather than fabricating a
+            // component for a value the slice can't actually be traced
+            // back to.
+            Some(
+                if S::TAG == EvalTag::Yq || (id.base.is_none() && !value.is_null()) {
+                    id.clone()
+                } else {
+                    id.child(
+                        &Rc::new(value.clone()),
+                        slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
+                    )
+                },
+            )
         }
         OwnedIdentityRule::Detaches => Some(OwnedIdentity::detached()),
         OwnedIdentityRule::DetachesContainer => {
@@ -35884,5 +35914,84 @@ mod tests {
         ] {
             let _ = drive_each_sink::<JqSemantics>(json, filter);
         }
+    }
+
+    /// #2834: `OwnedIdentity::child` (via `owned_identity_step`'s shared
+    /// `Slice`/`Field`/`Index`/`Iterate` arm) extended a detached identity's
+    /// `ancestors` unconditionally, so a slice off a literal reached through
+    /// jq mode's `path`/`key`/`parent` postfix trio fabricated a bogus
+    /// `{"start":s,"end":e}` position instead of staying detached -- the
+    /// same nothing a bare undecorated literal already answers (`.a | 1 |
+    /// key`). Every row confirmed live against jq 1.7.1 (`path(f)`, for the
+    /// mechanism these postfix builtins are modeled on when the root is
+    /// addressable) and yq v4.53.3 (the reference these postfix builtins are
+    /// otherwise modeled on, per `OwnedIdentity`'s own doc comment).
+    #[test]
+    fn owned_identity_slice_off_a_detached_literal_stays_detached_2834() {
+        let json: &[u8] = br#"{"a":{"b":1},"arr":[1,2,3]}"#;
+
+        // The exact #2834 repro: a string literal sliced with no document
+        // position at all -- real yq gives nothing for all three.
+        for (filter, expected) in [
+            (r#".a | ("x" | .[0:1]) | key"#, vec![]),
+            (
+                r#".a | ("x" | .[0:1]) | path"#,
+                vec![OwnedValue::Array(vec![])],
+            ),
+            (r#".a | ("x" | .[0:1]) | parent"#, vec![]),
+        ] {
+            let (out, control) = drive_each_sink::<JqSemantics>(json, filter);
+            assert_eq!(out, expected, "filter: {filter}");
+            assert!(control.is_none(), "filter: {filter}, control: {control:?}");
+        }
+
+        // A slice off an *attached* value still reports jq's own
+        // `{"start":s,"end":e}` component (`path(.a[0:2])` in jq 1.7.1) --
+        // this fix must not touch the addressable case.
+        let slice_component = |start: i64, end: i64| {
+            OwnedValue::Object(IndexMap::from([
+                ("start".to_string(), OwnedValue::Int(start)),
+                ("end".to_string(), OwnedValue::Int(end)),
+            ]))
+        };
+        let (out, control) = drive_each_sink::<JqSemantics>(json, ".arr | .[0:2] | path");
+        assert_eq!(
+            out,
+            vec![OwnedValue::Array(vec![
+                OwnedValue::String("arr".to_string()),
+                slice_component(0, 2),
+            ])]
+        );
+        assert!(control.is_none(), "control: {control:?}");
+
+        // `null` is always addressable in real jq (`path(null | .[0:1])`
+        // succeeds, the same exception `setpath` relies on to create an
+        // absent field) -- this fix's `!value.is_null()` guard must keep
+        // tracking it.
+        let (out, control) = drive_each_sink::<JqSemantics>(json, ".a | (null | .[0:1]) | path");
+        assert_eq!(out, vec![OwnedValue::Array(vec![slice_component(0, 1)])]);
+        assert!(control.is_none(), "control: {control:?}");
+
+        // Index navigation off a detached (but non-literal) root is
+        // untouched -- `.a.b | map(. + 1) | .[0] | path` stays `[0]`, the
+        // doc-comment-pinned yq v4.53.3 capture this fix must not regress.
+        let (out, control) = drive_each_sink::<JqSemantics>(
+            br#"{"a":{"b":[1,2,3]}}"#,
+            ".a.b | map(. + 1) | .[0] | path",
+        );
+        assert_eq!(
+            out,
+            vec![OwnedValue::Array(vec![OwnedValue::from_number_literal(
+                "0"
+            )])]
+        );
+        assert!(control.is_none(), "control: {control:?}");
+
+        // yq mode already omitted the slice component unconditionally
+        // (`OwnedIdentityRule::Slice`'s own `S::TAG == Yq` branch) -- this
+        // fix's jq-only condition must leave it unaffected.
+        let (out, control) = drive_each_sink::<YqSemantics>(json, r#".a | ("x" | .[0:1]) | path"#);
+        assert_eq!(out, vec![OwnedValue::Array(vec![])]);
+        assert!(control.is_none(), "control: {control:?}");
     }
 }

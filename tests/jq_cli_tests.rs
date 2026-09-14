@@ -54724,14 +54724,15 @@ fn test_literal_inside_pipe_operand_does_not_abort_2771() -> Result<()> {
         (".a | ((1 | .) + 2) | key", ""),
         (".a | ((.b | 1) == 1) | path", "[]\n"),
         (".a | (-(.b | 1)) | path", "[]\n"),
-        (
-            r#".a | (("x" | .[0:1]) + "y") | path"#,
-            "[{\"start\":0,\"end\":1}]\n",
-        ),
-        (
-            r#".a | (("abc" | .)[0:1] + "x") | path"#,
-            "[{\"start\":0,\"end\":1}]\n",
-        ),
+        // #2834: a slice's left-operand identity is its own -- `.[0:1]`
+        // sliced off a detached literal now stays detached (see that
+        // issue's fix), so the arithmetic built from it does too. These two
+        // rows previously pinned `[{"start":0,"end":1}]`, the bug #2834
+        // fixed: `path(("x" | .[0:1]) + "y")` raises "Invalid path
+        // expression" in real jq, which this extension downgrades to empty
+        // rather than a fabricated component.
+        (r#".a | (("x" | .[0:1]) + "y") | path"#, "[]\n"),
+        (r#".a | (("abc" | .)[0:1] + "x") | path"#, "[]\n"),
     ] {
         let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`: out={out:?}");
