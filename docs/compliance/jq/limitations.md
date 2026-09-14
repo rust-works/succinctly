@@ -6314,34 +6314,46 @@ already documents for a *directly* shadowed `break $x` applies identically to a 
 intercepted through #2840's re-raise (`def error: .; label $a | (def f: break $a; label $b | f)`
 sees `null` where jq sees the sentinel) — the same #562 choice, not a new divergence.
 
-**New, narrower gap found while fixing #2840: a shadowing `def error:` can catch a `break`
-that real jq's compiler would reject outright.** A shadowing `def error:` is in scope at
-every `break $x` lexically inside its own label's body too, so an *unshadowed* `break $x`
-constructed the ordinary way (lexically inside the label whose `def error:` shadows it) can
-never reach this re-raise as a `Control::Break` — #2687 already shadows it directly. The only
-way to construct one that does is a `def f: break $x;` declared *outside* the label's lexical
-scope entirely, then called from inside it:
+**New, narrower gap found while fixing #2840: succinctly's own Try-based re-raise can swallow
+a *self-matching* break that real jq's compiler would reject outright.** `error` in scope at
+`f`'s own lexical position (rather than only at the label's) makes #2687 shadow the `break`
+directly there, before it ever becomes a `Control::Break` at all — so the *shadowing* def has
+to be declared *after* `f`, not before, to isolate this from #2687's own already-documented
+mechanism:
 
 ```console
-$ jq            -nc 'def error: "S"; def f: break $x; label $x | f'
+$ jq            -nc 'def f: break $x; def error: "S"; label $x | f'
 jq: error: $*label-x is not defined at <top-level>, line 1:
-def error: "S"; def f: break $x; label $x | f
+def f: break $x; def error: "S"; label $x | f
 jq: 1 compile error
-$ succinctly jq -nc 'def error: "S"; def f: break $x; label $x | f'
+$ succinctly jq -nc 'def f: break $x; def error: "S"; label $x | f'
 "S"
 ```
 
 Real jq's own label scoping is lexical at compile time — `break $x` is only valid textually
 inside `label $x | ...`, so `def f: break $x;` (declared *before* the label, where `$x` is
 not yet in scope) fails to compile regardless of whether `f` is ever actually called from
-inside the label, and regardless of any shadowing `def error:`. succinctly has no such
-compile-time label-scope check: `break $x` resolves purely by label name at runtime (confirmed
-unshadowed too: `def f: break $x; label $x | f` compiles and runs silently, exit 0, no output,
-where jq rejects it identically at compile time), so a `def` declared anywhere can name any
-label reachable when it happens to run. This is what lets the break reach #2840's re-raise
-here (unlike #2687's own directly-lexical shape, where the shadow always intercepts it before
-it becomes a `Control::Break` at all) — not a bug in the re-raise itself, but a pre-existing
-absence of jq's own compile-time scope check, predating both #2687 and #2840. Filed as
+inside the label, and regardless of any shadowing `def error:` declared afterward. succinctly
+has no such compile-time label-scope check: `break $x` resolves purely by label name at
+runtime (confirmed unshadowed too: `def f: break $x; label $x | f` compiles and runs
+silently, exit 0, no output, where jq rejects it identically at compile time), so a `def`
+declared anywhere can name any label reachable when it happens to run — `f`'s `break $x`
+therefore reaches the label as a genuine, *self-matching* `Control::Break` at runtime (`$x`
+does match the enclosing label), which `eval_label`'s own primitive check would consume
+silently (empty output, confirmed on `main` before #2840). #2840's Try-wrap intercepts it
+first instead, since `Expr::Try`'s catch clause catches *any* `Control::Break` regardless of
+which label it targets (#562) — so once the label's body is Try-wrapped (because `error` is
+in scope at the *label's* own position), a self-matching break arriving this way is diverted
+into the shadowing `error()` call the same as a non-matching one would be, producing `"S"`
+where the pre-#2840 build produced nothing.
+
+Both directions trace back to the same root: a pre-existing absence of jq's own compile-time
+label-scope check, predating both #2687 and #2840 — without it, this program has no way to
+exist in the first place, so there is no reference answer for succinctly to diverge *from*
+here (jq refuses to compile it at all). #2840 changes *which* wrong answer succinctly gives
+for this one adversarial, only-succinctly-can-construct shape (empty output before, `"S"`
+after) rather than introducing a new kind of divergence; a real fix is the same compile-time
+scope check #2964 already calls for, not a narrower patch to the re-raise itself. Filed as
 [#2964](https://github.com/rust-works/succinctly/issues/2964) rather than chased here.
 
 ### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
