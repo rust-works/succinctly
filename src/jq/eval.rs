@@ -93544,6 +93544,26 @@ mod tests {
         );
     }
 
+    /// Reachable only by direct evaluation (#1986's pattern, resurfaced by
+    /// #2934): `eval_each` now has a dedicated `Builtin::Skip` arm
+    /// (`each_skip`), so every `query!`/top-level `skip(n; expr)` -- even a
+    /// non-streaming one like `skip(1; .)` -- routes through it instead of
+    /// `builtin_skip`/`skip_with_n`. That leaves `skip_with_n`'s scalar
+    /// `QueryResult::One` arm's `n > 0` branch reachable only when
+    /// `builtin_skip` is called directly, bypassing `eval_each` entirely.
+    #[test]
+    fn test_skip_with_n_one_arm_positive_n_direct_evaluation_2934() {
+        let json_bytes: &[u8] = b"5";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = parse("1").unwrap();
+        let expr = parse(".").unwrap();
+        match builtin_skip::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
+            QueryResult::None => {}
+            other => panic!("expected QueryResult::None, got {other:?}"),
+        }
+    }
+
     /// #1989 cluster 1: `fanout_two_args`'s eager (non-`ArgFanout::All`,
     /// i.e. yq-gated) path folded both argument slots through the unchecked
     /// `stream_outputs_lossy`, so an undecodable argument silently materialized as
