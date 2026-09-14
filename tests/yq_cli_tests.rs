@@ -46716,3 +46716,48 @@ fn test_comma_count_argument_extensions_2863() -> Result<()> {
     }
     Ok(())
 }
+
+// ---- #2878: yq mode must NOT inherit jq's control-character rule ----
+
+/// Real yq *accepts* a raw, unescaped control character inside a string that
+/// `fromjson` decodes -- `yq -n '"[\"a<TAB>b\"]" | fromjson'` answers
+/// `["a\tb"]` (confirmed live against yq v4.53.3). jq rejects the same input.
+///
+/// So #2878's fix is gated on the *mode*, not the format (ADR-0018), and this
+/// is the counter-test that keeps a future "make both modes consistent" sweep
+/// from quietly importing jq's stricter rule into yq. The jq-mode half lives
+/// in `jq_cli_tests.rs`.
+#[test]
+fn test_fromjson_accepts_raw_control_character_in_yq_mode_2878() -> Result<()> {
+    let prog = format!("\"[\\\"a{}b\\\"]\" | fromjson", '\u{9}');
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(&prog, "", &["-n"])?;
+    assert_eq!(
+        code, 0,
+        "yq mode must still accept a raw control char in fromjson; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("a\\tb"),
+        "yq mode should decode the raw tab, got: {stdout:?}"
+    );
+    Ok(())
+}
+
+/// `tonumber`'s "valid JSON but not a number" probe is mode-sensitive as of
+/// #2878. Real yq reports a tag-conversion error here (`cannot convert node
+/// value [...] of tag !!str to number`), which is this crate's
+/// `cannot be parsed as a number` family -- *not* jq's parse-error family.
+///
+/// Pins the half of #2878 that a jq-only fix would have silently regressed:
+/// passing jq's mode into that probe unconditionally flips yq's message to
+/// the wrong family.
+#[test]
+fn test_tonumber_control_character_keeps_yq_message_family_2878() -> Result<()> {
+    let prog = format!("\"[\\\"a{}b\\\"]\" | tonumber", '\u{9}');
+    let (_stdout, stderr, code) = run_yq_stdin_with_stderr(&prog, "", &["-n"])?;
+    assert_ne!(code, 0, "tonumber must still fail in yq mode");
+    assert!(
+        stderr.contains("cannot be parsed as a number"),
+        "yq mode should keep the tag-conversion family, got: {stderr}"
+    );
+    Ok(())
+}
