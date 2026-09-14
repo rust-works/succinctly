@@ -24761,6 +24761,60 @@ mod tests {
     use super::super::value::NumberRepr;
     use super::*;
 
+    /// #2661: the public value-only entry point has no cursor, so `..`
+    /// reaches the full-evaluator bridge rather than the native cursor walk.
+    /// Its borrowed `Many` must become owned values before the bridge's
+    /// temporary JSON index is dropped, preserving the complete preorder.
+    #[test]
+    fn cursorless_recursive_descent_bridge_preserves_values_2661() {
+        let json = br#"{"a":[1,{"b":false}],"c":null}"#;
+        let index = JsonIndex::build(json);
+        let expr = parse("..").unwrap();
+        let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value());
+        let GenericResult::ManyOwned(values) = result else {
+            panic!("expected the bridge's owned outputs, got {result:?}");
+        };
+        assert_eq!(
+            values.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            [
+                r#"{"a":[1,{"b":false}],"c":null}"#,
+                r#"[1,{"b":false}]"#,
+                "1",
+                r#"{"b":false}"#,
+                "false",
+                "null",
+            ]
+        );
+    }
+
+    /// #2661: #2692 removed any/all's eager validation walk. A malformed
+    /// object can now reach effective_fields_checked directly through the
+    /// public cursor API; no YAML alias or synthetic document is needed.
+    /// Both builtins must report the field error even if an earlier value
+    /// would otherwise decide their truthiness answer.
+    #[test]
+    fn any_all_reject_malformed_object_members_2661() {
+        for json in [
+            &br#"{"a":true,123:false}"#[..],
+            &br#"{"a":false,123:true}"#[..],
+        ] {
+            let index = JsonIndex::build(json);
+            for filter in ["any", "all"] {
+                let expr = parse(filter).unwrap();
+                let result = eval_with_cursor(&expr, index.root(json));
+                let GenericResult::Error(err) = result else {
+                    panic!("{filter} on {json:?}: expected a field error, got {result:?}");
+                };
+                assert!(err.is_decode_failure(), "{filter}: {err:?}");
+                assert!(
+                    err.message.contains("expected string key"),
+                    "{filter}: {}",
+                    err.message
+                );
+            }
+        }
+    }
+
     // ---- #2666: Budget composition and the validation window ----
 
     #[test]
@@ -32742,11 +32796,12 @@ mod tests {
         assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
 
-    /// #1192: the `Ok` (all-succeed) side of `eval_single`'s fallback
-    /// `QueryResult::Many` loop -- `foreach`'s per-step output list routes
-    /// here directly, same as the `reduce` case above.
+    /// Foreach's value-only entry point preserves every per-step output.
+    /// This used to exercise the full-evaluator bridge (#1192), but foreach
+    /// now has a native arm. The cursorless `..` test covers that bridge
+    /// separately (#2661).
     #[test]
-    fn test_eval_single_fallback_many_ok_via_foreach_1192() {
+    fn test_cursorless_foreach_preserves_step_outputs_1192() {
         let json = br"null";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
