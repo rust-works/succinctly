@@ -53773,3 +53773,60 @@ fn test_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result<()
 
     Ok(())
 }
+
+/// #2761: jq 1.7.1 rejects the identity seed at the terminal, but names
+/// iteration when a continuation discards that seed and asks for more.
+#[test]
+fn test_bare_recurse_untracked_navigation_wording_2761() -> Result<()> {
+    for stage in ["..", "recurse"] {
+        for value in ["1", "[]", "{}", "[1]", r#"{"a":1}"#] {
+            for (tail, message) in [
+                (stage.to_string(), "with result"),
+                (
+                    format!("{stage} | empty"),
+                    "near attempt to iterate through",
+                ),
+                (
+                    format!("[{stage}] | empty"),
+                    "near attempt to iterate through",
+                ),
+            ] {
+                let filter = format!("path({value} | {tail})");
+                let (out, err, code) = run_jq_full(&["-cn", &filter], None)?;
+                assert_eq!(code, 5, "{filter}: {err}");
+                assert_eq!(out, "", "{filter}");
+                assert_eq!(
+                    err,
+                    format!(
+                        "jq: error (at <unknown>): Invalid path expression {message} {value}\n"
+                    ),
+                    "{filter}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The seed itself performs no navigation: a bound can stop before it,
+/// and `try` can catch the iteration error when traversal continues.
+#[test]
+fn test_bare_recurse_untracked_seed_and_catch_2761() -> Result<()> {
+    for stage in ["..", "recurse"] {
+        for tail in [
+            format!("limit(1; {stage}) | empty"),
+            format!("try ({stage} | empty) catch empty"),
+            format!("try ([{stage}] | empty) catch empty"),
+        ] {
+            let filter = format!("path(1 | {tail})");
+            let (out, err, code) = run_jq_full(&["-cn", &filter], None)?;
+            assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0), "{filter}");
+        }
+    }
+    // `recurse_down` is an internal alias, absent from jq 1.7.1. Preserve
+    // its relationship with bare `recurse`, without claiming oracle parity.
+    let recurse = run_jq_full(&["-cn", "path(1 | recurse | empty)"], None)?;
+    let alias = run_jq_full(&["-cn", "path(1 | recurse_down | empty)"], None)?;
+    assert_eq!(alias, recurse);
+    Ok(())
+}
