@@ -46459,3 +46459,21 @@ fn recurse_through_a_bound_still_resolves_explicit_tags_2693() -> Result<()> {
     );
     Ok(())
 }
+
+/// #2863: jq extensions accept comma counts while preserving yq precedence.
+#[test]
+fn test_comma_count_argument_extensions_2863() -> Result<()> {
+    for (filter, expected) in [
+        ("[limit(1,2; 10,20,30)]", "[10,10,20]"),
+        ("[nth(0,1; 10,20,30)]", "[10,20]"),
+        // yq pipes bind tighter than commas: 1, (2 | .+1).
+        ("[limit(1,2|.+1; 10,20,30)]", "[10,10,20,30]"),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "null", &["--jq-extensions", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+        assert_eq!(stderr, "", "{filter}");
+    }
+    Ok(())
+}

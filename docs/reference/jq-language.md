@@ -376,18 +376,14 @@ Loosest first, matching jq's `parser.y`:
 `1,2,3 | . * 2` is therefore `(1,2,3) | . * 2` → `2 4 6`, and
 `1,2 as $x | $x | .+10` is `1, (2 as $x | $x | .+10)` → `1 12` (#462).
 
-Three positions are deliberately **not** full expressions:
+The count argument of `limit`/`skip`/`nth` accepts a full expression, including
+a comma generator without extra parentheses (#2863). `skip`'s generator-count
+limitation is recorded in [jq limitations](../compliance/jq/limitations.md#skip-with-a-generator-count).
 
-- **Object-construction values** are jq's `ExpD`, where `,` separates entries.
-  `{a: 1, b: 2}` is two entries; write `{a: (1,2)}` to fan a value out.
-- **The `n` of `limit`/`skip`/`nth`** rejects a comma, because jq's `$n`
-  parameter convention (re-running the whole call per output of `n`) is not
-  implemented here — a parse error beats parsing and silently taking one branch.
-- **`reduce`/`foreach`'s `init`/`update`/`extract` and `until`/`while`'s
-  `cond`/`update`** reject a comma for the same reason: jq forks the whole
-  construct per multi-output `init`, folds `update` by its last output per
-  step, and fans `extract`/loop backtracking out per output — none of that is
-  implemented here (#534).
+Object-construction values use jq's restricted `ExpD` production, where
+`,` separates entries: `{a: 1, b: 2}` is two entries; write `{a: (1,2)}` to
+fan a value out. The `reduce`/`foreach` and `until`/`while` slots accept full
+expressions too.
 
 Two precedence divergences from jq remain:
 

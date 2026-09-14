@@ -423,18 +423,10 @@ struct Parser<'a> {
     /// larger constant would have: the nested shape is exponential, so
     /// every constant is reachable at some small depth.
     ///
-    /// What can still draw on it: a shadow candidate whose *dedicated*
-    /// parser fails for a reason that is not an argument boundary it can
-    /// resolve in place. Two shapes reach that today -- a genuine syntax
-    /// error inside an argument, which the generic reparse rejects too, and
-    /// the comma-restricted first argument of `limit`/`nth`/`skip`
-    /// (`parse_pipe_no_comma_with_booleans` stops at the comma, so the
-    /// already-parsed prefix no longer lines up with the real argument
-    /// text and cannot be handed over). Only the second can still change a
-    /// program's verdict: `def nth(a;b): a; nth(1,2;3)` x65 is `130` in jq
-    /// 1.7.1 and a parse error here once the budget runs out. Tracked
-    /// separately; it is a residual of this class, not a regression -- the
-    /// pre-#2807 parser rejected it at every count. Tracked as #2863.
+    /// A genuine syntax error inside a dedicated argument parser can still
+    /// draw on this budget; the generic reparse rejects it too. Since #2863,
+    /// `limit`/`nth`/`skip` accept full first-argument expressions, so a valid
+    /// comma argument no longer enters this fallback.
     shadow_retry_budget: usize,
     /// #2807: the wrong-arity call a [`Self::try_parse_builtin`] arm
     /// resolved in place, handed to its one caller alongside `Ok(None)`.
@@ -2437,23 +2429,12 @@ impl<'a> Parser<'a> {
         }
         self.next();
         self.skip_ws();
-        // `n` deliberately stays restricted to non-comma: real jq's `limit`
-        // is defined with the `$n` parameter convention, where a
-        // comma-valued `n` re-invokes the whole builtin once per output.
-        // That fanout isn't implemented here, so accepting a comma would
-        // parse but silently misbehave — worse than today's parse error.
-        let n = self.parse_pipe_no_comma_with_booleans()?;
+        // #2863: count arguments use the same full grammar as ordinary calls.
+        // Parsing a comma here avoids retrying a shadowed call from scratch.
+        let n = self.parse_expr()?;
         self.skip_ws();
-        // #2237 review: only `)` here is unambiguously a missing-2nd-arg
-        // wrong-arity call -- rewinding on *any* non-`;` character (as an
-        // earlier version of this fix did) also caught a bare `,` right
-        // after `n`, silently defeating the comma restriction above by
-        // reparsing `limit(1,2; .)` through `parse_func_call_or_error`
-        // (whose own `parse_expr` call, unlike `parse_pipe_no_comma`, does
-        // accept commas) instead of raising this function's own intentional
-        // rejection. Anything else (`,` included) falls through to
-        // `expect(';')`, which raises its own natural error for that
-        // specific mismatch, exactly as before this fix.
+        // Only `)` identifies a missing second argument. Other malformed
+        // separators retain the natural `expect(';')` error below.
         if self.peek() == Some(')') && self.mode == ParserMode::Jq {
             // #2686: `n` is already parsed; `wrong_arity_call_from_parsed`
             // closes on the `)` we are sitting on and yields `limit/1`.
@@ -3719,10 +3700,8 @@ impl<'a> Parser<'a> {
     ///   a reason that is *not* an argument boundary it can resolve in
     ///   place: a genuine syntax error inside an argument, where the retry
     ///   only re-reports the same error and exhausting the budget changes
-    ///   nothing but the error text -- and the comma-restricted first
-    ///   argument of `limit`/`nth`/`skip`, where it still changes the
-    ///   verdict (#2863). See [`Self::shadow_retry_budget`]'s own doc
-    ///   comment for that residual.
+    ///   nothing but the error text. The formerly comma-restricted count
+    ///   arguments of `limit`/`nth`/`skip` now parse in place (#2863).
     fn retry_shadow_candidate_as_generic_call(
         &mut self,
         start_pos: usize,
@@ -5580,10 +5559,8 @@ impl<'a> Parser<'a> {
             }
             self.next();
             self.skip_ws();
-            // `n` deliberately stays restricted to non-comma — same rationale
-            // as `parse_limit_expr`'s own `n`: real jq's `$n` parameter
-            // convention isn't implemented here.
-            let n = self.parse_pipe_no_comma_with_booleans()?;
+            // #2863: consume the full argument, including comma generators.
+            let n = self.parse_expr()?;
             self.skip_ws();
             if self.peek() != Some(';') {
                 return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![n]);
@@ -5617,10 +5594,8 @@ impl<'a> Parser<'a> {
             }
             self.next();
             self.skip_ws();
-            // `n` deliberately stays restricted to non-comma — same rationale
-            // as `parse_limit_expr`'s own `n` above: real jq's `$n` parameter
-            // convention (per-output fanout) isn't implemented here.
-            let n = self.parse_pipe_no_comma_with_booleans()?;
+            // #2863: consume the full argument, including comma generators.
+            let n = self.parse_expr()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next();
@@ -6552,8 +6527,8 @@ impl<'a> Parser<'a> {
     /// yq's own `and`/`or` level on top of it in `Yq` mode.
     ///
     /// The operand positions that parse at "pipe but not comma" precedence
-    /// (an object value, and `limit`/`skip`/`nth`'s leading count) sit *below*
-    /// a comma and so, in yq, below `and`/`or` as well: yq's `createMapOpType`
+    /// (an object value) sit *below* a comma and so, in yq, below `and`/`or`
+    /// as well: yq's `createMapOpType`
     /// is precedence 15 and `,` is 10, both under `and`/`or`'s 20. Captured
     /// live: `yq '{"k": .a | .b and .c}'` is `{"k":false}`, i.e.
     /// `k: ((.a | .b) and .c)` (#2506). In jq mode this is exactly
@@ -6700,16 +6675,12 @@ impl<'a> Parser<'a> {
     /// Parse a pipe expression that stops at a `,` — deliberately *not* a full
     /// [`Self::parse_expr`].
     ///
-    /// Exactly three kinds of position want this, and no others:
+    /// Two kinds of position want this:
     ///
     /// 1. **Object-construction values**, jq's `ExpD` production. Inside
     ///    `{...}` a `,` separates entries, so `{a: 1, b: 2}` must not read
     ///    `1, b` as one value.
-    /// 2. **The `n` of `limit`/`skip`/`nth`**, where the restriction is this
-    ///    crate's rather than jq's: jq's `$n` parameter convention fans the
-    ///    whole call out once per output of `n`, which is not implemented here,
-    ///    so `n` stays single-valued instead of silently taking one branch.
-    /// 3. **Every comma operand in yq mode** ([`Self::parse_yq_comma_expr`]),
+    /// 2. **Every comma operand in yq mode** ([`Self::parse_yq_comma_expr`]),
     ///    where real yq's own precedence table ranks `|` (30) above `,` (10),
     ///    making "a pipe chain that stops at a comma" the whole of one comma
     ///    operand rather than a restricted sub-position (#2420).
@@ -7886,12 +7857,38 @@ mod tests {
             }))
         );
 
-        // Deliberate carve-out (#155): `n` in limit/skip/nth stays
-        // restricted to non-comma, since this codebase doesn't implement
-        // real jq's `$n` per-output fanout convention for these builtins.
-        assert!(parse("limit(1,2; .)").is_err());
-        assert!(parse("skip(1,2; .)").is_err());
-        assert!(parse("nth(1,2; .)").is_err());
+        // #2863: bare comma counts occupy one argument slot. Parentheses
+        // preserve an explicit Paren node, but its child is the same count.
+        for kw in ["limit", "skip", "nth"] {
+            let bare = parse(&format!("{kw}(1,2; .)")).unwrap();
+            let parenthesized = parse(&format!("{kw}((1,2); .)")).unwrap();
+            let count = |expr: Expr| match expr {
+                Expr::Limit { n, .. }
+                | Expr::Builtin(Builtin::Skip(n, _) | Builtin::NthStream(n, _)) => *n,
+                other => panic!("unexpected count expression: {other:?}"),
+            };
+            let bare_count = count(bare);
+            assert_eq!(
+                bare_count,
+                Expr::Comma(vec![
+                    Expr::Literal(Literal::number_literal("1".to_string())),
+                    Expr::Literal(Literal::number_literal("2".to_string())),
+                ]),
+                "{kw}"
+            );
+            assert_eq!(
+                count(parenthesized),
+                Expr::Paren(Box::new(bare_count)),
+                "{kw}"
+            );
+        }
+        assert_eq!(
+            parse("nth(1,2)").unwrap(),
+            Expr::Builtin(Builtin::Nth(Box::new(Expr::Comma(vec![
+                Expr::Literal(Literal::number_literal("1".to_string())),
+                Expr::Literal(Literal::number_literal("2".to_string())),
+            ]))))
+        );
 
         // User-defined single-parameter function called with a comma
         // argument: def f(x): x; f(1,2).

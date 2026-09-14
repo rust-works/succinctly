@@ -3574,6 +3574,16 @@ YAML, though — every YAML cursor's `preceding_delimiter_ok` uses the trait def
 to this evaluator-level check the way JSON's semi-index does — so there is no YAML input
 this gap check can actually catch or skip either way, today.
 
+## `skip` with a generator count
+
+`skip(n; f)` is a succinctly extension relative to the pinned jq 1.7.1,
+which rejects `skip/2` as undefined. Its count is still evaluated as a single
+value: `[skip((0,1); 10,20,30)]` raises `expected number, got null` instead
+of running the body once per count. Captured on the pre-#2863 checkout;
+accepting the equivalent bare-comma spelling in #2863 does not change this
+existing evaluator limitation. `builtin_skip` needs count fan-out separately
+from the parser change; tracked as [#2934](https://github.com/rust-works/succinctly/issues/2934).
+
 ## A generator `n` under a truncating consumer: fixed for `limit`, residual for `nth`/`isempty`
 
 Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention
