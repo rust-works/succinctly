@@ -143,10 +143,13 @@ fn report_module_load_error(e: &ModuleLoadError) {
 
 /// Resolve a module path to a file path within `search_path`.
 ///
-/// A free function rather than a `ModuleLoader` method (#2395): its only
-/// caller, [`ModuleLoader::ensure_module_loaded`], holds a mutable borrow of
-/// the module cache across the call, which an `&self` method could not
-/// coexist with. It reads nothing but the search path either way.
+/// A free function rather than a `ModuleLoader` method (#2395). The original
+/// reason -- its caller holding a mutable borrow of the module cache across
+/// the call -- went away with #2865, which had to drop that `entry()`
+/// spelling to make the loader re-entrant; it stays a free function because
+/// it reads nothing but the search path, and its caller
+/// ([`ModuleLoader::load_and_bind_module`]) does re-enter `&mut self` around
+/// it to load the module's own dependencies.
 fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathBuf> {
     // #2702: real jq appends `.jq` unconditionally -- `include "m.jq"` looks
     // for `m.jq.jq`, never `m.jq` itself. Confirmed live against jq 1.7.1.
@@ -171,8 +174,8 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
 /// (found directly, never searched for).
 ///
 /// A free function rather than a `ModuleLoader` method for the same reason
-/// [`resolve_module_in`] is: [`ModuleLoader::ensure_module_loaded`] holds a
-/// mutable borrow of the module cache across the call.
+/// [`resolve_module_in`] is: it reads nothing off the loader, and its caller
+/// re-enters `&mut self` around it.
 ///
 /// `canonicalize` can fail (a module deleted between resolving and reading
 /// it, a race no real program depends on); fall back to `resolved_path`
@@ -220,7 +223,7 @@ fn wrap_defs(mut expr: Expr, defs: FuncDefList) -> Expr {
 /// over-keeps a little (a dependency `g/1` survives when only `g/0` is
 /// called) where keying on arity could silently *drop* a dependency a call
 /// genuinely needs, turning a program that compiles into a compile error.
-/// The self-recursion filter in [`deps_excluding_self`] still keys on
+/// The self-recursion filter in [`visible_defs_for`] still keys on
 /// (name, arity), where it has to: there the exact pair is the semantics.
 ///
 /// `any_subexpr` with a predicate that never answers `true` is a full
@@ -230,8 +233,25 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     succinctly::jq::walk::any_subexpr(expr, &mut |node| {
         match node {
-            Expr::FuncCall { name, .. } => {
+            Expr::FuncCall {
+                name,
+                builtin_fallback,
+                ..
+            } => {
                 names.insert(name.clone());
+                // `any_subexpr`'s own `FuncCall` arm does not descend into
+                // `builtin_fallback`, which is sound only *after*
+                // `resolve::check` has run -- and a module's source has just
+                // been parsed here, so it has not. A module that defines a
+                // builtin's name turns every call to that builtin into a
+                // shadowable-call node whose real sub-expressions live in the
+                // fallback with `args` left empty, so skipping it hides them:
+                // `def limit: "s"; def h: [limit(1; g)];` would not see `g` at
+                // all and would drop the dependency that defines it, turning a
+                // program jq compiles into a compile error.
+                if let Some(fallback) = builtin_fallback {
+                    names.extend(called_func_names(fallback));
+                }
             }
             Expr::NamespacedCall {
                 namespace, name, ..
@@ -245,60 +265,93 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
     names
 }
 
-/// The dependencies a def's body can actually reach: `deps` minus any entry
-/// that would capture the def's own recursive calls, minus any entry nothing
-/// in the body transitively calls (#2865).
+/// The defs a module's exported def can actually reach, in [`wrap_defs`]
+/// order: its module's own earlier siblings and its module's dependencies,
+/// minus everything that must not capture a name in this body, minus
+/// everything nothing in the body transitively calls (#2865).
 ///
-/// ### The self-recursion filter
+/// ### Why `siblings` is here at all
 ///
-/// jq binds a def's own name inside its own body before it binds a dependency
-/// of the same name, and the match is on **(name, arity)**, not name alone --
-/// so a dependency `g/1` survives when wrapping an own `g/0`, and both stay
-/// reachable from that body.
+/// Every def's body has to be resolved in **its own module's scope**, which
+/// means a def handed to another module must already be self-contained --
+/// its sibling references cannot be left to find their target in whatever
+/// chain it lands in. With `inner.jq` = `def g: 42; def k: g;` and
+/// `outer.jq` = `include "inner"; def g: k;`, jq answers `42`: `k`'s `g` is
+/// `inner`'s. Wrapping only dependencies left `k`'s `g` to resolve outwards
+/// into `outer`'s own `g`, which is `k` -- unbounded recursion where jq
+/// returns a number. Carrying the siblings closes that by construction, and
+/// makes every exported body independent of its wrap site.
 ///
-/// ### The referenced-closure filter, and why it is not optional
+/// Only siblings declared *before* the def are in scope, which is also what
+/// makes this terminate: `def x: 1; def y: x; def x: 2;` binds `y`'s `x` to
+/// the first one, inside a module exactly as at the top level.
 ///
-/// This is jq's own `block_bind_referenced` rule, and here it is a
-/// **correctness-adjacent sizing requirement, not a micro-optimisation**:
-/// wrapping every dependency into every exported body multiplies down a
-/// chain, because each level's bodies already carry the level below. Measured
-/// on a synthetic chain of 3 modules x 40 defs (Apple M-series, release
-/// build), resolving one def at the top:
+/// ### Ordering
 ///
-/// | chain depth              | peak RSS | wall  |
-/// |--------------------------|----------|-------|
-/// | 1 module (no wrapping)   |    9 MB  | 0.00s |
-/// | 2 modules (one wrap)     |   18 MB  | 0.01s |
-/// | 3 modules (two wraps)    |  359 MB  | 0.28s |
-/// | jq 1.7.1, same 3 modules |  2.5 MB  | 0.00s |
+/// `siblings` first, `deps` second, so a dependency ends up **innermost** and
+/// beats a same-named sibling -- jq's answer for a module written
+/// `include "inner"; def g: 7; def h: g;` is `42`, not the `7` one line
+/// above.
 ///
-/// A fourth level would be tens of gigabytes. With the filter the same
-/// 3-module chain is flat, because each `c_i` calls exactly one `b_i`.
+/// ### The three exclusions
 ///
-/// Dropping an unreferenced dependency is unobservable: it is reachable from
-/// nothing, so no name resolves to it, and jq agrees an unreferenced
-/// dependency whose own body calls an undefined function is an error in
-/// neither tool. The closure is seeded from the body and widened through the
-/// body of every dependency it pulls in, which over-approximates (a
-/// dependency's body was already bound at its own load, so some of its names
-/// are satisfied internally) -- over-approximating only keeps something
-/// harmless, while under-approximating would drop something needed.
-fn deps_excluding_self(deps: &FuncDefList, name: &str, arity: usize, body: &Expr) -> FuncDefList {
-    let mut wanted = called_func_names(body);
-    let mut keep = vec![false; deps.len()];
+/// - **The def itself, by (name, arity).** jq binds a def's own recursive
+///   call to itself before anything else: with `inner`'s `g/0` in scope,
+///   `def g: if . == 0 then "base" else (. - 1 | g) end;` still answers
+///   `"base"`. Arity-scoped, so a dependency `g/1` alongside an own `g/0`
+///   leaves both reachable.
+/// - **Anything named after one of this def's parameters, at arity 0.** A
+///   parameter binds the bare call-site namespace (`Param::Dollar`'s `$g`
+///   binds `g` too), and it wins: `def f(g): g; def q: f(7);` answers `7` in
+///   jq even with a dependency or sibling `g` in scope. Without this the
+///   wrap, which nests *inside* the parameter's own binding, would capture
+///   the parameter's every use.
+/// - **Anything nothing in the body transitively calls.** jq's own
+///   `block_bind_referenced` rule, and here a sizing requirement rather than
+///   a micro-optimisation: wrapping unconditionally compounds down a chain,
+///   because each level's bodies already carry the level below. Measured on a
+///   synthetic chain of 40-def modules where each def calls one def from the
+///   level below, resolving one def at the top: 9 MB peak RSS at one module,
+///   18 MB at two, **359 MB** at three (jq: 2.5 MB), and a fourth level would
+///   have been tens of gigabytes. Filtered, the same chain is 10 MB and a
+///   five-level one 11.6 MB. It is a *mitigation*, not a cure -- a module
+///   whose defs each call several defs below still compounds; see
+///   [`docs/compliance/jq/limitations.md`].
+///
+/// Dropping an unreferenced def is unobservable: nothing resolves to it, and
+/// jq agrees an unreferenced dependency whose own body calls an undefined
+/// function is an error in neither tool. The closure is seeded from the body
+/// and widened through the body of everything it pulls in, which
+/// over-approximates -- over-approximating only keeps something harmless,
+/// where under-approximating would drop something a call genuinely needs.
+fn visible_defs_for(
+    siblings: &FuncDefList,
+    deps: &FuncDefList,
+    name: &str,
+    params: &[Param],
+    body: &Expr,
+) -> FuncDefList {
+    let param_names: BTreeSet<&str> = params.iter().map(Param::name).collect();
+    let arity = params.len();
+    let candidates: Vec<&(String, Vec<Param>, Expr)> = siblings.iter().chain(deps.iter()).collect();
 
-    // Fixed point: pulling a dependency in can widen `wanted` past
-    // dependencies already scanned, so rescan until a pass adds nothing.
+    let mut wanted = called_func_names(body);
+    let mut keep = vec![false; candidates.len()];
+
+    // Fixed point: pulling one in can widen `wanted` past candidates already
+    // scanned, so rescan until a pass adds nothing.
     loop {
         let mut grew = false;
-        for (i, (dep_name, dep_params, dep_body)) in deps.iter().enumerate() {
-            if keep[i] || (dep_name == name && dep_params.len() == arity) {
+        for (i, (cand_name, cand_params, cand_body)) in candidates.iter().enumerate() {
+            let excluded = (cand_name == name && cand_params.len() == arity)
+                || (cand_params.is_empty() && param_names.contains(cand_name.as_str()));
+            if keep[i] || excluded {
                 continue;
             }
-            if wanted.contains(dep_name) {
+            if wanted.contains(cand_name) {
                 keep[i] = true;
                 let before = wanted.len();
-                wanted.extend(called_func_names(dep_body));
+                wanted.extend(called_func_names(cand_body));
                 grew |= wanted.len() != before;
             }
         }
@@ -307,10 +360,11 @@ fn deps_excluding_self(deps: &FuncDefList, name: &str, arity: usize, body: &Expr
         }
     }
 
-    deps.iter()
+    candidates
+        .into_iter()
         .zip(keep)
         .filter(|(_, keep)| *keep)
-        .map(|(dep, _)| dep.clone())
+        .map(|(def, _)| (*def).clone())
         .collect()
 }
 
@@ -430,14 +484,14 @@ impl ModuleLoader {
     ///   parse time; that row already passes and is unchanged.)
     /// - ...while that module's own `g` is still what it exports: `7`.
     ///
-    /// ### The self-recursion filter
+    /// ### What each body is wrapped in
     ///
-    /// [`deps_excluding_self`] drops any dependency whose **(name, arity)**
-    /// matches the def being wrapped, because jq binds a def's own recursive
-    /// call to itself before it binds the dependency: with `inner`'s `g/0` in
-    /// scope, `def g: if . == 0 then "base" else (. - 1 | g) end;` still
-    /// answers `"base"`, not `42`. It is arity-scoped, not name-scoped -- a
-    /// dependency `g/1` alongside an own `g/0` leaves both reachable.
+    /// [`visible_defs_for`] decides that per def: the module's own earlier
+    /// siblings (so an exported body is self-contained wherever it is spliced
+    /// in) then its dependencies (innermost, so they win), minus the def
+    /// itself by (name, arity), minus anything named after one of the def's
+    /// parameters, minus anything the body never transitively calls. Its own
+    /// doc comment carries the oracle row behind each of those.
     ///
     /// ### Search-path resolution
     ///
@@ -455,9 +509,13 @@ impl ModuleLoader {
         })?;
 
         let canonical = canonical_or_self(&file_path);
-        if self.loading.iter().any(|(seen, _)| *seen == canonical) {
-            let mut chain: Vec<String> = self
-                .loading
+        if let Some(at) = self.loading.iter().position(|(seen, _)| *seen == canonical) {
+            // From the repeat, not from the bottom of the stack: the modules
+            // that merely *led* to the cycle are not part of it, and naming
+            // them makes the chain read as a longer cycle than it is. Loading
+            // `x` (which includes `ca`, which includes `cb`, which includes
+            // `ca`) reports `ca -> cb -> ca`, not `x -> ca -> cb -> ca`.
+            let mut chain: Vec<String> = self.loading[at..]
                 .iter()
                 .map(|(_, as_written)| as_written.clone())
                 .collect();
@@ -484,14 +542,21 @@ impl ModuleLoader {
         self.loading.pop();
         let deps = deps?;
 
-        Ok(own
-            .into_iter()
-            .map(|(name, params, body)| {
-                let visible = deps_excluding_self(&deps, &name, params.len(), &body);
-                let body = wrap_defs(body, visible);
-                (name, params, body)
-            })
-            .collect())
+        // `bound` doubles as the sibling list: walking the module's defs in
+        // declaration order means def `i` sees exactly `bound[..i]`, the same
+        // lexical rule a filter's own defs follow. Siblings are taken from
+        // `bound` rather than from `own` deliberately -- an *already bound*
+        // sibling carries its own dependencies inside its body, so splicing it
+        // into a later def's wrap keeps it self-contained. The unbound form
+        // would arrive with its references still looking outward, into a chain
+        // that no longer has them.
+        let mut bound: FuncDefList = Vec::with_capacity(own.len());
+        for (name, params, body) in own {
+            let visible = visible_defs_for(&bound, &deps, &name, &params, &body);
+            let wrapped = wrap_defs(body, visible);
+            bound.push((name, params, wrapped));
+        }
+        Ok(bound)
     }
 
     /// Every def one module's own `include`/`import` directives bring into

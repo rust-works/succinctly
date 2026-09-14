@@ -6363,24 +6363,67 @@ as its own dependencies are loading, which is precisely the window in which a cy
 `test_module_cycle_is_a_compile_error_not_a_hang_2865` (`tests/jq_cli_tests.rs`) pins all
 four shapes (two-module cycle, self-include, aliased spelling, `import`-side cycle).
 
-### Three module-scoping quirks that *are* matched, and read as bugs (#2865)
+### Five module-scoping rules that *are* matched, and read as bugs (#2865)
 
 Not divergences — recorded here because the next person to touch `ModuleLoader` will
-otherwise read them as ones, and because the self-recursion filter in
-`deps_excluding_self` has no other explanation. All three captured live against jq 1.7.1,
-with `inner.jq` = `def g: 42;`:
+otherwise read them as ones, and because the exclusions in `visible_defs_for` have no
+other explanation. All captured live against jq 1.7.1, with `inner.jq` = `def g: 42;`:
 
-| Case                                                                     | jq, and succinctly                                                                                               |
-|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| Module is `include "inner"; def g: 7; def h: g;` — what does `h` answer? | **`42`** — the dependency is innermost, so it beats the module's own same-name sibling one line above            |
-| ...and what does that module still *export* as `g`?                      | `7` — its own def                                                                                                |
-| Same collision at the **top level**: `include "inner"; def g: 7; g`      | `7` — the **opposite** way, because a filter's own defs bind at parse time before the module block is spliced in |
-| A def's own recursive call, with a same-named dependency in scope        | binds to **itself**: `def g: if . == 0 then "base" else (. - 1 \                                                 |
+1. **A dependency outranks the module's own same-name sibling.** With the module written
+   `include "inner"; def g: 7; def h: g;`, `h` answers **`42`** — not the `7` one line
+   above it. The dependency is bound innermost.
+2. **...while that module still exports its own `g`**, which answers `7`.
+3. **The same collision at the top level goes the opposite way.** `include "inner"; def
+   g: 7; g` answers `7`, because a filter's own defs bind at parse time, before the
+   module block is spliced in.
+4. **A def's own recursive call binds to itself, not to a same-named dependency, per
+   (name, arity).** With `inner`'s `g/0` in scope, a module's
+   `def g: if . == 0 then "base" else (. - 1 | g) end;` still answers `"base"`, never
+   `42`. Arity-scoped: a dependency `g/1` alongside an own `g/0` leaves both reachable
+   from the same body (`["own0","dep1arg"]`).
+5. **A parameter beats both.** `def f(g): g; def q: f(7);` answers `7` even with a
+   dependency or a sibling named `g` in scope, and `def f($g): [$g, g]` answers `[7,7]`
+   — a `$`-spelled parameter binds the bare call-site namespace too.
 
-Two further module-scope gaps found while closing #2865 are genuine and still open, filed
-rather than recorded as divergences: a dependency named after a builtin cannot shadow that
-builtin *inside* the module body, because a module's own source is parsed with no
-shadow-candidate seeding
+Rule 4 is why an exported def's body is *not* wrapped in a dependency matching its own
+(name, arity), and rule 5 is why it is not wrapped in one matching any of its parameters.
+Rules 1-3 are why the wrap goes around each exported def's **body** rather than being
+spliced into the module's exported chain.
+
+One consequence worth stating, since it is the reason an exported body carries its
+module's own earlier siblings as well as its dependencies: a def handed to another module
+has to be **self-contained**. With `inner.jq` = `def g: 42; def k: g;` and `outer.jq` =
+`include "inner"; def g: k;`, jq answers `42` — `k`'s `g` is `inner`'s. Leaving `k`'s `g`
+to resolve outward into wherever `k` gets spliced would instead find `outer`'s own `g`,
+which is `k`.
+
+### Deeply chained modules compound in memory (#2955)
+
+Binding copies the AST, so a chain of modules whose defs each call **more than one** def
+from the level below grows exponentially with depth. jq binds symbolically and shares its
+blocks, so it does not. Measured at #2865's own head (Apple M-series, release):
+
+| chain                            | succinctly peak RSS | jq peak RSS |
+|----------------------------------|---------------------|-------------|
+| 6 levels x 40 defs, 1 call each  | 10 MB               | 2.5 MB      |
+| 8 levels x 6 defs, 3 calls each  | 91 MB               | 2.6 MB      |
+| 14 levels x 4 defs, 2 calls each | 361 MB              | 2.6 MB      |
+
+The referenced-closure filter (jq's own `block_bind_referenced` rule, in
+`visible_defs_for`) flattens the one-call-each shape completely — without it the
+6 x 40 row was 359 MB rather than 10 MB — but it cannot flatten a genuinely wide closure,
+because that closure is itself exponential. Every row above produces the **correct**
+answer; this is a scalability limit of AST inlining, not a wrong result, and not a
+regression — none of these programs compiled at all before #2865. Tracked as
+[#2955](https://github.com/rust-works/succinctly/issues/2955), whose most promising fix is
+splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
+introduced) instead of by clone.
+
+### Two module-scope gaps that are genuinely open
+
+Found while closing #2865, filed rather than recorded as divergences: a dependency named
+after a builtin cannot shadow that builtin *inside* the module body, because a module's
+own source is parsed with no shadow-candidate seeding
 ([#2950](https://github.com/rust-works/succinctly/issues/2950)); and a module body can see
 names it should not — `~/.jq`'s defs, and sibling `include`d modules' defs in a
 declaration-order-dependent way — because every module is inlined into one flat def chain
