@@ -31065,13 +31065,17 @@ impl FoldRegister {
         }
     }
 
-    /// Whether `branch` is still sitting on this register — jq's own
-    /// `jv_identical(v, jq->value_at_path)`, modeled for a value type that
+    /// Whether an eligible value/snapshot pair is still sitting on this
+    /// register — jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type that
     /// has no pointer to compare (#1466).
     ///
     /// The rule itself lives in [`register_identical`], which
     /// `resolve_seq`'s own pipe register shares (#1573); this adds only the
-    /// `trackable` precondition, since a register that never resolved to a
+    /// `trackable` precondition and the caller's explicit `eligible` gate
+    /// (#2901). Eligibility can be expression-specific (`relocate`), jq-mode
+    /// only (source fork 0 and accumulator re-entry), or unconditional
+    /// (a later source fork's null ambient); those rules must not be widened
+    /// by sharing the identity check. A register that never resolved to a
     /// real path cannot recognise anything. A *trackable* branch never
     /// needs this either way: it navigated to a real path and `relocate`'s
     /// first arm already places it.
@@ -31093,12 +31097,11 @@ impl FoldRegister {
     /// `resolve_node`'s own finer-grained tracking already, correctly,
     /// marked it untracked. See [`relocate`](Self::relocate)'s own doc
     /// comment for the gate that gives this its precondition back.
-    fn identical(&self, branch: &PathBranch<'_>) -> bool {
-        self.trackable
-            && register_identical(&self.value, &self.frame, &branch.value, &branch.snapshot)
+    fn identical(&self, value: &OwnedValue, snapshot: &Snapshot, eligible: bool) -> bool {
+        eligible && self.trackable && register_identical(&self.value, &self.frame, value, snapshot)
     }
 
-    /// `identical_eligible` -- **#2860**: whether `self.identical(&b)`'s
+    /// `identical_eligible` -- **#2860**: whether `self.identical`'s
     /// coarse, position-blind value-equality check is even a valid
     /// question to ask for the expression `branches` came from. `false`
     /// whenever [`cannot_move_register`] says that expression could have
@@ -31132,7 +31135,7 @@ impl FoldRegister {
                 if b.trackable {
                     let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
                     PathBranch::new(path, b.value, true)
-                } else if identical_eligible && self.identical(&b) {
+                } else if self.identical(&b.value, &b.snapshot, identical_eligible) {
                     PathBranch::new(Rc::clone(&self.path), b.value, true)
                 } else {
                     // Demoting must not erase the snapshot mark: a fold
@@ -32526,10 +32529,8 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
         // above already applies) makes a widened acceptance here the
         // *wrong* direction for that mode, with no real-yq oracle to verify
         // it against either way.
-        let source_trackable = path_trackable
-            || (S::TAG == EvalTag::Jq
-                && reg.trackable
-                && register_identical(&reg.value, &reg.frame, value, snapshot));
+        let source_trackable =
+            path_trackable || reg.identical(value, snapshot, S::TAG == EvalTag::Jq);
         // The widened acceptance above answers a *value*-identity question
         // independent of `doc_branch`'s own path-derived snapshot, so
         // `path_snapshot` (unconditionally `doc_branch`'s own marker,
@@ -32567,8 +32568,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     // fix; flagged here rather than silently left inconsistent so a future
     // audit of this area starts from an accurate account instead of
     // assuming both gates cover the same risk.
-    let at_register =
-        reg.trackable && register_identical(&reg.value, &reg.frame, null, &Snapshot::No);
+    let at_register = reg.identical(null, &Snapshot::No, true);
     FoldSourceAmbient {
         value: null,
         trackable: at_register,
@@ -32861,9 +32861,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // this is unconditional.
             let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
             acc_at_register = acc_at_register
-                || (S::TAG == EvalTag::Jq
-                    && reg.trackable
-                    && register_identical(&reg.value, &reg.frame, acc_effective, &acc_snapshot));
+                || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
             match reg.resolve::<S>(
                 &substituted,
@@ -33279,14 +33277,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             frame: reg.frame.clone(),
                         },
                         state_at_register
-                            || (S::TAG == EvalTag::Jq
-                                && reg.trackable
-                                && register_identical(
-                                    &reg.value,
-                                    &reg.frame,
-                                    &state,
-                                    &state_snapshot,
-                                )),
+                            || reg.identical(&state, &state_snapshot, S::TAG == EvalTag::Jq),
                     ),
                 }
             };
