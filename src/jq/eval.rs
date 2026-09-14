@@ -35488,19 +35488,19 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
         // even though `target`, `(1,2)`, is untrackable and would
         // otherwise have raised its own "Invalid path expression" error
         // first -- `T`'s own escape wins before `target` is ever reached).
-        let ends =
-            drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(&s, &e, sink)
-            {
-                Ok(Demand::Continue) => Demand::Continue,
-                Ok(Demand::Stop) => {
-                    stopped = true;
-                    Demand::Stop
-                }
-                Err(control) => {
-                    inner_escape = Some(control);
-                    Demand::Stop
-                }
-            });
+        let ends = drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(
+            &s, &e, sink,
+        ) {
+            Ok(Demand::Continue) => Demand::Continue,
+            Ok(Demand::Stop) => {
+                stopped = true;
+                Demand::Stop
+            }
+            Err(control) => {
+                inner_escape = Some(control);
+                Demand::Stop
+            }
+        });
         let ends_escape = match ends {
             Ok(escape) => escape,
             Err(control) => {

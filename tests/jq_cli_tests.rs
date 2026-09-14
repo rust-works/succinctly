@@ -17354,10 +17354,8 @@ fn test_resolve_index_expr_target_escape_stops_key_generator_2267() -> Result<()
 /// the four pairs the cross product would have produced.
 #[test]
 fn test_assign_write_failure_stops_slice_pair_generator_2267() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r#"(.|stderr)[(0,1):(2,3)] = 99"#],
-        Some("[10,20,30]"),
-    )?;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r"(.|stderr)[(0,1):(2,3)] = 99"], Some("[10,20,30]"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "a failed write emits no document");
     // Count, not just content: the divergence was 4 firings where jq has 1,
@@ -17383,8 +17381,7 @@ fn test_assign_write_failure_stops_slice_pair_generator_2267() -> Result<()> {
 /// jq 1.7.1 fires `stderr` once for the two keys; this fired twice.
 #[test]
 fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", r#"(.|stderr)[(-1,-2)] = 1"#], Some("null"))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"(.|stderr)[(-1,-2)] = 1"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     let fired = stderr.matches("null").count();
@@ -17406,8 +17403,7 @@ fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
 /// that simply stopped after the first path would pass both tests above.
 #[test]
 fn test_assign_streams_every_path_when_writes_succeed_2267() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", r#"(.|stderr)[("a","b")] = 1"#], Some("{}"))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"(.|stderr)[("a","b")] = 1"#], Some("{}"))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
     assert_eq!(
@@ -17430,7 +17426,7 @@ fn test_assign_streams_every_path_when_writes_succeed_2267() -> Result<()> {
 #[test]
 fn test_assign_streaming_resolves_against_the_unwritten_document_2267() -> Result<()> {
     let (stdout, stderr, code) =
-        run_jq_full(&["-c", r#".[(.a,.a)] = 5"#], Some(r#"{"a":"b","b":1}"#))?;
+        run_jq_full(&["-c", r".[(.a,.a)] = 5"], Some(r#"{"a":"b","b":1}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "{\"a\":\"b\",\"b\":5}\n");
 
@@ -17492,7 +17488,7 @@ fn test_bounded_consumer_stops_computed_path_generators_2267() -> Result<()> {
 fn test_streaming_write_gate_leaves_neighbouring_shapes_alone_2267() -> Result<()> {
     for (filter, input, expected_stdout, expected_fired) in [
         // Static path: one path, no prepass, eager route.
-        (r#"(.|stderr).a = 5"#, r#"{"a":1}"#, "{\"a\":5}\n", 1),
+        (r"(.|stderr).a = 5", r#"{"a":1}"#, "{\"a\":5}\n", 1),
         // Multi-output RHS: eager route, and still the *pre-existing*
         // twice-not-four-times count step 2 would have changed (#2267's own
         // `limitations.md` entry), deliberately unchanged here.
@@ -45256,7 +45252,7 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
         ),
         (
             "[1,2,3]",
-            r#"[limit(1; path(.[(0|stderr):((1|stderr),(2|stderr))]))]"#.to_string(),
+            r"[limit(1; path(.[(0|stderr):((1|stderr),(2|stderr))]))]".to_string(),
             "[[{\"start\":0,\"end\":1}]]\n".to_string(),
             "01".to_string(),
             0,
@@ -45286,38 +45282,32 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
         assert_eq!(stderr, want_err, "{filter}");
     }
 
-    // #2925's remaining shape -- the second one it recorded (a generator in
-    // index position) closed with #2267 and is in the table above now. This
-    // row carries jq's answer and ours and asserts they still differ, so
-    // closing it trips this test rather than passing quietly.
+    // #2925's one remaining shape. The second one it recorded -- a generator
+    // in index position -- closed with #2267 and is in the table above now,
+    // which is why this is a single case rather than the loop it used to be.
+    //
+    // A document the reindex bridge will not round-trip identically takes
+    // the bridge, which collects -- so the *document* selects the route, not
+    // the filter. The same filter on `{"a":1,"b":2}` is in the table above,
+    // matching jq. jq 1.7.1 writes `1`; this writes `12`, and the assertions
+    // below carry both so that closing the gap trips this test rather than
+    // passing quietly.
     let big = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(300));
-    for (input, filter, want_out, jq_err, our_err) in [
-        // A document the reindex bridge will not round-trip identically
-        // takes the bridge, which collects -- so the *document* selects the
-        // route, not the filter. The same filter on `{"a":1,"b":2}` is in
-        // the table above, matching jq.
-        (
-            big.as_str(),
-            "[limit(1; path((.a|stderr),(.b|stderr)))]",
-            "[[\"a\"]]\n",
-            "1",
-            "12",
-        ),
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
-        assert_eq!(stdout, want_out, "{filter}");
-        assert_ne!(
-            our_err, jq_err,
-            "{filter}: this row exists because the two differ -- if they no longer do, \
-             move it into the table above"
-        );
-        assert_eq!(
-            stderr, our_err,
-            "{filter}: #2925's residual changed -- if it closed, move this row into the \
-             table above with jq's own stderr ({jq_err:?})"
-        );
-    }
+    let filter = "[limit(1; path((.a|stderr),(.b|stderr)))]";
+    let (jq_err, our_err) = ("1", "12");
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&big))?;
+    assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[[\"a\"]]\n", "{filter}");
+    assert_ne!(
+        our_err, jq_err,
+        "{filter}: this row exists because the two differ -- if they no longer do, \
+         move it into the table above"
+    );
+    assert_eq!(
+        stderr, our_err,
+        "{filter}: #2925's residual changed -- if it closed, move this case into the \
+         table above with jq's own stderr ({jq_err:?})"
+    );
     Ok(())
 }
 
