@@ -281,6 +281,13 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
         Ok(OwnedValue::Bool(b))
+    } else if let Some(f) = value.bridge_computed_float() {
+        // #2902: a computed float re-indexed by the bridge (a path-context
+        // pipe over an owned container reaches this materializer with the
+        // bridge's own document) -- bare, never a literal, and never
+        // `from_document_float` below, which would re-bake it past yq's
+        // threshold; see `DocumentValue::bridge_computed_float`.
+        Ok(OwnedValue::Float(f))
     } else if let Some(literal) = value.number_literal() {
         Ok(OwnedValue::from_number_literal(&literal))
     } else if let Some(i) = value.as_i64() {
@@ -289,8 +296,8 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
         // #2438: a document scalar that got this far has no preservable
         // literal left (`number_literal()` answered `None` just above), so
         // this is the boundary where its provenance is still known -- see
-        // `OwnedValue::from_document_float`. Unreachable for JSON input,
-        // whose `number_literal()` override is unconditional.
+        // `OwnedValue::from_document_float`. For JSON input this is reached
+        // only by a lenient span `number_literal()` declines (#966).
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
@@ -523,6 +530,13 @@ fn to_owned_at_depth<V: DocumentValue>(
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
         Ok(OwnedValue::Bool(b))
+    } else if let Some(f) = value.bridge_computed_float() {
+        // #2902: a computed float re-indexed by the bridge (a path-context
+        // pipe over an owned container reaches this materializer with the
+        // bridge's own document) -- bare, never a literal, and never
+        // `from_document_float` below, which would re-bake it past yq's
+        // threshold; see `DocumentValue::bridge_computed_float`.
+        Ok(OwnedValue::Float(f))
     } else if let Some(literal) = value.number_literal() {
         Ok(OwnedValue::from_number_literal(&literal))
     } else if let Some(i) = value.as_i64() {
@@ -531,8 +545,8 @@ fn to_owned_at_depth<V: DocumentValue>(
         // #2438: a document scalar that got this far has no preservable
         // literal left (`number_literal()` answered `None` just above), so
         // this is the boundary where its provenance is still known -- see
-        // `OwnedValue::from_document_float`. Unreachable for JSON input,
-        // whose `number_literal()` override is unconditional.
+        // `OwnedValue::from_document_float`. For JSON input this is reached
+        // only by a lenient span `number_literal()` declines (#966).
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
@@ -2815,19 +2829,17 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
 /// - A `NumberLiteral` whose source text exceeds
 ///   [`REINDEX_LITERAL_LEN_CAP`] is discarded (#1211).
-/// - A non-finite bare `Float` goes through a sentinel/overflow literal;
-///   it comes back as the same value, but this predicate stays out of that
-///   corner rather than reason about it.
 ///
-/// A bare finite **`Float`** used to head this list: the formatter re-spelled
-/// it by a mode-forked rule (#953) and it came back as a `NumberLiteral`
-/// carrying that new text, which was the case the bridge was genuinely
-/// load-bearing for (without the guard, `.outer.big | parent` on
+/// A bare **`Float`** used to head this list: the formatter re-spelled a
+/// finite one by a mode-forked rule (#953) and it came back as a
+/// `NumberLiteral` carrying that new text, which was the case the bridge was
+/// genuinely load-bearing for (without the guard, `.outer.big | parent` on
 /// `10000000000000000000.0` printed `1e+19` in yq mode). Since #2902 the
-/// bridge writes a bare finite `Float` as a token
+/// bridge writes a finite `Float` as a token
 /// (`crate::json::validate::computed_float_token`) that reparses to the same
-/// bare `Float`, so the round trip is an identity on it too and the bypass
-/// applies.
+/// bare `Float`, and a NaN/infinite one was always written as a sentinel
+/// `from_number_bytes` decodes back to the same bare `Float`, so the round
+/// trip is an identity on every bare `Float` and the bypass applies.
 ///
 /// Everything else -- `null`, booleans, strings (escaped and unescaped
 /// symmetrically), object keys, and the overwhelmingly common
@@ -2853,8 +2865,9 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// produces plain `Int`/`Float`.
 ///
 /// Deliberately an **input-side** predicate rather than an output-side fixup.
-/// A first version of this fix re-applied `yq_float_fidelity_fixup` to the
-/// *result* instead; code review showed that isn't the same transformation at
+/// A first version of this fix re-applied `yq_float_fidelity_fixup` (the
+/// output-side re-spelling pass #2902 has since removed) to the *result*
+/// instead; code review showed that isn't the same transformation at
 /// all, and got it wrong in both directions -- re-spell-then-evaluate is not
 /// evaluate-then-re-spell once the pipe does any computing.
 /// `.outer.big|parent|.big|tostring` lost the document spelling
@@ -2863,118 +2876,12 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// alone can safely skip the bridge.
 pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
     match value {
-        OwnedValue::Float(f) => f.is_finite(),
-        OwnedValue::Int(_) => true,
+        OwnedValue::Float(_) | OwnedValue::Int(_) => true,
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => false,
         OwnedValue::NumberLiteral(_, literal) => literal.len() <= REINDEX_LITERAL_LEN_CAP,
         OwnedValue::Array(items) => items.iter().all(reindex_bridge_is_identity),
         OwnedValue::Object(fields) => fields.values().all(reindex_bridge_is_identity),
         OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::String(_) => true,
-    }
-}
-
-/// Re-derives every `Float`'s spelling in `values` through
-/// [`eval_on_owned`]'s reindex bridge (`to_json_for_reindex`'s `S`-gated
-/// formatter, #953), without touching anything else in the input document.
-///
-/// `Expr::Array`/`Expr::Comma`'s own native `eval_single` arms (#1168) build
-/// `values` straight from `to_owned`/`to_owned_cursor` -- or, for a builtin
-/// with its own native construction (`to_entries`, ...), from whatever *that*
-/// builtin's arm produced, which uses the identical `to_owned`/`to_owned_cursor`
-/// conversion internally. Neither has any notion of "this bare `Float` came
-/// from a document-sourced literal that overflowed `i64`, keep its decimal
-/// point regardless of magnitude" -- only `to_json_for_reindex`'s own
-/// `S`-gated fallback applies that rule (see its doc comment,
-/// `src/jq/value.rs`), and *only* because, before `Expr::Array`/`Expr::Comma`
-/// had native arms, `[...]`/`,` had no choice but to fall through to this
-/// same bridge for lack of one. Adding native arms without also keeping this
-/// fix regressed #953 for a direct cursor result (`[.a]`, caught by its own
-/// regression test) *and*, less obviously, for a value one layer removed
-/// through a builtin's own construction (`[to_entries]` on an overflow
-/// field, caught in code review -- `Builtin::ToEntries` also reads the field
-/// via `to_owned_cursor`, just wrapped in an entry object before `Expr::Array`
-/// ever sees it, so scoping the fixup to only direct `GenericResult::
-/// OneCursor`/`ManyCursor` results missed this case entirely).
-///
-/// This is why the fixup applies unconditionally to the *whole* constructed
-/// result rather than trying to track, per value, whether it's document-
-/// sourced or genuinely computed (e.g. `1e10 * 2`) -- that distinction isn't
-/// recoverable from a `GenericResult` variant once a value has passed through
-/// even one further construction step (`to_entries`'s object wrapping looks
-/// identical, from here, to freshly computed arithmetic).
-///
-/// #1168 accepted a gap as the price of that: a genuinely computed float
-/// wrapped directly in `[...]`/`,` (`[1e10 * 2]`) also got its decimal point
-/// forced, where real yq keeps scientific notation. #2438 closed it by
-/// tagging the provenance at `OwnedValue`'s own construction site after all
-/// -- [`OwnedValue::from_document_float`], applied at the document boundary
-/// (`to_owned_at_depth`, `ResolvedScalar::to_owned_value`) rather than
-/// reconstructed here -- which let `to_json_for_reindex`'s yq fallback
-/// switch to yq's own magnitude threshold (`format_float_yq`). This function
-/// is unchanged by that and still round-trips the whole result; what changed
-/// is that a document-sourced float now arrives already carrying its
-/// spelling, so the round trip preserves it as a literal instead of having
-/// to synthesize one for everything. `[1e10 * 2]` keeps scientific notation
-/// as a result. #2902 then closed the ordinary-magnitude `join` gap
-/// (#1124/#1144, `[2.0/2]`) from the other side: the bridge now writes a
-/// bare `Float` as a token it hands back as a bare `Float`, so this round
-/// trip no longer bakes a computed float into a literal at any magnitude.
-///
-/// Round-tripping just `values` (not the whole input document, unlike the
-/// old wildcard fallback these two arms replace) keeps `Expr::Array`'s and
-/// `Expr::Comma`'s actual fix — duplicate mapping keys survive a builtin's
-/// own cursor-native conversion (`to_entries`, etc.) intact. Safe with
-/// respect to that fix: nothing in `values` still has a duplicate *mapping
-/// key* left to lose by round-tripping again — any genuine YAML duplicate
-/// was already collapsed the moment `to_owned`/`to_owned_cursor` first
-/// converted its mapping to an `IndexMap`-backed `Object`, before this ever
-/// runs; a builtin with its own dedup-preserving fix has already turned its
-/// duplicates into distinct array elements by this point instead, which
-/// round-trip through JSON text with no collision to lose.
-///
-/// A no-op in jq mode (`to_json_for_reindex`'s own `S`-gate already makes
-/// the round trip itself a no-op there — jq drops a computed float's
-/// literal formatting unconditionally), and a no-op whenever `values` has no
-/// `Float`/`NumberLiteral(Float, _)` anywhere in its tree (`contains_float`)
-/// — skipped outright rather than paying for a round trip that has nothing
-/// to fix, which is the common case (`[.a, .b, .c]` over strings/objects/
-/// plain ints). `Ok` carries the fixed-up values back for the caller to
-/// package (`Expr::Array` always wraps them in one `OwnedValue::Array`;
-/// `Expr::Comma` collapses via [`owned_vec_to_generic_result`]); `Err`
-/// carries an already-terminal `GenericResult` (an `Error`, in practice —
-/// see [`eval_on_owned`]'s own doc comment for why this is defense-in-depth
-/// rather than a reachable path for internally-constructed input) for the
-/// caller to return as-is.
-fn yq_float_fidelity_fixup<S: EvalSemantics, V: DocumentValue>(
-    values: Vec<OwnedValue>,
-) -> Result<Vec<OwnedValue>, GenericResult<V>> {
-    if S::TAG != EvalTag::Yq || values.is_empty() || !values.iter().any(contains_float) {
-        return Ok(values);
-    }
-    match eval_on_owned::<S, V>(&Expr::Identity, OwnedValue::Array(values), false) {
-        GenericResult::Owned(OwnedValue::Array(fixed)) => Ok(fixed),
-        GenericResult::Error(e) => Err(GenericResult::Error(e)),
-        other => Err(other),
-    }
-}
-
-/// Whether `value`'s tree contains a `Float`/`NumberLiteral(Float, _)`
-/// anywhere -- the only shapes [`yq_float_fidelity_fixup`]'s round trip can
-/// possibly change (see `to_json_for_reindex`'s own `S`-gated fallback,
-/// which is scoped identically). A cheap pre-check so a document with no
-/// float anywhere in the wrapped result skips the round trip entirely,
-/// rather than paying for one that has nothing to do.
-fn contains_float(value: &OwnedValue) -> bool {
-    match value {
-        OwnedValue::Float(_) => true,
-        OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => true,
-        OwnedValue::Array(items) => items.iter().any(contains_float),
-        OwnedValue::Object(fields) => fields.values().any(contains_float),
-        OwnedValue::Null
-        | OwnedValue::Bool(_)
-        | OwnedValue::Int(_)
-        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        | OwnedValue::String(_) => false,
     }
 }
 
@@ -6567,17 +6474,14 @@ fn each_lazy_array_iterate_sink<V: DocumentValue>(
 /// #2543: when `remaining` (the stages still to apply to an already-computed
 /// `o`) is exactly one `Expr::Format`/`Builtin::ToString`, routes through
 /// `eval_on_owned` directly instead of the caller's own `Expr::Pipe`-wrapped
-/// `eval_each_owned` fallback. `eval_on_owned` (this file) already
-/// special-cases exactly these two shapes immediately after a computed value
-/// to avoid rebaking its scientific-notation spelling as a
-/// document-sourced-looking literal on the JSON round-trip below it (#1054);
-/// the wrapped route missed both -- `eval_owned_fast_path` (`eval.rs`) has no
-/// `Expr::Format` arm at all, and (before also being fixed there) didn't
-/// recognize a `Builtin::ToString` wrapped in a trivial `Expr::Pipe` as the
-/// same shape its own bare-`Builtin` arm matches. Confirmed live:
-/// `succinctly jq -n '(2 * 1e16) | @json'` gave `"2E+16"` (jq's
-/// literal-reformat convention) where real jq and every non-streaming
-/// succinctly path give `"2e+16"` (the computed-value convention).
+/// `eval_each_owned` fallback, reaching `eval_on_owned`'s own bypass for
+/// exactly these two shapes. That bypass was load-bearing for correctness
+/// when it was added (#1054/#2543: the JSON round trip below it re-baked a
+/// computed float's spelling as a document-sourced-looking literal, so
+/// `succinctly jq -n '(2 * 1e16) | @json'` gave `"2E+16"` for real jq's
+/// `"2e+16"`); since #2902 the round trip hands a computed float back as a
+/// bare `Float`, so for every value [`reindex_bridge_is_identity`] admits
+/// the two routes agree and this is a speed-only short cut.
 ///
 /// Shared by [`fold_pipe_stages_sink`] and `continue_pipe_element_generic`
 /// so the allowed-shapes list and its short-circuit-safety rationale live in
@@ -7930,16 +7834,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     unreachable!("materialize_lazy() already normalized every lazy variant")
                 }
             };
-            // Fixed up as one whole unit, not per-source (#953/#1168, see
-            // `yq_float_fidelity_fixup`'s own doc comment for why -- in
-            // short, a builtin's own construction around a document value
-            // (`to_entries`, ...) is indistinguishable here from a genuinely
-            // computed one, so the fixup can't be scoped any narrower than
-            // this without missing that case).
-            match yq_float_fidelity_fixup::<S, _>(items) {
-                Ok(fixed) => GenericResult::Owned(OwnedValue::Array(fixed)),
-                Err(result) => result,
-            }
+            // No float re-spelling pass over `items` any more: #1168's
+            // `yq_float_fidelity_fixup` pushed every constructed result back
+            // through the reindex bridge so its yq-mode formatter would give
+            // a document-sourced overflow float its decimal spelling (#953),
+            // and #2438 then recorded that provenance at the document
+            // boundary instead (`OwnedValue::from_document_float`). Once
+            // #2902 made the bridge an identity on a bare `Float`, the round
+            // trip could no longer change anything it was meant to, and was
+            // removed.
+            GenericResult::Owned(OwnedValue::Array(items))
         }
 
         // Comma: evaluate each operand in source order against the ambient
@@ -7955,11 +7859,6 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `eval::eval_comma` defers to `eval::eval_try`. Handled natively so
         // a cursor-native builtin's fix doesn't lose it to the wildcard
         // fallback just for being joined with `,` either (#1168).
-        //
-        // `yq_float_fidelity_fixup` runs once over the whole collected `out`
-        // after the loop, not per-sibling -- same reasoning as `Expr::Array`
-        // above, and cheaper (one round trip for `.a, .b, .c` instead of up
-        // to three).
         // #2416 phase 3: `if` through the sink evaluator's own arm
         // (`each_if_generic`), which evaluates the condition and the taken
         // branch with the cursor, instead of the eager bridge -- so
@@ -7987,13 +7886,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 &mut acc,
                 &mut objects,
             );
-            // Deliberately *not* passed through `yq_float_fidelity_fixup`: the
-            // bridge this arm replaces returned the eager evaluator's objects
-            // as built, leaving a computed float bare for the YAML emitter's
-            // nested-float rule (`{"a": (.a * 1e100)}` prints `a: 1e+100`,
-            // as real yq does). The fixup's reindex round trip spells that
-            // same float out in full, which is the `Expr::Array` arm's own
-            // pre-existing divergence (`[.a * 1e100]`), not one to inherit.
+            // Objects are returned as built, leaving a computed float bare
+            // for the YAML emitter's nested-float rule (`{"a": (.a * 1e100)}`
+            // prints `a: 1e+100`, as real yq does) -- since #2902 the
+            // `Expr::Array`/`Expr::Comma` arms above do the same.
             match built {
                 Ok(()) => owned_vec_to_generic_result(objects),
                 Err(ObjectEscapeGeneric::Suppressed) => GenericResult::None,
@@ -8058,16 +7954,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             for expr in exprs {
                 let result = eval_single::<S, _>(expr, value.clone(), optional, cursor);
                 if let Some(control) = push_generic_owned_values(result, &mut out) {
-                    return match yq_float_fidelity_fixup::<S, _>(out) {
-                        Ok(fixed) => partial_generic(fixed, control),
-                        Err(result) => result,
-                    };
+                    return partial_generic(out, control);
                 }
             }
-            match yq_float_fidelity_fixup::<S, _>(out) {
-                Ok(fixed) => owned_vec_to_generic_result(fixed),
-                Err(result) => result,
-            }
+            owned_vec_to_generic_result(out)
         }
 
         // Fall back to the full evaluator for complex expressions
@@ -14762,10 +14652,10 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
 ///
 /// The generic twin of `eval::eval_array_construction`'s use inside
 /// `builtin_min_by`/`sort_by`/`group_by`/`unique_by`. It deliberately does
-/// *not* route through this file's own `Expr::Array` arm, which additionally
-/// applies `yq_float_fidelity_fixup` -- that fixup exists to make a computed
-/// float *print* the way real yq prints it, and running it here would let an
-/// output-formatting rule change which element sorts first.
+/// *not* route through this file's own `Expr::Array` arm: until #2902 that
+/// arm additionally re-spelled every computed float through the reindex
+/// bridge (`yq_float_fidelity_fixup`, an output-formatting rule), and
+/// running it here would have let it change which element sorts first.
 ///
 /// Atomic, matching `eval_array_construction`: any control from `f` -- error,
 /// break, halt, or the trailing control of a `Partial` -- discards the prefix
@@ -21021,8 +20911,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::ToNumber => {
             // Already a number: a passthrough, not a computation, so (like
-            // `.`) it keeps the source literal.
-            if let Some(literal) = value.number_literal() {
+            // `.`) it keeps the source literal -- or, for the reindex
+            // bridge's computed-float token, stays the bare `Float` it was
+            // (#2902, same reasoning as `to_owned_at_depth`'s own arm).
+            if let Some(f) = value.bridge_computed_float() {
+                GenericResult::Owned(OwnedValue::Float(f))
+            } else if let Some(literal) = value.number_literal() {
                 GenericResult::Owned(OwnedValue::from_number_literal(&literal))
             } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
@@ -25061,15 +24955,20 @@ mod tests {
 
         // The shape the guard used to exist for: a bare `Float`, which #953's
         // mode-forked re-spelling rewrote into a `NumberLiteral`. Since #2902
-        // the bridge writes it as a token that reparses to the same bare
-        // `Float`, so it is an identity in both modes and the predicate admits
-        // it -- asserted in both directions so a formatter regression that
-        // starts re-spelling it again fails here, not in a user's `tostring`.
+        // the bridge writes a finite one as a token that reparses to the same
+        // bare `Float` (a non-finite one always went through a sentinel that
+        // does the same), so it is an identity in both modes and the
+        // predicate admits it -- asserted in both directions so a formatter
+        // regression that starts re-spelling it again fails here, not in a
+        // user's `tostring`.
         for computed in [
             OwnedValue::Float(1e19),
             OwnedValue::Float(1.0),
             OwnedValue::Float(-0.0),
             OwnedValue::Float(5e-6),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
         ] {
             assert!(
                 super::reindex_bridge_is_identity(&computed),
@@ -25084,12 +24983,6 @@ mod tests {
                 "sanity: the jq-mode bridge hands back {computed:?} unchanged"
             );
         }
-        assert!(!super::reindex_bridge_is_identity(&OwnedValue::Float(
-            f64::NAN
-        )));
-        assert!(!super::reindex_bridge_is_identity(&OwnedValue::Float(
-            f64::INFINITY
-        )));
     }
 
     /// The one thing [`reindex_bridge_is_identity`]'s `Int` arm rests on, and

@@ -4239,6 +4239,26 @@ output is unaffected, since neither appears in JSON
 for the feature-level gaps (position builtins after DOM conversion; `file_index`/`key`/
 `document_index` inside object literals or `any`/`all`).
 
+## `tostring`/`tojson` render a container compactly ([#2902](https://github.com/rust-works/succinctly/issues/2902), found while verifying)
+
+Real yq's `tostring` on a container is its YAML encoder (block style, `!!float` tags
+where the spelling needs one), and its `tojson` is its indented JSON encoder, which ends
+every string it produces -- scalar or container -- with a newline of its own. succinctly
+renders both compactly and without that trailing newline. Captured live (v4.53.3, `null`
+on stdin):
+
+| filter                   | real yq                | succinctly yq |
+|--------------------------|------------------------|---------------|
+| `[1.0] \| tostring`      | `- 1.0`                | `[1.0]`       |
+| `[0.5+0.5] \| tostring`  | `- !!float 1`          | `[1.0]`       |
+| `[1] \| tojson`          | `[\n  1\n]\n` + `\n`   | `[1]`         |
+| `"x" \| tojson`          | `"x"\n` + `\n`         | `"x"`         |
+| `(0.5+0.5) \| tojson`    | `1.0\n` + `\n`         | `1.0`         |
+
+Scalar `tostring` agrees in both (the #2902 fix above); the container spellings and the
+trailing newline are pre-existing and not attempted there. The `tojson` tests in
+`tests/yq_cli_tests.rs` compare trimmed output for this reason.
+
 ## Evaluator resource caps apply in yq mode too, and are uncatchable (#2132)
 
 The five caps `succinctly jq` documents -- `MAX_RANGE`, `WHILE_UNTIL_MAX_STEPS`,
@@ -4365,9 +4385,12 @@ Until #2052 the flag validated through `serde_json::Value` and materialized thro
 (see the jq-mode limitations doc for why) and moved yq's materialization onto the
 `JsonIndex` + `to_owned_canonicalizing_numbers_at_depth` pair its `--input-format json` path
 already uses. #978's convention is intact -- `--argjson` still discards a literal's source
-spelling (`1.500` is `1.5`, `1.0` is `1.0`, `0099999999999999999999999` is `1e+23`) and
-still does not preserve it the way `succinctly jq`'s own `--argjson` does (#1058 was
-deliberately jq-mode-only).
+spelling (`1.500` is `1.5`, `0099999999999999999999999` is `1e+23`) and still does not
+preserve it the way `succinctly jq`'s own `--argjson` does (#1058 was deliberately
+jq-mode-only). Since [#2902](https://github.com/rust-works/succinctly/issues/2902) that same
+canonicalizer types a whole-valued float as an int, as real yq's own JSON decoder does
+(`1.0` is `!!int` under `-p json`), so `--argjson x 1.0` and `1.e5` render as `1` and
+`100000` where they rendered `1.0` and `100000.0` before.
 
 Two renderings do move, both because `serde_json` is no longer the one producing them
 (review of #2880 -- the PR text originally claimed nothing moved):

@@ -970,6 +970,22 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// The value this number token carries if it is the reindex bridge's
+    /// computed-float token (`crate::json::validate::computed_float_token`,
+    /// #2902), `None` for every other value.
+    ///
+    /// A materializer must consult this *before* [`number_literal`](Self::number_literal)
+    /// / [`as_i64`](Self::as_i64) / [`as_f64`](Self::as_f64): the token
+    /// deliberately fails the first two and decodes through the third, so a
+    /// chain that falls through to `as_f64` and then records document
+    /// provenance (`OwnedValue::from_document_float`) would re-bake the
+    /// computed value into a decimal literal past yq's threshold -- the very
+    /// re-spelling the token exists to prevent. Only a JSON document can
+    /// hold one (the bridge re-indexes as JSON), so the default is `None`.
+    fn bridge_computed_float(&self) -> Option<f64> {
+        None
+    }
+
     /// Try to get as a string.
     fn as_str(&self) -> Option<Cow<'_, str>>;
 

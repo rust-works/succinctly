@@ -10006,13 +10006,17 @@ fn test_argjson_materialization_is_unchanged_by_2052() -> Result<()> {
         // chain and now from the validator's own accept-set.
         ("007", "7"),
         (".5", "0.5"),
-        ("1.e5", "100000.0"),
+        ("1.e5", "100000"),
         ("[007,.5]", "[7,0.5]"),
-        // #978's spelling-discarding convention, unchanged (`-o=json`
-        // renders a float with its own `.0` where YAML output does not, so
-        // these are the JSON spellings, captured from the pre-#2052 binary).
+        // #978's spelling-discarding convention (`-o=json` renders a float
+        // with its own `.0` where YAML output does not, so these are the
+        // JSON spellings, captured from the pre-#2052 binary) -- with one
+        // later change: since #2902 the same canonicalizer types a
+        // whole-valued float as an int, the way real yq's own JSON decoder
+        // does (`1.0` is `!!int` under `-p json`), so `1.e5` and `1.0`
+        // render without the point.
         ("1.500", "1.5"),
-        ("1.0", "1.0"),
+        ("1.0", "1"),
         ("1e100", "1e+100"),
         ("99999999999999999", "99999999999999999"),
         ("0099999999999999999999999", "1e+23"),
@@ -10231,8 +10235,10 @@ fn test_argjson_shares_jq_dot_leniency_2240() -> Result<()> {
         (".05", r#"{"n":0.05}"#),
         (".007", r#"{"n":0.007}"#),
         ("-.05", r#"{"n":-0.05}"#),
-        ("1.e5", r#"{"n":100000.0}"#),
-        ("007.e5", r#"{"n":700000.0}"#),
+        // Whole-valued, so typed as an int by #978's canonicalizer since
+        // #2902 (real yq's JSON decoder does the same).
+        ("1.e5", r#"{"n":100000}"#),
+        ("007.e5", r#"{"n":700000}"#),
     ] {
         let (output, code) = run_yq_stdin(
             ".n = $n",
@@ -45814,13 +45820,21 @@ mod computed_float_through_container_2902 {
     use super::run_yq_stdin;
     use anyhow::Result;
 
-    fn check(rows: &[(&str, &str)]) -> Result<()> {
+    /// Compared trimmed, like every other `tojson` test in this file: real
+    /// yq's JSON encoder ends its string with a newline of its own, which
+    /// succinctly does not reproduce (see `docs/compliance/yq/limitations.md`,
+    /// "`tostring`/`tojson` render a container compactly").
+    fn check_on(input: &str, rows: &[(&str, &str)]) -> Result<()> {
         for (filter, want) in rows {
-            let (out, code) = run_yq_stdin(filter, "null\n", &[])?;
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
             assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
-            assert_eq!(out, format!("{want}\n"), "`{filter}`");
+            assert_eq!(out.trim_end(), *want, "`{filter}`");
         }
         Ok(())
+    }
+
+    fn check(rows: &[(&str, &str)]) -> Result<()> {
+        check_on("null\n", rows)
     }
 
     /// The issue's own table, plus the same value through deeper and
@@ -45854,22 +45868,15 @@ mod computed_float_through_container_2902 {
     /// yq's JSON encoder keeps a whole computed float's `.0` and switches to
     /// scientific notation past its magnitude threshold. The latter rows used
     /// to be right only because the bridge's literal spelled them that way;
-    /// `to_json_yq` now applies the threshold itself. Compared trimmed, like
-    /// every other `tojson` test here: real yq's encoder ends the string
-    /// with a newline of its own, which succinctly does not reproduce.
+    /// `to_json_yq` now applies the threshold itself.
     #[test]
     fn tojson_keeps_yqs_own_threshold_2902() -> Result<()> {
-        for (filter, want) in [
+        check(&[
             ("[0.5+0.5] | .[0] | tojson", "1.0"),
             ("[1e10*2] | .[0] | tojson", "2e+10"),
             ("(1e10*2) | tojson", "2e+10"),
             ("[1e-5/2] | .[0] | tojson", "5e-06"),
-        ] {
-            let (out, code) = run_yq_stdin(filter, "null\n", &[])?;
-            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
-            assert_eq!(out.trim_end(), want, "`{filter}`");
-        }
-        Ok(())
+        ])
     }
 
     /// #1134's shapes: every intervening stage that used to re-bake the
@@ -45886,23 +45893,107 @@ mod computed_float_through_container_2902 {
         ])
     }
 
+    /// The path-context route: a `reduce`/`foreach` body that needs `key`
+    /// re-indexes its owned container and hands the bridge's document to
+    /// the *generic* materializer, whose literal-first chain would otherwise
+    /// fall through to `from_document_float` and re-bake the value past yq's
+    /// threshold (`"20000000000.0"`, found in review).
+    #[test]
+    fn generic_materializer_keeps_the_token_bare_2902() -> Result<()> {
+        check(&[
+            (
+                "reduce 1 as $x ([1e10*2]; .[0] | [tostring, key])",
+                "- \"2e+10\"\n- 0",
+            ),
+            (
+                "reduce 1 as $x ([1e10*2]; .[0] | [tonumber, key])",
+                "- 2e+10\n- 0",
+            ),
+            (
+                "reduce 1 as $x ([1e-5/2]; .[0] | [tostring, key])",
+                "- \"5e-06\"\n- 0",
+            ),
+            (
+                "reduce 1 as $x ([0.5+0.5]; .[0] | [tostring, key])",
+                "- \"1\"\n- 0",
+            ),
+        ])
+    }
+
+    /// `@yaml`/`@props` spelled a bare `Float` with plain `Display` under a
+    /// comment claiming the bridge never yields one; with the token it does,
+    /// so both now take yq's computed-float rule (found in review).
+    #[test]
+    fn yaml_and_props_formats_use_the_computed_rule_2902() -> Result<()> {
+        check(&[
+            ("[1e17*1] | .[0] | @yaml", "1e+17"),
+            ("[1e-5/2] | .[0] | @props", "5e-06"),
+            ("[0.5+0.5] | .[0] | @yaml", "1"),
+            ("[0.5+0.5] | .[0] | @props", "1"),
+            ("[1.0] | .[0] | @yaml", "1.0"),
+        ])
+    }
+
+    /// The `--input-format json` DOM route used to print a whole JSON float
+    /// as `100` only because the jq-mode bridge spelled `Float(100.0)` as
+    /// `100` and reparsed it as an integer literal; real yq's JSON decoder
+    /// types it `!!int` outright, which `from_number_literal_plain` now
+    /// does. Every row captured from yq v4.53.3 with `-p json` (`ea` for the
+    /// multi-document reader that shares the route).
+    #[test]
+    fn json_input_whole_float_is_an_int_2902() -> Result<()> {
+        const DOC: &str = "{\"a\":1e2,\"c\":1.0,\"d\":20000000000.0,\"e\":2.5,\"z\":-0.0,\
+                           \"i\":9223372036854775808.0,\"j\":1e19,\
+                           \"n\":100000000000000000000,\"big\":1e300}";
+        for (filter, want) in [
+            (".c | type", "!!int"),
+            (".a | type", "!!int"),
+            (".j | type", "!!float"),
+            (".e | type", "!!float"),
+            (".i", "9223372036854775807"),
+            (".j", "1e+19"),
+            (".z", "0"),
+            (".n", "1e+20"),
+            (".big", "1e+300"),
+            (".a | tojson", "100"),
+            (".d | tojson", "20000000000"),
+            ("[.c]", "- 1"),
+            ("[.d] | .[0]", "20000000000"),
+            (
+                ".",
+                "a: 100\nc: 1\nd: 20000000000\ne: 2.5\nz: 0\ni: 9223372036854775807\n\
+                 j: 1e+19\nn: 1e+20\nbig: 1e+300",
+            ),
+        ] {
+            let (out, code) = run_yq_stdin(filter, DOC, &["--input-format", "json", "--eval-all"])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out.trim_end(), want, "`{filter}`");
+        }
+        let (out, code) = run_yq_stdin(".", DOC, &["--input-format", "json", "--slurp"])?;
+        assert_eq!(code, 0, "slurp exited {code}: {out:?}");
+        assert_eq!(
+            out.trim_end(),
+            "- a: 100\n  c: 1\n  d: 20000000000\n  e: 2.5\n  z: 0\n  i: 9223372036854775807\n  \
+             j: 1e+19\n  n: 1e+20\n  big: 1e+300"
+        );
+        Ok(())
+    }
+
     /// A tag-forced document float (`!!float 2`) is the one *document* shape
     /// that is also a bare `Float`; it keeps answering the way it did, and
     /// its text equality through a container (which used to see the
     /// bridge's `2.0`) now agrees with yq too.
     #[test]
     fn tag_forced_document_float_is_unchanged_2902() -> Result<()> {
-        for (filter, want) in [
-            ("[.a] | .[0] | tostring", "2"),
-            ("[.a] | .[0]", "2"),
-            ("[.a] | .[0] | tojson", "2.0"),
-            ("[.a] | .[0] == 2", "true"),
-        ] {
-            let (out, code) = run_yq_stdin(filter, "a: !!float 2\n", &[])?;
-            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
-            assert_eq!(out.trim_end(), want, "`{filter}`");
-        }
-        Ok(())
+        check_on(
+            "a: !!float 2\n",
+            &[
+                ("[.a] | .[0] | tostring", "2"),
+                ("[.a] | .[0]", "2"),
+                ("[.a] | .[0] | tojson", "2.0"),
+                ("[.a] | .[0] == 2", "true"),
+            ],
+        )
     }
 }
 

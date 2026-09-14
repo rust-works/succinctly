@@ -1095,9 +1095,7 @@ pub(crate) fn computed_float_token(f: f64) -> String {
         f.is_finite(),
         "computed_float_token requires a finite value; NaN/Infinity use their own sentinels"
     );
-    let mut token = alloc::format!("{f:e}");
-    token.push_str(COMPUTED_FLOAT_TOKEN_SUFFIX);
-    token
+    alloc::format!("{f:e}{COMPUTED_FLOAT_TOKEN_SUFFIX}")
 }
 
 /// Decodes a [`computed_float_token`], `None` for anything else -- the one
@@ -1153,20 +1151,11 @@ mod tests {
             assert!(token.parse::<f64>().is_err(), "{token}");
             assert!(token.parse::<i64>().is_err(), "{token}");
             assert!(!is_valid_number(token.as_bytes()), "{token}");
-            assert!(
-                token
-                    .bytes()
-                    .next()
-                    .is_some_and(|b| b.is_ascii_digit() || b == b'-'),
-                "{token}"
-            );
-            assert!(
-                token
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')),
-                "{token}"
-            );
         }
+        // That the semi-index scanner captures the token whole is pinned
+        // against the scanner itself, in `json/light.rs`
+        // (`json_number_decodes_the_computed_float_token_2902`), rather than
+        // by re-spelling its character class here.
         assert_eq!(computed_float_token(1.0), "1e0e0");
         assert_eq!(computed_float_token(2e16), "2e16e0");
         assert_eq!(computed_float_token(-0.5), "-5e-1e0");

@@ -1781,8 +1781,25 @@ impl OwnedValue {
     /// never wants the source spelling in the first place shouldn't have
     /// to pay, and the reason this exists as its own function rather than
     /// that two-call sequence.
+    ///
+    /// A whole-valued float becomes an `Int` (#2902): real yq's JSON decoder
+    /// types `1.0`, `1e2`, `-0.0` and `20000000000.0` as `!!int` and prints
+    /// them `1`, `100`, `0`, `20000000000` -- as does a decimal too big for
+    /// `i64`'s exact range but whose saturated conversion still round-trips
+    /// (`9223372036854775808.0` is `9223372036854775807`, `!!int`), while
+    /// `1e19`, `1e300` and `2.5` stay `!!float`; all captured live from yq
+    /// v4.53.3 with `-p json`. The rule is Go's `f == float64(int64(f))`
+    /// with a saturating cast, which Rust's `as` also is. Until #2902 the
+    /// `--slurp`/`--inplace` DOM route got the same rendering by accident:
+    /// the reindex bridge spelled a bare whole `Float` as `100` in jq mode
+    /// and reparsed it as an integer literal.
     pub fn from_number_literal_plain(literal: &str) -> Self {
-        Self::plain_number_from_repr(parse_i64_or_f64(literal))
+        match parse_i64_or_f64(literal) {
+            Some(NumberRepr::Float(f)) if f.is_finite() && (f as i64) as f64 == f => {
+                Self::Int(f as i64)
+            }
+            repr => Self::plain_number_from_repr(repr),
+        }
     }
 
     /// The shared "parsed repr -> plain scalar" mapping
@@ -3586,6 +3603,28 @@ mod tests {
         assert!(NAN_SENTINEL.parse::<i64>().is_err());
     }
 
+    /// #2902: yq's JSON decoder types a whole-valued float as an int, with
+    /// Go's saturating `int64` round-trip deciding the boundary -- every
+    /// row captured from yq v4.53.3 with `-p json` (`.x | type` / `.x`).
+    #[test]
+    fn test_from_number_literal_plain_types_a_whole_json_float_as_int_2902() {
+        for (literal, want) in [
+            ("1.0", OwnedValue::Int(1)),
+            ("1e2", OwnedValue::Int(100)),
+            ("-0.0", OwnedValue::Int(0)),
+            ("20000000000.0", OwnedValue::Int(20_000_000_000)),
+            ("9223372036854775808.0", OwnedValue::Int(i64::MAX)),
+            ("100000000000000000000", OwnedValue::Float(1e20)),
+            ("1e19", OwnedValue::Float(1e19)),
+            ("1e300", OwnedValue::Float(1e300)),
+            ("2.5", OwnedValue::Float(2.5)),
+            ("7", OwnedValue::Int(7)),
+        ] {
+            let got = OwnedValue::from_number_literal_plain(literal);
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{literal}");
+        }
+    }
+
     /// #2902: the bridge's computed-float token materializes as a bare
     /// `Float`, never as a `NumberLiteral` carrying the token's text --
     /// through the same public entry point real document numbers go
@@ -3643,12 +3682,8 @@ mod tests {
     /// what let `[0.5+0.5] | .[0] | tostring` come back as the literal `1.0`.
     #[test]
     fn test_to_json_for_reindex_writes_a_computed_float_as_the_token_2902() {
-        for (f, token) in [
-            (1e20, "1e20e0"),
-            (2.0, "2e0e0"),
-            (1e10, "1e10e0"),
-            (-0.5, "-5e-1e0"),
-        ] {
+        for f in [1e20, 2.0, 1e10, -0.5] {
+            let token = crate::json::validate::computed_float_token(f);
             assert_eq!(
                 OwnedValue::Float(f).to_json_for_reindex::<YqSemantics>(),
                 token

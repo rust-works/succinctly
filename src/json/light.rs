@@ -2712,6 +2712,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    fn bridge_computed_float(&self) -> Option<f64> {
+        match self {
+            StandardJson::Number(n) => {
+                crate::json::validate::parse_computed_float_token(n.raw_bytes())
+            }
+            _ => None,
+        }
+    }
+
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => {
@@ -6247,10 +6256,23 @@ mod tests {
     /// which the scanner captures whole and `as_f64` decodes, while
     /// `as_i64` and `number_literal()` both refuse it -- so a materializer
     /// that tries the literal first (`to_owned_at_depth`) still ends on a
-    /// bare `Float`, never a `NumberLiteral` carrying the token's text.
+    /// bare `Float`, never a `NumberLiteral` carrying the token's text. The
+    /// tokens come from the encoder itself: this pins the plumbing, not the
+    /// spelling (`validate.rs`'s own tests pin that).
     #[test]
     fn json_number_decodes_the_computed_float_token_2902() {
-        for (f, token) in [(1.0, "1e0e0"), (2e16, "2e16e0"), (-0.5, "-5e-1e0")] {
+        for f in [
+            1.0,
+            2e16,
+            -0.5,
+            0.0,
+            -0.0,
+            5e-324,
+            f64::MAX,
+            1e300,
+            0.1 + 0.2,
+        ] {
+            let token = crate::json::validate::computed_float_token(f);
             let json = format!("[{token}]");
             let bytes = json.as_bytes();
             assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
