@@ -318,7 +318,7 @@ re-exported to whoever included it, and it outranks a same-named sibling
 def in that module (while the module still exports its own). A def's own
 recursive call binds to itself rather than to a same-named dependency,
 per (name, arity). See
-[jq Limitations](../compliance/jq/limitations.md#three-module-scoping-quirks-that-are-matched-and-read-as-bugs-2865)
+[jq Limitations](../compliance/jq/limitations.md#five-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
 for the full table and the two scoping gaps that remain open.
 
 An `include` cycle is reported as `module cycle detected: a -> b -> a`

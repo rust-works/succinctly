@@ -25164,6 +25164,132 @@ fn test_transitive_names_do_not_seed_top_level_shadow_candidates_2865() -> Resul
     Ok(())
 }
 
+/// #2865 (PR review): a def's **parameter** beats a same-named dependency or
+/// sibling, in both spellings.
+///
+/// The wrap nests inside the parameter's own binding, so without an explicit
+/// exclusion it captured every use of the parameter: `def f(g): g; def q:
+/// f(7);` answered `42` where jq answers `7`. A `$`-spelled parameter binds
+/// the bare call-site namespace too (`def f($g): [$g, g]` is `[7,7]` in jq),
+/// so the exclusion is by name, not by spelling.
+#[test]
+fn test_module_def_parameter_beats_dependency_and_sibling_2865() -> Result<()> {
+    for (module, want) in [
+        ("include \"inner\";\ndef f(g): g;\ndef q: f(7);\n", "7"),
+        (
+            "include \"inner\";\ndef f($g): [$g, g];\ndef q: f(7);\n",
+            "[7,7]",
+        ),
+        // ...and over a sibling of the module's own, not just a dependency.
+        (
+            "include \"inner\";\ndef g2: 5;\ndef f(g2): g2;\ndef q: f(7);\n",
+            "7",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_with_modules(
+            &[("inner", "def g: 42;\n"), ("pshadow", module)],
+            &["-nc", r#"include "pshadow"; q"#],
+        )?;
+        assert_eq!(code, 0, "{module}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{module}");
+    }
+    Ok(())
+}
+
+/// #2865 (PR review): a module that defines a builtin's name does not lose
+/// the dependencies used *inside* that builtin's arguments.
+///
+/// `walk::any_subexpr`'s `FuncCall` arm does not descend into
+/// `builtin_fallback`, which is sound only after `resolve::check` has run --
+/// and a module's source has only just been parsed when its dependencies are
+/// chosen. A module defining `def limit:` turns `limit(1; g)` into a
+/// shadowable-call node with empty `args` and its real sub-expressions in the
+/// fallback, so the reference to `g` was invisible and its dependency got
+/// filtered out: jq answers `[42]`, succinctly raised `g/0 is not defined`
+/// and exited 3. Exactly the "under-keeping turns a compiling program into a
+/// compile error" case the filter must not produce.
+#[test]
+fn test_builtin_named_module_def_keeps_dependencies_in_its_arguments_2865() -> Result<()> {
+    for module in [
+        "include \"inner\";\ndef limit: \"shadowed\";\ndef h: [limit(1; g)];\n",
+        "include \"inner\";\ndef error: \"shadowed\";\ndef h: [first(g)];\n",
+    ] {
+        let (stdout, stderr, code) = run_jq_with_modules(
+            &[("inner", "def g: 42;\n"), ("blt", module)],
+            &["-nc", r#"include "blt"; h"#],
+        )?;
+        assert_eq!(code, 0, "{module}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), "[42]", "{module}");
+    }
+    Ok(())
+}
+
+/// #2865 (PR review): an exported def is self-contained -- its references to
+/// its own module's siblings travel with it, rather than resolving wherever
+/// it gets spliced in.
+///
+/// `inner.jq` = `def g: 42; def k: g;` and `outer.jq` = `include "inner"; def
+/// g: k;`: jq answers `42`, since `k`'s `g` is `inner`'s. Wrapping only
+/// dependencies left `k`'s `g` to resolve outward into `outer`'s own `g`,
+/// which is `k` -- unbounded recursion (`exceeded maximum recursion depth`)
+/// where jq returns a number.
+#[test]
+fn test_exported_module_def_carries_its_own_siblings_2865() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner2", "def g: 42;\ndef k: g;\n"),
+            ("outer2", "include \"inner2\";\ndef g: k;\n"),
+        ],
+        &["-nc", r#"include "outer2"; g"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42");
+
+    // The same shape one step further out: a sibling that needs the module's
+    // own dependency, reached only through another sibling.
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("inner", "def g: 42;\n"),
+            ("sibdep", "include \"inner\";\ndef x: g;\ndef y: x;\n"),
+        ],
+        &["-nc", r#"include "sibdep"; y"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42");
+
+    Ok(())
+}
+
+/// #2865 (PR review): the reported cycle chain starts at the repeat, not at
+/// the bottom of the load stack.
+///
+/// A module that merely *leads* to a cycle is not part of it: loading `x`,
+/// which includes `ca`, which includes `cb`, which includes `ca`, reports
+/// `ca -> cb -> ca` and not `x -> ca -> cb -> ca`. The existing cycle test
+/// only covers cycles rooted at the first module loaded, where the two spell
+/// the same thing.
+#[test]
+fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<()> {
+    let (_, stderr, code) = run_jq_with_modules(
+        &[
+            ("x", "include \"ca\";\ndef xx: 1;\n"),
+            ("ca", "include \"cb\";\ndef a: 1;\n"),
+            ("cb", "include \"ca\";\ndef b: 2;\n"),
+        ],
+        &["-nc", r#"include "x"; xx"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module cycle detected: ca -> cb -> ca"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("x -> ca"),
+        "chain must not name modules outside the cycle: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2865 (plan step 6): a chain of modules does not multiply in size.
 ///
 /// Wrapping every dependency into every exported body compounds down a chain,
