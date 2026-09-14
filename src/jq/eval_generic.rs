@@ -598,7 +598,19 @@ fn to_owned_at_depth<V: DocumentValue>(
 /// Returns `Err` past [`MAX_NESTING_DEPTH`] levels of nesting (#998,
 /// #2627), same as [`to_owned`].
 pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
-    let result = to_owned_cursor_at_depth(cursor, 0);
+    let result = to_owned_cursor_with(
+        cursor,
+        |depth| {
+            if depth >= MAX_NESTING_DEPTH {
+                Err(EvalError::decode_failure(
+                    super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+        |_| None,
+    );
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
     // depth-0 entry point only.
     debug_assert_materialization_error(&result);
@@ -692,15 +704,36 @@ fn resolve_terminal_prefix_generic<C: DocumentCursor>(
     }
 }
 
+/// The shared cursor traversal for the generic and lazy materializers.
+///
+/// #2868: container validation, duplicate keys and recursion have one
+/// definition. The callers retain two deliberate differences: their depth
+/// failure contract (panic, catchable error, or decode failure), and the
+/// lazy JSON path's raw-number conversion, which restores internal non-finite
+/// bridge markers. Ordinary JsonCursor numbers are not canonicalized by the
+/// generic fallback either; that policy belongs to JSON-sourced YAML cursors.
+///
+/// Both policies are statically dispatched. The scalar override is consulted
+/// only after ruling out containers, and None retains the generic scalar
+/// handling, including explicit tags and decode errors. A cursor starts its
+/// own depth budget at zero, even inside an already-nested JqValue tree.
+/// The public generic entry point keeps its decode-error assertion; callers
+/// with other depth contracts must not inherit that assertion.
+pub(super) fn to_owned_cursor_with<C: DocumentCursor>(
+    cursor: &C,
+    check_depth: impl Fn(usize) -> Result<(), EvalError>,
+    scalar_override: impl Fn(&C::Value) -> Option<OwnedValue>,
+) -> Result<OwnedValue, EvalError> {
+    to_owned_cursor_at_depth(cursor, 0, &check_depth, &scalar_override)
+}
+
 fn to_owned_cursor_at_depth<C: DocumentCursor>(
     cursor: &C,
     depth: usize,
+    check_depth: &impl Fn(usize) -> Result<(), EvalError>,
+    scalar_override: &impl Fn(&C::Value) -> Option<OwnedValue>,
 ) -> Result<OwnedValue, EvalError> {
-    if depth >= MAX_NESTING_DEPTH {
-        return Err(EvalError::decode_failure(
-            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
-        ));
-    }
+    check_depth(depth)?;
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -725,7 +758,12 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(
                 key,
-                to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
+                to_owned_cursor_at_depth(
+                    &field.value_cursor,
+                    depth + 1,
+                    check_depth,
+                    scalar_override,
+                )?,
             );
             last_field = Some(field.value_cursor);
             f = rest;
@@ -753,7 +791,12 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             if !elem_cursor.element_gap_ok(is_first) {
                 return Err(elem_cursor.malformed_delimiter_error());
             }
-            items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1)?);
+            items.push(to_owned_cursor_at_depth(
+                &elem_cursor,
+                depth + 1,
+                check_depth,
+                scalar_override,
+            )?);
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
@@ -763,6 +806,9 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok(OwnedValue::Array(items))
     } else {
+        if let Some(owned) = scalar_override(&value) {
+            return Ok(owned);
+        }
         // An applicable explicit tag resolves from the raw text and so can
         // succeed where a plain decode would not; only the untagged fallback
         // can raise.
