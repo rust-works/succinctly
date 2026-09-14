@@ -3284,8 +3284,13 @@ fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
     match bytes[pos] {
         // Object or array - find matching close
         b'{' | b'[' => find_matching_close(bytes, pos),
-        // String - find end quote
-        b'"' => find_string_end(bytes, pos),
+        // String. `string_literal_end` (shared with `light.rs`, same
+        // one-validated-implementation reasoning as `number_literal_end`
+        // below) both finds the end of and validates the token: it rejects
+        // a raw, unescaped control character `U+0000`-`U+001F` outright,
+        // matching real jq on every input path, while still accepting
+        // `0x7F` the way jq's own signed-char check does (#2878).
+        b'"' => succinctly::json::light::string_literal_end(bytes, pos),
         // true, false, null
         b't' | b'f' | b'n' => find_literal_end(bytes, pos),
         // Number. `number_literal_end` (shared with `light.rs`'s own
@@ -3312,8 +3317,10 @@ fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
     while i < bytes.len() && depth > 0 {
         match bytes[i] {
             b'"' => {
-                // Skip string
-                let end = find_string_end(bytes, i)?;
+                // Skip string. Same scanner as the top-level arm, so a raw
+                // control character is rejected just as readily nested
+                // inside a container -- in a key as well as a value (#2878).
+                let end = succinctly::json::light::string_literal_end(bytes, i)?;
                 i = end;
                 continue;
             }
@@ -3329,19 +3336,6 @@ fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
     } else {
         None
     }
-}
-
-/// Find the end of a string starting at `pos` (which points to opening quote).
-fn find_string_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    let mut i = pos + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => return Some(i + 1),
-            b'\\' => i += 2, // Skip escaped character
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 /// Find the end of a literal (true, false, null) starting at `pos`.
