@@ -17475,6 +17475,86 @@ fn test_bounded_consumer_stops_computed_path_generators_2267() -> Result<()> {
     Ok(())
 }
 
+/// #2267: what a streamed assignment does with the RHS's own trailing
+/// escape, and with `?`.
+///
+/// `collect_rhs_outputs` hands back `(values, terminal)`, and a *single*
+/// value plus a trailing escape still satisfies the streaming route's
+/// "exactly one RHS output" gate -- `(1, error("boom"))` is one value and an
+/// error, not two values -- so all four terminal shapes reach it. Each row
+/// is captured whole from jq 1.7.1: stdout, the target's firing count and
+/// the exit code.
+#[test]
+fn test_streaming_write_carries_the_rhs_terminal_and_optional_2267() -> Result<()> {
+    // A failing write under the call's own `?`: empty output, exit 0, and
+    // the short-circuit still holds (one firing, not four/two).
+    for (filter, input) in [
+        (r"((.|stderr)[(0,1):(2,3)] = 99)?", "[10,20,30]"),
+        (r"((.|stderr)[(-1,-2)] = 1)?", "null"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(
+            stdout, "",
+            "{filter}: a suppressed failed write emits nothing"
+        );
+        let fired = stderr.matches(input).count();
+        assert_eq!(
+            fired, 1,
+            "{filter}: target fired {fired} times, jq 1.7.1 fires 1: stderr: {stderr:?}"
+        );
+    }
+
+    // A trailing error on the RHS: the document the writes did produce is
+    // emitted, then the error is raised.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.|stderr)[("a","b")] = (1, error("boom"))"#],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    // ... and the same shape under `?`, which suppresses the error and keeps
+    // the document, at exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"((.|stderr)[("a","b")] = (1, error("boom")))?"#],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
+    assert!(
+        !stderr.contains("boom"),
+        "`?` suppresses it: stderr: {stderr:?}"
+    );
+
+    // A `break` out of an enclosing label, which is not an error and is not
+    // suppressed by `?` either -- the document still lands, at exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"label $out | ((.|stderr)[("a","b")] = (1, break $out))"#,
+        ],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
+
+    // A halt: jq emits the already-written document, then exits with the
+    // halt's own code. Only stdout and the exit code are asserted -- how
+    // `halt_error`'s own stderr write interleaves with `stderr`'s newlines
+    // differs from jq here, identically before this change, and is not this
+    // issue's.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", r#"(.|stderr)[("a","b")] = (1, halt_error(3))"#],
+        Some("{}"),
+    )?;
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "{\"a\":1,\"b\":1}\n");
+
+    Ok(())
+}
+
 /// #2267 (must-not-change): the three conditions gating the streaming write,
 /// each pinned by the shape that would take the eager route if it were
 /// dropped.
