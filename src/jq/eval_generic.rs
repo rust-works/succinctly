@@ -1728,12 +1728,21 @@ fn materialize_lazy_keys<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     let mut keys = effective_key_values(fields, collapse)?;
     if sorted {
-        // `sorted` is only ever `true` in jq mode: the yq parser lowers
-        // `keys` to `Builtin::KeysUnsorted` (real yq returns keys in
-        // document order), so this streaming entry point -- which has no
-        // `S` of its own -- never sorts under yq semantics, and jq's number
-        // model (#2906) is the only one it can need. (YAML keys are typed,
-        // so "keys are always strings" would be the wrong reason.)
+        // `sorted` is only ever `true` in jq mode -- not by convention, but
+        // because the parser decides which `Builtin` variant a `keys` call
+        // compiles to at parse time, keyed on `self.mode == ParserMode::Yq`
+        // (`try_parse_builtin` in `parser.rs`): yq mode always lowers to
+        // `Builtin::KeysUnsorted` (real yq returns keys in document order),
+        // jq mode always to this `sorted: true` `Builtin::Keys`. A single
+        // compiled query is only ever evaluated under the mode it was
+        // parsed in, so a `sorted: true` `LazyKeys` reaching this streaming
+        // entry point -- which has no `S` of its own -- structurally cannot
+        // have come from a yq-mode query; jq's number model (#2906) is the
+        // only one it can need. (YAML keys are typed, so "keys are always
+        // strings" would be the wrong reason.) `S` isn't threaded through
+        // just to make that static rather than structural: `into_lazy_items`
+        // and every caller up to `materialize_lazy_keys` would need it too,
+        // for an invariant already enforced one layer up, at compile time.
         keys.sort_by(compare_values::<JqSemantics>);
     }
     Ok(OwnedValue::Array(keys))
