@@ -28741,19 +28741,28 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Optional(inner) => {
             resolve_optional_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
-        // Every recurse-family spelling (`..`, bare `recurse`/`recurse_down`,
-        // `recurse(f)`, `recurse(f; cond)`) shares jq's own recursive
-        // definition `def r: ., (f | r); r;` — the *first* value any of them
-        // ever emits is `.` itself, zero navigation performed, so an
-        // untracked value (#843) is refused right here before any of the
-        // walks below even start (`#530`'s classic "with result" case). One
-        // shared guard arm for all five spellings, rather than one copy per
-        // spelling reaching this function — CLAUDE.md's own "duplicated
-        // predicates diverge silently" note (from #106) — folded in by
-        // #2696, which gave the bare spellings (`..`/`recurse`/
-        // `recurse_down`) their own native sink arm below; previously only
-        // the parameterised pair had one here; the bare spellings' guard
-        // lived a second time in `resolve_node_eager`.
+        // #2761: bare recursion emits its identity seed before attempting
+        // `.[]?`. A terminal consumer rejects that seed "with result", but
+        // a consumer that discards it reaches the navigation error instead.
+        // Delivering the seed also lets bounded consumers stop and lets
+        // `try` catch the later navigation error. `recurse_down` retains its
+        // internal alias behavior; jq 1.7.1 has no such spelling.
+        // jq only: yq and parameterized recursion keep the guard below.
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
+            if S::TAG == EvalTag::Jq && !trackable && !snapshot.is_marked() =>
+        {
+            match sink(recurse_family_root_seed(value, trackable, snapshot)) {
+                Demand::Stop => ResolveFlow::Stopped,
+                Demand::Continue => ResolveFlow::Escaped(
+                    EvalError::invalid_path_expression_near_iterate(value).into(),
+                ),
+            }
+        }
+        // Parameterized recursion (and every yq-mode recurse spelling)
+        // retains the eager guard introduced by #843 and shared in #2696.
+        // Its deferred-navigation gap is tracked in #2764: an arbitrary
+        // `f` may navigate differently or not at all. Bare jq recursion is
+        // handled above (#2761), where the next operation is always `.[]?`.
         //
         // `&& !snapshot` (#1591): a deferred `$x` snapshot must still reach
         // the walks below (which then correctly emit *self* with the mark
@@ -29181,11 +29190,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   (its own `keys.is_empty()` arm), where jq treats it as a
         //   passthrough and refuses only at the terminal. `path(1 |
         //   [getpath([])] | empty)` is accepted by jq. #2764.
-        // - `Recurse`/`RecurseF`/`RecurseCond`/`RecursiveDescent`: the shared
-        //   `recurse_untracked_error` guard refuses eagerly whether or not
+        // - `RecurseF`/`RecurseCond`: the shared `recurse_untracked_error`
+        //   guard refuses eagerly whether or not
         //   `f` navigates -- `recurse(empty)`, `recurse(.+1; .<3)` and a
-        //   caught `(..)?` are all accepted by jq. And its error is
-        //   uncatchable here, so `[try (..)]` cannot rescue it either. #2764.
+        //   caught parameterized recursions are accepted by jq. #2764.
+        //   Bare recursion now defers its navigation error (#2761) and is
+        //   safe to resolve inside brackets.
         // - `Optional`: the parser erases the parentheses in `(.a)?`, which
         //   is jq's `try .a` (a *caught* path error), into `.a?`, which is
         //   jq's `INDEX_OPT` (an uncaught one). Bare `[.a?]` happens to agree
@@ -29201,10 +29211,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                         e,
                         Expr::TrackedVar(_)
                             | Expr::Optional(_)
-                            | Expr::RecursiveDescent
                             | Expr::Builtin(
                                 Builtin::GetPath(_)
-                                    | Builtin::Recurse
                                     | Builtin::RecurseF(_)
                                     | Builtin::RecurseCond(_, _)
                             )
@@ -29934,12 +29942,10 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
     }
 }
 
-/// The one error every `recurse`-family spelling raises against an
-/// untracked value (#843) — see the doc comment on `resolve_node`'s shared
-/// guard arm for `RecursiveDescent`/`Recurse`/`RecurseDown`/`RecurseF`/
-/// `RecurseCond`. A single definition rather than one copy per spelling, so
-/// the four call sites cannot silently drift apart on it (CLAUDE.md:
-/// "Duplicated predicates diverge silently").
+/// The remaining eager recursion guard's terminal error (#843).
+/// Parameterized jq recursion and yq retain it; bare jq recursion instead
+/// delivers its seed before reporting navigation in `resolve_node_sink`
+/// (#2761). The remaining deferred-navigation gap is tracked in #2764.
 fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, EvalEscape) {
     (Vec::new(), EvalError::invalid_path_expression(value).into())
 }
