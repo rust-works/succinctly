@@ -4318,6 +4318,15 @@ document-wide, while a malformed *member* still is not (`{invalid}` stays at exi
 this section already draws. `0x7F` is on the accepting side of it in both tools, since jq's
 own check compares a signed char.
 
+One consequence is worth naming, because #2878 makes it reachable for a new input class
+without introducing it: **a rejected document produces no partial output.** On
+`{"ok":1}` followed by `["a<TAB>b"]`, jq prints `{"ok":1}` and *then* exits 5; succinctly
+prints nothing and exits 5. The exit codes agree, the streamed prefix does not. This is the
+splitter's own all-or-nothing shape — `find_json_values` resolves every value's span before
+any value is emitted — and it predates this rule: `{"ok":1}` followed by a truncated
+`[1,2,` behaves identically, and did before #2878. Pinned on stdout (not just the exit
+code) by `test_control_character_in_a_later_value_rejects_the_whole_document_2878`.
+
 **The materializing flag routes still validate whatever the filter — down to `-s` and
 `-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)
 for `-S`/`-a`/`-C`.** `-S` (sort keys), `-a` (ASCII output) and `-C` (color) used to force

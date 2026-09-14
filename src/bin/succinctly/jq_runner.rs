@@ -3276,10 +3276,20 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
 /// (#1723) can ask the identical per-token question without a second copy of
 /// this dispatch drifting from it.
 ///
-/// "Ends" is structural, not a validity verdict: `{"a":1 xyz}` scans as one
-/// token because its braces match, and only validation rejects it. Keeping
-/// the two separate is what lets the `--seq` caller reject a whole record
-/// without ever reading a value out of the middle of a malformed one.
+/// "Ends" is *mostly* structural rather than a validity verdict:
+/// `{"a":1 xyz}` scans as one token because its braces match, and only
+/// validation rejects it. Keeping the two separate is what lets the `--seq`
+/// caller reject a whole record without ever reading a value out of the
+/// middle of a malformed one.
+///
+/// Two arms are deliberate exceptions, both because the scan that finds the
+/// token's end is already the scan that would validate it, so splitting them
+/// would cost a second pass for nothing: `number_literal_end` rejects a
+/// number-*shaped* span that is not a number (`-e5`, `1e`), and
+/// `string_literal_end` rejects a string holding a raw `U+0000`-`U+001F`
+/// (#2878). Both were verified not to move `--seq`, whose own validity
+/// question (`seq_value_is_valid`) already rejected these inputs -- so the
+/// two routes still agree, they just now agree earlier.
 fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
     match bytes[pos] {
         // Object or array - find matching close

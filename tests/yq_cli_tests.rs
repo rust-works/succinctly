@@ -46742,22 +46742,39 @@ fn test_fromjson_accepts_raw_control_character_in_yq_mode_2878() -> Result<()> {
     Ok(())
 }
 
-/// `tonumber`'s "valid JSON but not a number" probe is mode-sensitive as of
-/// #2878. Real yq reports a tag-conversion error here (`cannot convert node
-/// value [...] of tag !!str to number`), which is this crate's
-/// `cannot be parsed as a number` family -- *not* jq's parse-error family.
+/// `tonumber` in yq mode reports **one** error family for every non-numeric
+/// string, because real yq does: `[1,2]`, `abc`, `1 2`, `""`, a lone
+/// `\udc00` and a raw control character all answer `cannot convert node
+/// value [...] of tag !!str to number` (yq 4.53.3, captured live). jq's
+/// "valid JSON but not a number" vs "not valid JSON at all" split has no yq
+/// equivalent, so yq mode does not run that probe at all (#2878).
 ///
-/// Pins the half of #2878 that a jq-only fix would have silently regressed:
-/// passing jq's mode into that probe unconditionally flips yq's message to
-/// the wrong family.
+/// Sweeping the whole list is the point, not thoroughness for its own sake:
+/// the two inputs that matter sit at *opposite* ends of the mode split, so
+/// any single-flag answer gets one of them wrong. A lone surrogate is
+/// rejected only by yq's reader (#2008) and a raw control character only by
+/// jq's (#2878) -- so a fix driven by either one alone silently flips the
+/// other into jq's parse-error family. Both are pinned here.
 #[test]
-fn test_tonumber_control_character_keeps_yq_message_family_2878() -> Result<()> {
-    let prog = format!("\"[\\\"a{}b\\\"]\" | tonumber", '\u{9}');
-    let (_stdout, stderr, code) = run_yq_stdin_with_stderr(&prog, "", &["-n"])?;
-    assert_ne!(code, 0, "tonumber must still fail in yq mode");
-    assert!(
-        stderr.contains("cannot be parsed as a number"),
-        "yq mode should keep the tag-conversion family, got: {stderr}"
-    );
+fn test_tonumber_reports_one_error_family_in_yq_mode_2878() -> Result<()> {
+    let raw_control = format!("\"[\\\"a{}b\\\"]\" | tonumber", '\u{9}');
+    let cases: [&str; 6] = [
+        &raw_control,
+        // A lone low surrogate: rejected by yq's own reader, accepted (as
+        // U+FFFD) by jq's -- the mirror image of the case above.
+        r#""\"\\udc00\"" | tonumber"#,
+        r#""[1,2]" | tonumber"#,
+        r#""abc" | tonumber"#,
+        r#""1 2" | tonumber"#,
+        r#""" | tonumber"#,
+    ];
+    for prog in cases {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(prog, "", &["-n"])?;
+        assert_ne!(code, 0, "tonumber must fail in yq mode for {prog}");
+        assert!(
+            stderr.contains("cannot be parsed as a number"),
+            "yq mode must use its single error family for {prog}, got: {stderr}"
+        );
+    }
     Ok(())
 }

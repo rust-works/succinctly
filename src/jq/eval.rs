@@ -15747,20 +15747,29 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     if let Ok(f) = trimmed.parse::<f64>() {
         return Ok(OwnedValue::Float(f));
     }
-    // Mode-*sensitive*, despite only picking between two error messages and
-    // never returning the parsed value. It was mode-blind while the only
-    // jq/yq split in `parse_complete_json` was `fromjson`'s surrogate one
-    // (#2008), which errors in both modes and so could never change this
-    // verdict. #2878's control-character rule can: a string like
-    // `["a<TAB>b"]` is "valid JSON" to yq and "not valid JSON at all" to jq,
-    // and each oracle's own wording follows its own answer --
-    //   jq 1.7.1: Invalid string: control characters ... must be escaped
-    //   yq 4.53.3: cannot convert node value [...] of tag !!str to number
-    // -- which are this crate's `invalid_numeric_literal` and
-    // `cannot_parse_as_number` branches respectively. Passing `false` here
-    // regardless would hand yq mode jq's answer (verified: it flips yq's
-    // message to the wrong family).
-    if parse_complete_json(trimmed, yq_mode).is_ok() {
+    // The probe below is jq's question, and jq's alone.
+    //
+    // It distinguishes "valid JSON but not a number" from "not valid JSON at
+    // all" purely to pick between two error messages, never to return a
+    // value. **Real yq draws no such distinction**: every non-numeric string
+    // gets the one tag-conversion error, whether or not the text is valid
+    // JSON (yq 4.53.3, captured live -- `[1,2]`, `abc`, `1 2`, `""`, a lone
+    // `\udc00` and a raw control character all answer `cannot convert node
+    // value [...] of tag !!str to number`). So in yq mode there is nothing
+    // for the probe to decide, and asking it anyway is what makes it
+    // wrong: whichever mode we hand `parse_complete_json`, some input
+    // crosses the boundary and lands in jq's parse-error family, which yq
+    // has no equivalent of. `\udc00` does it under yq mode (only yq rejects
+    // a lone surrogate, #2008) and a raw control character does it under jq
+    // mode (only jq rejects one, #2878) -- opposite directions, so no single
+    // flag avoids both. Answering `cannot_parse_as_number` unconditionally
+    // does, and matches the oracle in every case above.
+    if yq_mode {
+        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string(),
+        )));
+    }
+    if parse_complete_json(trimmed, false).is_ok() {
         Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
             s.to_string(),
         )))
@@ -16152,6 +16161,15 @@ fn parse_json_string_value(
                 // per-mode split precedent as the surrogate arms above
                 // (#2008/#2013). `0x7F` is deliberately not covered: jq's
                 // own check is on a signed char, so DEL passes it.
+                //
+                // This text is an internal signal, not output: both
+                // `parse_complete_json` callers discard the `Err(String)`
+                // and render their own diagnostic, so `fromjson` actually
+                // reports `Invalid numeric literal at EOF ...` here. That
+                // approximation of jq's per-reason wording is pre-existing
+                // and recorded in `docs/compliance/jq/limitations.md`; it is
+                // deliberately not widened by this fix, which is about
+                // accept-vs-reject.
                 return Err(format!(
                     "Invalid string: control character 0x{c:02X} from U+0000 through U+001F must be escaped"
                 ));

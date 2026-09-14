@@ -54414,9 +54414,6 @@ fn test_raw_control_character_rejected_in_keys_and_nested_values_2878() -> Resul
     for body in [
         &b"{\"a\x09b\": 1}"[..],
         &b"{\"x\": [1, {\"y\": \"a\x09b\"}]}"[..],
-        // Two top-level values: the malformed one is the second, so the
-        // per-value loop has to keep checking after a clean first value.
-        &b"{\"ok\":1}\n[\"a\x09b\"]\n"[..],
     ] {
         let mut file = NamedTempFile::new()?;
         file.write_all(body)?;
@@ -54430,6 +54427,48 @@ fn test_raw_control_character_rejected_in_keys_and_nested_values_2878() -> Resul
             String::from_utf8_lossy(body)
         );
     }
+    Ok(())
+}
+
+/// A document whose *second* value holds the control character is rejected
+/// whole: succinctly prints nothing, where jq prints the clean first value
+/// and then exits 5.
+///
+/// The exit code matches; the partial output does not. That difference is
+/// the document splitter's pre-existing all-or-nothing shape, not something
+/// #2878 introduced -- `{"ok":1}` followed by a *truncated* `[1,2,` behaves
+/// exactly the same way on `main`, and has for as long as the splitter has
+/// rejected truncated input. #2878 only routes one more input class into it.
+///
+/// Asserted on stdout, not just the exit code, because an exit-code-only
+/// assertion would pass whether the clean prefix were printed or not, and
+/// which one happens is the whole content of this divergence (#2878 review).
+#[test]
+fn test_control_character_in_a_later_value_rejects_the_whole_document_2878() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"ok\":1}\n[\"a\x09b\"]\n")?;
+    file.flush()?;
+    let path = file.path().to_str().expect("temp path is utf-8");
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".", path], None)?;
+    assert_ne!(code, 0, "the document must be rejected");
+    assert_eq!(
+        stdout, "",
+        "succinctly rejects the document whole, printing no partial output"
+    );
+
+    // The pre-existing member of the same class, to keep this pinned as
+    // "the splitter's shape" rather than "something the control-character
+    // rule does".
+    let mut trunc = NamedTempFile::new()?;
+    trunc.write_all(b"{\"ok\":1}\n[1,2,")?;
+    trunc.flush()?;
+    let trunc_path = trunc.path().to_str().expect("temp path is utf-8");
+    let (trunc_stdout, _stderr, trunc_code) = run_jq_full(&["-c", ".", trunc_path], None)?;
+    assert_ne!(trunc_code, 0);
+    assert_eq!(
+        trunc_stdout, "",
+        "a truncated later value behaves identically, and predates #2878"
+    );
     Ok(())
 }
 
