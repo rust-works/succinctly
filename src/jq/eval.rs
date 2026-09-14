@@ -23285,12 +23285,20 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //   with that change). One RHS output means one output document, so
     //   there is nothing for `first`/`limit` to truncate and none of that
     //   class is reachable -- see `limitations.md` and the holdout test.
-    // - **A computed path.** `needs_path_prepass` false means the
-    //   expression *is* its own single static path: no generator, no side
-    //   effects, and nothing a later path could observe. Streaming it would
-    //   be indistinguishable except for the extra document copy below, so
-    //   the static case keeps the eager route unchanged.
-    if S::TAG == EvalTag::Jq && rhs_values.len() == 1 && needs_path_prepass(path_expr) {
+    // - **A path whose resolution can be observed.** The streaming route
+    //   keeps a second document (see below), which is worth paying only
+    //   where the interleave is observable at all. `needs_path_prepass`
+    //   false means the expression *is* its own single static path;
+    //   `assignment_path_needs_streaming` false means it resolves to one
+    //   path inertly, so there is no later path for a stopped generator to
+    //   skip and nothing observable while reaching the first. Both keep the
+    //   eager route, which for those shapes produces the identical outcome
+    //   with one document instead of two -- `.[$k] = v` among them.
+    if S::TAG == EvalTag::Jq
+        && rhs_values.len() == 1
+        && needs_path_prepass(path_expr)
+        && assignment_path_needs_streaming(path_expr)
+    {
         debug_assert!(
             yq_targets.is_none(),
             "jq mode never prepares yq assign targets (#2481)"
@@ -23956,6 +23964,80 @@ pub(crate) fn yq_assign_rhs_document<S: EvalSemantics>(
     };
     let targets = yq_assign_targets_from::<S>(input.clone(), paths, value_expr, scalar_slice_noop)?;
     Ok(targets.rhs_document().cloned())
+}
+
+/// Can resolving `expr` as an assignment's path produce a *second* path, or
+/// anything observable on the way to the first?
+///
+/// The streaming write ([`eval_assign_streaming`]) exists to stop the path
+/// generator when a write fails, which is only observable if there is a later
+/// path whose resolution does something -- fires a side effect, consumes an
+/// `input`, or raises. When there is provably one path and resolving it is
+/// inert, the eager route produces the identical outcome, and it does so
+/// without the second document the streaming route has to keep. So this
+/// answers "must we stream", conservatively: anything not on the whitelist
+/// below streams.
+///
+/// Getting the whitelist *wrong in the admitting direction* would leave
+/// #2267's divergence unfixed for that shape -- never a corruption, and never
+/// worse than the behaviour this issue started from -- which is why it is a
+/// whitelist rather than a denylist.
+fn assignment_path_needs_streaming(expr: &Expr) -> bool {
+    !resolves_to_one_inert_path(expr)
+}
+
+/// Does `expr` resolve to at most one path, with nothing observable happening
+/// while it does? See [`assignment_path_needs_streaming`].
+///
+/// `Expr::Optional`/`Expr::Iterate` are deliberately absent. A `?` yields zero
+/// or one path, which would be admissible on the count alone, but #2909's
+/// scope rules make "what its group can fan out to" a question this shape
+/// check should not be re-deciding; an iterate genuinely fans out. Both simply
+/// stream, which is correct and only costs the copy.
+fn resolves_to_one_inert_path(expr: &Expr) -> bool {
+    match expr {
+        // A literal navigation component: exactly one path, no evaluation.
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. } => true,
+        Expr::Paren(inner) => resolves_to_one_inert_path(inner),
+        Expr::Pipe(stages) => stages.iter().all(resolves_to_one_inert_path),
+        // One target branch indexed by one key is one path. The key is a
+        // *value* expression, so it gets the value-side whitelist.
+        Expr::IndexExpr { target, key } => {
+            resolves_to_one_inert_path(target) && is_inert_single_value(key)
+        }
+        Expr::SliceExpr { target, start, end } => {
+            resolves_to_one_inert_path(target)
+                && start.as_deref().is_none_or(is_inert_single_value)
+                && end.as_deref().is_none_or(is_inert_single_value)
+        }
+        _ => false,
+    }
+}
+
+/// Does evaluating `expr` yield exactly one value, with no side effect and no
+/// escape? The key/bound half of [`resolves_to_one_inert_path`].
+///
+/// Deliberately *not* [`is_owned_pure_expr`], despite the overlap: that
+/// predicate's job is the #2048 fast path's representation-neutrality (it
+/// admits `Not`/`Compare`/`type` because their results are freshly
+/// constructed, and excludes `Expr::Var` for reasons about what escapes into
+/// an owned tree). The question here is only "one value, nothing observable",
+/// so a bare `$x` belongs and a comparison's freshness is irrelevant. Reusing
+/// that one would mean two callers reading one predicate as two different
+/// rules, which is how this file's own duplicated predicates have drifted
+/// before.
+fn is_inert_single_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. } => true,
+        Expr::Paren(inner) => is_inert_single_value(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_inert_single_value),
+        _ => false,
+    }
 }
 
 /// `eval_assign`'s demand-driven write loop (#2267): resolve one path,
@@ -61726,6 +61808,95 @@ mod tests {
             assert!(
                 !is_owned_pure_expr(&expr),
                 "{src:?} must NOT be fast-pathed, but is_owned_pure_expr accepted it: {expr:?}"
+            );
+        }
+    }
+
+    /// #2267: the streaming write's shape gate, tested directly, because
+    /// both answers produce identical observable behaviour -- that is the
+    /// whole premise of the gate, and it is exactly why a behavioural test
+    /// cannot tell which route ran.
+    ///
+    /// The *admitting* direction is the one with a cost attached (an
+    /// admitted shape keeps the eager route and its single document), so
+    /// each row here is a shape that provably resolves to one path with
+    /// nothing observable on the way.
+    #[test]
+    fn assignment_paths_that_resolve_to_one_inert_path_skip_streaming_2267() {
+        let eager = [
+            // Literal navigation, including the computed-looking spellings
+            // that are really literal after the parser folds them.
+            ".a",
+            ".a.b.c",
+            ".[0]",
+            ".[0:1]",
+            "(.a)",
+            // A computed key or bound whose own evaluation is one inert
+            // value: a variable, a literal, a navigation, a pipe of those.
+            // `.[$k] = v` is the shape this gate exists to keep cheap.
+            ".[$k]",
+            r#".[("a")]"#,
+            ".[.k]",
+            ".[.a.b]",
+            ".[$k].b",
+            ".a[$k]",
+            ".[(.a | .b)]",
+            ".[0:($n)]",
+            ".[($m):($n)]",
+            ".[($m):]",
+            ".[:($n)]",
+        ];
+        for src in eager {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                !assignment_path_needs_streaming(&expr),
+                "{src:?} resolves to one inert path, so it must keep the eager route: {expr:?}"
+            );
+        }
+    }
+
+    /// #2267: the refusing direction of the same gate -- every shape that
+    /// can produce a second path, or do something observable while
+    /// producing the first, must stream.
+    ///
+    /// A mistake here is not symmetric with the test above: wrongly
+    /// admitting a shape leaves this issue's divergence unfixed for it,
+    /// which is why the whitelist is a whitelist. The first two rows are
+    /// the issue's own repros A and B, so a regression that silently routed
+    /// them eagerly would fail here as well as in `jq_cli_tests`.
+    #[test]
+    fn assignment_paths_that_can_fan_out_or_be_observed_stream_2267() {
+        let streamed = [
+            // Repro A and repro B: a comma in bound and in key position.
+            "(.|stderr)[(0,1):(2,3)]",
+            "(.|stderr)[(-1,-2)]",
+            // Fan-out in key, bound, or target position.
+            r#".[("a","b")]"#,
+            ".[(0,1)]",
+            ".[range(2)]",
+            "(.a,.b)[$k]",
+            ".[$k][]",
+            "(.[]|.a)[$k]",
+            // An observable key/bound: a side effect, an input read, a
+            // raise -- each changes what a stopped generator skips.
+            ".[(.a|stderr)]",
+            ".[input]",
+            r#".[(1,error("x"))]"#,
+            ".[0:(.a|debug)]",
+            // An observable *target*, which is where the issue's own repros
+            // put it.
+            "(.|stderr)[0]",
+            "(.|debug)[0:1]",
+            // Shapes deliberately left off the whitelist rather than
+            // reasoned about here (#2909's `?` scope rules, and an iterate).
+            ".a?[$k]",
+            ".[][$k]",
+        ];
+        for src in streamed {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                assignment_path_needs_streaming(&expr),
+                "{src:?} can fan out or be observed, so it must stream: {expr:?}"
             );
         }
     }
