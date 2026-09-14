@@ -5822,15 +5822,15 @@ it wherever an `Int` is widened for `+`/`-`/`*`/`/`/`%`, for `==`, and for order
 exact (`869389897822472004 + 944331` is `869389897823416335` there, as it always was
 here), so its widening stays a plain cast (`EvalSemantics::INT_LITERAL_ROUNDS_TO_17_DIGITS`).
 
-**Still open, same mechanism, out of #2906's scope** (tracked as follow-up issues):
+**Still open, same mechanism, out of #2906's scope** (tracked as #2936, #2937 and #2938):
 a *float* literal with more than 17 significant digits, or an integer literal beyond
 `i64`, is still parsed with one correct rounding (`2.7293109604053567083 + 0` is
 `2.7293109604053565` in jq, `2.729310960405357` here) — closing it needs the mode plumbed
-through the number-materialisation funnels, not just the arithmetic; the math builtins
-(`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cast
+through the number-materialisation funnels, not just the arithmetic (#2936); the math
+builtins (`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cast
 (`869389897822472004 | sqrt` is `932410798.8555645` in jq, `…647` here); and
 `floor`/`ceil`/`round`/`trunc` of such a value print their exact integer digits where jq
-prints the double (`869389897822472000`). Two *literals* compared against each other are
+prints the double (`869389897822472000`) (both #2937). Two *literals* compared against each other are
 still widened here where jq compares them exactly as decimals (`9007199254740993 ==
 9007199254740992.0`, `numeric_repr_eq`'s own doc comment). And a computed double that
 crosses the reindex bridge into a document-input builtin (`sort`, `unique`, `min`, `max`,
@@ -5840,7 +5840,7 @@ crosses the reindex bridge into a document-input builtin (`sort`, `unique`, `min
 `[5,869389897822472000,869389897822472004]` here and
 `[5,869389897822472004,869389897822472000]` in jq (stable, the two are equal there) —
 identical before and after this fix, since the comparator is right and the bridge is what
-changes the operand. The `range` entry above and the unary-minus entry (#2357) are
+changes the operand (#2938). The `range` entry above and the unary-minus entry (#2357) are
 unaffected — both stay on the exact `i64` path they document.
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
