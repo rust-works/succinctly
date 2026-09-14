@@ -1062,6 +1062,9 @@ mod tests {
             OwnedValue::Float(f64::NAN),
             OwnedValue::Float(f64::INFINITY),
             OwnedValue::Float(f64::NEG_INFINITY),
+            // #2902 now bridges finite computed floats with a private token.
+            OwnedValue::Float(2e16),
+            OwnedValue::Float(-0.0),
         ])
         .to_json_for_reindex::<JqSemantics>();
         let index = JsonIndex::build(source.as_bytes());
@@ -1073,10 +1076,14 @@ mod tests {
             let OwnedValue::Array(values) = owned else {
                 panic!("expected an array")
             };
-            assert_eq!(values.len(), 3);
+            assert_eq!(values.len(), 5);
             assert!(matches!(values[0], OwnedValue::Float(f) if f.is_nan()));
             assert!(matches!(values[1], OwnedValue::Float(f) if f == f64::INFINITY));
             assert!(matches!(values[2], OwnedValue::Float(f) if f == f64::NEG_INFINITY));
+            assert!(matches!(values[3], OwnedValue::Float(f) if f == 2e16));
+            assert!(
+                matches!(values[4], OwnedValue::Float(f) if f.to_bits() == (-0.0f64).to_bits())
+            );
         }
     }
 
