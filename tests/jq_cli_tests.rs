@@ -25462,6 +25462,53 @@ fn test_excluded_sibling_name_stays_excluded_for_other_siblings_2865() -> Result
     Ok(())
 }
 
+/// #2865 (PR review, round 5): the top-level import loop takes the same
+/// data-import branch the module loader does, so the two agree.
+///
+/// `import "f" as $d;` binds a `$`-variable to a file's parsed JSON rather
+/// than a namespace of defs. It contributes no defs, but jq still resolves
+/// `<path>.json`: with the file present `import "dat" as $d; 1` answers `1`,
+/// and with it missing jq reports `module not found: dat` and exits 3. Before
+/// this, the top level reported `module not found` either way, which would
+/// have left it disagreeing with the identical line inside a module. Binding
+/// the variable itself is #2956.
+#[test]
+fn test_top_level_data_import_resolves_but_contributes_no_defs_2865() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("dat.json"), "{\"z\":9}\n")?;
+
+    let run = |filter: &'static str| {
+        let temp_path = temp_dir.path().to_path_buf();
+        spawn_with_signal_retry(
+            move || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(&temp_path)
+                    .args(["-nc", filter]);
+                command
+            },
+            None,
+        )
+    };
+
+    let (output, code) = run(r#"import "dat" as $d; 1"#)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
+    let (output, code) = run(r#"import "nofile" as $d; 1"#)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: nofile"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2865 (PR review, round 2): a dependency reached only from a **computed
 /// destructuring key** survives the referenced-closure filter.
 ///
@@ -25480,6 +25527,11 @@ fn test_dependency_reached_only_from_a_pattern_key_survives_2865() -> Result<()>
         (
             "include \"kfin\";\ndef h: reduce (.,.) as {(kf): $v} (0; . + $v);\n",
             "2",
+        ),
+        // `foreach` pattern -- a third `Expr` variant, so a third arm
+        (
+            "include \"kfin\";\ndef h: [foreach (.,.) as {(kf): $v} (0; . + $v)];\n",
+            "[1,2]",
         ),
         // `?//` alternatives
         (
