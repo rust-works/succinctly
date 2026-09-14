@@ -55575,35 +55575,39 @@ fn test_raw_control_character_rejected_on_every_input_path_2878() -> Result<()> 
 /// cursor-native route and miss these drivers (#2782).
 #[test]
 fn test_owned_identity_rest_escape_drivers_agree_2830() -> Result<()> {
-    for body in [
-        "(label $scope | key)",
-        "(try key catch .)",
-        "(try error(\"inner\") catch key)",
-        "limit(2; (key,key))",
-        "(key // 9)",
-    ] {
-        for (filter, expected_code, expected_error) in [
-            (
-                format!(".a | {body} | (path,error(\"downstream\"))"),
-                5,
-                "jq: error (at <stdin>:0): downstream\n",
-            ),
-            (format!(".a | {body} | (path,halt_error(7))"), 7, "a"),
-            (
-                format!("label $out | .a | {body} | (path,break $out)"),
-                0,
-                "",
-            ),
-            (
-                format!("first(.a | {body} | (path,error(\"unreached\")))"),
-                0,
-                "",
-            ),
+    // `tostring` forces an owned value before the scope; without it the
+    // try-handler case can stay on the cursor route and miss its store.
+    for entry in [".a", ".a | tostring"] {
+        for body in [
+            "(label $scope | key)",
+            "(try key catch .)",
+            "(try error(\"inner\") catch key)",
+            "limit(2; (key,key))",
+            "(key // 9)",
         ] {
-            let (out, err, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
-            assert_eq!(out, "[\"a\"]\n", "{filter}: {err}");
-            assert_eq!(code, expected_code, "{filter}: {err}");
-            assert_eq!(err, expected_error, "{filter}");
+            for (filter, expected_code, expected_error) in [
+                (
+                    format!("{entry} | {body} | (path,error(\"downstream\"))"),
+                    5,
+                    "jq: error (at <stdin>:0): downstream\n",
+                ),
+                (format!("{entry} | {body} | (path,halt_error(7))"), 7, "a"),
+                (
+                    format!("label $out | {entry} | {body} | (path,break $out)"),
+                    0,
+                    "",
+                ),
+                (
+                    format!("first({entry} | {body} | (path,error(\"unreached\")))"),
+                    0,
+                    "",
+                ),
+            ] {
+                let (out, err, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
+                assert_eq!(out, "[\"a\"]\n", "{filter}: {err}");
+                assert_eq!(code, expected_code, "{filter}: {err}");
+                assert_eq!(err, expected_error, "{filter}");
+            }
         }
     }
     Ok(())
