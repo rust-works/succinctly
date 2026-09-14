@@ -6406,7 +6406,7 @@ blocks, so it does not. Measured at #2865's own head (Apple M-series, release):
 | chain                            | succinctly peak RSS | jq peak RSS |
 |----------------------------------|---------------------|-------------|
 | 6 levels x 40 defs, 1 call each  | 10 MB               | 2.5 MB      |
-| 8 levels x 6 defs, 3 calls each  | 91 MB               | 2.6 MB      |
+| 8 levels x 6 defs, 3 calls each  | 98 MB               | 2.6 MB      |
 | 14 levels x 4 defs, 2 calls each | 361 MB              | 2.6 MB      |
 
 The referenced-closure filter (jq's own `block_bind_referenced` rule, in

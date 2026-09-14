@@ -258,6 +258,26 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
             } => {
                 names.insert(format!("{namespace}::{name}"));
             }
+            // `any_subexpr` does not descend into a `Pattern` either -- its
+            // own comment that a pattern holds only destructuring names has
+            // been stale since #2677 gave object patterns computed keys. A
+            // call reached only from such a key (`. as {(kf): $v} | $v`) would
+            // otherwise be invisible, and its dependency dropped.
+            //
+            // `map_pattern_subexprs` rather than a hand-rolled walk: it is the
+            // one exhaustive definition of what a pattern contains, and a
+            // fourth copy of that is exactly what would drift. The rebuilt
+            // `Pattern` it returns is discarded.
+            Expr::Reduce { patterns, .. }
+            | Expr::Foreach { patterns, .. }
+            | Expr::AsPattern { patterns, .. } => {
+                for pattern in patterns {
+                    succinctly::jq::walk::map_pattern_subexprs(pattern, &mut |key| {
+                        names.extend(called_func_names(key));
+                        key.clone()
+                    });
+                }
+            }
             _ => {}
         }
         false
@@ -320,10 +340,20 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 ///
 /// Dropping an unreferenced def is unobservable: nothing resolves to it, and
 /// jq agrees an unreferenced dependency whose own body calls an undefined
-/// function is an error in neither tool. The closure is seeded from the body
-/// and widened through the body of everything it pulls in, which
-/// over-approximates -- over-approximating only keeps something harmless,
-/// where under-approximating would drop something a call genuinely needs.
+/// function is an error in neither tool.
+///
+/// **One pass over the body suffices, with no transitive widening**, and the
+/// widening version was actively harmful: every candidate here is already
+/// bound, so its own references are satisfied *inside* its body and it needs
+/// nothing further from this scope. Re-deriving names from a bound body
+/// therefore re-adds what it has already captured, which pulls in the whole
+/// preceding sibling set and doubles the body per def -- a module with **no
+/// `include` at all** and 20 chained defs (`def f0: 0; def f1: f0 + 1; ...`)
+/// reached 13 GB of resident memory, against milliseconds before #2865
+/// touched this code. Correctness rests on that self-containment, which is
+/// why siblings are taken from the bound list; the cost is the one under
+/// "Anything nothing in the body transitively calls" above, and is tracked as
+/// #2955.
 fn visible_defs_for(
     siblings: &FuncDefList,
     deps: &FuncDefList,
@@ -335,36 +365,16 @@ fn visible_defs_for(
     let arity = params.len();
     let candidates: Vec<&(String, Vec<Param>, Expr)> = siblings.iter().chain(deps.iter()).collect();
 
-    let mut wanted = called_func_names(body);
-    let mut keep = vec![false; candidates.len()];
-
-    // Fixed point: pulling one in can widen `wanted` past candidates already
-    // scanned, so rescan until a pass adds nothing.
-    loop {
-        let mut grew = false;
-        for (i, (cand_name, cand_params, cand_body)) in candidates.iter().enumerate() {
-            let excluded = (cand_name == name && cand_params.len() == arity)
-                || (cand_params.is_empty() && param_names.contains(cand_name.as_str()));
-            if keep[i] || excluded {
-                continue;
-            }
-            if wanted.contains(cand_name) {
-                keep[i] = true;
-                let before = wanted.len();
-                wanted.extend(called_func_names(cand_body));
-                grew |= wanted.len() != before;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
+    let wanted = called_func_names(body);
 
     candidates
         .into_iter()
-        .zip(keep)
-        .filter(|(_, keep)| *keep)
-        .map(|(def, _)| (*def).clone())
+        .filter(|(cand_name, cand_params, _)| {
+            let excluded = (cand_name == name && cand_params.len() == arity)
+                || (cand_params.is_empty() && param_names.contains(cand_name.as_str()));
+            !excluded && wanted.contains(cand_name)
+        })
+        .cloned()
         .collect()
 }
 
@@ -575,6 +585,19 @@ impl ModuleLoader {
     /// `hj/0 is not defined` even with `def hj: 1234;` in `~/.jq`). They still
     /// leak in today through the top-level chain -- a separate, pre-existing
     /// gap this fix neither widens nor closes.
+    /// Whether `module_path` names a file the search path can actually
+    /// resolve (#2865).
+    ///
+    /// Used only to skip a module's own *data* imports, which cannot be
+    /// distinguished from namespace imports on the `Import` node itself --
+    /// see the call site. Deliberately not applied to `include`s: a missing
+    /// `include` is a genuine error jq reports too, and silently skipping one
+    /// would swap a clear `module not found` for a later, unexplained
+    /// `is not defined`.
+    fn module_resolves(&self, module_path: &str) -> bool {
+        resolve_module_in(&self.search_path, module_path).is_some()
+    }
+
     fn module_dep_defs(&mut self, program: &Program) -> Result<FuncDefList, ModuleLoadError> {
         let mut defs: FuncDefList = Vec::new();
 
@@ -587,7 +610,20 @@ impl ModuleLoader {
         // of `process_program` to pick up: these bodies are spliced into the
         // tree before that pass runs, so a `NamespacedCall` inside a module
         // body is rewritten along with every other one.
+        //
+        // A *data* import (`import "f" as $d;`, which binds a `$`-variable to
+        // the file's parsed JSON rather than a namespace of defs) contributes
+        // no defs and must be skipped: `parse_import` drops the `$`, so
+        // `Import` cannot tell the two apart, and loading one as a module
+        // fails with `module not found`. Before #2865 a module declaring one
+        // was simply ignored; making it fatal would be a regression, and a
+        // directive that binds a variable has no business in a *def*
+        // dependency list either way. Data imports remain unimplemented at the
+        // top level too (#2956) -- unchanged here.
         for import in &program.imports {
+            if !self.module_resolves(&import.path) {
+                continue;
+            }
             let namespace = &import.alias;
             defs.extend(
                 self.load_module(&import.path)?
