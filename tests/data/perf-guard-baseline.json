@@ -11,6 +11,7 @@
     "users_path_walk": 268790008,
     "users_yq_del_select": 2663041899,
     "users_yq_keys_unsorted": 73985720,
+    "wide_escaped_keys_unsorted": 317859745,
     "wide_identity": 467103831,
     "wide_keys_unsorted": 290306959
   },
@@ -26,6 +27,7 @@
     "users_path_walk": 314254982,
     "users_yq_del_select": 3290140229,
     "users_yq_keys_unsorted": 82751672,
+    "wide_escaped_keys_unsorted": 373125714,
     "wide_identity": 578691186,
     "wide_keys_unsorted": 345795217
   }
