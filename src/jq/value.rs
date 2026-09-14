@@ -1858,15 +1858,22 @@ impl OwnedValue {
                 f64::INFINITY
             });
         }
-        // The reindex bridge's computed-float token (#2902): a bare `Float`
-        // going in must be a bare `Float` coming out, never a
-        // `NumberLiteral` -- checked with the sentinels, before any of the
-        // literal-preserving arms below can see the text.
-        if let Some(f) = crate::json::validate::parse_computed_float_token(bytes) {
-            return Self::Float(f);
-        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+        }
+        // The reindex bridge's computed-float token (#2902): a bare `Float`
+        // going in must be a bare `Float` coming out, never a
+        // `NumberLiteral`. Checked only after `is_valid_number` fails --
+        // never before it, and never merged into the same `if`/`else`
+        // ordering as an unconditional first check: the token's doubled
+        // exponent marker (its whole design, see `computed_float_token`)
+        // makes `is_valid_number` reject every token unconditionally, so
+        // this is never reached for an ordinary number, including one that
+        // happens to end in this token's own suffix (`5e0`, `120e0`) --
+        // those take the literal-preserving arm above instead, without
+        // paying this check's `contains(&b'e')` scan at all.
+        if let Some(f) = crate::json::validate::parse_computed_float_token(bytes) {
+            return Self::Float(f);
         }
         // Real jq's own number reader also accepts a leading `.` (with or
         // without a preceding `-`) when at least one digit follows (`.5`
@@ -2354,23 +2361,14 @@ impl OwnedValue {
     ///
     /// A plain (non-`NumberLiteral`) finite `Float` is written as the
     /// bridge-only token `crate::json::validate::computed_float_token`
-    /// (#2902), which [`from_number_bytes`](Self::from_number_bytes) and
-    /// `JsonNumber::as_f64` decode back to a bare `Float`. It used to be
-    /// written with a display formatter -- `format_float_yq` in yq mode
-    /// (#953, #2438), `jq_bare_float_display` in jq mode -- and since the
-    /// reparse cannot tell `1.0` written by this bridge from `1.0` written
-    /// in a document, the value came back as a `NumberLiteral` and every
-    /// literal-preserving rule downstream (#1008, #1054, #2456) echoed the
-    /// bridge's spelling: `[0.5+0.5] | .[0] | tostring` answered `1.0`
-    /// (real yq `1`) and `[2*1e16] | .[0] | tostring` answered `2E+16`
-    /// (real jq `2e+16`). The token carries no spelling at all, so each
-    /// mode re-derives its own from the `f64` after the round trip, and the
-    /// mode fork this fallback used to need is gone. A **document** float
-    /// with no preserved literal (an i64-overflow YAML scalar) still keeps
-    /// the full decimal spelling real yq gives *it* because its provenance
-    /// is recorded upstream, at
-    /// [`from_document_float`](Self::from_document_float), as a
-    /// `NumberLiteral` that echoes verbatim below.
+    /// (#2902) -- see that function's own doc comment for why a token
+    /// rather than a display formatter, and the pre-#2902 bug it replaces.
+    /// [`from_number_bytes`](Self::from_number_bytes) and `JsonNumber::as_f64`
+    /// decode it back to a bare `Float`. A **document** float with no
+    /// preserved literal (an i64-overflow YAML scalar) still keeps the full
+    /// decimal spelling real yq gives *it* because its provenance is
+    /// recorded upstream, at [`from_document_float`](Self::from_document_float),
+    /// as a `NumberLiteral` that echoes verbatim below.
     pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> String {
         self.to_json_for_reindex_at_depth::<S>(0)
     }
@@ -3702,39 +3700,37 @@ mod tests {
     /// takes its one spelling.
     #[test]
     fn test_reindex_round_trip_keeps_float_and_literal_apart_2902() {
-        use crate::json::JsonIndex;
-        fn round_trip<S: EvalSemantics>(value: &OwnedValue) -> OwnedValue {
-            let json = value.to_json_for_reindex::<S>();
-            let bytes = json.as_bytes();
-            let index = JsonIndex::build(bytes);
-            let root = index.root(bytes);
-            let crate::json::light::StandardJson::Array(items) = root.value() else {
-                panic!("expected the round-tripped array, got {json}");
-            };
-            OwnedValue::Array(
-                items
-                    .map(|item| match item {
-                        crate::json::light::StandardJson::Number(n) => {
-                            OwnedValue::from_number_bytes(n.raw_bytes())
-                        }
-                        other => panic!("expected a number, got {other:?}"),
-                    })
-                    .collect(),
-            )
+        // Per-value, mirroring the two sibling tests above (token-writing,
+        // token-decoding) rather than re-deriving their composition through
+        // a hand-rolled `JsonIndex`/`StandardJson::Array` walk:
+        // `to_json_for_reindex_at_depth`'s `Array` arm serializes each
+        // element independently and `JsonIndex` parses each number span
+        // independently too, so wrapping these six values in an array and
+        // walking a real index would prove nothing this per-value round
+        // trip through `from_number_bytes` doesn't already cover.
+        let cases: &[(OwnedValue, &str)] = &[
+            (OwnedValue::Float(1.0), "Float(1.0)"),
+            (
+                OwnedValue::from_number_literal("1.0"),
+                "NumberLiteral(Float(1.0), \"1.0\")",
+            ),
+            (OwnedValue::Int(1), "NumberLiteral(Int(1), \"1\")"),
+            (OwnedValue::Float(2e16), "Float(2e16)"),
+            (
+                OwnedValue::from_number_literal("2e16"),
+                "NumberLiteral(Float(2e16), \"2e16\")",
+            ),
+            (OwnedValue::Float(-0.0), "Float(-0.0)"),
+        ];
+        for (value, want) in cases {
+            for json in [
+                value.to_json_for_reindex::<YqSemantics>(),
+                value.to_json_for_reindex::<JqSemantics>(),
+            ] {
+                let round_tripped = OwnedValue::from_number_bytes(json.as_bytes());
+                assert_eq!(format!("{round_tripped:?}"), *want, "{value:?} -> {json}");
+            }
         }
-        let value = OwnedValue::Array(vec![
-            OwnedValue::Float(1.0),
-            OwnedValue::from_number_literal("1.0"),
-            OwnedValue::Int(1),
-            OwnedValue::Float(2e16),
-            OwnedValue::from_number_literal("2e16"),
-            OwnedValue::Float(-0.0),
-        ]);
-        let want = "Array([Float(1.0), NumberLiteral(Float(1.0), \"1.0\"), \
-                    NumberLiteral(Int(1), \"1\"), Float(2e16), \
-                    NumberLiteral(Float(2e16), \"2e16\"), Float(-0.0)])";
-        assert_eq!(format!("{:?}", round_trip::<YqSemantics>(&value)), want);
-        assert_eq!(format!("{:?}", round_trip::<JqSemantics>(&value)), want);
     }
 
     /// #2456: `jq_bare_float_display`'s digit-count threshold

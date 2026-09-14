@@ -23537,14 +23537,17 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
 /// `eval::eval_path_context_pipe_owned` normally gives a cursor-less owned
 /// value a position by serializing it into a throwaway document and taking
 /// that document's root cursor. That round trip is a semantic identity for
-/// almost every value ([`reindex_bridge_is_identity`]), but not for a bare
-/// `Float`, a NaN, or a numeric literal past [`REINDEX_LITERAL_LEN_CAP`]:
-/// `to_json_for_reindex`'s mode-forked formatter re-spells those, so
-/// `syq --eval-all '.[0] | .a | parent'` over a document holding `.nan`
-/// would print the ancestor with `null` in place of the NaN and `1e+19` in
-/// place of `10000000000000000000.0`. Those values used to be kept off the
-/// bridge by handing the pipe to the eager evaluator; with that evaluator
-/// deleted, they take this route instead.
+/// almost every value ([`reindex_bridge_is_identity`]), but not for a NaN
+/// or a numeric literal past [`REINDEX_LITERAL_LEN_CAP`] (a bare finite
+/// `Float` used to be a third such case, until #2902 gave
+/// `to_json_for_reindex` a token spelling that survives the round trip
+/// intact): `to_json_for_reindex`'s mode-forked formatter re-spells those,
+/// so `syq --eval-all '.[0] | .a | parent'` over a document holding `.nan`
+/// would print the ancestor with `null` in place of the NaN, and the same
+/// pipe over an over-cap literal would print `1e+19` in place of
+/// `10000000000000000000.0`. Those values used to be kept off the bridge by
+/// handing the pipe to the eager evaluator; with that evaluator deleted,
+/// they take this route instead.
 ///
 /// The owned identity pipe is the exact replacement: it never serializes,
 /// and a detached root is precisely the position the reindexed root cursor
@@ -24773,10 +24776,11 @@ mod tests {
     /// "duplicated predicates diverge silently").
     ///
     /// The corpus straddles every boundary the predicate draws: a bare
-    /// `Float` (re-spelled), a bare `Int` (normalized to a `NumberLiteral`
-    /// carrying the same text it already rendered as — the one sanctioned
-    /// exception, spelled out in `round_trips_unchanged`), a NaN literal
-    /// (replaced by `NAN_SENTINEL`), and a `NumberLiteral` either side of
+    /// finite `Float` (identity since #2902's token spelling, no longer
+    /// re-spelled), a bare `Int` (normalized to a `NumberLiteral` carrying
+    /// the same text it already rendered as — the one sanctioned exception,
+    /// spelled out in `round_trips_unchanged`), a NaN literal (replaced by
+    /// `NAN_SENTINEL`), and a `NumberLiteral` either side of
     /// `REINDEX_LITERAL_LEN_CAP`, which is duplicated from a private `const`
     /// inside `to_json_for_reindex`'s body and cannot be shared.
     ///

@@ -32859,6 +32859,14 @@ fn test_computed_float_through_container_keeps_computed_spelling_2902() -> Resul
         ("[1.0] | .[0] | tostring", r#""1.0""#),
         ("[1e2] | .[0] | tostring", r#""1E+2""#),
         ("[1.50e10] | .[0]", "1.50E+10"),
+        // A negative computed float takes the same route (found in
+        // review): the token's sign-stripping in
+        // `parse_computed_float_token` is unit-tested directly, but this
+        // is the only place the full pipeline -- arithmetic, negation,
+        // array, reindex, cursor decode -- was exercised end-to-end for a
+        // negative value.
+        ("[0-(0.5+0.5)] | .[0] | tostring", r#""-1""#),
+        ("[0-1e16] | .[0] | tostring", r#""-1e+16""#),
     ] {
         let (stdout, code) = run_jq_stdin(filter, "null\n", &["-c"])?;
         assert_eq!(code, 0, "`{filter}` exited {code}: {stdout:?}");

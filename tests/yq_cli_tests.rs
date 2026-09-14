@@ -45851,6 +45851,13 @@ mod computed_float_through_container_2902 {
             ("[[0.5+0.5]] | .[0][0] | tostring", "1"),
             ("[0.5+0.5] | map(.) | .[0] | tostring", "1"),
             ("[1e2] | .[0] | tostring", "1e2"),
+            // A negative computed float takes the same route (found in
+            // review): `parse_computed_float_token`'s sign-stripping is
+            // unit-tested directly, but this is the only place the full
+            // pipeline -- arithmetic, negation, array, reindex, cursor
+            // decode -- is exercised end-to-end for a negative value.
+            // Real yq has no unary `-`, so `0 - x` stands in for it.
+            ("[0-(0.5+0.5)] | .[0] | tostring", "-1"),
         ])
     }
 
@@ -45876,6 +45883,8 @@ mod computed_float_through_container_2902 {
             ("[1e10*2] | .[0] | tojson", "2e+10"),
             ("(1e10*2) | tojson", "2e+10"),
             ("[1e-5/2] | .[0] | tojson", "5e-06"),
+            // Negative, same reasoning as the sibling `tostring` row above.
+            ("[0 - (1e10*2)] | .[0] | tojson", "-2e+10"),
         ])
     }
 

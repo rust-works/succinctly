@@ -41392,12 +41392,15 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// One value class must not take the round trip: one the reindex would
 /// re-spell ([`crate::jq::eval_generic::reindex_bridge_is_identity`]) -- a
-/// bare `Float`, a NaN, or a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP`
-/// (#1211). `syq --eval-all '.[0] | .a | parent'` over a document holding
-/// `.nan` reaches this door with exactly such a value, and reindexing it
-/// prints `null` where the document said `.nan`. Until spine 2416's exit
-/// that class was kept off the bridge by handing the pipe to the eager
-/// evaluator; it now takes
+/// NaN or a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP` (#1211). A bare
+/// `Float` used to be a third such case, until #2902 gave
+/// `to_json_for_reindex` a token spelling that survives the round trip
+/// intact, so a finite computed float is bridge-identity now and no longer
+/// reaches this door. `syq --eval-all '.[0] | .a | parent'` over a document
+/// holding `.nan` reaches this door with exactly such a value, and
+/// reindexing it prints `null` where the document said `.nan`. Until spine
+/// 2416's exit that class was kept off the bridge by handing the pipe to
+/// the eager evaluator; it now takes
 /// [`crate::jq::eval_generic::eval_path_context_pipe_detached`] -- the owned
 /// identity pipe rooted at a detached position, which never serializes and
 /// places the value exactly as the reindexed root cursor would have. A pipe
@@ -60799,10 +60802,12 @@ mod tests {
     /// Each scalar also appears *wrapped* as `{"a": {"b": v}}` and `[v]`, so
     /// the arms that hand a navigated subvalue straight back (`Field`,
     /// `Index`, and the `Pipe` threading built on them) are diffed on every
-    /// numeric spelling too — the round trip those arms skip is a *formatter*
-    /// (`to_json_for_reindex` writes a bare `Float` decimally and the reparse
-    /// hands back a `NumberLiteral`), so an un-round-tripped `Float`/`Int`
-    /// reaching a caller is exactly where a divergence would hide.
+    /// numeric spelling too — the round trip those arms skip re-spells a
+    /// NaN or an over-cap `NumberLiteral` (`REINDEX_LITERAL_LEN_CAP`); a
+    /// bare finite `Float` used to be a third such case until #2902 made
+    /// that leg an identity (a token, not a formatter), so an
+    /// un-round-tripped `Float`/`Int` reaching a caller is exactly where a
+    /// divergence would hide.
     fn pure_value_matrix() -> Vec<OwnedValue> {
         let scalars = pure_scalar_matrix();
         let mut out = scalars.clone();
@@ -82396,17 +82401,19 @@ mod tests {
     /// [`eval_path_context_pipe_owned`] gives a cursor-less owned value a
     /// position by serializing it into a throwaway document and walking that
     /// document's root cursor. `to_json_for_reindex`'s mode-forked formatter
-    /// re-spells a bare `Float`, a NaN and a `NumberLiteral` past
-    /// `REINDEX_LITERAL_LEN_CAP`, so `reindex_bridge_is_identity` keeps those
-    /// off the bridge; before the exit they went to the eager evaluator, and
-    /// they take `eval_generic::eval_path_context_pipe_detached` -- the owned
-    /// identity pipe at a detached root -- now.
+    /// re-spells a NaN and a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP`,
+    /// so `reindex_bridge_is_identity` keeps those off the bridge; before
+    /// the exit they went to the eager evaluator, and they take
+    /// `eval_generic::eval_path_context_pipe_detached` -- the owned identity
+    /// pipe at a detached root -- now. A bare `Float` used to be a third
+    /// such class, until #2902 gave `to_json_for_reindex` a token spelling
+    /// that survives the round trip intact: a finite computed float is
+    /// bridge-identity now, so it takes the ordinary bridge route instead of
+    /// this guard, and has no row here for the same reason the "not a row"
+    /// paragraph below explains for other bridge-identity values.
     ///
     /// Measured, not assumed: with the guard removed and the bridge taken,
     /// a 300-digit literal came back as `"1e+299"` and the NaN as `Null`.
-    /// (The third class, a bare `Float`, is re-spelled from `Float(1e19)`
-    /// into `NumberLiteral(1e19, "1e+19")` -- the same *text* either way, so
-    /// it is covered by the guard but has no row here that could fail.)
     ///
     /// One shape the detached route does *not* keep, and the reason it is
     /// not a row: a stage it hands to the ordinary owned evaluator
@@ -82424,9 +82431,9 @@ mod tests {
         use alloc::string::ToString as _;
         let long = "1".repeat(300);
         // Only the over-cap literal has a spelling `to_json` can show: a NaN
-        // renders as `null` in jq mode whatever the route preserved, and a
-        // bare `Float` renders identically before and after the round trip
-        // (see the note above). All three take the same route.
+        // renders as `null` in jq mode whatever the route preserved. Both
+        // still take this guard's route; a bare `Float` no longer does
+        // (see the note above).
         let rows: &[(OwnedValue, &str)] = &[(
             OwnedValue::NumberLiteral(NumberRepr::Float(1e299), long.clone().into()),
             &long,

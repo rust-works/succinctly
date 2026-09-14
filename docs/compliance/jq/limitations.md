@@ -6005,10 +6005,14 @@ fix or a closed decision.
 
 `jq::eval_owned_with_file_index` is the one public entry that hands the
 path-context machinery an `OwnedValue` the caller built rather than one read
-from a document, so it is the only way a bare `Float`, a NaN, or a
-`NumberLiteral` longer than `REINDEX_LITERAL_LEN_CAP` (256 chars) can reach
-`eval::eval_path_context_pipe_owned`. That door refuses the reindex bridge for
-exactly those values (`reindex_bridge_is_identity`) and runs the pipe through
+from a document, so it is the only way a NaN or a `NumberLiteral` longer than
+`REINDEX_LITERAL_LEN_CAP` (256 chars) can reach
+`eval::eval_path_context_pipe_owned`. (A bare `Float` used to be a third such
+class; #2902 gave `to_json_for_reindex` a token spelling that survives the
+reindex round trip intact, so a finite computed float is bridge-identity now
+and takes the ordinary bridge instead of this door.) That door refuses the
+reindex bridge for exactly those two remaining classes
+(`reindex_bridge_is_identity`) and runs the pipe through
 `eval_generic::eval_path_context_pipe_detached` instead, which never
 serializes -- so `.[0] | parent`, `[.[0] | parent]` and `.[0] | parent | .[1]`
 all hand the literal back exactly as the caller spelled it

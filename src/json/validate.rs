@@ -850,6 +850,20 @@ pub fn validate_jq_lenient(input: &[u8]) -> Result<(), ValidationError> {
     Validator::new(input).jq_lenient().validate()
 }
 
+/// Length (0 or 1) of an optional leading `-` sign at the start of `bytes`.
+///
+/// Shared building block for every "does this number-shaped span start with
+/// an optional sign, and what comes right after it" check in this file
+/// ([`is_valid_number`], [`strip_redundant_leading_zeros`],
+/// [`has_leading_dot`], `parse_computed_float_token`) -- previously each
+/// hand-rolled its own sign-stripping in a different style (index bump,
+/// slice split via `match` on `first()`, `strip_prefix`), a fourth
+/// independent copy of the same one-byte check.
+#[must_use]
+fn sign_len(bytes: &[u8]) -> usize {
+    usize::from(bytes.first() == Some(&b'-'))
+}
+
 /// True if `bytes` is *exactly* one RFC 8259 JSON number token, with
 /// nothing before or after it.
 ///
@@ -877,10 +891,7 @@ pub fn validate_jq_lenient(input: &[u8]) -> Result<(), ValidationError> {
 /// ```
 #[must_use]
 pub fn is_valid_number(bytes: &[u8]) -> bool {
-    let mut i = 0;
-    if bytes.first() == Some(&b'-') {
-        i += 1;
-    }
+    let mut i = sign_len(bytes);
     match bytes.get(i) {
         Some(b'0') => i += 1,
         Some(b'1'..=b'9') => {
@@ -946,10 +957,7 @@ pub fn is_valid_number(bytes: &[u8]) -> bool {
 /// receive one isolated span, so neither ever needed that machinery.
 #[must_use]
 pub fn strip_redundant_leading_zeros(bytes: &[u8]) -> Option<Vec<u8>> {
-    let (sign, rest) = match bytes.first() {
-        Some(b'-') => (&bytes[..1], &bytes[1..]),
-        _ => (&bytes[..0], bytes),
-    };
+    let (sign, rest) = bytes.split_at(sign_len(bytes));
     if rest.first() != Some(&b'0') || !rest.get(1).is_some_and(u8::is_ascii_digit) {
         return None;
     }
@@ -1034,14 +1042,10 @@ pub fn has_trailing_dot_before_exponent(bytes: &[u8]) -> bool {
 /// own inserted-`0` candidate.
 #[must_use]
 pub fn has_leading_dot(bytes: &[u8]) -> bool {
-    let dot_pos = match bytes.first() {
-        Some(b'.') => Some(0),
-        Some(b'-') if bytes.get(1) == Some(&b'.') => Some(1),
-        _ => None,
-    };
-    let Some(prefix_len) = dot_pos else {
+    let prefix_len = sign_len(bytes);
+    if bytes.get(prefix_len) != Some(&b'.') {
         return false;
-    };
+    }
     let mut fixed = Vec::with_capacity(bytes.len() + 1);
     fixed.extend_from_slice(&bytes[..prefix_len]);
     fixed.push(b'0');
@@ -1089,9 +1093,18 @@ const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";
 ///
 /// `f` must be finite: NaN/±Infinity have their own sentinels, which every
 /// caller emits first.
+///
+/// Checked with `assert!`, not `debug_assert!`, even though every current
+/// caller already guarantees it (`to_json_at_depth`'s `Self::Float(f)` arm
+/// re-checks `is_nan()`/`is_infinite()` before ever calling `float_fmt`):
+/// `format!("{:e}", f64::NAN)` is `"NaN"` and the infinities are
+/// `"inf"`/`"-inf"`, none digit-leading, so a future caller that skipped
+/// the pre-filter would otherwise splice unparseable text into reindexed
+/// JSON and corrupt the surrounding document silently in a release build,
+/// rather than fail loudly the way an invariant violation should.
 #[must_use]
 pub(crate) fn computed_float_token(f: f64) -> String {
-    debug_assert!(
+    assert!(
         f.is_finite(),
         "computed_float_token requires a finite value; NaN/Infinity use their own sentinels"
     );
@@ -1112,7 +1125,7 @@ pub(crate) fn computed_float_token(f: f64) -> String {
 #[must_use]
 pub(crate) fn parse_computed_float_token(bytes: &[u8]) -> Option<f64> {
     let inner = bytes.strip_suffix(COMPUTED_FLOAT_TOKEN_SUFFIX.as_bytes())?;
-    let digits = inner.strip_prefix(b"-").unwrap_or(inner);
+    let digits = &inner[sign_len(inner)..];
     if !digits.first().is_some_and(u8::is_ascii_digit) || !inner.contains(&b'e') {
         return None;
     }
