@@ -8744,8 +8744,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::NthExpr { n, expr: inner } | Expr::Builtin(Builtin::NthStream(n, inner)) => {
             each_nth_generic::<S, V>(n, inner, value, optional, cursor, sink)
         }
+        // `skip` already materializes through the owned bridge in the eager
+        // evaluator; use its streaming twin so downstream stops reach both
+        // the count and body generators (#2934).
         Expr::Builtin(
-            Builtin::IsEmpty(_)
+            Builtin::Skip(..)
+            | Builtin::IsEmpty(_)
             | Builtin::AnyCond(..)
             | Builtin::AllCond(..)
             | Builtin::UpperIn(_)
