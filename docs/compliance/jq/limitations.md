@@ -3014,6 +3014,14 @@ into — jq's `reduce` evaluates its source against the outer `.` — which is o
 `{"a":"b","b":1} | .[(.a,.a)] = 5` is `{"a":"b","b":5}`, where resolving the second `.a`
 against the written document would read back `5` and raise.
 
+That interleave has a price, and it is charged only where it buys something. The
+streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
+200,000-element array `.[(0,1)] = 0` goes from 74.8 MB to 88.5 MB peak RSS (+18%). A path
+that provably resolves to one path with nothing observable on the way stays on the eager
+route and pays none of it — `.[$k] = 0` is unchanged, as are a static path, `del()` and
+`|=`. jq pays nothing for the same separation because its values are refcounted; closing
+that gap here needs structural sharing in `OwnedValue`, not a better gate.
+
 **Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
 so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
