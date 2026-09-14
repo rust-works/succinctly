@@ -309,7 +309,8 @@ fn deps_excluding_self(deps: &FuncDefList, name: &str, arity: usize, body: &Expr
 
     deps.iter()
         .zip(keep)
-        .filter_map(|(dep, keep)| keep.then(|| dep.clone()))
+        .filter(|(_, keep)| *keep)
+        .map(|(dep, _)| dep.clone())
         .collect()
 }
 
