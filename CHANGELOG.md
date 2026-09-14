@@ -127,6 +127,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A slice off a detached literal no longer fabricates a `key`/`path`/`parent`
+  position, in jq mode** (#2834). `OwnedIdentity`'s shared navigation arm
+  extended a detached identity's ancestors unconditionally, so
+  `("x" | .[0:1]) | key` answered `{"start":0,"end":1}` instead of nothing —
+  real jq's own `path("x" | .[0:1])` raises "Invalid path expression" for the
+  same navigation, which this extension downgrades to silent omission, the
+  same downgrade a bare undecorated literal already gets (`1 | key` is
+  empty, not an error). `null` keeps tracking (`path(null | .[0:1])`
+  succeeds in real jq — `null` is always addressable, the rule `setpath`
+  relies on to create an absent field), and an attached slice (`.a | .[0:2]`)
+  is unaffected — only a slice with no position at all to trace back to now
+  stays detached.
+
 - **Bare `flatten` (no depth argument) now flattens fully, matching jq** (#2818).
   `Builtin::Flatten` was wired to `flatten(1)` instead of jq's actual
   unbounded-depth default (`[[1,[2]],3] | flatten` used to keep `[2]`
