@@ -15,8 +15,6 @@ use alloc::borrow::Cow;
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
-use alloc::format;
-#[cfg(not(test))]
 use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
@@ -28,8 +26,7 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    container_tail_gap_ok, effective_len, effective_len_checked, key_display_string,
-    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentFields,
+    effective_len, effective_len_checked, key_display_string, DistinctKeyCursors, DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -561,14 +558,12 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// (this one, `MAX_VALUE_TREE_DEPTH`-bounded; that one,
     /// `MAX_NESTING_DEPTH`-bounded, restarting from 0 whenever a `Cursor` is
     /// reached) mirror `materialize_at_depth`'s own split exactly, just with
-    /// both sides checked instead of both sides panicking. Preserves
-    /// `cursor_to_owned`'s raw-number-byte semantics via
-    /// `try_cursor_to_owned` rather than switching to
-    /// `eval_generic::to_owned_cursor`'s canonicalizing twin, which would
-    /// silently reformat a JSON-sourced number's spelling on every
-    /// `-S`/`-a`/`-C`/`-e` run -- exactly the risk that made a plain
-    /// delegation to the already-checked `eval_generic` materializer unsafe
-    /// (see this issue's own "why not a quick fix" note).
+    /// both sides checked instead of both sides panicking. The shared
+    /// container traversal retains the lazy raw-number policy, which
+    /// restores internal non-finite markers and preserves plain-float
+    /// fallbacks for lenient number spellings. Ordinary JSON number
+    /// spellings already agree with `eval_generic::to_owned_cursor`;
+    /// the number fallback and depth-error contracts require these policies.
     pub fn try_materialize(&self) -> Result<OwnedValue, EvalError> {
         self.try_materialize_at_depth(0)
     }
@@ -879,196 +874,48 @@ fn lazy_index_range_to_owned(len: usize) -> OwnedValue {
     OwnedValue::Array((0..len).map(|i| OwnedValue::Int(i as i64)).collect())
 }
 
-/// Convert a JsonCursor to an OwnedValue (full materialization).
+/// Convert a JsonCursor to an OwnedValue through the shared container walk.
 ///
-/// Panics past [`super::eval_generic::MAX_NESTING_DEPTH`] levels of nesting
-/// (#998) rather than recursing unbounded and overflowing the call stack --
-/// a second, independent materializer with the identical unguarded shape
-/// `eval_generic::to_owned_cursor` had, missed by that fix's own review pass
-/// and only found once it: `--exit-status`/`-e` forces `JqValue::
-/// materialize()` (see `Materializable::materialize` below) on every result
-/// before `jq_runner.rs`'s own guarded `print_json` output path ever runs,
-/// reaching this function directly. Confirmed live: `succinctly jq -e
-/// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT)
-/// even after `to_owned_cursor`'s own guard existed.
+/// The existing evaluator-facing contract panics at MAX_NESTING_DEPTH;
+/// malformed values still return decode errors. Keep this distinct from the
+/// checked CLI boundary below and the generic evaluator's uncatchable depth
+/// error. Each cursor starts its depth budget at zero (#998, #2850, #2868).
 fn cursor_to_owned<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    cursor_to_owned_at_depth(cursor, 0)
+    super::eval_generic::to_owned_cursor_with(
+        cursor,
+        |depth| {
+            super::eval_generic::assert_nesting_depth(depth);
+            Ok(())
+        },
+        cursor_number_to_owned,
+    )
 }
 
-fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
-    cursor: &JsonCursor<'_, W>,
-    depth: usize,
-) -> Result<OwnedValue, EvalError> {
-    super::eval_generic::assert_nesting_depth(depth);
-    Ok(match cursor.value() {
-        StandardJson::Null => OwnedValue::Null,
-        StandardJson::Bool(b) => OwnedValue::Bool(b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => OwnedValue::String(
-            // Was an empty string, which silently replaced the real value
-            // (#1098, #1247) -- the sibling `to_owned_at_depth` in
-            // eval_generic.rs swallowed the same case as `null`. Both raise
-            // now, with the wording #1192 established.
-            s.as_str()
-                .map_err(|e| EvalError::decode_failure(format!("{e}")))?
-                .into_owned(),
-        ),
-        StandardJson::Array(_) => {
-            // Use cursor navigation to iterate children
-            let mut items = Vec::new();
-            let mut is_first = true;
-            // #2358: the last real element's own cursor, retained past the
-            // loop so the trailing-gap check below (`[1,]`) has something
-            // to check from -- mirrors the `Object` arm's own `last_field`.
-            let mut last_elem: Option<JsonCursor<'_, W>> = None;
-            for child in cursor.children() {
-                // #2211 code review: this walk (unlike its
-                // `eval_generic::to_owned_cursor_at_depth` sibling it
-                // otherwise mirrors) never ran this check at all -- not even
-                // the missing/doubled-comma-between-two-real-elements case
-                // (#1677), which the `Object` arm below already had.
-                // `{"a" 1, "b": 2} | -e` used to silently succeed for the
-                // array shape (`[1 2, 3]`) the same way this object shape
-                // used to before #1956. #1803: via the shared
-                // `element_gap_ok` rather than an inline copy of it.
-                if !child.element_gap_ok(is_first) {
-                    return Err(child.malformed_delimiter_error());
-                }
-                items.push(cursor_to_owned_at_depth(&child, depth + 1)?);
-                last_elem = Some(child);
-                is_first = false;
-            }
-            // #2211/#2243, via the shared `container_tail_gap_ok`. #2358
-            // closes the STYLE-0013 exemption this walk used to carry: a
-            // stray `,` with no real element at all (`[,]`) was already
-            // checked, directly against `container_gap_ok`, but a stray `,`
-            // *after* a real last element (`[1,]`) was not -- unlike every
-            // other materializer sharing this same helper. Adopting it here
-            // is the behaviour change that comment used to defer.
-            container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-            OwnedValue::Array(items)
-        }
-        StandardJson::Object(fields) => {
-            let mut map = IndexMap::new();
-            let mut guard = DisplayKeyGuard::default();
-            // #1679: restructured from `for field in fields` to `uncons`
-            // so the walk can tell "ran out of fields" apart from "ran out
-            // on an unpaired child" (#1194) -- mirrors
-            // `eval_generic::to_owned_at_depth`'s identical shape.
-            let mut f = fields;
-            let mut is_first = true;
-            // #2358: same reasoning as the `Array` arm's own `last_elem`
-            // above.
-            let mut last_field: Option<JsonCursor<'_, W>> = None;
-            // #1803: `DocumentFields::uncons`, not the inherent
-            // `JsonFields::uncons` -- the trait impl (`json::light`) builds
-            // its `DocumentField` from exactly the four accessors this loop
-            // already called by hand, so nothing extra is resolved, and it
-            // is what lets this walk share `checked_key` with its generic
-            // siblings rather than hand-copying their checks again. #1956
-            // is the reminder of why that matters: this walk (unlike the
-            // `eval_generic::to_owned_at_depth` sibling it otherwise
-            // mirrors) had no delimiter checks at all until then, so a
-            // missing or doubled `,`/`:` with an otherwise-even member
-            // count silently succeeded here.
-            while let Some((field, rest)) = DocumentFields::uncons(&f) {
-                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-                map.insert(
-                    key,
-                    cursor_to_owned_at_depth(&field.value_cursor, depth + 1)?,
-                );
-                last_field = Some(field.value_cursor);
-                f = rest;
-                is_first = false;
-            }
-            if f.ends_unpaired() {
-                return Err(f.malformed_member_error());
-            }
-            // #2211/#2243, via the shared `container_tail_gap_ok` -- #2358
-            // closes this walk's own STYLE-0013 exemption; see the `Array`
-            // arm's identical comment above.
-            container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            OwnedValue::Object(map)
-        }
-        // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
-        // (#1194/#1247): a structurally malformed value raises rather than
-        // becoming `null`. #2286: decode_failure, not new -- same class as
-        // the malformed member/delimiter errors; confirmed live that real
-        // jq treats this uncatchably too.
-        StandardJson::Error(msg) => return Err(EvalError::decode_failure(msg)),
-    })
-}
-
-/// [`cursor_to_owned`]'s checked twin (#2850): reports a value nested past
-/// [`super::eval_generic::MAX_NESTING_DEPTH`] as an ordinary [`EvalError`]
-/// instead of panicking, for [`JqValue::try_materialize`]'s `Cursor` arm --
-/// a CLI-output-boundary caller, not the evaluator's own hot recursion
-/// [`cursor_to_owned`]'s own panicking contract stays deliberate for (see
-/// that function's doc comment). Otherwise byte-for-byte identical,
-/// including the raw-number-byte preservation
-/// (`OwnedValue::from_number_bytes`) that rules out delegating to
-/// `eval_generic::to_owned_cursor`'s canonicalizing twin instead.
+/// Checked CLI-boundary twin: the same traversal and number policy, with a
+/// catchable depth error rather than a panic (#2850).
 fn try_cursor_to_owned<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    try_cursor_to_owned_at_depth(cursor, 0)
+    super::eval_generic::to_owned_cursor_with(
+        cursor,
+        super::eval_generic::check_nesting_depth,
+        cursor_number_to_owned,
+    )
 }
 
-fn try_cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
-    cursor: &JsonCursor<'_, W>,
-    depth: usize,
-) -> Result<OwnedValue, EvalError> {
-    super::eval_generic::check_nesting_depth(depth)?;
-    Ok(match cursor.value() {
-        StandardJson::Null => OwnedValue::Null,
-        StandardJson::Bool(b) => OwnedValue::Bool(b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
-        StandardJson::String(s) => OwnedValue::String(
-            s.as_str()
-                .map_err(|e| EvalError::decode_failure(format!("{e}")))?
-                .into_owned(),
-        ),
-        StandardJson::Array(_) => {
-            let mut items = Vec::new();
-            let mut is_first = true;
-            let mut last_elem: Option<JsonCursor<'_, W>> = None;
-            for child in cursor.children() {
-                if !child.element_gap_ok(is_first) {
-                    return Err(child.malformed_delimiter_error());
-                }
-                items.push(try_cursor_to_owned_at_depth(&child, depth + 1)?);
-                last_elem = Some(child);
-                is_first = false;
-            }
-            container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-            OwnedValue::Array(items)
-        }
-        StandardJson::Object(fields) => {
-            let mut map = IndexMap::new();
-            let mut guard = DisplayKeyGuard::default();
-            let mut f = fields;
-            let mut is_first = true;
-            let mut last_field: Option<JsonCursor<'_, W>> = None;
-            while let Some((field, rest)) = DocumentFields::uncons(&f) {
-                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-                map.insert(
-                    key,
-                    try_cursor_to_owned_at_depth(&field.value_cursor, depth + 1)?,
-                );
-                last_field = Some(field.value_cursor);
-                f = rest;
-                is_first = false;
-            }
-            if f.ends_unpaired() {
-                return Err(f.malformed_member_error());
-            }
-            container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            OwnedValue::Object(map)
-        }
-        StandardJson::Error(msg) => return Err(EvalError::decode_failure(msg)),
-    })
+/// #2868: ordinary JSON number spellings agree with the generic conversion,
+/// but internal NaN/infinity markers and lenient numeric fallbacks do not.
+/// Keep raw-byte conversion for both lazy entry points; every other scalar
+/// shares the generic conversion's identical value/error behavior.
+fn cursor_number_to_owned<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Option<OwnedValue> {
+    match value {
+        StandardJson::Number(number) => Some(OwnedValue::from_number_bytes(number.raw_bytes())),
+        _ => None,
+    }
 }
 
 // ============================================================================
@@ -1107,7 +954,184 @@ impl<W> From<&str> for JqValue<'_, W> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::document::DocumentCursor;
     use super::*;
+
+    /// #2868: these real JSON cursors must preserve source spelling on
+    /// both walks. Include jq's accepted non-RFC spellings, overflow and
+    /// underflow, rather than only ordinary i64 inputs.
+    #[test]
+    fn cursor_materializers_preserve_number_spellings_2868() {
+        use crate::json::JsonIndex;
+        for literal in [
+            "0",
+            "-0",
+            "-0.0",
+            "1.2300",
+            "4e4",
+            "1E+009",
+            "1e999",
+            "-1e999",
+            "1e-999",
+            "9223372036854775808",
+            "18446744073709551616",
+            "2.7293109604053567083",
+            "007",
+            "007.500",
+            "007e5",
+            ".5",
+            "-.5",
+            "1.e999",
+            "-1.e5",
+        ] {
+            let index = JsonIndex::build(literal.as_bytes());
+            let cursor = index.root(literal.as_bytes());
+            assert!(!cursor.canonicalize_numbers());
+            for owned in [
+                cursor_to_owned(&cursor).unwrap(),
+                try_cursor_to_owned(&cursor).unwrap(),
+                super::super::eval_generic::to_owned_cursor(&cursor).unwrap(),
+            ] {
+                let OwnedValue::NumberLiteral(_, spelling) = owned else {
+                    panic!("{literal}: expected a source-backed number, got {owned:?}");
+                };
+                assert_eq!(&*spelling, literal);
+            }
+        }
+    }
+
+    /// #2868: compare complete results, including nested containers,
+    /// duplicate keys and errors, before replacing either traversal.
+    #[test]
+    fn cursor_materializers_agree_on_values_and_errors_2868() {
+        use crate::json::JsonIndex;
+        let values: &[&[u8]] = &[
+            b"null",
+            b"true",
+            b"false",
+            br#""escaped\n\u00e9""#,
+            br#"[1.2300,{"a":[null,true,"x"],"a":[-0,1e999]}]"#,
+            br#"{"bad\q":1,"ok":[.5,007,1.e999]}"#,
+        ];
+        for json in values {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expected = try_cursor_to_owned(&cursor).unwrap();
+            assert_eq!(cursor_to_owned(&cursor).unwrap(), expected, "{json:?}");
+            assert_eq!(
+                super::super::eval_generic::to_owned_cursor(&cursor).unwrap(),
+                expected,
+                "{json:?}"
+            );
+        }
+        let malformed: &[&[u8]] = &[
+            b"[,]",
+            b"[1,]",
+            b"[1 2]",
+            b"{,}",
+            br#"{"a":1,}"#,
+            br#"{"a" 1}"#,
+            b"{123:1}",
+            br#"{"a"}"#,
+            b"[xyz123]",
+            br#"["bad\q"]"#,
+            b"[\"\xff\"]",
+        ];
+        for json in malformed {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expected = try_cursor_to_owned(&cursor).unwrap_err();
+            assert!(expected.is_decode_failure(), "{json:?}: {expected:?}");
+            for actual in [
+                cursor_to_owned(&cursor).unwrap_err(),
+                super::super::eval_generic::to_owned_cursor(&cursor).unwrap_err(),
+            ] {
+                assert_eq!(actual.message, expected.message, "{json:?}");
+                assert_eq!(actual.is_decode_failure(), expected.is_decode_failure());
+            }
+        }
+    }
+
+    /// #2868: raw-byte conversion restores the reindex bridge's non-finite
+    /// values. Calling the generic scalar fallback here would lose them.
+    #[test]
+    fn lazy_cursor_materialization_restores_bridge_numbers_2868() {
+        use super::super::eval::JqSemantics;
+        use crate::json::JsonIndex;
+        let source = OwnedValue::Array(vec![
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+        ])
+        .to_json_for_reindex::<JqSemantics>();
+        let index = JsonIndex::build(source.as_bytes());
+        let cursor = index.root(source.as_bytes());
+        for owned in [
+            cursor_to_owned(&cursor).unwrap(),
+            try_cursor_to_owned(&cursor).unwrap(),
+        ] {
+            let OwnedValue::Array(values) = owned else {
+                panic!("expected an array")
+            };
+            assert_eq!(values.len(), 3);
+            assert!(matches!(values[0], OwnedValue::Float(f) if f.is_nan()));
+            assert!(matches!(values[1], OwnedValue::Float(f) if f == f64::INFINITY));
+            assert!(matches!(values[2], OwnedValue::Float(f) if f == f64::NEG_INFINITY));
+        }
+    }
+
+    /// #2868: a trailing dot without an exponent takes the raw-number
+    /// parser's plain Float fallback. In this range the generic document
+    /// conversion would instead wrap the float in a decimal NumberLiteral.
+    #[test]
+    fn lazy_cursor_materialization_keeps_plain_float_fallback_2868() {
+        use crate::json::JsonIndex;
+        let json = br"[100000000000000000000.]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        for owned in [
+            cursor_to_owned(&cursor).unwrap(),
+            try_cursor_to_owned(&cursor).unwrap(),
+        ] {
+            let OwnedValue::Array(values) = owned else {
+                panic!("expected an array")
+            };
+            assert_eq!(values.len(), 1);
+            assert!(matches!(values[0], OwnedValue::Float(f) if f == 1e20));
+        }
+    }
+
+    /// #2868: the depth ceiling agrees, but the three existing boundary
+    /// contracts deliberately differ: panic, catchable error, decode error.
+    #[test]
+    fn cursor_materializers_keep_depth_error_contracts_2868() {
+        use super::super::eval_generic::{to_owned_cursor, MAX_NESTING_DEPTH};
+        use crate::json::JsonIndex;
+        for depth in [
+            MAX_NESTING_DEPTH - 1,
+            MAX_NESTING_DEPTH,
+            MAX_NESTING_DEPTH + 1,
+        ] {
+            let json = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let index = JsonIndex::build(json.as_bytes());
+            let cursor = index.root(json.as_bytes());
+            if depth < MAX_NESTING_DEPTH {
+                assert_eq!(try_cursor_to_owned(&cursor).unwrap().to_json(), json);
+                assert_eq!(cursor_to_owned(&cursor).unwrap().to_json(), json);
+                assert_eq!(to_owned_cursor(&cursor).unwrap().to_json(), json);
+            } else {
+                let checked = try_cursor_to_owned(&cursor).unwrap_err();
+                let generic = to_owned_cursor(&cursor).unwrap_err();
+                assert_eq!(checked.message, generic.message);
+                assert!(!checked.is_decode_failure());
+                assert!(generic.is_decode_failure());
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cursor_to_owned(&cursor)
+                }))
+                .is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_constructors() {
@@ -1647,10 +1671,9 @@ mod tests {
         assert_eq!(into_owned_val.into_owned().unwrap().to_json(), "1E+100");
     }
 
-    /// Sibling of the number test above, for `cursor_to_owned_at_depth`'s
-    /// `StandardJson::String` arm -- the ordinary successfully-decoding
-    /// path, alongside `test_materialize_degrades_to_empty_string_on_decode_failure_1098`'s
-    /// coverage of the same arm's `Err` side.
+    /// Sibling of the number test above for successful string decoding,
+    /// alongside the decode-error test. Since #2868 both lazy materializers
+    /// use the generic scalar fallback for strings.
     #[test]
     fn test_jqvalue_cursor_string_materialize_and_into_owned() {
         use crate::json::JsonIndex;
@@ -1824,13 +1847,9 @@ mod tests {
         ));
     }
 
-    /// #2850 coverage: the `Bool`/`Float`/`RawNumber` scalar arms of both
-    /// `materialize_at_depth`/`try_materialize_at_depth`, the `Cursor` arm's
-    /// `Bool` case in `cursor_to_owned_at_depth`, and its `Null` case in
-    /// `try_cursor_to_owned_at_depth`, weren't exercised by any existing
-    /// test -- `test_materialize` above covers `Int`/`String`/`Null` (via a
-    /// direct `JqValue::Null`, never through a `Cursor`), and the two
-    /// depth-limit tests above only ever build arrays/ints.
+    /// #2850: scalar coverage through both owned and cursor entry points.
+    /// The cursor Bool/Null cases now use the shared generic scalar fallback
+    /// (#2868); a directly constructed JqValue exercises a different path.
     #[test]
     fn materialize_and_try_materialize_cover_the_remaining_scalar_arms_2850() {
         use crate::json::JsonIndex;
@@ -2319,7 +2338,7 @@ mod tests {
     /// #1194: sibling of `jq_runner.rs`'s `standard_json_to_jq_value` and its
     /// own `test_standard_json_to_jq_value_raises_on_malformed_top_level_value_1194`
     /// -- a bareword garbage token (`StandardJson::Error`, not a decode
-    /// failure) raises through `cursor_to_owned_at_depth`'s own `Error` arm
+    /// failure) raises through the cursor materializer's scalar fallback
     /// too, reached whenever `materialize`/`into_owned` walks a cursor whose
     /// value is structurally malformed (e.g. `--sort-keys`/`-C` forcing a
     /// full materialize of a query result that otherwise streams straight
