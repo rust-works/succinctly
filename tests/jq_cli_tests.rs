@@ -24889,7 +24889,7 @@ fn test_top_level_def_still_outranks_an_included_one_2865() -> Result<()> {
 ///
 /// With `inner`'s `g/0` in scope, `def g: if . == 0 then "base" else (. - 1 |
 /// g) end;` still recurses into itself and reaches `"base"`; without the
-/// `deps_excluding_self` filter it would answer `42` on the first step.
+/// `visible_defs_for` exclusion it would answer `42` on the first step.
 ///
 /// The arity half: a dependency `g/1` alongside an own `g/0` leaves both
 /// reachable from the same body (`["own0","dep1arg"]`). Both captured live
@@ -25290,12 +25290,139 @@ fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<(
     Ok(())
 }
 
+/// #2865 (PR review, round 2): a module with **no `include` at all** does not
+/// blow up as its own defs chain.
+///
+/// The referenced closure used to be widened transitively through each kept
+/// candidate's body. Every candidate is already *bound*, though, so its own
+/// references are satisfied inside it -- re-deriving names from a bound body
+/// re-adds what it has already captured, pulls in the whole preceding sibling
+/// set, and doubles the body per def. A 20-def chain (`def f0: 0; def f1: f0 +
+/// 1; ...`) reached **13 GB** of resident memory and six seconds, against
+/// milliseconds before #2865 touched this code at all -- a regression against
+/// `main`, and not the (disclosed, module-chain) shape of #2955. One pass over
+/// the body, with no widening, is both correct and linear.
+///
+/// 24 defs would have been minutes and hundreds of gigabytes on the widening
+/// version, and is instant now; asserting completion is the signal, since a
+/// wall-clock bound would flake on a loaded CI box.
+#[test]
+fn test_module_own_def_chain_does_not_blow_up_2865() -> Result<()> {
+    const DEFS: usize = 24;
+    let mut module = String::from("def f0: 0;\n");
+    for i in 1..DEFS {
+        module.push_str(&format!("def f{i}: f{} + 1;\n", i - 1));
+    }
+    let filter = format!(r#"include "chain"; f{}"#, DEFS - 1);
+    let (stdout, stderr, code) = run_jq_with_modules(&[("chain", &module)], &["-nc", &filter])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), (DEFS - 1).to_string());
+    Ok(())
+}
+
+/// #2865 (PR review, round 2): a dependency reached only from a **computed
+/// destructuring key** survives the referenced-closure filter.
+///
+/// `walk::any_subexpr` does not descend into a `Pattern` -- its own comment
+/// that a pattern holds only destructuring names has been stale since #2677
+/// gave object patterns computed keys. A call appearing only there was
+/// invisible, so its dependency was dropped and jq's answer became
+/// `undefined function: kf/0`. All three pattern-bearing constructs are
+/// covered, since they are three separate `Expr` variants.
+#[test]
+fn test_dependency_reached_only_from_a_pattern_key_survives_2865() -> Result<()> {
+    for (module, want) in [
+        // `as` pattern
+        ("include \"kfin\";\ndef h: . as {(kf): $v} | $v;\n", "1"),
+        // `reduce` pattern
+        (
+            "include \"kfin\";\ndef h: reduce (.,.) as {(kf): $v} (0; . + $v);\n",
+            "2",
+        ),
+        // `?//` alternatives
+        (
+            "include \"kfin\";\ndef h: . as [$x] ?// {(kf): $v} | ($v // $x);\n",
+            "1",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_with_modules(
+            &[("kfin", "def kf: \"a\";\n"), ("kfout", module)],
+            &["-nc", r#"include "kfout"; {"a":1} | h"#],
+        )?;
+        assert_eq!(code, 0, "{module}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{module}");
+    }
+    Ok(())
+}
+
+/// #2865 (PR review, round 2): a module that merely *declares* a data import
+/// still loads.
+///
+/// `import "f" as $d;` binds a `$`-variable to a file's parsed JSON rather
+/// than a namespace of defs, and `parse_import` drops the `$` -- so `Import`
+/// cannot tell it from a module import, and resolving one as a module fails
+/// with `module not found`. Before #2865 a module's own imports were never
+/// looked at, so declaring one was harmless; processing them transitively made
+/// it fatal. Data imports themselves remain unimplemented (#2956); this only
+/// pins that declaring one does not break the module around it.
+#[test]
+fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("data.json"), "{\"z\":9}\n")?;
+    std::fs::write(
+        temp_dir.path().join("dimp.jq"),
+        "import \"data\" as $d;\ndef h: 7;\n",
+    )?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "dimp"; h"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "7");
+
+    // A missing *include*, by contrast, is still the clear error jq reports --
+    // `module_resolves` is deliberately not applied there.
+    std::fs::write(
+        temp_dir.path().join("bad.jq"),
+        "include \"nosuchmod\";\ndef h: 7;\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "bad"; h"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: nosuchmod"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2865 (plan step 6): a chain of modules does not multiply in size.
 ///
 /// Wrapping every dependency into every exported body compounds down a chain,
 /// because each level's bodies already carry the level below: unfiltered, a
 /// 3-module x 40-def chain measured 359 MB peak RSS against jq's 2.5 MB, and
-/// a fourth level would have been tens of gigabytes. `deps_excluding_self`'s
+/// a fourth level would have been tens of gigabytes. `visible_defs_for`'s
 /// referenced-closure filter (jq's own `block_bind_referenced` rule) is what
 /// keeps it flat.
 ///
