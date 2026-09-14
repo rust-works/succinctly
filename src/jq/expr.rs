@@ -1073,8 +1073,20 @@ pub struct Import {
     /// unconditionally when resolving it to a file (#2702), so a path that
     /// already ends in `.jq` is not stripped or treated specially here.
     pub path: String,
-    /// The namespace alias
+    /// The namespace alias, without the `$` a data import spells it with --
+    /// see [`Self::data`].
     pub alias: String,
+    /// Whether this was written `import "f" as $d;` (a **data** import,
+    /// binding the file's parsed JSON to a `$`-variable) rather than
+    /// `import "m" as m;` (a **module** import, binding a namespace of defs).
+    ///
+    /// The two are different directives that happen to share a keyword, and
+    /// `alias` cannot tell them apart because the `$` is not part of the
+    /// identifier. Recorded here (#2865) so a module loader can decline to
+    /// resolve a data import as a module -- resolving one that way reports
+    /// `module not found`, where jq reads `<path>.json`. Data imports are
+    /// otherwise still unimplemented; see #2956.
+    pub data: bool,
     /// Optional metadata overrides
     pub metadata: Option<BTreeMap<String, MetaValue>>,
 }

@@ -6407,14 +6407,17 @@ blocks, so it does not. Measured at #2865's own head (Apple M-series, release):
 |----------------------------------|---------------------|-------------|
 | 6 levels x 40 defs, 1 call each  | 10 MB               | 2.5 MB      |
 | 8 levels x 6 defs, 3 calls each  | 98 MB               | 2.6 MB      |
-| 14 levels x 4 defs, 2 calls each | 361 MB              | 2.6 MB      |
+| 14 levels x 4 defs, 2 calls each | 382 MB              | 2.6 MB      |
 
 The referenced-closure filter (jq's own `block_bind_referenced` rule, in
 `visible_defs_for`) flattens the one-call-each shape completely — without it the
 6 x 40 row was 359 MB rather than 10 MB — but it cannot flatten a genuinely wide closure,
 because that closure is itself exponential. Every row above produces the **correct**
-answer; this is a scalability limit of AST inlining, not a wrong result, and not a
-regression — none of these programs compiled at all before #2865. Tracked as
+answer; this is a scalability limit of AST inlining, not a wrong result. It needs a
+*chain of modules* to appear: a module's own defs are spliced into each other in their
+`local` form (body plus dependencies, no siblings), which stays linear however many
+siblings each one calls, so a directive-free module is bound exactly as cheaply as
+before #2865. Tracked as
 [#2955](https://github.com/rust-works/succinctly/issues/2955), whose most promising fix is
 splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
 introduced) instead of by clone.
