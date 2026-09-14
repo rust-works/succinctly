@@ -35185,13 +35185,12 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
     // [0:((1|debug("t1")),(2|debug("t2")))]` prints `t1` and then `terr` on
     // jq 1.7.1; `t2` was printed here before this.
     //
-    // Stopping from *above* is a different, still-open gap and is not what
-    // this buys: `[first(path((.|debug("E"))[((0|debug("s0")),(1|debug(
-    // "s1"))):(2|debug("t"))]))]` still evaluates both `s`s here where jq
-    // evaluates only `s0`. This function returns a materialized
-    // `PathResolveResult`, so a consumer's own demand has nothing to travel
-    // down -- closing that needs a sink-shaped `resolve_slice_expr`, which
-    // is #2267's own remaining step 3, not this one.
+    // Stopping from *above* is the same rule in the other direction, and
+    // this function is sink-shaped now, so it buys that too:
+    // `[first(path((.|debug("E"))[((0|debug("s0")),(1|debug("s1"))):(2|
+    // debug("t"))]))]` evaluated both `s`s here where jq evaluates only
+    // `s0`, because a materialized `PathResolveResult` gave the consumer's
+    // demand nothing to travel down. It travels down `sink`.
     //
     // Only the *ordering* moves. Every one of these shapes produced the
     // same path outputs, in the same order, before and after -- the whole
