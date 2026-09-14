@@ -305,8 +305,14 @@ struct ModuleDef {
     /// what it has satisfied and pulls in the whole preceding sibling set.
     source: Expr,
     /// The body wrapped in the module's own **dependencies** only. What gets
-    /// spliced when this def is needed as a sibling.
+    /// spliced when this def is needed as a sibling, in the ordinary case
+    /// where the chain it lands in can supply its own sibling references.
     local: Expr,
+    /// The fully bound body -- dependencies *and* earlier siblings -- i.e.
+    /// what this def exports. Also what a sibling splice falls back to when
+    /// the receiving def excludes a name that sibling references; see
+    /// [`visible_defs_for`]'s "when a sibling has to be sealed anyway".
+    sealed: Expr,
 }
 
 /// The defs one of a module's own defs can actually reach, in [`wrap_defs`]
@@ -344,6 +350,27 @@ struct ModuleDef {
 /// jq agrees an unreferenced dependency whose own body calls an undefined
 /// function is an error in neither tool.
 ///
+/// ### When a sibling has to be sealed anyway
+///
+/// The exclusions are decided on the *including* def's behalf, but a kept
+/// sibling is spliced into that same scope and carries its own references
+/// outward into it -- so an excluded name is excluded for the sibling too,
+/// and resolves to whatever took its place. Both shapes are real:
+///
+/// - `def f: 1; def k: f; def h(f): k;` -- `h`'s parameter `f` displaces the
+///   sibling `f`, and `k`'s own `f` then resolves to the parameter.
+///   `include "m"; h(99)` answers `1` in jq; splicing `k` in `local` form
+///   answered `99`.
+/// - `def h: "first"; def g: h; def h: "second-" + g;` -- the second `h`
+///   excludes the first, and `g`'s `h` then resolves to the second,
+///   recursively. jq answers `"second-first"`; `local` form recursed until it
+///   hit the depth cap.
+///
+/// A sibling naming an excluded name is therefore spliced in its **sealed**
+/// form, where that reference is already bound and cannot be recaptured.
+/// Nothing is excluded for almost every def, so the sealed fallback -- and
+/// the nesting it reintroduces -- is confined to the two shapes above.
+///
 /// ### Why the closure widens over siblings but not dependencies
 ///
 /// A dependency arrives **sealed** from its own module, so it needs nothing
@@ -365,6 +392,16 @@ fn visible_defs_for(
         (cand_name == name && cand_params == arity)
             || (cand_params == 0 && param_names.contains(cand_name))
     };
+
+    // The sibling names this def excludes and that some sibling therefore
+    // cannot be allowed to reach past. Empty for almost every def -- it takes
+    // either an in-module redefinition of the same (name, arity) or a
+    // parameter sharing a sibling's name.
+    let shadowed: BTreeSet<&str> = siblings
+        .iter()
+        .filter(|sibling| excluded(&sibling.name, sibling.params.len()))
+        .map(|sibling| sibling.name.as_str())
+        .collect();
 
     let mut wanted = called_func_names(body);
     let mut keep = vec![false; siblings.len()];
@@ -396,11 +433,24 @@ fn visible_defs_for(
         .zip(keep)
         .filter(|(_, keep)| *keep)
         .map(|(sibling, _)| {
-            (
-                sibling.name.clone(),
-                sibling.params.clone(),
-                sibling.local.clone(),
-            )
+            // A `local` sibling still reaches outward for its own sibling
+            // references, and they land in *this* def's scope -- where an
+            // excluded name resolves to something else entirely (this def
+            // itself, or one of its parameters). Splice the sealed form for
+            // any sibling that names one, so its references are already bound
+            // and cannot be recaptured. `shadowed` is empty for almost every
+            // def, so this costs nothing in the ordinary case; it is checked
+            // against the unbound `source`, the real reference graph.
+            let body = if !shadowed.is_empty()
+                && called_func_names(&sibling.source)
+                    .iter()
+                    .any(|called| shadowed.contains(called.as_str()))
+            {
+                sibling.sealed.clone()
+            } else {
+                sibling.local.clone()
+            };
+            (sibling.name.clone(), sibling.params.clone(), body)
         })
         .chain(
             deps.iter()
@@ -586,41 +636,38 @@ impl ModuleLoader {
         self.loading.pop();
         let deps = deps?;
 
-        // Two passes, for the reason [`ModuleDef`] gives. First each def's
-        // `local` form -- its body wrapped in the module's dependencies alone,
-        // which is what a *sibling* splice needs, since the chain it lands in
-        // already carries the module's earlier siblings.
-        let locals: Vec<ModuleDef> = own
-            .into_iter()
-            .map(|(name, params, body)| {
-                let dep_wrap = visible_defs_for(&[], &deps, &name, &params, &body);
-                let local = wrap_defs(body.clone(), dep_wrap);
-                ModuleDef {
-                    name,
-                    params,
-                    source: body,
-                    local,
-                }
-            })
-            .collect();
+        // Both bound forms per def, for the reason [`ModuleDef`] gives. The
+        // `local` form is the body wrapped in the module's dependencies alone,
+        // which is what a *sibling* splice normally needs, since the chain it
+        // lands in already carries the module's earlier siblings...
+        // ...then, in the same declaration-order walk, the sealed form that
+        // leaves the module: each def wrapped in the siblings declared
+        // *before* it plus the dependencies, so it resolves identically
+        // wherever it is later spliced. Def `i` sees exactly `defs[..i]` --
+        // the same lexical rule a filter's own defs follow -- and each entry
+        // there already carries its own `sealed` form, which
+        // `visible_defs_for` falls back to for a sibling that names something
+        // this def excludes.
+        let mut defs: Vec<ModuleDef> = Vec::with_capacity(own.len());
+        for (name, params, body) in own {
+            let dep_wrap = visible_defs_for(&[], &deps, &name, &params, &body);
+            let local = wrap_defs(body.clone(), dep_wrap);
 
-        // Then the sealed form that leaves the module: each def wrapped in the
-        // siblings declared *before* it plus the dependencies, so it resolves
-        // identically wherever it is later spliced. Walking in declaration
-        // order means def `i` sees exactly `locals[..i]` -- the same lexical
-        // rule a filter's own defs follow.
-        Ok(locals
-            .iter()
-            .enumerate()
-            .map(|(i, def)| {
-                let visible =
-                    visible_defs_for(&locals[..i], &deps, &def.name, &def.params, &def.source);
-                (
-                    def.name.clone(),
-                    def.params.clone(),
-                    wrap_defs(def.source.clone(), visible),
-                )
-            })
+            let visible = visible_defs_for(&defs, &deps, &name, &params, &body);
+            let sealed = wrap_defs(body.clone(), visible);
+
+            defs.push(ModuleDef {
+                name,
+                params,
+                source: body,
+                local,
+                sealed,
+            });
+        }
+
+        Ok(defs
+            .into_iter()
+            .map(|def| (def.name, def.params, def.sealed))
             .collect())
     }
 
