@@ -25304,15 +25304,15 @@ fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<(
 /// the body, with no widening, is both correct and linear.
 ///
 /// A second round of review found the single-callee chain above too weak a
-/// lock: the *sealed* form of each def was being spliced where a sibling was
-/// needed, nesting a full copy of every earlier sibling inside every later
-/// one. That only shows when a def calls **more than one** earlier sibling,
-/// so the second shape below is a Fibonacci chain -- merely `include`d, never
-/// called, since the blow-up happens at load time. It reached 190 MB at 18
-/// defs, 4.1 GB at 24 and 32 GB at 28, against a flat 14.5 MB on `main`.
-/// Splicing the `local` form (body plus dependencies, no siblings) keeps it
-/// linear, because the chain a sibling lands in already supplies the earlier
-/// siblings.
+/// lock. Successive attempts at binding a module's own defs into each other
+/// nested a copy of every earlier sibling inside every later one, which only
+/// shows when a def calls **more than one** earlier sibling -- so the second
+/// shape below is a Fibonacci chain, merely `include`d and never called,
+/// since the blow-up happens at load time. It reached 190 MB at 18 defs, 4.1
+/// GB at 24 and 32 GB at 28, against a flat 14.5 MB on `main`. A module's own
+/// defs are now not wrapped into each other at all (see `visible_deps_for`):
+/// they are emitted as siblings in the top-level chain, where jq's lexical
+/// rule already relates them.
 ///
 /// Asserting completion rather than a wall-clock bound, which would flake on
 /// a loaded CI box.
@@ -25344,24 +25344,75 @@ fn test_module_own_def_chain_does_not_blow_up_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2865 (PR review, round 3): a name this def excludes stays excluded for
-/// the siblings spliced alongside it.
+/// #2865 (PR review, round 5): the two capture shapes that need something
+/// other than a plain zero-exit comparison -- a builtin resolved against
+/// stdin, and a compile error that must stay one.
 ///
-/// The exclusions are decided on the *including* def's behalf, but a sibling
-/// spliced in `local` form carries its own references outward into that same
-/// scope -- where the excluded name resolves to whatever displaced it. Both
-/// shapes are regressions against `main`, which splices flat:
+/// `def a: length; def h(length): a;` -- jq answers `2` for `h(9)` on
+/// `[1,2]`, because `a`'s `length` is the builtin it was written against.
+/// Nesting `a` inside `h`'s body put it under `h`'s parameter scope and
+/// answered `9`.
 ///
-/// - a parameter displacing a sibling that another sibling calls
-///   (`def f: 1; def k: f; def h(f): k;` -- jq says `h(99)` is `1`, the
-///   `local` splice said `99`), in both parameter spellings;
-/// - an in-module redefinition (`def h: "first"; def g: h; def h: "second-" +
-///   g;` -- jq says `"second-first"`, the `local` splice recursed into the
-///   second `h` until it hit the depth cap).
+/// `def a: b; def h(b): a;` -- `b` is defined nowhere, so jq reports
+/// `b/0 is not defined` and exits 3. Nesting let `h`'s parameter satisfy it,
+/// printing `99` and exiting 0: a compile error silently swallowed, which is
+/// the worse half of the same bug.
+#[test]
+fn test_module_def_scope_is_not_captured_by_its_caller_2865() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("cap.jq"),
+        "def a: length;\ndef h(length): a;\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-c", r#"include "cap"; h(9)"#]);
+            command
+        },
+        Some(b"[1,2]"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+
+    let (_, stderr, code) = run_jq_with_modules(
+        &[("m", "def a: b;\ndef h(b): a;\n")],
+        &["-nc", r#"include "m"; h(99)"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(stderr.contains("b/0 is not defined"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2865 (PR review, rounds 3, 4 and 5): a module's own def keeps the
+/// bindings it was written under, whatever the def that calls it declares.
 ///
-/// Both are fixed by splicing the sibling's *sealed* form when it names
-/// something excluded. The equivalent top-level filters have always answered
-/// correctly, and are included as controls.
+/// While a module's siblings were being nested inside each other's bodies,
+/// anything free in the nested copy was captured by the scopes it landed in.
+/// Every shape below was a regression against `main`, which emits a module's
+/// defs flat:
+///
+/// - a parameter capturing a sibling's call to another sibling
+///   (`def f: 1; def k: f; def h(f): k;` -- jq says `h(99)` is `1`, nesting
+///   said `99`), in both parameter spellings;
+/// - an in-module redefinition capturing an earlier sibling's call
+///   (`def h: "first"; def g: h; def h: "second-" + g;` -- jq says
+///   `"second-first"`, nesting recursed into the second `h` until it hit the
+///   depth cap);
+/// - a later-declared sibling capturing an earlier one's call to a
+///   **builtin**, which no amount of pre-binding the nested copy could have
+///   repaired, since a builtin call is free in every form of it.
+///
+/// `test_module_def_scope_is_not_captured_by_its_caller_2865` covers the
+/// parameter-versus-builtin and swallowed-compile-error shapes, which need a
+/// stdin input and a non-zero exit respectively. The equivalent top-level
+/// filters have always answered correctly, and are included as controls.
 #[test]
 fn test_excluded_sibling_name_stays_excluded_for_other_siblings_2865() -> Result<()> {
     for (module, filter, want) in [
@@ -25379,6 +25430,14 @@ fn test_excluded_sibling_name_stays_excluded_for_other_siblings_2865() -> Result
             "def h: \"first\";\ndef g: h;\ndef h: \"second-\" + g;\n",
             r#"include "m"; h"#,
             r#""second-first""#,
+        ),
+        // A later-declared sibling must not capture an earlier one's call to
+        // a builtin: `a`'s `type` is the builtin, so on `null` input it is
+        // `"null"`, never the sibling's `"q"`.
+        (
+            "def a: type;\ndef type: \"q\";\ndef h: a;\n",
+            r#"include "m"; h"#,
+            r#""null""#,
         ),
     ] {
         let (stdout, stderr, code) = run_jq_with_modules(&[("m", module)], &["-nc", filter])?;
@@ -25601,7 +25660,7 @@ fn test_transitive_include_chain_does_not_blow_up_2865() -> Result<()> {
     // The shape above has no *intra*-module calls, which hid a second
     // doubling found in review: the innermost dependency block was filtered by
     // the closure widened through kept siblings, so every dependency a sibling
-    // already carried in its own `local` wrap was materialized a second time
+    // already carried in its own dependency wrap was materialized a second time
     // -- 111 MB at 13 levels of the two-def module below, growing to tens of
     // gigabytes, against jq's 2.5 MB. Filtering dependencies by the body's
     // *direct* references instead keeps it flat (9 MB at 13, 10 MB at 21).
