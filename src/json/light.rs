@@ -2062,6 +2062,60 @@ pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
     Some(i)
 }
 
+/// Where the JSON string literal starting at `start` ends.
+///
+/// `start` must index the opening `"`; the returned index is one past the
+/// closing quote. `None` means the string is unterminated **or contains a
+/// raw, unescaped control character** (`U+0000`-`U+001F`).
+///
+/// Rejecting the control character here is what makes the CLI's document
+/// splitter match real jq, which refuses `["a<TAB>b"]` on every input path
+/// with `Invalid string: control characters from U+0000 through U+001F must
+/// be escaped` (jq 1.7.1). `0x7F` (DEL) is deliberately *accepted*: jq's own
+/// check compares a signed char, so only `0x00`-`0x1F` fail it -- a full
+/// `0x00`-`0x7F` sweep against jq 1.7.1 confirms exactly that split, with no
+/// per-byte exceptions to model (#2878).
+///
+/// Companion to [`number_literal_end`], and used by the same **top-level
+/// document splitting** caller (`find_json_values` /
+/// `scan_one_json_token` / `find_matching_close`, in
+/// `src/bin/succinctly/jq_runner.rs`), for the same reason: one validated
+/// implementation instead of independently-maintained copies. It lives in
+/// the library rather than beside its caller because `crate::util` is
+/// `pub(crate)`, so the SIMD scanner below is not reachable from the binary.
+///
+/// This does **not** make the splitter a validator. "Ends" stays structural
+/// everywhere else -- `{"a":1 xyz}` still scans as one token and `{invalid}`
+/// is still accepted document-wide (a deliberate, cost-driven divergence
+/// recorded in `docs/compliance/jq/limitations.md`). The control-character
+/// rule is affordable precisely because it rides a scan that already
+/// inspects every byte of every string, so it costs no extra pass.
+///
+/// The scan delegates to [`crate::util::simd::escape::find_json_escape`],
+/// whose predicate (`"`, `\`, or `< 0x20`) is already exactly this
+/// function's three-way question, at 16-32 bytes per iteration instead of
+/// the byte-at-a-time loop this replaced.
+pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    debug_assert_eq!(bytes.get(start), Some(&b'"'));
+    let mut i = start + 1;
+    loop {
+        // `find_json_escape` returns `bytes.len()` when it finds nothing and
+        // when `i` is already past the end, so the `\` -at-EOF case below
+        // lands here as "unterminated" without a separate bounds check.
+        let hit = crate::util::simd::escape::find_json_escape(bytes, i);
+        match bytes.get(hit) {
+            Some(b'"') => return Some(hit + 1),
+            // Skip the escaped byte. A `\` as the final byte pushes `i` past
+            // the end, which the fast-exit above turns into `None`.
+            Some(b'\\') => i = hit + 2,
+            // A raw control character: the whole string is rejected.
+            Some(_) => return None,
+            // Ran off the end without a closing quote.
+            None => return None,
+        }
+    }
+}
+
 /// Find the end of a number-*shaped* span starting at `start` in `text`
 /// (a byte that begins a candidate number: `-`, an ASCII digit, or a
 /// leading `.`), for a value reached while materializing an
@@ -6241,6 +6295,89 @@ mod tests {
         // A well-formed exponent still parses, so this isn't blanket
         // exponent-hostility.
         assert_eq!(number_literal_end(b"5e1", 0), Some(3));
+    }
+
+    /// `string_literal_end` rejects every raw `U+0000`-`U+001F` byte and
+    /// accepts `0x7F`, which is the exact split real jq draws (its check is
+    /// on a signed char, so DEL passes). Sweeping the whole range rather
+    /// than spot-checking TAB is deliberate: a hand-picked matrix would not
+    /// catch an off-by-one at either boundary, and `0x20`/`0x7F` are the two
+    /// bytes that prove the rule is "< 0x20" and not "non-printable" (#2878).
+    #[test]
+    fn test_string_literal_end_rejects_only_raw_c0_controls_2878() {
+        for byte in 0u8..=0x7F {
+            let mut doc = Vec::from(*b"\"a");
+            doc.push(byte);
+            doc.extend_from_slice(b"b\"");
+            let got = string_literal_end(&doc, 0);
+            if byte < 0x20 {
+                assert_eq!(got, None, "raw control byte 0x{byte:02X} must be rejected");
+            } else if byte == b'"' || byte == b'\\' {
+                // Not a control character: these two end or escape the
+                // string rather than sitting in it, so they are not part of
+                // this rule and are covered by the tests below.
+                continue;
+            } else {
+                assert_eq!(
+                    got,
+                    Some(doc.len()),
+                    "byte 0x{byte:02X} is not a C0 control and must be accepted"
+                );
+            }
+        }
+    }
+
+    /// The escaped spelling of the same character stays valid -- the rule is
+    /// about *raw* bytes, so `\\t` (two bytes: backslash, `t`) must still
+    /// scan, or the fix would break every well-formed document (#2878).
+    #[test]
+    fn test_string_literal_end_accepts_escaped_control_characters_2878() {
+        // Each of these is one complete string literal, so the answer is
+        // always the whole slice -- spelled `.len()` rather than a counted
+        // constant so the assertion cannot drift from the literal above it.
+        for doc in [
+            &br#""a\tb""#[..],
+            &br#""a\u0009b""#[..],
+            // An escaped quote does not end the string.
+            &br#""a\"b""#[..],
+        ] {
+            assert_eq!(
+                string_literal_end(doc, 0),
+                Some(doc.len()),
+                "{:?} is one whole string literal",
+                core::str::from_utf8(doc).unwrap()
+            );
+        }
+    }
+
+    /// Unterminated strings still return `None` -- the pre-existing contract
+    /// this function inherited from the scalar loop it replaced. The final
+    /// case pushes the escape-skip past the end of the buffer, which the
+    /// SIMD scanner's own past-the-end fast exit has to turn into `None`
+    /// rather than panicking on an out-of-bounds index (#2878).
+    #[test]
+    fn test_string_literal_end_rejects_unterminated_2878() {
+        assert_eq!(string_literal_end(b"\"abc", 0), None);
+        assert_eq!(string_literal_end(b"\"", 0), None);
+        assert_eq!(string_literal_end(br#""abc\"#, 0), None);
+    }
+
+    /// The scan starts at `start`, not at zero, and a control character
+    /// *before* the string it is asked about is none of its business --
+    /// pinning that `find_json_escape`'s `start` argument is threaded
+    /// through rather than dropped (#2878).
+    #[test]
+    fn test_string_literal_end_honours_its_start_offset_2878() {
+        // The first string holds a raw TAB, so scanning *it* must fail --
+        // and scanning from the *second* string must not notice it at all.
+        // `start` always indexes an opening quote, never the `[` before it.
+        let doc = b"[\"a\tb\", \"ok\"]";
+        assert_eq!(string_literal_end(doc, 1), None);
+        let second = doc
+            .windows(4)
+            .position(|w| w == b"\"ok\"")
+            .expect("second literal present");
+        assert_eq!(string_literal_end(doc, second), Some(second + 4));
     }
 
     /// Companion to the test above: `nested_number_span` -- unlike
