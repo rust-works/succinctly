@@ -1686,21 +1686,26 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
 ///   RFC-8259 "null" substitution, wrong for this purely-internal round
 ///   trip), matching `eval_owned_input`'s identical reindex bridge for
 ///   `reduce`/`foreach` (#561, #472).
-/// - Only the *fallback* arm — a plain, already-literal-less `Float` — is
-///   `S`-gated, and `YqSemantics` there is actively wrong for this call
-///   site specifically: `parse_input`'s `--input-format json` path already
-///   collapses every number straight to a plain `Float`/`Int` via
-///   `to_owned_canonicalizing_numbers` (#978, matching real yq's "a
-///   JSON-sourced number never keeps its own spelling" convention) *before*
-///   the value ever reaches here — forcing `YqSemantics`'s decimal point back onto
-///   that already-canonicalized value reintroduced exactly the bug #978
-///   fixed (`--slurp --input-format json '.'` on `{"a":1e2}` regressed from
-///   `[{"a":100}]` to `[{"a":100.0}]`, caught by CI). `JqSemantics`'s bare
-///   fallback (no forced point) is correct for both the JSON-canonicalized
-///   case and the untouched-overflow-scalar case (the latter is already
-///   lossy through this whole-document round trip regardless of the point —
-///   confirmed live, real yq keeps an untouched i64-overflow scalar
-///   byte-for-byte via `-i`, e.g. `99999999999999999999` verbatim, which
+/// - The *fallback* arm -- a plain, already-literal-less `Float` -- used to
+///   be `S`-gated, and `YqSemantics` there was actively wrong for this call
+///   site: `parse_input`'s `--input-format json` path collapses every
+///   number to a plain `Int`/`Float` via `to_owned_canonicalizing_numbers`
+///   (#978, matching real yq's "a JSON-sourced number never keeps its own
+///   spelling" convention) *before* the value reaches here, and forcing
+///   yq's decimal point back onto it reintroduced the bug #978 fixed
+///   (`--slurp --input-format json '.'` on `{"a":1e2}` regressed from
+///   `[{"a":100}]` to `[{"a":100.0}]`, caught by CI). Since #2902 the
+///   bridge writes a bare `Float` as a mode-independent token that
+///   reparses to the same bare `Float`, so `S` no longer changes the
+///   round trip at all; `JqSemantics` stays only because nothing here
+///   evaluates under it. That same change removed the accident this route
+///   used to rely on -- jq mode spelled a whole `Float(100.0)` as `100`,
+///   so it came back an *integer* literal and printed `a: 100` like real
+///   yq -- which is why `from_number_literal_plain` (the #978 canonicalizer)
+///   now types a whole-valued JSON float as `Int` itself, as yq's own
+///   decoder does. An untouched i64-overflow scalar is already lossy
+///   through this whole-document round trip regardless (confirmed live:
+///   real yq keeps `99999999999999999999` byte-for-byte via `-i`, which
 ///   this reindex-through-`f64` architecture cannot match either way).
 fn evaluate_input(
     input: &OwnedValue,

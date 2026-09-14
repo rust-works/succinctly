@@ -15397,17 +15397,14 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
-        // Required for match exhaustiveness over the `Float` variant, but
-        // not reachable through any real filter (#1064, verified via
-        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
-        // `@props` only ever sees a `Float` here via `eval_format`'s
-        // `to_owned_lossy(&value)`, which always round-trips a *finite* computed
-        // number through `from_number_bytes` -- and that always
-        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
-        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
-        // (guarded by the arm above, not this one) skips that
-        // reconstruction and arrives here as a bare `Float`.
-        OwnedValue::Float(f) => format!("{f}"),
+        // A computed float, spelled by yq's own computed-float rule
+        // (shortest form, scientific past yq's threshold): `[1e-5/2] | .[0]
+        // | @props` is `5e-06` in real yq. Reachable since #2902 -- the
+        // reindex bridge now hands a computed float back as a bare `Float`
+        // where it used to bake one into a `NumberLiteral` (which is why an
+        // earlier version of this arm documented itself as unreachable and
+        // spelled the value with plain `Display`, #1064).
+        OwnedValue::Float(f) => crate::yaml::format_float_yq_yaml(*f),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
@@ -15446,17 +15443,11 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }
-        // Required for match exhaustiveness over the `Float` variant, but
-        // not reachable through any real filter (#1064, verified via
-        // `cargo llvm-cov` and a direct entry-point probe, not assumed):
-        // `@yaml` only ever sees a `Float` here via `eval_format`'s
-        // `to_owned_lossy(&value)`, which always round-trips a *finite* computed
-        // number through `from_number_bytes` -- and that always
-        // reconstructs a `NumberLiteral`, never a bare `Float`, for any
-        // valid RFC-8259 number text. Only a NaN/Infinity sentinel
-        // (guarded by the arm above, not this one) skips that
-        // reconstruction and arrives here as a bare `Float`.
-        OwnedValue::Float(f) => format!("{f}"),
+        // A computed float, spelled by yq's own computed-float rule
+        // (shortest form, scientific past yq's threshold): `[1e17*1] | .[0]
+        // | @yaml` is `1e+17` in real yq. Reachable since #2902 -- see the
+        // identical arm in `props_value_to_string` above.
+        OwnedValue::Float(f) => crate::yaml::format_float_yq_yaml(*f),
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() || f.is_infinite() => {
             nonfinite_display_string::<YqSemantics>(*f).to_string()
         }

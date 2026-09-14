@@ -32848,6 +32848,13 @@ fn test_computed_float_through_container_keeps_computed_spelling_2902() -> Resul
         ("[2*1e17] | .[0] | tojson", r#""2e+17""#),
         ("[1e-5/2] | .[0] | tojson", r#""5e-06""#),
         ("[1e10] | map(. * 2 | tostring)", r#"["20000000000"]"#),
+        // The path-context route (`path(.)` needs it) hands the bridge's
+        // document to the generic materializer, which must keep the token
+        // bare too (found in review).
+        (
+            "reduce 1 as $x ([2*1e16]; .[0] | [tostring, path(.)])",
+            r#"["2e+16",[]]"#,
+        ),
         ("[0.5+0.5] | .[0] | tostring", r#""1""#),
         ("[1.0] | .[0] | tostring", r#""1.0""#),
         ("[1e2] | .[0] | tostring", r#""1E+2""#),
