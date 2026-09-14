@@ -2495,14 +2495,9 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
                 // field silently while `length` went on counting it. That is
                 // #1194, distinct from #1192's decode failures, and it raises
                 // now rather than degrading.
-                let key = match field.key() {
-                    StandardJson::String(s) => match s.as_str() {
-                        Ok(cow) => cow.to_string(),
-                        Err(e) => {
-                            return Err(EvalError::decode_failure(format!("{e} in object key")))
-                        }
-                    },
-                    _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
+                let key = match field.key().decoded_key_str_checked()? {
+                    Some(key) => key.into_owned(),
+                    None => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
                 };
                 let value = owned_from_standard_json_at_depth(&field.value(), depth + 1)?;
                 map.insert(key, value);
@@ -32621,10 +32616,8 @@ mod tests {
         let cursor = index.root(json);
         let value = cursor.value();
         let err = owned_from_standard_json(&value).unwrap_err();
-        assert!(
-            err.message.contains("invalid UTF-8") && err.message.contains("object key"),
-            "{err:?}"
-        );
+        assert_eq!(err.message, "invalid UTF-8 in string in object key");
+        assert!(err.is_decode_failure(), "{err:?}");
     }
 
     /// #1194: a key that isn't `StandardJson::String` at all (structurally

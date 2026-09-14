@@ -1059,6 +1059,15 @@ pub trait DocumentValue: Sized + Clone {
     }
     // omni-dev: coverage end
 
+    /// Decode a key for a strict consumer, retaining the object-key context
+    /// on a decode failure. Unlike the display-key helpers, this never uses
+    /// a fallback spelling for undecodable bytes. `Ok(None)` still leaves
+    /// a structurally malformed key's source diagnostic to the caller.
+    fn decoded_key_str_checked(&self) -> Result<Option<Cow<'_, str>>, EvalError> {
+        self.decoded_key_str()
+            .map_err(|reason| EvalError::decode_failure(alloc::format!("{reason} in object key")))
+    }
+
     /// This value's raw source bytes when it is a string key whose span
     /// needs no decoding -- byte-identical to what
     /// [`key_string`](Self::key_string) would return.

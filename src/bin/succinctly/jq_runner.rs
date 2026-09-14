@@ -4952,14 +4952,9 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
                 // structurally malformed key, not a decode failure. This used
                 // to `continue`, dropping the field and everything that
                 // depended on it while `length` went on counting it (#1194).
-                let key = match f.key() {
-                    StandardJson::String(s) => match s.as_str() {
-                        Ok(cow) => cow.to_string(),
-                        Err(e) => {
-                            return Err(EvalError::decode_failure(format!("{e} in object key")))
-                        }
-                    },
-                    _ => return Err(EvalError::malformed_json_text(parent_cursor.text())),
+                let key = match f.key().decoded_key_str_checked()? {
+                    Some(key) => key.into_owned(),
+                    None => return Err(EvalError::malformed_json_text(parent_cursor.text())),
                 };
                 // #2211 code review: same missing #1677 check as the array
                 // arm above -- neither the key's own preceding `,` nor the
@@ -7017,10 +7012,8 @@ mod tests {
         let cursor = index.root(json);
         let value = cursor.value();
         let err = standard_json_to_jq_value(value, &cursor).unwrap_err();
-        assert!(
-            err.message.contains("invalid UTF-8") && err.message.contains("object key"),
-            "{err:?}"
-        );
+        assert_eq!(err.message, "invalid UTF-8 in string in object key");
+        assert!(err.is_decode_failure(), "{err:?}");
     }
 
     /// #1192: the `Ok` side of `standard_json_to_jq_value`'s string arm and
@@ -7035,7 +7028,7 @@ mod tests {
         let jq_value = standard_json_to_jq_value(value, &cursor).unwrap();
         assert!(matches!(jq_value, JqValue::String(s) if s == "hello"));
 
-        let json: &[u8] = b"{\"a\": 1, \"b\": 2}";
+        let json: &[u8] = br#"{"a": 1, "b\u0063": 2}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
@@ -7043,7 +7036,7 @@ mod tests {
         let JqValue::Object(map) = jq_value else {
             panic!("expected an object");
         };
-        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["a", "bc"]);
     }
 
     /// #1194: a key that isn't `StandardJson::String` at all (structurally
