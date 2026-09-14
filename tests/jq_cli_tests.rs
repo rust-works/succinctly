@@ -54344,3 +54344,160 @@ fn test_bare_recurse_untracked_seed_and_catch_2761() -> Result<()> {
     assert_eq!(alias, recurse);
     Ok(())
 }
+
+// ---- #2878: a raw control character is not valid JSON on any input path ----
+
+/// Writes `["a<byte>b"]` to a temp file and returns it.
+///
+/// A file, not stdin, because the primary document path is the one under
+/// test and `--slurpfile` can only take a path anyway -- so every arm of the
+/// matrix below can share one fixture.
+fn ctl_char_doc(byte: u8) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(br#"["a"#)?;
+    file.write_all(&[byte])?;
+    file.write_all(br#"b"]"#)?;
+    file.flush()?;
+    Ok(file)
+}
+
+/// Real jq rejects a raw, unescaped `U+0000`-`U+001F` inside a string on
+/// every input path; `succinctly` used to accept it on the primary document
+/// path, `-s`, and `--slurpfile` (#2878).
+///
+/// The sweep runs the whole `0x00`-`0x1F` range plus `0x7F`, rather than
+/// spot-checking TAB, because `0x7F` is the byte that proves which rule is
+/// implemented: jq's own check compares a *signed* char, so DEL is accepted
+/// and "reject anything non-printable" would be the wrong generalisation. A
+/// hand-picked matrix of a few control bytes cannot tell those two apart.
+///
+/// Verdicts captured live from `/usr/bin/jq` 1.7.1: exit 5 for `0x00`-`0x1F`,
+/// exit 0 for `0x7F`.
+#[test]
+fn test_raw_control_character_rejected_on_every_input_path_2878() -> Result<()> {
+    for byte in (0x00u8..=0x1F).chain(core::iter::once(0x7F)) {
+        let file = ctl_char_doc(byte)?;
+        let path = file.path().to_str().expect("temp path is utf-8");
+        let jq_rejects = byte < 0x20;
+
+        for args in [
+            vec![".", path],
+            vec!["-s", ".", path],
+            vec!["-n", "--slurpfile", "x", path, "$x"],
+        ] {
+            let (_stdout, _stderr, code) = run_jq_full(&args, None)?;
+            if jq_rejects {
+                assert_ne!(
+                    code, 0,
+                    "raw control byte 0x{byte:02X} must be rejected by {args:?}"
+                );
+            } else {
+                assert_eq!(
+                    code, 0,
+                    "byte 0x{byte:02X} is not a C0 control and must be accepted by {args:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The rule reaches a control character in an object *key* and one nested
+/// inside a container, not just a top-level string value.
+///
+/// Both arrive through `find_matching_close`'s recursive string skip rather
+/// than the top-level `scan_one_json_token` arm, so they are a genuinely
+/// different call site -- and a key is a different site again from a value
+/// within that (#2878).
+#[test]
+fn test_raw_control_character_rejected_in_keys_and_nested_values_2878() -> Result<()> {
+    for body in [
+        &b"{\"a\x09b\": 1}"[..],
+        &b"{\"x\": [1, {\"y\": \"a\x09b\"}]}"[..],
+        // Two top-level values: the malformed one is the second, so the
+        // per-value loop has to keep checking after a clean first value.
+        &b"{\"ok\":1}\n[\"a\x09b\"]\n"[..],
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(body)?;
+        file.flush()?;
+        let path = file.path().to_str().expect("temp path is utf-8");
+        let (_stdout, _stderr, code) = run_jq_full(&[".", path], None)?;
+        assert_ne!(
+            code,
+            0,
+            "raw control character must be rejected in {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    Ok(())
+}
+
+/// The negative control for the whole rule: the *escaped* spellings of the
+/// same characters are well-formed JSON and must keep working, and so must a
+/// raw `0x7F`. Without this, a fix that rejected every tab -- raw or escaped
+/// -- would pass every assertion above (#2878).
+#[test]
+fn test_escaped_control_characters_still_accepted_2878() -> Result<()> {
+    for body in [
+        &b"[\"a\\tb\"]"[..],
+        &b"[\"a\\u0009b\"]"[..],
+        &b"[\"a\x7Fb\"]"[..],
+        &b"{\"a\\tb\": [1, {\"y\": \"\\u001f\"}]}"[..],
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(body)?;
+        file.flush()?;
+        let path = file.path().to_str().expect("temp path is utf-8");
+        let (_stdout, _stderr, code) = run_jq_full(&["-c", ".", path], None)?;
+        assert_eq!(
+            code,
+            0,
+            "escaped control character must stay valid in {:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    Ok(())
+}
+
+/// `fromjson` is a second, independent decoder (`eval.rs`), not reached
+/// through the document splitter at all -- so it needs its own arm of the
+/// same rule. jq rejects; jq mode must now too (#2878).
+///
+/// The yq-mode counter-test lives in `yq_cli_tests.rs`: real yq *accepts*
+/// this, so the fix is mode-gated rather than format-gated (ADR-0018).
+#[test]
+fn test_fromjson_rejects_raw_control_character_in_jq_mode_2878() -> Result<()> {
+    let raw = format!("\"[\\\"a{}b\\\"]\" | fromjson", '\u{9}');
+    let (_stdout, _stderr, code) = run_jq_full(&["-nc", &raw], None)?;
+    assert_ne!(code, 0, "jq mode `fromjson` must reject a raw control char");
+
+    // DEL as the negative control: jq accepts it here too.
+    let del = format!("\"[\\\"a{}b\\\"]\" | fromjson", '\u{7f}');
+    let (_stdout, _stderr, code) = run_jq_full(&["-nc", &del], None)?;
+    assert_eq!(code, 0, "jq mode `fromjson` must accept a raw 0x7F");
+
+    // And the escaped spelling still decodes.
+    let (stdout, _stderr, code) = run_jq_full(&["-nc", "\"[\\\"a\\\\tb\\\"]\" | fromjson"], None)?;
+    assert_eq!(code, 0, "escaped tab must still decode");
+    assert_eq!(stdout.trim(), "[\"a\\tb\"]");
+    Ok(())
+}
+
+/// `tonumber` shares `fromjson`'s decoder, and its "valid JSON but not a
+/// number" vs "not valid JSON at all" probe picks between two *different*
+/// error messages. #2878's rule moves a control-character string across that
+/// boundary -- in jq mode only, because each oracle classifies it its own way
+/// (jq: a parse error; yq: a tag-conversion error). Pins that the probe is
+/// mode-sensitive, which it did not need to be before this (#2878).
+#[test]
+fn test_tonumber_control_character_message_family_is_jq_mode_only_2878() -> Result<()> {
+    let prog = format!("\"[\\\"a{}b\\\"]\" | tonumber", '\u{9}');
+    let (_stdout, stderr, code) = run_jq_full(&["-nc", &prog], None)?;
+    assert_ne!(code, 0, "tonumber must still fail");
+    assert!(
+        stderr.contains("Invalid numeric literal"),
+        "jq mode should report the parse-error family, got: {stderr}"
+    );
+    Ok(())
+}
