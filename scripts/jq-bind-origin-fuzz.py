@@ -99,7 +99,38 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "path(.a | $v)", "(($v | .b?) as $w | .b? | $w)", "(.b? as $z | $v)", "($v | $v)",
         # #2649: a pattern variable is indexed/iterated/navigated as often as
         # it is used bare, and the register has to survive each of them.
-        "$v[0]?", "($v | .[]?)", "($v | recurse)", "($v[0]?, $v)", "($v | first(.[]?))"]
+        "$v[0]?", "($v | .[]?)", "($v | recurse)", "($v[0]?, $v)", "($v | first(.[]?))",
+        # #2896: `getpath` as a *stage*, not just a bind source. jq's
+        # `f_getpath` is the one navigating builtin that leaves the path
+        # register untouched when its input is not the register, and whose
+        # result is a pointer *into* its input -- so a `getpath` stage can
+        # both preserve a live register and land the pipe back on it. None
+        # of the pools above could emit one in stage position, so none of
+        # these shapes were reachable at all ("the alphabet is part of the
+        # claim", #2041).
+        #
+        # Drawn so both of the interesting halves are covered: a `getpath`
+        # whose result lands *back on* the register (`["a"]` after a `.a`
+        # navigation), and one that lands on a sibling holding an equal
+        # value at a different node (`["c"]`, `["x","a"]`) -- the shape a
+        # position-blind rule would wrongly accept. `getpath([])` is the
+        # pure no-op arm; the navigating-argument and two-key forms cover
+        # composition.
+        "($v | getpath([]))", "($v | getpath([]) | .b?)",
+        "($v | getpath([\"a\"]))", "($v | getpath([\"a\"]) | .b?)",
+        "($v | getpath([\"c\"]) | .b?)", "($v | getpath([\"x\",\"a\"]) | .b?)",
+        "($v | getpath([\"b\"]))", "($v | getpath([(\"a\")]) | .b?)",
+        "(.a | $v | getpath([\"a\"]) | .b?)", "(.c | $v | getpath([\"c\"]) | .b?)",
+        "(5 | getpath([]) | $v)", "({b:9} | getpath([\"b\"]) | $v)",
+        "(.a | 5 | getpath([]) | $v)", "(.a | {b:9} | getpath([\"b\"]) | $v)",
+        "reduce (1) as $i (.; getpath([\"a\"]))",
+        "reduce (1) as $i (.; getpath([\"a\"]); .b?)",
+        "foreach (1) as $i (.; getpath([\"a\"]); .b?)",
+        "foreach (1) as $i (.; getpath([\"c\"]); .b?)",
+        "foreach (1) as $i (.a; getpath([\"b\"]); .)",
+        "foreach (1,2) as $i (.; getpath([\"a\"]); .b?)",
+        "foreach (1) as $i (.; $v | getpath([\"a\"]); .b?)",
+        "foreach .[]? as $i (.; getpath([\"a\"]); .b?)"]
 
 # #2649 destructuring patterns: (pattern, the variable the body then uses).
 # `V` is replaced by this bind's generated name, `W` by its sibling.

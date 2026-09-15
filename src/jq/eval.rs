@@ -90203,6 +90203,204 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // #2896: `getpath` is transparent to the path register. jq's `f_getpath`
+    // is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, so on an input that
+    // is *not* the register it returns the value and leaves the register
+    // where it was (where an ordinary `.k` in the same slot raises), and the
+    // value it returns is a pointer *into* its input -- which can itself be
+    // the register's node, at which point tracking resumes.
+    //
+    // Every expectation below is confirmed live against jq 1.7.1, stdout and
+    // stderr byte-for-byte, in both the read and the write direction.
+    // =========================================================================
+
+    /// Rule A, pipe register: a `getpath` stage whose input provably is not
+    /// the register keeps it alive, so a later `$var` frozen from the
+    /// register's own position re-establishes across it. jq answers `["a"]`
+    /// for both; succinctly dropped the register and refused.
+    #[test]
+    fn test_path_register_survives_getpath_off_register_2896() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"path(.a as $y | .a | {b:9} | getpath(["b"]) | $y)"#
+            ),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#"path(.a as $y | .a | 5 | getpath([]) | $y)"#
+            ),
+            [r#"["a"]"#]
+        );
+    }
+
+    /// `getpath([])` is exactly `.` -- both of `_jq_path_append`'s arms
+    /// return the input untouched -- so it defers rather than raising on
+    /// the spot. The deferral must not become an *acceptance*: with nothing
+    /// to re-establish from, the same #530 check still refuses, with jq's
+    /// own message.
+    #[test]
+    fn test_path_register_getpath_empty_defers_but_still_refuses_2896() {
+        for filter in [
+            r"path(5 | getpath([]))",
+            r"path(.a | 5 | getpath([]) | .)",
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert!(e.is_invalid_path_expression(), "{filter}");
+                }
+            );
+        }
+        // The prefix a refusal emits before raising is jq's too: this one
+        // prints `["a"]` and *then* raises, on both binaries.
+        query!(
+            br#"{"a":1}"#,
+            r#"path(try (.a, error([1,2,3])) catch getpath([]))"#,
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert!(e.is_invalid_path_expression());
+                assert_eq!(prefix.len(), 1);
+            }
+        );
+        // ... and the no-op arm still answers where jq does.
+        assert_eq!(outputs(br#"{"a":1}"#, r"path(getpath([]))"), ["[]"]);
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r"path(.a | getpath([]))"),
+            [r#"["a"]"#]
+        );
+    }
+
+    /// Rule B: `getpath`'s result carries its own absolute position, so a
+    /// *second* `getpath` composes from it and the pipe lands back on the
+    /// register. Two stages deep, which is what proves the mark is read as
+    /// an input position and not merely produced.
+    #[test]
+    fn test_path_register_getpath_result_carries_its_position_2896() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":{"c":1}}}"#,
+                r#"path(foreach .[] as $k (.; getpath(["a"]) | getpath(["b"]); .))"#
+            ),
+            [r#"["a","b"]"#]
+        );
+    }
+
+    /// The filed repro (#2896), read and write. The fold's register sits at
+    /// `["a"]` (the navigating SOURCE) while the accumulator is the document
+    /// root (`INIT = .`), so `getpath(["a"])` inside UPDATE lands the
+    /// accumulator back on the register's own node and EXTRACT's `.b`
+    /// continues from it.
+    #[test]
+    fn test_foreach_register_getpath_resumes_at_register_node_2896() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":2}}"#,
+                r#"path(foreach .[] as $k (.; getpath(["a"]); .b))"#
+            ),
+            [r#"["a","b"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":2}}"#,
+                r#"del(foreach .[] as $k (.; getpath(["a"]); .b))"#
+            ),
+            [r#"{"a":{}}"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":2}}"#,
+                r#"(foreach .[] as $k (.; getpath(["a"]); .b)) = 9"#
+            ),
+            [r#"{"a":{"b":9}}"#]
+        );
+    }
+
+    /// The negative controls, each one a different way the gate could
+    /// wrongly pass. Every row raises in jq 1.7.1 and must keep raising, and
+    /// the expected text is jq's own, captured live -- succinctly's stdout
+    /// and stderr are byte-identical to the oracle's on all of them.
+    ///
+    /// The first two rows are the load-bearing pair: `.c` holds a value
+    /// *equal* to the register's at a *different node* (and, in the second,
+    /// an unequal one), which a value-equality rule would accept and an
+    /// absolute-position rule refuses. The third is `getpath` navigating
+    /// past the register rather than onto it. The fourth and fifth put a
+    /// genuinely register-moving stage in front of the `getpath`, so no
+    /// preserved register may survive it. The sixth is the `reduce`
+    /// spelling, which agreed with jq before this change and is the canary
+    /// that the accumulator seeding did not move `reduce`'s own final
+    /// re-entry boundary. The last is #2860's own repro: a
+    /// `Marked(Origin::At)` branch must *not* be admitted by `relocate`'s
+    /// widened eligibility -- only a positional `Snapshot::At` is.
+    #[test]
+    fn test_foreach_register_getpath_negative_controls_2896() {
+        for (doc, filter, expected) in [
+            (
+                &br#"{"a":{"b":2},"c":{"b":2}}"#[..],
+                r#"path(foreach .[] as $k (.; getpath(["c"]); .b))"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":2},"c":{"b":3}}"#[..],
+                r#"path(foreach .[] as $k (.; getpath(["c"]); .b))"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":3}"#,
+            ),
+            (
+                &br#"{"a":{"b":{"c":1}}}"#[..],
+                r#"path(foreach .[] as $k (.; getpath(["a","b"]); .))"#,
+                r#"Invalid path expression with result {"c":1}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(foreach .[] as $k (.; (.a|.b) | getpath([]); .))"#,
+                r#"Invalid path expression near attempt to access element "a" of {"a":{"b":2}}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | first(.b) | getpath([]) | $x)"#,
+                r#"Invalid path expression with result {"a":{"b":2}}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(reduce .[] as $k (.; getpath(["a"])))"#,
+                r#"Invalid path expression with result {"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r#"path(foreach .a as $v0 (.; $v0; (.zzz | $v0)))"#,
+                r#"Invalid path expression with result {"b":1}"#,
+            ),
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, expected, "{filter}");
+                }
+            );
+        }
+    }
+
+    /// The register resets between source elements, `getpath` or not: the
+    /// second element re-enters UPDATE with the *first* element's result as
+    /// its accumulator, which is no longer the register's node. jq raises
+    /// after emitting nothing; the one-element spelling above answers.
+    #[test]
+    fn test_foreach_register_getpath_resets_between_elements_2896() {
+        query!(br#"{"a":{"b":2}}"#, r#"path(foreach (1,2) as $k (.; getpath(["a"]); .b))"#,
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                // Element 1 resolved and was emitted; element 2 is the one
+                // that raises. jq prints `["a","b"]` and then errors too,
+                // with this same message.
+                assert_eq!(prefix.len(), 1);
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of null"#
+                );
+            }
+        );
+    }
+
     /// What the conservative allowlist costs, pinned so a later widening is
     /// deliberate. jq answers `[]` for every one of these; succinctly
     /// refuses.
