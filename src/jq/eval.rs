@@ -31602,16 +31602,19 @@ fn accumulator_provenance<S: EvalSemantics>(
     }
 }
 
-/// Whether `expr` is a `getpath(...)` stage, under any parenthesisation
-/// (#2896). A `getpath(...)?` is deliberately *not* one: `?` adds its own
-/// suppression layer between the stage and its result, and declining here
-/// costs only a refusal.
-fn is_getpath_stage(expr: &Expr) -> bool {
-    matches!(unwrap_paren(expr), Expr::Builtin(Builtin::GetPath(_)))
+/// A `getpath(...)` stage's key-list argument, under any parenthesisation,
+/// or `None` if `expr` is not one (#2896). A `getpath(...)?` is deliberately
+/// not one: `?` adds its own suppression layer between the stage and its
+/// result, and declining here costs only a refusal.
+fn getpath_stage_keys(expr: &Expr) -> Option<&Expr> {
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::GetPath(arg)) => Some(arg),
+        _ => None,
+    }
 }
 
-/// Whether `expr` is a `getpath` stage whose key list is the *statically*
-/// empty array literal (#2896). `getpath([])` performs no navigation at all:
+/// Whether a `getpath` stage's key list is the *statically* empty array
+/// literal (#2896). `getpath([])` performs no navigation at all:
 /// with an empty `p`, **both** of `_jq_path_append`'s arms leave jq's
 /// register exactly where it was (the non-intact arm returns the input
 /// untouched; the intact arm appends nothing and re-points `value_at_path`
@@ -31631,11 +31634,8 @@ fn is_getpath_stage(expr: &Expr) -> bool {
 /// `getpath([] | .)`) may evaluate to something else entirely, and its own
 /// per-output branch already carries the general rule -- declining here
 /// costs a refusal, which is the safe direction.
-fn is_getpath_of_empty_literal_path(expr: &Expr) -> bool {
-    let Expr::Builtin(Builtin::GetPath(arg)) = unwrap_paren(expr) else {
-        return false;
-    };
-    matches!(unwrap_paren(arg), Expr::Array(inner)
+fn is_empty_literal_path(keys: &Expr) -> bool {
+    matches!(unwrap_paren(keys), Expr::Array(inner)
         if matches!(unwrap_paren(inner), Expr::Comma(parts) if parts.is_empty()))
 }
 
@@ -31696,10 +31696,16 @@ fn getpath_preserves_register<S: EvalSemantics>(
     register: Option<&OwnedValue>,
     stage_frame: &Frame,
 ) -> bool {
-    if S::TAG != EvalTag::Jq || branch_trackable || !is_getpath_stage(expr) {
+    if S::TAG != EvalTag::Jq || branch_trackable {
         return false;
     }
-    if is_getpath_of_empty_literal_path(expr) {
+    // Destructured once, so `is_empty_literal_path` needs no "not a getpath
+    // at all" arm of its own -- an arm this function's own guard already
+    // made unreachable, and which coverage correctly flagged as dead.
+    let Some(keys) = getpath_stage_keys(expr) else {
+        return false;
+    };
+    if is_empty_literal_path(keys) {
         return true;
     }
     let Some(register) = register else {
@@ -90441,6 +90447,47 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// The **second** of `getpath_preserves_register`'s two proofs, which the
+    /// first (unequal values) can never reach: the input's value *equals* the
+    /// register's, but its own absolute position is provable and is not the
+    /// register's, so it is a different node holding an equal value and jq's
+    /// `path_intact` was false there too.
+    ///
+    /// `$y` is bound from `.c` and `$z` from `.a`, both `{"b":2}`; the
+    /// register is at `["a"]`. The `getpath(["b"])` stage therefore enters on
+    /// a value equal to the register but marked `["c"]`, keeps the register
+    /// alive, and `$z` re-establishes it. jq 1.7.1 answers `["a"]` and
+    /// deletes `.a`; `main` refused both.
+    ///
+    /// The third filter is the negative control for the same shape: `$y`
+    /// names the node the register is *not* on, so it must not re-establish
+    /// — it refuses on jq, on `main`, and here.
+    #[test]
+    fn test_path_register_getpath_equal_value_different_node_2896() {
+        let doc = br#"{"a":{"b":2},"c":{"b":2}}"#;
+        assert_eq!(
+            outputs(
+                doc,
+                r#"path(.c as $y | .a as $z | .a | $y | getpath(["b"]) | $z)"#
+            ),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(
+                doc,
+                r#"del(.c as $y | .a as $z | .a | $y | getpath(["b"]) | $z)"#
+            ),
+            [r#"{"c":{"b":2}}"#]
+        );
+        query!(
+            doc,
+            r#"path(.c as $y | .a as $z | .a | $y | getpath(["b"]) | $y)"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":2}"#);
+            }
+        );
     }
 
     /// yq mode stays exactly where `main` left it (review finding on #2896).
