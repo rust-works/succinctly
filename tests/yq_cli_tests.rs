@@ -34074,6 +34074,29 @@ fn test_yq_forward_reference_is_rejected_1473() -> Result<()> {
     Ok(())
 }
 
+/// #2734's one intentional yq-mode side effect: a pattern's computed key
+/// (`. as {(EXPR): $a} | ...`) went unchecked for undefined function calls
+/// before this pass added `check_pattern_keys` -- `patterns` was silently
+/// skipped entirely (folded into a generic arm by `..`), the same
+/// pre-existing gap #2734's issue text found for `. as PATTERN`'s own
+/// `$variable` binding. This is yq mode's already-established
+/// undefined-function-call policy (`test_yq_undefined_function_is_rejected_up_front_1473`
+/// above) reaching a position it previously missed, not a new policy --
+/// `#2734` is otherwise jq-mode-only (see `resolve_func_calls_all`'s own
+/// doc comment in `resolve.rs`).
+#[test]
+fn test_yq_computed_pattern_key_undefined_call_is_now_rejected_2734() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(". as {(nosuchfn): $a} | $a", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "no document should be emitted");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// Legal `def` usage in yq mode is untouched, including the `$`-parameter form
 /// this file's comment-preservation tests already rely on.
 #[test]

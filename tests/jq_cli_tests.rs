@@ -43476,6 +43476,61 @@ fn test_bare_unbound_variable_is_a_compile_error_2734() -> Result<()> {
     Ok(())
 }
 
+/// The unbound-variable diagnostic must point at the actual failing
+/// reference, not at any text that merely spells the same name -- a naive
+/// implementation (a plain substring search for `$name` over the filter's
+/// own source) would land inside this string literal instead, since it
+/// comes first in the source. `jq::collect_var_sites` (mirroring #2085's
+/// `collect_call_sites` for calls) is what prevents this: it only records
+/// positions of genuine `$name` reference sites the parser actually built,
+/// so a string literal that happens to spell `$nope` is never a candidate.
+/// Byte-for-byte against the pinned oracle.
+#[test]
+fn test_unbound_variable_position_is_not_confused_by_a_string_literal_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", r#""look at $nope", $nope"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error: $nope is not defined at <top-level>, line 1:\n\
+         \"look at $nope\", $nope                 \n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// A second reference of the *same* name that already resolved cleanly
+/// (bound by an enclosing `as`) is a harder case than the string-literal
+/// one above: `var_sites` records every real `$x` reference, bound or not,
+/// with no scope information (same limitation `CallSite`'s own doc comment
+/// records for calls, tracked at #2635) -- so distinguishing "this `$x` is
+/// fine" from "this other `$x` is the one that's actually unbound" isn't
+/// solved by this table alone. This test pins today's honest behavior
+/// (parity with the identical, pre-existing call-site limitation
+/// demonstrated by the second filter below) rather than a false claim of
+/// full accuracy: both mis-locate to the first, harmless occurrence of the
+/// shared name, one column short of where the pinned oracle points.
+#[test]
+fn test_unbound_variable_position_has_the_same_shadowing_limitation_as_calls_2734() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(&["-n", "-c", "(1 as $x | $x), $x"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("$x is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+
+    // The pre-existing call-site mechanism has the identical shape of
+    // imprecision on the exact same program structure, confirming this
+    // isn't a new or worse gap introduced by the variable path.
+    let (_, stderr, code) = run_jq_full(&["-n", "-c", "(def f: 1; f) | f"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("f/0 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// The part that actually matters beyond the message: a compile-error
 /// program produces *no* output, even for the branches that would have
 /// resolved cleanly and run first. Before #2734 this printed `1` before
