@@ -31705,9 +31705,7 @@ fn register_identical(
                 // differs between them is which "raise now" guards defer
                 // (see [`Snapshot`]'s own doc comment), not how they are
                 // recognised here.
-                Snapshot::Marked(origin) | Snapshot::At(origin) => {
-                    register_frame.certifies(origin)
-                }
+                Snapshot::Marked(origin) | Snapshot::At(origin) => register_frame.certifies(origin),
             })
 }
 
@@ -34237,7 +34235,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
                 // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
                 // "result 1" -- a wrong accept, the write-side hazard class.
-                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch), frame);
+                (state_at_register, state_snapshot) =
+                    reg.branch_provenance(Some(update_branch), frame);
                 state = update_branch.value.clone().into_owned();
                 if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
@@ -90224,14 +90223,14 @@ mod tests {
         assert_eq!(
             outputs(
                 br#"{"a":1,"b":2}"#,
-                r#"path(.a as $y | .a | {b:9} | getpath(["b"]) | $y)"#
+                r#"path(.a as $y | .a | { b: 9 } | getpath(["b"]) | $y)"#
             ),
             [r#"["a"]"#]
         );
         assert_eq!(
             outputs(
                 br#"{"a":1,"b":2}"#,
-                r#"path(.a as $y | .a | 5 | getpath([]) | $y)"#
+                r"path(.a as $y | .a | 5 | getpath([]) | $y)"
             ),
             [r#"["a"]"#]
         );
@@ -90244,10 +90243,7 @@ mod tests {
     /// own message.
     #[test]
     fn test_path_register_getpath_empty_defers_but_still_refuses_2896() {
-        for filter in [
-            r"path(5 | getpath([]))",
-            r"path(.a | 5 | getpath([]) | .)",
-        ] {
+        for filter in [r"path(5 | getpath([]))", r"path(.a | 5 | getpath([]) | .)"] {
             query!(br#"{"a":1}"#, filter,
                 QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
                     assert!(e.is_invalid_path_expression(), "{filter}");
@@ -90258,7 +90254,7 @@ mod tests {
         // prints `["a"]` and *then* raises, on both binaries.
         query!(
             br#"{"a":1}"#,
-            r#"path(try (.a, error([1,2,3])) catch getpath([]))"#,
+            r"path(try (.a, error([1,2,3])) catch getpath([]))",
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert!(e.is_invalid_path_expression());
                 assert_eq!(prefix.len(), 1);
@@ -90354,12 +90350,12 @@ mod tests {
             ),
             (
                 &br#"{"a":{"b":2}}"#[..],
-                r#"path(foreach .[] as $k (.; (.a|.b) | getpath([]); .))"#,
+                r"path(foreach .[] as $k (.; (.a|.b) | getpath([]); .))",
                 r#"Invalid path expression near attempt to access element "a" of {"a":{"b":2}}"#,
             ),
             (
                 &br#"{"a":{"b":2}}"#[..],
-                r#"path(. as $x | .a | first(.b) | getpath([]) | $x)"#,
+                r"path(. as $x | .a | first(.b) | getpath([]) | $x)",
                 r#"Invalid path expression with result {"a":{"b":2}}"#,
             ),
             (
@@ -90369,7 +90365,7 @@ mod tests {
             ),
             (
                 &br#"{"a":{"b":1}}"#[..],
-                r#"path(foreach .a as $v0 (.; $v0; (.zzz | $v0)))"#,
+                r"path(foreach .a as $v0 (.; $v0; (.zzz | $v0)))",
                 r#"Invalid path expression with result {"b":1}"#,
             ),
         ] {
