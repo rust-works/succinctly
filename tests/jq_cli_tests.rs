@@ -26517,39 +26517,50 @@ fn test_repeated_param_name_binding_questions_stay_distinct_2555() -> Result<()>
 /// `test_bare_param_does_not_bind_dollar_leaves_outer_binding_2726` for the
 /// case where an enclosing binder *does* supply one).
 ///
-/// Divergence that remains, and is not this issue's: jq rejects at compile
-/// time (exit 3), succinctly at evaluation (exit 5). That is how succinctly
-/// reports *every* unbound variable -- plain `$nope` diverges identically on
-/// unmodified `main` -- so it is a general gap, tracked separately.
+/// The compile-vs-evaluation timing gap this test used to also pin (jq
+/// rejects at compile time, succinctly at evaluation) closed with #2734:
+/// asserts the exact exit code and message now, not just "some error naming
+/// $a" (see `test_bare_param_dollar_rejection_matches_jqs_uncatchable_compile_error_2734`
+/// below for the visible consequence -- `try`/`?` no longer catch it).
 #[test]
 fn test_bare_param_does_not_create_a_dollar_binding_2726() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a): $a; f(1)"], None)?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
     assert!(
-        stderr.contains("$a"),
-        "the error should name the unbound variable, got: {stderr:?}"
+        stderr.contains("$a is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
     );
     Ok(())
 }
 
-/// #2726, the shape of that rejection as it actually ships: an *evaluation*
-/// error, so `try`/`?` catch it, where jq's compile-time refusal cannot be
-/// caught by the program at all. Pinned rather than left implicit, because
-/// it is the visible consequence of #2734 (the general
-/// compile-vs-evaluation timing gap) landing on this newly-rejected
-/// program, and it is what a reader comparing against jq will hit first.
+/// #2734 closed the compile-vs-evaluation timing gap
+/// `test_bare_param_does_not_create_a_dollar_binding_2726` used to carry as
+/// a known, tracked divergence: an unbound `$variable` is now a compile
+/// error here too, exactly like jq, so neither `try`/`catch` nor postfix
+/// `?` can catch it -- both previously did, since the old evaluation-time
+/// refusal was an ordinary catchable runtime error. Renamed from
+/// `test_bare_param_dollar_rejection_is_catchable_here_unlike_jq_2726`,
+/// which pinned the pre-fix behaviour this test now replaces.
 #[test]
-fn test_bare_param_dollar_rejection_is_catchable_here_unlike_jq_2726() -> Result<()> {
-    // jq: compile error, exit 3, nothing catches it.
+fn test_bare_param_dollar_rejection_matches_jqs_uncatchable_compile_error_2734() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-nc", r#"def f(a): try $a catch "caught"; f(1)"#], None)?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), r#""caught""#);
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error is not catchable by try/catch");
+    assert!(
+        stderr.contains("$a is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
 
-    // Same for postfix `?`, which suppresses it into an empty stream.
+    // Same for postfix `?`, which only suppresses an *evaluation* error.
     let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a): $a?; f(1)"], None)?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error is not suppressed by ?");
+    assert!(
+        stderr.contains("$a is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -43282,6 +43293,47 @@ fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result
     Ok(())
 }
 
+/// #2734's own variable-reference sibling to
+/// `test_unresolved_call_from_included_module_omits_the_location_1473`
+/// above: an unbound `$variable` referenced from an included module's `def`
+/// body has no occurrence in the top-level filter's own text either, so the
+/// text-search fallback (`locate_identifier_from`) finds nothing and the
+/// line marker is omitted the same way. jq itself still names the module
+/// file and line here; recorded as the same tracked location gap
+/// (docs/compliance/jq/limitations.md).
+#[test]
+fn test_unbound_variable_from_included_module_omits_the_location_2734() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("mymod.jq"),
+        "def helper: $nosuch_var_in_module;",
+    )?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"include "mymod"; helper"#);
+            cmd
+        },
+        None,
+    )?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(
+        stderr.contains("$nosuch_var_in_module is not defined at <top-level>"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(", line "),
+        "no line should be claimed for a variable with no in-filter occurrence: {stderr}"
+    );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// #2037: jq reports *every* unresolvable call in one compile pass, not just
 /// the first -- `jq: N compile errors`. Captured live against the pinned
 /// oracle (`/usr/bin/jq` 1.7.1); this filter and its exact three-error output
@@ -43394,6 +43446,128 @@ fn test_resolved_callee_still_checks_its_own_arguments_2037() -> Result<()> {
         "jq: error: nosuch/0 is not defined at <top-level>, line 1:\n\
          def f(x): x; f(nosuch)               \n\
          jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+// =============================================================================
+// #2734: an unbound `$variable` reference is a compile error (exit 3), same
+// timing as an unresolved function call (#1473/#2037/#2085 above) -- jq
+// resolves both at compile time, before any input is read, so a program
+// referencing an unbound `$name` produces zero output, not the partial
+// output-then-error `succinctly jq` used to produce by only catching this at
+// evaluation (exit 5). Every expectation below was captured live against the
+// pinned oracle (`/usr/bin/jq` 1.7.1). yq mode is untouched by this check --
+// real yq is fully permissive about an unbound `$variable` (#2981), the
+// opposite direction of divergence, so it is out of scope here.
+// =============================================================================
+
+#[test]
+fn test_bare_unbound_variable_is_a_compile_error_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "$nope"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: $nope is not defined at <top-level>, line 1:\n\
+         $nope\n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// The part that actually matters beyond the message: a compile-error
+/// program produces *no* output, even for the branches that would have
+/// resolved cleanly and run first. Before #2734 this printed `1` before
+/// failing at exit 5 -- see this test's own doc comment history in #2734's
+/// issue body for the exact before/after.
+#[test]
+fn test_unbound_variable_suppresses_all_output_not_just_downstream_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "1, $nope"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "jq emits nothing at all once compilation fails");
+    assert_eq!(
+        stderr,
+        "jq: error: $nope is not defined at <top-level>, line 1:\n\
+         1, $nope   \n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// A `$`-style def parameter binds the bare name (callable) and `$name`
+/// (the variable) both -- `def f($a): $a; f(1)` is valid, unlike a bare
+/// parameter, which only ever binds the callable half.
+#[test]
+fn test_dollar_style_param_binds_the_variable_2734() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "-c", "def f($a): $a; f(1)"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+#[test]
+fn test_bare_param_does_not_bind_the_dollar_variable_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "def f(a): $a; f(1)"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("$a is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// jq keeps the label and variable namespaces separate -- `label $out`
+/// binds `$out` only for `break $out` to resolve against, never as an
+/// ordinary `$variable` reference.
+#[test]
+fn test_label_name_is_not_a_variable_binding_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "label $out | $out"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("$out is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// A `reduce`/`foreach` pattern binds in `update` (and `foreach`'s
+/// `extract`) but not in `init` -- `init` runs before any element has ever
+/// been bound.
+#[test]
+fn test_reduce_pattern_var_is_not_visible_in_init_2734() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-c", "reduce empty as $x ($x; . + 1)"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("$x is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Real jq interleaves undefined-call and undefined-variable diagnostics by
+/// their position in the source, not grouped by kind -- confirmed live
+/// (`$bar, foo, $baz` reports all three left to right). This is the one
+/// behaviour a naive "collect calls, then collect variables" implementation
+/// would get wrong by construction.
+#[test]
+fn test_call_and_variable_errors_interleave_in_source_order_2734() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "$bar, foo, $baz"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error: $bar is not defined at <top-level>, line 1:\n\
+         $bar, foo, $baz\n\
+         jq: error: foo/0 is not defined at <top-level>, line 1:\n\
+         $bar, foo, $baz      \n\
+         jq: error: $baz is not defined at <top-level>, line 1:\n\
+         $bar, foo, $baz           \n\
+         jq: 3 compile errors\n"
     );
     Ok(())
 }

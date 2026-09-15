@@ -62,6 +62,26 @@ fn run_yq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
+/// `succinctly jq` gained a compile-time check rejecting an unbound
+/// `$variable` reference (#2734, exit 3, matching real jq). `succinctly yq`
+/// must not gain it too -- real yq treats an unbound `$variable` as a
+/// zero-output generator rather than any kind of error, confirmed live
+/// against yq v4.53.3 (`$nope` alone: exit 0, zero output; `$nope, 1`:
+/// exit 0, prints only `1`) -- filed separately as #2981 since it is the
+/// opposite direction of divergence and needs its own investigation before
+/// a fix. This pins that `succinctly yq`'s current (separately tracked,
+/// still-diverging) runtime-error behaviour is untouched by #2734's jq-mode
+/// change: `jq_runner.rs`'s new compile check is wired into `resolve_all`,
+/// which `yq_runner.rs` never calls (it keeps using the function-only
+/// `resolve_func_calls`).
+#[test]
+fn test_unbound_variable_is_not_a_compile_error_here_2734() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr("$nope", "null\n", &[])?;
+    assert_eq!(code, 1, "stdout: {out:?} stderr: {err:?}");
+    assert!(err.contains("undefined variable: $nope"), "stderr: {err:?}");
+    Ok(())
+}
+
 /// #2591: real yq's own `Preserve` output convention leaves a raw DEL byte
 /// unescaped (confirmed live against yq v4.53.3) -- unlike jq's
 /// `JqCompat` table, which always escapes it. The fix to
