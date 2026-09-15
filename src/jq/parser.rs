@@ -634,9 +634,27 @@ impl<'a> Parser<'a> {
         self.input[self.pos..].chars().next()
     }
 
-    /// Peek at the next n characters.
+    /// Peek at the next up to `n` bytes, for comparing against a short ASCII
+    /// operator spelling (`..`, `::`, `|=`, `?//`, ...) -- every call site
+    /// only ever matches this against an ASCII literal, so `n` is a byte
+    /// count, not a character count, and a multi-byte character starting
+    /// before byte `n` just yields a shorter, still-safe-to-compare slice
+    /// rather than the full `n` bytes.
+    ///
+    /// #2975: `self.pos + n` can land inside a multi-byte character rather
+    /// than on it, e.g. `.a（` after consuming `.a` -- `self.pos` sits right
+    /// before the 3-byte '（', and `pos + 2` lands mid-character. Real jq
+    /// reports a compile error for this input; naively slicing at that byte
+    /// offset panics instead. Rounding `end` down to the nearest character
+    /// boundary is always safe here: no caller's comparison target contains
+    /// a multi-byte character, so a shortened slice can only ever compare
+    /// as *not equal*, exactly like a slice that ran off the end of `input`
+    /// already does via the existing `.min(self.input.len())`.
     fn peek_str(&self, n: usize) -> &str {
-        let end = (self.pos + n).min(self.input.len());
+        let mut end = (self.pos + n).min(self.input.len());
+        while end > self.pos && !self.input.is_char_boundary(end) {
+            end -= 1;
+        }
         &self.input[self.pos..end]
     }
 
@@ -9775,5 +9793,57 @@ mod tests {
     fn test_parser_new_initializes_pattern_depth_1240() {
         let mut parser = Parser::new(". as {$a} | $a");
         parser.parse_expr().expect("Parser::new must still parse");
+    }
+
+    /// #2975: `peek_str` computed its end offset as `self.pos + n`, assuming
+    /// every one of the next `n` bytes belongs to a single-byte character --
+    /// true for every ASCII operator spelling it's ever compared against,
+    /// but not for arbitrary input. A multi-byte character starting right
+    /// after a field name landed that arithmetic mid-character and panicked
+    /// on the slice, rather than reporting the compile error real jq gives
+    /// this input (`.a（` -- U+FF08 FULLWIDTH LEFT PARENTHESIS, 3 bytes).
+    /// `parse` must return `Err`, never panic, for any of these.
+    #[test]
+    fn test_peek_str_does_not_panic_mid_multi_byte_character_2975() {
+        for filter in [
+            ".a（",
+            ".a（）",
+            "1（",
+            "1｜（",
+            ".a｜＝",
+            ".a？（",
+            ".a：（",
+            "reduce（",
+            "5（",
+            "[]（",
+            "\"x\"（",
+        ] {
+            assert!(
+                parse(filter).is_err(),
+                "`{filter}` should be a parse error, not a panic or a successful parse"
+            );
+        }
+    }
+
+    /// `peek_str` directly, isolating the fix from the rest of the parser:
+    /// every call site only ever compares the result against a short ASCII
+    /// literal, so a multi-byte character inside the requested window must
+    /// yield a shorter (but never out-of-bounds or panicking) slice that
+    /// simply can't equal that literal.
+    #[test]
+    fn test_peek_str_rounds_down_to_a_char_boundary_2975() {
+        let parser = Parser::new(".a（");
+        // `.a` is 2 ASCII bytes; `pos` starts at 0, so advance past them to
+        // sit right before the 3-byte '（' the way the real parse does.
+        let mut p = parser;
+        p.pos = 2;
+        assert_eq!(p.peek_str(1), "", "byte 0 of '（' alone is not a full char");
+        assert_eq!(p.peek_str(2), "", "byte offset 2 lands mid-character");
+        assert_eq!(p.peek_str(3), "（", "the full 3-byte character");
+        assert_eq!(
+            p.peek_str(10),
+            "（",
+            "requesting past the end still stops at the real end"
+        );
     }
 }

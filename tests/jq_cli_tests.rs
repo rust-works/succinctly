@@ -17140,6 +17140,27 @@ fn test_resolve_slice_expr_target_escape_does_not_panic_on_empty_later_ends_2245
     Ok(())
 }
 
+/// #2975: a multi-byte character immediately after a token (a field name,
+/// a number, a bracket, a quoted string, ...) made the parser's `peek_str`
+/// slice the filter source at a byte offset that landed mid-character,
+/// panicking (exit 101, a Rust backtrace) instead of reporting the compile
+/// error real jq gives this input. `'（'` is U+FF08 FULLWIDTH LEFT
+/// PARENTHESIS (3 bytes in UTF-8); every row below previously panicked with
+/// some variant of "byte index N is not a char boundary".
+#[test]
+fn test_multi_byte_character_after_a_token_is_a_compile_error_not_a_panic_2975() -> Result<()> {
+    for filter in [".a（", "1（", "1｜（", ".a｜＝", "[]（", "\"x\"（"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` should be a compile error (exit 3), not a panic -- \
+             stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "`{filter}`: stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
 /// #2245 (found in review of this fix's own first draft): within one `s`
 /// iteration, `end`'s own trailing escape was checked *before* `target`'s,
 /// so when both escaped in the same iteration the lower-priority `end`
