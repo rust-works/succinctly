@@ -106,30 +106,24 @@ impl IndentSpec {
 /// `--preserve-input` is documented to affect numbers and duplicate keys
 /// only (#2209).
 ///
-/// Since #2874 this is the *single* key for the whole axis, not one
-/// encoding of it among several. It is the type of the CLI's own
-/// `OutputConfig::convention` and of `JsonFormatOpts::convention`, and
-/// every consumer -- the M2 raw-passthrough gate, the DEL zero-copy gate,
-/// `json::light::write_json_number`, the `JqCompatFormatter`/
-/// `PreserveFormatter` selection, the duplicate-key collapse and
-/// `output::format_json_impl`'s `Float`/`NumberLiteral` arms -- reads it
-/// through [`Self::preserves_source_values`] /
-/// [`Self::uses_jq_escape_table`] or matches it exhaustively. It was
-/// previously re-derived at four sites from a `jq_compat: bool` that
-/// predated this enum, with the escape axis stored beside it as a separate
-/// `ControlEscape`; that pair spelled out these same three variants (plus
-/// one never constructed), which is what let the encodings drift apart in
-/// principle and forced yq's own construction site to pass a dummy value.
+/// **Contract for consumers** (#2874): this value is the single key for the
+/// whole bundle -- read the axis you need through
+/// [`Self::preserves_source_values`] / [`Self::uses_jq_escape_table`], or
+/// match the variants exhaustively; never re-derive the split from a
+/// separate `bool` or a `== Preserve` test. #2209 was exactly such a
+/// two-variant check silently missing a new case, and until #2874 this
+/// decision was still re-derived independently at four sites from a
+/// predecessor bool. Where a consumer matches exhaustively, adding a fourth
+/// variant is a compile error there by design -- that is the property this
+/// type exists to provide, so prefer the match to a helper call wherever
+/// the consumer genuinely has a per-variant answer.
 ///
-/// Adding a fourth variant is therefore a compile error in
-/// `format_json_impl`'s two number arms and in `write_json_number`, by
-/// design -- #2209 was precisely a two-variant check silently missing a
-/// new case. Two things are deliberately *not* keyed on it, each with its
-/// reason recorded at the site: `OwnedValue::to_json_yq` (its
-/// `to_json_at_depth` family hardcodes jq's escape table for every
-/// variant, so the `Preserve` mapping would be a false equivalence), and
-/// the DEL zero-copy gate (FIXME(#2985) -- it reads the preserve axis
-/// where it means the escape one).
+/// Two consumers are deliberately *not* keyed on it, each with its reason
+/// recorded where it lives: [`OwnedValue::to_json_yq`](crate::jq::OwnedValue)
+/// (its formatting family hardcodes jq's escape table for every variant, so
+/// mapping `Preserve` onto it would assert a false equivalence), and the
+/// CLI's DEL zero-copy gate, which reads the preserve axis where it means
+/// the escape one (FIXME(#2985)).
 ///
 /// - `Preserve`: echo the document's source number spelling verbatim
 ///   (`1e100` stays `1e100`), use yq's escape table (no `\b`/`\f` short
