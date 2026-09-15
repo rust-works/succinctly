@@ -17146,7 +17146,9 @@ fn test_resolve_slice_expr_target_escape_does_not_panic_on_empty_later_ends_2245
 /// panicking (exit 101, a Rust backtrace) instead of reporting the compile
 /// error real jq gives this input. `'（'` is U+FF08 FULLWIDTH LEFT
 /// PARENTHESIS (3 bytes in UTF-8); every row below previously panicked with
-/// some variant of "byte index N is not a char boundary".
+/// some variant of "byte index N is not a char boundary". Confirmed live
+/// against `/usr/bin/jq` 1.7.1: every row is `exit 3` there too (a
+/// `syntax error, unexpected INVALID_CHARACTER` compile error).
 #[test]
 fn test_multi_byte_character_after_a_token_is_a_compile_error_not_a_panic_2975() -> Result<()> {
     for filter in [".a（", "1（", "1｜（", ".a｜＝", "[]（", "\"x\"（"] {

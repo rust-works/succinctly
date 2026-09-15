@@ -635,21 +635,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Peek at the next up to `n` bytes, for comparing against a short ASCII
-    /// operator spelling (`..`, `::`, `|=`, `?//`, ...) -- every call site
-    /// only ever matches this against an ASCII literal, so `n` is a byte
-    /// count, not a character count, and a multi-byte character starting
-    /// before byte `n` just yields a shorter, still-safe-to-compare slice
-    /// rather than the full `n` bytes.
+    /// operator spelling (`..`, `::`, `|=`, `?//`, ...) -- so `n` is a byte
+    /// count, not a character count.
     ///
     /// #2975: `self.pos + n` can land inside a multi-byte character rather
     /// than on it, e.g. `.a（` after consuming `.a` -- `self.pos` sits right
     /// before the 3-byte '（', and `pos + 2` lands mid-character. Real jq
-    /// reports a compile error for this input; naively slicing at that byte
-    /// offset panics instead. Rounding `end` down to the nearest character
-    /// boundary is always safe here: no caller's comparison target contains
-    /// a multi-byte character, so a shortened slice can only ever compare
-    /// as *not equal*, exactly like a slice that ran off the end of `input`
-    /// already does via the existing `.min(self.input.len())`.
+    /// reports a compile error for this input (confirmed live against
+    /// `/usr/bin/jq` 1.7.1: exit 3, `syntax error, unexpected
+    /// INVALID_CHARACTER`); naively slicing at that byte offset panics
+    /// instead. Rounding `end` down to the nearest character boundary is
+    /// always safe: no call site's own comparison target (an equality check
+    /// against a fixed ASCII literal, or -- the one exception, line ~1847's
+    /// unary-minus lookahead -- a `.chars().nth(1)` extraction) can be
+    /// satisfied by a multi-byte character, so a shortened slice only ever
+    /// produces "not equal" or "no second character", exactly the same
+    /// harmless outcome a slice that ran off the end of `input` already
+    /// produces via the existing `.min(self.input.len())`.
     fn peek_str(&self, n: usize) -> &str {
         let mut end = (self.pos + n).min(self.input.len());
         while end > self.pos && !self.input.is_char_boundary(end) {
@@ -9799,10 +9801,16 @@ mod tests {
     /// every one of the next `n` bytes belongs to a single-byte character --
     /// true for every ASCII operator spelling it's ever compared against,
     /// but not for arbitrary input. A multi-byte character starting right
-    /// after a field name landed that arithmetic mid-character and panicked
-    /// on the slice, rather than reporting the compile error real jq gives
-    /// this input (`.a（` -- U+FF08 FULLWIDTH LEFT PARENTHESIS, 3 bytes).
-    /// `parse` must return `Err`, never panic, for any of these.
+    /// after a token landed that arithmetic mid-character and panicked on
+    /// the slice, rather than reporting the compile error real jq gives
+    /// this input (`.a（` -- U+FF08 FULLWIDTH LEFT PARENTHESIS, 3 bytes;
+    /// confirmed live against `/usr/bin/jq` 1.7.1 that every row here is a
+    /// compile error there too, exit 3). `parse` must return `Err`, never
+    /// panic, for any of these. `"-（"` is the bonus case: a *different*
+    /// `peek_str` call site (the unary-minus digit lookahead, `.chars()
+    /// .nth(1)` rather than an equality check) panicked on this same
+    /// arithmetic before the fix and is closed by the identical change,
+    /// found during review rather than in the issue's own repro.
     #[test]
     fn test_peek_str_does_not_panic_mid_multi_byte_character_2975() {
         for filter in [
@@ -9814,7 +9822,7 @@ mod tests {
             ".a？（",
             ".a：（",
             "reduce（",
-            "5（",
+            "-（",
             "[]（",
             "\"x\"（",
         ] {
