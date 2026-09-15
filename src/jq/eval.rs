@@ -27851,6 +27851,16 @@ pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> 
 /// `Pattern::Var` fold performs no step and stays off this gate -- `at`
 /// remains free for the ordinary write workloads (`.[] |= f`) that use
 /// neither shape.
+///
+/// #2896: `getpath` joins the list for the same reason, one step removed.
+/// It mints no *binding*, but it is the one navigating builtin that can
+/// hand back a value carrying its own absolute position ([`Snapshot::At`]),
+/// and that position is minted from — and later certified against —
+/// `Frame::at`. Leaving `getpath` off this gate left `at` at `None` for the
+/// filed repro (`path(foreach .[] as $k (.; getpath(["a"]); .b))`, a bare
+/// `Pattern::Var` fold with no `as`-binding anywhere), so no positional
+/// mark could be minted at all and the composition had nothing to start
+/// from. The cost is confined to programs that actually contain `getpath`.
 fn may_bind_navigated(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(
@@ -27859,6 +27869,7 @@ fn may_bind_navigated(expr: &Expr) -> bool {
                 | Expr::AsPattern { .. }
                 | Expr::FuncCall { .. }
                 | Expr::NamespacedCall { .. }
+                | Expr::Builtin(Builtin::GetPath(_))
         ) || matches!(
             e,
             Expr::Reduce { patterns, .. } | Expr::Foreach { patterns, .. }
@@ -27880,16 +27891,48 @@ fn may_bind_navigated(expr: &Expr) -> bool {
 /// way through `select(true)` would let `path(.a as $y | .c | 5 | $y |
 /// select(true))` re-establish at `.c` by value -- the exact confusion
 /// #2042 exists to rule out.
+/// `At(origin)` is the third kind (#2896): *positional* provenance, minted
+/// where a value's own absolute position is provable but the value was not
+/// frozen from a variable — `getpath`'s result on an untracked input, and
+/// a fold accumulator seeded from a trackable INIT/UPDATE branch. Like
+/// `Marked`, [`register_identical`] accepts it only through
+/// [`Frame::certifies`], so it proves *this node*, never merely this value.
+///
+/// It is a separate variant rather than a `Marked(Origin::At { .. })`
+/// precisely so [`Snapshot::is_marked`] stays `false` for it. `is_marked`
+/// does not mean "has provenance": it gates the recurse family's
+/// *deferral* (`resolve_node_sink`'s untracked guard, and the two
+/// `debug_assert!(trackable || snapshot.is_marked())` invariants that guard
+/// hands off to), where a frozen snapshot must reach the walk so the walk
+/// can emit *self* with the mark intact (#1591). A positional mark carries
+/// no such frozen-pointer guarantee, so reusing `Marked` here would
+/// silently turn several "raise now" refusals into deferred walks — a
+/// widening in the accepting direction with no oracle behind it.
 #[derive(Debug, Clone, PartialEq, Default)]
 enum Snapshot {
     #[default]
     No,
     Marked(Origin),
+    At(Origin),
 }
 
 impl Snapshot {
     fn is_marked(&self) -> bool {
         matches!(self, Self::Marked(_))
+    }
+
+    /// The origin this provenance proves a *position* with, for the two
+    /// readers that treat `Marked(At)` and `At` alike — [`register_identical`]
+    /// and the `getpath` arm's own input-position lookup. `Origin::Snapshot`
+    /// carries no position and answers `None`, as does an unprovenanced
+    /// branch.
+    fn position(&self) -> Option<&Origin> {
+        match self {
+            Self::No => None,
+            Self::Marked(origin) | Self::At(origin) => {
+                matches!(origin, Origin::At { .. }).then_some(origin)
+            }
+        }
     }
 }
 
@@ -28283,12 +28326,36 @@ impl<'a> PathBranch<'a> {
         }
     }
 
+    /// [`PathBranch::marked`]'s positional twin (#2896): an untracked branch
+    /// whose value is nonetheless provably *the node at* `origin`, without
+    /// being a frozen variable snapshot. Only `getpath`'s own untracked arm
+    /// and a fold accumulator's seeding mint these; see [`Snapshot::At`].
+    ///
+    /// The path stays empty for the same reason `marked`'s does: this
+    /// branch contributed no components of its own to the caller's prefix.
+    /// `origin` is an *absolute* position, checked only by
+    /// [`Frame::certifies`], and is not a path this branch may be assembled
+    /// at.
+    fn positioned(origin: Origin, value: Cow<'a, OwnedValue>) -> Self {
+        Self {
+            path: PathPrefix::root(),
+            value,
+            trackable: false,
+            snapshot: Snapshot::At(origin),
+            register: None,
+        }
+    }
+
     /// Rebuild as `untracked`/`snapshot` according to `snapshot`, for the
     /// sites that demote a branch but must not lose its provenance — see
     /// `FoldRegister::relocate` and `resolve_foreach`'s own emission (#1466).
     fn demoted(snapshot: Snapshot, value: Cow<'a, OwnedValue>) -> Self {
         match snapshot {
             Snapshot::Marked(origin) => Self::marked(origin, value),
+            // #2896: a demoted branch keeps a *positional* mark for the same
+            // reason it keeps a frozen one -- an outer register may still be
+            // the node this one names, and only `certifies` decides that.
+            Snapshot::At(origin) => Self::positioned(origin, value),
             Snapshot::No => Self::untracked(value),
         }
     }
@@ -29974,7 +30041,35 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                     // `path(try (.a, error([1,2,3])) catch getpath([]))`
                     // still raises "Invalid path expression with result
                     // [1,2,3]", just via that later check instead of here.
-                    if !trackable && !snapshot.is_marked() && keys.is_empty() {
+                    //
+                    // #2896: in **jq mode** that deferral is now
+                    // unconditional, not just for a frozen `$x`. `getpath([])`
+                    // is *exactly* `.`: `f_getpath` is `_jq_path_append(jq, a,
+                    // p, jv_getpath(a, p))`, and with an empty `p` both of
+                    // `_jq_path_append`'s arms return `a` and leave the
+                    // register alone. Raising here instead destroyed a live
+                    // register a later stage could still re-establish from --
+                    // `path(.a as $y | .a | 5 | getpath([]) | $y)` is `["a"]`
+                    // in jq 1.7.1, where this raised "with result 5". The
+                    // deferred branch is still refused by the same eventual
+                    // #530 check when nothing re-establishes, with the
+                    // identical message: `path(5 | getpath([]))` and
+                    // `path(try (.a, error([1,2,3])) catch getpath([]))` both
+                    // still report "Invalid path expression with result 5" /
+                    // "... [1,2,3]", exactly as jq does.
+                    //
+                    // yq mode keeps the eager refusal: `getpath` is not a real
+                    // yq builtin at all (its lexer rejects it; gated behind
+                    // `--jq-extensions` since #1512), so there is no yq oracle
+                    // for the deferred shape, and yq's scalar-write no-op
+                    // convention would turn a wrongly-deferred acceptance into
+                    // a silent corruption rather than a loud error -- the same
+                    // reasoning as [`trackable_step_register_eligible`].
+                    if S::TAG != EvalTag::Jq
+                        && !trackable
+                        && !snapshot.is_marked()
+                        && keys.is_empty()
+                    {
                         arg_escape = Some(EvalError::invalid_path_expression(value).into());
                         break;
                     }
@@ -30021,15 +30116,37 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                     // this arm's own doc comment above) — any non-empty
                     // `keys` genuinely indexed into `current`, which breaks
                     // the frozen-pointer identity regardless of ambient.
+                    // #2896 (Rule B): on an *untracked* input, the step did
+                    // not move jq's register at all (`f_getpath`'s
+                    // `!path_intact` arm), so it contributes no components
+                    // — reporting `components` here measured them against
+                    // the wrong origin anyway (`resolve_seq_stage` extends
+                    // the branch `prefix`, i.e. the *register's* position,
+                    // by components that are relative to the *input*), and
+                    // it set `StepRegisterFacts::navigated`, which alone
+                    // disqualified `reestablishes_register`. What the step
+                    // does contribute is the result's own absolute
+                    // position, whenever the input's is provable.
+                    let (step_path, step_snapshot) = if trackable || keys.is_empty() {
+                        (
+                            components,
+                            if keys.is_empty() {
+                                snapshot.clone()
+                            } else {
+                                Snapshot::No
+                            },
+                        )
+                    } else {
+                        (
+                            PathPrefix::root(),
+                            getpath_result_position(frame, snapshot, &components),
+                        )
+                    };
                     branches.push(PathBranch::passthrough(
-                        components,
+                        step_path,
                         current,
                         trackable,
-                        if keys.is_empty() {
-                            snapshot.clone()
-                        } else {
-                            Snapshot::No
-                        },
+                        step_snapshot,
                     ));
                 }
                 // The argument's own trailing escape only fires once the
@@ -31380,6 +31497,157 @@ fn cannot_move_register(expr: &Expr) -> bool {
     }
 }
 
+/// Rule B (#2896): the provenance `getpath(keys)`'s own result carries, when
+/// the result was produced from an *untracked* input.
+///
+/// jq's `f_getpath` returns `jv_getpath(a, p)` — for a container, a pointer
+/// *into* `a`'s own structure, not a copy. So the result is precisely the
+/// node at `a`'s position extended by `p`, and if that happens to be the
+/// node jq's register currently holds, the next `INDEX` finds `path_intact`
+/// true again and tracking silently resumes:
+///
+/// ```console
+/// $ echo '{"a":{"b":2}}' | jq -c 'path(. as $x | .a | $x | getpath(["a"]) | .b)'
+/// ["a","b"]
+/// $ echo '{"a":{"b":2},"c":{"b":3}}' | jq -c 'path(. as $x | .a | $x | getpath(["c"]) | .b)'
+/// jq: error: ... element "b" of {"b":3}      # lands elsewhere -> still refused
+/// ```
+///
+/// Both confirmed live against jq 1.7.1. Composing that needs the input's
+/// own absolute position, which for an untracked branch is exactly what a
+/// positional ambient ([`Snapshot::position`]) carries — a `$x` marker
+/// (`Marked(Origin::At)`), or another `getpath`'s own result (`At`). With
+/// none, there is nothing to compose from and the result gets no
+/// provenance, which costs a refusal.
+///
+/// A mark from a *different* resolver invocation is likewise dropped: its
+/// path is a position in another invocation's coordinate system, and
+/// [`Frame::certifies`] would reject it anyway.
+fn getpath_result_position(
+    frame: &Frame,
+    input_snapshot: &Snapshot,
+    components: &Rc<PathPrefix>,
+) -> Snapshot {
+    match input_snapshot.position() {
+        Some(Origin::At { invocation, path }) if *invocation == frame.invocation => {
+            Snapshot::At(Origin::At {
+                invocation: *invocation,
+                path: BindPath(PathPrefix::extend_many(&path.0, components.to_vec())),
+            })
+        }
+        _ => Snapshot::No,
+    }
+}
+
+/// A fold accumulator's own **positional** provenance (#2896), for the pair
+/// [`FoldRegister::branch_provenance`] hands to the next step.
+///
+/// A trackable branch is, by definition, the node at its own path, so its
+/// absolute position within `fold_frame` is exactly provable — and that is
+/// what [`getpath_result_position`] composes with to give `getpath`'s own
+/// result a position inside UPDATE/EXTRACT. `fold_frame` is the *fold's*
+/// frame (what INIT was resolved against, and what a relocated UPDATE
+/// branch's `path` is measured from), deliberately not `FoldRegister`'s
+/// own `frame`: the register's position and the accumulator's are different
+/// things, and the whole shape this fixes is the one where they differ.
+///
+/// `None` from [`Frame::origin_at`] means the frame is not tracking
+/// absolute positions at all ([`may_bind_navigated`] said this program has
+/// no use for them), so there is nothing to mint — a refusal, which is the
+/// safe direction.
+///
+/// An untracked branch keeps its own mark verbatim: whatever provenance it
+/// has is already the strongest available, and a branch that reached here
+/// untracked has no proven path of its own to mint from.
+fn accumulator_provenance(branch: &PathBranch<'_>, fold_frame: &Frame) -> Snapshot {
+    if branch.trackable {
+        fold_frame
+            .origin_at(&branch.path)
+            .map_or(Snapshot::No, Snapshot::At)
+    } else {
+        branch.snapshot.clone()
+    }
+}
+
+/// Whether `expr` is a `getpath(...)` stage, under any parenthesisation
+/// (#2896). A `getpath(...)?` is deliberately *not* one: `?` adds its own
+/// suppression layer between the stage and its result, and declining here
+/// costs only a refusal.
+fn is_getpath_stage(expr: &Expr) -> bool {
+    matches!(unwrap_paren(expr), Expr::Builtin(Builtin::GetPath(_)))
+}
+
+/// [`cannot_move_register`]'s one **dynamic** extension (#2896): whether a
+/// `getpath` stage entering on an already-untracked branch provably left
+/// jq's register where it was.
+///
+/// `cannot_move_register` is a static, per-expression predicate, and
+/// `Builtin::GetPath` is correctly absent from its allowlist: jq's
+/// `f_getpath` is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, whose
+/// first arm *does* advance the register — by `p` — whenever `path_intact(a)`
+/// holds. But its second arm does the exact opposite: when the input is not
+/// the register, it returns the value and leaves the register untouched,
+/// where an ordinary `.k` in the same slot raises instead. So the property
+/// is per-*branch*, not per-expression, and this is the branch half.
+///
+/// Confirmed live against jq 1.7.1 on `{"a":1,"b":2}`:
+///
+/// ```console
+/// $ jq -c 'path(.a as $y | .a | {b:9} | getpath(["b"]) | $y)'
+/// ["a"]                       # register survived the getpath stage
+/// $ jq -c 'path(.a as $y | .a | {b:9} | .b       | $y)'
+/// jq: error: ... element "b" of {"b":9}     # ordinary navigation raises
+/// ```
+///
+/// Two independent proofs, either of which is sufficient, and both of which
+/// establish `!path_intact` — never merely fail to establish `path_intact`:
+///
+/// - **The values differ.** `jv_identical` compares kind and then pointer
+///   (or, for a number, the raw representation); two values that are not
+///   even structurally equal are certainly not the same node. This is the
+///   proof that carries `… | 5 | getpath([]) | $y` and
+///   `… | {b:9} | getpath(["b"]) | $y`.
+/// - **The values are equal, but the input's own absolute position is
+///   provable and is not the register's.** `stage_frame` is where this
+///   stage's input sits (the carried register's position, once a
+///   non-navigating stage has stepped off it), so a positional mark that
+///   [`Frame::certifies`] rejects names a different node of an equal value —
+///   exactly the sibling-copy shape [`register_identical`] exists to refuse.
+///
+/// When the values are equal and *nothing* certifies a position, this
+/// answers `false` and the register is dropped exactly as before — a
+/// refusal, never a fabricated path. That asymmetry is the whole design:
+/// this predicate may only ever be consulted to *keep* a register, so a
+/// wrong `true` would accept a path jq refuses (the #1466 write-side hazard
+/// class), while a wrong `false` costs nothing but an error message.
+///
+/// **jq mode only**, for the reason [`trackable_step_register_eligible`]
+/// spells out: real yq's lexer rejects `getpath` outright (gated behind
+/// `--jq-extensions` since #1512), so there is no yq oracle for any of
+/// these shapes, and yq's own scalar-write no-op convention would turn a
+/// wrongly-accepted path into a silent corruption rather than a loud error.
+fn getpath_preserves_register<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    branch_trackable: bool,
+    branch_snapshot: &Snapshot,
+    register: Option<&OwnedValue>,
+    stage_frame: &Frame,
+) -> bool {
+    if S::TAG != EvalTag::Jq || branch_trackable || !is_getpath_stage(expr) {
+        return false;
+    }
+    let Some(register) = register else {
+        // Nothing live to preserve; the answer cannot matter, and `false`
+        // keeps this predicate's "only ever widens" contract trivially.
+        return false;
+    };
+    input != register
+        || branch_snapshot
+            .position()
+            .is_some_and(|origin| !stage_frame.certifies(origin))
+}
+
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
@@ -31430,7 +31698,16 @@ fn register_identical(
         && (null_bool_identical(value, register)
             || match snapshot {
                 Snapshot::No => false,
-                Snapshot::Marked(origin) => register_frame.certifies(origin),
+                // #2896: a positional mark is admitted by exactly the same
+                // rule as a frozen one. Both are only ever accepted through
+                // `certifies`, which compares an *absolute position*, so
+                // neither can promote a merely equal-valued sibling; what
+                // differs between them is which "raise now" guards defer
+                // (see [`Snapshot`]'s own doc comment), not how they are
+                // recognised here.
+                Snapshot::Marked(origin) | Snapshot::At(origin) => {
+                    register_frame.certifies(origin)
+                }
             })
 }
 
@@ -31543,9 +31820,27 @@ impl FoldRegister {
     /// register" without a second `identical()` call here. `None` (no
     /// branch survived a step, or this is a fresh accumulator with nothing
     /// to compare) answers `(false, false)`.
-    fn branch_provenance(&self, branch: Option<&PathBranch<'_>>) -> (bool, Snapshot) {
+    /// #2896: the returned `Snapshot` is the accumulator's own **positional**
+    /// provenance, not a verbatim copy of `branch.snapshot`. A trackable
+    /// branch *is* the node at its own path by definition, so it hands out
+    /// `Snapshot::At(fold_frame.origin_at(path))` where it used to hand out
+    /// the type's `Snapshot::No` (a trackable branch never carries a mark --
+    /// that is `PathBranch`'s own invariant). Nothing else could supply it:
+    /// `FoldRegister` records the *register's* frame, while this is the
+    /// accumulator's, and the two differ on exactly the shape this issue is
+    /// about (`path(foreach .[] as $k (.; getpath(["a"]); .b))` -- register at
+    /// `["a"]` from the navigating SOURCE, accumulator at `[]` from `INIT = .`).
+    /// Without it, a `getpath` inside UPDATE has no input position to compose
+    /// from and mints nothing.
+    ///
+    /// An untracked branch keeps whatever mark it already had, unchanged.
+    fn branch_provenance(
+        &self,
+        branch: Option<&PathBranch<'_>>,
+        fold_frame: &Frame,
+    ) -> (bool, Snapshot) {
         let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
-        let snapshot = branch.map_or(Snapshot::No, |b| b.snapshot.clone());
+        let snapshot = branch.map_or(Snapshot::No, |b| accumulator_provenance(b, fold_frame));
         (at_register, snapshot)
     }
 
@@ -31728,7 +32023,31 @@ impl FoldRegister {
                 if b.trackable {
                     let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
                     PathBranch::new(path, b.value, true)
-                } else if self.identical(&b.value, &b.snapshot, identical_eligible) {
+                } else if self.identical(
+                    &b.value,
+                    &b.snapshot,
+                    // #2896: #2860's gate exists to stop *position-blind*
+                    // value equality from second-guessing a verdict
+                    // `resolve_seq`/`resolve_node` already reached with full
+                    // position awareness. A `Snapshot::At` mark is not
+                    // position-blind: it is an exact absolute-position proof,
+                    // minted by the `getpath` arm at the moment it produced
+                    // this very value, from the input's own proven position
+                    // composed with the keys it actually navigated. So it is
+                    // admitted even where `cannot_move_register(expr)` is
+                    // `false` -- which for `getpath` it always is.
+                    //
+                    // Deliberately *not* widened to `Marked(Origin::At)`,
+                    // which `Snapshot::position` also answers for: a `Marked`
+                    // origin names where a *variable* was bound, which says
+                    // nothing about where the expression that produced this
+                    // branch ended up, and admitting it here is exactly the
+                    // regression #2860 closed (`path(foreach .a as $v0 (.;
+                    // $v0; (.zzz | $v0)))` answered `["a"]` instead of
+                    // raising, and `del()` through it corrupted a document jq
+                    // refuses to touch).
+                    identical_eligible || matches!(b.snapshot, Snapshot::At(_)),
+                ) {
                     PathBranch::new(Rc::clone(&self.path), b.value, true)
                 } else {
                     // Demoting must not erase the snapshot mark: a fold
@@ -33095,7 +33414,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
             trackable,
             snapshot.clone(),
         );
-        let (path_trackable, path_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        let (path_trackable, path_snapshot) = reg.branch_provenance(Some(&doc_branch), frame);
         // #2732: `branch_provenance` alone answers only "is `.` still
         // *where* the register is" -- a pure path comparison, blind to
         // every other case jq's own `jv_identical` still admits despite
@@ -33285,7 +33604,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // register's own seeding (`enter`) is the `acc == reg.value` case,
         // which is a genuine navigation to the register's own path.
         let mut acc_at_register = init_branch.trackable;
-        let mut acc_snapshot = init_branch.snapshot.clone();
+        // #2896: the accumulator's own position — see `resolve_foreach`'s
+        // identical seeding and [`accumulator_provenance`]. `reduce`'s own
+        // final re-entry check still refuses whatever this admits inside
+        // UPDATE (`path(reduce .[] as $k (.; getpath(["a"])))` raises "with
+        // result {...}" on both binaries, before and after this change) —
+        // that boundary is the canary this seeding must not move.
+        let mut acc_snapshot = accumulator_provenance(init_branch, frame);
         let mut aborted: Option<Control> = None;
         // #2031: unlike `resolve_foreach` below, every step here is checked
         // against the fold's own persistent `reg`, never a per-step
@@ -33487,7 +33812,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     // starting point purely from this step's own output
                     // branch, same as before #2632.
                     let last = branches.into_iter().last();
-                    (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref());
+                    (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref(), frame);
                     acc = last.map(|b| b.value.into_owned());
                     Demand::Continue
                 }
@@ -33665,7 +33990,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // own doc comment for why this can no longer be re-derived from a
         // bare `==` inside `resolve` itself.
         let mut state_at_register = init_branch.trackable;
-        let mut state_snapshot = init_branch.snapshot.clone();
+        // #2896: the accumulator's own position, not INIT's bare mark — see
+        // [`accumulator_provenance`]. `INIT = .` makes the accumulator the
+        // document root, which is what the filed repro's `getpath(["a"])`
+        // composes against inside UPDATE.
+        let mut state_snapshot = accumulator_provenance(init_branch, frame);
         let mut aborted: Option<Control> = None;
         // The source is driven by demand (#2235): each element is folded
         // here, inside the drive, before the next one is pulled, so a step
@@ -33895,7 +34224,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
             // then . else $v end))` names `1` in jq 1.7.1's second refusal.
             if update_branches.is_empty() {
-                (state_at_register, state_snapshot) = reg.branch_provenance(None);
+                (state_at_register, state_snapshot) = reg.branch_provenance(None, frame);
             }
             for update_branch in &update_branches {
                 // Every output, not just the last: a review pass tried
@@ -33908,7 +34237,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
                 // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
                 // "result 1" -- a wrong accept, the write-side hazard class.
-                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch));
+                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch), frame);
                 state = update_branch.value.clone().into_owned();
                 if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
@@ -33923,7 +34252,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     // snapshot)` — structurally, not by a second
                     // `identical()` check (#1590).
                     let (extract_at_register, extract_snapshot) =
-                        extract_reg.branch_provenance(Some(update_branch));
+                        extract_reg.branch_provenance(Some(update_branch), frame);
                     match drain_path_result(
                         extract_reg.resolve::<S>(
                             ext_expr,
@@ -36804,16 +37133,6 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     } else {
         Keep::AtMost(usize::MAX)
     };
-    // Whether this stage can carry a live path register across itself
-    // at all (#1573). `false` is the answer for every stage this
-    // resolver cannot see inside, because jq's register moves on any
-    // `INDEX` the stage executes — including the ones hidden in a
-    // jq-defined builtin (`first` is `.[0]`) or a user function body,
-    // which arrive here as one opaque computed value. See
-    // [`cannot_move_register`]: dropping the register merely costs a
-    // refusal, keeping a stale one fabricates a path.
-    let stage_preserves_register = cannot_move_register(element);
-
     let PathBranch {
         path: prefix,
         value: current,
@@ -36851,6 +37170,29 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // for those). What an `Origin::At` marker met in this stage, directly
     // or through a passthrough, is certified against.
     let stage_frame = frame.extend(&prefix);
+    // Whether this stage can carry a live path register across itself
+    // at all (#1573). `false` is the answer for every stage this
+    // resolver cannot see inside, because jq's register moves on any
+    // `INDEX` the stage executes — including the ones hidden in a
+    // jq-defined builtin (`first` is `.[0]`) or a user function body,
+    // which arrive here as one opaque computed value. See
+    // [`cannot_move_register`]: dropping the register merely costs a
+    // refusal, keeping a stale one fabricates a path.
+    //
+    // #2896: `getpath` is the one stage whose answer is per-*branch*
+    // rather than per-expression (jq's `f_getpath` advances the register
+    // only when its input *is* the register), so the static predicate is
+    // joined by [`getpath_preserves_register`] and this is computed after
+    // the branch is in hand rather than from `element` alone.
+    let stage_preserves_register = cannot_move_register(element)
+        || getpath_preserves_register::<S>(
+            element,
+            &current,
+            branch_trackable,
+            &branch_snapshot,
+            carried_register.as_deref(),
+            &stage_frame,
+        );
     let mut downstream: Option<ResolveFlow> = None;
     let flow = resolve_against_cow_sink::<S>(
         element,
