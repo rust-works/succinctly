@@ -123,14 +123,23 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "(.a | $v | getpath([\"a\"]) | .b?)", "(.c | $v | getpath([\"c\"]) | .b?)",
         "(5 | getpath([]) | $v)", "({b:9} | getpath([\"b\"]) | $v)",
         "(.a | 5 | getpath([]) | $v)", "(.a | {b:9} | getpath([\"b\"]) | $v)",
-        "reduce (1) as $i (.; getpath([\"a\"]))",
-        "reduce (1) as $i (.; getpath([\"a\"]); .b?)",
-        "foreach (1) as $i (.; getpath([\"a\"]); .b?)",
-        "foreach (1) as $i (.; getpath([\"c\"]); .b?)",
-        "foreach (1) as $i (.a; getpath([\"b\"]); .)",
-        "foreach (1,2) as $i (.; getpath([\"a\"]); .b?)",
+        # Fold shapes are wrapped in `$v | ...` rather than written bare:
+        # the bind is what this harness exists to exercise, and a pool entry
+        # that never mentions `$v` leaves it dead (review finding on #2896).
+        # The wrapper feeds the fold its ambient input and leaves the
+        # accumulator/register composition under test unchanged.
+        #
+        # `reduce` takes exactly two clauses -- a three-clause spelling is a
+        # parse error in *both* binaries, which `classify()` used to score
+        # "agree". It is `foreach` that has EXTRACT.
+        "($v | reduce (1) as $i (.; getpath([\"a\"])))",
+        "($v | reduce (1) as $i (.; getpath([\"a\"]) | .b?))",
+        "($v | foreach (1) as $i (.; getpath([\"a\"]); .b?))",
+        "($v | foreach (1) as $i (.; getpath([\"c\"]); .b?))",
+        "($v | foreach (1) as $i (.a; getpath([\"b\"]); .))",
+        "($v | foreach (1,2) as $i (.; getpath([\"a\"]); .b?))",
         "foreach (1) as $i (.; $v | getpath([\"a\"]); .b?)",
-        "foreach .[]? as $i (.; getpath([\"a\"]); .b?)"]
+        "($v | foreach .[]? as $i (.; getpath([\"a\"]); .b?))"]
 
 # #2649 destructuring patterns: (pattern, the variable the body then uses).
 # `V` is replaced by this bind's generated name, `W` by its sibling.
@@ -223,6 +232,13 @@ def run(cmd, data):
 def classify(j, s):
     (je, jo), (se, so) = j, s
     if je == 124 or se == 124: return "timeout"
+    # A program neither binary can even compile is not evidence of anything,
+    # but `je == se and jo == so` scored it "agree" -- so a pool entry with a
+    # syntax error in it inflated the agreement count instead of being
+    # noticed (review finding on #2896: a three-clause `reduce` in the
+    # getpath-stage pool accounted for 164 of 6000 "agreements"). jq and
+    # succinctly both exit 3 on a compile error.
+    if je == 3 and se == 3: return "both-reject"
     if je == se and jo == so: return "agree"
     if je != 0 and se == 0: return "fabricate"
     if je == 0 and se != 0: return "refuse-only"
@@ -255,7 +271,8 @@ def main():
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
-    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "fabricate-baseline", "mismatch-baseline", "timeout"]
+    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "both-reject",
+             "fabricate-baseline", "mismatch-baseline", "timeout"]
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
