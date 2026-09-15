@@ -47092,3 +47092,65 @@ fn test_skip_count_generators_extension_2934() -> Result<()> {
     }
     Ok(())
 }
+/// #2874: yq mode's own convention must not move when jq mode's
+/// `jq_compat` bool is folded into `JsonConvention`.
+///
+/// This is the repo's "shared helper needs a dual-mode check" rule applied
+/// to a refactor rather than a fix. `JsonFormatOpts` is shared by both
+/// runners, and yq's construction site used to pass `control_escape: Yq`
+/// plus a documented dummy `jq_compat: true` it never consulted; folding
+/// both into `convention: Preserve` removes the dummy, but only if
+/// `(Yq, true)` really was `Preserve` and nothing downstream read the
+/// dummy for something else. A wrong answer here is silent, so pin the two
+/// halves of yq's bundle -- byte-for-byte number literals (#1008) and yq's
+/// own escape table -- across every JSON-emitting route.
+#[test]
+fn yq_output_convention_unchanged_by_the_jsonconvention_fold_2874() -> Result<()> {
+    // Real yq preserves a document number literal byte-for-byte regardless
+    // of magnitude or query shape (#1008): `1e100` must not become
+    // `1E+100` (jq's spelling) at any indent or sort setting.
+    let input = "a: 1e100\nb: 0.1e1\nc: 1E5\n";
+
+    for extra in [
+        vec!["-o", "json"],
+        vec!["-o", "json", "-I0"],
+        vec!["-o", "json", "-S"],
+        vec!["-o", "json", "-a"],
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &extra)?;
+        assert_eq!(code, 0, "args={extra:?}");
+        for literal in ["1e100", "0.1e1", "1E5"] {
+            assert!(
+                out.contains(literal),
+                "args={extra:?}: lost the {literal} spelling in {out:?}"
+            );
+        }
+        assert!(
+            !out.contains("1E+100"),
+            "args={extra:?}: reformatted to jq's spelling in {out:?}"
+        );
+    }
+
+    // `@json` and string interpolation go through `to_json_yq`, which
+    // #2874 deliberately left outside the convention-keyed mapping -- so
+    // pin that they still preserve too.
+    let (out, code) = run_yq_stdin("@json", input, &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("1e100"), "@json reformatted: {out:?}");
+
+    let (out, code) = run_yq_stdin(".a | tojson", input, &[])?;
+    assert_eq!(code, 0);
+    assert!(out.contains("1e100"), "tojson reformatted: {out:?}");
+
+    // yq's escape table is the other half of the bundle: a backspace stays
+    // the long `` form, where jq's table would give the short one.
+    let escaped = "s: \"a\\bb\"\n";
+    let (out, code) = run_yq_stdin(".", escaped, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("\\u0008"),
+        "yq's escape table moved to jq's: {out:?}"
+    );
+
+    Ok(())
+}

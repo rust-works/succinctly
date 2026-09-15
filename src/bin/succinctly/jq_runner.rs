@@ -1236,7 +1236,7 @@ struct PreparedField<'a> {
     /// `write_object_key` gates this on the active `JsonConvention` exactly
     /// like `write_json_string_pretty`'s twin fix in `src/json/light.rs`,
     /// not unconditionally. (Which *side* of the convention it should gate
-    /// on is FIXME(#2988) -- see `write_json_string_zero_copy`.)
+    /// on is FIXME(#2985) -- see `write_json_string_zero_copy`.)
     has_del: bool,
 }
 
@@ -1432,7 +1432,7 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
 /// sibling ones in `print_json`/`keys_unsorted`, #2592) that used to each
 /// hand-roll this gate-and-branch shape independently.
 ///
-/// FIXME(#2988): the gate is keyed on the wrong axis. #2874 translated it
+/// FIXME(#2985): the gate is keyed on the wrong axis. #2874 translated it
 /// behaviour-preservingly from `config.jq_compat` to
 /// `!preserves_source_values()`, but the escape table is a *mode* rule that
 /// `--preserve-input` must not touch (#2209) -- so this should read

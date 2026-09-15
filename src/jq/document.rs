@@ -128,7 +128,7 @@ impl IndentSpec {
 /// reason recorded at the site: `OwnedValue::to_json_yq` (its
 /// `to_json_at_depth` family hardcodes jq's escape table for every
 /// variant, so the `Preserve` mapping would be a false equivalence), and
-/// the DEL zero-copy gate (FIXME(#2988) -- it reads the preserve axis
+/// the DEL zero-copy gate (FIXME(#2985) -- it reads the preserve axis
 /// where it means the escape one).
 ///
 /// - `Preserve`: echo the document's source number spelling verbatim

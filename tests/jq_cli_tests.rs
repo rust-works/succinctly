@@ -56331,3 +56331,185 @@ fn test_skip_count_generators_2934() -> Result<()> {
     assert_eq!((out.as_str(), err.as_str(), code), ("10\n20\n", "COUNT", 7));
     Ok(())
 }
+/// #2874: the whole preserve-vs-reformat flag matrix, in one place.
+///
+/// The refactor that folded `OutputConfig::jq_compat` and
+/// `JsonFormatOpts::{control_escape, jq_compat}` into a single
+/// `JsonConvention` had to translate six independent consumers -- the M2
+/// raw-passthrough gate, the DEL zero-copy gate, the `json_numbers`
+/// selection, the `to_json`/`to_json_jq_preserve` pick, the
+/// `JqCompatFormatter`/`PreserveFormatter` selection and the duplicate-key
+/// collapse -- each to the axis it actually meant. A mis-mapped axis is a
+/// *silent* output change, so this sweeps every output-shaping flag against
+/// both modes rather than spot-checking the routes the refactor happened to
+/// touch.
+///
+/// Sibling to `test_preserve_input_number_spelling_survives_materializing_routes_2852`,
+/// which pins the same axis for the routes #2852 fixed; this one is the
+/// breadth check, and deliberately covers the *default* mode too, since a
+/// mis-mapped axis is just as likely to break the common path as the opt-in
+/// one.
+#[test]
+fn test_preserve_vs_reformat_axis_across_every_output_flag_2874() -> Result<()> {
+    // `1e-3` reformats to `0.001` and `4e4` to `4E+4` -- two spellings that
+    // move in opposite directions, so an accidentally-swapped gate cannot
+    // look like a no-op.
+    let input = r#"{"a":1e-3,"b":4e4}"#;
+    let preserved = r#"{"a":1e-3,"b":4e4}"#;
+    let reformatted = r#"{"a":0.001,"b":4E+4}"#;
+
+    // Every flag combination that selects a different output route. `-c`
+    // throughout so the expectation is one compact line; the pretty routes
+    // get their own case below. `--slurp` wraps in an array, `--seq`
+    // prefixes an RS byte and `-j` drops the trailing newline, so this
+    // compares on the substring carrying the numbers rather than teaching
+    // the loop each wrapper's exact shape.
+    for extra in [
+        vec![],
+        vec!["-S"],
+        vec!["-a"],
+        vec!["-S", "-a"],
+        vec!["--slurp"],
+        vec!["-j"],
+    ] {
+        for (preserve, expected) in [(true, preserved), (false, reformatted)] {
+            let mut args = vec!["-c"];
+            args.extend(extra.iter().copied());
+            if preserve {
+                args.push("--preserve-input");
+            }
+            let (out, code) = run_jq_stdin(".", input, &args)?;
+            assert_eq!(code, 0, "args={args:?}");
+            assert!(
+                out.contains(expected),
+                "args={args:?}: expected {expected} in {out:?}"
+            );
+        }
+    }
+
+    // Pretty (no `-c`) and `--tab`: same axis, different writer.
+    for extra in [vec![], vec!["--tab"], vec!["-S"]] {
+        for (preserve, needle, absent) in [(true, "1e-3", "0.001"), (false, "0.001", "1e-3")] {
+            let mut args = extra.clone();
+            if preserve {
+                args.push("--preserve-input");
+            }
+            let (out, code) = run_jq_stdin(".", input, &args)?;
+            assert_eq!(code, 0, "args={args:?}");
+            assert!(out.contains(needle), "args={args:?}: {out:?}");
+            assert!(!out.contains(absent), "args={args:?}: {out:?}");
+        }
+    }
+
+    // `-C` wraps the same text in ANSI codes; check containment, both ways.
+    for (preserve, needle, absent) in [(true, "1e-3", "0.001"), (false, "0.001", "1e-3")] {
+        let args: Vec<&str> = if preserve {
+            vec!["-C", "-c", "--preserve-input"]
+        } else {
+            vec!["-C", "-c"]
+        };
+        let (out, code) = run_jq_stdin(".", input, &args)?;
+        assert_eq!(code, 0, "args={args:?}");
+        assert!(out.contains(needle), "args={args:?}: {out:?}");
+        assert!(!out.contains(absent), "args={args:?}: {out:?}");
+    }
+
+    Ok(())
+}
+
+/// #2874: the duplicate-key axis rides the same `JsonConvention` value as
+/// number spelling, and its gate was translated in the same pass -- so pin
+/// it across the same routes rather than trusting that one half of the
+/// bundle moving implies the other did.
+///
+/// jq collapses a repeated key to its first position holding its last value
+/// (#1385); `--preserve-input` keeps every occurrence, which ADR-0018 rule 5
+/// allows because no reference-defined filter is perturbed.
+///
+/// **This test pins a known gap, not the intended behaviour.** Writing it
+/// is what found the gap: `--preserve-input` keeps duplicates only on the
+/// cursor-streaming routes (`-c`, `-S -c`, pretty). The materializing ones
+/// (`-a`, `-s`/`--slurp`, `-C`) collapse them regardless -- the exact
+/// counterpart, for the duplicate-key half of the bundle, of the
+/// number-spelling gap #2852 closed for those same routes. Verified
+/// pre-existing against the pre-refactor binary (identical on every row
+/// here), so #2874 neither caused nor fixed it; filed as #2986.
+#[test]
+fn test_duplicate_key_axis_follows_the_same_convention_2874() -> Result<()> {
+    let input = r#"{"a":1,"a":2,"b":3}"#;
+
+    // Default mode collapses on every route, matching real jq 1.7.1.
+    for extra in [vec![], vec!["-S"], vec!["-a"], vec!["--slurp"]] {
+        let mut compat = vec!["-c"];
+        compat.extend(extra.iter().copied());
+        let (out, code) = run_jq_stdin(".", input, &compat)?;
+        assert_eq!(code, 0, "args={compat:?}");
+        assert!(
+            out.contains(r#""a":2"#) && !out.contains(r#""a":1"#),
+            "args={compat:?}: expected the collapse, got {out:?}"
+        );
+    }
+
+    // `--preserve-input` keeps both occurrences on the cursor-streaming
+    // routes ...
+    for extra in [vec!["-c"], vec!["-c", "-S"], vec![]] {
+        let mut args = extra.clone();
+        args.push("--preserve-input");
+        let (out, code) = run_jq_stdin(".", input, &args)?;
+        assert_eq!(code, 0, "args={args:?}");
+        assert!(
+            out.contains(r#""a": 1"#) || out.contains(r#""a":1"#),
+            "args={args:?}: expected both occurrences, got {out:?}"
+        );
+    }
+
+    // ... and loses them on the materializing ones (#2986, pre-existing).
+    for extra in [vec!["-c", "-a"], vec!["-c", "--slurp"]] {
+        let mut args = extra.clone();
+        args.push("--preserve-input");
+        let (out, code) = run_jq_stdin(".", input, &args)?;
+        assert_eq!(code, 0, "args={args:?}");
+        assert!(
+            !out.contains(r#""a":1"#),
+            "args={args:?}: #2986 is fixed -- update this test's expectation, got {out:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2874: `--preserve-input` must not cross into yq's escape table.
+///
+/// This is the #2209 rule, and the axis the refactor most easily could have
+/// mis-mapped: `JqPreserveInput` preserves source *values* while still
+/// escaping like jq, so a consumer reaching for `preserves_source_values()`
+/// where it meant `uses_jq_escape_table()` would silently render jq-mode
+/// strings through yq's table.
+///
+/// The one site where exactly that is still true is the DEL zero-copy gate
+/// -- a pre-existing bug this pass deliberately preserved rather than fixed
+/// (FIXME(#2985)). Backspace is the probe here precisely because it takes
+/// the non-DEL path, and so pins the rule that does hold today.
+#[test]
+fn test_preserve_input_keeps_jq_escape_table_2874() -> Result<()> {
+    // A backspace: jq's table has the short form, yq's spells it as the
+    // long `` (confirmed against jq 1.7.1 and yq v4.53.3).
+    let input = "{\"s\":\"a\\bb\"}";
+
+    for extra in [vec!["-c"], vec!["-c", "-S"], vec!["-c", "-a"], vec![]] {
+        for preserve in [false, true] {
+            let mut args = extra.clone();
+            if preserve {
+                args.push("--preserve-input");
+            }
+            let (out, code) = run_jq_stdin(".", input, &args)?;
+            assert_eq!(code, 0, "args={args:?}");
+            assert!(
+                out.contains("\\b") && !out.contains("\\u0008"),
+                "args={args:?}: jq's escape table is a mode rule, got {out:?}"
+            );
+        }
+    }
+
+    Ok(())
+}
