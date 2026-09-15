@@ -41,8 +41,8 @@ use super::m2_gate::can_use_m2_streaming;
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, flush_then_err, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle,
-    InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
+    self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, FloatStyle, InputLocation,
+    JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -4496,11 +4496,13 @@ fn output_value<W: Write>(
                 FloatStyle::PreserveWholeFloat
             },
             json_sourced: config.json_sourced_floats,
-            control_escape: ControlEscape::Yq,
-            // Only meaningful alongside `ControlEscape::Jq` -- yq mode has
-            // its own `json_sourced`-gated preserve/reformat split above
-            // and never consults this field.
-            jq_compat: true,
+            // #2874: was `control_escape: ControlEscape::Yq` plus a
+            // documented dummy `jq_compat: true` this site never consults.
+            // `Preserve` is exactly that pair -- yq's whole bundle: its own
+            // escape table, and byte-for-byte literal preservation (#1008).
+            // The dummy existed only because the two axes were stored
+            // separately; absorbing both into one value removes it.
+            convention: JsonConvention::Preserve,
         },
     );
 
