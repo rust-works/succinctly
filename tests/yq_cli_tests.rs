@@ -34050,6 +34050,20 @@ fn test_yq_fromjson_lone_high_surrogate_raises_2013() -> Result<()> {
 // shape.
 // ---------------------------------------------------------------------------
 
+/// #2975: `Parser::peek_str`'s byte-offset arithmetic is shared by both
+/// modes -- a multi-byte character right after a field name panicked here
+/// too before the fix (confirmed live on the pre-fix binary: same "byte
+/// index N is not a char boundary" panic, exit 101). Now a clean parse
+/// error, no panic.
+#[test]
+fn test_yq_multi_byte_character_after_a_token_is_a_parse_error_not_a_panic_2975() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a（", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "no document should be emitted");
+    assert!(stderr.contains("parse error"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// An undefined function is rejected before any document is parsed, with yq's
 /// wording and its uniform failure code.
 #[test]
