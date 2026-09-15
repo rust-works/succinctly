@@ -63,7 +63,7 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::eval::collect_pattern_var_names;
+use super::eval::pattern_alternatives_var_names;
 use super::walk::{builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Expr, ObjectKey, Pattern, StringPart};
 
@@ -858,6 +858,13 @@ pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
 /// keep seeing function-only results — real yq has no compile-time variable
 /// check to match (#2981), so folding variable errors into its output would
 /// make succinctly yq reject programs real yq accepts.
+///
+/// This filter is about *variable* errors only, not a promise that every
+/// `Call` entry predates #2734 unchanged — `check_pattern_keys`'s own doc
+/// comment (private, this module) records the one place a `Call` entry can
+/// newly appear here too (a pattern's computed key), and why that is the
+/// correct extension of yq mode's own pre-existing function-call policy
+/// rather than a new one.
 pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
     resolve_all(expr)
         .into_iter()
@@ -936,6 +943,21 @@ fn in_var_scope(var_scope: &VarScope, name: &str) -> bool {
 /// computed key referencing an undefined function or variable was silently
 /// unchecked — this closes that gap as a side effect of needing to visit the
 /// same nodes for #2734's own purposes, not a separate fix.
+///
+/// **Reaches yq mode too, unlike the rest of #2734.** The *variable* half
+/// stays jq-only (`resolve_func_calls_all` filters `ResolveError::Var` out
+/// for `yq_runner.rs`, per that function's own doc comment), but the *call*
+/// half does not: a computed key's undefined function call is a genuine
+/// `ResolveError::Call`, indistinguishable here from one found anywhere else
+/// in the tree, and `resolve_func_calls_all` keeps every `Call` entry
+/// regardless of where `check` found it. This is intentional, not
+/// collateral damage: `yq_runner.rs` already runs `resolve_func_calls`
+/// unconditionally over every program (an undefined function anywhere else
+/// already fails to compile in yq mode today, confirmed live:
+/// `succinctly yq 'nosuchfn'` → exit 1, `nosuchfn/0 is not defined`) — the
+/// pre-existing gap being closed here was that one specific position
+/// (inside a pattern's computed key) silently escaped that same,
+/// already-established policy, not that yq mode gained a new one.
 fn check_pattern_keys(
     pattern: &mut Pattern,
     scope: &mut Scope,
@@ -959,6 +981,26 @@ fn check_pattern_keys(
             }
         }
     }
+}
+
+/// Checks every `?//`-alternative's computed keys, then returns the union of
+/// every name any alternative could bind, deduped -- the shared shape
+/// `Expr::AsPattern`/`Expr::Reduce`/`Expr::Foreach` each need before binding
+/// their body/update/extract. Delegates the union-and-dedup step to
+/// `eval.rs`'s existing [`pattern_alternatives_var_names`] rather than
+/// re-deriving it a third time here — its own doc comment records #2180
+/// already finding and closing five copies of exactly this shape.
+fn bind_patterns(
+    patterns: &mut [Pattern],
+    scope: &mut Scope,
+    var_scope: &mut VarScope,
+    errors: &mut Vec<ResolveError>,
+    reachable: &BTreeSet<usize>,
+) -> Vec<String> {
+    for pattern in patterns.iter_mut() {
+        check_pattern_keys(pattern, scope, var_scope, errors, reachable);
+    }
+    pattern_alternatives_var_names(patterns)
 }
 
 /// #2036: the arity `fallback` -- a successfully-parsed builtin or
@@ -1271,11 +1313,7 @@ fn check(
         } => {
             check(expr, scope, var_scope, errors, reachable);
             let outer = var_scope.len();
-            let mut bound = Vec::new();
-            for pattern in patterns.iter_mut() {
-                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
-                collect_pattern_var_names(pattern, &mut bound);
-            }
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
             var_scope.extend(bound);
             check(body, scope, var_scope, errors, reachable);
             var_scope.truncate(outer);
@@ -1306,12 +1344,11 @@ fn check(
             // A parameter binds its bare name at arity 0 only: `def f(g):
             // g(1)` is `g/1 is not defined` in jq, not a call to the outer
             // `g`. Pushed after the function's own name so a parameter
-            // shadowing it wins.
-            for p in params.iter() {
-                scope.push((p.name().to_string(), 0));
-            }
+            // shadowing it wins. A `$`-style parameter also binds `$name`
+            // in the same pass over `params`, one loop for both namespaces.
             let var_outer = var_scope.len();
             for p in params.iter() {
+                scope.push((p.name().to_string(), 0));
                 if p.is_dollar() {
                     var_scope.push(p.name().to_string());
                 }
@@ -1379,11 +1416,7 @@ fn check(
             check(input, scope, var_scope, errors, reachable);
             check(init, scope, var_scope, errors, reachable);
             let outer = var_scope.len();
-            let mut bound = Vec::new();
-            for pattern in patterns.iter_mut() {
-                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
-                collect_pattern_var_names(pattern, &mut bound);
-            }
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
             var_scope.extend(bound);
             check(update, scope, var_scope, errors, reachable);
             var_scope.truncate(outer);
@@ -1401,11 +1434,7 @@ fn check(
             check(input, scope, var_scope, errors, reachable);
             check(init, scope, var_scope, errors, reachable);
             let outer = var_scope.len();
-            let mut bound = Vec::new();
-            for pattern in patterns.iter_mut() {
-                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
-                collect_pattern_var_names(pattern, &mut bound);
-            }
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
             var_scope.extend(bound);
             check(update, scope, var_scope, errors, reachable);
             check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable);

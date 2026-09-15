@@ -1683,15 +1683,21 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
     // Only consulted on this error path, so the extra parse is never on
     // anyone's hot path -- see `jq::collect_call_sites`.
     let call_sites = jq::collect_call_sites(filter, jq::ParserMode::Jq, true);
-    // How many calls of each name we have already reported, so a repeated
-    // undefined name walks its own successive call sites in source order --
-    // the same rule `call_resume_from` gives the fallback.
-    let mut consumed: HashMap<&str, usize> = HashMap::new();
+    // #2734: the same, for `$name` variable references -- see
+    // `jq::collect_var_sites`.
+    let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
+    // How many calls/variables of each name we have already reported, so a
+    // repeated undefined name walks its own successive sites in source
+    // order -- the same rule `call_resume_from`/`var_resume_from` gives the
+    // fallback. Separate maps for the same reason those are separate: a
+    // call named `f` and a variable named `f` are unrelated occurrences.
+    let mut calls_consumed: HashMap<&str, usize> = HashMap::new();
+    let mut vars_consumed: HashMap<&str, usize> = HashMap::new();
 
     for error in errors {
         match error {
             jq::ResolveError::Call(jq::UnresolvedCall { name, arity }) => {
-                let taken = consumed.entry(name.as_str()).or_insert(0);
+                let taken = calls_consumed.entry(name.as_str()).or_insert(0);
                 // Matched on arity as well as name (#2085 review, finding 2):
                 // an `f/1` diagnostic must not take a perfectly resolvable
                 // `f/2` call site earlier in the source. `def f(a;b): a;
@@ -1740,7 +1746,45 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
                 }
             }
             jq::ResolveError::Var(jq::UnboundVar { name }) => {
-                let needle = alloc_string_dollar(name);
+                let taken = vars_consumed.entry(name.as_str()).or_insert(0);
+                // #2734: prefer the real reference position from `var_sites`
+                // over the text-search fallback -- a blind search for
+                // `${name}` can land inside a string literal, or on an
+                // earlier, genuinely *bound* occurrence of the same name,
+                // neither of which is the failing reference. See
+                // `jq::VarSite`'s own doc comment for the one class of
+                // ambiguity this still can't resolve (two same-named
+                // references differing only by lexical scope), the same
+                // known limitation `jq::CallSite` has for calls (#2635).
+                let from_table = var_sites
+                    .iter()
+                    .filter(|v| v.name == *name)
+                    .nth(*taken)
+                    .map(|v| v.offset);
+                if let Some(offset) = from_table {
+                    *taken += 1;
+                    var_resume_from.insert(name.as_str(), offset + name.len() + 1);
+                    let (line_no, line_text, column) = line_at_offset(filter, offset);
+                    eprintln!("jq: error: ${name} is not defined at <top-level>, line {line_no}:");
+                    eprintln!("{line_text}{}", " ".repeat(column));
+                    continue;
+                }
+
+                // Fallback, for the same reason `call_sites` needs one: a
+                // variable reference inlined from an `include`d module or
+                // `~/.jq` has no occurrence in `filter`'s own text at all --
+                // exercised by this arm's `None` branch below (test:
+                // `test_unbound_variable_from_included_module_omits_the_location_2734`).
+                // The `Some` branch, kept for structural symmetry with the
+                // `Call` arm above, is not known to have a live repro for
+                // variables specifically: `call_sites` can under-record
+                // relative to a blind text search because calls carry
+                // retry/shadow/builtin-fallback machinery a second,
+                // simpler re-parse can diverge on (`Parser::shadow_retry_budget`,
+                // `builtin_fallback`) -- a `$name` token has no equivalent
+                // mechanism, so nothing here is known to make `var_sites`
+                // miss an entry `locate_identifier_from` would still find.
+                let needle = format!("${name}");
                 let start_from = var_resume_from.get(name.as_str()).copied().unwrap_or(0);
 
                 match locate_identifier_from(filter, &needle, start_from) {
@@ -1762,18 +1806,6 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
     let count = errors.len();
     let noun = if count == 1 { "error" } else { "errors" };
     eprintln!("jq: {count} compile {noun}");
-}
-
-/// `${name}`, built once per [`report_compile_errors`] variable diagnostic so
-/// [`locate_identifier_from`] can be reused unchanged: it already treats any
-/// non-identifier byte (`$` included) as a valid boundary, so searching for
-/// the sigil-prefixed spelling finds the real `$name` occurrence without
-/// matching an unrelated bare `name`.
-fn alloc_string_dollar(name: &str) -> String {
-    let mut s = String::with_capacity(name.len() + 1);
-    s.push('$');
-    s.push_str(name);
-    s
 }
 
 /// Find the first occurrence of `name` in `filter`, at or after byte offset

@@ -386,6 +386,14 @@ struct Parser<'a> {
     /// rewind-and-retry (#2110/#2237) that re-parses one call cannot produce
     /// a duplicate entry.
     call_sites: Vec<CallSite>,
+    /// [`Self::call_sites`]'s sibling for `$name` variable references
+    /// (#2734, closing the position-misattribution gap #2085 already fixed
+    /// for calls): every `Expr::Var`-producing `$name` occurrence this
+    /// parse has built, with the byte offset of its `$` sigil. `$__loc__`/
+    /// `$ENV` are never recorded — they lower to `Expr::Loc`/`Expr::Env`,
+    /// never `Expr::Var`, so they can never be the subject of an unbound-
+    /// variable diagnostic in the first place.
+    var_sites: Vec<VarSite>,
     /// #2036 Direction 3: every identifier that appears anywhere after a
     /// `def` keyword in `input`, computed once by [`collect_def_names`] at
     /// construction. A cheap, deliberately *imprecise* over-approximation
@@ -511,6 +519,48 @@ pub fn collect_call_sites(input: &str, mode: ParserMode, jq_extensions: bool) ->
     sites
 }
 
+/// Where one `$name` variable reference begins in the filter source (#2734).
+///
+/// [`CallSite`]'s sibling: produced by [`collect_var_sites`] and consumed
+/// only by the CLI's unbound-variable diagnostic, which needs to point at
+/// the actual reference rather than at any occurrence of the name's
+/// spelling — a plain text search for `${name}` can land inside a string
+/// literal, or on an earlier, genuinely *bound* occurrence of the same
+/// name, neither of which is the failing reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarSite {
+    /// The referenced name, without the `$` sigil (matching `Expr::Var`'s
+    /// own storage).
+    pub name: String,
+    /// Byte offset of the `$` sigil in the parsed source.
+    pub offset: usize,
+}
+
+/// Every `$name` variable-reference site in `input`, in source order (#2734).
+///
+/// [`collect_call_sites`]'s sibling, same reasoning: a second parse, purely
+/// to recover a position the AST does not carry, only ever run once on the
+/// compile-error path immediately before the process aborts.
+///
+/// Like `call_sites`, this is a table of *references*, not of *failing*
+/// references, and carries no scope information -- a `$x` that resolved
+/// perfectly well can still be matched against an unbound-variable
+/// diagnostic for the same name. Two references of the same name that
+/// differ only by lexical scope (one bound, one not) cannot be told apart
+/// here, the same known limitation `CallSite`'s own doc comment records for
+/// calls (tracked there at #2635) — this closes the more common and more
+/// misleading case instead: a name that merely spells the same as an
+/// unrelated string-literal occurrence, which this table excludes by
+/// construction (only real `$name` reference sites are ever pushed).
+pub fn collect_var_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<VarSite> {
+    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
+    let _ = parser.parse_program();
+    let mut sites = core::mem::take(&mut parser.var_sites);
+    sites.sort_by_key(|v| v.offset);
+    sites.dedup_by_key(|v| v.offset);
+    sites
+}
+
 /// See [`Parser::shadow_retry_budget`].
 const SHADOW_RETRY_BUDGET: usize = 64;
 
@@ -572,6 +622,7 @@ impl<'a> Parser<'a> {
             pattern_depth: 0,
             expr_depth: 0,
             call_sites: Vec::new(),
+            var_sites: Vec::new(),
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
@@ -1526,6 +1577,7 @@ impl<'a> Parser<'a> {
                 let s = self.parse_string_literal()?;
                 (ObjectKey::Literal(s), None)
             } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
+                let sigil_offset = self.pos;
                 let (name, line, has_colon) = self.parse_dollar_name()?;
                 if has_colon {
                     if name == "__loc__" {
@@ -1534,9 +1586,22 @@ impl<'a> Parser<'a> {
                             self.pos,
                         ));
                     }
-                    (ObjectKey::Expr(Box::new(dollar_var_expr(name, line))), None)
+                    let key_value = dollar_var_expr(name, line);
+                    if let Expr::Var(name) = &key_value {
+                        self.var_sites.push(VarSite {
+                            name: name.clone(),
+                            offset: sigil_offset,
+                        });
+                    }
+                    (ObjectKey::Expr(Box::new(key_value)), None)
                 } else {
                     let value = dollar_var_expr(name.clone(), line);
+                    if let Expr::Var(name) = &value {
+                        self.var_sites.push(VarSite {
+                            name: name.clone(),
+                            offset: sigil_offset,
+                        });
+                    }
                     (ObjectKey::Literal(name), Some(value))
                 }
             } else {
@@ -1928,10 +1993,17 @@ impl<'a> Parser<'a> {
 
             // Variable reference: $varname, $__loc__, or $ENV
             Some('$') => {
+                let sigil_offset = self.pos;
                 let line = self.current_line();
                 self.next();
                 let name = self.parse_ident()?;
                 let expr = dollar_var_expr(name, line);
+                if let Expr::Var(name) = &expr {
+                    self.var_sites.push(VarSite {
+                        name: name.clone(),
+                        offset: sigil_offset,
+                    });
+                }
                 self.parse_postfix(expr)
             }
 
