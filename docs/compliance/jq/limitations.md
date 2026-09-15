@@ -1355,23 +1355,53 @@ answers `["b"]` — and classified the two residuals appended below):
   per-step register" *and* "still identical to the persistent one") without regressing the
   `[]` case above — recorded rather than built, since the exit code and value already match
   and only wording differs.
-- **`foreach` + `getpath` on a `getpath` call whose position `EXTRACT` continues from is a
-  genuine value divergence, not message-only
-  ([#2732](https://github.com/rust-works/succinctly/issues/2732)'s Shape 3, out of that
-  issue's own scope; tracked separately as
-  [#2896](https://github.com/rust-works/succinctly/issues/2896)).** Confirmed live:
-  `path(foreach .[] as $k (.; getpath(["a"]); .b))` on `{"a":{"b":2}}` is `["a","b"]` in jq;
-  succinctly refuses. The `reduce` spelling of the identical shape already agrees with jq
-  (`with result 1`, the persistent-register position restored). The mechanism is *hypothesized*
-  rather than independently verified against jq's own C source: `getpath` inherits SOURCE's own
-  position transparently there, which is consistent with jq's C-implemented `_jq_path_append`
-  returning its argument value unchanged (and therefore pointer-identical to `value_at_path`)
-  whenever the input is not itself intact -- but #2896 is the issue to re-derive or correct that
-  mechanism, not this one. What is confirmed regardless of the exact mechanism: `getpath`
-  inherits a *value* here, not a path, so succinctly's own path-provenance model
-  (`PathBranch::trackable`/`snapshot`) has nothing to key off without `getpath` growing its own
-  register-threading, unlike the ordinary
-  `Field`/`Index` steps every other divergence in this section is about.
+- **`getpath` is transparent to the path register, and succinctly now models it — except when
+  the input's position comes from an identity-passthrough bind
+  ([#2896](https://github.com/rust-works/succinctly/issues/2896)).** The mechanism recorded
+  here as *hypothesized* is now confirmed behaviourally against jq 1.7.1, with a probe that
+  isolates each half. jq's `f_getpath` is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, so
+  (a) on an input that is not the register it returns the value and leaves the register
+  untouched, where an ordinary `.k` in the same slot raises; and (b) the value it returns is a
+  pointer *into* its input, so it can itself *be* the register's node, at which point tracking
+  silently resumes:
+  ```
+  $ echo '{"a":1,"b":2}' | jq -c 'path(.a as $y | .a | {b:9} | getpath(["b"]) | $y)'
+  ["a"]                                      # (a) register survived the getpath stage
+  $ echo '{"a":1,"b":2}' | jq -c 'path(.a as $y | .a | {b:9} | .b       | $y)'
+  jq: error: ... element "b" of {"b":9}      # ordinary navigation raises instead
+  $ echo '{"a":{"b":2}}' | jq -c 'path(. as $x | .a | $x | getpath(["a"]) | .b)'
+  ["a","b"]                                  # (b) result IS the register's node
+  ```
+  `getpath` is the only *navigating* builtin with this property — swept `.b?`, `first(.b)`,
+  `last(.b)`, `limit(1;.b)`, `[.b][0]` and `tojson|fromjson|.b` in the same slot, all raise.
+  The scope recorded here was also wrong twice: the divergence was never `foreach`-specific
+  (the plain pipe register and `reduce`'s per-step register diverge identically) and never
+  read-only (`=`/`|=`/`del()` refused a documented jq write).
+
+  succinctly models both halves as of #2896, composed over #2042's existing absolute-position
+  witness rather than by value equality, so the originally filed repro now agrees in both
+  directions:
+  ```
+  $ echo '{"a":{"b":2}}' | succinctly jq -c 'path(foreach .[] as $k (.; getpath(["a"]); .b))'
+  ["a","b"]
+  $ echo '{"a":{"b":2}}' | succinctly jq     'del(foreach .[] as $k (.; getpath(["a"]); .b))'
+  {"a":{}}
+  ```
+  **What still refuses**: a `getpath` whose *input* is a variable bound by an
+  identity-passthrough source (`. as $x`), as in the `(b)` probe above. Such a binding is
+  deliberately marked `Origin::Snapshot` — the #844 value-equality witness, which carries no
+  position — so there is nothing for `getpath`'s result to compose its own position from, and
+  the branch gets no provenance rather than a guessed one. A navigated bind (`.a as $y`), a
+  fold accumulator seeded from a trackable INIT/UPDATE branch, and another `getpath`'s own
+  result all do carry a position, so those compose. This is the safe direction — a refusal,
+  never a fabricated path — and is tracked as
+  [#2978](https://github.com/rust-works/succinctly/issues/2978); closing it means giving an
+  identity-passthrough bind a position without narrowing `Origin::Snapshot`'s own acceptance.
+
+  **Also still refusing**: `getpath` as a fold *SOURCE*
+  (`path(foreach getpath(["a"]) as $x (...))`), which is a separate position from the
+  UPDATE/EXTRACT one this closed and is recorded in
+  `scripts/jq-path-context-oracle-sweep.sh` as the `foreach_path` known divergence (#2388).
 
 ## Duplicate object keys collapse, except under `--preserve-input`
 
