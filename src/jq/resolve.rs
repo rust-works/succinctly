@@ -63,8 +63,9 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use super::eval::collect_pattern_var_names;
 use super::walk::{builtin_kids, map_builtin_subexprs, BuiltinKids};
-use super::{Expr, ObjectKey, StringPart};
+use super::{Expr, ObjectKey, Pattern, StringPart};
 
 /// A call this pass could not resolve to any in-scope `def`, parameter or
 /// builtin — the compile error's payload.
@@ -86,6 +87,43 @@ impl core::fmt::Display for UnresolvedCall {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}/{} is not defined", self.name, self.arity)
     }
+}
+
+/// A `$name` reference this pass could not resolve to any in-scope binding —
+/// [`UnresolvedCall`]'s sibling for variables (#2734).
+///
+/// Real jq resolves `$variable` references at compile time exactly as it does
+/// function calls: `$nope` alone is a compile error (`$nope is not defined`,
+/// exit 3, zero output), unconditional and uncatchable by `try`/`?`, same as
+/// an unresolved call. succinctly's evaluator already refuses an unbound
+/// `Expr::Var` at *runtime* (`eval.rs`'s `Expr::Var` arm) — this pass only
+/// moves that refusal earlier, the same relationship [`UnresolvedCall`] has
+/// to `eval_func_call`'s existing unconditional error arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundVar {
+    /// The referenced name, without the `$` sigil — matching [`Expr::Var`]'s
+    /// own storage.
+    pub name: String,
+}
+
+impl core::fmt::Display for UnboundVar {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "${} is not defined", self.name)
+    }
+}
+
+/// One compile-time diagnostic this pass can produce: an unresolved function
+/// call or an unbound `$variable` reference.
+///
+/// Both kinds interleave in a single, source-ordered list rather than two
+/// separate ones, because real jq's own diagnostics interleave them by
+/// position rather than grouping by kind (confirmed live: `$bar, foo, $baz`
+/// reports all three left to right, not variables-then-calls or vice versa)
+/// — only a single combined walk naturally preserves that order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    Call(UnresolvedCall),
+    Var(UnboundVar),
 }
 
 /// Every builtin the pinned jq (1.7.1) defines, as `(name, arity)`.
@@ -339,6 +377,14 @@ const JQ_BUILTIN_ROSTER: &[(&str, usize)] = &[
 /// and parameters), shadowing falls out of searching from the top, and pushing
 /// and truncating is cheaper than cloning a map per node.
 type Scope = Vec<(String, usize)>;
+
+/// A lexical *variable* scope: the `$name`s (without the sigil) visible at a
+/// point in the tree — [`Scope`]'s sibling for #2734, tracked in the same
+/// walk rather than a separate pass (see [`check`]'s doc comment).
+///
+/// No arity component: unlike a function, a variable binding has no
+/// overload-by-arity concept, so plain name equality is enough.
+type VarScope = Vec<String>;
 
 /// [`Scope`]'s sibling for [`build_call_graph`] (#2740): each entry also
 /// carries the identity of the `def` it resolves to -- a parameter has none
@@ -804,7 +850,43 @@ pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
 /// every unresolvable call in one compile pass (`jq: N compile errors`);
 /// this is what lets the jq runner match that instead of always reporting
 /// `jq: 1 compile error` (#2037).
+///
+/// A thin filter over [`resolve_all`] (#2734): unaffected in content or
+/// order by variable resolution running in the same walk, since it only
+/// keeps the [`ResolveError::Call`] entries. Exists as its own function
+/// because `yq_runner.rs` calls it (via [`resolve_func_calls`]) and must
+/// keep seeing function-only results — real yq has no compile-time variable
+/// check to match (#2981), so folding variable errors into its output would
+/// make succinctly yq reject programs real yq accepts.
 pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
+    resolve_all(expr)
+        .into_iter()
+        .filter_map(|e| match e {
+            ResolveError::Call(c) => Some(c),
+            ResolveError::Var(_) => None,
+        })
+        .collect()
+}
+
+/// Combined compile-time check: every unresolved function call and every
+/// unbound `$variable` reference (#2734).
+///
+/// Found in one walk over the tree so pattern-binding and `def`-scope
+/// machinery isn't duplicated across a second full `Expr` match — #2885
+/// already flags the drift risk of a third hand-written exhaustive match in
+/// this file (`check` and `build_call_graph` are the existing two); this
+/// keeps that count at two by folding variable tracking into `check` itself
+/// instead of adding a fourth.
+///
+/// Returns diagnostics in a single traversal-ordered list, matching real
+/// jq's own reporting: a program with both an unresolved call and an
+/// unbound variable reports them interleaved by source position, not
+/// grouped by kind (confirmed live: `$bar, foo, $baz` reports all three
+/// left to right).
+///
+/// jq-mode only in practice — see [`resolve_func_calls_all`]'s doc comment
+/// for why `yq_runner.rs` must keep using the function-only view instead.
+pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
     // #2740: a `def` whose call never appears anywhere reachable is never
     // checked -- jq's own compiler never compiles such a body either, since
     // it only ever compiles a `def` at the call site substituting it in.
@@ -817,8 +899,9 @@ pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
     let reachable = compute_reachable(&graph, &roots);
 
     let mut scope = Scope::new();
+    let mut var_scope = VarScope::new();
     let mut errors = Vec::new();
-    check(expr, &mut scope, &mut errors, &reachable);
+    check(expr, &mut scope, &mut var_scope, &mut errors, &reachable);
     errors
 }
 
@@ -832,6 +915,50 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
 /// Whether `(name, arity)` resolves against `scope`, innermost first.
 fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
     scope.iter().rev().any(|(n, a)| *a == arity && n == name)
+}
+
+/// Whether `$name` resolves against `var_scope`, innermost first (mirrors
+/// [`in_scope`]).
+fn in_var_scope(var_scope: &VarScope, name: &str) -> bool {
+    var_scope.iter().rev().any(|n| n == name)
+}
+
+/// A pattern's computed keys (`{(EXPR): P}`, #2677) are ordinary
+/// sub-expressions, evaluated in the scope the pattern itself sits in —
+/// *before* any of its own names are bound — so they need the same
+/// [`check`] treatment as any other sub-expression, function calls and
+/// variables both. `Pattern` binding names themselves are collected
+/// separately, read-only, by the existing [`collect_pattern_var_names`]
+/// (`eval.rs`) once every alternative's keys have been checked.
+///
+/// [`check`]'s own `AsPattern`/`Reduce`/`Foreach` arms did not visit
+/// `patterns` at all before this pass existed (folded away by `..`), so a
+/// computed key referencing an undefined function or variable was silently
+/// unchecked — this closes that gap as a side effect of needing to visit the
+/// same nodes for #2734's own purposes, not a separate fix.
+fn check_pattern_keys(
+    pattern: &mut Pattern,
+    scope: &mut Scope,
+    var_scope: &mut VarScope,
+    errors: &mut Vec<ResolveError>,
+    reachable: &BTreeSet<usize>,
+) {
+    match pattern {
+        Pattern::Var(_) => {}
+        Pattern::Object(entries) => {
+            for entry in entries.iter_mut() {
+                if let ObjectKey::Expr(k) = &mut entry.key {
+                    check(k, scope, var_scope, errors, reachable);
+                }
+                check_pattern_keys(&mut entry.pattern, scope, var_scope, errors, reachable);
+            }
+        }
+        Pattern::Array(patterns) => {
+            for p in patterns.iter_mut() {
+                check_pattern_keys(p, scope, var_scope, errors, reachable);
+            }
+        }
+    }
 }
 
 /// #2036: the arity `fallback` -- a successfully-parsed builtin or
@@ -955,7 +1082,8 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
 fn check(
     expr: &mut Expr,
     scope: &mut Scope,
-    errors: &mut Vec<UnresolvedCall>,
+    var_scope: &mut VarScope,
+    errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
 ) {
     match expr {
@@ -981,15 +1109,16 @@ fn check(
         // one clone in the (self-inflicted, still never hit by this crate's
         // own callers) multi-owner case.
         Expr::Shared(inner) => {
-            check(Rc::make_mut(inner), scope, errors, reachable);
+            check(Rc::make_mut(inner), scope, var_scope, errors, reachable);
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, scope, errors, reachable);
+                check(arg, scope, var_scope, errors, reachable);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
-        // own grouping so the two stay comparable arm for arm.
+        // own grouping so the two stay comparable arm for arm. `Var` is
+        // checked separately below (#2734) rather than folded in here.
         Expr::Identity
         | Expr::Field(_)
         | Expr::Index { .. }
@@ -999,11 +1128,22 @@ fn check(
         | Expr::RecursiveDescent
         | Expr::Not
         | Expr::Format(_)
-        | Expr::Var(_)
         | Expr::TrackedVar(_)
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Break(_) => {}
+
+        // #2734: the leaf this whole pass exists to add. `$ENV`/`$__loc__`
+        // never reach here at all -- the parser lowers them straight to
+        // `Expr::Env`/`Expr::Loc` (see `UnboundVar`'s own doc comment) -- and
+        // `TrackedVar` is an evaluation-time-only substitute for a `Var` that
+        // already resolved, never present on the freshly parsed tree this
+        // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
+        Expr::Var(name) => {
+            if !in_var_scope(var_scope, name) {
+                errors.push(ResolveError::Var(UnboundVar { name: name.clone() }));
+            }
+        }
 
         Expr::Optional(inner)
         | Expr::Array(inner)
@@ -1011,7 +1151,7 @@ fn check(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner) => check(inner, scope, errors, reachable),
+        | Expr::Repeat(inner) => check(inner, scope, var_scope, errors, reachable),
 
         // #2840: real jq's `label $x | BODY` intercepts every escape that
         // isn't its own `{"__jq":N}` break sentinel and re-raises it
@@ -1028,7 +1168,7 @@ fn check(
         // #2687's `break $x` -> `error/0` desugaring's own
         // shadowable-or-untouched gate).
         Expr::Label { name: _, body } => {
-            check(body, scope, errors, reachable);
+            check(body, scope, var_scope, errors, reachable);
             if in_scope(scope, "error", 0) {
                 let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
                 **body = Expr::Try {
@@ -1044,7 +1184,7 @@ fn check(
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, scope, errors, reachable);
+                check(e, scope, var_scope, errors, reachable);
             }
         }
 
@@ -1079,16 +1219,6 @@ fn check(
             cond: left,
             update: right,
         }
-        | Expr::As {
-            expr: left,
-            body: right,
-            ..
-        }
-        | Expr::AsPattern {
-            expr: left,
-            body: right,
-            ..
-        }
         | Expr::Assign {
             path: left,
             value: right,
@@ -1111,16 +1241,57 @@ fn check(
             value: right,
             ..
         } => {
-            check(left, scope, errors, reachable);
-            check(right, scope, errors, reachable);
+            check(left, scope, var_scope, errors, reachable);
+            check(right, scope, var_scope, errors, reachable);
         }
 
-        // The one arm that changes scope. `body` sees the function itself
-        // (self-recursion is legal) plus its parameters as arity-0 functions;
-        // `then` sees the function but *not* its parameters. Neither sees a
-        // `def` that comes later — which is exactly the forward reference
-        // `expand_func_calls` could not detect, and the reason
-        // `def f: g; def g: 42; f` computed `42` instead of failing.
+        // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
+        // evaluates `.foo` before `$x` exists.
+        Expr::As { expr, var, body } => {
+            check(expr, scope, var_scope, errors, reachable);
+            var_scope.push(var.clone());
+            check(body, scope, var_scope, errors, reachable);
+            var_scope.pop();
+        }
+
+        // #2734: `patterns` is every `?//`-alternative (usually just one);
+        // jq requires each alternative bind the same variable set, so the
+        // union of all of them is pushed once for `body` rather than
+        // rechecking `body` per alternative. Each alternative's own computed
+        // keys (`{(EXPR): P}`) are checked in the *pre-binding* scope via
+        // `check_pattern_keys`, which also closes a pre-existing gap: this
+        // arm previously ignored `patterns` entirely (folded into the
+        // generic two-child group above by `..`), so a computed key
+        // referencing an undefined function or variable was never checked
+        // at all.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            check(expr, scope, var_scope, errors, reachable);
+            let outer = var_scope.len();
+            let mut bound = Vec::new();
+            for pattern in patterns.iter_mut() {
+                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
+                collect_pattern_var_names(pattern, &mut bound);
+            }
+            var_scope.extend(bound);
+            check(body, scope, var_scope, errors, reachable);
+            var_scope.truncate(outer);
+        }
+
+        // The one arm that changes function scope. `body` sees the function
+        // itself (self-recursion is legal) plus its parameters as arity-0
+        // functions; `then` sees the function but *not* its parameters.
+        // Neither sees a `def` that comes later — which is exactly the
+        // forward reference `expand_func_calls` could not detect, and the
+        // reason `def f: g; def g: 42; f` computed `42` instead of failing.
+        //
+        // #2734: also the one arm that changes *variable* scope via a
+        // `$`-style parameter (`def f($a): $a; ...` desugars to `def f(a): a
+        // as $a | ...` in real jq, binding `$a` in `body` only, same as
+        // `Expr::As` above) -- a bare `Param::Bare` binds no variable.
         Expr::FuncDef {
             name,
             params,
@@ -1139,6 +1310,12 @@ fn check(
             for p in params.iter() {
                 scope.push((p.name().to_string(), 0));
             }
+            let var_outer = var_scope.len();
+            for p in params.iter() {
+                if p.is_dollar() {
+                    var_scope.push(p.name().to_string());
+                }
+            }
             // #2740: a `def` whose call never appears anywhere reachable is
             // never compiled by real jq either -- its own substitution model
             // only ever compiles a body at the call site that references it.
@@ -1151,18 +1328,19 @@ fn check(
             // scope/`then`, which still need the same treatment either way.
             let body_addr = body.as_ref() as *const Expr as usize;
             if reachable.contains(&body_addr) {
-                check(body, scope, errors, reachable);
+                check(body, scope, var_scope, errors, reachable);
             }
+            var_scope.truncate(var_outer);
             scope.truncate(with_self);
 
-            check(then, scope, errors, reachable);
+            check(then, scope, var_scope, errors, reachable);
             scope.truncate(outer);
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope, errors, reachable);
+            check(expr, scope, var_scope, errors, reachable);
             if let Some(c) = catch.as_deref_mut() {
-                check(c, scope, errors, reachable);
+                check(c, scope, var_scope, errors, reachable);
             }
         }
 
@@ -1171,50 +1349,72 @@ fn check(
             then_branch,
             else_branch,
         } => {
-            check(cond, scope, errors, reachable);
-            check(then_branch, scope, errors, reachable);
-            check(else_branch, scope, errors, reachable);
+            check(cond, scope, var_scope, errors, reachable);
+            check(then_branch, scope, var_scope, errors, reachable);
+            check(else_branch, scope, var_scope, errors, reachable);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope, errors, reachable);
-            check_opt(start.as_deref_mut(), scope, errors, reachable);
-            check_opt(end.as_deref_mut(), scope, errors, reachable);
+            check(target, scope, var_scope, errors, reachable);
+            check_opt(start.as_deref_mut(), scope, var_scope, errors, reachable);
+            check_opt(end.as_deref_mut(), scope, var_scope, errors, reachable);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope, errors, reachable);
-            check_opt(to.as_deref_mut(), scope, errors, reachable);
-            check_opt(step.as_deref_mut(), scope, errors, reachable);
+            check(from, scope, var_scope, errors, reachable);
+            check_opt(to.as_deref_mut(), scope, var_scope, errors, reachable);
+            check_opt(step.as_deref_mut(), scope, var_scope, errors, reachable);
         }
 
+        // #2734: `patterns`' vars are bound in `update` only, not `init` --
+        // `reduce .[] as $x (0; . + $x)` evaluates `init` before any element
+        // has been bound. Same union-of-alternatives and computed-key
+        // treatment as `Expr::AsPattern` above.
         Expr::Reduce {
             input,
+            patterns,
             init,
             update,
-            ..
         } => {
-            check(input, scope, errors, reachable);
-            check(init, scope, errors, reachable);
-            check(update, scope, errors, reachable);
+            check(input, scope, var_scope, errors, reachable);
+            check(init, scope, var_scope, errors, reachable);
+            let outer = var_scope.len();
+            let mut bound = Vec::new();
+            for pattern in patterns.iter_mut() {
+                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
+                collect_pattern_var_names(pattern, &mut bound);
+            }
+            var_scope.extend(bound);
+            check(update, scope, var_scope, errors, reachable);
+            var_scope.truncate(outer);
         }
 
+        // #2734: same rule as `Expr::Reduce` above -- `init` sees no bound
+        // vars, `update`/`extract` both do.
         Expr::Foreach {
             input,
+            patterns,
             init,
             update,
             extract,
-            ..
         } => {
-            check(input, scope, errors, reachable);
-            check(init, scope, errors, reachable);
-            check(update, scope, errors, reachable);
-            check_opt(extract.as_deref_mut(), scope, errors, reachable);
+            check(input, scope, var_scope, errors, reachable);
+            check(init, scope, var_scope, errors, reachable);
+            let outer = var_scope.len();
+            let mut bound = Vec::new();
+            for pattern in patterns.iter_mut() {
+                check_pattern_keys(pattern, scope, var_scope, errors, reachable);
+                collect_pattern_var_names(pattern, &mut bound);
+            }
+            var_scope.extend(bound);
+            check(update, scope, var_scope, errors, reachable);
+            check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable);
+            var_scope.truncate(outer);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
-                check(e, scope, errors, reachable);
+                check(e, scope, var_scope, errors, reachable);
             }
         }
 
@@ -1277,22 +1477,22 @@ fn check(
                     *args = builtin_fallback_into_args(*fallback);
                 }
                 for a in args.iter_mut() {
-                    check(a, scope, errors, reachable);
+                    check(a, scope, var_scope, errors, reachable);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
                 // one move, no cloning.
                 *expr = *fallback;
-                check(expr, scope, errors, reachable);
+                check(expr, scope, var_scope, errors, reachable);
             } else if is_jq_builtin(name, arity) {
                 for a in args.iter_mut() {
-                    check(a, scope, errors, reachable);
+                    check(a, scope, var_scope, errors, reachable);
                 }
             } else {
-                errors.push(UnresolvedCall {
+                errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
-                });
+                }));
             }
         }
 
@@ -1303,29 +1503,29 @@ fn check(
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, scope, errors, reachable);
+                check(a, scope, var_scope, errors, reachable);
             }
         }
 
         Expr::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, errors, reachable);
+                    check(k, scope, var_scope, errors, reachable);
                 }
-                check(&mut entry.value, scope, errors, reachable);
+                check(&mut entry.value, scope, var_scope, errors, reachable);
             }
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope, errors, reachable);
+                    check(e, scope, var_scope, errors, reachable);
                 }
             }
         }
 
-        // No builtin introduces a function binding, so its sub-expressions
-        // inherit the current scope unchanged. Rebuilt via
+        // No builtin introduces a function or variable binding, so its
+        // sub-expressions inherit the current scope unchanged. Rebuilt via
         // `map_builtin_subexprs` rather than an in-place mutable walker: a
         // builtin's own operand can itself be a `FuncCall` this same #2036
         // rewrite needs to reach (`map(length)` where `length` is
@@ -1338,7 +1538,7 @@ fn check(
         Expr::Builtin(builtin) => {
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut sub = sub.clone();
-                check(&mut sub, scope, errors, reachable);
+                check(&mut sub, scope, var_scope, errors, reachable);
                 sub
             });
         }
@@ -1349,11 +1549,12 @@ fn check(
 fn check_opt(
     expr: Option<&mut Expr>,
     scope: &mut Scope,
-    errors: &mut Vec<UnresolvedCall>,
+    var_scope: &mut VarScope,
+    errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
 ) {
     if let Some(e) = expr {
-        check(e, scope, errors, reachable);
+        check(e, scope, var_scope, errors, reachable);
     }
 }
 
@@ -1636,22 +1837,25 @@ mod tests {
         };
 
         let mut scope = Scope::new();
+        let mut var_scope = VarScope::new();
         let mut errors = Vec::new();
         check(
             &mut Expr::Shared(Rc::new(unresolved())),
             &mut scope,
+            &mut var_scope,
             &mut errors,
             &BTreeSet::new(),
         );
         assert_eq!(
             errors,
-            [UnresolvedCall {
+            [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
-            }]
+            })]
         );
 
         let mut scope = Scope::new();
+        let mut var_scope = VarScope::new();
         let mut errors = Vec::new();
         check(
             &mut Expr::DefCall {
@@ -1665,15 +1869,16 @@ mod tests {
                 bound: crate::jq::BoundBody::default(),
             },
             &mut scope,
+            &mut var_scope,
             &mut errors,
             &BTreeSet::new(),
         );
         assert_eq!(
             errors,
-            [UnresolvedCall {
+            [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
-            }]
+            })]
         );
     }
 
@@ -1804,5 +2009,239 @@ mod tests {
             !crate::jq::walk::any_subexpr(&expr, &mut |e| matches!(e, Expr::Break(_))),
             "the original Expr::Break must not survive once shadowed: {expr:?}"
         );
+    }
+
+    /// #2734: unbound `$variable` resolution. Every expectation captured
+    /// live against the pinned oracle (`/usr/bin/jq`, jq-1.7.1), same
+    /// discipline as [`resolve`]'s own doc comment.
+    mod unbound_vars {
+        use super::*;
+
+        /// Resolve a filter for *every* diagnostic ([`resolve_all`]), joining
+        /// them with `; ` for a compact assertion -- unlike [`resolve`]
+        /// above, which only ever needs the first.
+        fn resolve_all_strs(filter: &str) -> Vec<String> {
+            let mut expr = parse(filter).expect("filter must parse");
+            resolve_all(&mut expr)
+                .into_iter()
+                .map(|e| format!("{e:?}"))
+                .collect()
+        }
+
+        fn resolve_var(filter: &str) -> Result<(), String> {
+            let mut expr = parse(filter).expect("filter must parse");
+            match resolve_all(&mut expr).into_iter().next() {
+                Some(ResolveError::Var(v)) => Err(format!("{v}")),
+                Some(ResolveError::Call(c)) => {
+                    panic!("expected a variable error, got a call error: {c}")
+                }
+                None => Ok(()),
+            }
+        }
+
+        #[test]
+        fn rejects_a_bare_unbound_variable() {
+            // jq: `$nope is not defined`, exit 3.
+            assert_eq!(resolve_var("$nope"), Err("$nope is not defined".into()));
+        }
+
+        #[test]
+        fn accepts_a_variable_bound_by_as() {
+            assert_eq!(resolve_var(".foo as $x | $x"), Ok(()));
+        }
+
+        #[test]
+        fn as_does_not_bind_its_own_source_expression() {
+            // `.foo as $x` evaluates `.foo` before `$x` exists -- a `$x`
+            // reference in the source expression itself must stay unbound.
+            assert_eq!(
+                resolve_var("$x as $y | $x"),
+                Err("$x is not defined".into())
+            );
+        }
+
+        #[test]
+        fn rejects_a_variable_only_bound_in_a_sibling_branch() {
+            assert_eq!(
+                resolve_var(".foo as $x | $x, $nope"),
+                Err("$nope is not defined".into())
+            );
+        }
+
+        #[test]
+        fn accepts_object_and_array_destructuring_patterns() {
+            assert_eq!(resolve_var(". as {a: $a, b: $b} | $a + $b"), Ok(()));
+            assert_eq!(resolve_var(". as [$a, $b] | $a + $b"), Ok(()));
+        }
+
+        #[test]
+        fn accepts_the_shorthand_bind_in_an_object_pattern() {
+            // `{$a}` desugars to `{a: $a}` -- both spellings must bind.
+            assert_eq!(resolve_var(". as {$a} | $a"), Ok(()));
+        }
+
+        #[test]
+        fn accepts_qq_slash_slash_alternatives_binding_the_same_name() {
+            assert_eq!(resolve_var(". as $a ?// $b | $a"), Ok(()));
+        }
+
+        #[test]
+        fn a_computed_pattern_key_is_checked_in_the_outer_scope() {
+            // jq: `$nope is not defined` -- the computed key `($nope)` is
+            // evaluated before the pattern binds anything, so it never sees
+            // its own pattern's `$a`, only whatever was already in scope.
+            assert_eq!(
+                resolve_var(". as {($nope): $a} | $a"),
+                Err("$nope is not defined".into())
+            );
+        }
+
+        #[test]
+        fn accepts_a_pattern_var_referenced_from_a_computed_key() {
+            // The outer scope, not the pattern's own bindings, is what a
+            // computed key sees -- an *outer* `$x` is fine.
+            assert_eq!(
+                resolve_var("1 as $x | . as {($x|tostring): $a} | $a"),
+                Ok(())
+            );
+        }
+
+        #[test]
+        fn reduce_binds_the_pattern_in_update_only() {
+            assert_eq!(resolve_var("reduce .[] as $x (0; . + $x)"), Ok(()));
+            // jq: `init` is evaluated before the pattern binds -- `$x` in
+            // `init` refers to nothing.
+            assert_eq!(
+                resolve_var("reduce .[] as $x ($x; . + 1)"),
+                Err("$x is not defined".into())
+            );
+        }
+
+        #[test]
+        fn foreach_binds_the_pattern_in_update_and_extract_but_not_init() {
+            assert_eq!(resolve_var("foreach .[] as $x (0; . + $x; . + $x)"), Ok(()));
+            assert_eq!(
+                resolve_var("foreach .[] as $x ($x; . + 1)"),
+                Err("$x is not defined".into())
+            );
+        }
+
+        #[test]
+        fn a_dollar_style_def_param_binds_the_variable_in_body_only() {
+            assert_eq!(resolve_var("def f($a): $a; f(1)"), Ok(()));
+            // A *bare* param binds only the call-site name, never the `$`
+            // namespace -- `def f(a): $a; ...` is `$a is not defined` in jq.
+            assert_eq!(
+                resolve_var("def f(a): $a; f(1)"),
+                Err("$a is not defined".into())
+            );
+        }
+
+        #[test]
+        fn a_dollar_style_param_does_not_leak_into_then() {
+            assert_eq!(
+                resolve_var("def f($a): $a; $a"),
+                Err("$a is not defined".into())
+            );
+        }
+
+        #[test]
+        fn a_def_closes_over_an_outer_variable_it_is_lexically_nested_inside() {
+            // Confirmed live against jq 1.7.1: unlike function scope
+            // (`def`s never see a later sibling), variable scope through a
+            // `def` is ordinary lexical capture -- a def *nested inside* a
+            // binding sees it, including transitively through a further
+            // nested def, and this pass's own `var_scope` needs no special
+            // isolation at `FuncDef` boundaries to get this right: it
+            // already inherits whatever the ambient stack holds at that
+            // position, the same as any other nested expression.
+            assert_eq!(resolve_var("1 as $x | def f: $x; f"), Ok(()));
+            assert_eq!(resolve_var("1 as $x | def f: def g: $x; g; f"), Ok(()));
+            // But a def positioned *before* the binding still doesn't see
+            // it -- capture is purely lexical position, not "anywhere in
+            // the program".
+            assert_eq!(
+                resolve_var("def f: $x; 1 as $x | f"),
+                Err("$x is not defined".into())
+            );
+        }
+
+        #[test]
+        fn label_and_variable_are_separate_namespaces() {
+            // jq: `label $out | ...` never binds a `$out` *variable* -- only
+            // `break $out` resolves against the label namespace. Confirmed
+            // live: `label $out | $out` is `$out is not defined` in real jq.
+            assert_eq!(
+                resolve_var("label $out | $out"),
+                Err("$out is not defined".into())
+            );
+        }
+
+        #[test]
+        fn loc_and_env_never_reach_this_pass_as_a_var() {
+            // `$__loc__`/`$ENV` lower straight to `Expr::Loc`/`Expr::Env` at
+            // parse time (`parser.rs`'s `dollar_var_expr`) -- neither should
+            // ever be reported as unbound.
+            assert_eq!(resolve_var("$__loc__"), Ok(()));
+            assert_eq!(resolve_var("$ENV"), Ok(()));
+        }
+
+        #[test]
+        fn descends_into_builtin_arguments_for_both_as_and_bare_vars() {
+            assert_eq!(resolve_var("map(. as $x | $x)"), Ok(()));
+            assert_eq!(
+                resolve_var("map($nope)"),
+                Err("$nope is not defined".into())
+            );
+            assert_eq!(
+                resolve_var("select($nope)"),
+                Err("$nope is not defined".into())
+            );
+        }
+
+        #[test]
+        fn descends_into_array_and_object_constructors() {
+            assert_eq!(resolve_var("[$nope]"), Err("$nope is not defined".into()));
+            assert_eq!(
+                resolve_var("{a: $nope}"),
+                Err("$nope is not defined".into())
+            );
+            assert_eq!(
+                resolve_var("{($nope): 1}"),
+                Err("$nope is not defined".into())
+            );
+        }
+
+        /// #2734: real jq interleaves undefined calls and undefined
+        /// variables by source position, not grouped by kind. Confirmed
+        /// live: `$bar, foo, $baz` reports all three left to right.
+        #[test]
+        fn calls_and_variables_interleave_in_source_order() {
+            assert_eq!(
+                resolve_all_strs("$bar, foo, $baz"),
+                [
+                    r#"Var(UnboundVar { name: "bar" })"#,
+                    r#"Call(UnresolvedCall { name: "foo", arity: 0 })"#,
+                    r#"Var(UnboundVar { name: "baz" })"#,
+                ]
+            );
+        }
+
+        /// A program can fail on both fronts at once and jq's compile-error
+        /// gate (unconditional, before any input) applies uniformly --
+        /// [`resolve_func_calls_all`] (the yq-facing, function-only view)
+        /// must still see its own errors when a variable error is also
+        /// present in the same program.
+        #[test]
+        fn resolve_func_calls_all_still_sees_call_errors_alongside_var_errors() {
+            let mut expr = parse("$bar, foo").expect("filter must parse");
+            assert_eq!(
+                resolve_func_calls_all(&mut expr),
+                [UnresolvedCall {
+                    name: "foo".into(),
+                    arity: 0,
+                }]
+            );
+        }
     }
 }

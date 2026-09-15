@@ -23,7 +23,7 @@ use succinctly::jq::walk::{map_builtin_subexprs, stamp_loc_file};
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
     EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Program, StreamStats,
-    UnresolvedCall, MAX_VALUE_TREE_DEPTH,
+    MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, JsonString, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -1617,8 +1617,9 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
     eprintln!();
 }
 
-/// Report every call the compile-time resolution pass could not resolve, in
-/// jq's own compile-error shape (#1473, extended to all of them by #2037):
+/// Report every diagnostic the compile-time resolution pass could not
+/// resolve, in jq's own compile-error shape (#1473, extended to all of them
+/// by #2037, extended again to unbound `$variable`s by #2734):
 ///
 /// ```text
 /// jq: error: f/3 is not defined at <top-level>, line 1:
@@ -1633,7 +1634,11 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// instead, holding the byte offset of every *call*'s own identifier. Because
 /// only the generic call-parsing path records into it, an object key, a
 /// `$`-variable, or a string that merely spells the same identifier is absent
-/// from it by construction.
+/// from it by construction. A `$variable` diagnostic has no equivalent table
+/// (there is no call-site-style scan for variable references) — it always
+/// uses the text-search fallback below, on `${name}` rather than the bare
+/// name, so it cannot mistake an unrelated `nope` occurrence (a field, a
+/// call) for the `$nope` reference that actually failed.
 ///
 /// That closes the misfire this used to have. Before #2085 every line was
 /// found by searching `filter` for the offending identifier, which matched any
@@ -1658,11 +1663,21 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// column for a simple undefined name but points elsewhere for an
 /// arity mismatch, so this reproduces the column rule rather than every case.
 /// It is trailing whitespace either way.
-fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
+///
+/// Diagnostics are reported in `errors`' own order — [`jq::resolve_all`]
+/// already walks the tree in source order, and real jq interleaves a
+/// program's undefined calls and undefined variables by position rather than
+/// grouping by kind (confirmed live: `$bar, foo, $baz` reports all three left
+/// to right), so this function must not re-sort or re-group them.
+fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
-    // first one's. Used only by the text-search fallback below.
-    let mut resume_from: HashMap<&str, usize> = HashMap::new();
+    // first one's. Used only by the text-search fallback below. Calls and
+    // variables get independent maps: `f` (a call) and `$f` (a variable) are
+    // unrelated occurrences in the source, so their resume cursors must not
+    // share a key even though the bare names could coincide.
+    let mut call_resume_from: HashMap<&str, usize> = HashMap::new();
+    let mut var_resume_from: HashMap<&str, usize> = HashMap::new();
 
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
@@ -1670,57 +1685,95 @@ fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
     let call_sites = jq::collect_call_sites(filter, jq::ParserMode::Jq, true);
     // How many calls of each name we have already reported, so a repeated
     // undefined name walks its own successive call sites in source order --
-    // the same rule `resume_from` gives the fallback.
+    // the same rule `call_resume_from` gives the fallback.
     let mut consumed: HashMap<&str, usize> = HashMap::new();
 
-    for UnresolvedCall { name, arity } in unresolved {
-        let taken = consumed.entry(name.as_str()).or_insert(0);
-        // Matched on arity as well as name (#2085 review, finding 2): an
-        // `f/1` diagnostic must not take a perfectly resolvable `f/2` call
-        // site earlier in the source. `def f(a;b): a; f(1;2) | f(1)` cited
-        // the `f(1;2)` on line 2 instead of the failing `f(1)` on line 3.
-        let from_table = call_sites
-            .iter()
-            .filter(|c| c.name == *name && c.arity == *arity)
-            .nth(*taken)
-            .map(|c| c.offset);
-        if let Some(offset) = from_table {
-            *taken += 1;
-            // Keep the fallback's own cursor in step (#2085 review, finding
-            // 1). These are two counters over the same name, and letting
-            // them drift re-reports a position already used: once the table
-            // runs out -- exactly the module case, where a call inlined from
-            // `include`/`~/.jq` has no occurrence in `filter` at all -- the
-            // fallback would restart from offset 0 and invent a line for a
-            // call that has none. With `def helper: nosuch;` in a module,
-            // `include "m"; helper | nosuch` printed the `line 3` marker
-            // twice rather than leaving the module's own error unmarked.
-            resume_from.insert(name.as_str(), offset + name.len());
-            let (line_no, line_text, column) = line_at_offset(filter, offset);
-            eprintln!("jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:");
-            eprintln!("{line_text}{}", " ".repeat(column));
-            continue;
-        }
+    for error in errors {
+        match error {
+            jq::ResolveError::Call(jq::UnresolvedCall { name, arity }) => {
+                let taken = consumed.entry(name.as_str()).or_insert(0);
+                // Matched on arity as well as name (#2085 review, finding 2):
+                // an `f/1` diagnostic must not take a perfectly resolvable
+                // `f/2` call site earlier in the source. `def f(a;b): a;
+                // f(1;2) | f(1)` cited the `f(1;2)` on line 2 instead of the
+                // failing `f(1)` on line 3.
+                let from_table = call_sites
+                    .iter()
+                    .filter(|c| c.name == *name && c.arity == *arity)
+                    .nth(*taken)
+                    .map(|c| c.offset);
+                if let Some(offset) = from_table {
+                    *taken += 1;
+                    // Keep the fallback's own cursor in step (#2085 review,
+                    // finding 1). These are two counters over the same name,
+                    // and letting them drift re-reports a position already
+                    // used: once the table runs out -- exactly the module
+                    // case, where a call inlined from `include`/`~/.jq` has
+                    // no occurrence in `filter` at all -- the fallback would
+                    // restart from offset 0 and invent a line for a call
+                    // that has none. With `def helper: nosuch;` in a module,
+                    // `include "m"; helper | nosuch` printed the `line 3`
+                    // marker twice rather than leaving the module's own
+                    // error unmarked.
+                    call_resume_from.insert(name.as_str(), offset + name.len());
+                    let (line_no, line_text, column) = line_at_offset(filter, offset);
+                    eprintln!(
+                        "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
+                    );
+                    eprintln!("{line_text}{}", " ".repeat(column));
+                    continue;
+                }
 
-        let start_from = resume_from.get(name.as_str()).copied().unwrap_or(0);
+                let start_from = call_resume_from.get(name.as_str()).copied().unwrap_or(0);
 
-        match locate_identifier_from(filter, name, start_from) {
-            Some((line_no, line_text, column, end)) => {
-                resume_from.insert(name.as_str(), end);
-                eprintln!(
-                    "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
-                );
-                eprintln!("{line_text}{}", " ".repeat(column));
+                match locate_identifier_from(filter, name, start_from) {
+                    Some((line_no, line_text, column, end)) => {
+                        call_resume_from.insert(name.as_str(), end);
+                        eprintln!(
+                            "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
+                        );
+                        eprintln!("{line_text}{}", " ".repeat(column));
+                    }
+                    None => {
+                        eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
+                    }
+                }
             }
-            None => {
-                eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
+            jq::ResolveError::Var(jq::UnboundVar { name }) => {
+                let needle = alloc_string_dollar(name);
+                let start_from = var_resume_from.get(name.as_str()).copied().unwrap_or(0);
+
+                match locate_identifier_from(filter, &needle, start_from) {
+                    Some((line_no, line_text, column, end)) => {
+                        var_resume_from.insert(name.as_str(), end);
+                        eprintln!(
+                            "jq: error: ${name} is not defined at <top-level>, line {line_no}:"
+                        );
+                        eprintln!("{line_text}{}", " ".repeat(column));
+                    }
+                    None => {
+                        eprintln!("jq: error: ${name} is not defined at <top-level>");
+                    }
+                }
             }
         }
     }
 
-    let count = unresolved.len();
+    let count = errors.len();
     let noun = if count == 1 { "error" } else { "errors" };
     eprintln!("jq: {count} compile {noun}");
+}
+
+/// `${name}`, built once per [`report_compile_errors`] variable diagnostic so
+/// [`locate_identifier_from`] can be reused unchanged: it already treats any
+/// non-identifier byte (`$` included) as a valid boundary, so searching for
+/// the sigil-prefixed spelling finds the real `$name` occurrence without
+/// matching an unrelated bare `name`.
+fn alloc_string_dollar(name: &str) -> String {
+    let mut s = String::with_capacity(name.len() + 1);
+    s.push('$');
+    s.push_str(name);
+    s
 }
 
 /// Find the first occurrence of `name` in `filter`, at or after byte offset
@@ -1979,9 +2032,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // module function as undefined. `substitute_vars` above substitutes
     // `OwnedValue`s, never sub-expressions, so it cannot introduce a call and
     // running after it rather than before is equivalent.
-    let unresolved = jq::resolve_func_calls_all(&mut expr);
-    if !unresolved.is_empty() {
-        report_unresolved_calls(&unresolved, &filter_str);
+    //
+    // #2734: `resolve_all` also rejects an unbound `$variable` reference at
+    // this same compile stage, in the same walk -- real jq resolves `$name`
+    // at compile time exactly like a function call (`$nope` alone is `jq: 1
+    // compile error`, exit 3, zero output; `succinctly jq` previously let it
+    // reach evaluation and error there instead, at exit 5, after any earlier
+    // output had already been written). yq mode does not go through this
+    // function at all (`yq_runner.rs` calls `resolve_func_calls`, the
+    // call-only view) -- see that function's own doc comment for why: real
+    // yq is fully permissive about unbound variables (#2981), the opposite
+    // direction of divergence from what this fixes here.
+    let compile_errors = jq::resolve_all(&mut expr);
+    if !compile_errors.is_empty() {
+        report_compile_errors(&compile_errors, &filter_str);
         return Ok(exit_codes::COMPILE_ERROR);
     }
 

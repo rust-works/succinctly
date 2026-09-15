@@ -115,7 +115,10 @@ pub use parser::{
     parse_program_with_mode, parse_program_with_mode_and_extensions, parse_with_mode,
     parse_with_mode_and_extensions, CallSite, ParseError, ParserMode,
 };
-pub use resolve::{resolve_func_calls, resolve_func_calls_all, UnresolvedCall};
+pub use resolve::{
+    resolve_all, resolve_func_calls, resolve_func_calls_all, ResolveError, UnboundVar,
+    UnresolvedCall,
+};
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
