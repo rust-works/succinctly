@@ -29757,10 +29757,16 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   function is not handed. Resolved from here, `[$v.b?]` saw `$v` as
         //   just another untracked value and refused `.b` where jq accepts.
         //   #2759.
-        // - `GetPath`: `getpath([])` refuses *eagerly* on an untracked input
-        //   (its own `keys.is_empty()` arm), where jq treats it as a
-        //   passthrough and refuses only at the terminal. `path(1 |
-        //   [getpath([])] | empty)` is accepted by jq. #2764.
+        // - `GetPath`: #2896 made the `keys.is_empty()` arm *defer* in jq
+        //   mode -- the only mode this guard runs in -- so the eager refusal
+        //   this exclusion was originally written against is gone. It is
+        //   kept because the reason is now a different one: resolved from
+        //   here, a `getpath` stage is handed no `carried_register` and no
+        //   ambient positional mark, so neither `getpath_preserves_register`
+        //   nor `getpath_result_position` has anything to work from and the
+        //   bracket would refuse where jq accepts -- the same shape as
+        //   `TrackedVar` above, and the same #2759/#2764 bracket.
+        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2764.
         // - `RecurseF`/`RecurseCond`: the shared `recurse_untracked_error`
         //   guard refuses eagerly whether or not
         //   `f` navigates -- `recurse(empty)`, `recurse(.+1; .<3)` and a
@@ -30139,7 +30145,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                     } else {
                         (
                             PathPrefix::root(),
-                            getpath_result_position(frame, snapshot, &components),
+                            getpath_result_position::<S>(frame, snapshot, &components),
                         )
                     };
                     branches.push(PathBranch::passthrough(
@@ -31523,11 +31529,32 @@ fn cannot_move_register(expr: &Expr) -> bool {
 /// A mark from a *different* resolver invocation is likewise dropped: its
 /// path is a position in another invocation's coordinate system, and
 /// [`Frame::certifies`] would reject it anyway.
-fn getpath_result_position(
+fn getpath_result_position<S: EvalSemantics>(
     frame: &Frame,
     input_snapshot: &Snapshot,
     components: &Rc<PathPrefix>,
 ) -> Snapshot {
+    if S::TAG != EvalTag::Jq {
+        // Review finding on #2896: `Snapshot::At` is **minted** in jq mode
+        // only, which is what makes every downstream admission of it
+        // (`register_identical`, `FoldRegister::relocate`) jq-only without
+        // each needing its own gate -- the variant simply never exists in yq
+        // mode, so those arms are unreachable there. Gating at the two mint
+        // sites rather than at the N admission sites is deliberate: it is one
+        // auditable choke point instead of a rule each future reader of the
+        // variant has to remember.
+        //
+        // Ungated, this turned a yq-mode refusal into a *write* with no
+        // oracle behind it -- real yq's lexer rejects `getpath` outright, so
+        // `--jq-extensions` is the only way to reach these shapes at all:
+        // `printf 'a:\n  b: 2\n' | succinctly yq --jq-extensions
+        // '(. as $x | foreach (1,2) as $k (.c; getpath(["b"]); .c)) = 9'`
+        // wrote `c: {b: {c: 9}, c: 9}`, an output matching neither `main` nor
+        // jq. yq's scalar-write no-op convention makes that silent
+        // corruption rather than a loud error -- the same reasoning
+        // [`trackable_step_register_eligible`] gates itself on.
+        return Snapshot::No;
+    }
     match input_snapshot.position() {
         Some(Origin::At { invocation, path }) if *invocation == frame.invocation => {
             Snapshot::At(Origin::At {
@@ -31559,8 +31586,14 @@ fn getpath_result_position(
 /// An untracked branch keeps its own mark verbatim: whatever provenance it
 /// has is already the strongest available, and a branch that reached here
 /// untracked has no proven path of its own to mint from.
-fn accumulator_provenance(branch: &PathBranch<'_>, fold_frame: &Frame) -> Snapshot {
-    if branch.trackable {
+fn accumulator_provenance<S: EvalSemantics>(
+    branch: &PathBranch<'_>,
+    fold_frame: &Frame,
+) -> Snapshot {
+    // jq mode only -- the second of `Snapshot::At`'s two mint sites; see
+    // [`getpath_result_position`] for why both are gated here rather than at
+    // each admission.
+    if S::TAG == EvalTag::Jq && branch.trackable {
         fold_frame
             .origin_at(&branch.path)
             .map_or(Snapshot::No, Snapshot::At)
@@ -31575,6 +31608,35 @@ fn accumulator_provenance(branch: &PathBranch<'_>, fold_frame: &Frame) -> Snapsh
 /// costs only a refusal.
 fn is_getpath_stage(expr: &Expr) -> bool {
     matches!(unwrap_paren(expr), Expr::Builtin(Builtin::GetPath(_)))
+}
+
+/// Whether `expr` is a `getpath` stage whose key list is the *statically*
+/// empty array literal (#2896). `getpath([])` performs no navigation at all:
+/// with an empty `p`, **both** of `_jq_path_append`'s arms leave jq's
+/// register exactly where it was (the non-intact arm returns the input
+/// untouched; the intact arm appends nothing and re-points `value_at_path`
+/// at the same value). So it preserves the register unconditionally, with no
+/// proof about the input needed -- which is the same reason the arm in
+/// `resolve_node` treats it as a passthrough rather than a navigation.
+///
+/// Review finding on #2896: without this, the general
+/// "the input is provably not the register" proof was demanded of
+/// `getpath([])` too, so an untracked stage whose value merely *happened* to
+/// equal the register refused where the identical `.` stage does not --
+/// `path(.a as $z | .a | 1 | getpath([]) | $z)` on `{"a":1}` refused while
+/// both `... | 5 | getpath([]) | $z` and `... | 1 | . | $z` answered
+/// `["a"]`, jq's answer for all three.
+///
+/// Only the literal spelling counts. A computed argument (`getpath($p)`,
+/// `getpath([] | .)`) may evaluate to something else entirely, and its own
+/// per-output branch already carries the general rule -- declining here
+/// costs a refusal, which is the safe direction.
+fn is_getpath_of_empty_literal_path(expr: &Expr) -> bool {
+    let Expr::Builtin(Builtin::GetPath(arg)) = unwrap_paren(expr) else {
+        return false;
+    };
+    matches!(unwrap_paren(arg), Expr::Array(inner)
+        if matches!(unwrap_paren(inner), Expr::Comma(parts) if parts.is_empty()))
 }
 
 /// [`cannot_move_register`]'s one **dynamic** extension (#2896): whether a
@@ -31636,6 +31698,9 @@ fn getpath_preserves_register<S: EvalSemantics>(
 ) -> bool {
     if S::TAG != EvalTag::Jq || branch_trackable || !is_getpath_stage(expr) {
         return false;
+    }
+    if is_getpath_of_empty_literal_path(expr) {
+        return true;
     }
     let Some(register) = register else {
         // Nothing live to preserve; the answer cannot matter, and `false`
@@ -31832,13 +31897,13 @@ impl FoldRegister {
     /// from and mints nothing.
     ///
     /// An untracked branch keeps whatever mark it already had, unchanged.
-    fn branch_provenance(
+    fn branch_provenance<S: EvalSemantics>(
         &self,
         branch: Option<&PathBranch<'_>>,
         fold_frame: &Frame,
     ) -> (bool, Snapshot) {
         let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
-        let snapshot = branch.map_or(Snapshot::No, |b| accumulator_provenance(b, fold_frame));
+        let snapshot = branch.map_or(Snapshot::No, |b| accumulator_provenance::<S>(b, fold_frame));
         (at_register, snapshot)
     }
 
@@ -33412,7 +33477,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
             trackable,
             snapshot.clone(),
         );
-        let (path_trackable, path_snapshot) = reg.branch_provenance(Some(&doc_branch), frame);
+        let (path_trackable, path_snapshot) = reg.branch_provenance::<S>(Some(&doc_branch), frame);
         // #2732: `branch_provenance` alone answers only "is `.` still
         // *where* the register is" -- a pure path comparison, blind to
         // every other case jq's own `jv_identical` still admits despite
@@ -33608,7 +33673,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // UPDATE (`path(reduce .[] as $k (.; getpath(["a"])))` raises "with
         // result {...}" on both binaries, before and after this change) —
         // that boundary is the canary this seeding must not move.
-        let mut acc_snapshot = accumulator_provenance(init_branch, frame);
+        let mut acc_snapshot = accumulator_provenance::<S>(init_branch, frame);
         let mut aborted: Option<Control> = None;
         // #2031: unlike `resolve_foreach` below, every step here is checked
         // against the fold's own persistent `reg`, never a per-step
@@ -33810,7 +33875,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     // starting point purely from this step's own output
                     // branch, same as before #2632.
                     let last = branches.into_iter().last();
-                    (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref(), frame);
+                    (acc_at_register, acc_snapshot) =
+                        reg.branch_provenance::<S>(last.as_ref(), frame);
                     acc = last.map(|b| b.value.into_owned());
                     Demand::Continue
                 }
@@ -33992,7 +34058,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // [`accumulator_provenance`]. `INIT = .` makes the accumulator the
         // document root, which is what the filed repro's `getpath(["a"])`
         // composes against inside UPDATE.
-        let mut state_snapshot = accumulator_provenance(init_branch, frame);
+        let mut state_snapshot = accumulator_provenance::<S>(init_branch, frame);
         let mut aborted: Option<Control> = None;
         // The source is driven by demand (#2235): each element is folded
         // here, inside the drive, before the next one is pulled, so a step
@@ -34222,7 +34288,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
             // then . else $v end))` names `1` in jq 1.7.1's second refusal.
             if update_branches.is_empty() {
-                (state_at_register, state_snapshot) = reg.branch_provenance(None, frame);
+                (state_at_register, state_snapshot) = reg.branch_provenance::<S>(None, frame);
             }
             for update_branch in &update_branches {
                 // Every output, not just the last: a review pass tried
@@ -34236,7 +34302,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
                 // "result 1" -- a wrong accept, the write-side hazard class.
                 (state_at_register, state_snapshot) =
-                    reg.branch_provenance(Some(update_branch), frame);
+                    reg.branch_provenance::<S>(Some(update_branch), frame);
                 state = update_branch.value.clone().into_owned();
                 if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
@@ -34251,7 +34317,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     // snapshot)` — structurally, not by a second
                     // `identical()` check (#1590).
                     let (extract_at_register, extract_snapshot) =
-                        extract_reg.branch_provenance(Some(update_branch), frame);
+                        extract_reg.branch_provenance::<S>(Some(update_branch), frame);
                     match drain_path_result(
                         extract_reg.resolve::<S>(
                             ext_expr,
@@ -90375,6 +90441,56 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// yq mode stays exactly where `main` left it (review finding on #2896).
+    ///
+    /// `Snapshot::At` is minted in jq mode only, at both of its two mint
+    /// sites, which is what makes every downstream admission jq-only without
+    /// each needing its own gate -- the variant never exists in yq mode.
+    /// Ungated, this shape went from a refusal on `main` to *writing*
+    /// `c: {b: {c: 9}, c: 9}`, an output matching neither `main` nor jq, in a
+    /// mode that has no oracle at all: real yq's lexer rejects `getpath`
+    /// outright, so `--jq-extensions` is the only way to reach it. yq's
+    /// scalar-write no-op convention makes that silent corruption rather
+    /// than a loud error.
+    ///
+    /// The message is `main`'s own, captured from the merge-base binary, so
+    /// this fails if the gate is removed in either direction.
+    #[test]
+    fn test_yq_mode_getpath_register_unchanged_2896() {
+        yq_query!(
+            br#"{"a":{"b":2}}"#,
+            r#"(. as $x | foreach (1,2) as $k (.c; getpath(["b"]); .c)) = 9"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "c" of null"#
+                );
+            }
+        );
+    }
+
+    /// `getpath([])` performs no navigation on either of `_jq_path_append`'s
+    /// arms, so it preserves the register unconditionally -- no proof about
+    /// the input needed (review finding on #2896). Without that arm, an
+    /// untracked stage whose value merely *happened* to equal the register
+    /// refused where the identical `.` stage does not: all three of these
+    /// are `["a"]` in jq 1.7.1, but the first refused.
+    #[test]
+    fn test_path_register_getpath_empty_preserves_unconditionally_2896() {
+        for filter in [
+            r"path(.a as $z | .a | 1 | getpath([]) | $z)",
+            r"path(.a as $z | .a | 5 | getpath([]) | $z)",
+            r"path(.a as $z | .a | 1 | . | $z)",
+        ] {
+            assert_eq!(outputs(br#"{"a":1}"#, filter), [r#"["a"]"#], "{filter}");
+        }
+        // ... and the write direction follows it.
+        assert_eq!(
+            outputs(br#"{"a":1}"#, r"del(.a as $z | .a | 1 | getpath([]) | $z)"),
+            ["{}"]
+        );
     }
 
     /// The register resets between source elements, `getpath` or not: the
