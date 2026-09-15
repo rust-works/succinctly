@@ -2334,6 +2334,19 @@ impl OwnedValue {
     /// #2438 records it as a `NumberLiteral` at the document boundary
     /// ([`from_document_float`](Self::from_document_float)) and the literal
     /// arm echoes that.
+    ///
+    /// #2874 deliberately left this family *outside* a
+    /// [`JsonConvention`](crate::jq::document::JsonConvention)-keyed
+    /// mapping, even though the three variants line up with the three
+    /// wrappers by name: [`to_json_at_depth`](Self::to_json_at_depth)
+    /// hardcodes `write_json_body_jq` escaping for all three, so this
+    /// function is really "`Preserve` numbers + **jq** escaping", which
+    /// `JsonConvention::Preserve` does not mean
+    /// (`uses_jq_escape_table()` is `false` there). Keying the family on the
+    /// enum would assert an equivalence that does not hold. Whether yq mode
+    /// *should* escape `@json`/interpolation output through yq's own table
+    /// here is a real, separate question with its own oracle probe to run
+    /// against yq v4.53.3 -- not something to decide by refactor.
     pub(crate) fn to_json_yq(&self) -> String {
         self.to_json_at_depth(
             0,

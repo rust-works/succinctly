@@ -8,6 +8,7 @@ use std::io::{BufWriter, Write};
 
 // Aliased: this module already has an `escape_json_body` of its own, which
 // picks *which* convention to use; the library's runs a chosen writer.
+use succinctly::jq::document::JsonConvention;
 use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
@@ -473,18 +474,6 @@ pub fn escape_json_string_ascii_yq(s: &str) -> String {
     run_escaper(write_json_body_yq_ascii, s)
 }
 
-/// Which tool's control-character escaping convention [`format_json`] uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlEscape {
-    /// jq style: `\b`/`\f` short escapes and DEL escaped as `\u00xx`; the C1
-    /// controls are left raw, as jq leaves them (#385). See
-    /// [`escape_json_string`].
-    Jq,
-    /// yq style: backspace/form-feed as `\u0008`/`\u000c`, DEL and C1 controls
-    /// left raw. See [`escape_json_string_yq`].
-    Yq,
-}
-
 /// How to render finite floats with no fractional part.
 #[derive(Clone, Copy, Debug)]
 pub enum FloatStyle {
@@ -504,38 +493,48 @@ pub struct JsonFormatOpts<'a> {
     pub ascii: bool,
     /// Rendering of whole floats.
     pub float_style: FloatStyle,
-    /// Control-character escaping convention (jq vs yq).
-    pub control_escape: ControlEscape,
+    /// The active output convention: which tool's escape table strings go
+    /// through, and whether a `NumberLiteral` echoes its source spelling or
+    /// is reformatted to jq's own.
+    ///
+    /// #2874: was two separate fields, `control_escape: ControlEscape` and
+    /// `jq_compat: bool`, which between them spelled out exactly this enum's
+    /// three variants — `(Yq, true) = Preserve`, `(Jq, true) = JqCompat`,
+    /// `(Jq, false) = JqPreserveInput`, and `(Yq, false)` never constructed.
+    /// Storing the two axes separately is what forced yq's construction site
+    /// to pass a documented dummy `jq_compat: true` it never consults, and
+    /// what let this decision be re-derived independently at four sites
+    /// instead of read off [`JsonConvention`]'s own helper methods. A fourth
+    /// variant is now a compile error in the `Float` and `NumberLiteral`
+    /// arms below, which is the whole point of the exercise (#2209 was
+    /// precisely a two-variant check silently missing a new case).
+    pub convention: JsonConvention,
     /// Whether the source document was JSON (only meaningful alongside
-    /// `control_escape: Yq` — see the `Float` arm's own `json_sourced`
+    /// `convention: Preserve` — see the `Float` arm's own `json_sourced`
     /// branch below). A JSON-sourced float never keeps a decimal point in
     /// output, computed or not, compact or pretty (#978, #1398) — unlike
     /// `float_style`, which only distinguishes compact/pretty for *jq*
     /// mode (yq's own compact/pretty JSON output always agree with each
     /// other on float formatting; see [`format_float_yq`]'s doc comment).
-    pub json_sourced: bool,
-    /// Whether a jq-mode `NumberLiteral` reformats to jq's own number
-    /// spelling (`true`) or echoes its source spelling verbatim (`false`,
-    /// `--preserve-input`) — only meaningful alongside `control_escape:
-    /// Jq`, mirroring how `json_sourced` above is only meaningful
-    /// alongside `control_escape: Yq`. yq mode has its own, independent
-    /// preserve-vs-reformat split on `NumberLiteral` (gated by
-    /// `json_sourced`) and ignores this field entirely.
     ///
-    /// Before #2852, `format_json`/`JsonFormatOpts` had no such split at
-    /// all — every `NumberLiteral` in jq mode reformatted unconditionally,
-    /// disagreeing with `print_json`'s own `JqCompatFormatter`/
-    /// `PreserveFormatter` split for the default `-c` route.
-    pub jq_compat: bool,
+    /// Stays a separate field rather than folding into `convention`: it is a
+    /// yq-only *sub*-axis of `Preserve` (which of real yq's two float
+    /// spellings applies), not another spelling of the preserve-vs-reformat
+    /// split (#2874).
+    pub json_sourced: bool,
 }
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
 fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
-    match (opts.control_escape, opts.ascii) {
-        (ControlEscape::Jq, false) => escape_json_string(s),
-        (ControlEscape::Jq, true) => escape_json_string_ascii(s),
-        (ControlEscape::Yq, false) => escape_json_string_yq(s),
-        (ControlEscape::Yq, true) => escape_json_string_ascii_yq(s),
+    // The escape table is a *mode* rule, independent of the
+    // preserve-vs-reformat axis — that independence is exactly what #2209
+    // fixed, and `uses_jq_escape_table()` is the single place it is decided
+    // (`JqPreserveInput` preserves numbers but still escapes like jq).
+    match (opts.convention.uses_jq_escape_table(), opts.ascii) {
+        (true, false) => escape_json_string(s),
+        (true, true) => escape_json_string_ascii(s),
+        (false, false) => escape_json_string_yq(s),
+        (false, true) => escape_json_string_ascii_yq(s),
     }
 }
 
@@ -588,112 +587,151 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::Float(f) => {
             if f.is_nan() {
                 "null".to_string() // JSON doesn't support NaN
-            } else if f.is_infinite() {
-                if opts.control_escape == ControlEscape::Yq {
-                    // yq mode: still "null" -- real yq's own Go
-                    // encoding/json refuses to marshal Infinity at all and
-                    // errors instead, so this is a deliberate, open design
-                    // question left unresolved here, not a parity bug
-                    // (#1087's own scope note).
-                    "null".to_string()
-                } else {
-                    // jq mode: a computed Infinity has no source literal to
-                    // echo, so it renders jq's own DBL_MAX text instead of
-                    // "null" (#1087, confirmed live against jq 1.7.1: `null
-                    // | infinite` is `1.7976931348623157e+308`). Reuses
-                    // #1075's `nonfinite_display_string` rather than a
-                    // fourth hand-rolled copy of the same split (`value.rs`,
-                    // `jq_runner.rs`'s two `LiteralFormatter` impls).
-                    nonfinite_display_string::<JqSemantics>(*f).to_string()
-                }
-            } else if opts.control_escape == ControlEscape::Yq && opts.json_sourced {
-                // A JSON-sourced float never keeps a decimal point, in any
-                // output mode (#978, #1398) -- see `json_sourced_float_display`.
-                json_sourced_float_display(*f)
-            } else if opts.control_escape == ControlEscape::Yq {
-                // yq mode: scientific notation past yq's magnitude threshold
-                // (#997), decimal-with-fraction otherwise, regardless of
-                // compact/pretty -- real yq's Float formatting doesn't
-                // distinguish the two (`float_style` only matters for jq
-                // mode below).
-                format_float_yq(*f)
             } else {
-                match opts.float_style {
-                    // #2456: was a bare `f.to_string()`, which never switches
-                    // to scientific notation -- `jq_bare_float_display` is
-                    // the same formatter `OwnedValue::to_json` and the M2
-                    // streaming writer use, so this CLI print path stops
-                    // diverging from them past the threshold.
-                    FloatStyle::Shortest => jq_bare_float_display(*f),
-                    // Whole floats keep their decimal point at any magnitude;
-                    // the old `<= i64::MAX` guard silently dropped it above
-                    // that, disagreeing with the YAML writers (issue #169).
-                    FloatStyle::PreserveWholeFloat => format_float_with_fraction(*f),
+                // #2874: an exhaustive match on the convention rather than a
+                // chain of `== ControlEscape::Yq` tests, so a fourth variant
+                // has to state its float spelling here instead of silently
+                // inheriting jq's.
+                match opts.convention {
+                    JsonConvention::Preserve => {
+                        if f.is_infinite() {
+                            // yq mode: still "null" -- real yq's own Go
+                            // encoding/json refuses to marshal Infinity at
+                            // all and errors instead, so this is a
+                            // deliberate, open design question left
+                            // unresolved here, not a parity bug (#1087's own
+                            // scope note).
+                            "null".to_string()
+                        } else if opts.json_sourced {
+                            // A JSON-sourced float never keeps a decimal
+                            // point, in any output mode (#978, #1398) -- see
+                            // `json_sourced_float_display`.
+                            json_sourced_float_display(*f)
+                        } else {
+                            // yq mode: scientific notation past yq's
+                            // magnitude threshold (#997),
+                            // decimal-with-fraction otherwise, regardless of
+                            // compact/pretty -- real yq's Float formatting
+                            // doesn't distinguish the two (`float_style`
+                            // only matters for jq mode below).
+                            format_float_yq(*f)
+                        }
+                    }
+                    JsonConvention::JqCompat | JsonConvention::JqPreserveInput => {
+                        if f.is_infinite() {
+                            // jq mode: a computed Infinity has no source
+                            // literal to echo, so it renders jq's own
+                            // DBL_MAX text instead of "null" (#1087,
+                            // confirmed live against jq 1.7.1: `null |
+                            // infinite` is `1.7976931348623157e+308`).
+                            // Reuses #1075's `nonfinite_display_string`
+                            // rather than a fourth hand-rolled copy of the
+                            // same split (`value.rs`, `jq_runner.rs`'s two
+                            // `LiteralFormatter` impls).
+                            //
+                            // `--preserve-input` shares this arm: an
+                            // Infinity that was *computed* has no source
+                            // spelling for preserve mode to keep either, the
+                            // same reason `PreserveFormatter::format_float`
+                            // applies jq's rule too.
+                            nonfinite_display_string::<JqSemantics>(*f).to_string()
+                        } else {
+                            match opts.float_style {
+                                // #2456: was a bare `f.to_string()`, which
+                                // never switches to scientific notation --
+                                // `jq_bare_float_display` is the same
+                                // formatter `OwnedValue::to_json` and the M2
+                                // streaming writer use, so this CLI print
+                                // path stops diverging from them past the
+                                // threshold.
+                                FloatStyle::Shortest => jq_bare_float_display(*f),
+                                // Whole floats keep their decimal point at
+                                // any magnitude; the old `<= i64::MAX` guard
+                                // silently dropped it above that,
+                                // disagreeing with the YAML writers (issue
+                                // #169).
+                                FloatStyle::PreserveWholeFloat => format_float_with_fraction(*f),
+                            }
+                        }
+                    }
                 }
             }
         }
         OwnedValue::NumberLiteral(repr, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
                 "null".to_string() // JSON doesn't support NaN
-            } else if opts.control_escape == ControlEscape::Yq {
-                match repr {
-                    // #1498 review: `json_sourced_float_display` (plain
-                    // `f64::to_string()`) renders an infinite `f` as
-                    // `inf`/`-inf`, not valid JSON -- the `Float` arm above
-                    // avoids this by special-casing `is_infinite()` before
-                    // its own `json_sourced` branch ever runs. No live path
-                    // reconstructs an *infinite* `NumberLiteral` for
-                    // JSON-sourced document input today (`to_json_for_reindex`'s
-                    // unparseable sentinel gets intercepted back to a plain
-                    // `Float` on reparse, never boxed into a `NumberLiteral`
-                    // -- see that function's own doc comment) -- but a
-                    // query-*text* literal like `1e400` reaches this same
-                    // arm via the parser directly, independent of the
-                    // reindex bridge, and `json_sourced` is a document-level
-                    // flag that doesn't distinguish the two origins. Guarded
-                    // here defensively, matching the `Float` arm's own
-                    // `"null"` answer, rather than relying on that
-                    // cross-file invariant to keep holding.
-                    NumberRepr::Float(f) if opts.json_sourced && f.is_infinite() => {
-                        "null".to_string()
-                    }
-                    // #1498: a `NumberLiteral` can still reach here for
-                    // JSON-sourced input despite `to_owned_canonicalizing_numbers`
-                    // stripping it at parse time -- `--eval-all`'s
-                    // `eval_owned_input` reindex round-trip (serialize the
-                    // already-stripped `OwnedValue` back to JSON text, then
-                    // re-parse it through the library's own literal-preserving
-                    // `to_owned`, #918) reconstructs one. Same rule as the
-                    // `Float` arm above either way: a JSON-sourced *finite*
-                    // float never keeps a decimal point.
-                    NumberRepr::Float(f) if opts.json_sourced => json_sourced_float_display(*f),
-                    // Int literals have no such spelling ambiguity, and a
-                    // non-`json_sourced` float has no rule to apply here at
-                    // all -- both echo the source spelling verbatim (#1008),
-                    // matching real yq's documented byte-for-byte literal
-                    // preservation regardless of finiteness (confirmed live:
-                    // a genuine document `1e999` literal echoes verbatim in
-                    // real yq too).
-                    _ => literal.to_string(),
-                }
-            } else if opts.jq_compat {
-                // jq mode keeps `format_number_jq_compat`'s reformatting
-                // unchanged, which itself already reformats a non-finite
-                // literal's mantissa correctly (#1083/#1087) rather than
-                // assuming finiteness. This PR fixed its `-0.0`-sign-loss
-                // bug (also #1008, since widening
-                // `is_preservable_float_literal` newly exposed it via
-                // YAML), but it has other pre-existing divergences from
-                // real jq, unrelated and left alone here, e.g. `0.1e1` ->
-                // `1E+0` here vs real jq's `1`.
-                format_number_jq_compat(literal.as_bytes())
             } else {
-                // `--preserve-input`: echo the source spelling verbatim,
-                // the same rule `PreserveFormatter::format_raw_number`
-                // already applies on the default `-c` `print_json` route
-                // (#2852) -- this `format_json` route (`-S`/`-a`/`-C`/`-s`)
-                // had no such split until this fix.
-                literal.to_string()
+                // #2874: the point of the exercise. This is the
+                // preserve-vs-reformat decision itself, and it is now an
+                // exhaustive `match` on the one enum that owns the axis --
+                // adding a fourth `JsonConvention` variant fails to build
+                // here rather than silently inheriting one of these three
+                // bodies, which is literally the failure mode #2209 was.
+                match opts.convention {
+                    // yq's own bundle: byte-for-byte literal preservation.
+                    JsonConvention::Preserve => match repr {
+                        // #1498 review: `json_sourced_float_display` (plain
+                        // `f64::to_string()`) renders an infinite `f` as
+                        // `inf`/`-inf`, not valid JSON -- the `Float` arm above
+                        // avoids this by special-casing `is_infinite()` before
+                        // its own `json_sourced` branch ever runs. No live path
+                        // reconstructs an *infinite* `NumberLiteral` for
+                        // JSON-sourced document input today (`to_json_for_reindex`'s
+                        // unparseable sentinel gets intercepted back to a plain
+                        // `Float` on reparse, never boxed into a `NumberLiteral`
+                        // -- see that function's own doc comment) -- but a
+                        // query-*text* literal like `1e400` reaches this same
+                        // arm via the parser directly, independent of the
+                        // reindex bridge, and `json_sourced` is a document-level
+                        // flag that doesn't distinguish the two origins. Guarded
+                        // here defensively, matching the `Float` arm's own
+                        // `"null"` answer, rather than relying on that
+                        // cross-file invariant to keep holding.
+                        NumberRepr::Float(f) if opts.json_sourced && f.is_infinite() => {
+                            "null".to_string()
+                        }
+                        // #1498: a `NumberLiteral` can still reach here for
+                        // JSON-sourced input despite `to_owned_canonicalizing_numbers`
+                        // stripping it at parse time -- `--eval-all`'s
+                        // `eval_owned_input` reindex round-trip (serialize the
+                        // already-stripped `OwnedValue` back to JSON text, then
+                        // re-parse it through the library's own literal-preserving
+                        // `to_owned`, #918) reconstructs one. Same rule as the
+                        // `Float` arm above either way: a JSON-sourced *finite*
+                        // float never keeps a decimal point.
+                        NumberRepr::Float(f) if opts.json_sourced => json_sourced_float_display(*f),
+                        // Int literals have no such spelling ambiguity, and a
+                        // non-`json_sourced` float has no rule to apply here at
+                        // all -- both echo the source spelling verbatim (#1008),
+                        // matching real yq's documented byte-for-byte literal
+                        // preservation regardless of finiteness (confirmed live:
+                        // a genuine document `1e999` literal echoes verbatim in
+                        // real yq too).
+                        _ => literal.to_string(),
+                    },
+                    // jq's default: `format_number_jq_compat`'s reformatting,
+                    // which itself already reformats a non-finite literal's
+                    // mantissa correctly (#1083/#1087) rather than assuming
+                    // finiteness. #2852 fixed its `-0.0`-sign-loss bug (also
+                    // #1008, since widening `is_preservable_float_literal` newly
+                    // exposed it via YAML), but it has other pre-existing
+                    // divergences from real jq, unrelated and left alone here.
+                    // (#2874: the example this comment used to give, `0.1e1` ->
+                    // `1E+0` vs real jq's `1`, is stale -- both spell it `1`
+                    // today, confirmed live against jq 1.7.1 and pinned by
+                    // `format_json_number_literal_is_exhaustive_over_conventions_2874`.)
+                    JsonConvention::JqCompat => format_number_jq_compat(literal.as_bytes()),
+                    // `--preserve-input`: echo the source spelling verbatim,
+                    // the same rule `PreserveFormatter::format_raw_number`
+                    // already applies on the default `-c` `print_json` route
+                    // (#2852) -- this `format_json` route (`-S`/`-a`/`-C`/`-s`)
+                    // had no such split until that fix. `literal` is already a
+                    // `Box<str>` here, so this is the infallible spelling of the
+                    // same verbatim echo `PreserveFormatter::format_raw_number`
+                    // and `stream::real_output_finite_literal` reach through
+                    // `String::from_utf8_lossy` from raw bytes (#2874).
+                    JsonConvention::JqPreserveInput => literal.to_string(),
+                }
             }
         }
         OwnedValue::String(s) => {
@@ -1326,9 +1364,8 @@ mod tests {
             sort_keys: true,
             ascii: false,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
     }
@@ -1341,9 +1378,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(format_json(&value, &opts(FloatStyle::Shortest)), "1");
         assert_eq!(
@@ -1390,9 +1426,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style,
-            control_escape: ControlEscape::Yq,
+            convention: JsonConvention::Preserve,
             json_sourced: false,
-            jq_compat: true,
         };
         let huge = OwnedValue::Float(1e100);
         assert_eq!(format_json(&huge, &opts(FloatStyle::Shortest)), "1e+100");
@@ -1497,9 +1532,8 @@ mod tests {
             sort_keys: false,
             ascii: true,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Yq,
+            convention: JsonConvention::Preserve,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(
             format_json(&OwnedValue::Object(obj), &opts),
@@ -1519,9 +1553,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::PreserveWholeFloat,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
         assert_eq!(
@@ -1537,13 +1570,89 @@ mod tests {
         // question -- real yq's Go encoding/json errors on Infinity rather
         // than substituting anything).
         let yq_opts = JsonFormatOpts {
-            control_escape: ControlEscape::Yq,
+            convention: JsonConvention::Preserve,
             json_sourced: false,
             ..opts
         };
         assert_eq!(
             format_json(&OwnedValue::Float(f64::INFINITY), &yq_opts),
             "null"
+        );
+    }
+
+    /// #2874: the three conventions are the *only* three number-literal
+    /// renderings this formatter has, and each one is reached by naming its
+    /// variant -- not by a `(control_escape, jq_compat)` pair whose fourth
+    /// combination was unconstructible-but-expressible.
+    ///
+    /// Written as an exhaustive `match` over the enum rather than a list of
+    /// three asserts: a fourth variant makes *this test* fail to compile
+    /// too, so the invariant the refactor buys (`format_json_impl`'s number
+    /// arms cannot silently inherit a body) has a pin of its own and is not
+    /// left resting on a doc comment.
+    #[test]
+    fn format_json_number_literal_is_exhaustive_over_conventions_2874() {
+        // `0.1e1` separates the reformatting convention from the two
+        // preserving ones: both of those echo it verbatim, while jq's own
+        // reader canonicalizes it to `1` (confirmed live against jq 1.7.1 --
+        // `format_number_jq_compat` agrees with real jq on this spelling).
+        let literal = OwnedValue::NumberLiteral(NumberRepr::Float(1.0), "0.1e1".into());
+        for convention in [
+            JsonConvention::Preserve,
+            JsonConvention::JqPreserveInput,
+            JsonConvention::JqCompat,
+        ] {
+            let opts = JsonFormatOpts {
+                indent: "",
+                sort_keys: false,
+                ascii: false,
+                float_style: FloatStyle::Shortest,
+                convention,
+                json_sourced: false,
+            };
+            let expected = match convention {
+                JsonConvention::Preserve | JsonConvention::JqPreserveInput => "0.1e1",
+                JsonConvention::JqCompat => "1",
+            };
+            assert_eq!(
+                format_json(&literal, &opts),
+                expected,
+                "convention={convention:?}"
+            );
+        }
+    }
+
+    /// #2874: the escape table is the *other* axis, and `JqPreserveInput`
+    /// sits on the jq side of it while preserving numbers -- the exact
+    /// independence #2209 established. A test per axis, because collapsing
+    /// the two fields into one enum is only safe if neither axis quietly
+    /// picked up the other's answer.
+    #[test]
+    fn format_json_escape_table_follows_mode_not_preserve_2874() {
+        // Backspace: jq's table has the `\b` short form, yq's spells it
+        // `\u0008`.
+        let value = OwnedValue::String("a\u{8}b".to_string());
+        let opts = |convention| JsonFormatOpts {
+            indent: "",
+            sort_keys: false,
+            ascii: false,
+            float_style: FloatStyle::Shortest,
+            convention,
+            json_sourced: false,
+        };
+        assert_eq!(
+            format_json(&value, &opts(JsonConvention::JqCompat)),
+            r#""a\bb""#
+        );
+        assert_eq!(
+            format_json(&value, &opts(JsonConvention::JqPreserveInput)),
+            r#""a\bb""#,
+            "--preserve-input keeps jq's escape table (#2209)"
+        );
+        assert_eq!(
+            format_json(&value, &opts(JsonConvention::Preserve)),
+            r#""a\u0008b""#,
+            "yq's bundle uses yq's escape table"
         );
     }
 
@@ -1559,9 +1668,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         let overflowed = OwnedValue::NumberLiteral(
             succinctly::jq::NumberRepr::Float(f64::INFINITY),
@@ -1573,7 +1681,7 @@ mod tests {
         // (#1008's byte-for-byte preservation convention) -- confirmed live
         // against real yq.
         let yq_opts = JsonFormatOpts {
-            control_escape: ControlEscape::Yq,
+            convention: JsonConvention::Preserve,
             json_sourced: false,
             ..opts
         };
@@ -1592,9 +1700,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
         assert_eq!(
@@ -1616,9 +1723,8 @@ mod tests {
             sort_keys: false,
             ascii: true,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
         assert_eq!(
             format_json(&value, &opts),
@@ -1684,9 +1790,8 @@ mod tests {
             sort_keys: false,
             ascii: false,
             float_style: FloatStyle::Shortest,
-            control_escape: ControlEscape::Jq,
+            convention: JsonConvention::JqCompat,
             json_sourced: false,
-            jq_compat: true,
         };
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);

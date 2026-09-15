@@ -33,8 +33,7 @@ use super::m2_gate::can_use_m2_streaming;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
-    LoudFlushWriter, Terminator,
+    DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -1092,8 +1091,23 @@ struct OutputConfig {
     indent_string: String,
     unbuffered: bool,
     seq: bool,
-    /// Format numbers like jq (normalize 4e4 → 40000, 0.10 → 0.1)
-    jq_compat: bool,
+    /// The active output convention: whether a number literal is reformatted
+    /// to jq's own spelling (`JqCompat`, the default) or echoed verbatim
+    /// (`JqPreserveInput`, `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1`),
+    /// and which tool's escape table strings go through.
+    ///
+    /// #2874: was `jq_compat: bool`, one layer below where `JsonConvention`
+    /// was finally constructed — so the enum was built *late*, from the
+    /// bool, and five other consumers each re-derived the same split from
+    /// that bool instead. Computing it once here makes this the single
+    /// source of truth every consumer reads, via
+    /// [`JsonConvention::preserves_source_values`] /
+    /// [`JsonConvention::uses_jq_escape_table`] rather than a raw
+    /// two-variant pattern (#2209).
+    ///
+    /// This is jq mode, so it is never `Preserve` — that is yq's whole
+    /// bundle, escape table included; see `JsonConvention`'s own doc comment.
+    convention: JsonConvention,
 }
 
 impl OutputConfig {
@@ -1118,13 +1132,25 @@ impl OutputConfig {
         // Get color scheme from JQ_COLORS env var (or defaults)
         let color_scheme = ColorScheme::from_env();
 
-        // Determine jq_compat mode with priority:
-        // 1. --preserve-input flag forces off (preserve original formatting)
-        // 2. SUCCINCTLY_PRESERVE_INPUT=1 env var disables jq_compat
-        // 3. Default: on (jq-compatible formatting)
+        // Determine the output convention with priority:
+        // 1. --preserve-input flag forces preserve (keep original formatting)
+        // 2. SUCCINCTLY_PRESERVE_INPUT=1 env var does the same
+        // 3. Default: jq-compatible formatting
+        //
+        // #2209: `JqPreserveInput`, never `Preserve` -- this is jq mode, and
+        // `Preserve` is yq's whole bundle, escape table included. Selecting
+        // that here made `--preserve-input` silently render strings through
+        // yq's table on the cursor-streaming path, a divergence from real jq
+        // that `--preserve-input` was never meant to cause (it is documented
+        // to affect number spelling and duplicate keys only).
         let jq_compat = !args.preserve_input
             && !std::env::var("SUCCINCTLY_PRESERVE_INPUT")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let convention = if jq_compat {
+            JsonConvention::JqCompat
+        } else {
+            JsonConvention::JqPreserveInput
+        };
 
         Self {
             compact: args.compact_output,
@@ -1138,7 +1164,7 @@ impl OutputConfig {
             indent_string,
             unbuffered: args.unbuffered,
             seq: args.seq,
-            jq_compat,
+            convention,
         }
     }
 
@@ -1154,14 +1180,15 @@ impl OutputConfig {
         // - No ascii_output (would need to escape non-ASCII)
         // - No raw_output (would strip quotes from strings)
         // - No seq mode (would need to add RS characters)
-        // - Not jq_compat (would need to reformat numbers like 4e4 → 4E+4)
+        // - Source-preserving convention (jq's own would need to reformat
+        //   numbers like 4e4 → 4E+4)
         self.compact
             && !self.color_output
             && !self.sort_keys
             && !self.ascii_output
             && !self.raw_output
             && !self.seq
-            && !self.jq_compat
+            && self.convention.preserves_source_values()
     }
 }
 
@@ -1204,12 +1231,12 @@ struct PreparedField<'a> {
     /// on output, unlike a plain backslash-free span otherwise. This file is
     /// jq mode only (`succinctly yq` has its own separate runner), but it is
     /// *not* jq-convention only: `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1`
-    /// make this same runner select `JsonConvention::Preserve` (the same
-    /// convention yq uses, DEL left raw) for number formatting, and key
-    /// escaping must agree -- so `write_object_key` gates this on
-    /// `config.jq_compat` exactly like `write_json_string_pretty`'s twin
-    /// fix in `src/json/light.rs` gates on the active `JsonConvention`, not
-    /// unconditionally.
+    /// make this same runner select `JsonConvention::JqPreserveInput`, and
+    /// key escaping must agree with whatever the value side does -- so
+    /// `write_object_key` gates this on the active `JsonConvention` exactly
+    /// like `write_json_string_pretty`'s twin fix in `src/json/light.rs`,
+    /// not unconditionally. (Which *side* of the convention it should gate
+    /// on is FIXME(#2988) -- see `write_json_string_zero_copy`.)
     has_del: bool,
 }
 
@@ -1398,14 +1425,22 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
 /// for that a third time. Every other caller has nothing else to hoist them
 /// for and just passes `s.raw_and_escaped()` straight through.
 ///
-/// #2591/#2592: `has_del && config.jq_compat` is the one extra case the
-/// zero-copy path cannot take under jq's own escape convention -- a raw DEL
-/// byte (`0x7f`) is legal unescaped JSON source, but jq's escape table still
-/// re-encodes it to `` on output. `--preserve-input`/yq's own
-/// `Preserve` convention (`!config.jq_compat`) leaves it raw, matching real
-/// yq. Shared by four call sites (this one plus three sibling ones in
-/// `print_json`/`keys_unsorted`, #2592) that used to each hand-roll this
-/// gate-and-branch shape independently.
+/// #2591/#2592: a raw DEL byte is the one extra case the zero-copy path
+/// cannot take under jq's own escape convention -- `0x7f` is legal
+/// unescaped JSON source, but jq's escape table still re-encodes it to
+/// `\u007f` on output. Shared by four call sites (this one plus three
+/// sibling ones in `print_json`/`keys_unsorted`, #2592) that used to each
+/// hand-roll this gate-and-branch shape independently.
+///
+/// FIXME(#2988): the gate is keyed on the wrong axis. #2874 translated it
+/// behaviour-preservingly from `config.jq_compat` to
+/// `!preserves_source_values()`, but the escape table is a *mode* rule that
+/// `--preserve-input` must not touch (#2209) -- so this should read
+/// `uses_jq_escape_table()`, which is `true` for `JqPreserveInput` too. As
+/// written, `--preserve-input` echoes a raw DEL on the `-c`/`-S`/pretty
+/// routes while `-a`/`-s`/`-C` escape it, and real jq 1.7.1 escapes it on
+/// all of them. Fixing that is a behaviour change with its own oracle
+/// matrix, deliberately out of scope for #2874's no-behaviour-change pass.
 fn write_json_string_zero_copy<Out: Write>(
     out: &mut Out,
     raw: &[u8],
@@ -1414,7 +1449,8 @@ fn write_json_string_zero_copy<Out: Write>(
     s: JsonString<'_>,
     config: &OutputConfig,
 ) -> Result<()> {
-    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
+    if !(config.ascii_output || escaped || has_del && !config.convention.preserves_source_values())
+    {
         out.write_all(raw)?;
     } else if let Ok(decoded) = s.as_str() {
         out.write_all(b"\"")?;
@@ -2178,20 +2214,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     } else {
         IndentSpec::spaces(2)
     };
-    // `output_config.jq_compat` already encodes the same
-    // `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` priority `JsonConvention`
-    // needs (`OutputConfig::from_args`'s own doc comment).
-    // #2209: `JqPreserveInput`, never `Preserve` -- this is jq mode, and
-    // `Preserve` is yq's whole bundle, escape table included. Selecting it
-    // here made `--preserve-input` silently render strings through yq's
-    // table on the cursor-streaming path, a divergence from real jq that
-    // `--preserve-input` was never meant to cause (it is documented to
-    // affect number spelling and duplicate keys only).
-    let json_numbers = if output_config.jq_compat {
-        JsonConvention::JqCompat
-    } else {
-        JsonConvention::JqPreserveInput
-    };
+    // #2874: was this same two-way derive-from-bool, one of the four
+    // independent encodings of the axis. `OutputConfig::from_args` now owns
+    // the decision (including the #2209 `JqPreserveInput`-never-`Preserve`
+    // rule, recorded there) and this site just reads it.
+    let json_numbers = output_config.convention;
 
     // Set up output writer
     let stdout = std::io::stdout();
@@ -2318,7 +2345,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // - Not using input/inputs/input_line_number (#723): those need the
     //   "original" path's own already-materialized Vec<OwnedValue> to share
     //   with the shared input queue below; the lazy path never builds one.
-    // Both jq_compat (reformatting numbers) and preserve mode (keeping original formatting)
+    // Both the jq convention (reformatting numbers) and preserve mode (keeping original formatting)
     // use the lazy path for correctness.
     //
     // #2662: `sort_keys`/`color_output`/`ascii_output` used to be excluded
@@ -4703,10 +4730,18 @@ fn evaluate_input_streaming(
     // `input`/`inputs` builtin themselves was unaffected, since those
     // resolve from an already-materialized queue that never reaches this
     // function or either `to_json` variant).
-    let json_str = if output_config.jq_compat {
-        input.to_json()
-    } else {
+    //
+    // #2874: the *choice* now reads off the one convention value rather than
+    // an independent bool. The `to_json*` family itself deliberately stays
+    // outside a `JsonConvention`-keyed mapping: `to_json_at_depth` hardcodes
+    // jq's escape table for all three of its callers, so `to_json_yq` is
+    // "`Preserve` numbers + *jq* escaping", and keying the family on the
+    // enum would assert an equivalence that does not hold. See
+    // `OwnedValue::to_json_yq`'s own doc comment.
+    let json_str = if output_config.convention.preserves_source_values() {
         input.to_json_jq_preserve()
+    } else {
+        input.to_json()
     };
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -5612,8 +5647,16 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         return Ok(());
     }
 
-    // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
-    // For preserve mode (!jq_compat), use the preserve formatter (keeps original number format)
+    // `JqCompat` uses the jq-compatible formatter (reformats numbers); a
+    // source-preserving convention uses the preserve formatter (keeps the
+    // original number format).
+    //
+    // #2874: stays a static `if` over two monomorphised `print_json`
+    // instantiations rather than a `&dyn LiteralFormatter`. This is the
+    // default `-c` route -- the hottest path in the binary -- and a vtable
+    // call in its per-scalar inner loop is not something to buy for tidiness
+    // (#2603/#595: `[profile.release]` is pinned to cgu=1 + fat LTO because
+    // this path is sensitive to codegen alone).
     //
     // #2662: `ascii_output` joins `sort_keys`/`color_output` on the
     // materialize side here -- `print_json` streams structural + scalar
@@ -5626,11 +5669,11 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // of the document -- the same "materializes what it reads" rule this
     // issue is generalizing to `-S`/`-C` above.
     if !config.sort_keys && !config.color_output && !config.ascii_output {
-        if config.jq_compat {
+        if config.convention.preserves_source_values() {
             print_json(
                 out,
                 value,
-                &JqCompatFormatter,
+                &PreserveFormatter,
                 config,
                 0,
                 &mut Vec::new(),
@@ -5641,7 +5684,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
             print_json(
                 out,
                 value,
-                &PreserveFormatter,
+                &JqCompatFormatter,
                 config,
                 0,
                 &mut Vec::new(),
@@ -5878,10 +5921,23 @@ struct PreserveFormatter;
 
 impl LiteralFormatter for PreserveFormatter {
     fn format_raw_number<'a>(&self, raw: &'a [u8]) -> Cow<'a, str> {
-        match core::str::from_utf8(raw) {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(String::from_utf8_lossy(raw).into_owned()),
-        }
+        // #2874: this used to be a hand-rolled `from_utf8`/lossy match,
+        // which is what `String::from_utf8_lossy` already is -- same
+        // `Cow::Borrowed`-when-valid behaviour, so no allocation is added on
+        // this (hot, default `-c`) path. That one call is now the single
+        // spelling of "echo the source number span verbatim" shared with
+        // `jq::stream::real_output_finite_literal`, which is the same call
+        // plus `.into_owned()` for its `fn(&[u8]) -> String` signature.
+        //
+        // Two siblings deliberately stay distinct rather than being churned
+        // onto it: `output::format_json_impl`'s `JqPreserveInput` arm
+        // already holds a `Box<str>`, so its echo is the infallible
+        // `literal.to_string()`; and `json::light::write_json_number`'s
+        // source-preserving arm writes into a `core::fmt::Write` and so
+        // *errors* on invalid UTF-8 where these allocate a lossy
+        // replacement -- it cannot build a `Cow` without changing that
+        // signature.
+        String::from_utf8_lossy(raw)
     }
 
     fn format_float(&self, f: f64) -> String {
@@ -6441,7 +6497,7 @@ where
                         // diverged only because the value arriving here was
                         // still a cursor.
                         //
-                        // `--preserve-input` (`!jq_compat`) keeps every
+                        // A source-preserving convention keeps every
                         // occurrence *on output*. Reproducing the input
                         // verbatim is that extension's purpose, and ADR-0018
                         // rule 5 allows it because no reference-defined
@@ -6572,7 +6628,7 @@ where
                                 .into());
                             }
                         }
-                        let collapsed = if config.jq_compat {
+                        let collapsed = if !config.convention.preserves_source_values() {
                             collapse_duplicate_fields(&scratch[base..], &frame)
                         } else {
                             None
@@ -6913,16 +6969,16 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
         float_style: FloatStyle::Shortest,
-        control_escape: ControlEscape::Jq,
-        // Only meaningful alongside `ControlEscape::Yq` (see
+        // #2852: `-S`/`-a`/`-C`/`-s` used to reformat a `NumberLiteral`
+        // regardless of `--preserve-input`, disagreeing with `print_json`'s
+        // `JqCompatFormatter`/`PreserveFormatter` split on the default `-c`
+        // route; #2874 replaced the `(control_escape, jq_compat)` pair that
+        // fix left behind with the one convention value both routes now read.
+        convention: config.convention,
+        // Only meaningful alongside `JsonConvention::Preserve` (see
         // `JsonFormatOpts::json_sourced`'s own doc comment) -- jq mode
         // never consults it.
         json_sourced: false,
-        // #2852: was missing entirely, so `-S`/`-a`/`-C`/`-s` always
-        // reformatted a `NumberLiteral` regardless of `--preserve-input`,
-        // disagreeing with `print_json`'s `JqCompatFormatter`/
-        // `PreserveFormatter` split on the default `-c` route.
-        jq_compat: config.jq_compat,
     };
     let json = output::format_json(value, &opts);
 

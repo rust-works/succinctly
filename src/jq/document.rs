@@ -95,7 +95,7 @@ impl IndentSpec {
     }
 }
 
-/// Which value-formatting convention JSON streaming should use (#1576).
+/// Which value-formatting convention JSON output should use (#1576).
 ///
 /// Covers finite number literals, control-character escaping, and
 /// duplicate object keys. One enum selects all three rather than three
@@ -105,6 +105,31 @@ impl IndentSpec {
 /// yq's, since the escape table is a mode rule (ADR-0018) and
 /// `--preserve-input` is documented to affect numbers and duplicate keys
 /// only (#2209).
+///
+/// Since #2874 this is the *single* key for the whole axis, not one
+/// encoding of it among several. It is the type of the CLI's own
+/// `OutputConfig::convention` and of `JsonFormatOpts::convention`, and
+/// every consumer -- the M2 raw-passthrough gate, the DEL zero-copy gate,
+/// `json::light::write_json_number`, the `JqCompatFormatter`/
+/// `PreserveFormatter` selection, the duplicate-key collapse and
+/// `output::format_json_impl`'s `Float`/`NumberLiteral` arms -- reads it
+/// through [`Self::preserves_source_values`] /
+/// [`Self::uses_jq_escape_table`] or matches it exhaustively. It was
+/// previously re-derived at four sites from a `jq_compat: bool` that
+/// predated this enum, with the escape axis stored beside it as a separate
+/// `ControlEscape`; that pair spelled out these same three variants (plus
+/// one never constructed), which is what let the encodings drift apart in
+/// principle and forced yq's own construction site to pass a dummy value.
+///
+/// Adding a fourth variant is therefore a compile error in
+/// `format_json_impl`'s two number arms and in `write_json_number`, by
+/// design -- #2209 was precisely a two-variant check silently missing a
+/// new case. Two things are deliberately *not* keyed on it, each with its
+/// reason recorded at the site: `OwnedValue::to_json_yq` (its
+/// `to_json_at_depth` family hardcodes jq's escape table for every
+/// variant, so the `Preserve` mapping would be a false equivalence), and
+/// the DEL zero-copy gate (FIXME(#2988) -- it reads the preserve axis
+/// where it means the escape one).
 ///
 /// - `Preserve`: echo the document's source number spelling verbatim
 ///   (`1e100` stays `1e100`), use yq's escape table (no `\b`/`\f` short
