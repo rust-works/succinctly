@@ -280,6 +280,28 @@ fn data_file_exists(search_path: &[PathBuf], module_path: &str) -> bool {
         .any(|base| base.join(&data_file).is_file())
 }
 
+/// Merge one directive's load failure into a "last failing directive"
+/// selection, keeping whichever carries the higher [`Import::decl_index`]
+/// (#2857).
+///
+/// jq's module resolution reports the *last* `include`/`import` directive
+/// (in true source order) that it cannot honour, not the first: with all of
+/// `AAA`, `BBB`, `CCC` missing, `include "AAA"; include "BBB"; include
+/// "CCC"` reports `module not found: CCC`. The loader stores the two kinds
+/// in separate lists, so the only way to compare an `include` failure
+/// against an `import` failure is the shared `decl_index` both carry from
+/// the parser. Each load pass feeds every failure it hits through here and
+/// returns the survivor at the end, rather than bailing on the first one.
+fn keep_last_decl_failure(
+    last: &mut Option<(usize, ModuleLoadError)>,
+    decl_index: usize,
+    e: ModuleLoadError,
+) {
+    if last.as_ref().map_or(true, |(i, _)| decl_index >= *i) {
+        *last = Some((decl_index, e));
+    }
+}
+
 /// Extract a module's function definitions and stamp every `$__loc__` in
 /// each def's body with that module's own canonical (symlink-resolved)
 /// path (#2774) -- confirmed live against jq 1.7.1, and the same shape a
@@ -889,17 +911,60 @@ impl ModuleLoader {
             .map(|(name, _, _)| name.clone())
             .collect();
 
+        // #2857: a failing directive must not short-circuit the pass here --
+        // jq reports the *last* unresolvable `include`/`import` in source
+        // order, so every directive gets a chance to load (into the
+        // `loaded_modules` memo, which `process_program` then reuses) and the
+        // failures are kept only if they are the latest seen. Only
+        // `includes` contribute *names*; `imports` are probed purely for
+        // their failures so the whole program, not just the include block,
+        // decides what gets reported.
+        let mut last_err: Option<(usize, ModuleLoadError)> = None;
         for include in &program.includes {
-            let defs = self.ensure_module_loaded(&include.path)?;
-            names.extend(defs.iter().map(|(name, _, _)| name.clone()));
+            match self.ensure_module_loaded(&include.path) {
+                Ok(defs) => names.extend(defs.iter().map(|(name, _, _)| name.clone())),
+                Err(e) => keep_last_decl_failure(&mut last_err, include.decl_index, e),
+            }
+        }
+        for import in &program.imports {
+            // Same data-import split the real loading path uses (#2865):
+            // a data import reads `{path}.json`, not `{path}.jq`.
+            if import.data {
+                if !data_file_exists(&self.search_path, &import.path) {
+                    keep_last_decl_failure(
+                        &mut last_err,
+                        import.decl_index,
+                        ModuleLoadError::NotFound {
+                            module_path: import.path.clone(),
+                        },
+                    );
+                }
+                continue;
+            }
+            if let Err(e) = self.ensure_module_loaded(&import.path) {
+                keep_last_decl_failure(&mut last_err, import.decl_index, e);
+            }
         }
 
-        Ok(names)
+        match last_err {
+            Some((_, e)) => Err(e),
+            None => Ok(names),
+        }
     }
 
     /// Process imports and includes, returning the modified expression with all functions defined.
     pub fn process_program(&mut self, program: &Program) -> Result<Expr, ModuleLoadError> {
         let mut expr = program.expr.clone();
+
+        // #2857: as in `unqualified_def_names`, a failing directive must not
+        // short-circuit here -- jq reports the *last* unresolvable directive
+        // in source order, across both kinds. Every directive is still given
+        // its turn to load (the ones that fail simply wrap nothing), failures
+        // are merged against the running last via `decl_index`, and the
+        // survivor is returned after both loops. On success the wrapping
+        // order below is bit-for-bit what it was before this issue.
+
+        let mut last_err: Option<(usize, ModuleLoadError)> = None;
 
         // #2682: each `expr = FuncDef { .., then: expr }` wraps the *previous*
         // `expr` one layer further in, so whichever source is processed
@@ -921,7 +986,13 @@ impl ModuleLoader {
         // it ends up innermost) and the whole includes block running before
         // the `~/.jq` block that follows it.
         for include in program.includes.iter().rev() {
-            let defs = self.load_module(&include.path)?;
+            let defs = match self.load_module(&include.path) {
+                Ok(defs) => defs,
+                Err(e) => {
+                    keep_last_decl_failure(&mut last_err, include.decl_index, e);
+                    continue;
+                }
+            };
             // #2951: bracketed as a run, so these defs' own bodies cannot
             // see the sibling `include`s and `~/.jq` block wrapped around
             // them. Before this, `def sa: sb;` in one module resolved `sb`
@@ -947,13 +1018,23 @@ impl ModuleLoader {
             // there is none. Binding the variable itself is #2956.
             if import.data {
                 if !data_file_exists(&self.search_path, &import.path) {
-                    return Err(ModuleLoadError::NotFound {
-                        module_path: import.path.clone(),
-                    });
+                    keep_last_decl_failure(
+                        &mut last_err,
+                        import.decl_index,
+                        ModuleLoadError::NotFound {
+                            module_path: import.path.clone(),
+                        },
+                    );
                 }
                 continue;
             }
-            let defs = self.load_module(&import.path)?;
+            let defs = match self.load_module(&import.path) {
+                Ok(defs) => defs,
+                Err(e) => {
+                    keep_last_decl_failure(&mut last_err, import.decl_index, e);
+                    continue;
+                }
+            };
             let namespace = &import.alias;
 
             // Add each function with a namespaced name (namespace::funcname)
@@ -967,6 +1048,10 @@ impl ModuleLoader {
             // and only within this run.
             let id = self.run_id_for(&import.path);
             expr = wrap_run(expr, defs, id, Some(namespace));
+        }
+
+        if let Some((_, e)) = last_err {
+            return Err(e);
         }
 
         // Transform NamespacedCall expressions to regular FuncCall expressions

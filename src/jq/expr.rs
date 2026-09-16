@@ -1089,6 +1089,14 @@ pub struct Import {
     pub data: bool,
     /// Optional metadata overrides
     pub metadata: Option<BTreeMap<String, MetaValue>>,
+    /// Position of this directive among *all* `import`/`include` directives in
+    /// the program, counting from 0 in true source order (#2857). The parser
+    /// keeps `imports: Vec<Import>` and `includes: Vec<Include>` as two
+    /// separate lists, which preserves order within each kind but loses how
+    /// an `import` interleaved with an `include`; this index rebuilds that
+    /// interleaving when succinctly must report which directive failed last,
+    /// as jq's module-resolution error does.
+    pub decl_index: usize,
 }
 
 /// Include directive: `include "path";` or `include "path" { meta };`
@@ -1100,6 +1108,9 @@ pub struct Include {
     pub path: String,
     /// Optional metadata overrides
     pub metadata: Option<BTreeMap<String, MetaValue>>,
+    /// See [`Import::decl_index`] -- shared source-order counter over both
+    /// kinds of directive.
+    pub decl_index: usize,
 }
 
 /// A pattern for destructuring variable binding.
