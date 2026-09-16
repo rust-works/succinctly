@@ -17949,6 +17949,86 @@ fn test_slice_write_refusal_is_kind_aware_when_target_changed_before_write_2927(
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim(), "{}");
 
+    // #2927's own `del()` row: a shared slot deleted through both a plain
+    // path and a slice on the same target -- `delpaths` never parses the
+    // descriptor, so this must no-op regardless of the (now non-null)
+    // kind, same as the row above.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"del(.a["x":], .a)"#], Some(r#"{"a":null,"b":1}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#"{"b":1}"#);
+
+    Ok(())
+}
+
+/// #2927 (found by `/code-review` on this issue's own PR): the kind-aware
+/// refusal must be decided *before* `edit` runs, not after -- jq's own
+/// `getpath`/`setpath` only ever run the update filter when the target is
+/// genuinely `null`; for any other kind they raise immediately, without
+/// giving the filter a chance to run at all. The earlier (broken) version
+/// of this fix called `edit` unconditionally and only chose the message
+/// afterward, which ran the update filter an extra time whenever the
+/// target had stopped being null -- observable as a doubled side effect
+/// and consuming an extra `input`, not just as the wrong error path. Every
+/// row is a live jq 1.7.1 capture.
+#[test]
+fn test_slice_write_refusal_skips_edit_entirely_for_a_non_null_target_2927() -> Result<()> {
+    // A chained path after the slice (`["x":][0:1]`, not a bare terminal
+    // slice) still gets the kind-aware refusal, not the inner integer
+    // slice's own error -- this was the sharpest failure mode: `edit`
+    // recursing into the chain masked the outer refusal entirely.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"(.a, .a["x":][0:1]) = 5"#], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+
+    // Slice-after-slice (`["x":]["y":]`): same masking risk, since the
+    // inner slice is itself a `non_integer_bound` call.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.a, .a["x":]["y":]) = 5"#],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+
+    // The update filter's side effect must run exactly once -- for `.a`'s
+    // own write -- never a second time for `.a["x":]`'s, since jq never
+    // calls the filter at all once `.a` has stopped being null.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.a,.a["x":]) |= (debug|5)"#],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stderr.matches(r#"["DEBUG:",null]"#).count(),
+        1,
+        "the update filter must not run a second time once the target is non-null: stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+
+    // Same invariant via consumed `input`s, not just a printed side
+    // effect: the second path must not silently swallow an extra value
+    // from the input stream. `.` is the first document (`{"a":null}`);
+    // `input` reads the next one from the same stream.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.a, .a["x":]) |= input"#],
+        Some("{\"a\":null}\n1\n2\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+
     Ok(())
 }
 
