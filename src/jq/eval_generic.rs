@@ -643,7 +643,15 @@ fn eval_shared_chain_link_generic<S: EvalSemantics, V: DocumentValue>(
     }
     let result = eval_single::<S, V>(inner, value, optional, cursor);
     let owned = match &result {
+        // STYLE-0012: this `to_owned` is a side channel for *this* value's
+        // cache entry only -- `result` (already returned as-is below, with
+        // `optional` already consulted inside `eval_single` above) never
+        // sees its outcome. Its own `Err` (only `MAX_NESTING_DEPTH`, never a
+        // decode failure `optional` would suppress) means "don't cache," not
+        // "suppress" -- a decision that never reaches the caller has nothing
+        // for `optional` to apply to.
         GenericResult::One(v) => to_owned(v).ok(),
+        // STYLE-0012: same reasoning as the `One` arm directly above.
         GenericResult::OneCursor(c) => to_owned_cursor(c).ok(),
         GenericResult::Owned(v) => Some(v.clone()),
         _ => None,
