@@ -30174,12 +30174,16 @@ fn resolve_node<'a, S: EvalSemantics>(
 /// Whether `resolve_node_sink`'s `Expr::Reduce`/`Expr::Foreach` dispatch arm
 /// routes into `resolve_reduce`/`resolve_foreach` for this pattern list, or
 /// falls through to `resolve_leaf`'s catch-all — a single bare `$var` in any
-/// mode, or (jq mode only, #2676) a single destructuring
-/// `Pattern::Object`/`Pattern::Array`. Named and shared by both dispatch
-/// arms rather than spelled out twice so the two can't drift apart, and
-/// independently testable — see `test_fold_pattern_admitted_gate_2676`.
+/// mode, or in jq mode any pattern list at all: a destructuring
+/// `Pattern::Object`/`Pattern::Array` (#2676) and a `?//` chain of
+/// alternatives (#2979). Named and shared by both dispatch arms rather than
+/// spelled out twice so the two can't drift apart, and independently
+/// testable — see `test_fold_pattern_admitted_gate_2676`.
 fn fold_pattern_admitted<S: EvalSemantics>(patterns: &[Pattern]) -> bool {
-    matches!(patterns, [single] if matches!(single, Pattern::Var(_)) || S::TAG == EvalTag::Jq)
+    match S::TAG {
+        EvalTag::Jq => !patterns.is_empty(),
+        _ => matches!(patterns, [Pattern::Var(_)]),
+    }
 }
 
 /// Emits each branch to `sink` as it is produced (#1952), so a bounded
@@ -30523,18 +30527,21 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // first-step refusal here would be an artefact -- jq's own answer for
         // everything but a null/bool register, but an artefact nonetheless
         // -- which a `?//` retry must never act on: it would land on the
-        // wrong alternative, and `del`/`=` would write through it. A single
-        // pattern may still raise that refusal -- jq's own outcome, and its
-        // own wording wherever the source really is off the register (a
-        // certified marker on an untracked stage, `path(. as $x | 5 | $x as
-        // {a:$q} | .)`, refuses here at the first step where jq walks and
-        // refuses at `PATH_END`, so both refuse, differently worded); a
-        // chain falls through untouched.
+        // wrong alternative, and `del`/`=` would write through it. So
+        // `resolve_as_pattern` propagates that refusal rather than retrying
+        // on it. That is jq's own outcome wherever the source really is off
+        // the register (a certified marker on an untracked stage, `path(. as
+        // $x | 5 | $x as {a:$q} | .)`, refuses here at the first step where
+        // jq walks and refuses at `PATH_END`, so both refuse, differently
+        // worded), and a refusal where jq answers otherwise. A chain used to
+        // fall through to `resolve_leaf` instead, which evaluates it by value
+        // and refuses only on an output it emits: `path(5 | . as {a:$v} ?//
+        // $v | .b?)` emitted nothing and exited 0 where jq refuses (#2979).
         Expr::AsPattern {
             expr,
             patterns,
             body,
-        } if S::TAG == EvalTag::Jq && (trackable || patterns.len() == 1) => {
+        } if S::TAG == EvalTag::Jq => {
             resolve_as_pattern::<S>(
                 expr, patterns, body, value, trackable, snapshot, frame, keep, sink,
             )
@@ -30670,7 +30677,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             update,
         } if fold_pattern_admitted::<S>(patterns) => resolve_reduce::<S>(
             input,
-            &patterns[0],
+            patterns,
             init,
             update,
             value,
@@ -30688,7 +30695,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             extract,
         } if fold_pattern_admitted::<S>(patterns) => resolve_foreach::<S>(
             input,
-            &patterns[0],
+            patterns,
             init,
             update,
             extract.as_deref(),
@@ -34036,7 +34043,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         // `value` itself, so `.` is, a marker the frame certifies is (the
         // `TrackedVar` arm's own rule), and anything else only by jq's
         // null/bool value identity. Untracked: the register is out of
-        // sight, so never (the arm admits only a single pattern then).
+        // sight, so never.
         let identical = trackable
             && match head {
                 Expr::Identity => true,
@@ -34055,8 +34062,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
             };
             let reg = match walk_pattern::<S>(pattern, bound, seed, frame, &mut bindings) {
                 Ok(reg) => reg,
+                // Off the register (`!trackable`), a first-step refusal is
+                // a guess, not jq's verdict -- see the dispatch arm -- so it
+                // never retries (#2979).
                 Err(e) => {
-                    if is_last {
+                    if is_last || (!trackable && e.is_invalid_path_expression()) {
                         return ResolveFlow::Escaped(e.into());
                     }
                     continue;
@@ -34100,25 +34110,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     }
                     return ResolveFlow::Stopped;
                 }
-                ResolveFlow::Escaped(EvalEscape::Error(e)) => {
-                    if is_last
-                        || e.is_decode_failure()
-                        || e.is_resource_limit()
-                        || e.is_untracked_navigation_error()
-                        || e.is_invalid_path_expression()
-                    {
-                        return ResolveFlow::Escaped(EvalEscape::Error(e));
+                ResolveFlow::Escaped(escape) => {
+                    if path_alternative_retries(&escape, is_last) {
+                        continue;
                     }
-                    continue;
-                }
-                ResolveFlow::Escaped(EvalEscape::Break(label)) => {
-                    if is_last {
-                        return ResolveFlow::Escaped(EvalEscape::Break(label));
-                    }
-                    continue;
-                }
-                ResolveFlow::Escaped(halt @ EvalEscape::Halt(_)) => {
-                    return ResolveFlow::Escaped(halt);
+                    return ResolveFlow::Escaped(escape);
                 }
             }
         }
@@ -34602,6 +34598,150 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
     }
 }
 
+/// One `?//` alternative of a path-mode fold step, bound (#2979): UPDATE and
+/// EXTRACT with this alternative's names substituted (and, in a chain, the
+/// names only *other* alternatives bind filled with `null`, as value mode's
+/// #1368 does), plus where a destructuring pattern's walk left the register.
+struct FoldAlternative {
+    update: Expr,
+    extract: Option<Expr>,
+    walked: Option<PatternRegister>,
+}
+
+/// Why binding one fold alternative failed, and whether a `?//` chain may
+/// act on the failure by trying the next alternative.
+struct FoldBindFailure {
+    error: EvalError,
+    retryable: bool,
+}
+
+/// Bind `pattern` over one source element for [`resolve_reduce`] and
+/// [`resolve_foreach`] -- the per-alternative half of both folds (#2979).
+///
+/// A destructuring pattern is walked the way #2676 walks it, seeded by
+/// [`fold_pattern_seed`]; a bare `$var` performs no step and is substituted
+/// tracked exactly when the element is register-derived (#2031).
+/// `keep_origins` is `false` for `reduce`, which substitutes every
+/// destructured binding untracked (see the comment at its call in
+/// [`resolve_reduce`]), and `true` for `foreach`.
+///
+/// `alternatives` names every variable the chain binds, or is `None` for a
+/// single pattern: then there is nothing to null-fill, and the duplicate-name
+/// rule is not inverted.
+///
+/// **A walk refusal is retryable only when it is jq's own verdict.** jq runs
+/// the next alternative when a pattern step fails `path_intact`, so a walk
+/// error normally retries (rule 1 of the #2979 plan). But the walk can only
+/// *model* `path_intact` for an element that is not register-derived: it
+/// compares the element with the register by value, where jq compares
+/// nodes. When the two are equal and not `null`/a boolean, or the register
+/// itself is lost, jq may well find the step intact and carry on with *this*
+/// alternative -- so retrying would bind a different alternative than jq
+/// does, and `del`/`=` would write through it. That refusal propagates
+/// instead: a refusal where jq might answer, never an answer jq would not
+/// give.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `resolve_foreach`
+fn bind_fold_alternative<S: EvalSemantics>(
+    pattern: &Pattern,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+    frame: &Frame,
+    update: &Expr,
+    extract: Option<&Expr>,
+    alternatives: Option<&[String]>,
+    keep_origins: bool,
+) -> Result<FoldAlternative, FoldBindFailure> {
+    let mut bound_names: Vec<String> = Vec::new();
+    let (mut update, mut extract, walked) = match pattern {
+        Pattern::Object(_) | Pattern::Array(_) => {
+            let seed = fold_pattern_seed(elem, reg);
+            let mut bindings = Vec::new();
+            let walked = match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
+                Ok(walked) => walked,
+                Err(error) => {
+                    let guessed = elem.register_path.is_none()
+                        && (!reg.trackable
+                            || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
+                                && elem.value == reg.value));
+                    let retryable = !(guessed && error.is_invalid_path_expression());
+                    return Err(FoldBindFailure { error, retryable });
+                }
+            };
+            let mut bindings = dedup_pattern_bindings(pattern, bindings, alternatives.is_some());
+            if !keep_origins {
+                for binding in &mut bindings {
+                    binding.origin = None;
+                }
+            }
+            let update = apply_pattern_bindings(update, &bindings);
+            let extract = extract.map(|ext| apply_pattern_bindings(ext, &bindings));
+            if alternatives.is_some() {
+                bound_names.extend(bindings.into_iter().map(|b| b.name));
+            }
+            (update, extract, Some(walked))
+        }
+        Pattern::Var(name) => {
+            let binding = extract_single_pattern_binding::<S>(pattern, &elem.value, false)
+                .map_err(|error| FoldBindFailure {
+                    error,
+                    retryable: true,
+                })?;
+            bound_names.push(name.clone());
+            if elem.register_path.is_some() {
+                let (var, value) = &binding[0];
+                (
+                    substitute_var_tracked(update, var, value),
+                    extract.map(|ext| substitute_var_tracked(ext, var, value)),
+                    None,
+                )
+            } else {
+                (
+                    substitute_vars(update, as_var_refs(&binding)),
+                    extract.map(|ext| substitute_vars(ext, as_var_refs(&binding))),
+                    None,
+                )
+            }
+        }
+    };
+    let null = OwnedValue::Null;
+    for name in alternatives.unwrap_or_default() {
+        if !bound_names.contains(name) {
+            update = substitute_var(&update, name, &null);
+            extract = extract.map(|ext| substitute_var(&ext, name, &null));
+        }
+    }
+    Ok(FoldAlternative {
+        update,
+        extract,
+        walked,
+    })
+}
+
+/// Whether an escape out of one `?//` alternative's body retries the next
+/// alternative in path position -- [`resolve_as_pattern`]'s rule, shared
+/// with the folds (#2979) so the two cannot drift.
+///
+/// `halt` and the last alternative's escape always propagate, and so do
+/// decode failures and resource limits. So do the resolver's *own*
+/// refusals (`is_untracked_navigation_error`/`is_invalid_path_expression`):
+/// some of them are artefacts jq never raises, and retrying on one lands on
+/// a different alternative than jq's, which `del`/`=` then write through.
+/// That costs the rows where jq's own path error triggers the retry, as a
+/// refusal -- the safe direction. See [`resolve_as_pattern`] for the rows.
+fn path_alternative_retries(escape: &EvalEscape, is_last: bool) -> bool {
+    match escape {
+        EvalEscape::Error(e) => {
+            !(is_last
+                || e.is_decode_failure()
+                || e.is_resource_limit()
+                || e.is_untracked_navigation_error()
+                || e.is_invalid_path_expression())
+        }
+        EvalEscape::Break(_) => !is_last,
+        EvalEscape::Halt(_) => false,
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -34631,7 +34771,7 @@ fn fold_source_ambient<'v, S: EvalSemantics>(
                                      // one ambient and not the others.
 fn resolve_reduce<'a, S: EvalSemantics>(
     input: &Expr,
-    pattern: &Pattern,
+    patterns: &[Pattern],
     init: &Expr,
     update: &Expr,
     value: &'a OwnedValue,
@@ -34679,6 +34819,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #2388: hoisted so `fold_source_ambient` can hand a later fork's
     // `null` ambient back as a borrow rather than allocating one per fork.
     let null_ambient = OwnedValue::Null;
+    // #2979: every name a `?//` chain binds, for the null-fill; `None` for a
+    // single pattern, which has nothing to fill.
+    let alternative_names = (patterns.len() > 1).then(|| pattern_alternatives_var_names(patterns));
+    let alternatives = alternative_names.as_deref();
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
         let init_branch = &init_branch;
         let fork_index = {
@@ -34786,157 +34930,160 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             if let Some(control) = charge_budget(&mut budget, "reduce") {
                 return stop_with_escape(&mut aborted, control);
             }
-            // `eval_reduce`'s own substitution, minus the two things this
-            // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s
-            // dispatch arm) rules out: #1365's `patterns`-matrix, and
-            // #1368's null-fill for names an alternative leaves unbound --
-            // a bare `$var` pattern binds its one name unconditionally, so
-            // there is never an unbound name to fill. #2031: an element
-            // whose own navigation moved the register
-            // (`register_path.is_some()`) marks its substituted `$var` as
-            // `Expr::TrackedVar` rather than a plain value, so a bare
-            // `$var` reference inside UPDATE can itself recognise the
-            // per-step register `FoldRegister::relocate`'s `identical()`
-            // fallback checks it against below (confirmed live:
-            // `path(foreach (.a) as $k (0; $k))` is `["a"]` -- `$k`'s own
-            // frozen value must be told apart from a coincidentally-equal
-            // computed one, exactly the distinction `PathBranch::snapshot`
-            // already exists to carry).
-            // #2676: a destructuring pattern's own steps are checked
-            // against `value_at_path` regardless of whether any bound `$var`
-            // is ever referenced downstream — confirmed live against jq
-            // 1.7.1: `path(. as $x | reduce ([1]) as [$i] (0; $x))` refuses
-            // ("near attempt to access element 0 of [1]") even though `$i`
-            // goes unused in UPDATE (`$x`, a *different*, outer-bound var).
-            // `walk_pattern` (#2649) reproduces that refusal, seeded the
-            // same two ways `resolve_foreach`'s own walk is (its own doc
-            // comment has the full derivation, including the `null`/`bool`
-            // coincidence rule for a non-register-derived element).
+            // #2979: one attempt per `?//` alternative, in order -- jq's
+            // `bind_alternation_matchers` wraps the whole step (pattern,
+            // `LOADVN`, UPDATE, `STOREV`) in a `DESTRUCTURE_ALT` fork, so any
+            // error inside it backtracks to the next alternative:
             //
-            // Once the walk clears, the bound values are substituted
-            // *untracked*, unconditionally — `reduce` (unlike `foreach`)
-            // never seeds a per-step register from `elem.register_path`, so
-            // a bound `$var` is only ever recognised when it happens to be
-            // `register_identical` to `reg` (the fold's own, INIT-seeded,
-            // persistent register) — exactly the same test a bare `$var`
-            // bound from a register-derived element already fails whenever
-            // its value differs from `reg`'s own (confirmed live:
-            // `path(reduce .b as $x (.; $x))` refuses on `{"a":..,"b":..}`
-            // the same way `path(reduce .b as {c:$x} (.; $x))` does — see
-            // `resolve_node_sink`'s dispatch arm doc comment). Marking a
-            // destructured binding `Expr::TrackedVar` here would cost
-            // nothing beyond what this same structural check already
-            // refuses, so the plain, untracked substitution stays the
-            // simpler, equally-correct choice.
-            let substituted = match pattern {
-                Pattern::Object(_) | Pattern::Array(_) => {
-                    let seed = fold_pattern_seed(&elem, &reg);
-                    let mut bindings = Vec::new();
-                    match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
-                        // `reduce` substitutes every binding *untracked*
-                        // (`origin` cleared) regardless of what the walk
-                        // computed — see this arm's own doc comment above:
-                        // a destructured `$var` is only ever recognised
-                        // through `reg`'s structural `register_identical`
-                        // check, never through a position-based marker.
-                        Ok(_) => {
-                            let mut bindings = dedup_pattern_bindings(pattern, bindings, false);
-                            for b in &mut bindings {
-                                b.origin = None;
-                            }
-                            apply_pattern_bindings(update, &bindings)
+            // - a pattern-walk refusal leaves the accumulator untouched, since
+            //   `LOADVN` has not run (`bind_fold_alternative` decides whether
+            //   the refusal is jq's own, or a guess that must not retry);
+            // - an UPDATE escape leaves it at UPDATE's last output before the
+            //   escape, or `null` when there was none (`LOADVN` nulled it),
+            //   with that output's provenance -- value mode's
+            //   `try_reduce_step_alternatives` rule, which path mode has to
+            //   choose identically;
+            // - the resolver's own refusals, `halt`, and the last
+            //   alternative's escape never retry (`path_alternative_retries`).
+            //
+            // A single pattern is the one-alternative case of the same loop:
+            // it never retries, and binds exactly as before (#2031, #2676).
+            let last_idx = patterns.len() - 1;
+            let mut ran_update = false;
+            for (i, pattern) in patterns.iter().enumerate() {
+                let is_last = i == last_idx;
+                if alternatives.is_some() {
+                    clear_nonretryable_stop();
+                    // Charged once per UPDATE run, as value mode charges
+                    // (#695): the element's own charge above covers the
+                    // first.
+                    if ran_update {
+                        if let Some(control) = charge_budget(&mut budget, "reduce") {
+                            return stop_with_escape(&mut aborted, control);
                         }
-                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
                     }
                 }
-                Pattern::Var(_) => {
-                    match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
-                        Ok(b) if elem.register_path.is_some() => {
-                            substitute_var_tracked(update, &b[0].0, &b[0].1)
+                // #2676: a destructuring pattern's own steps are checked
+                // against `value_at_path` whether or not any bound `$var` is
+                // read downstream -- `path(. as $x | reduce ([1]) as [$i] (0;
+                // $x))` refuses ("near attempt to access element 0 of [1]")
+                // in jq 1.7.1 though `$i` goes unused. Once the walk clears,
+                // the bound values are substituted *untracked*
+                // (`keep_origins: false`): `reduce`, unlike `foreach`, never
+                // seeds a per-step register from `elem.register_path`, so a
+                // destructured `$var` is only ever recognised when it is
+                // `register_identical` to `reg`, the same test a bare `$var`
+                // already fails whenever its value differs from the register's
+                // (`path(reduce .b as $x (.; $x))` refuses on
+                // `{"a":..,"b":..}` exactly as `path(reduce .b as {c:$x} (.;
+                // $x))` does). A position marker would admit nothing that
+                // check does not already refuse.
+                let substituted = match bind_fold_alternative::<S>(
+                    pattern,
+                    &elem,
+                    &reg,
+                    frame,
+                    update,
+                    None,
+                    alternatives,
+                    false,
+                ) {
+                    Ok(bound) => bound.update,
+                    Err(failure) if failure.retryable && !is_last => continue,
+                    Err(failure) => {
+                        return stop_with_escape(&mut aborted, Control::Error(failure.error))
+                    }
+                };
+                // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
+                // (#2161) — `acc_at_register` alone is the previous step's
+                // `branch_provenance`, a path comparison, which is `false` from
+                // step 2 onward because UPDATE's whole job is to navigate away
+                // from the register. jq's actual rule is
+                // `jv_identical(current_input, value_at_path)`: this step is at
+                // the register when the accumulator arriving at it is still the
+                // register's own value, which `register_identical` answers
+                // directly. `||`, not a replacement — `register_identical`
+                // demands `snapshot || Null | Bool`, so it alone is `false` for
+                // step 1 of an object-valued register, where the carried
+                // provenance is the correct `true`. jq mode only, for the same
+                // reason `resolve_foreach`'s widening is: on the *write* side an
+                // un-gated widening turns a refusal into a write where real yq
+                // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
+                // v4.53.3).
+                //
+                // Checked against `acc`'s own *effective* value — `acc.as_ref()`
+                // unwrapped to `&OwnedValue::Null`, not gated on `acc.is_some()`
+                // -- because a step whose UPDATE produced zero outputs (`empty`)
+                // leaves `acc` as `None`, and the very next line already treats
+                // that the same as a real `Null` accumulator
+                // (`unwrap_or(OwnedValue::Null)`) when it becomes `acc_input`.
+                // Skipping the check on `None` missed exactly that case: a
+                // `null`/`bool` register is unconditionally identical to a
+                // `null` accumulator via `register_identical`'s kind-based
+                // clause, `None` included, since there is no pointer/snapshot
+                // involved for that arm at all. Confirmed live against jq 1.7.1:
+                // `path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a
+                // end))` on `{"a":1,"b":null}` is `["b"]`, matching only once
+                // this is unconditional.
+                let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
+                acc_at_register = acc_at_register
+                    || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
+                let acc_input = acc.take().unwrap_or(OwnedValue::Null);
+                ran_update = true;
+                match reg.resolve::<S>(
+                    &substituted,
+                    acc_input,
+                    acc_at_register,
+                    &acc_snapshot,
+                    keep,
+                ) {
+                    Ok(branches) => {
+                        // Only the last output of a multi-output UPDATE
+                        // becomes the new accumulator (same rule as
+                        // `eval_reduce`) — the *path* is discarded here: it is
+                        // re-derived from scratch against the same fixed `reg`
+                        // at every subsequent step, never carried forward as a
+                        // value flows from one step to the next (see this
+                        // function's own doc comment and `FoldRegister`'s).
+                        //
+                        // What is carried forward is only whether jq would still
+                        // be holding this exact value at the register — its
+                        // provenance, not its path (#1466), via
+                        // `FoldRegister::branch_provenance` (#1590). Always
+                        // relative to the fold's own *persistent* `reg`, even
+                        // on a step that just used a per-source-element
+                        // register instead — the persistent register is what
+                        // every step *without* its own source-derived register
+                        // (including reduce's own final emission below) is
+                        // still checked against. The widening just above only
+                        // affects what is fed *into* this step's `reg.resolve`;
+                        // this carry-forward still derives the *next* step's
+                        // starting point purely from this step's own output
+                        // branch, same as before #2632.
+                        let last = branches.into_iter().last();
+                        (acc_at_register, acc_snapshot) =
+                            reg.branch_provenance::<S>(last.as_ref(), frame);
+                        acc = last.map(|b| b.value.into_owned());
+                        return Demand::Continue;
+                    }
+                    Err((prefix, e)) => {
+                        // What a retried alternative resumes from. Irrelevant
+                        // once the escape propagates: the whole fork aborts
+                        // here, same as `eval_reduce`'s own `aborted =
+                        // Some(control); break;`, and nothing past this
+                        // element is ever pulled from the source.
+                        let last = prefix.into_iter().last();
+                        (acc_at_register, acc_snapshot) =
+                            reg.branch_provenance::<S>(last.as_ref(), frame);
+                        acc = last.map(|b| b.value.into_owned());
+                        if path_alternative_retries(&e, is_last) {
+                            continue;
                         }
-                        Ok(b) => substitute_vars(update, as_var_refs(&b)),
-                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                        return stop_with_escape(&mut aborted, e.into());
                     }
                 }
-            };
-            // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
-            // (#2161) — `acc_at_register` alone is the previous step's
-            // `branch_provenance`, a path comparison, which is `false` from
-            // step 2 onward because UPDATE's whole job is to navigate away
-            // from the register. jq's actual rule is
-            // `jv_identical(current_input, value_at_path)`: this step is at
-            // the register when the accumulator arriving at it is still the
-            // register's own value, which `register_identical` answers
-            // directly. `||`, not a replacement — `register_identical`
-            // demands `snapshot || Null | Bool`, so it alone is `false` for
-            // step 1 of an object-valued register, where the carried
-            // provenance is the correct `true`. jq mode only, for the same
-            // reason `resolve_foreach`'s widening is: on the *write* side an
-            // un-gated widening turns a refusal into a write where real yq
-            // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
-            // v4.53.3).
-            //
-            // Checked against `acc`'s own *effective* value — `acc.as_ref()`
-            // unwrapped to `&OwnedValue::Null`, not gated on `acc.is_some()`
-            // -- because a step whose UPDATE produced zero outputs (`empty`)
-            // leaves `acc` as `None`, and the very next line already treats
-            // that the same as a real `Null` accumulator
-            // (`unwrap_or(OwnedValue::Null)`) when it becomes `acc_input`.
-            // Skipping the check on `None` missed exactly that case: a
-            // `null`/`bool` register is unconditionally identical to a
-            // `null` accumulator via `register_identical`'s kind-based
-            // clause, `None` included, since there is no pointer/snapshot
-            // involved for that arm at all. Confirmed live against jq 1.7.1:
-            // `path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a
-            // end))` on `{"a":1,"b":null}` is `["b"]`, matching only once
-            // this is unconditional.
-            let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
-            acc_at_register = acc_at_register
-                || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
-            let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            match reg.resolve::<S>(
-                &substituted,
-                acc_input,
-                acc_at_register,
-                &acc_snapshot,
-                keep,
-            ) {
-                Ok(branches) => {
-                    // Only the last output of a multi-output UPDATE
-                    // becomes the new accumulator (same rule as
-                    // `eval_reduce`) — the *path* is discarded here: it is
-                    // re-derived from scratch against the same fixed `reg`
-                    // at every subsequent step, never carried forward as a
-                    // value flows from one step to the next (see this
-                    // function's own doc comment and `FoldRegister`'s).
-                    //
-                    // What is carried forward is only whether jq would still
-                    // be holding this exact value at the register — its
-                    // provenance, not its path (#1466), via
-                    // `FoldRegister::branch_provenance` (#1590). Always
-                    // relative to the fold's own *persistent* `reg`, even
-                    // on a step that just used a per-source-element
-                    // register instead — the persistent register is what
-                    // every step *without* its own source-derived register
-                    // (including reduce's own final emission below) is
-                    // still checked against. The widening just above only
-                    // affects what is fed *into* this step's `reg.resolve`;
-                    // this carry-forward still derives the *next* step's
-                    // starting point purely from this step's own output
-                    // branch, same as before #2632.
-                    let last = branches.into_iter().last();
-                    (acc_at_register, acc_snapshot) =
-                        reg.branch_provenance::<S>(last.as_ref(), frame);
-                    acc = last.map(|b| b.value.into_owned());
-                    Demand::Continue
-                }
-                // Whatever this step's UPDATE partially resolved before
-                // erroring never becomes a real accumulator — the whole
-                // fork aborts here, same as `eval_reduce`'s own `aborted =
-                // Some(control); break;`, and nothing past this element is
-                // ever pulled from the source.
-                Err((_prefix, e)) => stop_with_escape(&mut aborted, e.into()),
             }
+            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a bind failure, an UPDATE success, and an UPDATE escape that `path_alternative_retries` never retries on the last alternative (#2979)"
         });
         if let Some(control) = reclaim_fold_escape(aborted, source_control) {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
@@ -35038,7 +35185,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                      // from that established, unbundled threading convention.
 fn resolve_foreach<'a, S: EvalSemantics>(
     input: &Expr,
-    pattern: &Pattern,
+    patterns: &[Pattern],
     init: &Expr,
     update: &Expr,
     extract: Option<&Expr>,
@@ -35075,6 +35222,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     // #2388: see `resolve_reduce`'s identical hoist.
     let null_ambient = OwnedValue::Null;
+    // #2979: see `resolve_reduce`'s identical hoist.
+    let alternative_names = (patterns.len() > 1).then(|| pattern_alternatives_var_names(patterns));
+    let alternatives = alternative_names.as_deref();
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
         let init_branch = &init_branch;
         let fork_index = {
@@ -35138,18 +35288,15 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             if let Some(control) = charge_budget(&mut budget, "foreach") {
                 return stop_with_escape(&mut aborted, control);
             }
-            // `eval_foreach`'s own substitution, minus the two things this
-            // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s
-            // dispatch arm) rules out: #1365's `patterns`-matrix, and
-            // #1368's null-fill for names an alternative leaves unbound — a
-            // bare `$var` pattern binds its one name unconditionally, so
-            // there is never an unbound name to fill (same reasoning as
-            // `resolve_reduce`'s own substitution). Substituted per element
-            // as it arrives, into UPDATE and EXTRACT together so their
-            // agreement is unrepresentable rather than merely
-            // unreachable-in-practice (#1369). #2031: a trackable element's
-            // `$var` is substituted as `Expr::TrackedVar` (into both), the
-            // same reasoning as `resolve_reduce`'s own substitution.
+            // #2979: one attempt per `?//` alternative, in order -- see
+            // `resolve_reduce`'s identical loop for jq's backtracking rules
+            // and `bind_fold_alternative` for the bind. `foreach` adds rule 3:
+            // an escape *after* the state was stored (EXTRACT, the emission's
+            // own downstream, or `path()`'s terminal refusal answering
+            // `Demand::Stop`) retries from that stored state, and whatever
+            // was already emitted stays emitted -- value mode's
+            // `try_foreach_step_alternatives` rule.
+            //
             // #2676: a destructuring pattern is walked the same way a plain
             // `. as PATTERN` bind is (#2649's `walk_pattern`) — jq's own
             // compiled matcher performs real, tracked `INDEX` steps here
@@ -35185,231 +35332,258 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // `path(foreach .a as [$x,$y] (.; .; $x))` on `{"a":[1,2,3]}`)
             // is this step's own escape, exactly like any other
             // UPDATE/EXTRACT failure.
-            let walked = match pattern {
-                Pattern::Object(_) | Pattern::Array(_) => {
-                    let seed = fold_pattern_seed(&elem, &reg);
-                    let mut bindings = Vec::new();
-                    match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
-                        Ok(w) => Some((w, dedup_pattern_bindings(pattern, bindings, false))),
-                        Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+            let last_idx = patterns.len() - 1;
+            let mut ran_update = false;
+            'alternatives: for (i, pattern) in patterns.iter().enumerate() {
+                let is_last = i == last_idx;
+                if alternatives.is_some() {
+                    clear_nonretryable_stop();
+                    if ran_update {
+                        if let Some(control) = charge_budget(&mut budget, "foreach") {
+                            return stop_with_escape(&mut aborted, control);
+                        }
                     }
                 }
-                Pattern::Var(_) => None,
-            };
-            let (substituted_update, substituted_extract) = if let Some((_, bindings)) = &walked {
-                (
-                    apply_pattern_bindings(update, bindings),
-                    extract.map(|ext| apply_pattern_bindings(ext, bindings)),
-                )
-            } else {
-                match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
-                    Ok(b) if elem.register_path.is_some() => (
-                        substitute_var_tracked(update, &b[0].0, &b[0].1),
-                        extract.map(|ext| substitute_var_tracked(ext, &b[0].0, &b[0].1)),
-                    ),
-                    Ok(b) => (
-                        substitute_vars(update, as_var_refs(&b)),
-                        extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
-                    ),
-                    Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
-                }
-            };
-            // #2031: see `resolve_reduce`'s identical per-step register
-            // override.
-            let (active_reg, active_at_register) = if let Some((walked_reg, _)) = &walked {
-                let step_reg = FoldRegister {
-                    path: Rc::clone(&walked_reg.path),
-                    value: walked_reg.value.clone(),
-                    trackable: walked_reg.is_input,
-                    frame: frame.extend(&walked_reg.path),
+                let bound = match bind_fold_alternative::<S>(
+                    pattern,
+                    &elem,
+                    &reg,
+                    frame,
+                    update,
+                    extract,
+                    alternatives,
+                    true,
+                ) {
+                    Ok(bound) => bound,
+                    Err(failure) if failure.retryable && !is_last => continue,
+                    Err(failure) => {
+                        return stop_with_escape(&mut aborted, Control::Error(failure.error))
+                    }
                 };
-                let at_register =
-                    register_identical(&step_reg.value, &step_reg.frame, &state, &state_snapshot);
-                (step_reg, at_register)
-            } else {
-                match &elem.register_path {
-                    Some(path) => {
-                        let step_reg = FoldRegister {
-                            path: Rc::clone(path),
-                            value: elem.value.clone(),
-                            trackable: true,
-                            frame: frame.extend(path),
-                        };
-                        let at_register = register_identical(
-                            &step_reg.value,
-                            &step_reg.frame,
-                            &state,
-                            &state_snapshot,
-                        );
-                        (step_reg, at_register)
-                    }
-                    // #2161: `state_at_register` cannot come from the previous
-                    // step's `branch_provenance`, which answers "did the last
-                    // UPDATE branch end *at* the register's own path". The
-                    // register is fixed for the whole fold and UPDATE almost
-                    // always navigates away from it, so that answer is `false`
-                    // from step 2 onward and every later step refuses its own
-                    // navigation as untracked -- even though real jq re-enters
-                    // each step from the register, not from the previous step's
-                    // result.
-                    //
-                    // The register's own doc comment already states the model
-                    // ("fixed once per INIT fork -- never advances across
-                    // source-element iterations"): what decides a step is jq's
-                    // `jv_identical(current_input, value_at_path)`, i.e. whether
-                    // the accumulator coming into this step is still the
-                    // register's own value. That is exactly the check the
-                    // `Some(path)` arm above already performs via
-                    // `register_identical`, and it is the missing *second* way
-                    // a step can be at the register.
-                    //
-                    // It has to be an `||` rather than a replacement, because
-                    // neither answer subsumes the other. `register_identical`
-                    // demands `snapshot || Null | Bool` -- structural equality
-                    // is not jq's pointer identity, so a container counts only
-                    // when it is known to be the frozen node itself. So it
-                    // answers `false` for step 1 of an object-valued register,
-                    // where the carried `init_branch.trackable` is the correct
-                    // `true`; and the carried provenance answers `false` from
-                    // step 2 onward, where the identity check is the correct
-                    // `true` for a `null`/`bool` accumulator. Dropping either
-                    // half regresses one of the two shapes below.
-                    //
-                    // **jq mode only**, for exactly the reason
-                    // [`trackable_step_register_eligible`] gates its own
-                    // re-establishment the same way: the new half turns a step
-                    // that would have refused into one that navigates, and on
-                    // the *write* side that is a write where yq no-ops. Live
-                    // against yq v4.53.3, `(null | .a) = 5` on `null` is a
-                    // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
-                    // `a: 5` would be exactly the silent corruption that gate's
-                    // doc comment calls "a worse outcome than the refusal it
-                    // would replace". yq mode therefore stays refuse-only here,
-                    // as it already is for the single-step and carried-forward
-                    // shapes. The carried half is left ungated: it is the
-                    // pre-existing behaviour, not something this change
-                    // introduces.
-                    //
-                    // Live against jq 1.7.1, on `{"a":1}`:
-                    //
-                    // ```console
-                    // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
-                    // ["b","a"]
-                    // ["b","a"]
-                    // ["b","a"]
-                    // ```
-                    //
-                    // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
-                    // `["b","a"]` once and then raises "attempt to access
-                    // element \"a\" of {\"a\":9}" -- the accumulator has stopped
-                    // being the register's value, so step 2 is genuinely
-                    // untracked. Both fall out of the identity check; neither
-                    // falls out of the path comparison.
-                    None => (
-                        FoldRegister {
-                            path: Rc::clone(&reg.path),
-                            value: reg.value.clone(),
-                            trackable: reg.trackable,
-                            frame: reg.frame.clone(),
-                        },
-                        state_at_register
-                            || reg.identical(&state, &state_snapshot, S::TAG == EvalTag::Jq),
-                    ),
-                }
-            };
-            let update_branches = match active_reg.resolve::<S>(
-                &substituted_update,
-                core::mem::replace(&mut state, OwnedValue::Null),
-                active_at_register,
-                &state_snapshot,
-                keep,
-            ) {
-                Ok(branches) => branches,
-                Err((_prefix, e)) => return stop_with_escape(&mut aborted, e.into()),
-            };
-            // Each UPDATE output becomes the state *before* it is emitted --
-            // jq stores it first, then runs EXTRACT/emits -- so the last one
-            // carries forward as the next element's state (same rule as
-            // `eval_foreach`), with its provenance (#1590, mirroring
-            // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
-            // ordering is observable once a stop is retried by a source
-            // `?//`: the retried step re-enters from the refused output, not
-            // from the state before it, which is how `path(foreach (1 as $x
-            // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
-            // then . else $v end))` names `1` in jq 1.7.1's second refusal.
-            if update_branches.is_empty() {
-                (state_at_register, state_snapshot) = reg.branch_provenance::<S>(None, frame);
-            }
-            for update_branch in &update_branches {
-                // Every output, not just the last: a review pass tried
-                // carrying only the last one (the others are read straight
-                // off `update_branch` for EXTRACT/emission, so the clone
-                // looked like waste) and the oracle disagreed -- once an
-                // earlier output's emission is refused and the source's
-                // `?//` retries, the retried step must see *that* output as
-                // its state, or `path(foreach (1 as $x ?// $y | if $x == 1
-                // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
-                // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
-                // "result 1" -- a wrong accept, the write-side hazard class.
-                (state_at_register, state_snapshot) =
-                    reg.branch_provenance::<S>(Some(update_branch), frame);
-                state = update_branch.value.clone().into_owned();
-                if let Some(ext_expr) = &substituted_extract {
-                    if let Some(control) = charge_budget(&mut budget, "foreach") {
-                        return stop_with_escape(&mut aborted, control);
-                    }
-                    let extract_reg = active_reg.advance(update_branch, &substituted_update, frame);
-                    // `update_branch` is itself already relocated (it's
-                    // `active_reg.resolve()`'s own output above), and
-                    // `advance()` built `extract_reg` from this same
-                    // branch, so `extract_reg`'s own `branch_provenance` of
-                    // it answers exactly `update_branch`'s `(trackable,
-                    // snapshot)` — structurally, not by a second
-                    // `identical()` check (#1590).
-                    let (extract_at_register, extract_snapshot) =
-                        extract_reg.branch_provenance::<S>(Some(update_branch), frame);
-                    match drain_path_result(
-                        extract_reg.resolve::<S>(
-                            ext_expr,
-                            update_branch.value.clone().into_owned(),
-                            extract_at_register,
-                            &extract_snapshot,
-                            keep,
+                // #2031: see `resolve_reduce`'s identical per-step register
+                // override.
+                let (active_reg, active_at_register) = if let Some(walked_reg) = &bound.walked {
+                    let step_reg = FoldRegister {
+                        path: Rc::clone(&walked_reg.path),
+                        value: walked_reg.value.clone(),
+                        trackable: walked_reg.is_input,
+                        frame: frame.extend(&walked_reg.path),
+                    };
+                    let at_register =
+                        register_identical(&step_reg.value, &step_reg.frame, &state, &state_snapshot);
+                    (step_reg, at_register)
+                } else {
+                    match &elem.register_path {
+                        Some(path) => {
+                            let step_reg = FoldRegister {
+                                path: Rc::clone(path),
+                                value: elem.value.clone(),
+                                trackable: true,
+                                frame: frame.extend(path),
+                            };
+                            let at_register = register_identical(
+                                &step_reg.value,
+                                &step_reg.frame,
+                                &state,
+                                &state_snapshot,
+                            );
+                            (step_reg, at_register)
+                        }
+                        // #2161: `state_at_register` cannot come from the previous
+                        // step's `branch_provenance`, which answers "did the last
+                        // UPDATE branch end *at* the register's own path". The
+                        // register is fixed for the whole fold and UPDATE almost
+                        // always navigates away from it, so that answer is `false`
+                        // from step 2 onward and every later step refuses its own
+                        // navigation as untracked -- even though real jq re-enters
+                        // each step from the register, not from the previous step's
+                        // result.
+                        //
+                        // The register's own doc comment already states the model
+                        // ("fixed once per INIT fork -- never advances across
+                        // source-element iterations"): what decides a step is jq's
+                        // `jv_identical(current_input, value_at_path)`, i.e. whether
+                        // the accumulator coming into this step is still the
+                        // register's own value. That is exactly the check the
+                        // `Some(path)` arm above already performs via
+                        // `register_identical`, and it is the missing *second* way
+                        // a step can be at the register.
+                        //
+                        // It has to be an `||` rather than a replacement, because
+                        // neither answer subsumes the other. `register_identical`
+                        // demands `snapshot || Null | Bool` -- structural equality
+                        // is not jq's pointer identity, so a container counts only
+                        // when it is known to be the frozen node itself. So it
+                        // answers `false` for step 1 of an object-valued register,
+                        // where the carried `init_branch.trackable` is the correct
+                        // `true`; and the carried provenance answers `false` from
+                        // step 2 onward, where the identity check is the correct
+                        // `true` for a `null`/`bool` accumulator. Dropping either
+                        // half regresses one of the two shapes below.
+                        //
+                        // **jq mode only**, for exactly the reason
+                        // [`trackable_step_register_eligible`] gates its own
+                        // re-establishment the same way: the new half turns a step
+                        // that would have refused into one that navigates, and on
+                        // the *write* side that is a write where yq no-ops. Live
+                        // against yq v4.53.3, `(null | .a) = 5` on `null` is a
+                        // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
+                        // `a: 5` would be exactly the silent corruption that gate's
+                        // doc comment calls "a worse outcome than the refusal it
+                        // would replace". yq mode therefore stays refuse-only here,
+                        // as it already is for the single-step and carried-forward
+                        // shapes. The carried half is left ungated: it is the
+                        // pre-existing behaviour, not something this change
+                        // introduces.
+                        //
+                        // Live against jq 1.7.1, on `{"a":1}`:
+                        //
+                        // ```console
+                        // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
+                        // ["b","a"]
+                        // ["b","a"]
+                        // ["b","a"]
+                        // ```
+                        //
+                        // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
+                        // `["b","a"]` once and then raises "attempt to access
+                        // element \"a\" of {\"a\":9}" -- the accumulator has stopped
+                        // being the register's value, so step 2 is genuinely
+                        // untracked. Both fall out of the identity check; neither
+                        // falls out of the path comparison.
+                        None => (
+                            FoldRegister {
+                                path: Rc::clone(&reg.path),
+                                value: reg.value.clone(),
+                                trackable: reg.trackable,
+                                frame: reg.frame.clone(),
+                            },
+                            state_at_register
+                                || reg.identical(&state, &state_snapshot, S::TAG == EvalTag::Jq),
                         ),
-                        sink,
-                    ) {
-                        ResolveFlow::Stopped => {
+                    }
+                };
+                ran_update = true;
+                // An UPDATE escape still delivers the outputs before it, as
+                // jq's generator does (`path(foreach (1) as $x (.; (.a,
+                // error("x"))))` prints `["a"]` before raising), and then
+                // either retries from the last of them or propagates.
+                let (update_branches, update_escape) = match active_reg.resolve::<S>(
+                    &bound.update,
+                    core::mem::replace(&mut state, OwnedValue::Null),
+                    active_at_register,
+                    &state_snapshot,
+                    keep,
+                ) {
+                    Ok(branches) => (branches, None),
+                    Err((prefix, e)) => (prefix, Some(e)),
+                };
+                // Each UPDATE output becomes the state *before* it is emitted --
+                // jq stores it first, then runs EXTRACT/emits -- so the last one
+                // carries forward as the next element's state (same rule as
+                // `eval_foreach`), with its provenance (#1590, mirroring
+                // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
+                // ordering is observable once a stop is retried by a source
+                // `?//`: the retried step re-enters from the refused output, not
+                // from the state before it, which is how `path(foreach (1 as $x
+                // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
+                // then . else $v end))` names `1` in jq 1.7.1's second refusal.
+                if update_branches.is_empty() {
+                    (state_at_register, state_snapshot) = reg.branch_provenance::<S>(None, frame);
+                }
+                for update_branch in &update_branches {
+                    // Every output, not just the last: a review pass tried
+                    // carrying only the last one (the others are read straight
+                    // off `update_branch` for EXTRACT/emission, so the clone
+                    // looked like waste) and the oracle disagreed -- once an
+                    // earlier output's emission is refused and the source's
+                    // `?//` retries, the retried step must see *that* output as
+                    // its state, or `path(foreach (1 as $x ?// $y | if $x == 1
+                    // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
+                    // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
+                    // "result 1" -- a wrong accept, the write-side hazard class.
+                    (state_at_register, state_snapshot) =
+                        reg.branch_provenance::<S>(Some(update_branch), frame);
+                    state = update_branch.value.clone().into_owned();
+                    if let Some(ext_expr) = &bound.extract {
+                        if let Some(control) = charge_budget(&mut budget, "foreach") {
+                            return stop_with_escape(&mut aborted, control);
+                        }
+                        let extract_reg = active_reg.advance(update_branch, &bound.update, frame);
+                        // `update_branch` is itself already relocated (it's
+                        // `active_reg.resolve()`'s own output above), and
+                        // `advance()` built `extract_reg` from this same
+                        // branch, so `extract_reg`'s own `branch_provenance` of
+                        // it answers exactly `update_branch`'s `(trackable,
+                        // snapshot)` — structurally, not by a second
+                        // `identical()` check (#1590).
+                        let (extract_at_register, extract_snapshot) =
+                            extract_reg.branch_provenance::<S>(Some(update_branch), frame);
+                        match drain_path_result(
+                            extract_reg.resolve::<S>(
+                                ext_expr,
+                                update_branch.value.clone().into_owned(),
+                                extract_at_register,
+                                &extract_snapshot,
+                                keep,
+                            ),
+                            sink,
+                        ) {
+                            // #2979 rule 3: anything after `STOREV` that escapes --
+                            // EXTRACT, or the terminal `path()` check refusing the
+                            // branch -- retries the next alternative from the
+                            // state already stored, which is `update_branch`.
+                            ResolveFlow::Stopped => {
+                                if is_retryable_stop(is_last) {
+                                    continue 'alternatives;
+                                }
+                                downstream_stopped = true;
+                                return Demand::Stop;
+                            }
+                            ResolveFlow::Escaped(e) => {
+                                if path_alternative_retries(&e, is_last) {
+                                    continue 'alternatives;
+                                }
+                                return stop_with_escape(&mut aborted, e.into());
+                            }
+                            ResolveFlow::Exhausted => {}
+                        }
+                    } else {
+                        let emitted = if update_branch.trackable {
+                            PathBranch::new(
+                                update_branch.path.clone(),
+                                update_branch.value.clone(),
+                                true,
+                            )
+                        } else {
+                            // `demoted`, not `untracked`: an emitted value that is
+                            // still a frozen snapshot must stay recognisable to an
+                            // outer register when this `foreach` is nested inside
+                            // another fold (#1466) — same rule as `relocate`'s own
+                            // demotion arm.
+                            PathBranch::demoted(
+                                update_branch.snapshot.clone(),
+                                update_branch.value.clone(),
+                            )
+                        };
+                        if sink(emitted) == Demand::Stop {
+                            if is_retryable_stop(is_last) {
+                                continue 'alternatives;
+                            }
                             downstream_stopped = true;
                             return Demand::Stop;
                         }
-                        ResolveFlow::Escaped(e) => return stop_with_escape(&mut aborted, e.into()),
-                        ResolveFlow::Exhausted => {}
-                    }
-                } else {
-                    let emitted = if update_branch.trackable {
-                        PathBranch::new(
-                            update_branch.path.clone(),
-                            update_branch.value.clone(),
-                            true,
-                        )
-                    } else {
-                        // `demoted`, not `untracked`: an emitted value that is
-                        // still a frozen snapshot must stay recognisable to an
-                        // outer register when this `foreach` is nested inside
-                        // another fold (#1466) — same rule as `relocate`'s own
-                        // demotion arm.
-                        PathBranch::demoted(
-                            update_branch.snapshot.clone(),
-                            update_branch.value.clone(),
-                        )
-                    };
-                    if sink(emitted) == Demand::Stop {
-                        downstream_stopped = true;
-                        return Demand::Stop;
                     }
                 }
+                if let Some(e) = update_escape {
+                    if path_alternative_retries(&e, is_last) {
+                        continue;
+                    }
+                    return stop_with_escape(&mut aborted, e.into());
+                }
+                return Demand::Continue;
             }
-            Demand::Continue
+            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- `is_retryable_stop` and `path_alternative_retries` never retry on the last alternative (#2979)"
         });
         // The source stream's own trailing control belongs to this fork
         // too, applied after its own inner drive — mirrors `eval_foreach`'s
