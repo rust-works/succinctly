@@ -30479,11 +30479,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             expr,
             patterns,
             body,
-        } if S::TAG == EvalTag::Jq => {
-            resolve_as_pattern::<S>(
-                expr, patterns, body, value, trackable, snapshot, frame, keep, sink,
-            )
-        }
+        } if S::TAG == EvalTag::Jq => resolve_as_pattern::<S>(
+            expr, patterns, body, value, trackable, snapshot, frame, keep, sink,
+        ),
         // #2234: `stderr`/`debug`/`debug(msg)` are true identity passthroughs
         // in jq -- their value-mode implementations (`builtin_stderr`/
         // `builtin_debug`/`builtin_debug_msg` below) all decode-then-return
@@ -30614,16 +30612,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             init,
             update,
         } if fold_pattern_admitted::<S>(patterns) => resolve_reduce::<S>(
-            input,
-            patterns,
-            init,
-            update,
-            value,
-            trackable,
-            snapshot,
-            frame,
-            keep,
-            sink,
+            input, patterns, init, update, value, trackable, snapshot, frame, keep, sink,
         ),
         Expr::Foreach {
             input,
@@ -35307,8 +35296,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         trackable: walked_reg.is_input,
                         frame: frame.extend(&walked_reg.path),
                     };
-                    let at_register =
-                        register_identical(&step_reg.value, &step_reg.frame, &state, &state_snapshot);
+                    let at_register = register_identical(
+                        &step_reg.value,
+                        &step_reg.frame,
+                        &state,
+                        &state_snapshot,
+                    );
                     (step_reg, at_register)
                 } else {
                     match &elem.register_path {
@@ -96120,14 +96113,11 @@ mod tests {
     /// jq says "near attempt to access ...", a pre-existing `resolve_leaf`
     /// wording gap.
     ///
-    /// **`?//`-alternatives fall back despite jq accepting them** — the one
-    /// refuse-only divergence here (confirmed live: `path(. as $x | reduce
-    /// (1) as $y ?// $z (0; $x))` is `[]` in jq), since #1365's retry +
-    /// null-fill machinery isn't threaded through path-tracking. Routing
-    /// `?//` into `resolve_reduce` with only `patterns[0]` would not error;
-    /// it would silently drop the null-fill for names the matching
-    /// alternative doesn't bind, which is why this needs a test and not
-    /// just a comment.
+    /// **`?//`-alternatives no longer fall back** (#2979): the chain is
+    /// resolved here, with jq's own retry rules and #1365's null-fill for
+    /// names the matching alternative doesn't bind. Those rows assert jq's
+    /// answers rather than a refusal; the fallback they used to take is yq
+    /// mode's alone now.
     #[test]
     fn test_reduce_foreach_path_dispatch_falls_back_1440() {
         let refuses = |src: &str| {
@@ -96156,14 +96146,17 @@ mod tests {
         refuses("path(. as $x | foreach ([1]) as [$i] (0; $x))");
         refuses("path(. as $x | foreach ({v: 1}) as {v: $v} (0; $x))");
 
-        // `?//` alternatives: refuse (jq accepts -- documented divergence).
-        refuses("path(. as $x | reduce (1) as $y ?// $z (0; $x))");
-        refuses("path(. as $x | foreach (1) as $y ?// $z (0; $x))");
-        // A destructuring alternative inside a `?//` chain refuses too --
-        // `patterns.len() > 1` never reaches the walk regardless of pattern
-        // shape.
-        refuses("path(. as $x | reduce (1) as {v: $y} ?// $z (0; $x))");
-        refuses("path(. as $x | foreach (1) as {v: $y} ?// $z (0; $x))");
+        // `?//` alternatives: answered since #2979, matching jq -- whatever
+        // the alternatives' shapes. See
+        // `test_fold_pattern_alternatives_track_paths_2979` for the rules.
+        for filter in [
+            "path(. as $x | reduce (1) as $y ?// $z (0; $x))",
+            "path(. as $x | foreach (1) as $y ?// $z (0; $x))",
+            "path(. as $x | reduce (1) as {v: $y} ?// $z (0; $x))",
+            "path(. as $x | foreach (1) as {v: $y} ?// $z (0; $x))",
+        ] {
+            assert_eq!(outputs(br#"{"a":1}"#, filter), [r"[]"], "{filter}");
+        }
 
         // The admitted shape still works, so the guard didn't over-narrow.
         assert_eq!(
@@ -96177,6 +96170,196 @@ mod tests {
             ),
             [r#"["a"]"#]
         );
+    }
+
+    /// #2979: a `?//` alternation in a fold's loop pattern is resolved in
+    /// path position, instead of falling back to by-value evaluation that
+    /// could only refuse on an output it emitted -- so a construct producing
+    /// nothing (`empty`, a refused `$v.b?`) exited 0 where jq refuses, and
+    /// `del`/`=`/`|=` wrote through it.
+    ///
+    /// Every row is captured from jq 1.7.1: its outputs, or the first line of
+    /// its error. They cover jq's four backtracking rules (a walk refusal, an
+    /// UPDATE escape, an escape after the state was stored, and the last
+    /// alternative propagating), both fold kinds, the write direction, and
+    /// the two rows where retrying would be unsound: a walk verdict this
+    /// resolver can only guess at, and a chain on an untracked stage
+    /// (family B).
+    ///
+    /// The value-mode rows are here as the comparison the accumulator rule
+    /// rests on: path mode must pick the same accumulator on a retry as
+    /// `try_reduce_step_alternatives`/`try_foreach_step_alternatives` do.
+    ///
+    /// Object-pattern colons are spaced (`{b: $v}`), cosmetic to jq, for the
+    /// reason `test_reduce_foreach_path_dispatch_falls_back_1440` gives.
+    #[test]
+    fn test_fold_pattern_alternatives_track_paths_2979() {
+        type Row = (
+            &'static str,
+            &'static str,
+            Result<&'static [&'static str], &'static str>,
+        );
+        let rows: &[Row] = &[
+        // rule 1: a walk refusal on a non-last alternative retries the next one
+        (
+            "{\"a\":[1]}",
+            "path(foreach .a as {b: $v} ?// [$v] (.; .; $v))",
+            Ok(&["[\"a\",0]"]),
+        ),
+        // rule 1, reduce: the same retry, UPDATE reading the retried alternative's bind
+        (
+            "{\"a\":[1]}",
+            "[path(reduce .a as {b: $v} ?// [$v] (.; $v))]",
+            Err("Invalid path expression with result 1"),
+        ),
+        // rule 2 in value mode: UPDATE's escape leaves the accumulator null
+        (
+            "null",
+            "[reduce 1 as $a ?// $b (10; if $b then . else error(\"x\") end)]",
+            Ok(&["[null]"]),
+        ),
+        // rule 2 in path mode: the same accumulator, so the register still answers
+        (
+            "null",
+            "[path(reduce 1 as $a ?// $b (.; if $b then . else error(\"x\") end))]",
+            Ok(&["[[]]"]),
+        ),
+        // rule 2: ...and the null accumulator is not the register here
+        (
+            "{\"a\":1}",
+            "[path(reduce 1 as $a ?// $b (.; if $b then . else error(\"x\") end))]",
+            Err("Invalid path expression with result null"),
+        ),
+        // rule 3 in value mode: what EXTRACT already emitted stays emitted
+        (
+            "null",
+            "[foreach 1 as $a ?// $b (0; .+1; if $b then . else (., error(\"x\")) end)]",
+            Ok(&["[1,2]"]),
+        ),
+        // rule 3 in path mode: the terminal refusal retries, after the emitted prefix
+        (
+            "{\"a\":{\"b\":1}}",
+            "[path(foreach .a as {b: $v} ?// $w (.; .; $v, 1))]",
+            Err("Invalid path expression with result null"),
+        ),
+        // rule 3: alternative 1's null $w is refused at PATH_END, then retried
+        (
+            "{\"a\":[1]}",
+            "[path(foreach .a as [$v] ?// $w (.; .; $w))]",
+            Ok(&["[[\"a\"]]"]),
+        ),
+        // rule 3, per element
+        (
+            "{\"a\":[1,2]}",
+            "[path(foreach .a[] as [$x] ?// $y (.; .; $y))]",
+            Ok(&["[[\"a\",0],[\"a\",1]]"]),
+        ),
+        // rule 4: the last alternative's refusal propagates
+        (
+            "{\"a\":{\"b\":1}}",
+            "[path(reduce .a as {b: $v} ?// $w (.; $v))]",
+            Err("Invalid path expression with result 1"),
+        ),
+        // rule 4: the last alternative's error propagates
+        (
+            "{\"a\":{\"b\":1}}",
+            "[path(foreach .a as {b: $v} ?// {c: $w} (.; .; if $w == null then error(\"e\") else . end))]",
+            Err("e"),
+        ),
+        // a guessed walk verdict refuses instead of retrying
+        (
+            "{\"a\":2,\"c\":2}",
+            "[path(foreach .a as {a: $v} ?// $v (.c; .; empty))]",
+            Err("Invalid path expression near attempt to access element \"a\" of {\"a\":2,\"c\":2}"),
+        ),
+        // the same, through reduce
+        (
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
+            "[path(reduce .a as {b: $v} ?// $v (.c; .) | empty)]",
+            Err("Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}"),
+        ),
+        // an outer bind still tracks through a chain
+        (
+            "{\"a\":1}",
+            "[path(. as $x | reduce (1) as $y ?// $z (0; $x))]",
+            Ok(&["[[]]"]),
+        ),
+        // the same, foreach
+        (
+            "{\"a\":1}",
+            "[path(. as $x | foreach (1) as $y ?// $z (0; $x; .))]",
+            Ok(&["[[]]"]),
+        ),
+        // the retried alternative's own bind keeps navigating
+        (
+            "{\"a\":{\"b\":{\"c\":1}}}",
+            "[path(foreach .a as {b: $v} ?// $w (.; .; $v | .c))]",
+            Ok(&["[[\"a\",\"b\",\"c\"]]"]),
+        ),
+        // one retry per source element
+        (
+            "{\"a\":{\"b\":1}}",
+            "[path(foreach (.a,.a) as {b: $v} ?// $w (.; .; $v))]",
+            Ok(&["[[\"a\",\"b\"],[\"a\",\"b\"]]"]),
+        ),
+        // a null register admits the walk, so no retry happens
+        (
+            "null",
+            "[path(foreach (1,2) as [$a] ?// $b (.; .; .))]",
+            Ok(&["[[],[]]"]),
+        ),
+        // a bounded consumer outside path()
+        (
+            "{\"a\":1}",
+            "[limit(1; path(foreach (1,2) as [$a] ?// $b (.; .; .)))]",
+            Ok(&["[[]]"]),
+        ),
+        // the write side goes through the retried alternative's path
+        (
+            "{\"a\":[1]}",
+            "[del(foreach .a as {b: $v} ?// [$v] (.; .; $v))]",
+            Ok(&["[{\"a\":[]}]"]),
+        ),
+        // a refused chain writes nothing
+        (
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
+            "[(foreach .a as {b: $v} ?// $w (.c; .; empty)) |= 5]",
+            Err("Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}"),
+        ),
+        // family B: a chain on an untracked stage refuses rather than answering
+        (
+            "{\"a\":1}",
+            "[path(5 | . as {a: $v} ?// $v | .b?)]",
+            Err("Invalid path expression near attempt to access element \"b\" of 5"),
+        ),
+        // family B: ...and still answers where the body produces nothing to refuse
+        (
+            "{\"a\":1}",
+            "[path(5 | 5 as {a: $v} ?// $v | empty)]",
+            Ok(&["[]"]),
+        ),
+        ];
+
+        for (doc, filter, want) in rows {
+            let json = doc.as_bytes();
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            match want {
+                Ok(want) => {
+                    let got: Vec<String> = got
+                        .collect_owned()
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect();
+                    assert_eq!(got, *want, "{doc} | {filter}");
+                }
+                Err(want) => match got {
+                    QueryResult::Error(e) => assert_eq!(&e.message, want, "{doc} | {filter}"),
+                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"),
+                },
+            }
+        }
     }
 
     /// #2676: a fold's own destructuring pattern is tracked exactly the way
@@ -96368,8 +96551,20 @@ mod tests {
         assert!(fold_pattern_admitted::<JqSemantics>(&array));
         assert!(!fold_pattern_admitted::<YqSemantics>(&object));
         assert!(!fold_pattern_admitted::<YqSemantics>(&array));
-        assert!(!fold_pattern_admitted::<JqSemantics>(&alternatives));
+        // #2979: a `?//` chain is admitted in jq mode too, whatever its
+        // alternatives' shapes; yq mode still admits only a bare `$var`.
+        assert!(fold_pattern_admitted::<JqSemantics>(&alternatives));
         assert!(!fold_pattern_admitted::<YqSemantics>(&alternatives));
+        let mixed = [
+            Pattern::Object(vec![crate::jq::PatternEntry {
+                key: ObjectKey::Literal("c".to_string()),
+                bind: None,
+                pattern: Pattern::Var("x".to_string()),
+            }]),
+            Pattern::Var("y".to_string()),
+        ];
+        assert!(fold_pattern_admitted::<JqSemantics>(&mixed));
+        assert!(!fold_pattern_admitted::<YqSemantics>(&mixed));
     }
 
     // =========================================================================
