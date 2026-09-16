@@ -58,19 +58,22 @@ pub enum OwnedValue {
     Float(f64),
     String(String),                         // 24 bytes + heap allocation
     Array(Vec<OwnedValue>),                 // 24 bytes + heap allocation
-    Object(IndexMap<String, OwnedValue>),   // ~72 bytes + heap allocation
+    Object(ObjectMap),                      // 8 bytes + heap allocation (#3000)
 }
 ```
 
-**Memory overhead per value type:**
+**Memory overhead per value type.** Every arm pays the widest one, so the whole
+table's "stack size" is really `size_of::<OwnedValue>()`, which #3000 took from
+72 bytes to **32** by boxing the object map — `NumberLiteral(NumberRepr,
+Box<str>)` is the widest arm now, and `Object` costs one pointer:
 
-| Type      | Stack Size | Heap Overhead          | Notes                       |
-|-----------|------------|------------------------|-----------------------------|
-| Null/Bool | 16 bytes   | 0                      | Enum discriminant + padding |
-| Int/Float | 16 bytes   | 0                      | 8-byte value + padding      |
-| String    | 24 bytes   | len + capacity padding | Copies source text          |
-| Array     | 24 bytes   | 24×len + capacity      | Recursive overhead          |
-| Object    | ~72 bytes  | ~40×entries + keys     | IndexMap hash table         |
+| Type      | Payload    | Heap Overhead           | Notes                        |
+|-----------|------------|-------------------------|------------------------------|
+| Null/Bool | 0-1 bytes  | 0                       | Discriminant only            |
+| Int/Float | 8 bytes    | 0                       | 8-byte value                 |
+| String    | 24 bytes   | len + capacity padding  | Copies source text           |
+| Array     | 24 bytes   | 32×len + capacity       | Recursive overhead           |
+| Object    | 8 bytes    | 72 + ~40×entries + keys | Boxed IndexMap (#3000)       |
 
 **Why OwnedValue is 3-5× the source text:**
 
@@ -79,6 +82,9 @@ pub enum OwnedValue {
 3. **Vec capacity**: Vecs often allocate 2× needed capacity
 4. **Recursive overhead**: Each nested value has its own allocations
 5. **Alignment padding**: Rust aligns to 8 bytes
+6. **One allocation per object** (#3000): the boxed map costs a `malloc` even
+   for `{}`, which is the trade for every *other* value being 32 bytes instead
+   of 72
 
 ### 3. Result Buffering (Additional 1-2×)
 
