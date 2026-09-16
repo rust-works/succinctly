@@ -36,6 +36,7 @@ use alloc::rc::Rc;
 #[cfg(test)]
 use std::rc::Rc;
 
+use core::marker::PhantomData;
 use indexmap::IndexMap;
 
 use super::document::{
@@ -34865,21 +34866,112 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     root: OwnedValue,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> RecurseWalkEnd {
-    let mut emitted = 0usize;
-    let mut stack: Vec<OwnedValue> = vec![root];
-    let mut pending_error: Option<EvalEscape> = None;
+    let mut walk = ValueRecurseWalk::<S> {
+        f,
+        cond,
+        sink,
+        emitted: 0,
+        _semantics: PhantomData,
+    };
+    let abort = walk.visit(root);
+    RecurseAbort::walk_end(abort)
+}
 
-    while !stack.is_empty() && emitted < RECURSE_MAX_ITEMS {
-        let current = stack.pop().expect("loop condition checked non-empty");
-        emitted += 1;
-        if sink(current.clone()) == Demand::Stop {
-            return RecurseWalkEnd {
+/// Why a `recurse` walk ended before every node was visited -- the three
+/// ways [`RecurseWalkEnd`] can come out other than "drained, no error".
+enum RecurseAbort {
+    /// The sink answered [`Demand::Stop`], carrying any escape an earlier
+    /// node had already deferred (see [`RecurseWalkEnd::pending_error`]).
+    Stopped(Option<EvalEscape>),
+    /// [`RECURSE_MAX_ITEMS`] was reached with nodes still to visit. A
+    /// deferred escape is dropped, never raised (#842 review).
+    Capped,
+    /// `f` or `cond` ended in an escape, raised once every child it had
+    /// already approved has had its own descent (#842/#854).
+    Escaped(EvalEscape),
+}
+
+impl RecurseAbort {
+    fn walk_end(abort: Option<RecurseAbort>) -> RecurseWalkEnd {
+        match abort {
+            None => RecurseWalkEnd {
+                drained: true,
+                pending_error: None,
+                stopped: false,
+            },
+            Some(RecurseAbort::Stopped(pending_error)) => RecurseWalkEnd {
                 drained: false,
                 pending_error,
                 stopped: true,
-            };
+            },
+            Some(RecurseAbort::Capped) => RecurseWalkEnd {
+                drained: false,
+                pending_error: None,
+                stopped: false,
+            },
+            Some(RecurseAbort::Escaped(e)) => RecurseWalkEnd {
+                drained: true,
+                pending_error: Some(e),
+                stopped: false,
+            },
+        }
+    }
+}
+
+/// [`each_recurse_walk`]'s state: what every node's visit shares.
+struct ValueRecurseWalk<'e, 's, S> {
+    f: &'e Expr,
+    cond: Option<&'e Expr>,
+    sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
+    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    emitted: usize,
+    _semantics: PhantomData<S>,
+}
+
+impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
+    /// Deliver `node`, then its whole subtree.
+    fn visit(&mut self, node: OwnedValue) -> Option<RecurseAbort> {
+        if self.emitted >= RECURSE_MAX_ITEMS {
+            return Some(RecurseAbort::Capped);
+        }
+        self.emitted += 1;
+        if (self.sink)(node.clone()) == Demand::Stop {
+            return Some(RecurseAbort::Stopped(None));
+        }
+        self.expand_queued(node)
+    }
+
+    /// Visit the subtree below an already-delivered `node` with an explicit
+    /// LIFO stack of materialized children.
+    fn expand_queued(&mut self, node: OwnedValue) -> Option<RecurseAbort> {
+        let mut stack: Vec<OwnedValue> = Vec::new();
+        let mut pending_error: Option<EvalEscape> = None;
+        self.queue_children(&node, &mut stack, &mut pending_error);
+
+        while !stack.is_empty() && self.emitted < RECURSE_MAX_ITEMS {
+            let current = stack.pop().expect("loop condition checked non-empty");
+            self.emitted += 1;
+            if (self.sink)(current.clone()) == Demand::Stop {
+                return Some(RecurseAbort::Stopped(pending_error));
+            }
+            self.queue_children(&current, &mut stack, &mut pending_error);
         }
 
+        if !stack.is_empty() {
+            Some(RecurseAbort::Capped)
+        } else {
+            pending_error.map(RecurseAbort::Escaped)
+        }
+    }
+
+    /// Evaluate `f` (and `cond`) on `current` in full, and queue the
+    /// approved children onto `stack`.
+    fn queue_children(
+        &self,
+        current: &OwnedValue,
+        stack: &mut Vec<OwnedValue>,
+        pending_error: &mut Option<EvalEscape>,
+    ) {
         // Every output of `f` becomes exactly one candidate child, in order
         // -- a null output is a real value (not "no child"), and an array
         // output is visited as one node, not spliced into its elements
@@ -34888,14 +34980,14 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
         // (#636) -- but only after whatever `f` already produced at this node
         // (kept via `eval_owned_multi_keep_partial`, #842) has had its own
         // full recursive treatment.
-        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
+        let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(self.f, current);
 
         // Collected in encounter order, then pushed onto `stack` reversed by
         // `queue_recurse_children` -- see `resolve_recurse_sink`'s doc
         // comment (#635) -- so the first entry's whole subtree completes
         // before the next sibling is reached.
         let mut next: Vec<OwnedValue> = Vec::new();
-        match cond {
+        match self.cond {
             None => next.extend(children),
             // `cond` gates the child, not `current`, and forks once per
             // truthy output (#627). A `cond` error defers exactly like `f`'s
@@ -34916,13 +35008,7 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
             }
         }
 
-        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
-    }
-
-    RecurseWalkEnd {
-        drained: stack.is_empty(),
-        pending_error,
-        stopped: false,
+        queue_recurse_children(stack, next, deferred_error, pending_error);
     }
 }
 
@@ -35132,16 +35218,113 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     // `f` for the next — closing this needs `f`'s own generator interleaved
     // with this function's recursion, not just streamed delivery of what it
     // already produced in one shot. See limitations.md.
-    let mut emitted = 0usize;
-    // [`recurse_family_root_seed`] -- every subsequent node on the stack
-    // comes from `f` instead, and that is `child_snapshot`'s own job below,
-    // not this seed's.
-    let mut stack: Vec<PathBranch<'a>> = vec![recurse_family_root_seed(value, trackable, snapshot)];
-    // Set by `queue_recurse_children` once `f` itself ends in an
-    // error/break/halt — see that function's doc comment (#842).
-    let mut pending_error: Option<EvalEscape> = None;
+    let mut walk = PathRecurseWalk::<S> {
+        f,
+        cond,
+        frame,
+        keep,
+        sink,
+        emitted: 0,
+        _semantics: PhantomData,
+    };
+    // [`recurse_family_root_seed`] -- every subsequent node comes from `f`
+    // instead, and that is `child_snapshot`'s own job below, not this seed's.
+    match walk.visit(recurse_family_root_seed(value, trackable, snapshot)) {
+        None | Some(RecurseAbort::Capped) => ResolveFlow::Exhausted,
+        // A deferred escape the sink stopped before is dropped: jq never
+        // resumes a generator once its consumer is satisfied (see
+        // [`ResolveFlow::Stopped`]).
+        Some(RecurseAbort::Stopped(_)) => ResolveFlow::Stopped,
+        Some(RecurseAbort::Escaped(e)) => ResolveFlow::Escaped(e),
+    }
+}
 
-    while !stack.is_empty() && emitted < RECURSE_MAX_ITEMS {
+/// [`resolve_recurse_sink`]'s state: what every node's visit shares.
+struct PathRecurseWalk<'e, 'a, 's, S> {
+    f: &'e Expr,
+    cond: Option<&'e Expr>,
+    frame: &'e Frame,
+    keep: Keep,
+    sink: &'s mut dyn FnMut(PathBranch<'a>) -> Demand,
+    /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
+    emitted: usize,
+    _semantics: PhantomData<S>,
+}
+
+impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
+    /// Deliver `node`, then its whole subtree.
+    fn visit(&mut self, node: PathBranch<'a>) -> Option<RecurseAbort> {
+        if self.emitted >= RECURSE_MAX_ITEMS {
+            return Some(RecurseAbort::Capped);
+        }
+        self.emitted += 1;
+        if (self.sink)(Self::delivered(&node)) == Demand::Stop {
+            return Some(RecurseAbort::Stopped(None));
+        }
+        self.expand_queued(node)
+    }
+
+    /// The branch the sink sees for a visited `node`.
+    fn delivered(node: &PathBranch<'a>) -> PathBranch<'a> {
+        // `value.clone()` is cheap (`Cow`, #668). `path` is a `PathPrefix`
+        // (#701): `Rc::clone` is O(1), not the O(path length) `Vec<Expr>`
+        // clone this used to pay per node.
+        PathBranch {
+            path: Rc::clone(&node.path),
+            value: node.value.clone(),
+            register: None,
+            // Propagated rather than assumed `true`. The shared
+            // recurse-family guard means only a trackable value can enter
+            // this walk today, so this is `true` in practice — but carrying
+            // it keeps that a fact about the guard rather than a second
+            // place the invariant has to be independently maintained
+            // (#1023's `MAX_ITEMS` triplication is what the other way looks
+            // like). See #986's Stage 3 open risk.
+            trackable: node.trackable,
+            // Carried, not assumed `false` (#1591): this is the value the
+            // caller actually observes, so it is the one whose provenance a
+            // downstream `FoldRegister` reads.
+            snapshot: node.snapshot.clone(),
+        }
+    }
+
+    /// Visit the subtree below an already-delivered `node` with an explicit
+    /// LIFO stack of materialized children.
+    fn expand_queued(&mut self, node: PathBranch<'a>) -> Option<RecurseAbort> {
+        let mut stack: Vec<PathBranch<'a>> = Vec::new();
+        // Set by `queue_recurse_children` once `f` itself ends in an
+        // error/break/halt — see that function's doc comment (#842).
+        let mut pending_error: Option<EvalEscape> = None;
+        self.queue_children(node, &mut stack, &mut pending_error);
+
+        while !stack.is_empty() && self.emitted < RECURSE_MAX_ITEMS {
+            let current = stack.pop().expect("loop condition checked non-empty");
+            self.emitted += 1;
+            if (self.sink)(Self::delivered(&current)) == Demand::Stop {
+                return Some(RecurseAbort::Stopped(pending_error));
+            }
+            self.queue_children(current, &mut stack, &mut pending_error);
+        }
+
+        // Same pending_error/stack-drain rule `finish_recurse_walk` documents
+        // (#842, #1023). Hitting `RECURSE_MAX_ITEMS` with the stack still
+        // non-empty silently truncates without raising `pending_error`,
+        // exactly as the collecting version always did.
+        if !stack.is_empty() {
+            Some(RecurseAbort::Capped)
+        } else {
+            pending_error.map(RecurseAbort::Escaped)
+        }
+    }
+
+    /// Resolve `f` (and `cond`) on an already-delivered `node` in full, and
+    /// queue the approved children onto `stack`.
+    fn queue_children(
+        &self,
+        node: PathBranch<'a>,
+        stack: &mut Vec<PathBranch<'a>>,
+        pending_error: &mut Option<EvalEscape>,
+    ) {
         // `snapshot` is *not* uniformly `false` across this walk, though
         // this comment claimed it was until #1591. The seed is a
         // `PathBranch::new` (so `false`), but children come from `f`, and
@@ -35162,31 +35345,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
             // separate register of its own. `resolve_seq` re-attaches the
             // pipe register around this whole call if one is live.
             register: _,
-        } = stack.pop().unwrap();
-        // `current.clone()` is cheap (`Cow`, #668). `prefix` is a
-        // `PathPrefix` (#701): `Rc::clone` is O(1), not the O(path length)
-        // `Vec<Expr>` clone this used to pay per node.
-        emitted += 1;
-        if sink(PathBranch {
-            path: Rc::clone(&prefix),
-            value: current.clone(),
-            register: None,
-            // Propagated rather than assumed `true`. The shared
-            // recurse-family guard means only a trackable value can enter
-            // this loop today, so this is `true` in practice — but carrying
-            // it keeps that a fact about the guard rather than a second
-            // place the invariant has to be independently maintained
-            // (#1023's `MAX_ITEMS` triplication is what the other way looks
-            // like). See #986's Stage 3 open risk.
-            trackable: node_trackable,
-            // Carried, not assumed `false` (#1591): this is the value the
-            // caller actually observes, so it is the one whose provenance a
-            // downstream `FoldRegister` reads.
-            snapshot: node_snapshot.clone(),
-        }) == Demand::Stop
-        {
-            return ResolveFlow::Stopped;
-        }
+        } = node;
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
 
@@ -35220,17 +35379,17 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
         // `path(.a as $y | .a | recurse(if . == $y then $y.b else empty
         // end))` certifies `$y` at `["a"]` (jq `["a"]`, `["a","b"]`).
         let node_frame = if node_trackable {
-            frame.extend(&prefix)
+            self.frame.extend(&prefix)
         } else {
-            frame.unknown()
+            self.frame.unknown()
         };
         let (children, mut deferred_error) = match resolve_against_cow::<S>(
-            f,
+            self.f,
             current,
             node_trackable,
             &node_snapshot,
             &node_frame,
-            keep,
+            self.keep,
         ) {
             Ok(children) => (children, None),
             Err((partial_children, e)) => (partial_children, Some(e)),
@@ -35251,7 +35410,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
         {
             let path = PathPrefix::extend_many(&prefix, child_components.to_vec());
 
-            match cond {
+            match self.cond {
                 None => {
                     // A null node's own line of descent ends here (see the
                     // doc comment above for why): its own path was already
@@ -35321,19 +35480,7 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
             }
         }
 
-        queue_recurse_children(&mut stack, next, deferred_error, &mut pending_error);
-    }
-
-    // Same pending_error/stack-drain rule `finish_recurse_walk` documents
-    // (#842, #1023) — can't share that helper directly, since this returns
-    // `ResolveFlow`, not `QueryResult`. Hitting `RECURSE_MAX_ITEMS` with the
-    // stack still non-empty silently truncates without raising
-    // `pending_error`, exactly as the collecting version always did — not
-    // this change's rule to revisit.
-    if stack.is_empty() {
-        flow_result(pending_error)
-    } else {
-        ResolveFlow::Exhausted
+        queue_recurse_children(stack, next, deferred_error, pending_error);
     }
 }
 
