@@ -48126,7 +48126,7 @@ pub mod cli_context {
         value.map_or(OwnedValue::Null, OwnedValue::String)
     }
 
-    /// `get_search_list`: the `-L` list as given, else jq's own default.
+    /// `get_search_list`: the `-L` list the CLI recorded, else jq's own default.
     pub fn search_list() -> OwnedValue {
         let list = program()
             .map(|p| p.search_list)
@@ -49258,8 +49258,13 @@ fn format_strftime(
                     result.push_str(&format!("{sign}{:02}{:02}", minutes / 60, minutes % 60));
                 }
                 Some('Z') => result.push_str(zone_name),
+                // The fields are in `zone`, so the epoch is theirs minus its
+                // offset (#3046 review: `TZ=EST5EDT`, `0 |
+                // strflocaltime("%s")` is `"0"` in jq 1.7.1).
                 Some('s') => result.push_str(
                     &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)?
+                        .checked_sub(zone_offset)
+                        .ok_or_else(overflow)?
                         .to_string(),
                 ),
                 Some('U') => {

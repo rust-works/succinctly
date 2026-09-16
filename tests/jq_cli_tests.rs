@@ -44167,6 +44167,10 @@ fn strflocaltime_matches_jq_3046() -> Result<()> {
             "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
             5,
         ),
+        // `%s` is the epoch of the local fields (#3046 review).
+        ("EST5EDT", "[(0|strflocaltime(\"%s\")), ([1970,0,1,0,0,0,4,0]|strflocaltime(\"%s\")), (1700000000|strflocaltime(\"%s\"))]", "[\"0\",\"18000\",\"1700000000\"]\n", "", 0),
+        ("UTC-9", "[(0|strflocaltime(\"%s\")), ([1970,0,1,0,0,0,4,0]|strflocaltime(\"%s\")), (1700000000|strflocaltime(\"%s\"))]", "[\"0\",\"-32400\",\"1700000000\"]\n", "", 0),
+        ("UTC", "[(0|strflocaltime(\"%s\")), ([1970,0,1,0,0,0,4,0]|strflocaltime(\"%s\")), (1700000000|strflocaltime(\"%s\"))]", "[\"0\",\"0\",\"1700000000\"]\n", "", 0),
     ] {
         let (output, code) = spawn_jq_with_env(&["-nc", filter], "TZ", tz, None)?;
         let stdout = String::from_utf8(output.stdout)?;
@@ -44214,6 +44218,7 @@ fn cli_context_builtins_match_jq_3046() -> Result<()> {
     let dir = tempfile::tempdir()?;
     std::fs::write(dir.path().join("in.json"), "1\n")?;
     std::fs::write(dir.path().join("b.json"), "2\n")?;
+    std::fs::write(dir.path().join("d.csv"), "a,b\n")?;
     std::fs::create_dir(dir.path().join("sub"))?;
     std::fs::write(dir.path().join("sub").join("p.jq"), "get_prog_origin")?;
     let here = std::fs::canonicalize(dir.path())?;
@@ -44279,6 +44284,50 @@ fn cli_context_builtins_match_jq_3046() -> Result<()> {
             vec!["-L", "lib", "-L", "/x", "-nc", "get_search_list"],
             None,
             "[\"lib\",\"/x\"]\n".to_string(),
+        ),
+        // A `-L` directory that exists is resolved to its real path; one that
+        // does not is kept as given (#3046 review).
+        (
+            vec![
+                "-L",
+                "sub",
+                "-L",
+                "./sub/",
+                "-L",
+                ".",
+                "-nc",
+                "get_search_list",
+            ],
+            None,
+            format!("[\"{here}/sub\",\"{here}/sub\",\"{here}\"]\n"),
+        ),
+        // Stdin on the routes that materialize (#3046 review).
+        (
+            vec!["-c", "[input, input_filename]"],
+            Some("1\n2\n"),
+            "[2,\"<stdin>\"]\n".to_string(),
+        ),
+        (
+            vec!["-c", "-R", "input_filename"],
+            Some("a\n"),
+            "\"<stdin>\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "-s", "input_filename"],
+            Some("1\n"),
+            "\"<stdin>\"\n".to_string(),
+        ),
+        // `--input-dsv` (succinctly-only) names its file on its streaming
+        // route as on its slurped one.
+        (
+            vec!["-c", "--input-dsv", ",", "input_filename", "d.csv"],
+            None,
+            "\"d.csv\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "-s", "--input-dsv", ",", "input_filename", "d.csv"],
+            None,
+            "\"d.csv\"\n".to_string(),
         ),
         (
             vec!["-nc", "get_prog_origin"],
