@@ -47750,6 +47750,10 @@ mod remaining_inputs {
             return Pop::Document(doc);
         }
         if let Some((error, at)) = TRAILING_ERROR.with(|t| t.borrow_mut().take()) {
+            // `input_line_number` follows the parser to the error's line, as
+            // it does for a document: jq answers 2 after `input, input, (try
+            // input catch 0)` on `1\n2 }\n\n\n`.
+            LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
             EXHAUSTED.with(|e| e.set(Some(at)));
             return Pop::ParseError(error);
@@ -48026,7 +48030,10 @@ fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResul
         // A `Continue`-only sink never stops, but the arm costs nothing and
         // keeps this total rather than relying on that.
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(docs),
-        Flow::Escaped(control) => control_to_result(control),
+        // A trailing parse error (#2961) ends the stream *after* the documents
+        // before it, which stay: `.a = inputs` on `1 2 {invalid}` yields
+        // `{"a":1}` and `{"a":2}` before raising, as in jq.
+        Flow::Escaped(control) => partial(docs, control),
     }
 }
 

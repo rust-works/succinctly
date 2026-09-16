@@ -3819,6 +3819,7 @@ fn get_inputs(
                 // The splitter exists here only to feed
                 // `locations.extend_from_ends`, so slurp mode skips that scan
                 // entirely rather than running it and discarding the result.
+                let mut error_line = 0;
                 if !args.slurp {
                     // The splitter recognizes every span the parse above
                     // produced a value for (it is the more lenient of the two,
@@ -3827,7 +3828,7 @@ fn get_inputs(
                     // crate's own public CLI surface, and surfaced as an
                     // internal error rather than silently reusing a stale or
                     // wrong offset list if that ever stops holding (#1064).
-                    let (spans, _) = split_json_values(raw.as_bytes());
+                    let (spans, split_error) = split_json_values(raw.as_bytes());
                     if spans.len() < parsed.len() {
                         return Ok(Err(anyhow::anyhow!(
                             "internal error: the JSON splitter found {} values where the \
@@ -3842,19 +3843,27 @@ fn get_inputs(
                         .map(|&(_, end)| end)
                         .collect();
                     locations.extend_from_ends(src, &raw, &ends, parsed.len());
+                    if parse_error.is_some() {
+                        // The malformed value starts at the first span the
+                        // parse did not produce a value for, or where the
+                        // splitter itself gave up.
+                        let start = spans
+                            .get(parsed.len())
+                            .map(|&(start, _)| start)
+                            .or(split_error)
+                            .unwrap_or(raw.len());
+                        error_line = parse_error_line(raw.as_bytes(), start);
+                    }
                 }
                 values.extend(parsed);
                 // jq's parser stops at the first malformed value: nothing
                 // after it is read, this file or any later one, and the error
                 // is raised once the documents before it have been (#2961).
-                // Its marker names where the parser stood, which on a file
-                // read in one chunk is every newline in it (`printf '1 2
-                // {invalid} 3\n' | jq -n 'input,input,input'` reports line 1).
                 if let Some(error) = parse_error {
                     trailing_error = Some(TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
-                        line: u32::try_from(line_at(raw.as_bytes(), raw.len())).unwrap_or(u32::MAX),
+                        line: u32::try_from(error_line).unwrap_or(u32::MAX),
                     });
                     break;
                 }
@@ -4264,6 +4273,24 @@ fn line_at(bytes: &[u8], end: usize) -> usize {
         count += 1;
     }
     count
+}
+
+/// jq's `(at <file>:<line>)` line once its parser has stopped on a malformed
+/// value starting at `start` (#2961): every newline up to and including the
+/// one ending that value's line, since jq's lexer reads to the next delimiter
+/// before it raises. On a document with one value per line that is exact --
+/// `1\n2 }\n\n\n` reports line 2, `1\n2\n}\n3\n` line 3. A malformed value
+/// spanning several lines, or cut off at end of input, is where it is not:
+/// jq names wherever its parser gave up inside it, or `<unknown>` at EOF, and
+/// this names the end of its first line instead. Recorded in
+/// `docs/compliance/jq/limitations.md`.
+fn parse_error_line(bytes: &[u8], start: usize) -> usize {
+    let start = start.min(bytes.len());
+    let line_end = bytes[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |offset| start + offset);
+    line_at(bytes, line_end)
 }
 
 /// Find the byte ranges of JSON values in a byte slice.
