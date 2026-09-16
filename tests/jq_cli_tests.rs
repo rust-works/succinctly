@@ -26714,9 +26714,10 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
 ///   def's own binding (`R3`, `R25`). Such a dependency is now renamed, with
 ///   the calls that reach it.
 /// - **The rename is scope-aware**: a nested def of the same name (`R21`), a
-///   parameter (`R22`, `R26`, `R30`), a dependency's own dependency (`R23`),
-///   a later same-name entry (`R27`, `R28`) and declaration order (`R24`)
-///   each keep a call bound where jq binds it.
+///   parameter (`R22`, `R26`, `R30`), a dependency's own dependency (`R23`,
+///   and past its run's end marker `R33`), a later same-name entry (`R27`,
+///   `R28`) and declaration order (`R24`) each keep a call bound where jq
+///   binds it.
 ///
 /// `R2u`, `R9`, `R11`, `R12`, `R15`, `R16` and `R17` already matched, and are
 /// here so the change cannot move them.
@@ -26960,6 +26961,14 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("mt", "import \"it\" as t; include \"it\"; def c: if . == 0 then [g, t::g] else (. - 1 | c) end;\n"), ("it", "def c: 7; def g: c;\n")],
             "include \"mt\"; 0 | c",
             "[7,7]\n",
+            "",
+            0,
+        ),
+        (
+            "R33",
+            &[("mv", "include \"iv\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("iv", "include \"iv2\"; def c: 7; def g: [c, z];\n"), ("iv2", "def z: 3;\n")],
+            "include \"mv\"; 0 | c",
+            "[7,3]\n",
             "",
             0,
         ),
@@ -45260,6 +45269,40 @@ fn test_unbound_variable_from_included_module_names_its_own_line_2962() -> Resul
             " ".repeat(25)
         )
     );
+    Ok(())
+}
+
+/// #2962 / #3058: a dependency copied into two reached defs reports its
+/// unbound variable once per copy. jq reports it once (`jq: 1 compile
+/// error`), so the count is #3058's divergence, shared with calls. What this
+/// pins is the second report's form: the site table has no second
+/// occurrence, and the reporter names the file alone rather than searching
+/// the text for a coincidental `$nosuch` -- here, the one in a string.
+#[test]
+fn test_unbound_variable_in_a_twice_copied_dependency_3058() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_with_modules(
+        &[
+            ("dep", "def g: $nosuch;\ndef s: \"$nosuch\";\n"),
+            ("mid", "include \"dep\"; def a: g; def b: g;\n"),
+        ],
+        &["-nc", r#"include "mid"; a, b"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 4, "stderr: {stderr:?}");
+    assert!(
+        lines[0].starts_with("jq: error: $nosuch is not defined at ")
+            && lines[0].ends_with("dep.jq, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(lines[1], "def g: $nosuch;       ");
+    assert!(
+        lines[2].starts_with("jq: error: $nosuch is not defined at ")
+            && lines[2].ends_with("dep.jq"),
+        "the second copy names the file only, never line 2's string: {stderr:?}"
+    );
+    assert_eq!(lines[3], "jq: 2 compile errors");
     Ok(())
 }
 

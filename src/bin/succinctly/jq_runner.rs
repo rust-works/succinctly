@@ -2185,34 +2185,28 @@ fn report_unresolved_call(
 }
 
 /// Report one unbound `$name` against `source` (the main filter, or a
-/// module's own text), placing it at its `taken`-th recorded site when there
-/// is one and falling back to a text search from `resume_from` otherwise --
-/// [`report_unresolved_call`]'s twin for variables.
+/// module's own text), at its `taken`-th recorded site -- the variable twin
+/// of [`report_unresolved_call`].
+///
+/// Unlike calls, no text-search fallback: `collect_var_sites` records every
+/// `$name` a parse sees (a `$name` token has none of the retry, shadow or
+/// builtin-fallback machinery that can make the call-site table diverge from
+/// the real parse), so a miss here is never a site the table lost. It is a
+/// second report for the same site, from a second copy of a module dependency
+/// (#3058), and a text search could only land on a coincidental `$name` in a
+/// string or comment. The file-only form is the honest report for it.
 fn report_unbound_var(
     name: &str,
     location: &str,
     source: &str,
     var_sites: &[jq::VarSite],
     taken: &mut usize,
-    resume_from: &mut usize,
 ) {
-    let from_table = var_sites
-        .iter()
-        .filter(|v| v.name == name)
-        .nth(*taken)
-        .map(|v| v.offset);
-    if let Some(offset) = from_table {
-        *taken += 1;
-        *resume_from = offset + name.len() + 1;
-        let (line_no, line_text, column) = line_at_offset(source, offset);
-        eprintln!("jq: error: ${name} is not defined at {location}, line {line_no}:");
-        eprintln!("{line_text}{}", " ".repeat(column));
-        return;
-    }
-
-    match locate_identifier_from(source, &format!("${name}"), *resume_from) {
-        Some((line_no, line_text, column, end)) => {
-            *resume_from = end;
+    let site = var_sites.iter().filter(|v| v.name == name).nth(*taken);
+    match site {
+        Some(site) => {
+            *taken += 1;
+            let (line_no, line_text, column) = line_at_offset(source, site.offset);
             eprintln!("jq: error: ${name} is not defined at {location}, line {line_no}:");
             eprintln!("{line_text}{}", " ".repeat(column));
         }
@@ -2225,12 +2219,9 @@ fn report_unbound_var(
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
-    // first one's. Used only by the text-search fallback below. Calls and
-    // variables get independent maps: `f` (a call) and `$f` (a variable) are
-    // unrelated occurrences in the source, so their resume cursors must not
-    // share a key even though the bare names could coincide.
+    // first one's. Used only by the text-search fallback below, which only
+    // calls have (see `report_unbound_var`).
     let mut call_resume_from: HashMap<&str, usize> = HashMap::new();
-    let mut var_resume_from: HashMap<&str, usize> = HashMap::new();
 
     // #2991: a module-body error's `origin` names a *different* source than
     // `filter`, so it needs its own text and its own call-site table --
@@ -2253,7 +2244,6 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     let mut module_var_diagnostics: HashMap<u32, Option<(String, Vec<jq::VarSite>)>> =
         HashMap::new();
     let mut module_vars_consumed: HashMap<(u32, &str), usize> = HashMap::new();
-    let mut module_var_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
 
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
@@ -2264,9 +2254,9 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
     // How many calls/variables of each name we have already reported, so a
     // repeated undefined name walks its own successive sites in source
-    // order -- the same rule `call_resume_from`/`var_resume_from` gives the
-    // fallback. Separate maps for the same reason those are separate: a
-    // call named `f` and a variable named `f` are unrelated occurrences.
+    // order -- the same rule `call_resume_from` gives the calls' fallback.
+    // Separate maps: a call named `f` and a variable named `f` are unrelated
+    // occurrences.
     let mut calls_consumed: HashMap<&str, usize> = HashMap::new();
     let mut vars_consumed: HashMap<&str, usize> = HashMap::new();
 
@@ -2361,10 +2351,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                             let taken = module_vars_consumed
                                 .entry((*id, name.as_str()))
                                 .or_insert(0);
-                            let resume = module_var_resume_from
-                                .entry((*id, name.as_str()))
-                                .or_insert(0);
-                            report_unbound_var(name, &at, source, var_sites, taken, resume);
+                            report_unbound_var(name, &at, source, var_sites, taken);
                         }
                         None => {
                             eprintln!("jq: error: ${name} is not defined at {at}");
@@ -2372,8 +2359,8 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     }
                     continue;
                 }
-                // #2734: prefer the real reference position from `var_sites`
-                // over the text-search fallback -- a blind search for
+                // #2734: the real reference position from `var_sites`, not a
+                // text search -- a blind search for
                 // `${name}` can land inside a string literal, or on an
                 // earlier, genuinely *bound* occurrence of the same name,
                 // neither of which is the failing reference. See
@@ -2381,19 +2368,8 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // ambiguity this still can't resolve (two same-named
                 // references differing only by lexical scope), the same
                 // known limitation `jq::CallSite` has for calls (#2635).
-                //
-                // The fallback, for the same reason `call_sites` needs one:
-                // a variable reference inlined from `~/.jq` has no
-                // occurrence in `filter`'s own text at all. `var_sites` is
-                // not known to under-record relative to a blind text search
-                // for variables specifically: calls carry retry/shadow/
-                // builtin-fallback machinery a second, simpler re-parse can
-                // diverge on (`Parser::shadow_retry_budget`,
-                // `builtin_fallback`), while a `$name` token has no
-                // equivalent mechanism.
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
-                let resume = var_resume_from.entry(name.as_str()).or_insert(0);
-                report_unbound_var(name, "<top-level>", filter, &var_sites, taken, resume);
+                report_unbound_var(name, "<top-level>", filter, &var_sites, taken);
             }
         }
     }
