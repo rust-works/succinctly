@@ -5909,6 +5909,14 @@ impl<'a> Parser<'a> {
                 .parse_required_single_arg(keyword_start)?
                 .map(|name| Builtin::FormatNamed(Box::new(name))));
         }
+        if self.matches_keyword("strflocaltime") {
+            self.reject_unless_jq_extensions("strflocaltime")?;
+            let keyword_start = self.pos;
+            self.consume_keyword("strflocaltime");
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|fmt| Builtin::Strflocaltime(Box::new(fmt))));
+        }
         if self.matches_keyword("strftime") {
             self.reject_unless_jq_extensions("strftime")?;
             let keyword_start = self.pos;
