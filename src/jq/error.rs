@@ -2009,8 +2009,12 @@ mod tests {
     // `into_owned_panics_past_nesting_depth_limit_1021`'s controlled panic
     // becomes a stack overflow. That test still panics in a controlled way
     // at 56.
+    // Gated off under `unboxed-object-map` (#3000): that measurement-only
+    // holdout deliberately restores the pre-#3000, 72-byte `OwnedValue`, so
+    // this pin describes the shipped layout only.
     #[test]
     #[cfg(target_pointer_width = "64")]
+    #[cfg(not(feature = "unboxed-object-map"))]
     fn eval_error_size_is_pinned_for_the_1021_stack_overflow_fix() {
         assert_eq!(
             core::mem::size_of::<EvalError>(),

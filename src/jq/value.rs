@@ -1778,35 +1778,6 @@ type ObjectMapInner = Box<IndexMap<String, OwnedValue>>;
 #[cfg(feature = "unboxed-object-map")]
 type ObjectMapInner = IndexMap<String, OwnedValue>;
 
-/// Wrap an owned `IndexMap` in whichever [`ObjectMapInner`] is in effect.
-#[cfg(not(feature = "unboxed-object-map"))]
-#[inline]
-fn object_map_wrap(map: IndexMap<String, OwnedValue>) -> ObjectMapInner {
-    Box::new(map)
-}
-
-/// See [`object_map_wrap`]'s boxed twin.
-#[cfg(feature = "unboxed-object-map")]
-#[inline]
-fn object_map_wrap(map: IndexMap<String, OwnedValue>) -> ObjectMapInner {
-    map
-}
-
-/// Unwrap whichever [`ObjectMapInner`] is in effect back to an owned
-/// `IndexMap`.
-#[cfg(not(feature = "unboxed-object-map"))]
-#[inline]
-fn object_map_unwrap(inner: ObjectMapInner) -> IndexMap<String, OwnedValue> {
-    *inner
-}
-
-/// See [`object_map_unwrap`]'s boxed twin.
-#[cfg(feature = "unboxed-object-map")]
-#[inline]
-fn object_map_unwrap(inner: ObjectMapInner) -> IndexMap<String, OwnedValue> {
-    inner
-}
-
 impl ObjectMap {
     /// An empty object map.
     #[inline]
@@ -1821,9 +1792,18 @@ impl ObjectMap {
     }
 
     /// Consume this map, yielding the `IndexMap` it wraps.
+    #[cfg(not(feature = "unboxed-object-map"))]
     #[inline]
     pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
-        object_map_unwrap(self.0)
+        *self.0
+    }
+
+    /// See [`ObjectMap::into_index_map`]'s boxed twin -- the holdout shape
+    /// holds the map inline, so there is nothing to unbox.
+    #[cfg(feature = "unboxed-object-map")]
+    #[inline]
+    pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
+        self.0
     }
 }
 
@@ -1844,9 +1824,16 @@ impl DerefMut for ObjectMap {
 }
 
 impl From<IndexMap<String, OwnedValue>> for ObjectMap {
+    #[cfg(not(feature = "unboxed-object-map"))]
     #[inline]
     fn from(map: IndexMap<String, OwnedValue>) -> Self {
-        Self(object_map_wrap(map))
+        Self(Box::new(map))
+    }
+
+    #[cfg(feature = "unboxed-object-map")]
+    #[inline]
+    fn from(map: IndexMap<String, OwnedValue>) -> Self {
+        Self(map)
     }
 }
 

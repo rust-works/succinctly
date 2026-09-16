@@ -26011,8 +26011,12 @@ mod tests {
     /// `LazySeq` stays boxed, one pointer wide, instead of inlining its 184
     /// bytes into every return -- is untouched; only the arm that was
     /// already widest got smaller.
+    /// Gated off under `unboxed-object-map` (#3000): that measurement-only
+    /// holdout deliberately restores the pre-#3000, 72-byte `OwnedValue`, so
+    /// this pin describes the shipped layout only.
     #[test]
     #[cfg(target_pointer_width = "64")]
+    #[cfg(not(feature = "unboxed-object-map"))]
     fn test_generic_result_size_stays_bounded_789() {
         assert_eq!(
             core::mem::size_of::<GenericResult<crate::json::light::StandardJson<'_, Vec<u64>>>>(),
@@ -26041,8 +26045,12 @@ mod tests {
     /// `OneCursorValue(V::Cursor, V)` (32 + 40 for `StandardJson`, #1599/O5)
     /// widest at 72 with the discriminant folded into a niche. As above, the
     /// `LazySeq`-stays-boxed property this test guards is untouched.
+    /// Gated off under `unboxed-object-map` (#3000): that measurement-only
+    /// holdout deliberately restores the pre-#3000, 72-byte `OwnedValue`, so
+    /// this pin describes the shipped layout only.
     #[test]
     #[cfg(target_pointer_width = "64")]
+    #[cfg(not(feature = "unboxed-object-map"))]
     fn test_generic_item_size_stays_bounded_789() {
         assert_eq!(
             core::mem::size_of::<GenericItem<crate::json::light::StandardJson<'_, Vec<u64>>>>(),
