@@ -457,6 +457,7 @@ for the full list.
 | `mmap-tests`        | Memory-mapped bitvector tests             |
 | `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
 | `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
+| `unboxed-object-map`| Measurement-only: un-box `OwnedValue::Object`'s map (#3000 A/B holdout; never ship) |
 
 ## Testing Strategy
 

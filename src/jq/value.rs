@@ -1747,7 +1747,13 @@ fn try_positive_shifted_plain(
 /// exactly 32 bytes and the discriminant packs into `NumberRepr`'s own
 /// niche, so `size_of::<OwnedValue>()` is 32: a 55% cut on every element of
 /// every `Vec<OwnedValue>`, on every route, eager and streaming alike. The
-/// cost is one extra allocation and one extra pointer chase per object.
+/// cost is one extra allocation and one extra pointer chase per object --
+/// charged per object regardless of size, so an *empty* `{}`, which used to
+/// cost nothing on the heap (`IndexMap::new()` does not allocate), now costs a
+/// `malloc`/`free` pair with no offsetting inline saving of its own. That is
+/// the shape of the whole trade: workloads that materialize many small objects
+/// and hold them live pay for it, and everything that moves or copies values
+/// in bulk is paid back at 40 bytes an element.
 ///
 /// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
 /// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,

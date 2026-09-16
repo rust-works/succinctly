@@ -70,9 +70,17 @@ broadword-yaml = []
 
 # Measurement-only holdout for #3000: swap `OwnedValue::Object`'s backing map
 # back to an inline `IndexMap` (the pre-#3000, 72-byte-value layout) while
-# keeping this branch's source shape, so an A/B can subtract code-layout bias
-# from the boxed build's numbers. NEVER enable this in a shipped build --
-# it undoes the 72 -> 32 byte shrink the default build exists to deliver.
+# keeping the current source shape, so an A/B can subtract code-layout bias
+# from the boxed build's numbers. NEVER enable this in a shipped build -- it
+# undoes the 72 -> 32 byte shrink the default build exists to deliver.
+#
+# Non-additive, like `portable-popcount`/`broadword-yaml`/`scalar-yaml`/
+# `select-stats` above and below: `--all-features` turns it on, so a
+# `--all-features` build is the *unboxed* layout and the size pins that guard
+# the boxed one are `cfg`'d off in it. That is this repo's existing shape for
+# a measurement flag, and the existing mitigation applies unchanged -- CI
+# lints the shipped shape on its own second `clippy` leg, not only under
+# `--all-features`.
 unboxed-object-map = []
 
 # Use pure scalar (byte-by-byte) for YAML parsing. Disables all SIMD/broadword.

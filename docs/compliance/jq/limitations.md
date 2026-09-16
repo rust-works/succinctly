@@ -3047,12 +3047,13 @@ against the written document would read back `5` and raise.
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
 200,000-element array `.[(0,1)] = 0` costs more peak RSS than the eager `.[$k] = 0`:
-54.4 MB against 74.5 MB on an Apple M4 Pro, 51.5 MB against 66.8 MB on an AMD 7950X
-(interleaved `/usr/bin/time -l`/`-v`, five reps, minimum). Both figures are post-#3000 —
-before `OwnedValue` shrank from 72 bytes to 32 they were 73.4 MB against 92.5 MB and
-75.3 MB against 104.7 MB on the same two machines. A path that provably resolves to
-**at most one path** stays on the eager route and pays none of it — `.[$k] = 0` is the
-eager number above, as are a static path, `del()` and `|=`.
+74.5 MB for the streaming form against 54.4 MB for the eager one on an Apple M4 Pro, and
+66.8 MB against 51.5 MB on an AMD Ryzen 9 7950X (interleaved `/usr/bin/time -l`/`-v`,
+five reps, minimum of each). Both pairs are post-#3000 — before `OwnedValue` shrank from
+72 bytes to 32 they were 92.5 MB against 73.4 MB and 104.7 MB against 75.3 MB on the same
+two machines. A path that provably resolves to **at most one path** stays on the eager
+route and pays none of it — `.[$k] = 0` is the eager number above, as are a static path,
+`del()` and `|=`.
 
 The count is the whole criterion, and purity is not part of it
 ([#2976](https://github.com/rust-works/succinctly/issues/2976)): the eager and streaming
