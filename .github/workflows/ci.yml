@@ -17,6 +17,14 @@ on:
   merge_group:
     types: [checks_requested]
 
+# Cancel a PR branch's in-progress run when it's pushed again (#3011); every
+# merge-queue entry gets its own `gh-readonly-queue/main/pr-N-<sha>` ref, and a
+# `main` push never shares a group with anything else, so neither is ever
+# cancelled by this.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
