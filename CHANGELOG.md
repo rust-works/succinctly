@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`size_of::<OwnedValue>()` is 32 bytes, down from 72** (#3000).
+  `OwnedValue::Object` held its `IndexMap<String, OwnedValue>` inline, and an
+  `IndexMap` is 72 bytes, so `Object` was the widest arm and *every* value paid
+  those 72 bytes — every array element, every map entry, every bare `Null`. The
+  map now sits behind one pointer, which makes `NumberLiteral(NumberRepr,
+  Box<str>)` the widest arm at exactly 32 with the discriminant packed into
+  `NumberRepr`'s niche. A 200,000-element array drops from 14.4 MB to 6.4 MB per
+  materialized copy, on every route that materializes — `=`, `|=`, `del()`,
+  `sort_by`, `to_entries`, `map`, and `succinctly yq`'s DOM path alike.
+
+  **Breaking** for anything that pattern-matches the variant: `OwnedValue::Object`
+  now carries a `succinctly::jq::ObjectMap`, not an `IndexMap<String,
+  OwnedValue>`. `ObjectMap` is deliberately transparent — it `Deref`s to the
+  `IndexMap`, iterates in all three forms, and converts both ways with `From` —
+  so a read-side `OwnedValue::Object(map) => map.get(k)` needs no change and only
+  construction needs `.into()` (or `OwnedValue::object_from(pairs)`, which
+  already existed). `as_object`/`as_object_mut` keep their exact signatures and
+  still hand out a bare `&IndexMap`/`&mut IndexMap`.
+
+  Three internal exact-size pins moved as a consequence, each re-derived from
+  what it guards rather than bumped: `EvalError` 96 → 56, `GenericResult` 120 →
+  80, `GenericItem` 80 → 72. Smaller is the safe direction for the #1021
+  stack-overflow guard those pins exist for. `size_of::<Expr>()` is unchanged.
+
+  The new `unboxed-object-map` cargo feature restores the old inline layout. It
+  exists so the A/B for this change could build a functionally-pre-#3000 binary
+  from the *same* source shape and subtract code-layout bias; it is a measurement
+  tool, it is not part of any supported configuration, and enabling it undoes the
+  entire point of the change.
+
 - **A filter now validates only what it *materializes*** (#2692). `select`,
   `if`, `not`, `and`, `or`, `//` and zero-arity `any`/`all` answer through
   `DocumentCursor::is_falsy`, which is O(1) and decodes nothing, so none of
