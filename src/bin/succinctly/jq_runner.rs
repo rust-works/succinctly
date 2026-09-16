@@ -3110,9 +3110,10 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // `anyhow` path.
                 //
                 // Line 0, the same placeholder the lazy path prints when it has
-                // no better position: this route reads the whole stream up front
-                // and fails before any per-document offset exists. Reusing the
-                // existing shape beats introducing a second rendering.
+                // no better position. Only `--slurp` still fails here: it reads
+                // the whole stream into one value, so there is no document
+                // position to name. A non-slurped stream keeps its clean prefix
+                // and reports its parse error after it instead (#2961).
                 Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
                     Ok(MalformedJsonError(err)) => {
                         let files = get_input_files(&args);
@@ -4472,10 +4473,10 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// jq-compatible scanner (accepts a leading `.` as a number start, doesn't
 /// reject trailing garbage) with no `serde_json` dependency at all, while
 /// this function's own validation strictness is load-bearing for more than
-/// just `--slurpfile`'s CLI-arg error message -- the main input path's own
-/// call site (below `evaluate_input_streaming`) depends on this function rejecting
-/// everything `find_json_values` would reject, so its own internal
-/// `find_json_values` cross-check never diverges.
+/// just `--slurpfile`'s CLI-arg error message -- the main input path's
+/// [`parse_json_stream_prefix`], which shares this function's accept-set
+/// value by value, depends on rejecting everything the splitter would
+/// reject, so `get_inputs`' span cross-check never diverges.
 ///
 /// It *does* fall back to `find_json_values` on a `serde_json` failure,
 /// though (#1243): real jq's own number parser tolerates a leading zero
@@ -7857,6 +7858,46 @@ mod tests {
                 .to_json(),
             "{\"a\":7,\"b\":{\"c\":\"\u{FFFD}\"}}"
         );
+    }
+
+    #[test]
+    fn split_json_values_keeps_the_prefix_before_a_failure_2961() {
+        let bytes = b"1 [2] {\"a\":3} [4,";
+        let (spans, error) = split_json_values(bytes);
+        assert_eq!(spans, vec![(0, 1), (2, 5), (6, 13)]);
+        assert_eq!(error, Some(14));
+        assert_eq!(find_json_values(bytes), Err(14));
+
+        let (spans, error) = split_json_values(b" 1 2 ");
+        assert_eq!(spans, vec![(1, 2), (3, 4)]);
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn parse_json_stream_prefix_stops_at_the_first_malformed_value_2961() {
+        let show = |(values, error): (Vec<OwnedValue>, Option<EvalError>)| {
+            (
+                values.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                error.map(|e| e.message),
+            )
+        };
+        // A clean stream, including a leniency only the fallback accepts.
+        assert_eq!(
+            show(parse_json_stream_prefix("1 007 \"x\"")),
+            (vec!["1".into(), "7".into(), "\"x\"".into()], None)
+        );
+        assert_eq!(show(parse_json_stream_prefix("  ")), (vec![], None));
+        // A splitter failure: truncated, unterminated, unmatched.
+        for text in ["1 2 [3,", "1 2 \"abc", "1 2 }"] {
+            let (values, error) = show(parse_json_stream_prefix(text));
+            assert_eq!(values, vec!["1", "2"], "{text}");
+            assert_eq!(error.as_deref(), Some("Invalid JSON text"), "{text}");
+        }
+        // A span the splitter accepts but the materializer rejects: the
+        // prefix ends there, and nothing after it is kept.
+        let (values, error) = show(parse_json_stream_prefix("1 2 {invalid} 3"));
+        assert_eq!(values, vec!["1", "2"]);
+        assert!(error.is_some());
     }
 
     #[test]
