@@ -1091,23 +1091,25 @@ fn compute_reachable(graph: &BTreeMap<usize, Vec<usize>>, roots: &[usize]) -> BT
 /// the wrapper it also creates. Running earlier would report every module
 /// function as undefined.
 ///
-/// # Correctness caveat for a multi-owner `Expr::Shared`
+/// # Reachability survives this function's own clones
 ///
 /// `build_call_graph`'s reachability graph (#2740) identifies a `def` by
-/// its body's own heap address, computed once, read-only, before this
-/// function's own `&mut`-mutating walk runs. That walk's `Expr::Shared` arm
-/// calls `Rc::make_mut`, which clone-on-writes the wrapped subtree -- new
-/// heap addresses for every `Expr::FuncDef` inside it -- if (and only if)
-/// the `Rc` is not uniquely owned at that point. A multi-owner `Rc` handed
-/// to this function can therefore desync the two: a `def` the graph found
-/// reachable through the *pre-clone* address is checked against the wrong,
-/// *post-clone* one and silently skipped instead. This crate's own three
-/// CLI call sites (`jq_runner.rs`, `yq_runner.rs`) never construct a
-/// multi-owner `Expr::Shared` here -- `Expr::Shared` itself only exists on
-/// an evaluation-time tree to begin with (see the leaf-arm comment on
-/// `check`'s own `Shared` handling), and neither runner calls this
-/// function on one. An external caller of this public API that does is not
-/// guaranteed the identical protection this crate's own callers get.
+/// its body's heap address, read once off the tree before this function's
+/// own `&mut`-mutating walk runs. That walk reallocates a subtree in two
+/// places -- `check`'s `Expr::Builtin` arm clones each operand, and its
+/// `Expr::Shared` arm's `Rc::make_mut` clones when the `Rc` has another
+/// owner -- and either one used to strand every `def` inside, checking it
+/// against an address the graph had never seen and silently skipping it.
+///
+/// The builtin arm fired on ordinary programs through this crate's own CLI
+/// (`[1]|map(def g: nosuchfn; g)`); the `Shared` arm needed an external
+/// caller holding a second handle. Both now re-key the reachable set onto
+/// the clone (`rebase_reachable`), so a caller of this public API gets the
+/// same result whether or not it shares the `Rc` it passes in (#2971).
+///
+/// Any *new* clone or clone-on-write of a subtree inside `check` has to do
+/// the same, or it reopens this; a move does not, since moving an `Expr`
+/// carries its `Box` pointers along unchanged.
 pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
     match resolve_func_calls_all(expr).into_iter().next() {
         Some(first) => Err(first),
@@ -1433,8 +1435,26 @@ fn check(
         // like the pre-`&mut Expr` version of this arm did, at the cost of
         // one clone in the (self-inflicted, still never hit by this crate's
         // own callers) multi-owner case.
+        //
+        // #2971: that clone reallocates every `def` body inside, exactly as
+        // the builtin arm's does, so it is re-keyed the same way. A handle on
+        // the pre-clone tree is kept only when `make_mut` is going to clone
+        // -- the uniquely owned case, which is every case this crate's own
+        // callers produce, pays nothing.
         Expr::Shared(inner) => {
-            check(Rc::make_mut(inner), scope, var_scope, errors, reachable);
+            let original = (Rc::strong_count(inner) > 1 || Rc::weak_count(inner) > 0)
+                .then(|| Rc::clone(inner));
+            let target = Rc::make_mut(inner);
+            let rebased = original
+                .as_deref()
+                .and_then(|original| rebase_reachable(original, &*target, reachable));
+            check(
+                target,
+                scope,
+                var_scope,
+                errors,
+                rebased.as_ref().unwrap_or(reachable),
+            );
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
@@ -2224,6 +2244,44 @@ mod tests {
         assert_eq!(
             resolve("def h: map(def g: nosuchfn; g); [1]|h"),
             Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
+    /// #2971's second site. `check`'s `Expr::Shared` arm reaches its
+    /// subtree through `Rc::make_mut`, which clones when the `Rc` has another
+    /// owner -- the same reallocation the builtin arm's clone causes, so a
+    /// called def inside it was skipped the same way. This was the
+    /// "multi-owner `Expr::Shared`" caveat documented on
+    /// `resolve_func_calls`; it needs an external caller holding a second
+    /// handle, which is what `_keep` is. The uniquely-owned spelling is the
+    /// control: `make_mut` does not clone there, so it always worked.
+    #[test]
+    fn a_called_def_inside_a_multi_owner_shared_is_checked() {
+        let program = || parse("def g: nosuchfn; g").expect("filter must parse");
+
+        let mut unique = Expr::Shared(Rc::new(program()));
+        assert_eq!(
+            resolve_func_calls(&mut unique).map_err(|e| format!("{e}")),
+            Err("nosuchfn/0 is not defined".into()),
+            "uniquely owned: make_mut does not clone"
+        );
+
+        let inner = Rc::new(program());
+        let _keep = Rc::clone(&inner);
+        let mut shared = Expr::Shared(inner);
+        assert_eq!(
+            resolve_func_calls(&mut shared).map_err(|e| format!("{e}")),
+            Err("nosuchfn/0 is not defined".into()),
+            "multi-owner: make_mut clones, which must not strand the def"
+        );
+
+        // And the gate still holds there: an uncalled def stays skipped.
+        let inner = Rc::new(parse("def g: nosuchfn; 1").expect("filter must parse"));
+        let _keep = Rc::clone(&inner);
+        let mut shared = Expr::Shared(inner);
+        assert_eq!(
+            resolve_func_calls(&mut shared).map_err(|e| format!("{e}")),
+            Ok(())
         );
     }
 
