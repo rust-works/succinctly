@@ -221,7 +221,18 @@ Three findings, in order of what they cost:
   residual remains: jq's own reference-counted `jv` keeps node identity through a handful of
   constructions succinctly's `OwnedValue`-cloning model cannot represent as "the same node"
   (`[.] | .[0]`, `{k:.} | .k`, `. + {}`, `reduce empty as $i (.; .)`) — these now refuse
-  rather than silently accept a copy, tracked as a follow-up ("owned embed map").
+  rather than silently accept a copy, tracked as a follow-up ("owned embed map",
+  [#2889](https://github.com/rust-works/succinctly/issues/2889)). `[.] | .[0] | path($x)`
+  was recovered by [#2575](https://github.com/rust-works/succinctly/issues/2575) as a side
+  effect (`[.]`'s element is a `LazySeq` on the same cursor).
+- **Closed by [#3036](https://github.com/rust-works/succinctly/issues/3036).** The same
+  fabrication where the bind and the rebuild both run inside `eval.rs` (the input-queue
+  bridge, a fold's UPDATE, a `|=` right-hand side, `with_entries`, a `catch` handler) — no
+  funnel ran there. Closed at every owned→document re-entry in `eval.rs` (`eval_each_owned`
+  and its siblings demote every `Snapshot` marker; the generic funnels take the
+  non-demoting `eval_each_owned_bridged`), plus `OwnedIdentity::exact`/`root_witness` for the
+  owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
+  paragraph for the refuse-only flips.
 - **Value-mode bindings.** `eval_as` (the non-path-tracked evaluator) still binds with no
   path at all, so `.a as $y | path(.a | $y)` — jq `["a"]` — stays refuse-only. Closing it
   needs document-absolute identity reachable from a value-mode cursor plus

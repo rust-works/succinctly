@@ -910,19 +910,46 @@ is the revert that established what the other one costs.
    identity jq's own `jv` already had. `[.] \| path(.[0] \| $x)` (the same construction, but
    with the navigation happening inside `path()`'s own argument) is a genuinely different
    mechanism and stays refused.
-   **Applied at every "funnel" crossing except one deliberately excluded class:** sites inside
-   `eval_owned_identity_stages`/`owned_identity_values`/`try_path_context_absent_sink` (the
-   `OwnedIdentity`/#2072 machinery a `key`/`parent`/`path`/`file_index`-reading sibling stage
-   routes through) do not call `demote_rebuilt_markers` — a blanket `Owned` witness there cannot
-   distinguish "this position is a genuine, unrebuilt document node the identity tracker already
-   knows about" from "this position was rebuilt," and an earlier attempt to demote unconditionally
-   here broke a previously-correct write (`.foo | . as $x | (parent, ($x.a = 9))` used to write
-   through the sibling `parent` read; blanket demotion made it wrongly refuse). Left as a
-   narrower, still-open instance of the same rebuilt-root hole rather than threading the
-   identity tracker's own witness through under time pressure — tracked in the same follow-up.
-   `try . catch`/`error($x)` is the same story: raising a marker's own value verbatim and
-   catching it is not a rebuild, so `run_try_handler_generic`/`try_single_generic`'s `run_catch`
-   also do not demote. And
+   **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
+   fabrication through the routes that never cross a funnel.** #2642's check ran only where
+   an expression is handed from the generic evaluator to `eval.rs`; when the bind *and* the
+   rebuild both run inside `eval.rs` — the whole-program input-queue bridge (any program
+   mentioning `input`/`inputs`/`input_line_number`), a fold's UPDATE, a `|=` right-hand side,
+   `with_entries`' body, a `catch` handler, the owned-surface consumers' arguments — no funnel
+   ran and `input | . as $x | {a:1} | ($x.a = 9)` still wrote `{"a":9}` (jq exit 5). Closed
+   at the *re-entry* rather than by node identity: every place `eval.rs` re-indexes an owned
+   value into a throwaway document (`eval_each_owned`, `eval_owned_input_reindexed`,
+   `eval_owned_expr_full`, `eval_path_context_pipe_owned`, `builtin_with_entries`) demotes
+   every `Snapshot` marker the expression carries first, because a freshly rebuilt document
+   cannot be a node any earlier binding was frozen from — the one fact a `StandardJson` can
+   always establish, where a positive witness cannot (an empty container or a scalar carries
+   no cursor to recover a node id from). The generic funnels, which already prove their
+   markers against a live cursor, take the non-demoting `eval_each_owned_bridged` so the proof
+   is kept. The two classes #2642 deliberately excluded are closed with it: the owned-identity
+   route (`eval_owned_identity_stages`/`owned_identity_values`, the `OwnedIdentity`/#2072
+   machinery a `key`/`parent`/`path` sibling routes through) now checks against
+   `OwnedIdentity::root_witness` — the base node itself only while the value is that node's
+   own, unrebuilt value (`OwnedIdentity::exact`, cleared by every stage rule that places a new
+   value: `sort`, `to_entries`, a write), never `ancestors.is_empty()` alone, which would
+   certify `sort`'s new array; `.foo | . as $x | (parent, ($x.a = 9))` still writes and
+   `.foo | . as $x | sort | (parent, ($x[0] = 9))` now refuses — and a `catch` handler's
+   markers are checked against the payload's own node (`try_payload_root`): `error($x)` and
+   `$x | error` raise the marker's node verbatim, as jq's `catch` then sees the same `jv`, so
+   `. as $x | try error($x) catch path($x)` stays `[]`, while a value-equal payload
+   (`try error({a:1}) catch ($x.a = 9)` on `{"a":1}`) no longer certifies. The refuse-only
+   flips this makes are the in-evaluator twins of the embed residual above — a stage that
+   hands its input on as an owned copy is the same node to jq and a fresh document to
+   `eval.rs` — plus two the generic evaluator already refused: on the input-queue route,
+   `input | . as $x | [.] | .[0] | path($x)`, `… | {k:.} | .k | path($x)`, `… | reduce empty
+   as $i (.; .) | path($x)`, `input | reduce (.) as $x (.; ($x.a = 9))` (a fold's loop
+   variable, demoted with the accumulator's re-index, as the generic fold has done since
+   #2642) and `input | . as $x | try error($x) catch path($x)` (an `eval.rs`-minted marker
+   carries no node witness for `try_payload_root` to match) all answer in jq and refuse here.
+   Pinned in `tests/jq_cli_tests.rs` (`*_3036`), swept by
+   `scripts/jq-bind-origin-oracle-sweep.sh`'s `in-evaluator-*` rows and fuzzed by
+   `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family. The accepting direction — recovering
+   the embed residual on either route — is [#2889](https://github.com/rust-works/succinctly/issues/2889).
+   And
    [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
    navigating inside their own jq-level definitions against a *constructed* value inside
    `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and
