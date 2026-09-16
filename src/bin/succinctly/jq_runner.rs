@@ -2028,6 +2028,24 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     let mut call_resume_from: HashMap<&str, usize> = HashMap::new();
     let mut var_resume_from: HashMap<&str, usize> = HashMap::new();
 
+    // #2991: a module-body error's `origin` names a *different* source than
+    // `filter`, so it needs its own text and its own call-site table --
+    // built lazily, once per module, and cached here rather than up front,
+    // since most runs raise no module-body errors at all. `None` marks a
+    // module whose file could not be re-read (deleted between load and this
+    // error path, or similar); such an error keeps today's file-name-only
+    // report rather than panicking or guessing a line.
+    let mut module_diagnostics: HashMap<u32, Option<(String, Vec<jq::CallSite>)>> = HashMap::new();
+    // Per-(module, name) resume counters, the module-body counterpart of
+    // `calls_consumed` above -- kept separate so a name repeated in two
+    // different modules does not share (and so prematurely exhaust) one
+    // counter.
+    let mut module_calls_consumed: HashMap<(u32, &str), usize> = HashMap::new();
+    // The module-body counterpart of `call_resume_from` above, for the same
+    // text-search fallback -- see the `origin` branch's own doc comment for
+    // why a module needs one too.
+    let mut module_call_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
+
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
     // anyone's hot path -- see `jq::collect_call_sites`.
@@ -2057,16 +2075,68 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // finding a coincidental occurrence of the same name in the
                 // main filter and citing that line. `origin` is the first
                 // thing this pass has ever had that distinguishes the two,
-                // so a module-body error now says so and stops there rather
-                // than guessing.
+                // so a module-body error names the right file instead of
+                // guessing.
                 //
-                // Real jq goes further and names the module's own path, line
-                // and source echo; doing that needs the module's text
-                // threaded down here, which is #2991.
+                // #2991: real jq also names the line and echoes the source,
+                // which needs the module's *own* text and its *own*
+                // call-site table -- re-derived here (never at load time:
+                // this is a cold error path, and most runs never take it) by
+                // re-reading the file `run_origin` already resolved. Falls
+                // back to a text search over that same source, mirroring
+                // `filter`'s own fallback below and for the same reason:
+                // `collect_call_sites` never records a namespaced call at
+                // all (`parse_namespaced_call` has no `call_sites.push`,
+                // unlike the plain-call path a few lines below it), so
+                // `def f: ns::g;` inside a module needs the search to find
+                // `ns::g`'s real occurrence.
                 if let Some(id) = origin {
                     let at = loader
                         .run_origin(*id)
                         .map_or_else(|| "<module>".to_string(), ToString::to_string);
+
+                    let cached = module_diagnostics.entry(*id).or_insert_with(|| {
+                        std::fs::read_to_string(&at).ok().map(|source| {
+                            let sites = jq::collect_call_sites(&source, jq::ParserMode::Jq, true);
+                            (source, sites)
+                        })
+                    });
+
+                    if let Some((source, call_sites)) = cached {
+                        let taken = module_calls_consumed
+                            .entry((*id, name.as_str()))
+                            .or_insert(0);
+                        let from_table = call_sites
+                            .iter()
+                            .filter(|c| c.name == *name && c.arity == *arity)
+                            .nth(*taken)
+                            .map(|c| c.offset);
+                        if let Some(offset) = from_table {
+                            *taken += 1;
+                            let (line_no, line_text, column) = line_at_offset(source, offset);
+                            eprintln!(
+                                "jq: error: {name}/{arity} is not defined at {at}, line {line_no}:"
+                            );
+                            eprintln!("{line_text}{}", " ".repeat(column));
+                            continue;
+                        }
+
+                        let module_start_from = module_call_resume_from
+                            .get(&(*id, name.as_str()))
+                            .copied()
+                            .unwrap_or(0);
+                        if let Some((line_no, line_text, column, end)) =
+                            locate_identifier_from(source, name, module_start_from)
+                        {
+                            module_call_resume_from.insert((*id, name.as_str()), end);
+                            eprintln!(
+                                "jq: error: {name}/{arity} is not defined at {at}, line {line_no}:"
+                            );
+                            eprintln!("{line_text}{}", " ".repeat(column));
+                            continue;
+                        }
+                    }
+
                     eprintln!("jq: error: {name}/{arity} is not defined at {at}");
                     continue;
                 }

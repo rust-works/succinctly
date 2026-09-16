@@ -43710,13 +43710,14 @@ fn test_unresolved_call_line_comes_from_the_call_not_a_name_match_2085() -> Resu
 /// `f/2` call site. The table records calls, not failures, and carries no
 /// scope information, so arity is what separates same-name sites.
 ///
-/// **Fallback**: a call with no entry in the table at all — one inlined from
-/// an `include`d module, which has no occurrence in the filter text — still
-/// drops the line marker rather than inventing a position. This needs a real
-/// module: the first version of this test used a single-line filter, where
-/// the table path and the fallback path both answer "line 1", so it could not
-/// tell them apart and missed a regression that re-reported an already-used
-/// position (#2085 review, finding 1).
+/// **Fallback**: a call with no entry in the *filter's* table at all — one
+/// written inside an `include`d module — must not borrow the filter's own
+/// resume position for its own line marker (module errors get their own
+/// line, from the module's own text and table, since #2991). This needs a
+/// real module: the first version of this test used a single-line filter,
+/// where the table path and the fallback path both answer "line 1", so it
+/// could not tell them apart and missed a regression that re-reported an
+/// already-used position (#2085 review, finding 1).
 ///
 /// Every expectation is a live jq 1.7.1 capture.
 #[test]
@@ -43767,6 +43768,11 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     // error when it reports one at all. Before that, with nothing to mark a
     // call as coming from a module, this path was one coincidence away from
     // citing the *filter's* line for the *module's* error.
+    //
+    // #2991: the module error now also claims its own `, line 1:` -- the
+    // module's own first line, re-derived from the module's own re-read
+    // text and its own call-site table, never borrowed from the filter's
+    // line 3.
     let dir = tempfile::TempDir::new()?;
     std::fs::write(dir.path().join("m.jq"), "def helper: nosuch;\n")?;
     let lib = dir.path().to_string_lossy().to_string();
@@ -43784,10 +43790,10 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     let module_file = std::fs::canonicalize(dir.path().join("m.jq"))?;
     assert!(
         stderr.contains(&format!(
-            "nosuch/0 is not defined at {}\n",
+            "nosuch/0 is not defined at {}, line 1:",
             module_file.display()
         )),
-        "the module call should name its own file and claim no line -- stderr: {stderr:?}"
+        "the module call should name its own file and its own first line -- stderr: {stderr:?}"
     );
 
     Ok(())
@@ -43993,22 +43999,20 @@ fn test_unresolved_call_line_search_is_word_bounded_1473() -> Result<()> {
 
 /// #1473: an unresolvable call reached through an `include`d module has no
 /// occurrence in the filter source, so the in-filter position machinery
-/// finds nothing and the diagnostic must not invent a position.
+/// finds nothing and the diagnostic must not invent a position from the
+/// wrong file.
 ///
-/// **#2951 closed half of this.** The module-scope boundary gave every
-/// unresolved call an `origin` -- which run it was written in -- so the
-/// diagnostic now names the module's own canonical file, byte-identical to
-/// jq's (`... is not defined at /abs/path/mymod.jq`). What still differs is
-/// jq's trailing `, line N:` and its echo of the module's source line, which
-/// need the module's *text* threaded down to the reporter; that is #2991.
+/// **#2951 closed the file half of this**: the module-scope boundary gave
+/// every unresolved call an `origin` -- which run it was written in -- so
+/// the diagnostic names the module's own canonical file, byte-identical to
+/// jq's (`... is not defined at /abs/path/mymod.jq`).
 ///
-/// Before #2951 this said `at <top-level>` and could do worse than say
-/// nothing: with no `origin` to distinguish a module-body error, the
-/// text-search fallback could find a coincidental occurrence of the same
-/// name in the *main filter* and cite that line. The `, line ` assertion
-/// below pins that it still does not guess.
+/// **#2991 closes the rest**: jq's own trailing `, line N:` and its echo of
+/// the module's source line, from the module's own text re-read on this
+/// cold error path rather than searched for in the main filter (which does
+/// not contain it at all -- the call is written only in the module).
 #[test]
-fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result<()> {
+fn test_unresolved_call_from_included_module_names_its_own_line_2991() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(
         temp_dir.path().join("mymod.jq"),
@@ -44031,14 +44035,100 @@ fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result
     let module_path = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
     assert!(
         stderr.contains(&format!(
-            "nosuchfn_in_module/0 is not defined at {}",
+            "nosuchfn_in_module/0 is not defined at {}, line 1:",
             module_path.display()
         )),
-        "the module's own file should be named, as jq names it: {stderr}"
+        "the module's own file and line should be named, as jq names them: {stderr}"
     );
     assert!(
-        !stderr.contains(", line "),
-        "no line should be claimed for a call with no in-filter occurrence: {stderr}"
+        stderr.contains("def helper: nosuchfn_in_module;"),
+        "the module's own source line should be echoed, as jq echoes it: {stderr}"
+    );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #2991: the same call-site table jq_runner already builds for the main
+/// filter's own diagnostics (#2085's `nth`-occurrence rule), applied to a
+/// module's text -- a second unresolved call in the *same* module must find
+/// its own line, not repeat the first one's.
+#[test]
+fn test_second_unresolved_call_in_the_same_module_finds_its_own_line_2991() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("mymod.jq"),
+        "def a: nosuch;\ndef b: nosuch;\n",
+    )?;
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-L",
+            &temp_dir.path().to_string_lossy(),
+            r#"include "mymod"; a, b"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout} stderr: {stderr}");
+
+    let module_path = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    assert!(
+        stderr.contains(&format!(
+            "nosuch/0 is not defined at {}, line 1:",
+            module_path.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "nosuch/0 is not defined at {}, line 2:",
+            module_path.display()
+        )),
+        "the second occurrence must not repeat the first's line: {stderr}"
+    );
+    assert!(stderr.contains("jq: 2 compile errors"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #2991: a namespaced call inside a module body needs the text-search
+/// fallback, not just the call-site table. `collect_call_sites` never
+/// records a namespaced call at all -- `parse_namespaced_call`
+/// (`src/jq/parser.rs`) has no `call_sites.push`, unlike the plain-call path
+/// a few lines above it in the same file -- so `def f: ns::g;` inside a
+/// module would otherwise fall through to the file-name-only report even
+/// though the call has a real, findable occurrence in the module's own
+/// source. Found while implementing this issue's own fix, by testing the
+/// case a sibling test (`test_module_body_cannot_see_siblings_or_home_jq_2951`)
+/// happens to also exercise (`sibA3.jq`'s `b::sb`) without asserting on the
+/// line -- a coverage check surfaced the fallback going unused and this is
+/// the direct pin for why it is needed.
+#[test]
+fn test_namespaced_call_inside_module_body_finds_its_own_line_2991() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("mymod.jq"), "def f: ns::g;\n")?;
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-L",
+            &temp_dir.path().to_string_lossy(),
+            r#"include "mymod"; f"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout} stderr: {stderr}");
+
+    let module_path = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    assert!(
+        stderr.contains(&format!(
+            "ns::g/0 is not defined at {}, line 1:",
+            module_path.display()
+        )),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("def f: ns::g;"),
+        "the module's own source line should be echoed: {stderr}"
     );
     assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
