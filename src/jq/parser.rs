@@ -208,7 +208,7 @@ fn join_expr(mut args: Vec<Expr>) -> Expr {
         (Some(stream), Some(idx_expr), Some(join)) => {
             Expr::Pipe(vec![stream, pair(idx_expr), join])
         }
-        _ => unreachable!("parse_join_expr passes two to four arguments"),
+        _ => unreachable!("parse_join_expr passes two to four arguments"), // omni-dev: coverage tolerate-line reason="unreachable: parse_join_expr only calls join_expr with two to four arguments (#3046)"
     };
     Expr::As {
         expr: Box::new(idx),
@@ -222,30 +222,19 @@ fn join_expr(mut args: Vec<Expr>) -> Expr {
 /// still shadow it (#2036's `builtin_fallback`, read back by `resolve.rs`).
 /// The inverse of `join_expr`, kept beside it so the two cannot drift.
 pub(crate) fn join_expr_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
-    let Expr::As {
-        expr: idx,
-        var,
-        body,
-    } = expr
-    else {
-        return Err(expr);
+    let (idx, body) = match expr {
+        Expr::As { expr, var, body } if var == JOIN_IDX_VAR => (expr, body),
+        other => return Err(other),
     };
-    if var != JOIN_IDX_VAR {
-        return Err(Expr::As {
-            expr: idx,
-            var,
-            body,
-        });
-    }
-    let idx_expr_of = |pair: Expr| {
-        if let Expr::Array(inner) = pair {
-            if let Expr::Comma(mut items) = *inner {
-                if let Some(Expr::IndexExpr { key, .. }) = items.pop() {
-                    return *key;
-                }
-            }
-        }
-        unreachable!("join_expr's pair is `[., $idx[idx_expr]]`") // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+    let idx_expr_of = |pair: Expr| match pair {
+        Expr::Array(inner) => match *inner {
+            Expr::Comma(mut items) => match items.pop() {
+                Some(Expr::IndexExpr { key, .. }) => *key,
+                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+            },
+            _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+        },
+        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
     };
     let mut args = alloc::vec![*idx];
     let stages = match *body {
