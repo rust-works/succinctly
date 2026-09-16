@@ -22931,6 +22931,72 @@ fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()
     Ok(())
 }
 
+/// #3012: recursion through a `$`-bound parameter used to be `O(depth^2)` --
+/// `bind_def_call_params` (`src/jq/eval.rs`) substitutes each `$`-bound
+/// occurrence with an `Expr::Shared` wrapping the call-site's argument
+/// *expression*, and each recursion level nests the previous level's
+/// `Shared` one layer deeper (`Shared(Arithmetic(Shared(prev), Sub,
+/// Literal(1)))`), so dereferencing `$n` at level `i` used to re-walk all
+/// `i` prior levels from scratch every time -- 13.4s at n=11000 before this
+/// fix (measured on Apple Silicon, release build), 0.007s in real jq. A
+/// zero-arity recursive `def` was always linear (`bind_def_call` skips
+/// `bind_def_call_params` entirely when there are no parameters), which is
+/// what pointed at parameter substitution specifically rather than
+/// recursion itself.
+///
+/// n=13000 -- close to (but safely under) the ~13,333-level ceiling
+/// `MAX_EVAL_FRAMES` (`src/jq/eval.rs`) imposes on this exact shape (3
+/// frames/level: `if`, `Arithmetic`, `DefCall`) -- so this also pins that
+/// the fix doesn't regress the *native* recursion-depth guard itself, only
+/// the per-level dereference cost. If this test starts timing out or
+/// taking more than a couple of seconds, the fix in this commit has
+/// regressed back toward `O(depth^2)`.
+#[test]
+fn test_recursion_through_dollar_param_is_linear_not_quadratic_3012() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def d2($n): if $n == 0 then 0 else 1 + d2($n-1) end; d2(13000)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "13000");
+    Ok(())
+}
+
+/// #3012 regression guard: the cache #3012 added must apply only to a
+/// `$`-scoped substitution, never to a bare one.
+///
+/// A `$`-bound parameter is evaluated exactly once per invocation in real
+/// jq (`def f($x): BODY` desugars to `def f(x): x as $x | BODY`, and `x as
+/// $x` binds once, up front), so caching its dereference is a safe
+/// refinement. A **bare** reference to the same declared name is the
+/// opposite: real jq re-evaluates it fresh at every reference site, using
+/// whatever `.` is ambient *there* -- confirmed live against jq 1.7.1,
+/// which answers `[2,3]` for the query below, not `[1,2,3]`. An earlier,
+/// less careful version of the #3012 fix cached the `n | d(n-1)` chain
+/// link indiscriminately (gated only on `is_pure_chain_link`'s shape check,
+/// not on which namespace produced it), and answered `[1,2,3]` --
+/// confirmed by temporarily building that version and running this exact
+/// query. `bind_def_call_params` now gives a `$`-scoped substitution its
+/// own, separately-`Rc`'d `Expr::Shared` (via `dollar_safe_shared`) so a
+/// bare occurrence of the same parameter name is never mistaken for one
+/// safe to cache.
+#[test]
+fn test_bare_param_recursion_keeps_dynamic_dot_not_cached_3012() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def d(n): if n == 0 then [] else (n | d(n-1)) + [n] end; 3 | d(.)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[2,3]");
+    Ok(())
+}
+
 /// #2737: `substitute_func_param_impl`'s `Expr::FuncDef` arm cleared the
 /// bare namespace for a nested zero-argument `def` of the enclosing
 /// parameter's own name in that def's `then` but not in its `body` -- so a
