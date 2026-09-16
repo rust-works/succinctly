@@ -17439,9 +17439,14 @@ fn test_one_path_assignments_are_unchanged_by_the_eager_route_2976() -> Result<(
     let rows: &[(&str, &str, &str, Option<&str>)] = &[
         // Moved off the streaming route by #2976: an observable target, key
         // or bound, each reaching exactly one path.
-        (r"(.|stderr)[0] = 99", "[10,20,30]", "[99,20,30]\n", Some("[10,20,30]")),
         (
-            r#".[(.a|stderr)] = 99"#,
+            r"(.|stderr)[0] = 99",
+            "[10,20,30]",
+            "[99,20,30]\n",
+            Some("[10,20,30]"),
+        ),
+        (
+            r".[(.a|stderr)] = 99",
             r#"{"a":"k"}"#,
             "{\"a\":\"k\",\"k\":99}\n",
             Some("k"),
@@ -17461,7 +17466,7 @@ fn test_one_path_assignments_are_unchanged_by_the_eager_route_2976() -> Result<(
         // Newly eager because the key is computed but single-valued.
         (r".[length-1] = 99", "[10,20,30]", "[10,20,99]\n", None),
         (
-            r#".[(.a // 0)] = 99"#,
+            r".[(.a // 0)] = 99",
             r#"{"a":"k"}"#,
             "{\"a\":\"k\",\"k\":99}\n",
             None,
