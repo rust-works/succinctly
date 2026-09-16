@@ -48009,10 +48009,10 @@ mod remaining_inputs {
     }
 }
 
-/// What `input_filename`, `get_search_list`, `get_jq_origin` and
-/// `get_prog_origin` read (#3046): facts about the running CLI that the
-/// evaluator has no parameter for, supplied by the CLI driver the same way it
-/// seeds the `input` queue above.
+/// The CLI facts `input_filename` and the `get_*` origin builtins read (#3046).
+///
+/// The evaluator has no parameter for them, so the CLI driver supplies them
+/// the same way it seeds the `input` queue above.
 ///
 /// Nothing is set in a library embedding or in yq mode, and then the
 /// builtins answer as jq does before it has read anything: `input_filename`
@@ -48082,11 +48082,12 @@ pub mod cli_context {
         let _ = source;
     }
 
-    /// `input_filename`: the file jq's parser last read a document from --
-    /// through the `input` queue when one is seeded, whose own position is
-    /// exactly that (`jq -n '[input_filename, (input|input_filename)]'` is
-    /// `[null,"in.json"]`), else the document the driver is evaluating.
-    /// Stdin is `"<stdin>"`; nothing read yet is `null`.
+    /// `input_filename`: the file jq's parser last read a document from.
+    ///
+    /// That is the `input` queue's own position when one is seeded (`jq -n
+    /// '[input_filename, (input|input_filename)]'` is `[null,"in.json"]`), else
+    /// the document the driver is evaluating. Stdin is `"<stdin>"`; nothing
+    /// read yet is `null`.
     pub fn input_filename() -> OwnedValue {
         #[cfg(feature = "std")]
         {
