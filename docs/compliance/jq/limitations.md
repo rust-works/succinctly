@@ -4446,14 +4446,16 @@ document-wide, while a malformed *member* still is not (`{invalid}` stays at exi
 this section already draws. `0x7F` is on the accepting side of it in both tools, since jq's
 own check compares a signed char.
 
-One consequence is worth naming, because #2878 makes it reachable for a new input class
-without introducing it: **a rejected document produces no partial output.** On
-`{"ok":1}` followed by `["a<TAB>b"]`, jq prints `{"ok":1}` and *then* exits 5; succinctly
-prints nothing and exits 5. The exit codes agree, the streamed prefix does not. This is the
-splitter's own all-or-nothing shape — `find_json_values` resolves every value's span before
-any value is emitted — and it predates this rule: `{"ok":1}` followed by a truncated
-`[1,2,` behaves identically, and did before #2878. Pinned on stdout (not just the exit
-code) by `test_control_character_in_a_later_value_rejects_the_whole_document_2878`.
+A rejected later value no longer takes the values before it with it: on `{"ok":1}` followed
+by `["a<TAB>b"]` (or a truncated `[1,2,`), succinctly prints `{"ok":1}` and then exits 5, as jq
+does, on both input routes — closed by [#2961](https://github.com/rust-works/succinctly/issues/2961),
+which keeps the splitter's clean prefix instead of discarding it, and queues the parse error
+behind it for `input`/`inputs` (catchable there, delivered once, `break` after). Two
+differences remain, both pre-existing: the error reads `Invalid JSON text` where jq quotes its
+parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)`
+marker from the driver loop), and on the lazy per-file route a splitter error moves on to the
+next file, where jq stops the whole stream — the [#355](https://github.com/rust-works/succinctly/issues/355)
+continue-past-error rule below. The `input`/`inputs` route stops there, as jq does.
 
 **The materializing flag routes still validate whatever the filter — down to `-s` and
 `-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)

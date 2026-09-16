@@ -47627,7 +47627,7 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// with no CLI driver to seed it anyway.
 #[cfg(feature = "std")]
 mod remaining_inputs {
-    use super::OwnedValue;
+    use super::{EvalError, OwnedValue};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -47665,6 +47665,22 @@ mod remaining_inputs {
         // list and whether the whole input was slurped into one value; see
         // `seed`.
         static EXHAUSTED: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+        // The parse error that ended the input stream after the queued
+        // documents, with where jq's marker names once its parser stopped
+        // there -- delivered by exactly one pop, after the last document
+        // (#2961). See `pop_input`.
+        static TRAILING_ERROR: RefCell<Option<(EvalError, (u32, u32))>> = const { RefCell::new(None) };
+    }
+
+    /// One read from the input stream.
+    pub enum Pop {
+        /// The next document.
+        Document(OwnedValue),
+        /// The stream ended in a parse error after the documents before it.
+        /// Delivered once; every later read is [`Pop::Exhausted`].
+        ParseError(EvalError),
+        /// Nothing left to read.
+        Exhausted,
     }
 
     /// Replaces the queue's contents wholesale. Called once by the CLI driver
@@ -47675,8 +47691,13 @@ mod remaining_inputs {
     /// once every document has been consumed -- jq's parser position after EOF
     /// -- or `None` for jq's `<unknown>`, which is what slurping leaves behind
     /// (the whole input became one value, so no file position survives).
-    pub fn seed(documents: Vec<(OwnedValue, u32, u32)>, exhausted: Option<(u32, u32)>) {
+    pub fn seed(
+        documents: Vec<(OwnedValue, u32, u32)>,
+        exhausted: Option<(u32, u32)>,
+        trailing_error: Option<(EvalError, (u32, u32))>,
+    ) {
         QUEUE.with(|q| *q.borrow_mut() = documents.into());
+        TRAILING_ERROR.with(|t| *t.borrow_mut() = trailing_error);
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
         CURRENT.with(|c| c.set(None));
@@ -47714,19 +47735,27 @@ mod remaining_inputs {
     /// same stream it still reports the last document's line -- and one probe
     /// with two readings is not a model worth encoding. Recorded as a
     /// divergence instead; see `docs/compliance/jq/limitations.md`.
-    pub fn pop() -> Option<OwnedValue> {
+    ///
+    /// Once the documents run out, a stream that ended in a parse error
+    /// delivers that error exactly once, moving the marker to where jq's
+    /// parser stopped, and reads after it are exhausted with the marker left
+    /// there: jq never reads past a parse error, and `jq -n '(try input catch
+    /// null), ..., error("x")'` still names the malformed file's position
+    /// (#2961).
+    pub fn pop_input() -> Pop {
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
-        match popped {
-            Some((doc, src, line)) => {
-                LAST_LINE.with(|l| l.set(line));
-                CURRENT.with(|c| c.set(Some((src, line))));
-                Some(doc)
-            }
-            None => {
-                CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
-                None
-            }
+        if let Some((doc, src, line)) = popped {
+            LAST_LINE.with(|l| l.set(line));
+            CURRENT.with(|c| c.set(Some((src, line))));
+            return Pop::Document(doc);
         }
+        if let Some((error, at)) = TRAILING_ERROR.with(|t| t.borrow_mut().take()) {
+            CURRENT.with(|c| c.set(Some(at)));
+            EXHAUSTED.with(|e| e.set(Some(at)));
+            return Pop::ParseError(error);
+        }
+        CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
+        Pop::Exhausted
     }
 
     /// The `(source, line)` jq's `(at ...)` marker names right now, or `None`
@@ -47779,7 +47808,36 @@ pub fn seed_remaining_inputs(
     documents: Vec<(OwnedValue, u32, u32)>,
     exhausted: Option<(u32, u32)>,
 ) {
-    remaining_inputs::seed(documents, exhausted);
+    remaining_inputs::seed(documents, exhausted, None);
+}
+
+/// [`seed_remaining_inputs`] for an input stream that ended in a parse error
+/// after `documents` (#2961).
+///
+/// `trailing_error` is the error and the `(source, line)` jq's marker names
+/// once its parser stopped there. `input` raises it as an ordinary catchable
+/// error once the documents are consumed, `inputs` raises it after yielding
+/// them, and [`pop_input`] hands it to the CLI driver; it is delivered once,
+/// and the stream is exhausted after it.
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_with_error(
+    documents: Vec<(OwnedValue, u32, u32)>,
+    exhausted: Option<(u32, u32)>,
+    trailing_error: Option<(EvalError, (u32, u32))>,
+) {
+    remaining_inputs::seed(documents, exhausted, trailing_error);
+}
+
+/// One read from the `input`/`inputs` queue: a document, the parse error the
+/// input stream ended in (delivered once, #2961), or nothing left.
+#[cfg(feature = "std")]
+pub use remaining_inputs::Pop as InputPop;
+
+/// Reads the next item from the input queue, the same read `input` makes:
+/// see [`InputPop`]. Moves [`current_input_location`] as a side effect.
+#[cfg(feature = "std")]
+pub fn pop_input() -> InputPop {
+    remaining_inputs::pop_input()
 }
 
 /// Pops the next queued input document (#723).
@@ -47790,9 +47848,15 @@ pub fn seed_remaining_inputs(
 /// not two cursors -- not doc-linkable from here since that module is
 /// private). Moves [`current_input_location`] as a side effect, on a failed
 /// pop as well as a successful one.
+///
+/// A trailing parse error ([`seed_remaining_inputs_with_error`]) reads as
+/// `None` here, and is consumed by that read; use [`pop_input`] to see it.
 #[cfg(feature = "std")]
 pub fn pop_remaining_input() -> Option<OwnedValue> {
-    remaining_inputs::pop()
+    match remaining_inputs::pop_input() {
+        InputPop::Document(doc) => Some(doc),
+        InputPop::ParseError(_) | InputPop::Exhausted => None,
+    }
 }
 
 /// Where jq's `(at <file>:<line>)` marker points right now, as the opaque
@@ -47879,9 +47943,11 @@ fn builtin_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult
     }
     #[cfg(feature = "std")]
     {
-        match remaining_inputs::pop() {
-            Some(doc) => owned_vec_to_result(vec![doc]),
-            None => QueryResult::Error(EvalError::new("break")),
+        match remaining_inputs::pop_input() {
+            InputPop::Document(doc) => owned_vec_to_result(vec![doc]),
+            // An ordinary catchable error, as in jq (#2961).
+            InputPop::ParseError(error) => QueryResult::Error(error),
+            InputPop::Exhausted => QueryResult::Error(EvalError::new("break")),
         }
     }
     #[cfg(not(feature = "std"))]
@@ -47922,14 +47988,22 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     #[cfg(feature = "std")]
     {
-        while let Some(doc) = remaining_inputs::pop() {
-            if sink(Item::Owned(doc)) == Demand::Stop {
-                // `pop` cannot fail, so nothing was raised before the stop and
-                // there is no unreached control to carry forward.
-                return Flow::Stopped { pending: None };
+        loop {
+            match remaining_inputs::pop_input() {
+                InputPop::Document(doc) => {
+                    if sink(Item::Owned(doc)) == Demand::Stop {
+                        // Nothing was raised before the stop, so there is no
+                        // unreached control to carry forward -- and a trailing
+                        // parse error stays unread, as it does in jq, where
+                        // `first(inputs)` never reaches it (#2961).
+                        return Flow::Stopped { pending: None };
+                    }
+                }
+                // jq's `inputs` re-raises anything but `break` (#2961).
+                InputPop::ParseError(error) => return Flow::Escaped(Control::Error(error)),
+                InputPop::Exhausted => return Flow::Exhausted,
             }
         }
-        Flow::Exhausted
     }
     #[cfg(not(feature = "std"))]
     {
