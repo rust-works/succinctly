@@ -34704,10 +34704,11 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     )
 }
 
-/// Shared "defer the escape, queue what's left" step for `recurse`'s three
-/// stack-driven implementations (`resolve_recurse_sink`,
-/// `builtin_recurse_f`/`builtin_recurse_cond`) (#842, extended to `cond`'s
-/// own fan-out by #854).
+/// Shared "defer the escape, queue what's left" step for `recurse`'s two
+/// queued walks (`resolve_recurse_sink`'s and `each_recurse_walk`'s) (#842,
+/// extended to `cond`'s own fan-out by #854). Since #2918 those run only past
+/// the native stack budget; the native order gets the same rules from the
+/// shape of the recursion instead (see [`native_recurse_end`]).
 ///
 /// `next` is this node's already-`cond`-approved children — from a
 /// fully-successful `f` call with every candidate child either passing or
@@ -34852,14 +34853,28 @@ pub(crate) struct RecurseWalkEnd {
 /// [{"a":{"x":1},"b":{"y":2}}]          # zero DEBUG lines; 20000 before #2693
 /// ```
 ///
-/// **What this does *not* fix**, and cannot without suspending `f`
-/// mid-stream: jq also stops *between* `f`'s own outputs, since the first
-/// child's whole subtree is traversed before `f` is asked for the second.
-/// Here `f` still runs to completion at the node the bound is reached on, so
-/// `[limit(2; recurse(.[]?|debug))]` writes two DEBUG lines where jq writes
-/// one. That residual is bounded by one node's fan-out (it was the whole
-/// remaining tree before), and `resolve_recurse_sink` has the identical one
-/// on the path side. See #2918.
+/// **`f` is also stopped between its own outputs (#2918).** jq traverses
+/// the first output's whole subtree before asking `f` for the second, so
+/// `[limit(2; recurse(.[]?|debug))]` writes one DEBUG line, and an unbounded
+/// walk interleaves `f`'s side effects with the descent. The walk matches
+/// that by visiting each child from inside `f`'s own sink
+/// ([`ValueRecurseWalk::expand`]) -- nothing needs suspending, because the
+/// child's subtree simply runs before the sink returns to `f`. `cond` is
+/// driven the same way.
+///
+/// That descent is native recursion, so it is budgeted by the stack it
+/// actually spends ([`RecurseNativeBudget`]); past the budget the rest of a
+/// subtree is walked with the explicit stack this function always used,
+/// where `f` still runs to completion per node. Both orders deliver the same
+/// values and end the same way (`recurse_native_and_queued_orders_agree_2918`);
+/// only when `f`/`cond` run differs.
+///
+/// **Memory.** Where `f` takes [`eval_each_owned`]'s reindex route (`.[]?`
+/// does), each native level keeps its node's temporary document alive while
+/// its children's subtrees run, so live reindexed input is bounded by the
+/// sum of the subtree sizes along the current path rather than one node's.
+/// That is invisible on ordinary documents and ~1.4x peak memory (time
+/// unchanged) on a 200-deep chain with its whole bulk at the leaf.
 pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
@@ -34871,9 +34886,10 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
         cond,
         sink,
         emitted: 0,
+        budget: RecurseNativeBudget::start(),
         _semantics: PhantomData,
     };
-    let abort = walk.visit(root);
+    let abort = walk.visit(root, 0);
     RecurseAbort::walk_end(abort)
 }
 
@@ -34918,6 +34934,185 @@ impl RecurseAbort {
     }
 }
 
+/// Record `end` as the walk's abort and answer [`Demand::Stop`], or
+/// [`Demand::Continue`] when there is none -- the one way a native `recurse`
+/// level tells the generator it runs inside to stop.
+fn stop_on_abort(slot: &mut Option<RecurseAbort>, end: Option<RecurseAbort>) -> Demand {
+    match end {
+        None => Demand::Continue,
+        Some(abort) => {
+            *slot = Some(abort);
+            Demand::Stop
+        }
+    }
+}
+
+/// How a native `recurse` level ended, from the abort its sink recorded and
+/// the [`Flow`] of the `f`/`cond` generator the sink ran inside.
+///
+/// A recorded abort wins: it happened inside the subtree of an output the
+/// generator had already produced, so it precedes anything the generator
+/// would have done next. The one thing taken from the generator alongside it
+/// is a `pending` escape on a stop -- an eager fallback inside `f` that had
+/// already raised one -- which the queued walk carries the same way.
+fn native_recurse_end(abort: Option<RecurseAbort>, flow: Flow) -> Option<RecurseAbort> {
+    match flow {
+        Flow::Exhausted => abort,
+        Flow::Escaped(control) => abort.or(Some(RecurseAbort::Escaped(control.into()))),
+        Flow::Stopped { pending } => match abort {
+            None | Some(RecurseAbort::Stopped(None)) => {
+                Some(RecurseAbort::Stopped(pending.map(EvalEscape::from)))
+            }
+            other => other,
+        },
+    }
+}
+
+/// How much native stack a `recurse` walk may spend descending from inside
+/// `f`'s sink before it queues instead (#2918).
+///
+/// **Measured, not estimated.** What one native level costs is everything
+/// between `f`'s root and the arm that produces the output: a fast-path
+/// `.+1` is ~1.4 KB a level in release, `if . < N then .+1 else empty end`
+/// ~11 KB, eight nested `if`s ~25 KB, and each `(.+0)` pipe stage adds ~8.5
+/// KB -- a 30-stage one overflowed the CLI's 256 MB thread inside 1,000
+/// levels with a per-level constant in place. A constant per level cannot
+/// be sized for that, and an estimate from `f`'s shape would have to model
+/// every arm's frame. So the walk records a stack address when it starts,
+/// and before each level reads how far the stack has actually moved.
+///
+/// That distance is converted to [`MAX_EVAL_FRAMES`]' own unit and charged
+/// on the ambient frame guard, so the walk and `def` recursion share one
+/// ceiling in both directions: a walk started deep inside `def` recursion
+/// begins with less room, and a `def` reached inside `f` sees the stack the
+/// walk already holds. A `recurse` nested inside `f` starts from the outer
+/// walk's charge the same way.
+///
+/// It also carries the one other piece of ambient state a native level has to
+/// restore rather than inherit: whether a yq read-only operand scope was
+/// active when the walk started ([`yq_read_only_context`]). A lazy operand
+/// inside `f` suspends that scope on the way into its own sink, which is
+/// where the next level's `f` now runs, so `(... | recurse((.n + 1) as $m |
+/// ...[.zzz | key]...)) + 0` read the absent key outside the scope from the
+/// second level down where the queued walk read it inside.
+#[derive(Clone, Copy)]
+struct RecurseNativeBudget {
+    /// A stack address taken when the walk started.
+    origin: usize,
+    /// The ambient frame depth when the walk started.
+    base_frames: u32,
+    /// Whether a yq read-only operand scope was active when the walk started.
+    read_only: bool,
+}
+
+/// The ambient state one native `recurse` level holds while its `f` runs.
+struct RecurseNativeLevel {
+    _frames: ambient_frame_depth::Guard,
+    _read_only: yq_read_only_context::Guard,
+}
+
+/// Stack bytes per [`MAX_EVAL_FRAMES`] frame, from that constant's own
+/// calibration: its crash floors put release at ~1.5 KB a frame on a 256 MB
+/// stack and debug at ~14 KB on 2 GB. Rounded down, so the charge errs high.
+const RECURSE_NATIVE_BYTES_PER_FRAME: usize = if cfg!(debug_assertions) {
+    12 * 1024
+} else {
+    1536
+};
+
+/// The charge past which a `recurse` walk queues instead of descending: a
+/// quarter of [`MAX_EVAL_FRAMES`] (~15 MB of release stack), so a `def`
+/// reached inside `f` at the deepest native level keeps three quarters of
+/// its budget. Every realistic document is far inside it -- JSON nesting
+/// stops at 256, and a simple `f` reaches over a thousand levels -- so what
+/// the ceiling trades away is only #2918's ordering on synthetic chains
+/// deeper than that, which keep the queued order past it.
+const RECURSE_NATIVE_FRAME_CEILING: u32 = MAX_EVAL_FRAMES / 4;
+
+impl RecurseNativeBudget {
+    fn start() -> Self {
+        Self {
+            origin: stack_address(),
+            base_frames: ambient_frame_depth::get(),
+            read_only: yq_read_only_context::active(),
+        }
+    }
+
+    /// Enter native level `level + 1` -- its frame charge and the walk's
+    /// read-only scope, both restored on drop -- or `None` if the walk must
+    /// queue instead.
+    fn enter_level(self, level: u32) -> Option<RecurseNativeLevel> {
+        let frames = self.next_level(level)?;
+        Some(RecurseNativeLevel {
+            _frames: ambient_frame_depth::enter(frames),
+            _read_only: if self.read_only {
+                yq_read_only_context::enter()
+            } else {
+                yq_read_only_context::suspend()
+            },
+        })
+    }
+
+    /// The ambient frame depth to enter for native level `level + 1`, or
+    /// `None` if the walk must queue instead.
+    ///
+    /// The level about to run has not spent its stack yet, so what is
+    /// checked is what the levels above it spent, plus one frame. One level
+    /// can therefore overshoot the ceiling by its own cost; the ceiling is
+    /// a quarter of the guard, and the guard itself carries a 4x margin.
+    fn next_level(self, level: u32) -> Option<u32> {
+        if level >= recurse_native_max_levels() {
+            return None;
+        }
+        let spent = self.origin.abs_diff(stack_address()) / RECURSE_NATIVE_BYTES_PER_FRAME;
+        let frames = self
+            .base_frames
+            .saturating_add(u32::try_from(spent).unwrap_or(u32::MAX))
+            .saturating_add(1);
+        (frames <= RECURSE_NATIVE_FRAME_CEILING).then_some(frames)
+    }
+}
+
+/// An address in the caller's native stack frame.
+#[inline(never)]
+fn stack_address() -> usize {
+    let marker = 0u8;
+    core::hint::black_box(core::ptr::addr_of!(marker)) as usize
+}
+
+/// A cap on native levels on top of [`RecurseNativeBudget`]'s stack charge;
+/// unbounded outside tests.
+fn recurse_native_max_levels() -> u32 {
+    #[cfg(test)]
+    if let Some(levels) = recurse_native_levels_override::get() {
+        return levels;
+    }
+    u32::MAX
+}
+
+/// Test-only override of [`recurse_native_max_levels`], so one query can be
+/// run fully queued (0) and fully native and the two compared.
+#[cfg(test)]
+mod recurse_native_levels_override {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static LEVELS: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<u32> {
+        LEVELS.with(Cell::get)
+    }
+
+    /// Run `body` with the override set, restoring the previous value after.
+    pub(super) fn with<T>(levels: u32, body: impl FnOnce() -> T) -> T {
+        let previous = LEVELS.with(|l| l.replace(Some(levels)));
+        let out = body();
+        LEVELS.with(|l| l.set(previous));
+        out
+    }
+}
+
 /// [`each_recurse_walk`]'s state: what every node's visit shares.
 struct ValueRecurseWalk<'e, 's, S> {
     f: &'e Expr,
@@ -34925,12 +35120,14 @@ struct ValueRecurseWalk<'e, 's, S> {
     sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
     /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
     emitted: usize,
+    budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
 }
 
 impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
-    /// Deliver `node`, then its whole subtree.
-    fn visit(&mut self, node: OwnedValue) -> Option<RecurseAbort> {
+    /// Deliver `node`, then its whole subtree. `level` is how many native
+    /// levels are already live above it (see [`RecurseNativeBudget`]).
+    fn visit(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
         if self.emitted >= RECURSE_MAX_ITEMS {
             return Some(RecurseAbort::Capped);
         }
@@ -34938,7 +35135,41 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
         if (self.sink)(node.clone()) == Demand::Stop {
             return Some(RecurseAbort::Stopped(None));
         }
-        self.expand_queued(node)
+        self.expand(node, level)
+    }
+
+    /// Visit the subtree below an already-delivered `node` in jq's own
+    /// order: each output of `f` has its whole subtree visited from inside
+    /// `f`'s sink, before `f` is asked for its next output (#2918). Past the
+    /// native budget, [`Self::expand_queued`] instead.
+    fn expand(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
+        let Some(_scope) = self.budget.enter_level(level) else {
+            return self.expand_queued(node);
+        };
+        let (f, cond) = (self.f, self.cond);
+        let mut abort = None;
+        let flow = eval_each_owned::<S>(f, &node, false, &mut |child| {
+            let end = match cond {
+                None => self.visit(child, level + 1),
+                Some(cond) => self.gate(cond, child, level + 1),
+            };
+            stop_on_abort(&mut abort, end)
+        });
+        native_recurse_end(abort, flow)
+    }
+
+    /// `select(cond) | r` for one child of `f`: visit `child` once per truthy
+    /// output of `cond`, each before `cond` is asked for its next (#627).
+    fn gate(&mut self, cond: &Expr, child: OwnedValue, level: u32) -> Option<RecurseAbort> {
+        let mut abort = None;
+        let flow = eval_each_owned::<S>(cond, &child, false, &mut |verdict| {
+            if verdict.is_truthy() {
+                stop_on_abort(&mut abort, self.visit(child.clone(), level))
+            } else {
+                Demand::Continue
+            }
+        });
+        native_recurse_end(abort, flow)
     }
 
     /// Visit the subtree below an already-delivered `node` with an explicit
@@ -35205,19 +35436,13 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     // `RECURSE_MAX_ITEMS` regardless of what was asked for, the way the
     // collecting version always did.
     //
-    // **What this does not close**: `f` is still resolved for one *accepted*
-    // node in full via `resolve_against_cow`, so if `f` is itself a
-    // multi-output generator, every one of that node's own outputs (and
-    // their side effects) fires even when a bounded consumer only ever asks
-    // for the first child's own subtree — confirmed live, `path(limit(2;
-    // recurse((.a|debug), (.b|debug))))` on `{"a":1,"b":2}` writes `debug`
-    // for `.a` only in jq (the second call's own child, `.b`, is never
-    // asked for once the bound is satisfied by `.a`'s own self-emission);
-    // here both fire. Real jq's `f | select(cond) | r` pulls `f`'s own
-    // outputs one at a time, fully recursing into each (`r`) before asking
-    // `f` for the next — closing this needs `f`'s own generator interleaved
-    // with this function's recursion, not just streamed delivery of what it
-    // already produced in one shot. See limitations.md.
+    // #2918: `f` is also stopped *between* its own outputs. jq's `f |
+    // select(cond) | r` recurses fully into each output before asking `f`
+    // for the next, so `path(limit(2; recurse((.a|debug), (.b|debug))))` on
+    // `{"a":1,"b":2}` writes `debug` for `.a` only. Each child is visited
+    // from inside `f`'s own sink ([`PathRecurseWalk::expand`]), within the
+    // stack budget [`each_recurse_walk`]'s doc comment describes, and the
+    // explicit stack below is the fallback past it.
     let mut walk = PathRecurseWalk::<S> {
         f,
         cond,
@@ -35225,11 +35450,12 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
         keep,
         sink,
         emitted: 0,
+        budget: RecurseNativeBudget::start(),
         _semantics: PhantomData,
     };
     // [`recurse_family_root_seed`] -- every subsequent node comes from `f`
     // instead, and that is `child_snapshot`'s own job below, not this seed's.
-    match walk.visit(recurse_family_root_seed(value, trackable, snapshot)) {
+    match walk.visit(recurse_family_root_seed(value, trackable, snapshot), 0) {
         None | Some(RecurseAbort::Capped) => ResolveFlow::Exhausted,
         // A deferred escape the sink stopped before is dropped: jq never
         // resumes a generator once its consumer is satisfied (see
@@ -35248,12 +35474,14 @@ struct PathRecurseWalk<'e, 'a, 's, S> {
     sink: &'s mut dyn FnMut(PathBranch<'a>) -> Demand,
     /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
     emitted: usize,
+    budget: RecurseNativeBudget,
     _semantics: PhantomData<S>,
 }
 
 impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
-    /// Deliver `node`, then its whole subtree.
-    fn visit(&mut self, node: PathBranch<'a>) -> Option<RecurseAbort> {
+    /// Deliver `node`, then its whole subtree. `level` is how many native
+    /// levels are already live above it (see [`RecurseNativeBudget`]).
+    fn visit(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
         if self.emitted >= RECURSE_MAX_ITEMS {
             return Some(RecurseAbort::Capped);
         }
@@ -35261,7 +35489,85 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         if (self.sink)(Self::delivered(&node)) == Demand::Stop {
             return Some(RecurseAbort::Stopped(None));
         }
-        self.expand_queued(node)
+        self.expand(node, level)
+    }
+
+    /// Visit the subtree below an already-delivered `node` in jq's own
+    /// order, each output of `f` descended into from inside `f`'s sink
+    /// (#2918) -- [`ValueRecurseWalk::expand`]'s path-mode twin. Every rule
+    /// [`Self::queue_children`] documents holds here too; only *when* a
+    /// child's subtree runs differs. Past the native budget,
+    /// [`Self::expand_queued`] instead.
+    fn expand(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
+        let Some(_scope) = self.budget.enter_level(level) else {
+            return self.expand_queued(node);
+        };
+        let PathBranch {
+            path: prefix,
+            value: current,
+            trackable: node_trackable,
+            snapshot: node_snapshot,
+            register: _,
+        } = node;
+        let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
+        let node_frame = if node_trackable {
+            self.frame.extend(&prefix)
+        } else {
+            self.frame.unknown()
+        };
+        let (f, cond, keep) = (self.f, self.cond, self.keep);
+        let mut abort = None;
+        let flow = resolve_against_cow_sink::<S>(
+            f,
+            current,
+            node_trackable,
+            &node_snapshot,
+            &node_frame,
+            keep,
+            &mut |child| {
+                let child = PathBranch {
+                    path: PathPrefix::extend_many(&prefix, child.path.to_vec()),
+                    value: child.value,
+                    register: None,
+                    trackable: node_trackable && child.trackable,
+                    snapshot: child.snapshot,
+                };
+                let end = match cond {
+                    // A null node's children are never descended into
+                    // (#856), but `f` still runs to completion on it.
+                    None if is_null_current => None,
+                    None => self.visit(child, level + 1),
+                    Some(cond) => self.gate(cond, child, !is_null_current, level + 1),
+                };
+                stop_on_abort(&mut abort, end)
+            },
+        );
+        match flow {
+            ResolveFlow::Exhausted => abort,
+            ResolveFlow::Stopped => abort.or(Some(RecurseAbort::Stopped(None))),
+            ResolveFlow::Escaped(e) => abort.or(Some(RecurseAbort::Escaped(e))),
+        }
+    }
+
+    /// `select(cond) | r` for one child of `f`. `cond` runs to completion
+    /// even when `open` is false (a null node's child, #856), so its side
+    /// effects and escape still happen; only the visits are withheld.
+    fn gate(
+        &mut self,
+        cond: &Expr,
+        child: PathBranch<'a>,
+        open: bool,
+        level: u32,
+    ) -> Option<RecurseAbort> {
+        let mut abort = None;
+        let flow = eval_each_owned::<S>(cond, &child.value, false, &mut |verdict| {
+            if open && verdict.is_truthy() {
+                stop_on_abort(&mut abort, self.visit(Self::delivered(&child), level))
+            } else {
+                Demand::Continue
+            }
+        });
+        native_recurse_end(abort, flow)
     }
 
     /// The branch the sink sees for a visited `node`.
@@ -87913,6 +88219,147 @@ mod tests {
             ),
             vec![r#"{"a":1,"b":2}"#, "1"]
         );
+    }
+
+    /// Everything `filter` delivers on `json`, plus how it ended.
+    fn outputs_and_end(json: &[u8], filter: &str) -> (Vec<String>, String) {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+        let end = match &result {
+            QueryResult::Error(e) => format!("error: {e}"),
+            QueryResult::Break(label) => format!("break: {label}"),
+            QueryResult::Halt(code) => format!("halt: {code}"),
+            QueryResult::Partial(_, control) => format!("partial: {control:?}"),
+            _ => String::new(),
+        };
+        let values = result
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        (values, end)
+    }
+
+    /// #2918: `recurse`'s native order (each output of `f` descended into
+    /// from inside `f`'s sink) and its queued order (the explicit stack it
+    /// falls back to past the stack budget) must deliver the same values and
+    /// end the same way -- they differ only in *when* `f` and `cond` run, so
+    /// every filter here is side-effect free. Forcing the native level cap to
+    /// 0 runs a whole query queued. This is the guard against the two orders'
+    /// copies of #490/#627/#635/#636/#842/#854/#856 drifting apart.
+    ///
+    /// On an explicitly sized thread: native descent is budgeted for the
+    /// CLI's evaluation thread (2 GiB in debug), not the harness's 2 MiB, and
+    /// the `recurse(.a?)` rows walk 10000 levels.
+    #[test]
+    fn recurse_native_and_queued_orders_agree_2918() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024 * 1024)
+            .spawn(|| {
+                let docs: [&[u8]; 3] = [
+                    br#"{"a":{"b":[1,2,{"c":null}]},"d":[3,[4,[5]]],"e":null}"#,
+                    br#"[[1,2],[3,[4,5]],{"x":{"y":6}}]"#,
+                    b"0",
+                ];
+                let filters = [
+                    "[recurse(.[]?)]",
+                    r#"[recurse(.[]?; type != "number")]"#,
+                    "[recurse(.[]?; (true, true))] | length",
+                    "[recurse(.[]?; (true, false))]",
+                    "[recurse(.[]?; . == null)]",
+                    "[limit(4; recurse(.[]?))]",
+                    "[limit(3; recurse(.[]?, .[]?))]",
+                    "[first(recurse(.[]?; . != null))]",
+                    "isempty(recurse(.[]?))",
+                    r#"[recurse(if type == "array" then .[] else empty end)]"#,
+                    r#"[recurse(if type == "number" and . < 3 then .+1 else empty end)]"#,
+                    r#"[recurse(.[]?, error("x"))]"#,
+                    r#"try [recurse(.[]?, error("x"))] catch ."#,
+                    r#"[recurse(.[]?; if type == "number" then error("c") else true end)]"#,
+                    r#"[recurse(.[]?; (true, error("x")))]"#,
+                    r#"[label $out | recurse(if type == "number" then break $out else .[]? end)]"#,
+                    "[recurse(.a?, .d?)]",
+                    "[recurse(.a?)] | length",
+                    "[limit(10001; recurse(.a?))] | length",
+                    "[recurse(recurse(.[]?) | arrays | .[]?)] | length",
+                    "[.[]? | recurse(.[]?)] | length",
+                    "reduce recurse(.[]?) as $x (0; . + 1)",
+                    "[foreach recurse(.[]?) as $x (0; . + 1)]",
+                    "[path(recurse(.[]?))]",
+                    r#"[path(recurse(.[]?; type == "object" or type == "array"))]"#,
+                    "[path(recurse(.[]?; (true, true)))] | length",
+                    "[path(limit(5; recurse(.[]?)))]",
+                    "[path(recurse(.a?))]",
+                    r#"[path(recurse(.[]?; if . == 2 then error("boom") else true end))]"#,
+                    r#"[path(recurse(.[]?, error("p")))]"#,
+                    r#"[path(recurse(.[]?; (true, error("x"))))]"#,
+                    r#"[paths(type == "number")]"#,
+                    "del(recurse(.[]?) | select(. == 2))",
+                    "(recurse(.[]?) | select(type == \"number\")) |= . + 1",
+                ];
+                for json in docs {
+                    for filter in filters {
+                        let queued = recurse_native_levels_override::with(0, || {
+                            outputs_and_end(json, filter)
+                        });
+                        let native = recurse_native_levels_override::with(u32::MAX, || {
+                            outputs_and_end(json, filter)
+                        });
+                        assert_eq!(
+                            native,
+                            queued,
+                            "{filter} on {}",
+                            String::from_utf8_lossy(json)
+                        );
+                    }
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("recurse must not overflow its thread");
+    }
+
+    /// #2918: native `recurse` descent shares [`MAX_EVAL_FRAMES`] with `def`
+    /// recursion through the ambient frame depth, in both directions.
+    #[test]
+    fn recurse_native_budget_shares_the_frame_guard_2918() {
+        // A walk starting at the top level may descend, and charges at least
+        // one frame for the level it enters.
+        let budget = RecurseNativeBudget::start();
+        let frames = budget.next_level(0).expect("room at the top level");
+        assert!(frames >= 1 && frames <= RECURSE_NATIVE_FRAME_CEILING);
+
+        // A walk starting deep inside `def` recursion queues from the start.
+        {
+            let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING);
+            assert_eq!(RecurseNativeBudget::start().next_level(0), None);
+        }
+        {
+            let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING - 1);
+            assert_eq!(
+                RecurseNativeBudget::start().next_level(0),
+                Some(RECURSE_NATIVE_FRAME_CEILING)
+            );
+        }
+
+        // Stack the walk has already spent is charged: an origin a ceiling's
+        // worth of bytes away leaves no room.
+        let spent = RecurseNativeBudget {
+            origin: stack_address()
+                + RECURSE_NATIVE_BYTES_PER_FRAME * RECURSE_NATIVE_FRAME_CEILING as usize,
+            base_frames: 0,
+            read_only: false,
+        };
+        assert_eq!(spent.next_level(0), None);
+
+        // The test override caps levels independently of the charge.
+        recurse_native_levels_override::with(2, || {
+            let budget = RecurseNativeBudget::start();
+            assert!(budget.next_level(1).is_some());
+            assert_eq!(budget.next_level(2), None);
+        });
     }
 
     #[test]

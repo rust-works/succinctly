@@ -1185,6 +1185,27 @@ fn test_yq_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
     Ok(())
 }
 
+/// #2918: `recurse`'s native order runs each level's `f` from inside the
+/// previous level's sink, and a lazy operand inside `f` (`(.n + 1) as $m`)
+/// suspends the yq read-only operand scope on the way into that sink. Each
+/// level must re-establish the scope the walk started under, or the second
+/// level's absent-key read (`.zzz | key`) escapes an enclosing operand's
+/// scope that the first level's is inside. Real yq rejects `recurse` outright,
+/// so the acceptance criterion is internal consistency: every level reads it
+/// the same way the queued walk always did.
+#[test]
+fn recurse_levels_keep_the_read_only_operand_scope_2918() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#"[recurse(([.zzz | key] | length) as $k | (.n + 1) as $m | select($m < 3) | {"n": $m, "k": $k}) | .k] + []"#,
+        "n: 0\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[0,0]");
+    Ok(())
+}
+
 /// #868: the same duplicate-key fix, one level of nesting deeper -- confirms
 /// `collect_paths_generic`'s `effective_fields` call applies at every
 /// recursion level, not just the root object.
