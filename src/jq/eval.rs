@@ -34909,24 +34909,24 @@ enum RecurseAbort {
 }
 
 impl RecurseAbort {
-    fn walk_end(abort: Option<RecurseAbort>) -> RecurseWalkEnd {
+    fn walk_end(abort: Option<Self>) -> RecurseWalkEnd {
         match abort {
             None => RecurseWalkEnd {
                 drained: true,
                 pending_error: None,
                 stopped: false,
             },
-            Some(RecurseAbort::Stopped(pending_error)) => RecurseWalkEnd {
+            Some(Self::Stopped(pending_error)) => RecurseWalkEnd {
                 drained: false,
                 pending_error,
                 stopped: true,
             },
-            Some(RecurseAbort::Capped) => RecurseWalkEnd {
+            Some(Self::Capped) => RecurseWalkEnd {
                 drained: false,
                 pending_error: None,
                 stopped: false,
             },
-            Some(RecurseAbort::Escaped(e)) => RecurseWalkEnd {
+            Some(Self::Escaped(e)) => RecurseWalkEnd {
                 drained: true,
                 pending_error: Some(e),
                 stopped: false,
@@ -88342,7 +88342,7 @@ mod tests {
         // one frame for the level it enters.
         let budget = RecurseNativeBudget::start();
         let frames = budget.next_level(0).expect("room at the top level");
-        assert!(frames >= 1 && frames <= RECURSE_NATIVE_FRAME_CEILING);
+        assert!((1..=RECURSE_NATIVE_FRAME_CEILING).contains(&frames));
 
         // A walk starting deep inside `def` recursion queues from the start.
         // (`no_std` has no ambient depth to read, so only the stack and the
@@ -88362,26 +88362,34 @@ mod tests {
         }
 
         // Stack the walk has already spent is bounded in bytes ...
-        let spent = |bytes: usize| RecurseNativeBudget {
+        let spent = |bytes: usize, base_frames: u32| RecurseNativeBudget {
             origin: stack_address() + bytes,
-            base_frames: 0,
+            base_frames,
             read_only: false,
         };
-        assert_eq!(spent(RECURSE_NATIVE_STACK_BYTES + 1024).next_level(0), None);
-        // ... and charged on the frame guard while under that bound.
-        let charged = spent(RECURSE_NATIVE_STACK_BYTES / 2)
+        assert_eq!(
+            spent(RECURSE_NATIVE_STACK_BYTES + 1024, 0).next_level(0),
+            None
+        );
+        // ... and charged on the frame guard while under that bound, so it
+        // counts against the ceiling a walk's starting depth left.
+        let charged = spent(RECURSE_NATIVE_STACK_BYTES / 2, 0)
             .next_level(0)
             .expect("half the byte budget leaves room");
         assert!(charged > 1, "spent stack is charged, not just the level");
-        #[cfg(feature = "std")]
-        {
-            let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING - 1);
-            assert_eq!(
-                spent(RECURSE_NATIVE_STACK_BYTES / 2).next_level(0),
-                None,
-                "the spent-stack charge counts against the ceiling"
-            );
-        }
+        assert_eq!(
+            spent(0, RECURSE_NATIVE_FRAME_CEILING - 1).next_level(0),
+            Some(RECURSE_NATIVE_FRAME_CEILING)
+        );
+        assert_eq!(
+            spent(
+                RECURSE_NATIVE_STACK_BYTES / 2,
+                RECURSE_NATIVE_FRAME_CEILING - 1
+            )
+            .next_level(0),
+            None,
+            "the spent-stack charge counts against the ceiling"
+        );
 
         // The test override caps levels independently of the charge.
         recurse_native_levels_override::with(2, || {
