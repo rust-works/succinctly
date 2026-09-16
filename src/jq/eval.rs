@@ -94969,4 +94969,59 @@ mod tests {
         assert_eq!(fresh_run_len(&steps(".a | .[1:2] | .b")), 1);
         assert_eq!(fresh_run_len(&steps("length")), 0);
     }
+
+    /// #3000 put a `.into()` on both of `eval.rs`'s own empty-object
+    /// constructors, and raw `DA:` counts showed both lines at zero hits
+    /// before it did. This one is the `{}` arm of the JSON parser behind
+    /// `fromjson`/`tonumber` (`parse_complete_json`): the suite parsed
+    /// objects through it, but never an *empty* one, so the early return
+    /// that builds the map without ever inserting into it was never taken.
+    #[test]
+    fn parse_complete_json_builds_an_empty_object_3000() {
+        let empty = OwnedValue::Object(IndexMap::new().into());
+        assert_eq!(parse_complete_json("{}", false).unwrap(), empty);
+        assert_eq!(parse_complete_json("  {   }  ", false).unwrap(), empty);
+        assert_eq!(parse_complete_json("{}", true).unwrap(), empty);
+        // The nested spelling reaches the same return one level down, and
+        // the non-empty path still builds what it always did.
+        assert_eq!(
+            parse_complete_json(r#"{"a":{},"b":1}"#, false).unwrap(),
+            OwnedValue::object_from([
+                ("a".to_string(), OwnedValue::Object(IndexMap::new().into())),
+                ("b".to_string(), OwnedValue::Int(1)),
+            ])
+        );
+    }
+
+    /// The other zero-hit constructor #3000 touched: `parent`'s
+    /// past-the-root placeholder. `eval.rs`'s `Builtin::Parent` arm is not
+    /// reachable from the CLI today -- `eval_generic` answers `parent` for
+    /// both modes, verified by tripwiring this function and finding it silent
+    /// under every `parent`/`parent(n)` spelling in both modes -- so the
+    /// contract is pinned directly on the two functions that encode it
+    /// rather than through a query that cannot reach them.
+    ///
+    /// The placeholder is built either way (it is an argument, so it is
+    /// evaluated before the branch); what the per-mode constant decides is
+    /// whether it is handed back. jq mode yields the empty object, yq mode
+    /// yields nothing at all.
+    #[test]
+    fn parent_past_the_root_placeholder_is_an_empty_object_3000() {
+        assert_eq!(
+            no_parent_placeholder(),
+            OwnedValue::Object(IndexMap::new().into())
+        );
+        let jq: QueryResult<'_, Vec<u64>> =
+            root_path_context_placeholder::<Vec<u64>, JqSemantics>(no_parent_placeholder());
+        match jq {
+            QueryResult::Owned(OwnedValue::Object(map)) => assert!(map.is_empty()),
+            other => panic!("jq mode should hand back the empty object, got {other:?}"),
+        }
+        let yq: QueryResult<'_, Vec<u64>> =
+            root_path_context_placeholder::<Vec<u64>, YqSemantics>(no_parent_placeholder());
+        assert!(
+            matches!(yq, QueryResult::None),
+            "yq mode yields nothing past the root"
+        );
+    }
 }
