@@ -28302,24 +28302,6 @@ impl PathTrail {
         })
     }
 
-    /// Build a fresh trail from an already-flat `&[OwnedValue]` -- an O(depth)
-    /// bridge for a caller that still carries its own path as a plain `Vec`
-    /// (`eval_generic.rs`'s `PathContextPos`, whose `key`/`parent`/
-    /// `file_index` machinery is out of scope for #2058 and left unchanged),
-    /// so it can still call into the shared, `PathTrail`-based step helpers.
-    /// This is a *second* O(depth) traversal on top of that caller's own
-    /// pre-existing per-call flatten (paired with an equal-cost `to_vec()`
-    /// on the way back out) -- not a regression in asymptotic order (that
-    /// call site was already O(d^2) end to end and stays so), but a real,
-    /// roughly 2x constant-factor increase this bridge introduces, not
-    /// eliminated here because restructuring `PathContextPos` itself to
-    /// carry a `PathTrail` natively is out of scope for #2058.
-    pub(crate) fn from_slice(components: &[OwnedValue]) -> Rc<Self> {
-        components.iter().fold(Self::root(), |acc, component| {
-            Self::extend(&acc, component.clone())
-        })
-    }
-
     /// The one O(depth) operation: flatten the chain into an owned
     /// `Vec<OwnedValue>`, root-to-leaf order. Paid once per branch, only
     /// where a flat path is actually required (i.e. when it becomes one

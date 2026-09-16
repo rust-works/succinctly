@@ -9119,10 +9119,10 @@ fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
         return Flow::Stopped { pending: None };
     }
     let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
-    let stepped = path_step_generic::<S, V>(
+    let stepped = path_step_generic::<S, V, _>(
         &Expr::Iterate,
         &PathNode::At(cursor),
-        &PathTrail::from_slice(&[]),
+        &PathTrail::root(),
         S::COLLAPSE_DUPLICATE_KEYS,
         &mut children,
     );
@@ -14981,6 +14981,155 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
     }
 }
 
+/// The trail one navigation step extends (#2572): `path()`'s own
+/// [`PathTrail`], or the path-context walk's [`PathContextTrail`].
+///
+/// [`path_step_generic`] is the one definition of a navigation step both
+/// walks share, and each needs a different record of where the step came
+/// from -- `path()` only the components, the path-context walk the node at
+/// every prefix as well, so `parent` can hop back to it. Before this the walk
+/// flattened its own `Vec`s into a `PathTrail` on the way in (a
+/// `PathTrail::from_slice` bridge, now gone) and back out again, plus a clone
+/// of its ancestor `Vec`, per position per step: O(depth) allocations and
+/// component clones where the step itself is O(1). Extending through this
+/// trait makes a step exactly one allocation for either trail.
+trait StepTrail<V: DocumentValue>: Sized {
+    /// Components from the root to here; O(1).
+    fn trail_depth(&self) -> usize;
+    /// The trail one `component` below this one, taken from `from` -- the
+    /// node standing at `self`.
+    fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self;
+    /// The same trail, shared (an `Rc` bump).
+    fn share(&self) -> Self;
+}
+
+impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
+    fn trail_depth(&self) -> usize {
+        self.depth()
+    }
+
+    fn extend_from(&self, component: OwnedValue, _from: &PathNode<V>) -> Self {
+        PathTrail::extend(self, component)
+    }
+
+    fn share(&self) -> Self {
+        Rc::clone(self)
+    }
+}
+
+/// The path-context walk's position trail (#2572): the components from the
+/// root to a position, each link also holding the node it was taken *from*
+/// -- `ancestors[i]` of the flat `(path, ancestors)` pair this replaced is
+/// link `i + 1`'s `from`.
+///
+/// Extending is one allocation and a refcount bump, where the flat pair paid
+/// a clone of both `Vec`s per position per step; `path`, `key` and `parent`
+/// read the chain instead (`to_vec` flattens it once where a whole path is
+/// emitted, `parent(n)` walks `n` links). `None` is the root, so a detached
+/// owned root allocates nothing.
+struct PathContextTrail<V: DocumentValue>(Option<Rc<PathContextLink<V>>>);
+
+/// One component of a [`PathContextTrail`].
+struct PathContextLink<V: DocumentValue> {
+    parent: PathContextTrail<V>,
+    component: OwnedValue,
+    /// The node at `parent`'s position, which `component` was taken from.
+    from: PathNode<V>,
+    /// Components from the root to here, inclusive: the same O(1) depth
+    /// [`PathTrail`] caches, for the same `assert_nesting_depth` guards.
+    depth: usize,
+}
+
+impl<V: DocumentValue> Drop for PathContextLink<V> {
+    /// Unlink iteratively. The walk roots a trail at its input's real
+    /// position (`path_context_root`), so a trail is as deep as the document
+    /// is -- not only as the query -- and the derived drop would recurse once
+    /// per link.
+    fn drop(&mut self) {
+        let mut next = self.parent.0.take();
+        while let Some(link) = next {
+            next = match Rc::try_unwrap(link) {
+                Ok(mut link) => link.parent.0.take(),
+                Err(_) => None,
+            };
+        }
+    }
+}
+
+impl<V: DocumentValue> Clone for PathContextTrail<V> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<V: DocumentValue> PathContextTrail<V> {
+    /// The empty trail: the document root, or a detached owned root.
+    fn root() -> Self {
+        Self(None)
+    }
+
+    /// A trail from the flat shape [`cursor_path_and_ancestors`] climbs:
+    /// `ancestors[i]` is the node `path[i]` was taken from.
+    fn from_climb(path: Vec<OwnedValue>, ancestors: Vec<V::Cursor>) -> Self {
+        debug_assert_eq!(path.len(), ancestors.len());
+        path.into_iter()
+            .zip(ancestors)
+            .fold(Self::root(), |trail, (component, from)| {
+                trail.extend_from(component, &PathNode::At(from))
+            })
+    }
+
+    fn depth(&self) -> usize {
+        self.0.as_ref().map_or(0, |link| link.depth)
+    }
+
+    /// The last component -- what `key` answers -- or `None` at the root.
+    fn last_component(&self) -> Option<&OwnedValue> {
+        self.0.as_ref().map(|link| &link.component)
+    }
+
+    /// The links from this position up to the root, nearest first.
+    fn links(&self) -> impl Iterator<Item = &PathContextLink<V>> {
+        core::iter::successors(self.0.as_deref(), |link| link.parent.0.as_deref())
+    }
+
+    /// The whole path, root first: the one O(depth) read, paid where a
+    /// position emits or resolves its full path.
+    fn to_vec(&self) -> Vec<OwnedValue> {
+        let mut out = vec_with_capacity(self.depth());
+        out.extend(self.links().map(|link| link.component.clone()));
+        out.reverse();
+        out
+    }
+
+    /// `n >= 1` levels up: that position's trail and the node standing
+    /// there, or `None` above the root.
+    fn hop(&self, n: usize) -> Option<(Self, PathNode<V>)> {
+        debug_assert!(n >= 1, "a zero hop keeps the position itself");
+        let link = self.links().nth(n.checked_sub(1)?)?;
+        Some((link.parent.clone(), link.from.clone()))
+    }
+}
+
+impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
+    fn trail_depth(&self) -> usize {
+        self.depth()
+    }
+
+    fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
+        Self(Some(Rc::new(PathContextLink {
+            parent: self.clone(),
+            component,
+            from: from.clone(),
+            depth: self.depth() + 1,
+        })))
+    }
+
+    fn share(&self) -> Self {
+        self.clone()
+    }
+}
+
 /// Walk `expr` from `node`, appending one `OwnedValue::Array` per emitted
 /// path to `out` (#2061).
 ///
@@ -15065,8 +15214,13 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // A terminal navigation step: take it, then emit each resulting path.
         _ => {
             let mut heads = Vec::new();
-            let stepped =
-                path_step_generic::<S, V>(expr, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
+            let stepped = path_step_generic::<S, V, _>(
+                expr,
+                node,
+                path,
+                S::COLLAPSE_DUPLICATE_KEYS,
+                &mut heads,
+            );
             for (p, _) in heads {
                 out.push(OwnedValue::Array(p.to_vec()));
             }
@@ -15111,7 +15265,7 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // same per-output shape `Expr::Iterate` needs.
     let mut heads = Vec::new();
     let stepped =
-        path_step_generic::<S, V>(first, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
+        path_step_generic::<S, V, _>(first, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
     // Heads the step produced *before* failing are earlier in jq's generator
     // order than its own error, so they are walked first and only then is
     // the error propagated -- the same "never un-emit an output already
@@ -15124,30 +15278,30 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// One navigation step: from `node` at `path`, produce every (path, node)
 /// position the step reaches.
-fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
+fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     expr: &Expr,
     node: &PathNode<V>,
-    path: &Rc<PathTrail>,
+    path: &T,
     collapse_duplicate_keys: bool,
-    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
+    out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment (#2058 code review).
-    assert_nesting_depth(path.depth());
+    assert_nesting_depth(path.trail_depth());
     // spine 2416 (walk residue): a step from an owned value descends the
     // value itself, with the components the owned identity pipe would name.
     // Only the path-context walk produces such a node (`path()`'s own walk
     // admits no slice), so the cursor arms below never see one.
     if let (PathNode::Owned(v), Expr::Field(_) | Expr::Index { .. } | Expr::Iterate) = (node, expr)
     {
-        return path_step_owned::<S, V>(expr, v, path, out);
+        return path_step_owned::<S, V, T>(expr, node, v, path, out);
     }
     match expr {
         Expr::Identity => {
-            out.push((Rc::clone(path), node.clone()));
+            out.push((path.share(), node.clone()));
             Ok(())
         }
         Expr::Paren(inner) => {
-            path_step_generic::<S, V>(inner, node, path, collapse_duplicate_keys, out)
+            path_step_generic::<S, V, T>(inner, node, path, collapse_duplicate_keys, out)
         }
         Expr::Field(name) => {
             let next = match node {
@@ -15199,7 +15353,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                 return Ok(());
             }
             out.push((
-                PathTrail::extend(path, OwnedValue::String(name.clone())),
+                path.extend_from(OwnedValue::String(name.clone()), node),
                 next,
             ));
             Ok(())
@@ -15298,7 +15452,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             };
-            out.push((PathTrail::extend(path, component), next));
+            out.push((path.extend_from(component, node), next));
             Ok(())
         }
         Expr::Iterate => match node {
@@ -15334,7 +15488,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             return Err(fields.malformed_member_error());
                         };
                         out.push((
-                            PathTrail::extend(path, OwnedValue::String(key.into_owned())),
+                            path.extend_from(OwnedValue::String(key.into_owned()), node),
                             PathNode::At(field.value_cursor),
                         ));
                     }
@@ -15352,7 +15506,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // `.[]` consumer already does.
                     for (i, ec) in elements.collect_cursors_checked()?.into_iter().enumerate() {
                         out.push((
-                            PathTrail::extend(path, OwnedValue::Int(i as i64)),
+                            path.extend_from(OwnedValue::Int(i as i64), node),
                             PathNode::At(ec),
                         ));
                     }
@@ -15410,11 +15564,11 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
         // and aborted the process with exit 101 -- a live, CLI-reachable
         // panic, not a can't-happen.
         Expr::Pipe(exprs) => {
-            path_step_pipe_generic::<S, V>(exprs, node, path, collapse_duplicate_keys, out)
+            path_step_pipe_generic::<S, V, T>(exprs, node, path, collapse_duplicate_keys, out)
         }
         Expr::Comma(exprs) => {
             for e in exprs {
-                path_step_generic::<S, V>(e, node, path, collapse_duplicate_keys, out)?;
+                path_step_generic::<S, V, T>(e, node, path, collapse_duplicate_keys, out)?;
             }
             Ok(())
         }
@@ -15427,8 +15581,13 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             // unguarded discard let `path((.a[]?)|.x)` answer past an
             // undecodable string that plain `(.a[])|.x` still raises on.
             let mut branch = Vec::new();
-            let result =
-                path_step_generic::<S, V>(inner, node, path, collapse_duplicate_keys, &mut branch);
+            let result = path_step_generic::<S, V, T>(
+                inner,
+                node,
+                path,
+                collapse_duplicate_keys,
+                &mut branch,
+            );
             out.append(&mut branch);
             match result {
                 Err(e) if e.is_decode_failure() => Err(e),
@@ -15444,17 +15603,18 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
 /// One literal navigation step (`.a`, `.[i]`, `.[]`) from an owned value in
 /// the path-context walk (spine 2416, walk residue): the children
 /// [`owned_nav_children`] names, each an owned node at the extended path.
-fn path_step_owned<S: EvalSemantics, V: DocumentValue>(
+fn path_step_owned<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     expr: &Expr,
+    node: &PathNode<V>,
     value: &Rc<OwnedValue>,
-    path: &Rc<PathTrail>,
-    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
+    path: &T,
+    out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     let (children, control) = owned_nav_children::<S>(expr, value, false);
     for (component, child) in children {
         let next_path = match component {
-            Some(component) => PathTrail::extend(path, component),
-            None => Rc::clone(path),
+            Some(component) => path.extend_from(component, node),
+            None => path.share(),
         };
         out.push((next_path, PathNode::Owned(Rc::new(child))));
     }
@@ -15550,31 +15710,32 @@ fn owned_nav_children<S: EvalSemantics>(
 /// slice here for the identical reason -- no owned `Expr::Pipe(rest.to_vec())`
 /// rebuilt per stage, and `path`'s own O(1) `PathTrail::extend` instead of an
 /// O(depth) `Vec` clone-and-push.
-fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue>(
+fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     exprs: &[Expr],
     node: &PathNode<V>,
-    path: &Rc<PathTrail>,
+    path: &T,
     collapse_duplicate_keys: bool,
-    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
+    out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment -- like `path_walk_pipe_
     // generic`, this recurses into itself once per pipe stage (#2058 code
     // review).
-    assert_nesting_depth(path.depth());
+    assert_nesting_depth(path.trail_depth());
     let Some((first, rest)) = exprs.split_first() else {
-        out.push((Rc::clone(path), node.clone()));
+        out.push((path.share(), node.clone()));
         return Ok(());
     };
     if rest.is_empty() {
-        return path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, out);
+        return path_step_generic::<S, V, T>(first, node, path, collapse_duplicate_keys, out);
     }
     let mut heads = Vec::new();
-    let stepped = path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, &mut heads);
+    let stepped =
+        path_step_generic::<S, V, T>(first, node, path, collapse_duplicate_keys, &mut heads);
     // Positions completed through the whole chain land in `out` before
     // `stepped`'s own error surfaces, for the same generator-order reason as
     // `path_walk_pipe_generic`.
     for (p, n) in heads {
-        path_step_pipe_generic::<S, V>(rest, &n, &p, collapse_duplicate_keys, out)?;
+        path_step_pipe_generic::<S, V, T>(rest, &n, &p, collapse_duplicate_keys, out)?;
     }
     stepped
 }
@@ -15821,8 +15982,8 @@ fn path_context_component_walkable(expr: &Expr) -> bool {
 /// eager evaluator and not the walk's to decide.
 struct PathContextPos<V: DocumentValue> {
     node: PathNode<V>,
-    path: Vec<OwnedValue>,
-    ancestors: Vec<PathNode<V>>,
+    /// The path and the ancestors, as one shared chain (#2572).
+    trail: PathContextTrail<V>,
     /// `node` is a member's *key* node (#2763): the walk was seeded from the
     /// cursor `key` emitted. It stands at its member's position -- `path`
     /// and a `parent` hop answer as they would for the value -- but a key has
@@ -15837,8 +15998,7 @@ impl<V: DocumentValue> Clone for PathContextPos<V> {
     fn clone(&self) -> Self {
         Self {
             node: self.node.clone(),
-            path: self.path.clone(),
-            ancestors: self.ancestors.clone(),
+            trail: self.trail.clone(),
             at_key: self.at_key,
         }
     }
@@ -15982,21 +16142,17 @@ fn path_context_hop<V: DocumentValue>(
     pos: &PathContextPos<V>,
     n: usize,
 ) -> Option<PathContextPos<V>> {
-    let len = pos.path.len().checked_sub(n)?;
-    let stays = len == pos.path.len();
-    let node = if stays {
-        pos.node.clone()
-    } else {
-        pos.ancestors[len].clone()
-    };
-    Some(PathContextPos {
-        node,
-        path: pos.path[..len].to_vec(),
-        ancestors: pos.ancestors[..len].to_vec(),
+    if n == 0 {
         // `parent(0)` is the node itself, key node included (`[.a | key |
         // parent(0) | key]` is `[]` in yq v4.53.3); any real hop lands on a
         // container.
-        at_key: stays && pos.at_key,
+        return Some(pos.clone());
+    }
+    let (trail, node) = pos.trail.hop(n)?;
+    Some(PathContextPos {
+        node,
+        trail,
+        at_key: false,
     })
 }
 
@@ -16021,18 +16177,20 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // input -- or, when that node is not in this document, to a
         // detached copy of the value.
         Expr::TrackedVar(var) => {
-            let anchor = core::iter::once(&pos.node)
-                .chain(pos.ancestors.iter())
-                .find_map(|n| match n {
-                    PathNode::At(c) => Some(*c),
-                    PathNode::Absent | PathNode::Owned(_) => None,
-                });
+            // The node itself, else the root-most live ancestor: every live
+            // node on one trail is a cursor of the same document, which is
+            // all `bind_origin_cursor` reads from its anchor.
+            let live = |n: &PathNode<V>| match n {
+                PathNode::At(c) => Some(*c),
+                PathNode::Absent | PathNode::Owned(_) => None,
+            };
+            let anchor = live(&pos.node)
+                .or_else(|| pos.trail.links().filter_map(|link| live(&link.from)).last());
             match anchor.and_then(|a| bind_origin_cursor(&var.node, &a)) {
                 Some(c) => out.push(path_context_root::<V>(c)?),
                 None => out.push(PathContextPos {
                     node: PathNode::Owned(Rc::new(var.value.clone())),
-                    path: Vec::new(),
-                    ancestors: Vec::new(),
+                    trail: PathContextTrail::root(),
                     at_key: false,
                 }),
             }
@@ -16046,27 +16204,21 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             // reason it is there: a walk over a YAML mapping with duplicate
             // keys yields one position per key, matching the materialized
             // tree's `IndexMap`.
+            //
+            // The step extends the position's own trail (#2572): one link
+            // per position, recording `pos.node` as the node it came from.
             let mut heads = Vec::new();
-            let stepped = path_step_generic::<S, V>(
-                expr,
-                &pos.node,
-                &PathTrail::from_slice(&pos.path),
-                true,
-                &mut heads,
-            );
-            for (path, node) in heads {
-                let path = path.to_vec();
+            let stepped =
+                path_step_generic::<S, V, _>(expr, &pos.node, &pos.trail, true, &mut heads);
+            for (trail, node) in heads {
                 debug_assert_eq!(
-                    path.len(),
-                    pos.path.len() + 1,
+                    trail.depth(),
+                    pos.trail.depth() + 1,
                     "a navigational step appends exactly one path component"
                 );
-                let mut ancestors = pos.ancestors.clone();
-                ancestors.push(pos.node.clone());
                 out.push(PathContextPos {
                     node,
-                    path,
-                    ancestors,
+                    trail,
                     at_key: false,
                 });
             }
@@ -16078,21 +16230,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             }
             Ok(())
         }
-        Expr::Pipe(exprs) => match exprs.split_first() {
-            None => {
-                out.push(pos.clone());
-                Ok(())
-            }
-            Some((first, [])) => path_context_step_generic::<S, V>(first, pos, out),
-            Some((first, rest)) => {
-                let mut heads = Vec::new();
-                let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
-                for head in heads {
-                    path_context_step_generic::<S, V>(&Expr::Pipe(rest.to_vec()), &head, out)?;
-                }
-                stepped
-            }
-        },
+        Expr::Pipe(exprs) => path_context_step_pipe::<S, V>(exprs, pos, out),
         Expr::Builtin(Builtin::Parent) => {
             out.extend(path_context_hop(pos, 1));
             Ok(())
@@ -16108,7 +16246,8 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             let produced_from = out.len();
             let (counts, control) = path_context_component_values::<S, V>(n_expr, pos);
             for n_value in counts {
-                let n = classify_parent_n::<S>(&n_value, pos.path.len()).map_err(Control::Error)?;
+                let n =
+                    classify_parent_n::<S>(&n_value, pos.trail.depth()).map_err(Control::Error)?;
                 out.extend(path_context_hop(pos, n));
             }
             control.map_or(Ok(()), |c| {
@@ -16274,8 +16413,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                 Some(last) => out.push(last),
                 None => out.push(PathContextPos {
                     node: PathNode::Owned(Rc::new(OwnedValue::Null)),
-                    path: pos.path.clone(),
-                    ancestors: pos.ancestors.clone(),
+                    trail: pos.trail.clone(),
                     at_key: false,
                 }),
             }
@@ -16291,8 +16429,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             for v in values {
                 out.push(PathContextPos {
                     node: PathNode::Owned(Rc::new(v)),
-                    path: pos.path.clone(),
-                    ancestors: pos.ancestors.clone(),
+                    trail: pos.trail.clone(),
                     at_key: false,
                 });
             }
@@ -16306,6 +16443,33 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         other => unreachable!(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
         ),
+    }
+}
+
+/// [`path_context_step_generic`]'s `Expr::Pipe` case over a borrowed slice
+/// (#2572), the fix #2058 gave `path_walk_generic`: the remaining stages are
+/// passed on as `&[Expr]`, where rewrapping them in a fresh
+/// `Expr::Pipe(rest.to_vec())` deep-cloned every remaining stage's AST once
+/// per position the head reached.
+fn path_context_step_pipe<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    match exprs.split_first() {
+        None => {
+            out.push(pos.clone());
+            Ok(())
+        }
+        Some((first, [])) => path_context_step_generic::<S, V>(first, pos, out),
+        Some((first, rest)) => {
+            let mut heads = Vec::new();
+            let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
+            for head in heads {
+                path_context_step_pipe::<S, V>(rest, &head, out)?;
+            }
+            stepped
+        }
     }
 }
 
@@ -16340,22 +16504,14 @@ fn path_context_push_owned_children<V: DocumentValue>(
     for (component, child) in children {
         let node = PathNode::Owned(Rc::new(child));
         match component {
-            Some(component) => {
-                let mut path = pos.path.clone();
-                path.push(component);
-                let mut ancestors = pos.ancestors.clone();
-                ancestors.push(pos.node.clone());
-                out.push(PathContextPos {
-                    node,
-                    path,
-                    ancestors,
-                    at_key: false,
-                });
-            }
+            Some(component) => out.push(PathContextPos {
+                node,
+                trail: pos.trail.extend_from(component, &pos.node),
+                at_key: false,
+            }),
             None => out.push(PathContextPos {
                 node,
-                path: pos.path.clone(),
-                ancestors: pos.ancestors.clone(),
+                trail: pos.trail.clone(),
                 at_key: false,
             }),
         }
@@ -16822,7 +16978,7 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
-    assert_nesting_depth(pos.path.len());
+    assert_nesting_depth(pos.trail.depth());
     out.push(pos.clone());
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
@@ -16867,8 +17023,7 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
     for v in values {
         out.push(PathContextPos {
             node: PathNode::Owned(Rc::new(v)),
-            path: pos.path.clone(),
-            ancestors: pos.ancestors.clone(),
+            trail: pos.trail.clone(),
             at_key: false,
         });
     }
@@ -16957,11 +17112,12 @@ fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
     if !needs_path_context(expr) {
         return Ok(expr.clone());
     }
+    let path = pos.trail.to_vec();
     path_context_resolve_constants::<S>(
         expr,
         &PathContextAt {
-            key: pos.path.last(),
-            path: &pos.path,
+            key: path.last(),
+            path: &path,
             parent_of: None,
             prefetch: None,
         },
@@ -16996,8 +17152,7 @@ fn path_context_step_target<S: EvalSemantics, V: DocumentValue>(
     for value in values {
         out.push(PathContextPos {
             node: PathNode::Owned(Rc::new(value)),
-            path: Vec::new(),
-            ancestors: Vec::new(),
+            trail: PathContextTrail::root(),
             at_key: false,
         });
     }
@@ -17204,9 +17359,9 @@ fn path_context_emitting_value<V: DocumentValue>(
 ) -> Result<Option<GenericItem<V>>, EvalError> {
     let owned = |v: OwnedValue| Some(GenericItem::Owned(v));
     match expr {
-        Expr::Builtin(Builtin::PathNoArg) => Ok(owned(OwnedValue::Array(pos.path.clone()))),
+        Expr::Builtin(Builtin::PathNoArg) => Ok(owned(OwnedValue::Array(pos.trail.to_vec()))),
         Expr::Builtin(Builtin::Key) if pos.at_key => Ok(None),
-        Expr::Builtin(Builtin::Key) => match pos.path.last() {
+        Expr::Builtin(Builtin::Key) => match pos.trail.last_component() {
             Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
                 PathNode::At(c) => Ok(cursor_key(c)?.and_then(owned)),
                 _ => Ok(owned(OwnedValue::Int(*i))),
@@ -18330,8 +18485,7 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
     };
     Ok(PathContextPos {
         node: PathNode::At(root),
-        path,
-        ancestors: ancestors.into_iter().map(PathNode::At).collect(),
+        trail: PathContextTrail::from_climb(path, ancestors),
         at_key,
     })
 }
@@ -18871,25 +19025,31 @@ fn path_context_absent_identity<V: DocumentValue>(
     // always holds at least one live cursor -- and, since a step from an
     // absent node is absent too, every entry after the last live one is
     // absent.
-    let Some(base_index) = pos
-        .ancestors
-        .iter()
-        .rposition(|node| matches!(node, PathNode::At(_)))
-    else {
+    //
+    // The links below the deepest live ancestor, root first: the first one
+    // was taken from that ancestor, and the rest hang under it.
+    let mut below: Vec<&PathContextLink<V>> = Vec::new();
+    let mut base = None;
+    for link in pos.trail.links() {
+        below.push(link);
+        if let PathNode::At(c) = link.from {
+            base = Some(c);
+            break;
+        }
+    }
+    let Some(base) = base else {
         debug_assert!(false, "an absent position hangs under a real ancestor");
         return Ok(OwnedIdentity::detached());
     };
-    let PathNode::At(base) = pos.ancestors[base_index] else {
-        unreachable!("rposition matched a live cursor")
-    };
+    below.reverse();
     let mut parent = Rc::new(to_owned_cursor(&base)?);
     let mut id = OwnedIdentity::kept(base);
-    for (i, component) in pos.path[base_index..].iter().enumerate() {
-        id = id.child(&parent, component.clone());
+    for (i, link) in below.iter().enumerate() {
+        id = id.child(&parent, link.component.clone());
         // spine 2416 (walk residue): an owned ancestor below the base (the
         // array a slice built) is the parent value its own children hang
         // under; everything else below the base is absent, which is `null`.
-        parent = match pos.ancestors.get(base_index + i + 1) {
+        parent = match below.get(i + 1).map(|next| &next.from) {
             Some(PathNode::Owned(v)) => Rc::clone(v),
             Some(PathNode::At(_)) => unreachable!("a live ancestor above the deepest live one"),
             Some(PathNode::Absent) | None => Rc::new(OwnedValue::Null),
@@ -18918,7 +19078,12 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 }
 
 /// Replace every path-context builtin in `expr` with the constant it answers
-/// at `pos`, leaving a filter that needs no path context at all.
+/// at the position `path` reaches, leaving a filter that needs no path
+/// context at all.
+///
+/// The position's path, not the position (#2572): a position's trail is a
+/// chain, and a caller rewriting several stages at one position flattens it
+/// once rather than per stage.
 ///
 /// The arms mirror [`path_context_absent_resolvable`] exactly, and the two
 /// are held together by `path_context_absent_resolution_clears_path_context`
@@ -18926,9 +19091,9 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 /// here would evaluate its `key` against no position and answer `null`,
 /// which is the silent-fallback failure ADR-0021 was written to end. The
 /// `_` arm is reached only for a subtree with no path-context builtin in it.
-fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
+fn path_context_resolve_absent<S: EvalSemantics>(
     expr: &Expr,
-    pos: &PathContextPos<V>,
+    path: &[OwnedValue],
 ) -> Result<Expr, EvalError> {
     // An absent position always has at least one component -- it took a
     // `.a`/`[i]` step to become absent -- so its key is the walk's own
@@ -18936,8 +19101,8 @@ fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
     path_context_resolve_constants::<S>(
         expr,
         &PathContextAt {
-            key: pos.path.last(),
-            path: &pos.path,
+            key: path.last(),
+            path,
             parent_of: None,
             prefetch: None,
         },
@@ -19401,8 +19566,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     // Positions reached before an error are still evaluated -- jq's
     // generator never un-emits an output it already produced -- and the
     // error follows them, the same rule `path_context_step_generic` states.
-    let stepped =
-        path_context_step_generic::<S, V>(&Expr::Pipe(head.to_vec()), &root_pos, &mut positions);
+    let stepped = path_context_step_pipe::<S, V>(head, &root_pos, &mut positions);
     // A live node keeps its cursor wherever `rest` can be evaluated from
     // one; the identity route's own real positions are the shapes where it
     // cannot (`.c | key` moves the position `rest` reads), and those
@@ -19484,9 +19648,10 @@ fn path_context_resolve_absent_stages<S: EvalSemantics, V: DocumentValue>(
     rest: &[Expr],
     pos: &PathContextPos<V>,
 ) -> Result<Expr, EvalError> {
+    let path = pos.trail.to_vec();
     let mut stages = vec_with_capacity(rest.len());
     for stage in rest {
-        stages.push(path_context_resolve_absent::<S, V>(stage, pos)?);
+        stages.push(path_context_resolve_absent::<S>(stage, &path)?);
     }
     let resolved = Expr::Pipe(stages);
     debug_assert!(
@@ -20875,7 +21040,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 return match path_walk_generic::<S, V>(
                     path_expr,
                     &PathNode::At(root),
-                    &PathTrail::from_slice(&[]),
+                    &PathTrail::root(),
                     &mut out,
                 ) {
                     Ok(()) => owned_vec_to_generic_result(out),
@@ -35018,13 +35183,12 @@ mod tests {
         let root = index.root(doc);
         // A position two components deep, both of them absent, so `key`
         // and `path` resolve to different constants.
+        let trail = PathContextTrail::root()
+            .extend_from(OwnedValue::String("a".to_string()), &PathNode::At(root))
+            .extend_from(OwnedValue::String("x".to_string()), &PathNode::Absent);
         let pos: PathContextPos<crate::json::StandardJson<'_, Vec<u64>>> = PathContextPos {
             node: PathNode::Absent,
-            path: vec![
-                OwnedValue::String("a".to_string()),
-                OwnedValue::String("x".to_string()),
-            ],
-            ancestors: vec![PathNode::At(root), PathNode::Absent],
+            trail,
             at_key: false,
         };
         for filter in [
@@ -35059,7 +35223,7 @@ mod tests {
                 path_context_absent_resolvable(&expr),
                 "gate refuses `{filter}`; drop the row or widen the gate"
             );
-            let resolved = path_context_resolve_absent::<JqSemantics, _>(&expr, &pos)
+            let resolved = path_context_resolve_absent::<JqSemantics>(&expr, &pos.trail.to_vec())
                 .expect("the constant route's rewrite cannot fail");
             assert!(
                 !needs_path_context(&resolved),
