@@ -842,11 +842,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eager route and its single document. `try` and `reduce` are refused despite
   plausibly qualifying, for reasons recorded on the predicate.
 
-  `.[(0,1)] = 0` is **unchanged** at +18%: every remaining streamed shape
-  genuinely needs both documents, and only structural sharing in `OwnedValue`
-  removes that. A new test runs the resolver over a battery of documents and
-  counts the paths each admitted shape actually produces, so the gate's
-  premise is checked rather than restated.
+  **Measured** (Apple M5 Max, release, 1.5 MB / 200,000-element array, peak
+  RSS via `/usr/bin/time -l`, binaries interleaved within each repetition,
+  5 reps, median):
+
+  | filter | before | after | |
+  |---|---|---|---|
+  | `.[length-1] = 0` | 96.1 MB | 78.6 MB | **-18.3%** |
+  | `.[(.[0]+1)] = 0` | 96.0 MB | 78.4 MB | **-18.3%** |
+  | `.[(.[0]\|stderr)] = 0` | 96.2 MB | 78.6 MB | **-18.2%** |
+  | `(.\|stderr)[0] = 0` | 99.1 MB | 78.4 MB | **-20.9%** |
+  | `.[(0,1)] = 0` | 96.0 MB | 96.1 MB | unchanged |
+  | `.[0] = 0` | 59.0 MB | 58.9 MB | unchanged |
+
+  78.5 MB is exactly where `.[$k] = 0` already sat on both binaries (~77 MB),
+  i.e. the moved shapes now pay what every other computed path pays and
+  nothing more. The remaining gap to a *static* path's 59 MB is the eager
+  route's own per-path cost, which is a different cost and untouched here.
+
+  `.[(0,1)] = 0` is **unchanged**: every remaining streamed shape genuinely
+  needs both documents, and only structural sharing in `OwnedValue` removes
+  that. A new test runs the resolver over a battery of documents and counts
+  the paths each admitted shape actually produces, so the gate's premise is
+  checked rather than restated.
 
 - **A top-level `//`, `and` or `or` no longer materializes the whole
   document** (#2692). #2476 removed that materialization from
