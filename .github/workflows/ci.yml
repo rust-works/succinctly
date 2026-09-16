@@ -74,10 +74,74 @@ jobs:
   # step is skipped, which is a genuine passing job — not a `skipped` conclusion
   # whose branch-protection semantics vary. Non-required jobs (bench, coverage,
   # perf-guard) below skip wholesale via a job-level `if`.
+  # #3059: the 8 feature-flag `cargo test` invocations below are mutually
+  # independent (no step consumes a prior step's output) and were previously
+  # chained sequentially in one job, inflating this leg's wall-clock ~2x
+  # versus running them in parallel. Split into matrix legs
+  # (test-x86-matrix) that fan out across runners; this job stays a thin
+  # required-context aggregator, since `Test (x86_64)` is in the branch
+  # ruleset's required-status-checks list and a matrix job's per-leg context
+  # names (`Test (x86_64) (cli-gated)`, etc.) can never satisfy that exact
+  # literal name on their own.
   test-x86:
     name: Test (x86_64)
+    needs: test-x86-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All Test (x86_64) matrix legs passed"
+
+  test-x86-matrix:
+    name: Test (x86_64) (${{ matrix.name }})
     needs: gate
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli-gated
+            buildCli: true
+            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
+          # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
+          # and must stay isolated from the cli-gated leg above (#1705): its
+          # `cargo run`-spawned CLI subprocesses would otherwise re-link the
+          # shared `target/debug/succinctly` binary with a narrower feature
+          # set, dropping the `bench` subcommand out from under this test
+          # target if it ran in the same invocation.
+          - name: bench-runner-gated
+            buildCli: true
+            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+          - name: default
+            buildCli: false
+            testCmd: cargo test --verbose
+          # Re-run the suite with yaml x86 dispatch clamped to SSE2 (#247): the
+          # parser and the light.rs regression tests then genuinely execute the
+          # 16-byte classify path, so a reintroduced length-derived skip width
+          # (#231) fails here instead of sailing through on AVX2 dispatch. The
+          # in-lib contract test (test_succinctly_simd_env_contract) fails
+          # this leg if the clamp ever stops applying or the value here is
+          # typo'd.
+          - name: sse2-clamped-dispatch
+            buildCli: false
+            testCmd: SUCCINCTLY_SIMD=sse2 cargo test --verbose
+          - name: simd
+            buildCli: false
+            testCmd: cargo test --verbose --features simd
+          - name: portable-popcount
+            buildCli: false
+            testCmd: cargo test --verbose --features portable-popcount
+          # scalar-yaml switches x86_64 off the `x86` module entirely, so it is
+          # a distinct dispatch set that no other leg here builds (#185). Its
+          # ARM counterpart, plus broadword-yaml, run on the test-arm-matrix
+          # job — broadword-yaml is a no-op on x86_64.
+          - name: scalar-yaml
+            buildCli: false
+            testCmd: cargo test --verbose --features simd,scalar-yaml
+          # #2114: `cargo check` doesn't build test targets at all, so it never
+          # caught #2083 (a std-only symbol reachable from test code with no
+          # matching cfg gate) -- `cargo test` both builds and runs them.
+          - name: no-std
+            buildCli: false
+            testCmd: cargo test --no-default-features --verbose
     env:
       # x86 SIMD CI leg (#193): the SIMD suites self-skip (with a visible
       # `SKIPPED` line) when a CPU feature is missing, so this pins the runner
@@ -90,11 +154,11 @@ jobs:
       #    dispatch.
       #  - Caller integration: kernel-direct tests cannot catch caller-side
       #    bugs like the classify/skip-width accounting (#231), so the
-      #    "SSE2-clamped dispatch" step below re-runs the suite with
+      #    "sse2-clamped-dispatch" leg re-runs the suite with
       #    SUCCINCTLY_SIMD=sse2 (docs/reference/environment-variables.md),
       #    forcing the yaml parser through the real 16-byte SSE2 dispatch
       #    path (#247). The clamp affects dispatch only, not detection, so
-      #    this expectation still holds in that step.
+      #    this expectation still holds in that leg.
       SUCCINCTLY_EXPECT_SIMD: sse2,sse4.2,avx2,bmi2,popcnt
     steps:
       - uses: actions/checkout@v7
@@ -124,7 +188,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       # The x86 SIMD tests (BMI2, AVX2) self-skip when the feature is absent,
       # which reads as a silent pass. Fail loudly if this runner can't actually
@@ -146,72 +210,101 @@ jobs:
           fi
           echo "BMI2 + AVX2 present: SIMD tests will assert, not skip."
 
-      - name: Build
-        if: needs.gate.outputs.code == 'true'
-        run: cargo build --verbose
-
       - name: Build CLI (for integration tests)
-        if: needs.gate.outputs.code == 'true'
+        if: needs.gate.outputs.code == 'true' && matrix.buildCli
         run: cargo build --features cli --bin succinctly
-
-      - name: Run cli-gated tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
-
-      # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
-      # and was never previously built or run by any `cargo test` step here
-      # (#1705) -- run in its own step, isolated from the `cli`-only tests
-      # above (whose `cargo run`-spawned CLI subprocesses would otherwise
-      # re-link the shared `target/debug/succinctly` binary with a narrower
-      # feature set, dropping the `bench` subcommand out from under this
-      # test target if it ran afterward in the same invocation).
-      - name: Run bench-runner-gated tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose
+        run: ${{ matrix.testCmd }}
 
-      # Re-run the suite with yaml x86 dispatch clamped to SSE2 (#247): the
-      # parser and the light.rs regression tests then genuinely execute the
-      # 16-byte classify path, so a reintroduced length-derived skip width
-      # (#231) fails here instead of sailing through on AVX2 dispatch. Same
-      # features as "Run tests", so this reuses the build and costs only
-      # execution time. The in-lib contract test
-      # (test_succinctly_simd_env_contract) fails this step if the clamp ever
-      # stops applying or the value here is typo'd.
-      - name: Run tests (SSE2-clamped dispatch)
-        if: needs.gate.outputs.code == 'true'
-        run: SUCCINCTLY_SIMD=sse2 cargo test --verbose
-
-      - name: Run tests (simd feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd
-
-      - name: Run tests (portable-popcount feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features portable-popcount
-
-      # scalar-yaml switches x86_64 off the `x86` module entirely, so it is a
-      # distinct dispatch set that no other step here builds (#185). Its ARM
-      # counterpart, plus broadword-yaml, run on the test-arm leg —
-      # broadword-yaml is a no-op on x86_64.
-      - name: Run tests (scalar-yaml — no SIMD or broadword)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd,scalar-yaml
-
-      # #2114: `cargo check` doesn't build test targets at all, so it never
-      # caught #2083 (a std-only symbol reachable from test code with no
-      # matching cfg gate) -- `cargo test` both builds and runs them.
-      - name: Check no_std compatibility (build + run tests)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --no-default-features --verbose
-
+  # #3059: same rationale as test-x86/test-x86-matrix above — the 9
+  # feature-flag `cargo test` invocations plus 3 Clippy variants below are
+  # mutually independent and were previously chained sequentially in one job.
+  # `Test (ARM64)` is a required status check, so this job stays a thin
+  # aggregator over test-arm-matrix's per-leg contexts.
   test-arm:
     name: Test (ARM64)
+    needs: test-arm-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All Test (ARM64) matrix legs passed"
+
+  test-arm-matrix:
+    name: Test (ARM64) (${{ matrix.name }})
     needs: gate
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli-gated
+            buildCli: true
+            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
+          - name: bench-runner-gated
+            buildCli: true
+            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+          - name: default
+            buildCli: false
+            testCmd: cargo test --verbose
+          - name: simd
+            buildCli: false
+            testCmd: cargo test --verbose --features simd
+          # SUCCINCTLY_SVE2=1 switches JSON semi-index building to the SVE2
+          # kernels (src/json/simd/mod.rs use_sve2()); DSV and broadword SVE2
+          # are always-on via sve2-bitperm detection and covered by the
+          # `simd` leg above. Without this leg the JSON SVE2 dispatch has no
+          # routine CI coverage (#194). Neoverse-N2 provides sve2, so
+          # use_sve2() is true here.
+          - name: simd-sve2-dispatch
+            buildCli: false
+            testCmd: SUCCINCTLY_SVE2=1 cargo test --verbose --features simd
+          - name: portable-popcount
+            buildCli: false
+            testCmd: cargo test --verbose --features portable-popcount
+          # The YAML backend selectors are mutually exclusive by cfg, so a
+          # build compiles at most one of neon/broadword/x86 and the compiler
+          # never compares them. Nothing built these two flags until #185,
+          # which is how `neon.rs` came to carry a drifted duplicate of the
+          # whole broadword layer for however long: both copies were
+          # syntactically fine, and no leg ever instantiated the one that had
+          # gone stale. This leg exists to make the unselected backend fail
+          # loudly rather than rot quietly.
+          - name: broadword-yaml
+            buildCli: false
+            testCmd: cargo test --verbose --features simd,broadword-yaml
+          - name: scalar-yaml
+            buildCli: false
+            testCmd: cargo test --verbose --features simd,scalar-yaml
+          # Same no_std cargo-test rationale as test-x86 (#2114) -- this leg
+          # needs its own copy rather than relying on that one, because it's
+          # the only place the target_arch="aarch64"-gated NEON/SVE2 test
+          # modules (src/util/simd/neon.rs, sve2.rs; src/yaml/simd/neon.rs;
+          # src/dsv/simd/neon.rs, sve2.rs; src/json/simd/neon.rs, sve2.rs)
+          # ever get built at all -- an x86_64 runner can't compile them
+          # regardless of cargo subcommand or feature flags, so a
+          # #2083-class std-only-symbol bug inside any of them was invisible
+          # to every CI leg until this one (#2123).
+          - name: no-std
+            buildCli: false
+            testCmd: cargo test --no-default-features --verbose
+          # No clippy job runs on aarch64, so every target_arch="aarch64"-gated
+          # kernel — yaml/simd/neon.rs, yaml/simd/broadword.rs, the NEON
+          # popcount path in src/bits/popcount.rs, plus the DSV/JSON/util
+          # NEON+SVE2 kernels — has only ever been built and tested here,
+          # never linted (#388, the ARM half of the same blind spot fixed for
+          # x86_64 in the `clippy` job). Three legs are needed because the
+          # YAML backend selectors are cfg-exclusive (see the `broadword-yaml`
+          # leg above): one build only ever selects one of neon/broadword/scalar.
+          - name: clippy-all-features
+            clippy: true
+            testCmd: cargo clippy --all-targets --all-features -- -D warnings
+          - name: clippy-simd
+            clippy: true
+            testCmd: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+          - name: clippy-broadword-yaml
+            clippy: true
+            testCmd: cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -239,14 +332,16 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-arm64-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       # The aarch64 SVE2 tests self-skip (emitting a `SKIPPED: SIMD test` marker
       # via note_simd_skip) when sve2-bitperm is absent. The ubuntu-24.04-arm
       # runner (Neoverse-N2) provides it, so require it here: an all-skipped SVE2
-      # suite must never read as green (#192). NEON is always present on aarch64.
+      # suite must never read as green (#192). NEON is always present on
+      # aarch64. Not meaningful for the Clippy legs (they only compile, never
+      # execute SIMD), so skipped there.
       - name: Verify SIMD CPU features (NEON + SVE2-BITPERM)
-        if: needs.gate.outputs.code == 'true'
+        if: needs.gate.outputs.code == 'true' && !matrix.clippy
         run: |
           echo "=== CPU Info ==="
           lscpu | grep -E "Model name|Architecture|CPU|Flags" || true
@@ -256,90 +351,13 @@ jobs:
           fi
           echo "NEON (always on aarch64) + SVE2-BITPERM present: SIMD tests will assert, not skip."
 
-      - name: Build
-        if: needs.gate.outputs.code == 'true'
-        run: cargo build --verbose
-
       - name: Build CLI (for integration tests)
-        if: needs.gate.outputs.code == 'true'
+        if: needs.gate.outputs.code == 'true' && matrix.buildCli
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated tests
+      - name: Run
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
-
-      - name: Run bench-runner-gated tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
-
-      - name: Run tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose
-
-      - name: Run tests (simd feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd
-
-      # SUCCINCTLY_SVE2=1 switches JSON semi-index building to the SVE2
-      # kernels (src/json/simd/mod.rs use_sve2()); DSV and broadword SVE2 are
-      # always-on via sve2-bitperm detection and covered by the runs above.
-      # Without this step the JSON SVE2 dispatch has no routine CI coverage
-      # (#194). Neoverse-N2 provides sve2, so use_sve2() is true here.
-      - name: Run tests (simd feature, JSON SVE2 dispatch)
-        if: needs.gate.outputs.code == 'true'
-        run: SUCCINCTLY_SVE2=1 cargo test --verbose --features simd
-
-      - name: Run tests (portable-popcount feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features portable-popcount
-
-      # The YAML backend selectors are mutually exclusive by cfg, so a build
-      # compiles at most one of neon/broadword/x86 and the compiler never
-      # compares them. Nothing built these two flags until #185, which is how
-      # `neon.rs` came to carry a drifted duplicate of the whole broadword layer
-      # for however long: both copies were syntactically fine, and no leg ever
-      # instantiated the one that had gone stale. These runs exist to make the
-      # unselected backends fail loudly rather than rot quietly.
-      - name: Run tests (broadword-yaml — ARM64 SWAR instead of NEON)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd,broadword-yaml
-
-      - name: Run tests (scalar-yaml — no SIMD or broadword)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd,scalar-yaml
-
-      # Same no_std cargo-test rationale as test-x86 (#2114) -- this leg needs
-      # its own copy rather than relying on that one, because it's the only
-      # place the target_arch="aarch64"-gated NEON/SVE2 test modules
-      # (src/util/simd/neon.rs, sve2.rs; src/yaml/simd/neon.rs;
-      # src/dsv/simd/neon.rs, sve2.rs; src/json/simd/neon.rs, sve2.rs) ever
-      # get built at all -- an x86_64 runner can't compile them regardless of
-      # cargo subcommand or feature flags, so a #2083-class std-only-symbol
-      # bug inside any of them was invisible to every CI leg until this one
-      # (#2123).
-      - name: Check no_std compatibility (build + run tests)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --no-default-features --verbose
-
-      # No clippy job runs on aarch64, so every target_arch="aarch64"-gated kernel —
-      # yaml/simd/neon.rs, yaml/simd/broadword.rs, the NEON popcount path in
-      # src/bits/popcount.rs, plus the DSV/JSON/util NEON+SVE2 kernels — has only ever
-      # been built and tested here, never linted (#388, the ARM half of the same
-      # blind spot fixed for x86_64 in the `clippy` job above). Three invocations are
-      # needed because the YAML backend selectors are cfg-exclusive (see the `Run
-      # tests (broadword-yaml...)` comment above): one build only ever selects one of
-      # neon/broadword/scalar.
-      - name: Run Clippy (--all-features — scalar-yaml + NEON/SVE2 kernels)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run Clippy (simd feature — NEON YAML backend selected)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
-
-      - name: Run Clippy (broadword-yaml — ARM64 SWAR backend selected)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+        run: ${{ matrix.testCmd }}
 
   test-macos-arm:
     name: Test (macOS ARM64)
@@ -417,8 +435,14 @@ jobs:
   # (job-level `if`, like bench/coverage/perf-guard) rather than run-and-skip-steps. Also
   # skipped on `merge_group` (#310): it is advisory, not required, so running it
   # per queue entry would just add latency to every merge without gating it.
+  # #3059: same rationale as test-x86-matrix above, applied to the second
+  # matrix dimension — the 6 feature-flag `cargo test` invocations per
+  # toolchain leg are mutually independent and were previously chained
+  # sequentially. Unlike test-x86/test-arm, this job isn't a required status
+  # check, so no thin aggregator is needed: the per-combination context names
+  # are free to vary.
   test-x86-upstream:
-    name: Test (x86_64) (${{ matrix.rust }})
+    name: Test (x86_64) (${{ matrix.rust }}, ${{ matrix.variant.name }})
     needs: gate
     if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
@@ -426,6 +450,26 @@ jobs:
       fail-fast: false                                   # beta breakage must not cancel nightly
       matrix:
         rust: [beta, nightly]
+        variant:
+          - name: cli-gated
+            buildCli: true
+            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
+          - name: bench-runner-gated
+            buildCli: true
+            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+          - name: default
+            buildCli: false
+            testCmd: cargo test --verbose
+          - name: simd
+            buildCli: false
+            testCmd: cargo test --verbose --features simd
+          - name: portable-popcount
+            buildCli: false
+            testCmd: cargo test --verbose --features portable-popcount
+          # Same no_std cargo-test rationale as test-x86 (#2114).
+          - name: no-std
+            buildCli: false
+            testCmd: cargo test --no-default-features --verbose
     continue-on-error: ${{ matrix.rust == 'nightly' }}   # beta gates CI; nightly is advisory
     env:
       # Same x86 SIMD runner contract as test-x86 (#193).
@@ -447,42 +491,29 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --verbose
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build CLI (for integration tests)
+        if: matrix.variant.buildCli
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated tests
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
-
-      - name: Run bench-runner-gated tests
-        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
-
       - name: Run tests
-        run: cargo test --verbose
-
-      - name: Run tests (simd feature)
-        run: cargo test --verbose --features simd
-
-      - name: Run tests (portable-popcount feature)
-        run: cargo test --verbose --features portable-popcount
-
-      # Same no_std cargo-test rationale as test-x86 (#2114).
-      - name: Check no_std compatibility (build + run tests)
-        run: cargo test --no-default-features --verbose
+        run: ${{ matrix.variant.testCmd }}
 
   # Skipped on `merge_group` (#310): a 3-arch `cargo bench` fan-out is far too
   # slow to run per queue entry, and it gates nothing.
+  #
+  # #3059: the 3 `cargo bench` invocations per arch used to run back-to-back
+  # in one job; matrixed over both arch and feature variant here so they run
+  # in parallel instead.
   bench:
-    name: Bench (${{ matrix.name }})
+    name: Bench (${{ matrix.platform.name }}, ${{ matrix.variant.name }})
     needs: gate
     if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
     strategy:
+      fail-fast: false
       matrix:
-        include:
+        platform:
           - name: x86_64
             runner: ubuntu-latest
             arch: x86_64
@@ -492,7 +523,14 @@ jobs:
           - name: ARM64-macOS
             runner: macos-latest
             arch: arm64-macos
-    runs-on: ${{ matrix.runner }}
+        variant:
+          - name: default
+            args: ''
+          - name: simd
+            args: '--features simd'
+          - name: portable
+            args: '--features portable-popcount'
+    runs-on: ${{ matrix.platform.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -508,7 +546,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-${{ matrix.arch }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.platform.arch }}-bench-${{ matrix.variant.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Print CPU info
         run: |
@@ -527,20 +565,14 @@ jobs:
             echo "Note: Apple Silicon does not support SVE/SVE2"
           fi
 
-      - name: Run benchmarks (default)
-        run: cargo bench --bench rank_select -- --noplot | tee bench-default.txt
-
-      - name: Run benchmarks (simd)
-        run: cargo bench --bench rank_select --features simd -- --noplot | tee bench-simd.txt
-
-      - name: Run benchmarks (portable)
-        run: cargo bench --bench rank_select --features portable-popcount -- --noplot | tee bench-portable.txt
+      - name: Run benchmarks
+        run: cargo bench --bench rank_select ${{ matrix.variant.args }} -- --noplot | tee bench-${{ matrix.variant.name }}.txt
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-results-${{ matrix.arch }}
-          path: bench-*.txt
+          name: benchmark-results-${{ matrix.platform.arch }}-${{ matrix.variant.name }}
+          path: bench-${{ matrix.variant.name }}.txt
 
   # Instruction-count regression guard (#1523): `bench` above times
   # `rank_select` and uploads artifacts nobody compares against a baseline --
