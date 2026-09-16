@@ -4977,7 +4977,7 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
         expr,
         &PathContextAt {
             key,
-            path,
+            path: &|| Cow::Borrowed(path),
             parent_of: Some(parent_of),
             prefetch: None,
         },
@@ -14992,7 +14992,7 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 /// `PathTrail::from_slice` bridge, now gone) and back out again, plus a clone
 /// of its ancestor `Vec`, per position per step: O(depth) allocations and
 /// component clones where the step itself is O(1). Extending through this
-/// trait makes a step exactly one allocation for either trail.
+/// trait makes a step one trail link for either trail.
 ///
 /// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
 trait StepTrail<V: DocumentValue>: Clone {
@@ -15098,10 +15098,11 @@ impl<V: DocumentValue> PathContextTrail<V> {
         out
     }
 
-    /// `n >= 1` levels up: that position's trail and the node standing
-    /// there, or `None` above the root.
+    /// `n` levels up: that position's trail and the node standing there, or
+    /// `None` above the root -- and for `n == 0`, whose node is the
+    /// position's own and not on its trail ([`path_context_hop`] answers
+    /// that one).
     fn hop(&self, n: usize) -> Option<(Self, PathNode<V>)> {
-        debug_assert!(n >= 1, "a zero hop keeps the position itself");
         let link = self.links().nth(n.checked_sub(1)?)?;
         Some((link.parent.clone(), link.from.clone()))
     }
@@ -15700,8 +15701,8 @@ fn owned_nav_children<S: EvalSemantics>(
 /// step inside an *outer* pipe (`path(((.a|.b)|.c))`, see the doc comment
 /// where this arm used to live) is rare, but recurses on a borrowed `&[Expr]`
 /// slice here for the identical reason -- no owned `Expr::Pipe(rest.to_vec())`
-/// rebuilt per stage, and `path`'s own O(1) `PathTrail::extend` instead of an
-/// O(depth) `Vec` clone-and-push.
+/// rebuilt per stage, and the trail's own O(1) [`StepTrail::extend_from`]
+/// instead of an O(depth) `Vec` clone-and-push.
 fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     exprs: &[Expr],
     node: &PathNode<V>,
@@ -15948,18 +15949,13 @@ fn path_context_component_walkable(expr: &Expr) -> bool {
 }
 
 /// A position reached during a path-context walk: the node the path reached
-/// (or its absence), the path itself, and the node at every proper prefix of
-/// that path.
+/// (or its absence), and the trail to it -- the path itself and the node at
+/// every proper prefix of that path ([`PathContextTrail`]).
 ///
-/// `ancestors[i]` is the node at `path[..i]`, so `ancestors.len() ==
-/// path.len()` and `parent(n)` is a truncation of both rather than a
-/// re-navigation from the root -- which is what `resolve_ancestor_path` has
-/// to do once the document is an `OwnedValue` tree.
-///
-/// Retaining a stack of cursors is cheap and already an established pattern
-/// here: `V::Cursor` is `Copy` and 32 bytes, and `LazySource::Cursors` and
-/// `GenericResult::ManyCursor` both hold arbitrary cursor vectors across
-/// evaluation.
+/// Every link holds the node its component was taken from, so `parent(n)`
+/// walks `n` links back rather than re-navigating from the root. Positions
+/// reached from one node share that node's trail (#2572), so holding the
+/// ancestors costs one link per step, not a copy of the prefix per position.
 ///
 /// An absent position *is* representable (#2416 phase 2). `.a.b` on
 /// `{"a":{}}` reaches [`PathNode::Absent`] at `["a","b"]`: it emits `null`
@@ -16169,15 +16165,15 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // input -- or, when that node is not in this document, to a
         // detached copy of the value.
         Expr::TrackedVar(var) => {
-            // The node itself, else the root-most live ancestor: every live
-            // node on one trail is a cursor of the same document, which is
-            // all `bind_origin_cursor` reads from its anchor.
+            // The node itself, else the nearest live ancestor: every live
+            // node on one trail is a cursor of the same document, and the
+            // document is all `bind_origin_cursor` reads from its anchor.
             let live = |n: &PathNode<V>| match n {
                 PathNode::At(c) => Some(*c),
                 PathNode::Absent | PathNode::Owned(_) => None,
             };
-            let anchor = live(&pos.node)
-                .or_else(|| pos.trail.links().filter_map(|link| live(&link.from)).last());
+            let anchor =
+                live(&pos.node).or_else(|| pos.trail.links().find_map(|link| live(&link.from)));
             match anchor.and_then(|a| bind_origin_cursor(&var.node, &a)) {
                 Some(c) => out.push(path_context_root::<V>(c)?),
                 None => out.push(PathContextPos {
@@ -17094,9 +17090,9 @@ fn path_context_component_escape<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// `expr`'s `key`/`path`/`file_index` reads rewritten to the constants `pos`
-/// answers -- the same [`path_context_resolve_constants`] every other route
-/// uses, with no `parent` source: the walk's gate
-/// ([`path_context_component_walkable`]) admits constant-only reads.
+/// answers -- [`path_context_resolve_absent`]'s rewrite, which has no
+/// `parent` source: the walk's gate ([`path_context_component_walkable`])
+/// admits constant-only reads.
 fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
@@ -17104,16 +17100,7 @@ fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
     if !needs_path_context(expr) {
         return Ok(expr.clone());
     }
-    let path = pos.trail.to_vec();
-    path_context_resolve_constants::<S>(
-        expr,
-        &PathContextAt {
-            key: path.last(),
-            path: &path,
-            parent_of: None,
-            prefetch: None,
-        },
-    )
+    path_context_resolve_absent::<S, V>(expr, pos)
 }
 
 /// The *target* of a computed bracket or slice, as positions (spine 2416,
@@ -17913,8 +17900,8 @@ fn key_node_spells<C: DocumentCursor>(kc: &C, v: &C::Value, expected: &str) -> b
 }
 
 /// The path from the document root to `c`, the node at every proper prefix
-/// of it -- `(path, ancestors)` in the shape [`PathContextPos`] holds them --
-/// and whether `c` is itself a member's key node. Empty at the root.
+/// of it -- `ancestors[i]` is the node `path[i]` is taken from, the pairs
+/// [`PathContextTrail::from_climb`] links -- and whether `c` is itself a member's key node. Empty at the root.
 ///
 /// A key node's path is its member's path: `.a.b | key | path` is
 /// `["a","b"]` in yq v4.53.3, and `parent` from it is the mapping, so the
@@ -19073,12 +19060,7 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 }
 
 /// Replace every path-context builtin in `expr` with the constant it answers
-/// at the position `path` reaches, leaving a filter that needs no path
-/// context at all.
-///
-/// The position's path, not the position (#2572): a position's trail is a
-/// chain, and a caller rewriting several stages at one position flattens it
-/// once rather than per stage.
+/// at `pos`, leaving a filter that needs no path context at all.
 ///
 /// The arms mirror [`path_context_absent_resolvable`] exactly, and the two
 /// are held together by `path_context_absent_resolution_clears_path_context`
@@ -19086,18 +19068,18 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 /// here would evaluate its `key` against no position and answer `null`,
 /// which is the silent-fallback failure ADR-0021 was written to end. The
 /// `_` arm is reached only for a subtree with no path-context builtin in it.
-fn path_context_resolve_absent<S: EvalSemantics>(
+fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
-    path: &[OwnedValue],
+    pos: &PathContextPos<V>,
 ) -> Result<Expr, EvalError> {
     // An absent position always has at least one component -- it took a
-    // `.a`/`[i]` step to become absent -- so its key is the walk's own
-    // `path.last()`.
+    // `.a`/`[i]` step to become absent -- so its key is the trail's last
+    // component. The full path is flattened only if the rewrite reads it.
     path_context_resolve_constants::<S>(
         expr,
         &PathContextAt {
-            key: path.last(),
-            path,
+            key: pos.trail.last_component(),
+            path: &|| Cow::Owned(pos.trail.to_vec()),
             parent_of: None,
             prefetch: None,
         },
@@ -19117,7 +19099,11 @@ fn path_context_resolve_absent<S: EvalSemantics>(
 /// rewriter's `Parent` arms are unreachable with it unset.
 struct PathContextAt<'a> {
     key: Option<&'a OwnedValue>,
-    path: &'a [OwnedValue],
+    /// The full path, produced only for a rewrite that reads it (#2572): the
+    /// walk's position holds its path as a chain, and flattening it for a
+    /// `key`-only read cost O(depth) per evaluation. A caller already holding
+    /// a slice lends it (`Cow::Borrowed`).
+    path: &'a dyn Fn() -> Cow<'a, [OwnedValue]>,
     parent_of: Option<&'a dyn Fn(usize) -> Result<Option<OwnedValue>, EvalError>>,
     /// spine 2416 (identity pass): what to do with a sub-expression whose
     /// reads the rewrite cannot resolve -- a pipe that moves before it reads
@@ -19155,7 +19141,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             None => Expr::Builtin(Builtin::Empty),
         },
         Expr::Builtin(Builtin::PathNoArg) => {
-            let components: Vec<Expr> = path.iter().map(path_component_literal).collect();
+            let components: Vec<Expr> = path().iter().map(path_component_literal).collect();
             Expr::Array(Box::new(match components.len() {
                 0 => Expr::Builtin(Builtin::Empty),
                 1 => components.into_iter().next().expect("len checked"),
@@ -19179,7 +19165,9 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // (`--eval-all '.[] | try error("x") catch file_index'` resolves
         // the handler here), so the position's own file it is -- `path` is
         // absolute, which is what `file_index_for_path` reads.
-        Expr::Builtin(Builtin::FileIndex) => Expr::Literal(Literal::Int(file_index_for_path(path))),
+        Expr::Builtin(Builtin::FileIndex) => {
+            Expr::Literal(Literal::Int(file_index_for_path(&path())))
+        }
         // #2472: `parent`/`parent(n)` inside a stage the owned identity
         // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
         // null)`). The node they answer with is not a constant -- no
@@ -19204,7 +19192,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             };
             let mut ancestors: Vec<Expr> = Vec::new();
             for n_value in counts {
-                let n = classify_parent_n::<S>(&n_value, path.len())?;
+                let n = classify_parent_n::<S>(&n_value, path().len())?;
                 ancestors.push(path_context_resolve_parent(at, n)?);
             }
             match ancestors.len() {
@@ -19643,10 +19631,9 @@ fn path_context_resolve_absent_stages<S: EvalSemantics, V: DocumentValue>(
     rest: &[Expr],
     pos: &PathContextPos<V>,
 ) -> Result<Expr, EvalError> {
-    let path = pos.trail.to_vec();
     let mut stages = vec_with_capacity(rest.len());
     for stage in rest {
-        stages.push(path_context_resolve_absent::<S>(stage, &path)?);
+        stages.push(path_context_resolve_absent::<S, V>(stage, pos)?);
     }
     let resolved = Expr::Pipe(stages);
     debug_assert!(
@@ -22776,7 +22763,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
         expr,
         &PathContextAt {
             key: key.as_ref(),
-            path: &path,
+            path: &|| Cow::Borrowed(path.as_slice()),
             // A computed component keeps the constant-only gate
             // ([`owned_identity_component_supported`]), so no `parent` can
             // appear in one.
@@ -24192,7 +24179,7 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
         stage,
         &PathContextAt {
             key: key.as_ref(),
-            path: &path,
+            path: &|| Cow::Borrowed(path.as_slice()),
             parent_of: Some(&parent_of),
             prefetch: Some(&prefetch),
         },
@@ -35218,7 +35205,7 @@ mod tests {
                 path_context_absent_resolvable(&expr),
                 "gate refuses `{filter}`; drop the row or widen the gate"
             );
-            let resolved = path_context_resolve_absent::<JqSemantics>(&expr, &pos.trail.to_vec())
+            let resolved = path_context_resolve_absent::<JqSemantics, _>(&expr, &pos)
                 .expect("the constant route's rewrite cannot fail");
             assert!(
                 !needs_path_context(&resolved),
@@ -35433,8 +35420,6 @@ mod tests {
         assert!(!can(".[]?"));
     }
 
-    /// `key`/`parent`/`path` as cursor properties, straight from the tree,
-    /// including the document-root edge (#2421) and array indices.
     /// #2572: a walk step extends the position's trail rather than copying
     /// it. Every position `.[]` reaches from one node hangs off that node's
     /// own link -- one allocation per position whatever the depth -- and the
@@ -35503,24 +35488,37 @@ mod tests {
     }
 
     /// #2572: a trail is as deep as the document a walk is rooted in, not
-    /// only as the query, so dropping one must not recurse once per link --
-    /// under a derived drop a million links overflow a test thread's stack.
+    /// only as the query, so dropping one must not recurse once per link.
+    /// The drop runs on a thread with a pinned 2 MiB stack, where a derived
+    /// (recursive) drop of this chain overflows, so the test does not depend
+    /// on the ambient test-thread stack size.
     #[test]
     fn path_context_trail_drops_a_deep_chain_iteratively_2572() {
-        let mut trail: PathContextTrail<crate::json::StandardJson<'static, Vec<u64>>> =
-            PathContextTrail::root();
-        for i in 0..1_000_000 {
-            trail = trail.extend_from(OwnedValue::Int(i), &PathNode::Absent);
-        }
-        assert_eq!(trail.depth(), 1_000_000);
-        // A second handle keeps the chain alive through the first drop, so
-        // the unlink stops at a shared link and the rest goes with the last.
-        let shared = trail.hop(1).expect("one level up").0;
-        drop(trail);
-        assert_eq!(shared.depth(), 999_999);
-        drop(shared);
+        const LINKS: i64 = 100_000;
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut trail: PathContextTrail<crate::json::StandardJson<'static, Vec<u64>>> =
+                    PathContextTrail::root();
+                for i in 0..LINKS {
+                    trail = trail.extend_from(OwnedValue::Int(i), &PathNode::Absent);
+                }
+                assert_eq!(trail.depth(), LINKS as usize);
+                // A second handle keeps the chain alive through the first
+                // drop, so the unlink stops at a shared link and the rest
+                // goes with the last handle.
+                let shared = trail.hop(1).expect("one level up").0;
+                drop(trail);
+                assert_eq!(shared.depth(), LINKS as usize - 1);
+                drop(shared);
+            })
+            .expect("spawn")
+            .join()
+            .expect("the drop completes");
     }
 
+    /// `key`/`parent`/`path` as cursor properties, straight from the tree,
+    /// including the document-root edge (#2421) and array indices.
     #[test]
     fn cursor_properties_answer_from_the_tree_2416() {
         let json = br#"{"a":{"b":[10,20]},"c":1}"#;
