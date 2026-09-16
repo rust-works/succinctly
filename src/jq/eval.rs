@@ -45,6 +45,7 @@ use super::document::{
     DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
+use super::math;
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_pattern_subexprs, map_subexprs};
 
@@ -51734,25 +51735,6 @@ fn round_f64(x: f64) -> f64 {
     }
 }
 
-// no_std compatible sqrt using Newton-Raphson
-fn sqrt_f64(x: f64) -> f64 {
-    if x < 0.0 {
-        return f64::NAN;
-    }
-    if x == 0.0 {
-        return 0.0;
-    }
-    let mut guess = x / 2.0;
-    for _ in 0..50 {
-        let next = (guess + x / guess) / 2.0;
-        if (next - guess).abs() < 1e-15 * guess.abs() {
-            break;
-        }
-        guess = next;
-    }
-    guess
-}
-
 /// Builtin: floor
 fn builtin_floor<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
@@ -51796,7 +51778,7 @@ fn builtin_trunc<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
         Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Ok(n) => QueryResult::Owned(OwnedValue::Int(libm::trunc(n) as i64)),
+        Ok(n) => QueryResult::Owned(OwnedValue::Int(math::trunc(n) as i64)),
         Err(r) => r,
     }
 }
@@ -51807,7 +51789,7 @@ fn builtin_sqrt<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(sqrt_f64(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sqrt(n))),
         Err(r) => r,
     }
 }
@@ -51818,7 +51800,7 @@ fn builtin_fabs<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::fabs(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::fabs(n))),
         Err(r) => r,
     }
 }
@@ -51829,7 +51811,7 @@ fn builtin_log<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log(n))),
         Err(r) => r,
     }
 }
@@ -51840,7 +51822,7 @@ fn builtin_log10<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log10(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log10(n))),
         Err(r) => r,
     }
 }
@@ -51851,7 +51833,7 @@ fn builtin_log2<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::log2(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log2(n))),
         Err(r) => r,
     }
 }
@@ -51862,7 +51844,7 @@ fn builtin_exp<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp(n))),
         Err(r) => r,
     }
 }
@@ -51873,7 +51855,7 @@ fn builtin_exp10<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::pow(10.0, n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp10(n))),
         Err(r) => r,
     }
 }
@@ -51884,7 +51866,7 @@ fn builtin_exp2<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::exp2(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp2(n))),
         Err(r) => r,
     }
 }
@@ -51941,7 +51923,7 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
             };
-            QueryResult::Owned(OwnedValue::Float(libm::pow(base, exp)))
+            QueryResult::Owned(OwnedValue::Float(math::pow(base, exp)))
         },
     )
 }
@@ -51954,7 +51936,7 @@ fn builtin_sin<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sin(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sin(n))),
         Err(r) => r,
     }
 }
@@ -51965,7 +51947,7 @@ fn builtin_cos<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cos(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::cos(n))),
         Err(r) => r,
     }
 }
@@ -51976,7 +51958,7 @@ fn builtin_tan<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tan(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::tan(n))),
         Err(r) => r,
     }
 }
@@ -51987,7 +51969,7 @@ fn builtin_asin<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asin(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::asin(n))),
         Err(r) => r,
     }
 }
@@ -51998,7 +51980,7 @@ fn builtin_acos<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acos(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::acos(n))),
         Err(r) => r,
     }
 }
@@ -52009,7 +51991,7 @@ fn builtin_atan<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atan(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::atan(n))),
         Err(r) => r,
     }
 }
@@ -52044,7 +52026,7 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
             };
-            QueryResult::Owned(OwnedValue::Float(libm::atan2(y, x)))
+            QueryResult::Owned(OwnedValue::Float(math::atan2(y, x)))
         },
     )
 }
@@ -52057,7 +52039,7 @@ fn builtin_sinh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::sinh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sinh(n))),
         Err(r) => r,
     }
 }
@@ -52068,7 +52050,7 @@ fn builtin_cosh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::cosh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::cosh(n))),
         Err(r) => r,
     }
 }
@@ -52079,7 +52061,7 @@ fn builtin_tanh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::tanh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::tanh(n))),
         Err(r) => r,
     }
 }
@@ -52090,7 +52072,7 @@ fn builtin_asinh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::asinh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::asinh(n))),
         Err(r) => r,
     }
 }
@@ -52101,7 +52083,7 @@ fn builtin_acosh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::acosh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::acosh(n))),
         Err(r) => r,
     }
 }
@@ -52112,7 +52094,7 @@ fn builtin_atanh<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W>(&value, optional) {
-        Ok(n) => QueryResult::Owned(OwnedValue::Float(libm::atanh(n))),
+        Ok(n) => QueryResult::Owned(OwnedValue::Float(math::atanh(n))),
         Err(r) => r,
     }
 }
