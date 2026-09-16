@@ -17670,6 +17670,40 @@ fn update_streaming_holdouts_2974() -> Result<()> {
     Ok(())
 }
 
+/// #2974 review: what a `?//` retry in the path does to a write the earlier
+/// alternative could not make depends on the operator, in jq 1.7.1. `=`'s
+/// `reduce` carries on, so a retry whose writes succeed succeeds; `|=` and
+/// `op=` fail on any retry (jq's own accumulator quirk, `Paths must be
+/// specified as an array`), so succinctly keeps the earlier write's error --
+/// same exit code, different message, which is why those rows pin stdout and
+/// the exit code rather than stderr.
+#[test]
+fn update_streaming_retry_after_a_failed_write_2974() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1",
+        ],
+        Some("[1]"),
+    )?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("[1]\n", "", 0));
+
+    for (input, filter) in [
+        (
+            "[1]",
+            "(. as $x ?// $y | .[if $x == null then 0 else -5 end]) |= 1",
+        ),
+        (
+            "[1,\"a\"]",
+            "(. as $x ?// $y | .[if $x == null then 1 else 0 end]) += \"x\"",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2267: a bounded consumer's demand now reaches the computed-navigation
 /// generators themselves -- the "stopping from above" gap
 /// `resolve_slice_expr`'s own body comment recorded as still open, closed by
