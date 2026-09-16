@@ -832,11 +832,6 @@ fn build_call_graph(
             body: right,
             ..
         }
-        | Expr::AsPattern {
-            expr: left,
-            body: right,
-            ..
-        }
         | Expr::Assign {
             path: left,
             value: right,
@@ -922,12 +917,28 @@ fn build_call_graph(
             }
         }
 
+        // #2971 review: `check` compile-checks every computed key in these
+        // patterns (`bind_patterns`, #2734), so a call inside one is an edge
+        // like any other. Skipping them left a def written in a key -- `. as
+        // {(def g: nosuchfn; g): $x} | $x` -- permanently unreachable, and so
+        // never checked, where jq refuses to compile it.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            build_call_graph(expr, scope, enclosing, graph, roots);
+            build_call_graph_pattern_keys(patterns, scope, enclosing, graph, roots);
+            build_call_graph(body, scope, enclosing, graph, roots);
+        }
+
         Expr::Reduce {
             input,
+            patterns,
             init,
             update,
-            ..
         } => {
+            build_call_graph_pattern_keys(patterns, scope, enclosing, graph, roots);
             build_call_graph(input, scope, enclosing, graph, roots);
             build_call_graph(init, scope, enclosing, graph, roots);
             build_call_graph(update, scope, enclosing, graph, roots);
@@ -935,11 +946,12 @@ fn build_call_graph(
 
         Expr::Foreach {
             input,
+            patterns,
             init,
             update,
             extract,
-            ..
         } => {
+            build_call_graph_pattern_keys(patterns, scope, enclosing, graph, roots);
             build_call_graph(input, scope, enclosing, graph, roots);
             build_call_graph(init, scope, enclosing, graph, roots);
             build_call_graph(update, scope, enclosing, graph, roots);
@@ -1060,6 +1072,41 @@ fn build_call_graph(
     }
 }
 
+/// [`build_call_graph`] over every computed key in `patterns` -- the mirror
+/// of `check`'s `check_pattern_keys`, which compile-checks the same keys in
+/// the same scope. A key is an ordinary expression, so a call inside one is
+/// an ordinary edge from `enclosing`.
+fn build_call_graph_pattern_keys(
+    patterns: &[Pattern],
+    scope: &mut ReachScope,
+    enclosing: Option<usize>,
+    graph: &mut BTreeMap<usize, Vec<usize>>,
+    roots: &mut Vec<usize>,
+) {
+    for pattern in patterns {
+        match pattern {
+            Pattern::Var(_) => {}
+            Pattern::Object(entries) => {
+                for entry in entries {
+                    if let ObjectKey::Expr(key) = &entry.key {
+                        build_call_graph(key, scope, enclosing, graph, roots);
+                    }
+                    build_call_graph_pattern_keys(
+                        core::slice::from_ref(&entry.pattern),
+                        scope,
+                        enclosing,
+                        graph,
+                        roots,
+                    );
+                }
+            }
+            Pattern::Array(elements) => {
+                build_call_graph_pattern_keys(elements, scope, enclosing, graph, roots);
+            }
+        }
+    }
+}
+
 /// Every `def` body address reachable from `roots` by following `graph`
 /// -- iterative, not recursive, so a long call chain (or the pathological
 /// self-recursive/mutually-recursive cases this graph handles trivially,
@@ -1095,21 +1142,29 @@ fn compute_reachable(graph: &BTreeMap<usize, Vec<usize>>, roots: &[usize]) -> BT
 ///
 /// `build_call_graph`'s reachability graph (#2740) identifies a `def` by
 /// its body's heap address, read once off the tree before this function's
-/// own `&mut`-mutating walk runs. That walk reallocates a subtree in two
-/// places -- `check`'s `Expr::Builtin` arm clones each operand, and its
-/// `Expr::Shared` arm's `Rc::make_mut` clones when the `Rc` has another
-/// owner -- and either one used to strand every `def` inside, checking it
-/// against an address the graph had never seen and silently skipping it.
+/// own `&mut`-mutating walk runs. That walk reallocates subtrees in three
+/// places, and each used to strand every `def` inside -- checking it
+/// against an address the graph had never seen, and silently skipping it:
 ///
-/// The builtin arm fired on ordinary programs through this crate's own CLI
-/// (`[1]|map(def g: nosuchfn; g)`); the `Shared` arm needed an external
-/// caller holding a second handle. Both now re-key the reachable set onto
-/// the clone (`rebase_reachable`), so a caller of this public API gets the
-/// same result whether or not it shares the `Rc` it passes in (#2971).
+/// - `check`'s `Expr::Builtin` arm clones each operand. Ordinary programs
+///   hit this through the CLI: `[1]|map(def g: nosuchfn; g)`.
+/// - `check`'s `Expr::FuncCall` arm, when a builtin name is shadowed by a
+///   user `def`, unpacks the `builtin_fallback` parse -- by moving, except
+///   for its own `Builtin` arm, which clones.
+/// - `check`'s `Expr::Shared` arm reaches its subtree through `Rc::make_mut`,
+///   which clones when an external caller holds another handle on the `Rc`.
 ///
-/// Any *new* clone or clone-on-write of a subtree inside `check` has to do
-/// the same, or it reopens this; a move does not, since moving an `Expr`
-/// carries its `Box` pointers along unchanged.
+/// All three now re-key the reachable set onto the copy (`rebase_reachable`),
+/// so a caller of this public API gets the same result whether or not it
+/// shares the `Rc` it passes in (#2971).
+///
+/// The invariant that keeps this closed: **after a clone, check the copy
+/// against the re-keyed set only, never the enclosing one.** The enclosing
+/// set still holds the addresses of trees already replaced and freed, and
+/// the allocator reuses them -- consulting it is what once made an uncalled
+/// def look called. Any new clone of a subtree inside `check` must follow
+/// the same rule; a move need not, since moving an `Expr` carries its `Box`
+/// pointers along unchanged.
 pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
     match resolve_func_calls_all(expr).into_iter().next() {
         Some(first) => Err(first),
@@ -1442,19 +1497,16 @@ fn check(
         // -- the uniquely owned case, which is every case this crate's own
         // callers produce, pays nothing.
         Expr::Shared(inner) => {
-            let original = (Rc::strong_count(inner) > 1 || Rc::weak_count(inner) > 0)
-                .then(|| Rc::clone(inner));
-            let target = Rc::make_mut(inner);
-            let rebased = original
-                .as_deref()
-                .and_then(|original| rebase_reachable(original, &*target, reachable));
-            check(
-                target,
-                scope,
-                var_scope,
-                errors,
-                rebased.as_ref().unwrap_or(reachable),
-            );
+            if Rc::strong_count(inner) > 1 || Rc::weak_count(inner) > 0 {
+                // Holding `original` keeps the pre-clone tree alive while it is
+                // paired with the copy -- and guarantees `make_mut` clones.
+                let original = Rc::clone(inner);
+                let target = Rc::make_mut(inner);
+                let rebased = rebase_reachable(&original, target, reachable);
+                check(target, scope, var_scope, errors, &rebased);
+            } else {
+                check(Rc::make_mut(inner), scope, var_scope, errors, reachable);
+            }
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
@@ -1824,9 +1876,22 @@ fn check(
                 *name = qualified;
             }
             if resolved {
+                // #2971: of `builtin_fallback_into_args`'s arms only the
+                // `Builtin` one clones -- the rest move their operands, which
+                // keeps every `def` body where `build_call_graph` found it.
+                // Where it clones, the new args are re-keyed; both address
+                // lists come from `builtin_kids` order, so they pair up.
+                let mut rebased = None;
                 if let Some(fallback) = builtin_fallback.take() {
+                    let cloned_from =
+                        matches!(*fallback, Expr::Builtin(_)).then(|| def_body_addrs(&fallback));
                     *args = builtin_fallback_into_args(*fallback);
+                    rebased = cloned_from.map(|from| {
+                        let to = args.iter().flat_map(def_body_addrs).collect();
+                        translate_reachable(&from, to, reachable)
+                    });
                 }
+                let reachable = rebased.as_ref().unwrap_or(reachable);
                 for a in args.iter_mut() {
                     check(a, scope, var_scope, errors, reachable);
                 }
@@ -1900,13 +1965,7 @@ fn check(
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
-                check(
-                    &mut copy,
-                    scope,
-                    var_scope,
-                    errors,
-                    rebased.as_ref().unwrap_or(reachable),
-                );
+                check(&mut copy, scope, var_scope, errors, &rebased);
                 copy
             });
         }
@@ -1918,57 +1977,108 @@ fn check(
 ///
 /// [`build_call_graph`] identifies a `def` by its body's heap address, and a
 /// clone reallocates every `Box` it copies, so none of `original`'s keys
-/// name anything in `copy`. A *move* would not have this problem -- moving
-/// an `Expr` carries its `Box` pointers along unchanged -- which is why
-/// [`check`]'s one clone site, its `Expr::Builtin` arm, is the only place
-/// this is needed.
+/// name anything in `copy`. `original` and `copy` are structurally identical,
+/// so one deterministic walk ([`def_body_addrs`]) visits their defs in the
+/// same order, and zipping the two lists pairs each body with its copy.
 ///
-/// `original` and `copy` are structurally identical, so walking both with
-/// the same deterministic pre-order walk ([`any_subexpr`]) visits their
-/// `def`s in the same order, and zipping the two address lists pairs each
-/// body with its copy. Only the copies of reachable bodies are kept: every
-/// lookup the subsequent `check(copy, ..)` makes is for a `def` inside
-/// `copy`, so nothing outside it needs a key.
+/// **The caller must use the result, never fall back to `reachable`.** That
+/// is what makes this sound. `reachable` still holds the addresses of every
+/// tree this pass has already replaced and freed, and the allocator hands
+/// those addresses out again -- to exactly the copies this function is
+/// called for. Consulting it after a clone let an *uncalled* def land on a
+/// freed address that had belonged to a *called* one, and be rejected:
+/// `def select: 1; [1]|map(def g: 1; g), [1]|map(select(def k: nosuchfn; 1))`
+/// failed to compile where jq runs it. The set returned here holds only
+/// addresses inside `copy`, each put there because its own original was
+/// reachable, so a reused address cannot match by coincidence.
 ///
-/// `None` when `original` holds no `def` at all -- the overwhelmingly
-/// common case for a builtin operand -- so the caller keeps using
-/// `reachable` itself and nothing is allocated. Resolution runs once per
-/// program, not per input, so the extra walk scales with program size.
-fn rebase_reachable(
-    original: &Expr,
-    copy: &Expr,
-    reachable: &BTreeSet<usize>,
-) -> Option<BTreeSet<usize>> {
+/// The same property makes any gap in the walk safe: a `def` it fails to
+/// pair is simply absent, so it is treated as unreachable -- the pre-#2971
+/// behaviour for it -- rather than wrongly checked. Completeness only decides
+/// how many answers this fixes, never whether it can break one.
+///
+/// Empty (and unallocated) when `original` holds no `def`, the common case.
+/// Resolution runs once per program, not per input, so the walk scales with
+/// program size.
+fn rebase_reachable(original: &Expr, copy: &Expr, reachable: &BTreeSet<usize>) -> BTreeSet<usize> {
     let from = def_body_addrs(original);
     if from.is_empty() {
-        return None;
+        return BTreeSet::new();
     }
-    let to = def_body_addrs(copy);
+    translate_reachable(&from, def_body_addrs(copy), reachable)
+}
+
+/// The copies (`to`) of whichever `from` addresses are in `reachable`,
+/// pairing the two lists by position -- see [`rebase_reachable`].
+fn translate_reachable(
+    from: &[usize],
+    to: Vec<usize>,
+    reachable: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
     debug_assert_eq!(
         from.len(),
         to.len(),
         "a clone must hold exactly its source's defs, in the same order"
     );
-    Some(
-        from.iter()
-            .zip(&to)
-            .filter(|(old, _)| reachable.contains(old))
-            .map(|(_, new)| *new)
-            .collect(),
-    )
+    from.iter()
+        .zip(to)
+        .filter(|(old, _)| reachable.contains(old))
+        .map(|(_, new)| new)
+        .collect()
 }
 
-/// Every `def` body's address in `expr`, in [`any_subexpr`]'s pre-order --
-/// the identity [`build_call_graph`] keys reachability on.
+/// Every `def` body's address in `expr`, in a deterministic pre-order -- the
+/// identity [`build_call_graph`] keys reachability on.
+///
+/// Built on [`any_subexpr`], plus the two places it does not look but
+/// [`check`] does: a call's `builtin_fallback` (the alternate parse a
+/// shadowed builtin name carries, which is where `select(def g: ..; g)` puts
+/// its def once `select` is also user-defined) and a destructuring pattern's
+/// computed object keys (#2734). Missing either left those defs unpaired.
 fn def_body_addrs(expr: &Expr) -> Vec<usize> {
     let mut addrs = Vec::new();
+    collect_def_body_addrs(expr, &mut addrs);
+    addrs
+}
+
+fn collect_def_body_addrs(expr: &Expr, addrs: &mut Vec<usize>) {
     any_subexpr(expr, &mut |node| {
-        if let Expr::FuncDef { body, .. } = node {
-            addrs.push(body.as_ref() as *const Expr as usize);
+        match node {
+            Expr::FuncDef { body, .. } => addrs.push(body.as_ref() as *const Expr as usize),
+            Expr::FuncCall {
+                builtin_fallback: Some(fallback),
+                ..
+            } => collect_def_body_addrs(fallback, addrs),
+            Expr::Reduce { patterns, .. }
+            | Expr::Foreach { patterns, .. }
+            | Expr::AsPattern { patterns, .. } => {
+                for pattern in patterns {
+                    collect_pattern_def_body_addrs(pattern, addrs);
+                }
+            }
+            _ => {}
         }
         false
     });
-    addrs
+}
+
+fn collect_pattern_def_body_addrs(pattern: &Pattern, addrs: &mut Vec<usize>) {
+    match pattern {
+        Pattern::Var(_) => {}
+        Pattern::Object(entries) => {
+            for entry in entries {
+                if let ObjectKey::Expr(key) = &entry.key {
+                    collect_def_body_addrs(key, addrs);
+                }
+                collect_pattern_def_body_addrs(&entry.pattern, addrs);
+            }
+        }
+        Pattern::Array(patterns) => {
+            for pattern in patterns {
+                collect_pattern_def_body_addrs(pattern, addrs);
+            }
+        }
+    }
 }
 
 /// [`check`] over an optional sub-expression.
@@ -2283,6 +2393,78 @@ mod tests {
             resolve_func_calls(&mut shared).map_err(|e| format!("{e}")),
             Ok(())
         );
+    }
+
+    /// #2971 review: the other two clone sites, reached only when a builtin's
+    /// name is also user-defined. `select(def g: ..; g)` then parses to a
+    /// call whose `builtin_fallback` holds the def -- a field the pairing
+    /// walk first missed -- and unpacking that fallback clones the def again.
+    /// All oracle-verified against jq 1.7.1.
+    #[test]
+    fn a_def_inside_a_shadowed_builtins_argument_is_checked() {
+        for filter in [
+            "def select: 1; [1]|map(select(def g: nosuchfn; g))",
+            "def first: 1; [1]|map(first(def g: nosuchfn; g))",
+            "def map(f): f; [1] | map(def g: nosuchfn; g)",
+        ] {
+            assert_eq!(
+                resolve(filter),
+                Err("nosuchfn/0 is not defined".into()),
+                "{filter}"
+            );
+        }
+        assert_eq!(
+            resolve("def map(f): f; [1] | map(def g: nosuchfn; 1)"),
+            Ok(())
+        );
+    }
+
+    /// #2971 review: the regression the first version of this fix shipped.
+    /// Once the first `map` has been resolved and its operand freed, the
+    /// address of `g`'s body is free for reuse but still in the reachable
+    /// set -- and `k`'s copy can be allocated exactly there. Consulting the
+    /// enclosing set after a clone then called `k` reachable and rejected a
+    /// program jq runs (exit 0).
+    ///
+    /// **This test does not catch that regression.** Whether `k`'s copy lands
+    /// on the freed address depends on heap state, and inside this harness it
+    /// does not: reintroducing the fallback leaves this test passing. It pins
+    /// the correct answer for the shape; the guard is
+    /// `test_uncalled_def_inside_builtin_argument_still_compiles_2971`
+    /// (`jq_cli_tests.rs`), whose CLI binary does reproduce the reuse and
+    /// fails under that mutation -- itself allocator-dependent, which is why
+    /// the invariant is also written down on `resolve_func_calls` and at
+    /// each clone site rather than left to a test to enforce.
+    #[test]
+    fn an_uncalled_def_is_not_mistaken_for_a_freed_called_one() {
+        assert_eq!(
+            resolve("def select: 1; [1]|map(def g: 1; g), [1]|map(select(def k: nosuchfn; 1))"),
+            Ok(())
+        );
+    }
+
+    /// #2971 review: a def written inside a destructuring pattern's computed
+    /// key. `check` compile-checks those keys (#2734), but `build_call_graph`
+    /// never walked them, so every such def was unreachable and skipped. Each
+    /// pattern-carrying form -- `as`, `reduce`, `foreach` -- and an object
+    /// pattern nested in an array one. All oracle-verified against jq 1.7.1;
+    /// the last row is the uncalled control.
+    #[test]
+    fn a_def_inside_a_pattern_computed_key_is_checked() {
+        for filter in [
+            ". as {(def g: nosuchfn; g): $x} | $x",
+            "[1]|map(. as {(def g: nosuchfn; g): $x} | $x)",
+            "reduce ([{}]|.[]) as {(def g: nosuchfn; g): $x} (0; .)",
+            "foreach ([{}]|.[]) as {(def g: nosuchfn; g): $x} (0; .)",
+            ". as [{(def g: nosuchfn; g): $x}] | $x",
+        ] {
+            assert_eq!(
+                resolve(filter),
+                Err("nosuchfn/0 is not defined".into()),
+                "{filter}"
+            );
+        }
+        assert_eq!(resolve(". as {(def g: nosuchfn; \"a\"): $x} | $x"), Ok(()));
     }
 
     #[test]

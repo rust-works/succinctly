@@ -27217,6 +27217,10 @@ fn test_called_def_inside_builtin_argument_is_a_compile_error_2971() -> Result<(
         "[1]|all(def g: nosuchfn; g)",
         // Two builtins deep: re-keyed at each clone.
         "[[1]]|map(map(def g: nosuchfn; g))",
+        // The builtin's name is also user-defined, so the operand is held in
+        // the call's `builtin_fallback` and unpacked -- by a second clone.
+        "def select: 1; [1]|map(select(def g: nosuchfn; g))",
+        "def map(f): f; [1] | map(def g: nosuchfn; g)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
@@ -27255,6 +27259,13 @@ fn test_uncalled_def_inside_builtin_argument_still_compiles_2971() -> Result<()>
         ("[[1]]|map(map(def g: nosuchfn; 1))", "[[1]]"),
         // Reachable only through a def that is itself never called.
         ("def h: map(def g: nosuchfn; g); 1", "1"),
+        ("def map(f): f; [1] | map(def g: nosuchfn; 1)", "1"),
+        // The false positive an earlier version of this fix introduced: `k`'s
+        // copy reused the freed address of `g`'s body, still marked reachable.
+        (
+            "def select: 1; [1]|map(def g: 1; g), [1]|map(select(def k: nosuchfn; 1))",
+            "[1]\n[1]",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
