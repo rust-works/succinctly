@@ -154,6 +154,36 @@ pub(crate) fn value_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     reader.values
 }
 
+/// The byte offset jq's own parser was standing at when it last returned a
+/// parse error to its caller over this whole stream, or `None` if it never
+/// returned one.
+///
+/// This is the raw material for the `--seq -s` EOF-location question --
+/// whether real jq still has a `file:line` to point a runtime error at, or
+/// answers `<unknown>`; see
+/// [`super::jq_runner::seq_stream_trailing_record_is_dropped`], which owns
+/// the rule and the reasoning. Offsets are into `bytes` and index the same
+/// UTF-8-normalized stream [`value_ranges`] reads, so a caller can compare
+/// one against a position it computed itself (a file boundary, a newline)
+/// in that same buffer.
+///
+/// An `at EOF` diagnostic is recorded at `bytes.len()` -- [`Reader::run`]
+/// advances `offset` past the last byte before calling [`Reader::finish`],
+/// so "detected at real EOF" sorts after every byte, which is exactly how
+/// the caller's comparison needs it.
+pub(crate) fn last_parse_error_offset(bytes: &[u8]) -> Option<usize> {
+    let bom = bom_prefix_from(bytes.iter().copied());
+    let mut ignore = |_: &str| {};
+    let mut reader = Reader::new(bom, &mut ignore);
+    // Same suppression [`for_each_warning`] applies, and for the same
+    // reason: under a malformed BOM jq wipes its accumulated state before
+    // the EOF branch can report on it, so no error is returned to the
+    // caller and the position survives.
+    reader.suppress_eof_warning = bom.malformed && bytes.last() == Some(&b'\n');
+    reader.run(bytes.iter().copied().enumerate().skip(bom.consumed));
+    reader.last_warning_offset
+}
+
 /// The kinds jq's parser distinguishes while classifying a failure. It
 /// tracks full values; only these distinctions affect which message fires
 /// (`Object keys must be strings` needs `String`, the top-level truncated
@@ -246,6 +276,10 @@ struct Reader<'a> {
     /// See [`for_each_warning`]: a malformed BOM plus a newline-terminated
     /// stream means jq's own EOF report is wiped before it is written.
     suppress_eof_warning: bool,
+    /// [`Reader::offset`] as of the most recent [`Reader::warn`] call --
+    /// i.e. where jq's own parser was standing when it last returned an
+    /// error to its caller. See [`last_parse_error_offset`].
+    last_warning_offset: Option<usize>,
     emit: &'a mut dyn FnMut(&str),
 }
 
@@ -274,11 +308,13 @@ impl<'a> Reader<'a> {
             completed: None,
             values: Vec::new(),
             suppress_eof_warning: false,
+            last_warning_offset: None,
             emit,
         }
     }
 
     fn warn(&mut self, body: &str) {
+        self.last_warning_offset = Some(self.offset);
         (self.emit)(&format!("jq: ignoring parse error: {body}"));
     }
 
