@@ -78,6 +78,7 @@ pub mod eval_generic;
 mod expr;
 mod glob;
 mod lazy;
+mod math;
 mod parser;
 pub mod resolve;
 mod slice;
