@@ -179,6 +179,10 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Input
         | Builtin::Inputs
         | Builtin::InputLineNumber
+        | Builtin::InputFilename
+        | Builtin::GetSearchList
+        | Builtin::GetJqOrigin
+        | Builtin::GetProgOrigin
         | Builtin::Abs
         | Builtin::Builtins
         | Builtin::Normals
@@ -479,6 +483,10 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::Input
         | Builtin::Inputs
         | Builtin::InputLineNumber
+        | Builtin::InputFilename
+        | Builtin::GetSearchList
+        | Builtin::GetJqOrigin
+        | Builtin::GetProgOrigin
         | Builtin::Abs
         | Builtin::Builtins
         | Builtin::Normals
@@ -1539,6 +1547,10 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Input
             | Builtin::Inputs
             | Builtin::InputLineNumber
+            | Builtin::InputFilename
+            | Builtin::GetSearchList
+            | Builtin::GetJqOrigin
+            | Builtin::GetProgOrigin
             | Builtin::AtOffset(_)
             | Builtin::AtPosition(_, _) => true,
 

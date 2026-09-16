@@ -1619,6 +1619,15 @@ pub enum Builtin {
     /// `input_line_number` - the line number of the most recently read
     /// input document (#723)
     InputLineNumber,
+    /// `input_filename` - the file the current input came from (#3046)
+    InputFilename,
+    /// `get_search_list` - the module search path (#3046)
+    GetSearchList,
+    /// `get_jq_origin` - the directory the running binary was invoked from (#3046)
+    GetJqOrigin,
+    /// `get_prog_origin` - the directory of the `-f` program, or the current
+    /// directory (#3046)
+    GetProgOrigin,
     /// `abs` - absolute value (alias for fabs)
     Abs,
     /// `builtins` - list all builtin function names

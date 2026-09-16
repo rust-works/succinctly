@@ -5753,6 +5753,19 @@ impl<'a> Parser<'a> {
             self.consume_keyword("inputs");
             return Ok(Some(Builtin::Inputs));
         }
+        // #3046: the CLI-context builtins. None is part of yq's syntax.
+        for (name, builtin) in [
+            ("input_filename", Builtin::InputFilename),
+            ("get_search_list", Builtin::GetSearchList),
+            ("get_jq_origin", Builtin::GetJqOrigin),
+            ("get_prog_origin", Builtin::GetProgOrigin),
+        ] {
+            if self.matches_keyword(name) {
+                self.reject_unless_jq_extensions(name)?;
+                self.consume_keyword(name);
+                return Ok(Some(builtin));
+            }
+        }
         if self.matches_keyword("input_line_number") {
             self.reject_in_yq_mode("input_line_number")?;
             self.consume_keyword("input_line_number");

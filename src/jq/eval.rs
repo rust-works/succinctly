@@ -10657,6 +10657,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Input => builtin_input::<W, S>(),
         Builtin::Inputs => builtin_inputs::<W, S>(),
         Builtin::InputLineNumber => builtin_input_line_number::<W, S>(),
+        Builtin::InputFilename => QueryResult::Owned(cli_context::input_filename()),
+        Builtin::GetSearchList => QueryResult::Owned(cli_context::search_list()),
+        Builtin::GetJqOrigin => QueryResult::Owned(cli_context::jq_origin()),
+        Builtin::GetProgOrigin => QueryResult::Owned(cli_context::prog_origin()),
         Builtin::Abs => builtin_fabs::<W>(value, optional), // abs is an alias for fabs
         Builtin::Builtins => builtin_builtins::<W>(),
         Builtin::Normals => builtin_normals::<W>(value),
@@ -48002,6 +48006,147 @@ mod remaining_inputs {
             UNKNOWN_LINE => None,
             line => Some(line),
         }
+    }
+}
+
+/// What `input_filename`, `get_search_list`, `get_jq_origin` and
+/// `get_prog_origin` read (#3046): facts about the running CLI that the
+/// evaluator has no parameter for, supplied by the CLI driver the same way it
+/// seeds the `input` queue above.
+///
+/// Nothing is set in a library embedding or in yq mode, and then the
+/// builtins answer as jq does before it has read anything: `input_filename`
+/// is `null`, `get_search_list` is jq's own default list, and the two origins
+/// are `null` (jq always has a binary and a working directory; a library call
+/// has neither to report). `no_std` has no `thread_local!`, so it always
+/// answers that way.
+pub mod cli_context {
+    use super::OwnedValue;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    /// jq 1.7.1's search list when no `-L` is given, unexpanded.
+    const DEFAULT_SEARCH_LIST: [&str; 3] = ["~/.jq", "$ORIGIN/../lib/jq", "$ORIGIN/../lib"];
+
+    /// The running program's context.
+    #[derive(Clone, Debug, Default)]
+    pub struct ProgramContext {
+        /// `-L` directories, as given; empty for jq's default list.
+        pub search_list: Vec<String>,
+        /// The directory part of the path the binary was invoked by.
+        pub jq_origin: Option<String>,
+        /// The directory of the `-f` program, or the working directory.
+        pub prog_origin: Option<String>,
+    }
+
+    #[cfg(feature = "std")]
+    mod state {
+        use super::ProgramContext;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        use std::cell::{Cell, RefCell};
+
+        std::thread_local! {
+            pub(super) static PROGRAM: RefCell<Option<ProgramContext>> = const { RefCell::new(None) };
+            // File name per input source tag, `None` for stdin -- the same
+            // tags `seed_remaining_inputs` documents carry.
+            pub(super) static INPUT_NAMES: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+            // The source of the document in hand, for the routes that do not
+            // read through the `input` queue.
+            pub(super) static CURRENT_SOURCE: Cell<Option<u32>> = const { Cell::new(None) };
+        }
+    }
+
+    /// Record the running program's context. Called once by the CLI.
+    pub fn set_program(context: ProgramContext) {
+        #[cfg(feature = "std")]
+        state::PROGRAM.with(|p| *p.borrow_mut() = Some(context));
+        #[cfg(not(feature = "std"))]
+        let _ = context;
+    }
+
+    /// Record the file name for each input source tag (`None` for stdin).
+    pub fn set_input_names(names: Vec<Option<String>>) {
+        #[cfg(feature = "std")]
+        state::INPUT_NAMES.with(|n| *n.borrow_mut() = names);
+        #[cfg(not(feature = "std"))]
+        let _ = names;
+    }
+
+    /// Record which source the document about to be evaluated came from, on a
+    /// route that does not read through the `input` queue.
+    pub fn set_current_source(source: Option<u32>) {
+        #[cfg(feature = "std")]
+        state::CURRENT_SOURCE.with(|c| c.set(source));
+        #[cfg(not(feature = "std"))]
+        let _ = source;
+    }
+
+    /// `input_filename`: the file jq's parser last read a document from --
+    /// through the `input` queue when one is seeded, whose own position is
+    /// exactly that (`jq -n '[input_filename, (input|input_filename)]'` is
+    /// `[null,"in.json"]`), else the document the driver is evaluating.
+    /// Stdin is `"<stdin>"`; nothing read yet is `null`.
+    pub fn input_filename() -> OwnedValue {
+        #[cfg(feature = "std")]
+        {
+            let source = if super::remaining_inputs::is_active() {
+                super::remaining_inputs::current_location().map(|(source, _)| source)
+            } else {
+                state::CURRENT_SOURCE.with(std::cell::Cell::get)
+            };
+            let Some(source) = source else {
+                return OwnedValue::Null;
+            };
+            state::INPUT_NAMES.with(|names| match names.borrow().get(source as usize) {
+                Some(Some(name)) => OwnedValue::String(name.clone()),
+                Some(None) => OwnedValue::String("<stdin>".to_string()),
+                None => OwnedValue::Null,
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            OwnedValue::Null
+        }
+    }
+
+    fn program() -> Option<ProgramContext> {
+        #[cfg(feature = "std")]
+        {
+            state::PROGRAM.with(|p| p.borrow().clone())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            None
+        }
+    }
+
+    fn string_or_null(value: Option<String>) -> OwnedValue {
+        value.map_or(OwnedValue::Null, OwnedValue::String)
+    }
+
+    /// `get_search_list`: the `-L` list as given, else jq's own default.
+    pub fn search_list() -> OwnedValue {
+        let list = program()
+            .map(|p| p.search_list)
+            .filter(|list| !list.is_empty())
+            .unwrap_or_else(|| {
+                DEFAULT_SEARCH_LIST
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            });
+        OwnedValue::Array(list.into_iter().map(OwnedValue::String).collect())
+    }
+
+    /// `get_jq_origin`.
+    pub fn jq_origin() -> OwnedValue {
+        string_or_null(program().and_then(|p| p.jq_origin))
+    }
+
+    /// `get_prog_origin`.
+    pub fn prog_origin() -> OwnedValue {
+        string_or_null(program().and_then(|p| p.prog_origin))
     }
 }
 
