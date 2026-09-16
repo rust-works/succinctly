@@ -237,33 +237,31 @@ pub(crate) fn join_expr_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
             body,
         });
     }
-    let idx_expr_of = |pair: Expr| match pair {
-        Expr::Array(inner) => match *inner {
-            Expr::Comma(mut items) if items.len() == 2 => match items.pop() {
-                Some(Expr::IndexExpr { key, .. }) => *key,
-                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
-            },
-            _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
-        },
-        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
+    let idx_expr_of = |pair: Expr| {
+        if let Expr::Array(inner) = pair {
+            if let Expr::Comma(mut items) = *inner {
+                if let Some(Expr::IndexExpr { key, .. }) = items.pop() {
+                    return *key;
+                }
+            }
+        }
+        unreachable!("join_expr's pair is `[., $idx[idx_expr]]`") // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
     };
     let mut args = alloc::vec![*idx];
-    match *body {
-        // JOIN/2: `[.[] | pair]`
+    let stages = match *body {
+        // JOIN/2: `[.[] | pair]` -- the `.[]` is not an argument.
         Expr::Array(inner) => match *inner {
-            Expr::Pipe(mut stages) if stages.len() == 2 => {
-                args.push(idx_expr_of(stages.pop().expect("two stages")));
-            }
-            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"),
+            Expr::Pipe(stages) => stages.into_iter().skip(1).collect(),
+            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         },
         // JOIN/3: `stream | pair`; JOIN/4: `stream | pair | join_expr`
-        Expr::Pipe(stages) => {
-            let mut stages = stages.into_iter();
-            args.push(stages.next().expect("stream"));
-            args.push(idx_expr_of(stages.next().expect("pair")));
-            args.extend(stages);
-        }
-        _ => unreachable!("join_expr builds an array or a pipe"),
+        Expr::Pipe(stages) => stages,
+        _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
+    };
+    // The pair stage carries `idx_expr`; every other stage is its own argument.
+    for stage in stages {
+        let is_pair = matches!(&stage, Expr::Array(inner) if matches!(inner.as_ref(), Expr::Comma(items) if matches!(items.last(), Some(Expr::IndexExpr { target, .. }) if matches!(target.as_ref(), Expr::Var(v) if v == JOIN_IDX_VAR))));
+        args.push(if is_pair { idx_expr_of(stage) } else { stage });
     }
     Ok(args)
 }
@@ -274,7 +272,7 @@ pub(crate) fn join_expr_arity(expr: &Expr) -> Option<usize> {
         Expr::As { var, body, .. } if var == JOIN_IDX_VAR => Some(match body.as_ref() {
             Expr::Array(_) => 2,
             Expr::Pipe(stages) => stages.len() + 1,
-            _ => unreachable!("join_expr builds an array or a pipe"),
+            _ => unreachable!("join_expr builds an array or a pipe"), // omni-dev: coverage tolerate-line reason="unreachable: join_expr builds only this shape, and only join_expr names JOIN_IDX_VAR, which no program can spell (#3046)"
         }),
         _ => None,
     }

@@ -44014,6 +44014,28 @@ fn join_and_format_match_jq_3046() -> Result<()> {
     Ok(())
 }
 
+/// #3046: `JOIN`'s wrong arities and a malformed call resolve as jq's do --
+/// `JOIN/0`, `JOIN/1` and `JOIN/5` are not defined (exit 3), and an unclosed
+/// argument list is a syntax error (jq's wording differs).
+#[test]
+fn join_wrong_arity_matches_jq_3046() -> Result<()> {
+    for (filter, want) in [
+        ("JOIN", "jq: error: JOIN/0 is not defined"),
+        ("JOIN(1)", "jq: error: JOIN/1 is not defined"),
+        (
+            "[1] | JOIN({}; .; .; .; .)",
+            "jq: error: JOIN/5 is not defined",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!((stdout.as_str(), code), ("", 3), "{filter}: {stderr:?}");
+        assert!(stderr.starts_with(want), "{filter}: {stderr:?}");
+    }
+    let (_, stderr, code) = run_jq_full(&["-nc", "[1] | JOIN({}; ."], None)?;
+    assert_eq!(code, 3, "{stderr:?}");
+    Ok(())
+}
+
 /// #3046: `strflocaltime` under POSIX `TZ` offset strings, captured from jq
 /// 1.7.1. (An IANA zone name is not resolved by `localtime` either; see
 /// `limitations.md`.)
