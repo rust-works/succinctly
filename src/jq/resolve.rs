@@ -1349,6 +1349,9 @@ fn bind_patterns(
 /// decide `in_scope` costs nothing beyond the match itself, regardless of
 /// how large `fallback`'s own children are.
 fn builtin_fallback_arity(fallback: &Expr) -> usize {
+    if let Some(arity) = super::parser::join_expr_arity(fallback) {
+        return arity;
+    }
     match fallback {
         Expr::Not => 0,
         Expr::Limit { .. } | Expr::Until { .. } | Expr::While { .. } => 2,
@@ -1401,6 +1404,11 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
 /// across every declined one, could still duplicate an arbitrarily large
 /// not-yet-resolved subtree sitting in one of `fallback`'s own arguments.
 fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
+    // #3046: `JOIN` desugars to an `as` binding; see `parser::join_expr`.
+    let fallback = match super::parser::join_expr_into_args(fallback) {
+        Ok(args) => return args,
+        Err(fallback) => fallback,
+    };
     match fallback {
         Expr::Not => Vec::new(),
         Expr::Limit { n, expr } => alloc::vec![*n, *expr],

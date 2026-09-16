@@ -10679,6 +10679,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Localtime => builtin_localtime::<W>(value, optional),
         Builtin::Mktime => builtin_mktime::<W>(value, optional),
         Builtin::Strftime(fmt) => builtin_strftime::<W, S>(fmt, value, optional),
+        Builtin::FormatNamed(name) => builtin_format_named::<W, S>(name, value, optional),
         Builtin::Strptime(fmt) => builtin_strptime::<W, S>(fmt, value, optional),
         Builtin::Todate => builtin_todate::<W>(value, optional),
         Builtin::Fromdate => builtin_fromdate::<W>(value, optional),
@@ -14618,6 +14619,39 @@ pub(crate) fn format_owned<S: EvalSemantics>(
         FormatType::Yaml => format_yaml(owned),
         FormatType::Props => format_props(owned),
     }
+}
+
+/// Builtin: `format(name)` (#3046) -- `@name`, chosen at run time.
+///
+/// One output per output of `name`, like every argument-taking builtin. A
+/// name must be one of jq 1.7.1's own formats, spelled without the `@`; the
+/// formats only succinctly has (`@urid`, `@dsv`, `@yaml`, `@props`) are
+/// refused here, since jq refuses the same names (`"x" | format("urid")` is
+/// `urid is not a valid format` in jq 1.7.1). Anything that is not a string
+/// raises jq's `<kind> (<value>) is not a valid format`.
+fn builtin_format_named<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    name_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    fanout_arg::<W, S, _>(name_expr, value.clone(), optional, ArgFanout::All, |name| {
+        let format_type = match &name {
+            OwnedValue::String(s) => match s.as_str() {
+                "text" => FormatType::Text,
+                "json" => FormatType::Json,
+                "csv" => FormatType::Csv,
+                "tsv" => FormatType::Tsv,
+                "html" => FormatType::Html,
+                "uri" => FormatType::Uri,
+                "sh" => FormatType::Sh,
+                "base64" => FormatType::Base64,
+                "base64d" => FormatType::Base64d,
+                _ => return QueryResult::Error(EvalError::not_a_valid_format(&name)),
+            },
+            _ => return QueryResult::Error(EvalError::not_a_valid_format(&name)),
+        };
+        eval_format::<W, S>(&format_type, value.clone(), optional)
+    })
 }
 
 /// Evaluate a format string: `@json`, `@uri`, etc.
