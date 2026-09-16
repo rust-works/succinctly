@@ -173,6 +173,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`recurse(f)`/`recurse(f; cond)` stops between `f`'s own outputs** (#2918).
+  jq traverses the first output's whole subtree before asking `f` for the
+  second; succinctly ran `f` to completion at every node first. The values were
+  always right, but side effects were not: `[limit(2; recurse(.[]?|debug))]` on
+  `[1,[2,[3]]]` wrote two `debug` lines where jq writes one, `recurse(f)?` ran
+  an erroring `f` twice, and an unbounded walk printed each node's whole fan-out
+  before descending instead of interleaving. The same held for `cond`, and for
+  `path(recurse(f))`. Each output is now visited from inside `f`'s own sink,
+  within a native stack budget measured as the walk descends and shared with
+  `def` recursion's frame guard; past it (only synthetic chains get there) the
+  old per-node order resumes for the remaining levels.
+
 - **A called `def` inside a builtin's argument, or a destructuring key, is a
   compile error** (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then
   failed at runtime, exit 5, where jq refuses to compile it, exit 3 with no
