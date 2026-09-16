@@ -1394,12 +1394,22 @@ absent-head shape; the 7950X is essentially unchanged (645 -> 646, 663 -> 640,
 not reported: in yq mode `paths` is gated behind `--jq-extensions`, so it timed
 the error path, and in jq mode it never enters this walk (flat on both boxes).
 
+The `first(.[] | key)` row is a timing of succinctly's own answer, not of a
+yq-compatible one: in yq mode both binaries print `0` where yq v4.53.3's
+`first(f)` ignores its argument and prints the first child (#2377), so that
+row is evidence about the walk only, not about fidelity.
+
 **What is left.** The absent-head shape keeps the smallest win on both boxes;
 its remaining term is the missing-key scan itself (#2470/#2482's territory,
-and the YAML-only part the exit measurement named), not the walk. The
-per-stage `heads` `Vec` and `try_path_context_cursor_walk`'s
-collect-then-materialize were left as they are: one allocation per stage, not
-per position.
+and the YAML-only part the exit measurement named), not the walk. The largest
+remaining per-position allocation is now the `heads` `Vec` each step
+collects into: it is created inside calls made once per incoming position
+(`path_context_walk_pipe`, `path_context_step_pipe`, the navigational arm), so
+every stage costs one more buffer per element -- on `[.[] | .k.x | parent]`
+more buffers than trail links. Streaming positions instead of collecting them
+per step is the lever the issue estimated at 2-3 days. A walk rooted at a
+nested node also pays one link per document level to seed its trail
+(`PathContextTrail::from_climb`), where the flat pair collected one `Vec`.
 
 ## Result
 

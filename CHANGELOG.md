@@ -928,7 +928,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remaining stages' AST once per head. A position now carries one
   `Rc`-linked `PathContextTrail` (each link a component plus the node it was
   taken from), extended through the same `path_step_generic` `path()` uses;
-  a step is one allocation, and `parent(n)` walks `n` links.
+  a step adds one trail link per position instead of copying the path and
+  ancestors, and `parent(n)` walks `n` links.
 
   Interleaved A/B against the merge-base, 11 reps, `cgu1+fat` both sides,
   1/6/20 MB inputs, output identical on all 84 configurations (median
