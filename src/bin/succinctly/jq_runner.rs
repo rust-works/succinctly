@@ -124,13 +124,77 @@ pub(crate) enum ModuleLoadError {
     /// repeat that closed it (`["ca", "cb", "ca"]`); detection itself keys on
     /// the *resolved* file, so two spellings of one module still close a cycle.
     Cycle { chain: Vec<String> },
-    /// The module could not be read, or its own contents failed to parse.
-    /// jq's shape for this case additionally names the resolved *absolute*
-    /// path and echoes the module's own source line -- #2703's fix does not
-    /// yet extend this far (see the issue's own follow-up note on the
-    /// syntax-error padding rule, which isn't a fixed formula), so this
-    /// stays an opaque `anyhow::Error`, reported the same way as before.
+    /// The module's own contents failed to parse -- jq's fourth compile-error
+    /// kind (#2703). Carries everything [`report_module_load_error`] needs to
+    /// build jq's shape: the module's *canonical absolute* path (jq names the
+    /// module by it, and canonicalizing turns `/tmp/...` into
+    /// `/private/tmp/...`), the module's text for the line echo, and the
+    /// parser error holding the byte position. The message wording stays
+    /// succinctly's own (jq's `syntax error, unexpected ...` phrasing is
+    /// per-parse-state -- see [`report_syntax_error`]), and jq's source-echo
+    /// padding is not a fixed formula (the issue's own follow-up note), so
+    /// the padding reuses the same column rule the undefined-name path uses.
+    Parse {
+        path: PathBuf,
+        contents: String,
+        error: jq::ParseError,
+    },
+    /// The module could not be read (as opposed to parsed). A *parse*
+    /// failure now has its own [`Self::Parse`] variant; this is the residue
+    /// of the pre-#2703 opaque `anyhow::Error`.
     Other(anyhow::Error),
+}
+
+/// Report a single compile-time syntax error in jq 1.7.1's report shape
+/// (#2703), the same family the undefined-name path
+/// ([`report_compile_errors`]) builds inline:
+///
+/// ```text
+/// jq: error: unexpected end of input at <top-level>, line 1:
+/// 1 +
+/// jq: 1 compile error
+/// ```
+///
+/// The `at ...` label is `<top-level>` for the main filter and a module's
+/// canonical absolute path for a module-body parse failure. `source` is the
+/// text the error lives in and `offset` its byte position; the line the
+/// error is on, and the echoed line's trailing padding, come from
+/// [`line_at_offset`] -- the "existing reporter's own helper" the issue
+/// points Path 2/Path 4 at.
+///
+/// Two fidelity limits, both recorded in
+/// `docs/compliance/jq/limitations.md`:
+///
+/// - **Wording is succinctly's own, not jq's.** jq's `syntax error,
+///   unexpected ...` phrasing -- which token name, which "expecting ..."
+///   list, and the `(Unix shell quoting issues?)` suffix -- is a function of
+///   its bison parse state, and a lone [`jq::ParseError`] reason cannot
+///   reproduce it (`1 +` and `."` are both "end of input" here, but jq
+///   distinguishes them, the latter appending a QQSTRING expect-list).
+/// - **Padding is the column rule, not a formula.** jq's own
+///   `locfile_locate` `%*s` width is not formula-derived (probing `1 +`,
+///   `[1,]`, `def f: ;`, `1 2`, `if then`, `?` gives no consistent rule), so
+///   this points at the error column and differs from jq, where it differs
+///   at all, only in trailing whitespace.
+///
+/// Whether a blank line sits between the echoed line and the trailer is
+/// per-path in real jq (measured live against 1.7.1): a top-level syntax
+/// error has none, while a module-body syntax error leaves one. `blank_line`
+/// reproduces that.
+fn report_syntax_error(
+    message: &str,
+    source: &str,
+    offset: usize,
+    location: &str,
+    blank_line: bool,
+) {
+    let (line_no, line_text, column) = line_at_offset(source, offset);
+    eprintln!("jq: error: {message} at {location}, line {line_no}:");
+    eprintln!("{line_text}{}", " ".repeat(column));
+    if blank_line {
+        eprintln!();
+    }
+    eprintln!("jq: 1 compile error");
 }
 
 impl From<anyhow::Error> for ModuleLoadError {
@@ -154,6 +218,22 @@ fn report_module_load_error(e: &ModuleLoadError) {
             eprintln!("jq: error: module cycle detected: {}", chain.join(" -> "));
             eprintln!();
             eprintln!("jq: 1 compile error");
+        }
+        ModuleLoadError::Parse {
+            path,
+            contents,
+            error,
+        } => {
+            // jq 1.7.1 names the module by its resolved *absolute* path and
+            // leaves a blank line between the echoed source and the trailer;
+            // both measured live (see [`report_syntax_error`]).
+            report_syntax_error(
+                &error.message,
+                contents,
+                error.position,
+                &path.display().to_string(),
+                true,
+            );
         }
         ModuleLoadError::Other(inner) => {
             eprintln!("jq: module error: {inner}");
@@ -665,8 +745,10 @@ impl ModuleLoader {
         let contents = std::fs::read_to_string(&file_path)
             .with_context(|| format!("failed to read module: {}", file_path.display()))?;
 
-        let program = jq::parse_program(&contents).map_err(|e| {
-            anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+        let program = jq::parse_program(&contents).map_err(|e| ModuleLoadError::Parse {
+            path: canonical.clone(),
+            contents,
+            error: e,
         })?;
 
         // Stamp `$__loc__` BEFORE wrapping, never after: `stamp_loc_file`
@@ -2160,7 +2242,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let program = match parse_filter(&BTreeSet::new()) {
         Ok(program) => program,
         Err(e) => {
-            eprintln!("jq: compile error: {e}");
+            report_syntax_error(&e.message, &filter_str, e.position, "<top-level>", false);
             return Ok(exit_codes::COMPILE_ERROR);
         }
     };

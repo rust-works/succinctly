@@ -3238,7 +3238,7 @@ and a def referenced only as an unused filter *argument* (`def use(f): 1; use(h)
 counts as reached, confirmed live: real jq's own argument-closure compilation needs that
 reference to resolve independent of whether the callee's body ever invokes the parameter.
 
-### The other three compile-error paths — one closed, two still open (#2703)
+### The other three compile-error paths — shape now shared, wording still not (#2703)
 
 [#2703](https://github.com/rust-works/succinctly/issues/2703) found that the shape above
 (`jq: error: … at <top-level>, line N:`, the echoed source, and the `jq: N compile error(s)`
@@ -3272,25 +3272,42 @@ every `include` resolves) the first failing declaration in whichever of the two
 order. This is a gap #2703's own single-module repro never exercised; tracked separately
 as [#2857](https://github.com/rust-works/succinctly/issues/2857).
 
-**Still open: a syntax error in the main filter, and a syntax error inside an `include`d
-module.** Unlike the deterministic not-found case, jq's trailing padding for a *syntax*
-error is not the same fixed rule as the undefined-name case above — probing several shapes
-(`1 +`, `.foo[`, `{a:`, `1,,`, `.foo | 1,, | .bar`) all echoed the line plus `len - 1` trailing
-spaces, but `if 1 then` breaks that pattern: it produces *two* separate compile errors from
-one parse, one padded per the `len - 1` rule and the second with none at all. jq's real rule
-depends on the specific diagnostic's own token span, which is bison/lexer internals this
-codebase has no access to; reproducing it needs either reading jq's C parser source
-(`parser.y`/`scanner.l`) or a much wider oracle sweep than #2703 did. Also unresolved: jq's
-parser can report *multiple* compile errors from a single malformed filter (again, `if 1 then`
-→ 2 errors); succinctly's parser returns a single `Result<_, ParseError>` and has no
-architecture for accumulating more than one, which is a separate, larger gap than the message
-wording alone.
+**Closed for a syntax error in the main filter.** Route to the same shared reporter
+(`report_syntax_error` in `jq_runner.rs`, factored out of the undefined-name path's inline
+construction): `jq: error: … at <top-level>, line N:`, the echoed filter line, and the
+trailer. The flat `jq: compile error: parse error at position N: …` is gone.
 
-Until that lands, these two paths keep their pre-#2703 shape: `jq: compile error: parse error
-at position N: …` for the main filter, `jq: module error: parse error in module '{path}': …`
-for a module (naming the path as given on the command line, not jq's resolved absolute path).
-Both still exit 3, matching jq, and neither corrupts output or crashes — the two conditions
-that would otherwise make this an accepted ADR-0018 divergence rather than an open gap.
+**Closed for a syntax error inside an `include`d module.** Same reporter, with the module's
+*canonical absolute* resolved path in the `at …` label (`/private/tmp/…` — canonicalizing
+`-L /tmp` matches jq's own naming), the module's echoed source line, a blank line before the
+trailer (jq 1.7.1 leaves one here, but not after a *top-level* syntax error — reproduced
+per-path), and the trailer. The pre-#2703 `jq: module error: parse error in module
+'{path-as-given}': …` is gone.
+
+**What remains open, all three narrower than the shape gap:**
+
+- **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of
+  input at …` / `jq: error: unexpected character ']', expected expression at …`, not jq's
+  `syntax error, unexpected end of file (Unix shell quoting issues?)` /
+  `syntax error, unexpected ']' (Unix shell quoting issues?)`. jq's phrasing — which token
+  name, which "expecting …" list, and the `(Unix shell quoting issues?)` suffix — is a
+  function of its bison parse state, and a single `ParseError` reason cannot reproduce it:
+  `1 +` and `."` are both "end of input" to our parser, but jq distinguishes them, appending
+  a `QQSTRING_TEXT or …` expect-list to the latter. Reproducing it needs reading jq's C
+  parser source (`parser.y`/`scanner.l`) or a much wider oracle sweep than #2703 did.
+- **The echoed line's trailing padding is the column rule, not a fixed formula.** jq's own
+  `locfile_locate` `%*s` width is not formula-derived (probing `1 +`, `[1,]`, `def f: ;`,
+  `1 2`, `if then`, `?` gives no consistent rule); the reporter points at the error column
+  instead, so where the two differ it is only in trailing whitespace.
+- **jq can report *multiple* compile errors from one malformed filter** (e.g. `if 1 then`
+  → 2 errors); succinctly's parser returns a single `Result<_, ParseError>` and has no
+  architecture for accumulating more than one — a separate, larger gap than the wording.
+
+All four paths now share the same `jq: error:` prefix, the same `jq: N compile error(s)`
+trailer discriminator, and exit 3, so a script that greps or counts `compile error` to tell
+a compile failure from a runtime one gets a consistent answer on every one of them.
+Neither remaining gap corrupts output or crashes — the two conditions that would otherwise
+make this an accepted ADR-0018 divergence rather than an open gap.
 
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
 
