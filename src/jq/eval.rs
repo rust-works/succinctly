@@ -51335,7 +51335,7 @@ fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> 
 #[cfg(not(feature = "std"))]
 fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> {
     // Return empty object in no_std context
-    QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+    QueryResult::Owned(OwnedValue::Object(IndexMap::new().into()))
 }
 
 /// Builtin: env - object of all environment variables
@@ -51357,7 +51357,7 @@ fn builtin_env<'a, W: Clone + AsRef<[u64]>>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     // Return empty object in no_std context
-    QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+    QueryResult::Owned(OwnedValue::Object(IndexMap::new().into()))
 }
 
 /// Builtin: env.VAR or $ENV.VAR - get environment variable (expression-based)
