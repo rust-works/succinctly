@@ -147,11 +147,9 @@ pub enum ResolveError {
 /// **Not** the builtins succinctly implements. succinctly lowers the ones it
 /// does implement to typed `Builtin::*` variants at parse time, so those never
 /// reach this pass as an `Expr::FuncCall` at all. This roster matters for the
-/// opposite set: the ~45 jq builtins succinctly does *not* implement (the libm
+/// opposite set: the ~36 jq builtins succinctly does *not* implement (the libm
 /// family — `cbrt`, `hypot`, `fma`, `ldexp`, `frexp`, `lgamma`, `j0`/`j1`/`jn`,
-/// `y0`/`y1`/`yn`, … — plus `JOIN/2..4`, `format/1`, `input_filename/0`,
-/// `get_search_list/0`, `get_jq_origin/0`, `get_prog_origin/0`,
-/// `strflocaltime/1`), which *do* reach it as bare calls.
+/// `y0`/`y1`/`yn`, …, tracked on #3042), which *do* reach it as bare calls.
 ///
 /// Without this roster, `if false then cbrt else 1 end` would become a compile
 /// error here where real jq compiles it happily — a regression this pass would

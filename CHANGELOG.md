@@ -1350,6 +1350,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`JOIN/2..4`, `format/1`, `input_filename`, `get_search_list`,
+  `get_jq_origin`, `get_prog_origin` and `strflocaltime/1`** (#3046), the nine
+  non-math jq 1.7.1 builtins succinctly did not implement. Each matches jq's
+  output, including `JOIN`'s shadowing by a user `def`, `format`'s refusal of
+  succinctly-only format names, and `input_filename`'s `null` under `-n` until
+  `input` reads. They are gated behind `--jq-extensions` in `succinctly yq`.
+
 - **`succinctly yq` gains real yq's own `downcase`/`upcase` builtins** (#2462).
   Confirmed live against yq v4.53.3: `downcase`/`upcase` lowercase/uppercase
   ASCII characters and keep the node's position (`.a.c | downcase | key` is
