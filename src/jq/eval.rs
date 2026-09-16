@@ -34883,14 +34883,6 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 let is_last = i == last_idx;
                 if alternatives.is_some() {
                     clear_nonretryable_stop();
-                    // Charged once per UPDATE run, as value mode charges
-                    // (#695): the element's own charge above covers the
-                    // first.
-                    if ran_update {
-                        if let Some(control) = charge_budget(&mut budget, "reduce") {
-                            return stop_with_escape(&mut aborted, control);
-                        }
-                    }
                 }
                 // #2676: a destructuring pattern's own steps are checked
                 // against `value_at_path` whether or not any bound `$var` is
@@ -34958,6 +34950,14 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 acc_at_register = acc_at_register
                     || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
                 let acc_input = acc.take().unwrap_or(OwnedValue::Null);
+                // Charged once per UPDATE that runs, as value mode charges
+                // (#695): the element's own charge above covers the first,
+                // and an alternative whose bind failed ran nothing.
+                if ran_update {
+                    if let Some(control) = charge_budget(&mut budget, "reduce") {
+                        return stop_with_escape(&mut aborted, control);
+                    }
+                }
                 ran_update = true;
                 match reg.resolve::<S>(
                     &substituted,
@@ -35267,11 +35267,6 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 let is_last = i == last_idx;
                 if alternatives.is_some() {
                     clear_nonretryable_stop();
-                    if ran_update {
-                        if let Some(control) = charge_budget(&mut budget, "foreach") {
-                            return stop_with_escape(&mut aborted, control);
-                        }
-                    }
                 }
                 let bound = match bind_fold_alternative::<S>(
                     pattern,
@@ -35396,6 +35391,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         ),
                     }
                 };
+                // See `resolve_reduce`'s identical charge.
+                if ran_update {
+                    if let Some(control) = charge_budget(&mut budget, "foreach") {
+                        return stop_with_escape(&mut aborted, control);
+                    }
+                }
                 ran_update = true;
                 // An UPDATE escape still delivers the outputs before it, as
                 // jq's generator does (`path(foreach (1) as $x (.; (.a,
@@ -96327,6 +96328,19 @@ mod tests {
             "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
             "[(foreach .a as {b: $v} ?// $w (.c; .; empty)) |= 5]",
             Err("Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}"),
+        ),
+        // review: an alternative whose bind fails is not charged, so a
+        // retrying chain over a long source stays within the step budget
+        // as value mode does
+        (
+            "null",
+            "[path(reduce range(40000) as $a ?// [$b] ?// $c (.; if $a != null then error(\"x\") else . end))]",
+            Ok(&["[[]]"]),
+        ),
+        (
+            "null",
+            "[limit(2; path(foreach range(40000) as $a ?// [$b] ?// $c (.; if $a != null then error(\"x\") else . end; .)))]",
+            Ok(&["[[],[]]"]),
         ),
         // family B: a chain on an untracked stage refuses rather than
         // answering -- jq refuses too, on `$v`'s body (`element "b" of 5`)
