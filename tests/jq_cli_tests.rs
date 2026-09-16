@@ -46996,27 +46996,26 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
 }
 
 /// #2918's own limit: `recurse` descends natively from inside `f`'s sink
-/// only within a stack budget measured as it goes, and past it walks the rest
-/// of the subtree with the explicit stack, where `f` still runs to completion
-/// per node. jq writes one DEBUG line for both rows below; succinctly matches
-/// it at depth 20 and keeps the old residual at depth 1000, with a 30-stage
-/// pipe inside `f` making each level expensive enough to exhaust the budget
-/// long before that in every build profile (~60-90 levels measured).
+/// only within a small stack budget (512 KiB, measured as it goes, so that it
+/// is safe on any thread), and past it walks the rest of the subtree with the
+/// explicit stack, where `f` still runs to completion per node. jq writes one
+/// DEBUG line for both rows below; succinctly matches it at depth 3 and keeps
+/// the old residual at depth 1000, far past the budget in every build
+/// profile (~40 levels of this `f` in release, fewer in debug).
 ///
 /// Values are the same either way. This pins that the budget exists, so a
 /// change to its size or its accounting trips here rather than passing
 /// silently.
 #[test]
 fn recurse_queues_past_its_native_stack_budget_2918() -> Result<()> {
-    let stages = vec!["(.+0)"; 30].join(" | ");
     let dbg = |v: &str| format!("[\"DEBUG:\",{v}]\n");
     for (depth, want_err) in [
-        (20, dbg("21")),
+        (3, dbg("4")),
         (1000, format!("{}{}", dbg("1001"), dbg("1002"))),
     ] {
         let filter = format!(
             "[limit({}; 0 | recurse(if . < {depth} then .+1 elif . == {depth} then \
-             ((.+1|debug), (.+2|debug)) else empty end | {stages}))] | length",
+             ((.+1|debug), (.+2|debug)) else empty end))] | length",
             depth + 2
         );
         let (stdout, stderr, code) = run_jq_full(&["-cn", &filter], None)?;
