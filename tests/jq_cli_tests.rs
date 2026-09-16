@@ -17547,6 +17547,129 @@ fn test_assign_streaming_resolves_against_the_unwritten_document_2267() -> Resul
     Ok(())
 }
 
+/// #2974: `|=` and the `op=`/`//=` family stream their writes the way #2267
+/// made `=` stream, because jq lowers all of them to a `reduce` over
+/// `path(paths)` that updates one path before asking for the next. A write
+/// that fails stops the path generator (the target fires once, not once per
+/// path), and a filter's side effects interleave with the paths'. Every row's
+/// stdout, stderr and exit code is captured whole from jq 1.7.1.
+#[test]
+fn update_streams_its_path_generator_2974() -> Result<()> {
+    for (input, filter, want_out, want_err, want_code) in [
+        // the issue: a slice write the filter cannot satisfy
+        ("[10,20,30]", "(.|stderr)[(0,1):(2,3)] |= 99", "", "[10,20,30]jq: error (at <stdin>:0): A slice of an array can only be assigned another array\n", 5),
+        // the filter raises
+        ("[1,2]", "(.|stderr)[(0,1)] |= error(\"x\")", "", "[1,2]jq: error (at <stdin>:0): x\n", 5),
+        // a negative index on null
+        ("null", "(.|stderr)[(-1,-2)] |= 1", "", "nulljq: error (at <stdin>:0): Out of bounds negative array index\n", 5),
+        // op= shares the loop
+        ("[1,2]", "(.|stderr)[(0,1)] += \"x\"", "", "[1,2]jq: error (at <stdin>:0): number (1) and string (\"x\") cannot be added\n", 5),
+        ("[10,20,30]", "(.|stderr)[(0,1):(2,3)] -= 1", "", "[10,20,30]jq: error (at <stdin>:0): array ([10,20]) and number (1) cannot be subtracted\n", 5),
+        ("[1,2]", "(.|stderr)[(0,1)] /= \"x\"", "", "[1,2]jq: error (at <stdin>:0): number (1) and string (\"x\") cannot be divided\n", 5),
+        ("[1,2]", "(.|stderr)[(0,1)] %= \"x\"", "", "[1,2]jq: error (at <stdin>:0): number (1) and string (\"x\") cannot be divided (remainder)\n", 5),
+        ("null", "(.|stderr)[(-1,-2)] //= 1", "", "nulljq: error (at <stdin>:0): Out of bounds negative array index\n", 5),
+        // caught, and suppressed by an outer ?
+        ("[1,2]", "try ((.|stderr)[(0,1)] |= error(\"x\")) catch \"c\"", "\"c\"\n", "[1,2]", 0),
+        ("[1,2]", "((.|stderr)[(0,1)] |= error(\"x\"))?", "", "[1,2]", 0),
+        // halt and break stop it too
+        ("[1,2]", "(.|stderr)[(0,1)] |= halt_error", "", "[1,2]1\n", 5),
+        ("[1,2]", "label $f | (.|stderr)[(0,1)] |= break $f", "", "[1,2]", 0),
+        ("{\"a\":1}", ".[(\"a\",\"b\") | debug(\"k\")] |= error(\"x\")", "", "[\"DEBUG:\",\"k\"]\njq: error (at <stdin>:0): x\n", 5),
+        // nested
+        ("[[1],[2]]", "(.|stderr)[(0,1)] |= ((.|stderr)[(0,1)] |= error(\"x\"))", "", "[[1],[2]][1]jq: error (at <stdin>:0): x\n", 5),
+        // no failure at all: the filter interleaves with the paths
+        ("[0,0]", ".[(0,1)|debug(\"p\")] |= debug(\"f\")", "[0,0]\n", "[\"DEBUG:\",\"p\"]\n[\"DEBUG:\",\"f\"]\n[\"DEBUG:\",\"p\"]\n[\"DEBUG:\",\"f\"]\n", 0),
+        // the first path's error, not the resolver's on the second
+        ("[{\"a\":1},\"s\"]", "(.[] | select(.a > 0)) |= error(\"x\")", "", "jq: error (at <stdin>:0): x\n", 5),
+        ("[{\"a\":\"1\"},{\"a\":\"z\"},\"s\"]", "(.[] | select(.a != null)).a |= tonumber", "", "jq: error (at <stdin>:0): Invalid numeric literal at EOF at line 1, column 1 (while parsing 'z')\n", 5),
+        // ?// retries past an error or break, never past a halt
+        ("[10,20,30]", "(. as $x ?// $y | (.|stderr)[(0,1):(2,3)]) |= 99", "", "[10,20,30][10,20,30]jq: error (at <stdin>:0): A slice of an array can only be assigned another array\n", 5),
+        ("[10,20,30]", "(.[] as $x ?// $y | (.|stderr)[(0,1)]) |= error(\"x\")", "", "[10,20,30][10,20,30]jq: error (at <stdin>:0): x\n", 5),
+        ("[10,20,30]", "(. as $x ?// $y | (.|stderr)[(0,1)]) |= (\"h\"|halt_error(3))", "", "[10,20,30]h", 3),
+        ("[10,20,30]", "label $out | (. as $x ?// $y | (.|stderr)[(0,1)]) |= break $out", "", "[10,20,30][10,20,30]", 0),
+        // a ?// inside the filter itself
+        ("[10,20,30]", "(. as $x ?// $y | (.|stderr)[(0,1)]) |= (. as [$a] ?// $a | error(\"x\"))", "", "[10,20,30][10,20,30]jq: error (at <stdin>:0): x\n", 5),
+        // must not change: a successful update still reaches every path
+        ("[1,2]", "(.|stderr)[(0,1)] |= .+1", "[2,3]\n", "[1,2][1,2]", 0),
+        ("[1,2]", "(.|stderr)[(0,1)] += 1", "[2,3]\n", "[1,2][1,2]", 0),
+        // first output only
+        ("[1,2]", "(.|stderr)[(0,1)] |= (1,error(\"x\"))", "[1,1]\n", "[1,2][1,2]", 0),
+        // paths resolve against the unwritten document
+        ("{\"a\":\"b\",\"b\":\"a\"}", ".[(.a,.b)] |= 5", "{\"a\":5,\"b\":5}\n", "", 0),
+        // a static path
+        ("[1,2]", "(.|stderr)[] |= error(\"x\")", "", "[1,2]jq: error (at <stdin>:0): x\n", 5),
+        ("[1,2]", "(.|stderr)[(0,1)] *= \"x\"", "[\"x\",\"xx\"]\n", "[1,2][1,2]", 0),
+        ("[1,2,3,4]", "(.[] | select(. % 2 == 1)) |= . * 10", "[10,2,30,4]\n", "", 0),
+        ("{\"a\":{\"b\":1}}", "(.a, .a.b) |= 5", "", "jq: error (at <stdin>:0): Cannot index number with string \"b\"\n", 5),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, want_code, "{filter} on {input}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter} on {input}");
+        assert_eq!(stderr, want_err, "{filter} on {input}");
+    }
+    Ok(())
+}
+
+/// #2974: the streaming update reads `input` in jq's order -- one read for the
+/// path, then the filter's, per path -- rather than every path's reads first,
+/// and a failing update leaves the documents after it unread. Captured from
+/// jq 1.7.1.
+#[test]
+fn update_streaming_interleaves_input_reads_2974() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".[(input,input)] |= input"],
+        Some("[0,0]\n0 1 7 8\n"),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("[1,0,null,null,null,null,null,8]\n", "", 0)
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "try (.[(input,input)] |= error(\"x\")) catch \"c\""],
+        Some("[1,2]\n0 1\n"),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("\"c\"\n\"c\"\n", "", 0)
+    );
+    Ok(())
+}
+
+/// #2974 holdouts, pinned to succinctly's own output rather than jq's so a
+/// change trips here:
+///
+/// - A multi-output right side keeps the eager fork, which is #2267's
+///   still-open re-resolution half: jq fires the target three times here.
+/// - `key`/`parent` are succinctly extensions (no oracle). A filter that
+///   reads `parent` keeps the eager route, because its view of the document
+///   has every target vivified before any filter runs; one that only reads
+///   `key` streams. Both answer what they did before #2974.
+#[test]
+fn update_streaming_holdouts_2974() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(.|stderr)[(0,1)] += (1,\"x\")"], Some("[1,2]"))?;
+    assert_eq!(code, 5, "{stderr:?}");
+    assert_eq!(stdout, "[2,3]\n");
+    assert!(
+        stderr.starts_with("[1,2][1,2]jq: error"),
+        "two fires, not jq's three: {stderr:?}"
+    );
+
+    for (filter, want) in [
+        (".a[(0,1)] |= key", "{\"a\":[0,1,3]}\n"),
+        (".a[(0,1)] |= parent", "{\"a\":[[1,2,3],[1,2,3],3]}\n"),
+        (
+            "(.a[] | select(. > 1)) |= (parent | length)",
+            "{\"a\":[1,3,3]}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{\"a\":[1,2,3]}"))?;
+        assert_eq!((stdout.as_str(), code), (want, 0), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2267: a bounded consumer's demand now reaches the computed-navigation
 /// generators themselves -- the "stopping from above" gap
 /// `resolve_slice_expr`'s own body comment recorded as still open, closed by
