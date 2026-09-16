@@ -15013,7 +15013,7 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
     }
 
     fn share(&self) -> Self {
-        Rc::clone(self)
+        Self::clone(self)
     }
 }
 
