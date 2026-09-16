@@ -56885,9 +56885,34 @@ fn test_module_error_names_the_file_that_wrote_the_call_2951() -> Result<()> {
 /// `path(f)` and no `key` at all, both `… is not defined` there), so the
 /// oracle for these rows is the pre-#2829 binary, against which every answer
 /// below is unchanged.
+///
+/// **The first rows are the ones with power, and that distinction was earned
+/// the hard way.** This test first consisted only of the `path`/`key` rows
+/// below, which gave the line 100% *coverage* and no *authority*: mutating
+/// the call to `Cow::Owned(OwnedValue::Null)` / `OwnedIdentity::detached()`
+/// left every assertion green, because five of them never entered the pipe
+/// at all and the sixth never read either argument. The `[., path]` rows
+/// read the error payload *and* the path in one output, so the same mutant
+/// fails them. Coverage says a line ran; only a mutant says a test would
+/// notice if it changed.
 #[test]
 fn test_try_handler_reads_path_context_from_the_failing_stage_2829() -> Result<()> {
     let input = r#"{"a":{"b":1}}"#;
+
+    // Payload *and* path in one output: the handler receives the raised
+    // error's value as `.`, from the cursor the failing stage stood on.
+    // These are the rows that fail if either argument to the pipe changes.
+    let (out, code) = run_jq_stdin(r#"try error("x") catch [., path]"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"["x",[]]"#);
+
+    let (out, code) = run_jq_stdin(r#".a | try error("x") catch [., path]"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"["x",["a"]]"#);
+
+    let (out, code) = run_jq_stdin(r#".a.b | try error("x") catch [., key]"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"["x","b"]"#);
 
     // The handler sees the path of the stage that raised, not the root.
     let (out, code) = run_jq_stdin(r#".a | try error("x") catch path"#, input, &["-c"])?;
