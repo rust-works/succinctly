@@ -384,8 +384,10 @@ fn wrap_run(expr: Expr, defs: FuncDefList, id: u32, alias: Option<&str>) -> Expr
 /// over-keeps a little (a dependency `g/1` survives when only `g/0` is
 /// called) where keying on arity could silently *drop* a dependency a call
 /// genuinely needs, turning a program that compiles into a compile error.
-/// The self-recursion filter in [`visible_deps_for`] still keys on
-/// (name, arity), where it has to: there the exact pair is the semantics.
+/// The clash test in [`visible_deps_for`] and [`rename_dep_calls`] still key
+/// on (name, arity), where they have to: there the exact pair is the
+/// semantics, and `rename_dep_calls` reads a shadowable call's real arity
+/// through [`jq::call_arity`].
 ///
 /// `any_subexpr` with a predicate that never answers `true` is a full
 /// traversal -- the "must not rely on visiting every node" caveat in its doc
@@ -835,9 +837,9 @@ impl ModuleLoader {
     /// ### What each body is wrapped in
     ///
     /// [`visible_deps_for`] decides that per def: the module's dependencies
-    /// that the body transitively calls, minus the def itself by (name,
-    /// arity) and minus anything named after one of the def's parameters when
-    /// the body calls that name directly. The module's *own* defs are
+    /// that the body transitively calls, each origin's group wrapped as its
+    /// own flooring run, with a dependency that would shadow the def's own
+    /// name or a parameter renamed out of the way (#2962). The module's *own* defs are
     /// deliberately not wrapped in -- they are emitted as siblings in the
     /// top-level chain, where jq's lexical rule already relates them, and
     /// nesting a copy of one inside another's body would put it under scopes
