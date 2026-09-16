@@ -2018,6 +2018,56 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// program's undefined calls and undefined variables by position rather than
 /// grouping by kind (confirmed live: `$bar, foo, $baz` reports all three left
 /// to right), so this function must not re-sort or re-group them.
+/// Report one unresolved call, in jq's own `name/arity is not defined at
+/// {location}[, line N:]` shape. Tries `source`'s own call-site table first
+/// (the real, parser-recorded position -- see [`jq::CallSite`]), then a
+/// text-search fallback for a call the table does not record -- a
+/// namespaced call, since `Parser::parse_namespaced_call` never pushes to
+/// `call_sites`, unlike the plain-call path a few lines above it in the same
+/// file -- and finally the bare `at {location}` form if even that fails.
+///
+/// `taken`/`resume_from` are the caller's own per-name counters (each
+/// caller keys its own map, since `filter` and a given module are unrelated
+/// namespaces of occurrences), kept in step across *both* the table and
+/// text-search paths so a repeated name walks its own successive
+/// occurrences rather than re-citing a position already used (#2085
+/// review, finding 1) -- shared by both callers below so that discipline
+/// cannot drift between them the way it did before this was one function.
+fn report_unresolved_call(
+    name: &str,
+    arity: usize,
+    location: &str,
+    source: &str,
+    call_sites: &[jq::CallSite],
+    taken: &mut usize,
+    resume_from: &mut usize,
+) {
+    let from_table = call_sites
+        .iter()
+        .filter(|c| c.name == name && c.arity == arity)
+        .nth(*taken)
+        .map(|c| c.offset);
+    if let Some(offset) = from_table {
+        *taken += 1;
+        *resume_from = offset + name.len();
+        let (line_no, line_text, column) = line_at_offset(source, offset);
+        eprintln!("jq: error: {name}/{arity} is not defined at {location}, line {line_no}:");
+        eprintln!("{line_text}{}", " ".repeat(column));
+        return;
+    }
+
+    match locate_identifier_from(source, name, *resume_from) {
+        Some((line_no, line_text, column, end)) => {
+            *resume_from = end;
+            eprintln!("jq: error: {name}/{arity} is not defined at {location}, line {line_no}:");
+            eprintln!("{line_text}{}", " ".repeat(column));
+        }
+        None => {
+            eprintln!("jq: error: {name}/{arity} is not defined at {location}");
+        }
+    }
+}
+
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
@@ -2082,14 +2132,14 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // which needs the module's *own* text and its *own*
                 // call-site table -- re-derived here (never at load time:
                 // this is a cold error path, and most runs never take it) by
-                // re-reading the file `run_origin` already resolved. Falls
-                // back to a text search over that same source, mirroring
-                // `filter`'s own fallback below and for the same reason:
-                // `collect_call_sites` never records a namespaced call at
-                // all (`parse_namespaced_call` has no `call_sites.push`,
-                // unlike the plain-call path a few lines below it), so
-                // `def f: ns::g;` inside a module needs the search to find
-                // `ns::g`'s real occurrence.
+                // re-reading the file `run_origin` already resolved.
+                // `report_unresolved_call` gives it the same fallback the
+                // main filter's own diagnostic uses below, for the same
+                // reason: `collect_call_sites` never records a namespaced
+                // call at all (`parse_namespaced_call` has no
+                // `call_sites.push`, unlike the plain-call path a few lines
+                // below it in the same file), so `def f: ns::g;` inside a
+                // module needs the search to find `ns::g`'s real occurrence.
                 if let Some(id) = origin {
                     let at = loader
                         .run_origin(*id)
@@ -2102,91 +2152,35 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                         })
                     });
 
-                    if let Some((source, call_sites)) = cached {
-                        let taken = module_calls_consumed
-                            .entry((*id, name.as_str()))
-                            .or_insert(0);
-                        let from_table = call_sites
-                            .iter()
-                            .filter(|c| c.name == *name && c.arity == *arity)
-                            .nth(*taken)
-                            .map(|c| c.offset);
-                        if let Some(offset) = from_table {
-                            *taken += 1;
-                            let (line_no, line_text, column) = line_at_offset(source, offset);
-                            eprintln!(
-                                "jq: error: {name}/{arity} is not defined at {at}, line {line_no}:"
+                    match cached {
+                        Some((source, call_sites)) => {
+                            let taken = module_calls_consumed
+                                .entry((*id, name.as_str()))
+                                .or_insert(0);
+                            let resume = module_call_resume_from
+                                .entry((*id, name.as_str()))
+                                .or_insert(0);
+                            report_unresolved_call(
+                                name, *arity, &at, source, call_sites, taken, resume,
                             );
-                            eprintln!("{line_text}{}", " ".repeat(column));
-                            continue;
                         }
-
-                        let module_start_from = module_call_resume_from
-                            .get(&(*id, name.as_str()))
-                            .copied()
-                            .unwrap_or(0);
-                        if let Some((line_no, line_text, column, end)) =
-                            locate_identifier_from(source, name, module_start_from)
-                        {
-                            module_call_resume_from.insert((*id, name.as_str()), end);
-                            eprintln!(
-                                "jq: error: {name}/{arity} is not defined at {at}, line {line_no}:"
-                            );
-                            eprintln!("{line_text}{}", " ".repeat(column));
-                            continue;
+                        None => {
+                            eprintln!("jq: error: {name}/{arity} is not defined at {at}");
                         }
                     }
-
-                    eprintln!("jq: error: {name}/{arity} is not defined at {at}");
                     continue;
                 }
                 let taken = calls_consumed.entry(name.as_str()).or_insert(0);
-                // Matched on arity as well as name (#2085 review, finding 2):
-                // an `f/1` diagnostic must not take a perfectly resolvable
-                // `f/2` call site earlier in the source. `def f(a;b): a;
-                // f(1;2) | f(1)` cited the `f(1;2)` on line 2 instead of the
-                // failing `f(1)` on line 3.
-                let from_table = call_sites
-                    .iter()
-                    .filter(|c| c.name == *name && c.arity == *arity)
-                    .nth(*taken)
-                    .map(|c| c.offset);
-                if let Some(offset) = from_table {
-                    *taken += 1;
-                    // Keep the fallback's own cursor in step (#2085 review,
-                    // finding 1). These are two counters over the same name,
-                    // and letting them drift re-reports a position already
-                    // used: once the table runs out -- exactly the module
-                    // case, where a call inlined from `include`/`~/.jq` has
-                    // no occurrence in `filter` at all -- the fallback would
-                    // restart from offset 0 and invent a line for a call
-                    // that has none. With `def helper: nosuch;` in a module,
-                    // `include "m"; helper | nosuch` printed the `line 3`
-                    // marker twice rather than leaving the module's own
-                    // error unmarked.
-                    call_resume_from.insert(name.as_str(), offset + name.len());
-                    let (line_no, line_text, column) = line_at_offset(filter, offset);
-                    eprintln!(
-                        "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
-                    );
-                    eprintln!("{line_text}{}", " ".repeat(column));
-                    continue;
-                }
-
-                let start_from = call_resume_from.get(name.as_str()).copied().unwrap_or(0);
-
-                match locate_identifier_from(filter, name, start_from) {
-                    Some((line_no, line_text, column, end)) => {
-                        call_resume_from.insert(name.as_str(), end);
-                        eprintln!(
-                            "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
-                        );
-                        eprintln!("{line_text}{}", " ".repeat(column));
-                    }
-                    None => {
-                        eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
-                    }
-                }
+                let resume = call_resume_from.entry(name.as_str()).or_insert(0);
+                report_unresolved_call(
+                    name,
+                    *arity,
+                    "<top-level>",
+                    filter,
+                    &call_sites,
+                    taken,
+                    resume,
+                );
             }
             jq::ResolveError::Var(jq::UnboundVar { name }) => {
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
