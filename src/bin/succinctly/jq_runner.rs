@@ -570,15 +570,16 @@ fn visible_deps_for(
         }
     }
 
-    // Each kept entry with its name as written, which the renaming below
-    // compares against: a renamed entry's own name no longer says.
-    let mut kept: Vec<(String, usize, (String, Vec<Param>, Expr))> = Vec::new();
+    // Each kept entry, and alongside it its (name, arity) as written, which the
+    // renaming below compares against: a renamed entry's own name no longer
+    // says.
+    let mut kept: FuncDefList = Vec::new();
+    let mut written: Vec<(&str, usize)> = Vec::new();
     let mut renames = Vec::new();
     for (i, (dep_name, dep_params, dep_body)) in deps.iter().enumerate() {
         if !keep[i] {
             continue;
         }
-        let written = (dep_name.clone(), dep_params.len());
         let bound_as = if clashes(dep_name, dep_params) {
             let renamed = jq::ModuleRun::renamed_dep(run, i, dep_name);
             renames.push((kept.len(), renamed.clone()));
@@ -586,11 +587,8 @@ fn visible_deps_for(
         } else {
             dep_name.clone()
         };
-        kept.push((
-            written.0,
-            written.1,
-            (bound_as, dep_params.clone(), dep_body.clone()),
-        ));
+        written.push((dep_name, dep_params.len()));
+        kept.push((bound_as, dep_params.clone(), dep_body.clone()));
     }
 
     // A call reaches the renamed entry from the entry's own body (recursion)
@@ -598,21 +596,19 @@ fn visible_deps_for(
     // arity) shadows it -- `wrap_defs` nests later entries inside earlier
     // ones. An earlier entry cannot see it at all.
     for (at, renamed) in renames {
-        let (old, old_arity) = (kept[at].0.clone(), kept[at].1);
-        for j in at..kept.len() {
-            if j > at && kept[j].0 == old && kept[j].1 == old_arity {
+        let (old, old_arity) = written[at];
+        for (j, (_, entry_params, entry_body)) in kept.iter_mut().enumerate().skip(at) {
+            if j > at && written[j] == (old, old_arity) {
                 break;
             }
-            let (_, entry_params, entry_body) = &kept[j].2;
             if old_arity == 0 && entry_params.iter().any(|p| p.name() == old) {
                 continue;
             }
-            let rewritten = rename_dep_calls(entry_body, &old, old_arity, &renamed, 0);
-            kept[j].2 .2 = rewritten;
+            *entry_body = rename_dep_calls(entry_body, old, old_arity, &renamed, 0);
         }
     }
 
-    kept.into_iter().map(|(_, _, def)| def).collect()
+    kept
 }
 
 /// `expr` with every call that resolves to `old/arity` renamed to `new`
