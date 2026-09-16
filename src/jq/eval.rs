@@ -26616,7 +26616,13 @@ fn update_path<S: EvalSemantics>(
                         }
                     } else {
                         let mut retained = IndexMap::with_capacity(map.len());
-                        for (key, mut value) in core::mem::take(map) {
+                        // Take the `IndexMap` *through* the `ObjectMap` wrapper
+                        // (#3000): taking the wrapper itself would leave a freshly
+                        // boxed empty map behind, and the write-back below would
+                        // then allocate a second box and free that one -- two heap
+                        // round-trips per object, for a value that is overwritten
+                        // before anything can read it.
+                        for (key, mut value) in core::mem::take(&mut **map) {
                             let child = pos.map(|pos| pos.child(OwnedValue::String(key.clone())));
                             if update_path::<S>(
                                 &mut value,
@@ -26629,7 +26635,7 @@ fn update_path<S: EvalSemantics>(
                                 retained.insert(key, value);
                             }
                         }
-                        *map = retained.into();
+                        **map = retained;
                     }
                     Ok(true)
                 }
