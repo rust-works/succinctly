@@ -46895,6 +46895,79 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
             String::new(),
             0,
         ),
+        // #2918: `f` is also stopped *between* its own outputs -- each
+        // output's whole subtree runs before `f` is asked for the next. Under
+        // a bound that is one DEBUG line, not the whole node's fan-out ...
+        (
+            "[1,[2,[3]]]",
+            "[limit(2; recurse(.[]?|debug))]",
+            "[[1,[2,[3]]],1]\n".to_string(),
+            dbg("1"),
+            0,
+        ),
+        // ... through `?`, one `f` run at the node that errors, not two ...
+        (
+            r#"{"a":1}"#,
+            r#"[recurse(.[]?, ("x"|stderr|error("f")))?]"#,
+            "[{\"a\":1},1]\n".to_string(),
+            "x".to_string(),
+            0,
+        ),
+        // ... and unbounded, `f`'s side effects interleave with the descent.
+        (
+            r#"{"a":{"x":1},"b":{"y":2}}"#,
+            "[recurse(.[]?|debug)]",
+            "[{\"a\":{\"x\":1},\"b\":{\"y\":2}},{\"x\":1},1,{\"y\":2},2]\n".to_string(),
+            format!(
+                "{}{}{}{}",
+                dbg(r#"{"x":1}"#),
+                dbg("1"),
+                dbg(r#"{"y":2}"#),
+                dbg("2")
+            ),
+            0,
+        ),
+        // `cond` is stopped between its outputs the same way ...
+        (
+            r#"{"a":1,"b":2,"c":3}"#,
+            r#"[limit(2; recurse(.[]?; (true, ("c"|stderr|true))))]"#,
+            "[{\"a\":1,\"b\":2,\"c\":3},1]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // ... and runs on each child before that child's own `f` does.
+        (
+            "[0,1]",
+            "[limit(3; recurse(.[]?|debug; (.|debug|true)))]",
+            "[[0,1],0,1]\n".to_string(),
+            format!("{}{}{}{}", dbg("0"), dbg("0"), dbg("1"), dbg("1")),
+            0,
+        ),
+        // A chain: the second output of `f` is never asked for.
+        (
+            "0",
+            r#"[limit(3; recurse(.+1, ("s"|stderr|.+100)))]"#,
+            "[0,1,2]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // Path mode, the same rule (#2235 had left `.b`'s DEBUG firing).
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(limit(2; recurse((.a|debug), (.b|debug))))]",
+            "[[],[\"a\"]]\n".to_string(),
+            dbg("1"),
+            0,
+        ),
+        // Unchanged: `cond`'s later `error` is never reached, because the
+        // first approved child's own `f` fails first (#854).
+        (
+            r#"{"a":1,"b":2,"c":3}"#,
+            r#"[recurse(.[]; (true, error("x")))]"#,
+            String::new(),
+            "jq: error (at <stdin>:0): Cannot iterate over number (1)\n".to_string(),
+            5,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -46912,61 +46985,44 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[{\"a\":{\"b\":1}},{\"b\":1}]\n");
     assert_eq!(stderr, "");
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "[limit(2; [1,[2,[3]]] | recurse(.[]?|debug))]"],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[[1,[2,[3]]],1]\n");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n");
     Ok(())
 }
 
-/// #2918, the residual #2693 deliberately does **not** close: `f` is still
-/// run to completion at the node the traversal is at, because the walk is an
-/// explicit stack of materialized nodes and `f` is driven by a push-based
-/// sink that cannot be suspended between its own outputs. jq descends into
-/// `f`'s first output's whole subtree before asking `f` for its second.
+/// #2918's own limit: `recurse` descends natively from inside `f`'s sink
+/// only within a stack budget measured as it goes, and past it walks the rest
+/// of the subtree with the explicit stack, where `f` still runs to completion
+/// per node. jq writes one DEBUG line for both rows below; succinctly matches
+/// it at depth 20 and keeps the old residual at depth 1000, with a 30-stage
+/// pipe inside `f` making each level expensive enough to exhaust the budget
+/// long before that in every build profile (~60-90 levels measured).
 ///
-/// Each row records what jq does and what succinctly does, so closing #2918
-/// trips this test rather than passing silently. Values match in every row;
-/// only stderr differs, and in the third only its *order*.
+/// Values are the same either way. This pins that the budget exists, so a
+/// change to its size or its accounting trips here rather than passing
+/// silently.
 #[test]
-fn recurse_still_finishes_a_nodes_f_before_descending_2918() -> Result<()> {
-    for (input, filter, want_out, jq_err, our_err) in [
-        // Under a bound: one node's fan-out too many. Before #2693 this was
-        // five DEBUG lines (the whole remaining tree), not two.
-        (
-            "[1,[2,[3]]]",
-            "[limit(2; recurse(.[]?|debug))]",
-            "[[1,[2,[3]]],1]\n",
-            "[\"DEBUG:\",1]\n",
-            "[\"DEBUG:\",1]\n[\"DEBUG:\",[2,[3]]]\n",
-        ),
-        // Through `?`, one extra `f` run at the node that errors.
-        (
-            r#"{"a":1}"#,
-            r#"[recurse(.[]?, ("x"|stderr|error("f")))?]"#,
-            "[{\"a\":1},1]\n",
-            "x",
-            "xx",
-        ),
-        // Unbounded, it is stderr *ordering*: a node's whole fan-out is
-        // evaluated before its first child is descended into.
-        (
-            r#"{"a":{"x":1},"b":{"y":2}}"#,
-            "[recurse(.[]?|debug)]",
-            "[{\"a\":{\"x\":1},\"b\":{\"y\":2}},{\"x\":1},1,{\"y\":2},2]\n",
-            "[\"DEBUG:\",{\"x\":1}]\n[\"DEBUG:\",1]\n[\"DEBUG:\",{\"y\":2}]\n[\"DEBUG:\",2]\n",
-            "[\"DEBUG:\",{\"x\":1}]\n[\"DEBUG:\",{\"y\":2}]\n[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n",
-        ),
+fn recurse_queues_past_its_native_stack_budget_2918() -> Result<()> {
+    let stages = vec!["(.+0)"; 30].join(" | ");
+    let dbg = |v: &str| format!("[\"DEBUG:\",{v}]\n");
+    for (depth, want_err) in [
+        (20, dbg("21")),
+        (1000, format!("{}{}", dbg("1001"), dbg("1002"))),
     ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
-        assert_eq!(stdout, want_out, "{filter}");
-        assert_ne!(
-            our_err, jq_err,
-            "{filter}: this row exists because the two differ -- if they no longer do, \
-             move it into `recurse_runs_f_only_on_demand_2693`"
+        let filter = format!(
+            "[limit({}; 0 | recurse(if . < {depth} then .+1 elif . == {depth} then \
+             ((.+1|debug), (.+2|debug)) else empty end | {stages}))] | length",
+            depth + 2
         );
-        assert_eq!(
-            stderr, our_err,
-            "{filter}: #2918's residual changed -- if it closed, move this row into \
-             `recurse_runs_f_only_on_demand_2693` with jq's own stderr ({jq_err:?})"
-        );
+        let (stdout, stderr, code) = run_jq_full(&["-cn", &filter], None)?;
+        assert_eq!(code, 0, "depth {depth}: stderr: {stderr:?}");
+        assert_eq!(stdout, format!("{}\n", depth + 2), "depth {depth}");
+        assert_eq!(stderr, want_err, "depth {depth}");
     }
     Ok(())
 }
