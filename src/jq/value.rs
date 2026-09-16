@@ -1767,7 +1767,7 @@ fn try_positive_shifted_plain(
 /// [`OwnedValue::object_from`] (or `IndexMap::….into()`) and read through
 /// [`OwnedValue::as_object`]/[`OwnedValue::as_object_mut`], whose signatures
 /// are unchanged.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ObjectMap(ObjectMapInner);
 
 /// [`ObjectMap`]'s inner representation, boxed in the shipped build.
@@ -1810,6 +1810,18 @@ impl ObjectMap {
     #[inline]
     pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
         self.0
+    }
+}
+
+/// Transparent, so `{:?}` on an `OwnedValue` prints `Object({...})` exactly as
+/// it did before #3000 wrapped the map. A derived `Debug` would have printed
+/// `Object(ObjectMap({...}))` -- a cosmetic but real change to what a
+/// downstream `println!("{:?}", value)` shows, for a wrapper whose whole
+/// purpose is to be invisible.
+impl core::fmt::Debug for ObjectMap {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&self.0, f)
     }
 }
 
@@ -3575,6 +3587,16 @@ mod tests {
         let plain: IndexMap<String, OwnedValue> = rebuilt.clone().into();
         assert_eq!(plain.len(), 4);
         assert_eq!(rebuilt.into_index_map(), plain);
+
+        // `Debug` is transparent: the wrapper must not show up in `{:?}`
+        // output that a downstream caller prints (it did not exist before
+        // #3000, so printing it would be a change in observable behaviour).
+        let one = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert_eq!(
+            alloc::format!("{one:?}"),
+            r#"Object({"a": Int(1)})"#,
+            "ObjectMap must not appear in an OwnedValue's Debug output"
+        );
 
         // Constructors.
         assert!(ObjectMap::new().is_empty());
