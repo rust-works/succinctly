@@ -838,7 +838,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
                 let value = yaml_to_owned_value(field.value_cursor())?;
                 map.insert(key, value);
             }
-            Ok(OwnedValue::Object(map))
+            Ok(OwnedValue::Object(map.into()))
         }
         YamlValue::Sequence(elements) => {
             let mut arr = Vec::new();
@@ -1225,7 +1225,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // `container_tail_gap_ok` arm here, closing #2211's `{,}` gap the
         // same way `eval_generic::to_owned_at_depth` does since #2358.
         tail_gap_ok(Some(cursor), last_field.as_ref(), b'}')?;
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.into())
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
@@ -5611,10 +5611,10 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
     let mut args_obj = IndexMap::new();
     args_obj.insert(
         "named".to_string(),
-        OwnedValue::Object(context.named.clone()),
+        OwnedValue::Object(context.named.clone().into()),
     );
     args_obj.insert("positional".to_string(), OwnedValue::Array(Vec::new()));
-    OwnedValue::Object(args_obj)
+    OwnedValue::Object(args_obj.into())
 }
 
 /// Whether `expr` mentions the `split_doc` builtin anywhere.
@@ -8419,7 +8419,7 @@ mod tests {
 
         let mut obj = IndexMap::new();
         obj.insert("k".to_string(), OwnedValue::Int(1));
-        let value = OwnedValue::Array(vec![OwnedValue::Object(obj)]);
+        let value = OwnedValue::Array(vec![OwnedValue::Object(obj.into())]);
 
         let mut obj_comments = IndexMap::new();
         obj_comments.insert(
@@ -9049,10 +9049,13 @@ mod tests {
         let owned = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap();
         assert_eq!(
             owned,
-            OwnedValue::Object(IndexMap::from([
-                ("a".to_string(), OwnedValue::Int(1)),
-                ("b".to_string(), OwnedValue::Int(2)),
-            ]))
+            OwnedValue::Object(
+                IndexMap::from([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ])
+                .into()
+            )
         );
 
         // The array arm has the identical gap for a missing ','.
@@ -9116,10 +9119,13 @@ mod tests {
         let owned = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap();
         assert_eq!(
             owned,
-            OwnedValue::Object(IndexMap::from([
-                ("a".to_string(), OwnedValue::Int(1)),
-                ("b".to_string(), OwnedValue::Int(2)),
-            ]))
+            OwnedValue::Object(
+                IndexMap::from([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ])
+                .into()
+            )
         );
         let json = br"[1,2,3]";
         let index = JsonIndex::build(json);
@@ -9237,18 +9243,23 @@ mod tests {
         let json = br#"{"a": [1,2,{"b":3}], "c": {}, "d": []}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let expected = OwnedValue::Object(IndexMap::from([
-            (
-                "a".to_string(),
-                OwnedValue::Array(vec![
-                    OwnedValue::Int(1),
-                    OwnedValue::Int(2),
-                    OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Int(3))])),
-                ]),
-            ),
-            ("c".to_string(), OwnedValue::Object(IndexMap::new())),
-            ("d".to_string(), OwnedValue::Array(vec![])),
-        ]));
+        let expected = OwnedValue::Object(
+            IndexMap::from([
+                (
+                    "a".to_string(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Object(
+                            IndexMap::from([("b".to_string(), OwnedValue::Int(3))]).into(),
+                        ),
+                    ]),
+                ),
+                ("c".to_string(), OwnedValue::Object(IndexMap::new().into())),
+                ("d".to_string(), OwnedValue::Array(vec![])),
+            ])
+            .into(),
+        );
         assert_eq!(
             to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap(),
             expected
@@ -9573,25 +9584,29 @@ mod tests {
             (OwnedValue::Bool(true), OwnedValue::Bool(true)),
             // Object equality is order-independent.
             (
-                OwnedValue::Object(IndexMap::from_iter([
-                    ("a".to_string(), OwnedValue::Int(1)),
-                    ("b".to_string(), OwnedValue::Int(2)),
-                ])),
-                OwnedValue::Object(IndexMap::from_iter([
-                    ("b".to_string(), OwnedValue::Int(2)),
-                    ("a".to_string(), OwnedValue::Int(1)),
-                ])),
+                OwnedValue::Object(
+                    IndexMap::from_iter([
+                        ("a".to_string(), OwnedValue::Int(1)),
+                        ("b".to_string(), OwnedValue::Int(2)),
+                    ])
+                    .into(),
+                ),
+                OwnedValue::Object(
+                    IndexMap::from_iter([
+                        ("b".to_string(), OwnedValue::Int(2)),
+                        ("a".to_string(), OwnedValue::Int(1)),
+                    ])
+                    .into(),
+                ),
             ),
             // ...including nested, and mixing the number rule in.
             (
-                OwnedValue::Array(vec![OwnedValue::Object(IndexMap::from_iter([(
-                    "n".to_string(),
-                    OwnedValue::Int(2),
-                )]))]),
-                OwnedValue::Array(vec![OwnedValue::Object(IndexMap::from_iter([(
-                    "n".to_string(),
-                    OwnedValue::Float(2.0),
-                )]))]),
+                OwnedValue::Array(vec![OwnedValue::Object(
+                    IndexMap::from_iter([("n".to_string(), OwnedValue::Int(2))]).into(),
+                )]),
+                OwnedValue::Array(vec![OwnedValue::Object(
+                    IndexMap::from_iter([("n".to_string(), OwnedValue::Float(2.0))]).into(),
+                )]),
             ),
         ];
         for (a, b) in equal_pairs {

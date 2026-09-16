@@ -68,6 +68,13 @@ mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 # Useful for testing broadword performance vs NEON intrinsics.
 broadword-yaml = []
 
+# Measurement-only holdout for #3000: swap `OwnedValue::Object`'s backing map
+# back to an inline `IndexMap` (the pre-#3000, 72-byte-value layout) while
+# keeping this branch's source shape, so an A/B can subtract code-layout bias
+# from the boxed build's numbers. NEVER enable this in a shipped build --
+# it undoes the 72 -> 32 byte shrink the default build exists to deliver.
+unboxed-object-map = []
+
 # Use pure scalar (byte-by-byte) for YAML parsing. Disables all SIMD/broadword.
 # Useful for benchmarking baseline scalar performance.
 scalar-yaml = []

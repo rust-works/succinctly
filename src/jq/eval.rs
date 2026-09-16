@@ -382,7 +382,7 @@ use super::expr::{
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, int_to_f64,
     is_infinity_sentinel, is_nan_sentinel, jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp,
-    owned_value_eq, NumberRepr, OwnedValue,
+    owned_value_eq, NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -1640,7 +1640,7 @@ fn root_path_context_placeholder<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// The jq-mode placeholder for `parent`/`parent(n)` past the document root.
 fn no_parent_placeholder() -> OwnedValue {
-    OwnedValue::Object(IndexMap::new())
+    OwnedValue::Object(IndexMap::new().into())
 }
 
 /// [`yq_empty_operand_output`]'s `and`/`or` row, as the `bool` those two
@@ -1940,7 +1940,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
                     }
                 }
             }
-            OwnedValue::Object(map)
+            OwnedValue::Object(map.into())
         }
         StandardJson::Error(_) => OwnedValue::Null,
     }
@@ -2107,7 +2107,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             }
             // #2403: same reasoning as the array arm's own check above.
             tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
-            OwnedValue::Object(map)
+            OwnedValue::Object(map.into())
         }
         // #2286 review: this arm used to silently substitute `Null` for a
         // bareword-garbage token (`StandardJson::Error`, e.g. `xyz123`),
@@ -2189,7 +2189,7 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(
 ) -> Result<OwnedValue, EvalError> {
     match value {
         StandardJson::Array(_) => Ok(OwnedValue::Array(Vec::new())),
-        StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new())),
+        StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned(other),
     }
 }
@@ -2824,7 +2824,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::String(file.as_deref().unwrap_or("<top-level>").into()),
             );
             obj.insert("line".into(), OwnedValue::Int(*line as i64));
-            QueryResult::Owned(OwnedValue::Object(obj))
+            QueryResult::Owned(OwnedValue::Object(obj.into()))
         }
         Expr::Env => {
             // $ENV returns an object containing all environment variables
@@ -3016,7 +3016,7 @@ pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<Own
                 let value = yq_empty_context_literal_or_constructor(&entry.value)?;
                 map.insert(key, value);
             }
-            Some(OwnedValue::Object(map))
+            Some(OwnedValue::Object(map.into()))
         }
         Expr::Pipe(stages) => yq_empty_context_literal_or_constructor(stages.last()?),
         _ => None,
@@ -3391,7 +3391,7 @@ fn build_object_entries<S: EvalSemantics>(
         } else {
             acc.iter().cloned().collect::<IndexMap<_, _>>()
         };
-        out.push(OwnedValue::Object(object));
+        out.push(OwnedValue::Object(object.into()));
         return Ok(());
     };
 
@@ -7286,7 +7286,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Flow {
     let Some((entry, rest)) = entries.split_first() else {
         let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
-        return match sink(Item::Owned(OwnedValue::Object(object))) {
+        return match sink(Item::Owned(OwnedValue::Object(object.into()))) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         };
@@ -9200,9 +9200,9 @@ fn arith_mul<S: EvalSemantics>(
         // `arith_add`'s `null`-passthrough arm) -- this arm must run
         // before the numeric arm further down collapses it.
         (left, OwnedValue::Null) if S::NULL_MERGES_AS_EMPTY => Ok(left),
-        (OwnedValue::Null, b @ OwnedValue::Object(_)) if S::NULL_MERGES_AS_EMPTY => {
-            Ok(merge_values(OwnedValue::Object(IndexMap::new()), b, flags))
-        }
+        (OwnedValue::Null, b @ OwnedValue::Object(_)) if S::NULL_MERGES_AS_EMPTY => Ok(
+            merge_values(OwnedValue::Object(IndexMap::new().into()), b, flags),
+        ),
         (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
             Ok(merge_values(OwnedValue::Array(Vec::new()), b, flags))
         }
@@ -9498,11 +9498,11 @@ fn merge_position(
 /// each field merged below is one level deeper, so every call back into
 /// [`merge_existing_at_depth`]/[`merge_position`] passes `depth + 1`.
 fn merge_object_fields(
-    mut left: IndexMap<String, OwnedValue>,
-    right: IndexMap<String, OwnedValue>,
+    mut left: ObjectMap,
+    right: ObjectMap,
     flags: MergeFlags,
     depth: usize,
-) -> IndexMap<String, OwnedValue> {
+) -> ObjectMap {
     for (k, v) in right {
         match left.entry(k) {
             indexmap::map::Entry::Occupied(mut e) => {
@@ -11478,7 +11478,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     result_map.insert(key, value);
                 }
             }
-            QueryResult::Owned(OwnedValue::Object(result_map))
+            QueryResult::Owned(OwnedValue::Object(result_map.into()))
         }
         StandardJson::Array(elements) => {
             // map_values on array applies to each element. #1829:
@@ -13846,7 +13846,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::Int(i as i64));
                 entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry));
+                entries.push(OwnedValue::Object(entry.into()));
             }
             QueryResult::Owned(OwnedValue::Array(entries))
         }
@@ -13889,7 +13889,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
                 entry.insert("value".to_string(), val);
-                entries.push(OwnedValue::Object(entry));
+                entries.push(OwnedValue::Object(entry.into()));
             }
             QueryResult::Owned(OwnedValue::Array(entries))
         }
@@ -14041,7 +14041,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return suppress_or_raise(e, optional),
     };
     match entries_to_object::<S, _>(entries) {
-        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result.into())),
         // The `?` suffix swallows the refusal outright in jq, as the arm
         // above already does for a non-array/non-object input. See
         // `ObjectEscape`'s doc on why the flag is not yet reachable from
@@ -14129,7 +14129,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // from_entries
     match entries_to_object::<S, _>(transformed) {
-        Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
+        Ok(result) => QueryResult::Owned(OwnedValue::Object(result.into())),
         Err(_) if optional => QueryResult::None,
         Err(e) => e.into(),
     }
@@ -16271,7 +16271,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
     // Check for empty object
     if *pos < bytes.len() && bytes[*pos] == b'}' {
         *pos += 1;
-        return Ok(OwnedValue::Object(entries));
+        return Ok(OwnedValue::Object(entries.into()));
     }
 
     loop {
@@ -16313,7 +16313,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
         match bytes[*pos] {
             b'}' => {
                 *pos += 1;
-                return Ok(OwnedValue::Object(entries));
+                return Ok(OwnedValue::Object(entries.into()));
             }
             b',' => {
                 *pos += 1;
@@ -16929,7 +16929,7 @@ fn build_upper_index<'a, W, S: EvalSemantics>(
             obj.insert(owned_to_string::<S>(&k), row.clone());
         }
     }
-    QueryResult::Owned(OwnedValue::Object(obj))
+    QueryResult::Owned(OwnedValue::Object(obj.into()))
 }
 
 /// Builtin: rindex(s) - last index of substring/element s, or null
@@ -18243,11 +18243,11 @@ fn build_match_object(
             "name".to_string(),
             name.map_or(OwnedValue::Null, |n| OwnedValue::String(n.to_string())),
         );
-        captures.push(OwnedValue::Object(cap_obj));
+        captures.push(OwnedValue::Object(cap_obj.into()));
     }
     obj.insert("captures".to_string(), OwnedValue::Array(captures));
 
-    OwnedValue::Object(obj)
+    OwnedValue::Object(obj.into())
 }
 
 /// Split `input` around each match in `matches` (already
@@ -18807,7 +18807,7 @@ fn capture_object(re: &JqRegex, caps: &regex::Captures) -> OwnedValue {
             entries.insert(name.to_string(), OwnedValue::String(m.as_str().to_string()));
         }
     }
-    OwnedValue::Object(entries)
+    OwnedValue::Object(entries.into())
 }
 
 /// Builtin: sub(re; replacement; flags) - replace first match with flags
@@ -24808,7 +24808,7 @@ fn yq_metadata_builtin_as_assign_path_error(path_expr: &Expr) -> Option<EvalErro
 /// only value auto-vivified, matching `set_value_at_path`'s own rule.
 fn autovivify_object(root: &mut OwnedValue) {
     if matches!(root, OwnedValue::Null) {
-        *root = OwnedValue::Object(IndexMap::new());
+        *root = OwnedValue::Object(IndexMap::new().into());
     }
 }
 
@@ -26629,7 +26629,7 @@ fn update_path<S: EvalSemantics>(
                                 retained.insert(key, value);
                             }
                         }
-                        *map = retained;
+                        *map = retained.into();
                     }
                     Ok(true)
                 }
@@ -27122,7 +27122,7 @@ fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError
             Expr::Field(name) => {
                 let mut map = IndexMap::new();
                 map.insert(name.clone(), value);
-                OwnedValue::Object(map)
+                OwnedValue::Object(map.into())
             }
             Expr::Index { idx, .. } => {
                 let mut arr = Vec::new();
@@ -42510,7 +42510,7 @@ fn walk_impl_at_depth<S: EvalSemantics>(
                     new_obj.insert(k, new_v);
                 }
             }
-            OwnedValue::Object(new_obj)
+            OwnedValue::Object(new_obj.into())
         }
         other => other,
     };
@@ -43954,7 +43954,7 @@ fn set_value_at_path(
                     name.clone(),
                     set_value_at_path(OwnedValue::Null, rest, new_val)?,
                 );
-                Ok(OwnedValue::Object(entries))
+                Ok(OwnedValue::Object(entries.into()))
             }
             other => Err(EvalError::cannot_index(other.type_name(), key)),
         },
@@ -49343,7 +49343,7 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
                 let value = yaml_value_to_owned_checked(field.value_cursor())?;
                 map.insert(key, value);
             }
-            OwnedValue::Object(map)
+            OwnedValue::Object(map.into())
         }
         YamlValue::Alias { target, .. } => {
             // Resolve the *entire* alias chain first (#1193), not just this
@@ -51329,7 +51329,7 @@ fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> 
     for (key, value) in std::env::vars() {
         env_obj.insert(key, OwnedValue::String(value));
     }
-    QueryResult::Owned(OwnedValue::Object(env_obj))
+    QueryResult::Owned(OwnedValue::Object(env_obj.into()))
 }
 
 #[cfg(not(feature = "std"))]
@@ -51348,7 +51348,7 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     for (key, value) in std::env::vars() {
         env_obj.insert(key, OwnedValue::String(value));
     }
-    QueryResult::Owned(OwnedValue::Object(env_obj))
+    QueryResult::Owned(OwnedValue::Object(env_obj.into()))
 }
 
 #[cfg(not(feature = "std"))]
@@ -51862,7 +51862,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // If key not found, yq silently skips it
                 }
             }
-            QueryResult::Owned(OwnedValue::Object(result))
+            QueryResult::Owned(OwnedValue::Object(result.into()))
         }
         StandardJson::Array(elements) => {
             // For arrays, pick specified indices
@@ -52010,7 +52010,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     result.insert(key.into_owned(), owned);
                 }
             }
-            QueryResult::Owned(OwnedValue::Object(result))
+            QueryResult::Owned(OwnedValue::Object(result.into()))
         }
         StandardJson::Array(elements) => {
             // For arrays, keep all indices except those in the omit list
@@ -52330,7 +52330,7 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
         result.insert(key.clone(), OwnedValue::Array(values));
     }
 
-    QueryResult::Owned(OwnedValue::Object(result))
+    QueryResult::Owned(OwnedValue::Object(result.into()))
 }
 
 // ============================================================================
@@ -61905,7 +61905,7 @@ mod tests {
             let mut m = indexmap::IndexMap::new();
             m.insert("a".to_string(), OwnedValue::Int(1));
             m.insert("b".to_string(), OwnedValue::Int(2));
-            OwnedValue::Object(m)
+            OwnedValue::Object(m.into())
         };
         let arr = || {
             OwnedValue::Array(vec![
@@ -61975,7 +61975,7 @@ mod tests {
             let mut m = indexmap::IndexMap::new();
             m.insert("a".to_string(), OwnedValue::Int(1));
             m.insert("b".to_string(), OwnedValue::Int(2));
-            OwnedValue::Object(m)
+            OwnedValue::Object(m.into())
         };
         let arr = || {
             OwnedValue::Array(vec![
@@ -62038,7 +62038,7 @@ mod tests {
             let mut m = indexmap::IndexMap::new();
             m.insert("a".to_string(), OwnedValue::Int(1));
             m.insert("b".to_string(), OwnedValue::Int(2));
-            OwnedValue::Object(m)
+            OwnedValue::Object(m.into())
         };
         let arr = || {
             OwnedValue::Array(vec![
@@ -62151,8 +62151,8 @@ mod tests {
             let mut inner = indexmap::IndexMap::new();
             inner.insert("b".to_string(), v.clone());
             let mut wrapper = indexmap::IndexMap::new();
-            wrapper.insert("a".to_string(), OwnedValue::Object(inner));
-            out.push(OwnedValue::Object(wrapper));
+            wrapper.insert("a".to_string(), OwnedValue::Object(inner.into()));
+            out.push(OwnedValue::Object(wrapper.into()));
             out.push(OwnedValue::Array(vec![v]));
         }
         out
@@ -62163,7 +62163,7 @@ mod tests {
         let mut inner = indexmap::IndexMap::new();
         inner.insert("b".to_string(), OwnedValue::Int(2));
         let mut nested = indexmap::IndexMap::new();
-        nested.insert("a".to_string(), OwnedValue::Object(inner));
+        nested.insert("a".to_string(), OwnedValue::Object(inner.into()));
         let mut flat = indexmap::IndexMap::new();
         flat.insert("a".to_string(), OwnedValue::Int(1));
         flat.insert("b".to_string(), OwnedValue::Bool(false));
@@ -62191,10 +62191,10 @@ mod tests {
             OwnedValue::String("x".to_string()),
             OwnedValue::Array(Vec::new()),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
-            OwnedValue::Object(indexmap::IndexMap::new()),
-            OwnedValue::Object(flat),
-            OwnedValue::Object(nested),
-            OwnedValue::Object(nulled),
+            OwnedValue::Object(indexmap::IndexMap::new().into()),
+            OwnedValue::Object(flat.into()),
+            OwnedValue::Object(nested.into()),
+            OwnedValue::Object(nulled.into()),
         ]
     }
 
@@ -62699,8 +62699,8 @@ mod tests {
         let mut inner = indexmap::IndexMap::new();
         inner.insert("b".to_string(), OwnedValue::Int(2));
         let mut outer = indexmap::IndexMap::new();
-        outer.insert("a".to_string(), OwnedValue::Object(inner));
-        let value = OwnedValue::Object(outer);
+        outer.insert("a".to_string(), OwnedValue::Object(inner.into()));
+        let value = OwnedValue::Object(outer.into());
 
         // Pure and single-output, so evaluable as an operand ...
         assert!(is_owned_pure_expr(&expr));
@@ -62796,7 +62796,7 @@ mod tests {
         let mut value = indexmap::IndexMap::new();
         value.insert("a".to_string(), OwnedValue::String("str".to_string()));
         value.insert("c".to_string(), OwnedValue::Int(1));
-        let value = OwnedValue::Object(value);
+        let value = OwnedValue::Object(value.into());
 
         let err = eval_owned_pure::<JqSemantics>(&cond, &value, ResultPosition::Fresh)
             .unwrap()
@@ -62985,8 +62985,8 @@ mod tests {
         let mut inner = indexmap::IndexMap::new();
         inner.insert("b".to_string(), OwnedValue::Int(2));
         let mut outer = indexmap::IndexMap::new();
-        outer.insert("a".to_string(), OwnedValue::Object(inner));
-        let value = OwnedValue::Object(outer);
+        outer.insert("a".to_string(), OwnedValue::Object(inner.into()));
+        let value = OwnedValue::Object(outer.into());
         for src in [".", ".a", ".a.b", ".[\"a\"]", ".a | .b"] {
             let expr = parse(src).unwrap();
             assert!(
@@ -65290,7 +65290,7 @@ mod tests {
         // leaving `a: {}` (not `a: null`, and not the full rhs).
         yq_query!(br#"{"b": {"x": 1, "y": 2}}"#, ".a *=? .b",
             QueryResult::Owned(OwnedValue::Object(o)) => {
-                assert_eq!(o.get("a"), Some(&OwnedValue::Object(IndexMap::new())));
+                assert_eq!(o.get("a"), Some(&OwnedValue::Object(IndexMap::new().into())));
             }
         );
 
@@ -67322,7 +67322,7 @@ mod tests {
                 assert_eq!(e.message, "{}");
                 assert_eq!(
                     e.value,
-                    EvalErrorPayload::Value(OwnedValue::Object(IndexMap::new()))
+                    EvalErrorPayload::Value(OwnedValue::Object(IndexMap::new().into()))
                 );
             }
         );
@@ -68077,21 +68077,27 @@ mod tests {
         let json = br#"{"a": [1,2,{"b":3}], "c": {}, "d": []}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let expected = OwnedValue::Object(IndexMap::from([
-            (
-                "a".to_string(),
-                OwnedValue::Array(vec![
-                    OwnedValue::from_number_literal("1"),
-                    OwnedValue::from_number_literal("2"),
-                    OwnedValue::Object(IndexMap::from([(
-                        "b".to_string(),
-                        OwnedValue::from_number_literal("3"),
-                    )])),
-                ]),
-            ),
-            ("c".to_string(), OwnedValue::Object(IndexMap::new())),
-            ("d".to_string(), OwnedValue::Array(vec![])),
-        ]));
+        let expected = OwnedValue::Object(
+            IndexMap::from([
+                (
+                    "a".to_string(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::from_number_literal("1"),
+                        OwnedValue::from_number_literal("2"),
+                        OwnedValue::Object(
+                            IndexMap::from([(
+                                "b".to_string(),
+                                OwnedValue::from_number_literal("3"),
+                            )])
+                            .into(),
+                        ),
+                    ]),
+                ),
+                ("c".to_string(), OwnedValue::Object(IndexMap::new().into())),
+                ("d".to_string(), OwnedValue::Array(vec![])),
+            ])
+            .into(),
+        );
         assert_eq!(to_owned(&cursor.value()).unwrap(), expected);
     }
 
@@ -68102,7 +68108,7 @@ mod tests {
     fn test_to_owned_wellformed_containers_unaffected_2262() {
         for (json, expected) in [
             (b"[]".as_slice(), OwnedValue::Array(vec![])),
-            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new())),
+            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
                 OwnedValue::Array(vec![
@@ -68113,10 +68119,13 @@ mod tests {
             ),
             (
                 br#"{"a":1,"b":2}"#.as_slice(),
-                OwnedValue::Object(IndexMap::from([
-                    ("a".to_string(), OwnedValue::from_number_literal("1")),
-                    ("b".to_string(), OwnedValue::from_number_literal("2")),
-                ])),
+                OwnedValue::Object(
+                    IndexMap::from([
+                        ("a".to_string(), OwnedValue::from_number_literal("1")),
+                        ("b".to_string(), OwnedValue::from_number_literal("2")),
+                    ])
+                    .into(),
+                ),
             ),
         ] {
             let index = JsonIndex::build(json);
@@ -69532,7 +69541,7 @@ mod tests {
             OwnedValue::Float(1.5),
             OwnedValue::String("s".to_string()),
             OwnedValue::Array(vec![]),
-            OwnedValue::Object(IndexMap::new()),
+            OwnedValue::Object(IndexMap::new().into()),
         ]
     }
 
@@ -76522,7 +76531,7 @@ mod tests {
             let mut desc = IndexMap::new();
             desc.insert("start".to_string(), OwnedValue::Int(0));
             desc.insert("end".to_string(), OwnedValue::Int(1));
-            OwnedValue::Object(desc)
+            OwnedValue::Object(desc.into())
         })
         .take(200_000)
         .collect();
@@ -81992,7 +82001,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             root,
-            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1),)]))
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1),)]).into())
         );
 
         let mut root = OwnedValue::Null;
@@ -82017,7 +82026,7 @@ mod tests {
         // `set_path_steps` vivifies each intermediate as it walks a
         // multi-part chain, not just the first step (#1429: this used to be
         // `get_path_mut`'s job, and its own direct-call coverage).
-        let mut root = OwnedValue::Object(IndexMap::new());
+        let mut root = OwnedValue::Object(IndexMap::new().into());
         let steps = [
             Expr::Field("a".to_string()),
             Expr::Field("b".to_string()),
@@ -82034,13 +82043,21 @@ mod tests {
         .unwrap();
         assert_eq!(
             root,
-            OwnedValue::Object(IndexMap::from([(
-                "a".to_string(),
-                OwnedValue::Object(IndexMap::from([(
-                    "b".to_string(),
-                    OwnedValue::Object(IndexMap::from([("c".to_string(), OwnedValue::Int(7))])),
-                )])),
-            )]))
+            OwnedValue::Object(
+                IndexMap::from([(
+                    "a".to_string(),
+                    OwnedValue::Object(
+                        IndexMap::from([(
+                            "b".to_string(),
+                            OwnedValue::Object(
+                                IndexMap::from([("c".to_string(), OwnedValue::Int(7))]).into()
+                            )
+                        )])
+                        .into()
+                    )
+                )])
+                .into()
+            )
         );
     }
 
@@ -84028,7 +84045,7 @@ mod tests {
         )];
         for (scalar, spelling) in rows {
             let input = OwnedValue::Array(alloc::vec![
-                OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Int(1))])),
+                OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Int(1))]).into()),
                 scalar.clone(),
             ]);
             // Every filter here reaches the door (it reads path context) and
@@ -84154,10 +84171,13 @@ mod tests {
         // the array-`.[]` loop above already has a test for, but for the
         // `OwnedValue::Object` iteration branch specifically.
         let expr = parse(r#".[] | if key == "a" then error("boom") else file_index end"#).unwrap();
-        let input = OwnedValue::Object(IndexMap::from([
-            ("a".to_string(), OwnedValue::Int(1)),
-            ("b".to_string(), OwnedValue::Int(2)),
-        ]));
+        let input = OwnedValue::Object(
+            IndexMap::from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ])
+            .into(),
+        );
         match eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, &[]) {
             QueryResult::Error(e) => assert_eq!(e.message, "boom"),
             other => panic!("expected Error, got {other:?}"),
@@ -88640,10 +88660,13 @@ mod tests {
         let expr = parse(".a, .b").unwrap();
         match eval_owned_expr_ctrl_full::<JqSemantics>(
             &expr,
-            &OwnedValue::Object(IndexMap::from([
-                ("a".to_string(), OwnedValue::Int(1)),
-                ("b".to_string(), OwnedValue::Int(2)),
-            ])),
+            &OwnedValue::Object(
+                IndexMap::from([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ])
+                .into(),
+            ),
             false,
         ) {
             Ok((OwnedValue::Array(vs), None)) => {
@@ -88679,7 +88702,8 @@ mod tests {
     /// (`ManyOwned`, len 1).
     #[test]
     fn eval_owned_expr_full_one_and_len1_many_shapes_1280() {
-        let input = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
+        let input =
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]).into());
 
         // QueryResult::One
         let expr = parse("if true then .a else . end").unwrap();
@@ -88720,7 +88744,7 @@ mod tests {
         // QueryResult::Many, len() == 0: `.[]` over `{}` produces nothing at
         // all, matching `result_to_owned_full`'s identical rule -- not
         // `Ok(Some((OwnedValue::Array(vec![]), None)))`.
-        let empty_obj = OwnedValue::Object(IndexMap::new());
+        let empty_obj = OwnedValue::Object(IndexMap::new().into());
         let expr = parse(".[]").unwrap();
         match eval_owned_expr_full::<JqSemantics>(&expr, &empty_obj, false) {
             Ok(None) => {}
@@ -88736,10 +88760,13 @@ mod tests {
         }
 
         // Positive control: 2+ outputs still array-collapse (unchanged).
-        let input = OwnedValue::Object(IndexMap::from([
-            ("a".to_string(), OwnedValue::Int(1)),
-            ("b".to_string(), OwnedValue::Int(2)),
-        ]));
+        let input = OwnedValue::Object(
+            IndexMap::from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ])
+            .into(),
+        );
         let expr = parse(".[]").unwrap();
         match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
             Ok(Some((OwnedValue::Array(vs), None))) => {
@@ -88798,7 +88825,8 @@ mod tests {
     /// returns its single value normally.
     #[test]
     fn eval_owned_expr_opt_no_trailing_control_unaffected_1559() {
-        let input = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
+        let input =
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]).into());
         let expr = parse(".a").unwrap();
         match eval_owned_expr_opt::<JqSemantics>(&expr, &input, false) {
             Ok(Some(OwnedValue::Int(1))) => {}
@@ -88830,7 +88858,8 @@ mod tests {
     /// no trailing control still returns its single value normally.
     #[test]
     fn eval_owned_expr_ctrl_no_trailing_control_unaffected_1559() {
-        let input = OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
+        let input =
+            OwnedValue::Object(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]).into());
         let expr = parse(".a").unwrap();
         match eval_owned_expr_ctrl::<JqSemantics>(&expr, &input, false) {
             Ok(OwnedValue::Int(1)) => {}
@@ -90061,11 +90090,11 @@ mod tests {
     /// instead of `depth + 1` in an object-value closure) would pass every
     /// boundary test built only from array nesting (#1025 code review).
     fn linear_object_nest(depth: usize) -> OwnedValue {
-        let mut v = OwnedValue::Object(IndexMap::new());
+        let mut v = OwnedValue::Object(IndexMap::new().into());
         for _ in 0..depth {
             let mut obj = IndexMap::new();
             obj.insert("k".to_string(), v);
-            v = OwnedValue::Object(obj);
+            v = OwnedValue::Object(obj.into());
         }
         v
     }
@@ -90171,7 +90200,7 @@ mod tests {
         assert_tag_agrees!(b"1.5", OwnedValue::Float(1.5));
         assert_tag_agrees!(b"\"a\"", OwnedValue::String("a".to_string()));
         assert_tag_agrees!(b"[1]", OwnedValue::Array(vec![OwnedValue::Int(1)]));
-        assert_tag_agrees!(b"{}", OwnedValue::Object(IndexMap::new()));
+        assert_tag_agrees!(b"{}", OwnedValue::Object(IndexMap::new().into()));
     }
 
     // #844: `path()` losing trackability through an `as`-bound variable
@@ -90985,8 +91014,8 @@ mod tests {
                 OwnedValue::Int(3),
             ]),
         );
-        obj.insert("b".to_string(), OwnedValue::Object(inner));
-        OwnedValue::Object(obj)
+        obj.insert("b".to_string(), OwnedValue::Object(inner.into()));
+        OwnedValue::Object(obj.into())
     }
 
     fn walk_pattern_field_2649(name: &str) -> Expr {
@@ -91187,7 +91216,7 @@ mod tests {
     /// with `$q` bound to `null`.
     #[test]
     fn test_walk_pattern_missing_key_keeps_stepping_2649() {
-        let input = OwnedValue::Object(IndexMap::new());
+        let input = OwnedValue::Object(IndexMap::new().into());
         let (_, result, bindings) = walk_pattern_run_2649(". as {a:{b:$q}} | .", 0, &input, true);
         let reg = result.expect("the absent key yields null and the walk continues");
         assert_eq!(
@@ -91219,7 +91248,7 @@ mod tests {
         assert_eq!(bindings[0].name, "b");
         let mut inner = IndexMap::new();
         inner.insert("c".to_string(), OwnedValue::Int(5));
-        assert_eq!(bindings[0].value, OwnedValue::Object(inner));
+        assert_eq!(bindings[0].value, OwnedValue::Object(inner.into()));
         assert_eq!(
             walk_pattern_origin_path_2649(&bindings[0].origin),
             vec![walk_pattern_field_2649("b")]

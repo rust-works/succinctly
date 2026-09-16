@@ -1813,7 +1813,7 @@ mod tests {
         obj.insert("a".to_string(), OwnedValue::Float(f64::INFINITY));
         obj.insert("b".to_string(), OwnedValue::String("x".to_string()));
         assert_eq!(
-            EvalError::from_value(OwnedValue::Object(obj)).message,
+            EvalError::from_value(OwnedValue::Object(obj.into())).message,
             r#"{"a":1.7976931348623157e+308,"b":"x"}"#
         );
         // `from_value`'s message is the whole value, not a truncated
@@ -1997,12 +1997,24 @@ mod tests {
     // exact byte count doesn't hold there -- matches this crate's existing
     // convention for exact-size assertions (e.g. `trees::bp`'s own
     // `#[cfg(target_pointer_width = "64")]`-gated tests).
+    //
+    // Re-derived for #3000 (96 -> 56), not bumped: `EvalError` is
+    // `message: String` (24) + `value: EvalErrorPayload`, and
+    // `EvalErrorPayload` rides in `Option<OwnedValue>`'s space (the pin
+    // directly above asserts exactly that). #3000 boxed
+    // `OwnedValue::Object`'s map, taking `OwnedValue` from 72 to 32 bytes,
+    // so the payload went 72 -> 32 and the struct 96 -> 56. Shrinking is the
+    // *safe* direction for what this guards: the hazard is growth, which
+    // deepens every recursive frame that carries an `EvalError` until
+    // `into_owned_panics_past_nesting_depth_limit_1021`'s controlled panic
+    // becomes a stack overflow. That test still panics in a controlled way
+    // at 56.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn eval_error_size_is_pinned_for_the_1021_stack_overflow_fix() {
         assert_eq!(
             core::mem::size_of::<EvalError>(),
-            96,
+            56,
             "EvalError's size regressed -- see #1021's doc comment on EvalErrorPayload \
              for why an 8-byte increase here turns a controlled panic into a stack overflow"
         );

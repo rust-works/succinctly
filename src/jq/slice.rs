@@ -187,7 +187,7 @@ pub(crate) fn literal_component_from_values(start: OwnedValue, end: OwnedValue) 
     let mut obj = IndexMap::with_capacity(2);
     obj.insert("start".into(), start);
     obj.insert("end".into(), end);
-    OwnedValue::Object(obj)
+    OwnedValue::Object(obj.into())
 }
 
 /// The character range `range` of `s`, as an owned string.

@@ -1410,7 +1410,7 @@ mod tests {
 
         for (json, expected) in [
             (b"[]".as_slice(), OwnedValue::Array(vec![])),
-            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new())),
+            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
                 OwnedValue::Array(vec![
@@ -1452,10 +1452,13 @@ mod tests {
             .expect("an undecodable key is preserved, not raised on (#1642)");
         assert_eq!(
             owned,
-            OwnedValue::Object(IndexMap::from([(
-                "\u{FFFD}\u{FFFD}".to_string(),
-                OwnedValue::from_number_literal("1")
-            )]))
+            OwnedValue::Object(
+                IndexMap::from([(
+                    "\u{FFFD}\u{FFFD}".to_string(),
+                    OwnedValue::from_number_literal("1")
+                )])
+                .into()
+            )
         );
     }
 
@@ -1929,11 +1932,11 @@ mod tests {
     /// depth-threading bug isolated to an `Object` match arm would pass a
     /// boundary test built only from array nesting (#1025 code review).
     fn linear_owned_object_nest(depth: usize) -> OwnedValue {
-        let mut v = OwnedValue::Object(IndexMap::new());
+        let mut v = OwnedValue::Object(IndexMap::new().into());
         for _ in 0..depth {
             let mut obj = IndexMap::new();
             obj.insert("k".to_string(), v);
-            v = OwnedValue::Object(obj);
+            v = OwnedValue::Object(obj.into());
         }
         v
     }
@@ -2240,10 +2243,13 @@ mod tests {
             .expect("a nested undecodable key is preserved, not raised on (#1642)");
         assert_eq!(
             owned,
-            OwnedValue::Object(IndexMap::from([(
-                "x".to_string(),
-                OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
-            )]))
+            OwnedValue::Object(
+                IndexMap::from([(
+                    "x".to_string(),
+                    OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+                )])
+                .into()
+            )
         );
     }
 

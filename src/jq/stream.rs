@@ -2052,7 +2052,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
         map.insert("age".to_string(), OwnedValue::Int(30));
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2072,12 +2072,12 @@ mod tests {
         let mut inner = IndexMap::new();
         inner.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
         let mut outer = IndexMap::new();
-        outer.insert("user".to_string(), OwnedValue::Object(inner));
+        outer.insert("user".to_string(), OwnedValue::Object(inner.into()));
         outer.insert(
             "tags".to_string(),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
         );
-        OwnedValue::Object(outer)
+        OwnedValue::Object(outer.into())
             .stream_json(
                 &mut buf,
                 IndentSpec::spaces(2),
@@ -2116,7 +2116,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
         let mut out = FailOnMarker { marker: "boom" };
-        let result = OwnedValue::Object(map).stream_json(
+        let result = OwnedValue::Object(map.into()).stream_json(
             &mut out,
             IndentSpec::spaces(2),
             false,
@@ -2175,7 +2175,7 @@ mod tests {
             calls: 0,
             fail_after: 5,
         };
-        let result = OwnedValue::Object(map).stream_json(
+        let result = OwnedValue::Object(map.into()).stream_json(
             &mut out,
             IndentSpec::COMPACT,
             false,
@@ -2204,7 +2204,7 @@ mod tests {
             calls: 0,
             fail_after: 5,
         };
-        let result = OwnedValue::Object(map).stream_json(
+        let result = OwnedValue::Object(map.into()).stream_json(
             &mut out,
             IndentSpec::COMPACT,
             true,
@@ -2226,7 +2226,7 @@ mod tests {
         map.insert("b".to_string(), OwnedValue::Int(1));
         map.insert("a".to_string(), OwnedValue::Int(2));
         let mut buf = String::new();
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.into())
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -2240,7 +2240,7 @@ mod tests {
     #[test]
     fn test_stream_yaml_empty_object() {
         let mut buf = String::new();
-        OwnedValue::Object(IndexMap::new())
+        OwnedValue::Object(IndexMap::new().into())
             .stream_yaml(&mut buf, IndentSpec::spaces(2), false)
             .unwrap();
         assert_eq!(buf, "{}");
@@ -2276,7 +2276,7 @@ mod tests {
         map.insert("b".to_string(), OwnedValue::Int(1));
         map.insert("a".to_string(), OwnedValue::Int(2));
         let mut buf = String::new();
-        OwnedValue::Object(map.clone())
+        OwnedValue::Object(map.clone().into())
             .stream_yaml(&mut buf, IndentSpec::COMPACT, true)
             .unwrap();
         assert_eq!(buf, "{a: 2, b: 1}");
@@ -2284,7 +2284,7 @@ mod tests {
         // `sort_keys: false` skips the `sort_by` call above but shares the
         // rest of this function -- covers that branch too.
         buf.clear();
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.into())
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "{b: 1, a: 2}");
@@ -2299,9 +2299,9 @@ mod tests {
         map.insert("b".to_string(), OwnedValue::Int(1));
         let mut nested = IndexMap::new();
         nested.insert("x".to_string(), OwnedValue::Int(9));
-        map.insert("a".to_string(), OwnedValue::Object(nested));
+        map.insert("a".to_string(), OwnedValue::Object(nested.into()));
         let mut buf = String::new();
-        OwnedValue::Object(map)
+        OwnedValue::Object(map.into())
             .stream_yaml(&mut buf, IndentSpec::spaces(2), true)
             .unwrap();
         assert_eq!(buf, "a:\n  x: 9\nb: 1");
