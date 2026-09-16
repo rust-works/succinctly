@@ -49,6 +49,7 @@ by Michael Nygard.
 | [ADR-0020](adr-0020.md) | ✅ Accepted | 2026-09-01 | Evaluate User-Defined `def`s as Runtime Calls (#1371)         |
 | [ADR-0021](adr-0021.md) | ✅ Accepted | 2026-09-05 | Path Context as a Cursor Property, Not Walk State (#2416)     |
 | [ADR-0022](adr-0022.md) | ✅ Accepted | 2026-09-12 | Demand Budgets Ride the Sink (#2666)                          |
+| [ADR-0023](adr-0023.md) | ✅ Accepted | 2026-09-16 | Module Scope Boundary as a Resolver Floor (#2951)             |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
