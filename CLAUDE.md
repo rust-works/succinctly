@@ -278,6 +278,13 @@ succinctly extensions and are all real yq features (#715). Calling reference sur
 extension is the costly direction of that mistake, because extensions are exempt from the
 divergence rule above. See [docs/adrs/adr-0018.md](docs/adrs/adr-0018.md).
 
+A floating-point *digit* from a math builtin (`sin`, `tan`, `exp`, `pow`, ...) is a claim
+about a platform, not just a version: jq calls the platform libm, and Apple's and glibc's
+disagree in the last bit on ~40% of ordinary `tan` inputs. succinctly calls the same libm
+(`src/jq/math.rs`, #3045), so capture such digits on the platform in question and never pin
+one in a hermetic golden without checking the other libm agrees
+(`scripts/jq-libm-oracle-sweep.sh`).
+
 ### yq Merge-Flag Suffixes on `*`/`*=` (yq mode only)
 
 Real yq extends `*`/`*=` with combinable flag suffixes that control merge semantics. They go directly after `*` for the plain (non-assign) form, or after `*=` for the in-place form — never between `*` and `=` (`.a *+= .b` is not valid; the flags belong after the `=`):
