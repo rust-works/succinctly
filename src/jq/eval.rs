@@ -25787,47 +25787,56 @@ fn through_slice<E: From<EvalError>>(
     // `start: None, end: None`, which every arm below reads as *the whole
     // slice*, so an array target would be silently spliced. #2927 gives
     // this its own kind-aware refusal below, mirroring
-    // `SliceTargetKind::of_type_name`'s own three-way split (sliceable/null
-    // vs everything else) rather than delegating to the existing arms.
+    // `SliceTargetKind::of_type_name`'s own three-way split.
     //
-    // It is also
-    // deliberately not gated on `terminal_write`: mid-chain, `edit` is the
-    // inner `set_path_steps`/`update_path_steps`, whose own `wrote` answers
-    // the very same question (`.["x":][0] = 5` raises, `.["x":][0] |= empty`
-    // no-ops).
-    //
-    // `edit` runs *first*, against a throwaway, and its outcome propagates
-    // via `?` before either disposition is decided -- the #1876/#1883 rule
-    // the `String` arm below states at length, and for the same reasons.
-    // Refusing before calling `edit` would discard a `debug`/`stderr` side
-    // effect and replace a genuine error from inside the update filter with
-    // this generic sentence. All three confirmed live against jq 1.7.1 on
-    // input `null`: `.["x":] |= (debug|5)` prints `["DEBUG:",null]` and
-    // *then* raises this; `.["x":] -= 5` raises "null (null) and number (5)
-    // cannot be subtracted" from inside the filter instead; `.["x":] |=
-    // empty` no-ops to `null`.
-    //
-    // The throwaway is `Null`, not `[]`: that DEBUG line prints `null`, so
-    // it is jq's own `INDEX` answer for a null target that the filter sees.
     if non_integer_bound {
+        // #2927: `root`'s kind is classified *before* `edit`, and only the
+        // `Null` arm calls it at all -- jq's own `getpath`/`setpath` only
+        // ever run the update filter when `root` is genuinely `null`; for
+        // anything else (including a target that just stopped being null,
+        // in the same fan-out that produced this call) they raise straight
+        // away. Confirmed live against jq 1.7.1: `{"a":null} | (.a,
+        // .a["x":]) |= (debug|"s")` (`.a` becomes a string) prints
+        // `["DEBUG:",null]` exactly once -- for `.a`'s own write -- never a
+        // second time for `.a["x":]`'s, and answers `Array/string slice
+        // indices must be integers` with no further DEBUG output; a target
+        // that becomes `Other`-kind behaves identically, modulo the
+        // message. Earlier code called `edit` unconditionally here and only
+        // chose the message afterward, which ran the update filter (and its
+        // side effects, and any input it consumed) an extra time for every
+        // non-null kind -- found by `/code-review` on #2927's own PR.
+        match SliceTargetKind::of_type_name(owned_type_name(root)) {
+            SliceTargetKind::Sliceable => {
+                return Err(EvalError::slice_indices_not_integers().into());
+            }
+            SliceTargetKind::Other(name) => {
+                return Err(EvalError::cannot_index_with_type(name, "object").into());
+            }
+            SliceTargetKind::Null => {}
+        }
+
+        // `edit` runs *first*, against a throwaway, and its outcome
+        // propagates via `?` before either disposition is decided -- the
+        // #1876/#1883 rule the `String` arm below states at length, and for
+        // the same reasons. Refusing before calling `edit` would discard a
+        // `debug`/`stderr` side effect and replace a genuine error from
+        // inside the update filter with this generic sentence. All three
+        // confirmed live against jq 1.7.1 on input `null`: `.["x":] |=
+        // (debug|5)` prints `["DEBUG:",null]` and *then* raises this;
+        // `.["x":] -= 5` raises "null (null) and number (5) cannot be
+        // subtracted" from inside the filter instead; `.["x":] |= empty`
+        // no-ops to `null`.
+        //
+        // The throwaway is `Null`, not `[]`: that DEBUG line prints `null`,
+        // so it is jq's own `INDEX` answer for a null target that the
+        // filter sees. `root` is already known `Null` here (the match
+        // above only falls through for that arm), so there is nothing left
+        // to classify -- `slice_indices_not_integers` is the only answer a
+        // `wrote` write can have.
         let mut throwaway = OwnedValue::Null;
         let wrote = edit(&mut throwaway)?;
         return if wrote {
-            // #2927: jq's `setpath` re-reads `root`'s *current* kind before
-            // it parses the descriptor, so the refusal it raises depends on
-            // that kind, not on the fact that the bound is non-integer.
-            // `SliceTargetKind::of_type_name` is the one place that
-            // three-way split already lives (`Sliceable`/`Null` both still
-            // need the descriptor parsed -- and refused, since the bound is
-            // non-integer -- while `Other` never gets that far).
-            match SliceTargetKind::of_type_name(owned_type_name(root)) {
-                SliceTargetKind::Other(name) => {
-                    Err(EvalError::cannot_index_with_type(name, "object").into())
-                }
-                SliceTargetKind::Sliceable | SliceTargetKind::Null => {
-                    Err(EvalError::slice_indices_not_integers().into())
-                }
-            }
+            Err(EvalError::slice_indices_not_integers().into())
         } else {
             // `|= empty` (#1894): jq's `_modify` falls back to `delpaths`,
             // which never parses the descriptor at all -- so this no-ops,
