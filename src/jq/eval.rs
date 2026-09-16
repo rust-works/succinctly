@@ -25782,13 +25782,13 @@ fn through_slice<E: From<EvalError>>(
     // though the component can only be produced over a null target. A slot
     // can stop being null between resolution and write -- `{"a":null} |
     // (.a, .a["x":]) = 5` -- and jq, which re-reads the kind, answers
-    // `Cannot index number with object` there where this answers the
-    // integers error. Falling through instead would be far worse than a
-    // wrong sentence: a `Raw` bound carries `start: None, end: None`, which
-    // every arm below reads as *the whole slice*, so an array target would
-    // be silently spliced. The message gap is pre-existing in effect --
-    // before #2853 the resolver raised this same error for this same
-    // program -- and is tracked separately (#2927).
+    // `Cannot index number with object` there. Falling through instead
+    // would be far worse than a wrong sentence: a `Raw` bound carries
+    // `start: None, end: None`, which every arm below reads as *the whole
+    // slice*, so an array target would be silently spliced. #2927 gives
+    // this its own kind-aware refusal below, mirroring
+    // `SliceTargetKind::of_type_name`'s own three-way split (sliceable/null
+    // vs everything else) rather than delegating to the existing arms.
     //
     // It is also
     // deliberately not gated on `terminal_write`: mid-chain, `edit` is the
@@ -25813,8 +25813,21 @@ fn through_slice<E: From<EvalError>>(
         let mut throwaway = OwnedValue::Null;
         let wrote = edit(&mut throwaway)?;
         return if wrote {
-            // jq's `setpath` parses the descriptor and refuses it.
-            Err(EvalError::slice_indices_not_integers().into())
+            // #2927: jq's `setpath` re-reads `root`'s *current* kind before
+            // it parses the descriptor, so the refusal it raises depends on
+            // that kind, not on the fact that the bound is non-integer.
+            // `SliceTargetKind::of_type_name` is the one place that
+            // three-way split already lives (`Sliceable`/`Null` both still
+            // need the descriptor parsed -- and refused, since the bound is
+            // non-integer -- while `Other` never gets that far).
+            match SliceTargetKind::of_type_name(owned_type_name(root)) {
+                SliceTargetKind::Other(name) => {
+                    Err(EvalError::cannot_index_with_type(name, "object").into())
+                }
+                SliceTargetKind::Sliceable | SliceTargetKind::Null => {
+                    Err(EvalError::slice_indices_not_integers().into())
+                }
+            }
         } else {
             // `|= empty` (#1894): jq's `_modify` falls back to `delpaths`,
             // which never parses the descriptor at all -- so this no-ops,
