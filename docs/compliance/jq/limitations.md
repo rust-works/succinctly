@@ -1277,7 +1277,8 @@ answers `["b"]` — and classified the two residuals appended below):
   generator in *index* position: `[limit(1; path(.[("a"|stderr),("b"|stderr)]))]` writes `ab`
   where jq writes `a`, which is `resolve_index_expr`'s eager key evaluation — the same function
   #2032 sits in.
-- **`recurse(f)`/`recurse(f; cond)` finishes one node's own `f` before descending.**
+- **`recurse(f)`/`recurse(f; cond)` past its native stack budget finishes one node's own `f`
+  before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
   `path(limit(1; recurse(if (.|debug) < 3 then .+1 else empty end)))` now runs `debug` zero
@@ -1298,17 +1299,29 @@ answers `["b"]` — and classified the two residuals appended below):
   with `x` on stderr where jq raises a path error, and its mirror wrote a stray `x`; with `f`
   unevaluated the `halt_error` is never reached at all.
 
-  **What remains** is that `f` still runs to completion at the node the traversal is *at*:
-  jq descends into `f`'s first output's whole subtree before asking `f` for the second, and
-  an explicit stack of materialized nodes cannot suspend a push-driven `f` mid-stream. So a
-  bound overshoots by one node's fan-out (`[limit(2; recurse(.[]?|debug))]` on `[1,[2,[3]]]`
-  writes two `debug` lines where jq writes one — it wrote five before #2693), and unbounded it
-  shows as stderr *ordering* (`[recurse(.[]?|debug)]` interleaves in jq, groups each node's
-  fan-out here). Values are identical in every case. All three walkers share it, path mode
-  included. Tracked as [#2918](https://github.com/rust-works/succinctly/issues/2918), whose
-  own text sets out the fork — bounded native recursion with a fallback, versus a pull-based
-  generator protocol. (#2908, listed there as sharing the class, turned out not to need one:
-  its branches were already produced lazily and only the terminal was collecting them.)
+  **Closed within a stack budget by
+  [#2918](https://github.com/rust-works/succinctly/issues/2918).** jq descends into `f`'s first
+  output's whole subtree before asking `f` for its second, so a bound stops *between* `f`'s
+  outputs and an unbounded walk interleaves `f`'s side effects with the descent. Both walkers
+  (`each_recurse_walk` for the two value evaluators, `resolve_recurse_sink` for path mode) now
+  visit each output from inside `f`'s own sink, and `cond`'s the same way, so nothing has to be
+  suspended: `[limit(2; recurse(.[]?|debug))]` on `[1,[2,[3]]]` writes one `debug` line, as in
+  jq, and `[recurse(.[]?|debug)]` interleaves.
+
+  That descent is native recursion, so it is budgeted by the stack it has actually spent,
+  measured as it goes and charged on the same ambient frame depth `MAX_EVAL_FRAMES` guards
+  `def` recursion with (a quarter of it, ~15 MB of release stack). **What remains** is past that
+  budget: the rest of the subtree is walked with the old explicit stack, where `f` runs to
+  completion per node and the residual above returns for those levels only. Realistic
+  documents never reach it (JSON nesting stops at 256; a simple `f` reaches over a thousand
+  native levels), but a synthetic chain can — a 30-stage pipe inside `f` exhausts it within
+  ~60-90 levels, and `recurse_queues_past_its_native_stack_budget_2918` pins that. Values are
+  identical in both orders. Where `f` takes the reindex bridge (`.[]?` does), each native level
+  also keeps its node's temporary document alive while its children run, so peak memory is
+  bounded by the subtree sizes along the current path rather than one node's — invisible on
+  ordinary documents, ~1.4x on a 200-deep chain holding its whole bulk at the leaf.
+  (#2908, once listed as sharing this class, turned out not to need it: its branches were
+  already produced lazily and only the terminal was collecting them.)
   Bare `..`/`recurse`/
   `recurse_down`, which predates #2235 and was not part of that migration at all, had the
   same gap one level up (no `f`/`cond` to over-fire, but the same "collects the whole
