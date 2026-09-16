@@ -19,6 +19,9 @@ use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec::Vec;
 
+// Only the test module builds a map literal directly now; the enum's own
+// object arm goes through `ObjectMapOf` (#3000).
+#[cfg(test)]
 use indexmap::IndexMap;
 #[cfg(test)]
 use std::borrow::Cow;
@@ -31,7 +34,7 @@ use super::document::{
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
-use super::value::{assert_value_tree_depth, infinite_float_preview_text, OwnedValue};
+use super::value::{assert_value_tree_depth, infinite_float_preview_text, ObjectMapOf, OwnedValue};
 
 /// A JSON value for jq evaluation - lazy by default, materialized when needed.
 ///
@@ -89,7 +92,15 @@ pub enum JqValue<'a, W = Vec<u64>> {
     ///
     /// Created when constructing objects with `{a: .x, b: .y + 1}`.
     /// Keys are always strings, values can be lazy or materialized.
-    Object(IndexMap<String, Self>),
+    ///
+    /// Boxed through the same [`ObjectMapOf`] wrapper `OwnedValue::Object`
+    /// uses (#3000), and for a reason specific to *this* enum:
+    /// `try_from_owned` converts an `OwnedValue` tree into a `JqValue` tree
+    /// object by object, freeing one map and allocating the other. If the
+    /// two enums are different widths those chunk sizes differ, nothing
+    /// freed fits what is asked for next, and peak RSS grows by the whole
+    /// hole -- see [`ObjectMapOf`]'s own doc comment for the measurement.
+    Object(ObjectMapOf<Self>),
 
     /// Lazy array of `keys_unsorted` results, backed by an object field
     /// iterator — not yet decoded into `String`s (#140). `write_json` and
@@ -167,7 +178,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// Create an empty object.
     #[inline]
     pub fn empty_object() -> Self {
-        JqValue::Object(IndexMap::new())
+        JqValue::Object(ObjectMapOf::new())
     }
 
     /// Create an object from key-value pairs.
@@ -271,7 +282,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             OwnedValue::Object(obj) => JqValue::Object(
                 obj.into_iter()
                     .map(|(k, v)| Self::try_from_owned_at_depth(v, depth + 1).map(|v| (k, v)))
-                    .collect::<Result<IndexMap<_, _>, _>>()?,
+                    .collect::<Result<ObjectMapOf<_>, _>>()?,
             ),
             // Every scalar arm is exactly `from_owned_at_depth`'s, reached
             // only after the depth check above; kept as one delegation
@@ -956,6 +967,85 @@ impl<W> From<&str> for JqValue<'_, W> {
 mod tests {
     use super::super::document::DocumentCursor;
     use super::*;
+
+    /// #3000: `JqValue` is the *output* representation -- `jq_runner`'s
+    /// `to_jq_values` turns every materialized result into one through
+    /// [`JqValue::try_from_owned`], which walks the `OwnedValue` tree
+    /// object by object, freeing each source map and immediately allocating
+    /// the `JqValue` one. The two maps' `entries` buffers are
+    /// `capacity * (8 + size_of::<String>() + size_of::<V>())` bytes, so
+    /// while `OwnedValue` was 72 and `JqValue` was 72 those two chunk sizes
+    /// were *identical* and the allocator recycled every freed chunk: peak
+    /// RSS tracked live heap.
+    ///
+    /// Boxing only `OwnedValue`'s map broke that. Measured with valgrind
+    /// DHAT on `wide_10mb | to_entries` (7950X), the first form of #3000
+    /// held **15% less** live heap at peak (454 MB vs 533 MB) and **23%
+    /// more** RSS, because per two-key entry object it freed
+    /// `[table 64][entries 208][box 80]` and asked for
+    /// `[table 64][entries 320]`: nothing freed fit anything requested,
+    /// ~290 bytes of hole per entry, ~220 MB over 763k entries.
+    ///
+    /// So this size is not cosmetic -- it is half of a *pair* that has to
+    /// stay as close as the two enums' own contents allow. The derivation:
+    ///
+    /// - `Object(ObjectMapOf<Self>)` is now one pointer, 8 bytes.
+    /// - `Cursor(JsonCursor<'a, W>)` is 32: `text: &[u8]` (16) +
+    ///   `index: &JsonIndex<W>` (8) + `bp_pos: usize` (8).
+    /// - `LazyKeysArray { fields: JsonFields<'a, W>, collapse: bool }` is
+    ///   also 32 + 1 -> 40: `JsonFields` is `Option<JsonCursor>`, which is
+    ///   32 because it already spent `JsonCursor`'s single niche (a
+    ///   reference's niche is the one value 0) on its own `None`.
+    /// - Nothing is left for `JqValue`'s own 11-way discriminant to hide
+    ///   in, so the enum is `32 + tag` rounded to **40**.
+    ///
+    /// **32 is therefore unreachable here** without boxing `Cursor`, which
+    /// is the lazy path's entire reason to exist. 40 leaves an 8-byte
+    /// residual against `OwnedValue`'s 32: the `table` and the box recycle
+    /// exactly, and only the `entries` buffer still steps one allocator bin
+    /// (208 freed, 224 wanted for a two-key object). The measured effect of
+    /// closing the rest is in the PR and in #3000's corrected comment.
+    /// Re-pinning this number means re-doing that measurement.
+    ///
+    /// Same 64-bit gate and `unboxed-object-map` exemption as the crate's
+    /// other exact-size pins: the holdout deliberately restores the 72-byte
+    /// layout on both enums at once.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[cfg(not(feature = "unboxed-object-map"))]
+    fn jq_value_width_tracks_owned_value_3000() {
+        assert_eq!(
+            core::mem::size_of::<JqValue<'_, alloc::vec::Vec<u64>>>(),
+            40,
+            "size_of::<JqValue>() moved -- it is the output representation \
+             try_from_owned allocates per object, and its distance from \
+             size_of::<OwnedValue>() is what decides whether the allocator can \
+             recycle. See #3000 before re-pinning."
+        );
+        // The residual the boxing could not remove, asserted rather than
+        // described, so a future change that closes it (or widens it) has to
+        // come here and say so.
+        assert_eq!(
+            core::mem::size_of::<JqValue<'_, alloc::vec::Vec<u64>>>()
+                - core::mem::size_of::<OwnedValue>(),
+            8,
+            "the JqValue/OwnedValue width gap moved; see this test's derivation"
+        );
+    }
+
+    /// The holdout twin of [`jq_value_width_tracks_owned_value_3000`]: under
+    /// `unboxed-object-map` both enums must go back to 72, or the A/B is
+    /// comparing two boxed binaries and calling the difference layout bias.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[cfg(feature = "unboxed-object-map")]
+    fn unboxed_holdout_restores_both_widths_3000() {
+        assert_eq!(
+            core::mem::size_of::<JqValue<'_, alloc::vec::Vec<u64>>>(),
+            72
+        );
+        assert_eq!(core::mem::size_of::<OwnedValue>(), 72);
+    }
 
     /// #2868: these real JSON cursors must preserve source spelling on
     /// both walks. Include jq's accepted non-RFC spellings, overflow and
@@ -1734,10 +1824,9 @@ mod tests {
         // own recursive `.map()` closure -- exercise it too so both arms are
         // covered, not just the array-nesting shape `linear_jqvalue_nest`
         // builds.
-        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
-            "a".to_string(),
-            JqValue::Array(vec![JqValue::Null]),
-        )]));
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(
+            IndexMap::from([("a".to_string(), JqValue::Array(vec![JqValue::Null]))]).into(),
+        );
         assert!(matches!(
             nested_object.materialize().unwrap(),
             OwnedValue::Object(_)
@@ -1772,10 +1861,9 @@ mod tests {
 
         // Exercise the `Object` arm too -- see `materialize`'s sibling test
         // above for why.
-        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
-            "a".to_string(),
-            JqValue::Array(vec![JqValue::Null]),
-        )]));
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(
+            IndexMap::from([("a".to_string(), JqValue::Array(vec![JqValue::Null]))]).into(),
+        );
         assert!(matches!(
             nested_object.try_materialize().unwrap(),
             OwnedValue::Object(_)
@@ -1897,10 +1985,9 @@ mod tests {
 
         // Exercise the `Object` arm too -- see `materialize`'s sibling test
         // above for why.
-        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(IndexMap::from([(
-            "a".to_string(),
-            JqValue::Array(vec![JqValue::Null]),
-        )]));
+        let nested_object: JqValue<'_, Vec<u64>> = JqValue::Object(
+            IndexMap::from([("a".to_string(), JqValue::Array(vec![JqValue::Null]))]).into(),
+        );
         assert!(matches!(
             nested_object.into_owned().unwrap(),
             OwnedValue::Object(_)
@@ -1980,11 +2067,11 @@ mod tests {
     /// [`linear_owned_object_nest`]'s doc comment for why this arm needs
     /// its own boundary coverage, not just `Array`'s.
     fn linear_jqvalue_object_nest(depth: usize) -> JqValue<'static, Vec<u64>> {
-        let mut v = JqValue::Object(IndexMap::new());
+        let mut v = JqValue::Object(IndexMap::new().into());
         for _ in 0..depth {
             let mut obj = IndexMap::new();
             obj.insert("k".to_string(), v);
-            v = JqValue::Object(obj);
+            v = JqValue::Object(obj.into());
         }
         v
     }
@@ -2237,7 +2324,7 @@ mod tests {
         );
 
         let nested_in_object: JqValue<'_, Vec<u64>> =
-            JqValue::Object(IndexMap::from([("x".to_string(), lazy_keys)]));
+            JqValue::Object(IndexMap::from([("x".to_string(), lazy_keys)]).into());
         let owned = nested_in_object
             .into_owned()
             .expect("a nested undecodable key is preserved, not raised on (#1642)");
