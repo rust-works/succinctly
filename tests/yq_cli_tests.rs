@@ -19030,6 +19030,31 @@ fn test_yq_undefined_name_inside_a_called_def_still_a_compile_error_2740() -> Re
     Ok(())
 }
 
+/// #2971 on yq's route, which shares `resolve_func_calls` with jq's. No
+/// oracle, for the same reason as the #2740 test above: real yq's lexer
+/// rejects `def` outright. What this pins is *internal consistency* -- a
+/// called def nested in a builtin argument is now the same compile-time
+/// `is not defined` as the top-level spelling, not a runtime
+/// `undefined function` -- and that an uncalled one still compiles.
+#[test]
+fn test_yq_called_def_inside_builtin_argument_is_a_compile_error_2971() -> Result<()> {
+    let doc = "a: 1\n";
+
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[1] | map(def g: nosuchfn; g)", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined") && !stderr.contains("undefined function"),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[1] | map(def g: nosuchfn; 1)", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "[1]");
+    Ok(())
+}
+
 // ============================================================================
 // --split-exp Tests (#715)
 // ============================================================================
