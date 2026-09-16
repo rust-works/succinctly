@@ -50,6 +50,20 @@ draw. Sources are drawn from the same `SOURCES` pool as a plain bind, so a
 pattern is exercised on `.`, on a prior binding `$x`, and on a navigation
 `.k` (which jq refuses at the first step: the source is not the register).
 
+#3036 added the ROUTES family, because every program above binds at the
+head of a `path()`/`del()`/assignment and is answered by the generic
+evaluator, whose funnels are where #2642's rebuilt-root check runs -- so
+none of them could reach the routes on which the bind *and* the rebuild both
+run inside `eval.rs`'s owned-value evaluator (a program mentioning
+`input`/`inputs`/`input_line_number`, a fold's UPDATE, a `|=` right-hand
+side, `with_entries`, a `catch` handler). A ROUTES program binds `. as $x`
+outside any resolver, rebuilds (or passes through) the document, then
+writes through `$x`, and wraps the whole thing in one of those routes; the
+control routes (`first`, `[...]`, `label`, a `def`) and the bare twin are
+drawn from the same pool so a route that changes the answer is visible next
+to ones that must not. The stdin carries the document twice so `input` has
+a second, equal-valued document to read.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -187,6 +201,48 @@ def fold_program(rng):
 
 FOLD_P = 0.2
 
+# #3036: routes into `eval.rs`'s own owned-value evaluator (see the module
+# doc). `%s` is the body. The `input` route binds the *second* stdin
+# document, a value-equal but different `jv` to jq -- the same document
+# every other route binds directly.
+ROUTES = [
+    "input | %s", "(input_line_number | empty), (%s)", "input_line_number as $n | %s",
+    "[.] | .[] |= (%s)", "reduce (1) as $i (.; %s)", "foreach (1) as $i (.; %s; .)",
+    "with_entries(.value |= (%s))", "try error(.) catch (%s)", "try error({z:1}) catch (%s)",
+    # Controls: routes that never leave the generic evaluator, and the bare twin.
+    "first(%s)", "[%s]", "label $out | %s", "def f: %s; f", "%s",
+]
+# Stages between the bind and the write: rebuilds that jq allocates a new
+# `jv` for (must refuse), and passthroughs jq keeps the same `jv` through
+# (a refusal is safe, an answer must match). `DOC` is the document itself,
+# spelled as a literal.
+REBUILDS = [
+    "(tojson | fromjson)", "({k: .} | .k)", "([.] | .[0])", "(. + {})", "DOC", "(DOC | .)",
+    "(. as $q | $q)", "first(.)", "select(true)", "if true then . else 1 end", "(. // 1)",
+    "(try . catch 1)", "(label $l | .)", "reduce empty as $i (.; .)", "([.] | first)",
+    "limit(1; .)", "(. + null)", "(to_entries | from_entries)", "(with_entries(.))",
+    "({a: .a, c: .c, d: .d, x: .x})", "(.x | {a: .a, c: .c})",
+]
+# Writes and reads through the root marker; every key is present in `doc`.
+ROOT_USES = [
+    "($x.a = 9)", "del($x.a)", "path($x)", "($x.c) |= 5", "($x | .a) = 1", "path($x | .c)",
+    "del($x | .d)", "($x.a, $x.c) = 2", "path($x, $x.a)", "($x.a? // $x.c) = 3",
+]
+ROUTE_P = 0.25
+
+def route_program(rng, d):
+    v = "$x"
+    prefix = rng.choice(["", "", ".x | "])
+    parts = [f". as {v}"]
+    for _ in range(rng.choice([0, 1, 1, 2])):
+        stage = rng.choice(REBUILDS)
+        if prefix and "DOC" in stage:
+            stage = stage.replace("DOC", json.dumps(d["x"]))
+        parts.append(stage.replace("DOC", json.dumps(d)))
+    parts.append(rng.choice(ROOT_USES))
+    body = prefix + " | ".join(parts)
+    return rng.choice(ROUTES) % body
+
 def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
@@ -267,7 +323,8 @@ def main():
     if a.self_test:
         for name, pool in [("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
                            ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES),
-                           ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS])]:
+                           ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
+                           ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -276,8 +333,16 @@ def main():
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
-        d = json.dumps(doc(rng))
-        f = fold_program(rng) if rng.random() < FOLD_P else program(rng)
+        dv = doc(rng)
+        d = json.dumps(dv)
+        r = rng.random()
+        if r < ROUTE_P:
+            # #3036: the document twice, so `input` reads a second copy.
+            f, d = route_program(rng, dv), d + "\n" + d
+        elif r < ROUTE_P + FOLD_P:
+            f = fold_program(rng)
+        else:
+            f = program(rng)
         j = run([a.jq, "-c", f], d)
         s = run([a.bin, "jq", "-c", f], d)
         c = classify(j, s)

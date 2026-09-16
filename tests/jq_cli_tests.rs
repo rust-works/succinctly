@@ -58925,6 +58925,303 @@ fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// #3036: #2642's fabrication through the routes that never cross a funnel
+// ============================================================================
+
+/// The issue's own repro rows: a root-bound `$x` written through after a
+/// rebuild, where the bind *and* the rebuild both run inside `eval.rs`'s
+/// owned-value evaluator -- the whole-program input-queue bridge (any
+/// program mentioning `input`/`inputs`/`input_line_number`), a fold's
+/// UPDATE, a `|=` right-hand side, `with_entries`' body -- so #2642's
+/// funnel-side demotion never ran. jq's `jv_identical` refuses every one
+/// (exit 5, `Invalid path expression`); before this fix every one exited 0
+/// with a written result. Captured live against jq 1.7.1.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()> {
+    for (args, input, filter) in [
+        // The input-queue bridge: the whole program runs in `eval.rs`.
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | {a:1} | ($x.a = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "[inputs] | .[0] | . as $x | {a:1} | ($x.a = 9)",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | (input_line_number, ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | (input_line_number, del($x.a))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | (input_line_number, path($x))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | input_line_number as $n | ($x.a = 9)",
+        ),
+        // A bind inside a fold's UPDATE, inside `|=`'s right-hand side, and
+        // inside `with_entries`' body: each runs in `eval.rs` after the
+        // funnel already demoted the *enclosing* expression.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            "reduce (1) as $i (.; . as $x | {a:1} | ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            "[.] | .[] |= (. as $x | {a:1} | ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            "with_entries(.value |= (. as $x | 1 | path($x)))",
+        ),
+        // An empty container is the one value `eval.rs` can recover no
+        // node identity for from a `StandardJson`; the fix keys on the
+        // re-entry, not on identity, so it is closed too.
+        (&["-n", "-c"][..], "{}", "input | . as $x | {} | ($x.a = 9)"),
+        (
+            &["-n", "-c"][..],
+            "[]",
+            "input | . as $x | [] | ($x[0] = 9)",
+        ),
+        // A `catch` payload that is a value-equal rebuild of the marker's
+        // node (the #2642 review's deliberately-open gap), on both routes.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try error({a:1}) catch ($x.a = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | try error({a:1}) catch ($x.a = 9)",
+        ),
+        // The owned-surface consumers bridge their whole argument; the
+        // rebuild inside it is an `eval.rs` pipe stage.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | isempty({a:1} | ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | any({a:1}; ($x.a = 9))",
+        ),
+        // A rebuilt value at a tracked position on the owned identity
+        // route (`OwnedIdentity::exact` cleared by `sort`).
+        (
+            &["-c"][..],
+            r#"{"foo":[2,1]}"#,
+            ".foo | . as $x | sort | (path | empty), ($x[0] = 9)",
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3036: `{filter}` must refuse (jq: Invalid path expression), got \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3036: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The refuse-only tripwire for the same routes: a write through `$x` with
+/// no rebuild in between stays accepted -- the demotion is keyed on an
+/// owned value re-entering the document evaluator, so a marker used against
+/// the very document it was bound from is never touched, empty containers
+/// and scalars included (the values `eval.rs` cannot recover a node
+/// identity for, which is why the fix does not rely on one). Captured live
+/// against jq 1.7.1.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
+    for (args, input, filter, want) in [
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | $x = 5",
+            "5",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | del($x.a)",
+            "{}",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | first(.) | path($x)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | first(.) | ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | select(true) | path($x)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | (. as $y | .) | path($x)",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            "{}",
+            "input | . as $x | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            "[]",
+            "input | . as $x | ($x[0]) = 9",
+            "[9]",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#""s""#,
+            "input | . as $x | ($x) = 9",
+            "9",
+        ),
+        (&["-n", "-c"][..], "5", "input | . as $x | ($x) = 9", "9"),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | isempty(($x.a = 9))",
+            "false",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            "[.] | .[] |= (. as $x | ($x.a = 9))",
+            r#"[{"a":9}]"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            "reduce (1) as $i (.; . as $x | ($x.a = 9))",
+            r#"{"a":9}"#,
+        ),
+        // `error($x)` raises the marker's own value, and jq's `catch` runs
+        // against that same `jv` (`try_payload_root`): kept accepted on the
+        // generic route exactly as #2642 left it.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try error($x) catch path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try ($x | error) catch ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3036: `{filter}` must stay accepted (real jq accepts it); stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The agree-to-refuse flips this fix makes, each a materialized
+/// passthrough on the `eval.rs` route: the stage hands its input on as an
+/// owned copy, which is the same node to jq's `jv` and a fresh document to
+/// `eval.rs`. Every one is the in-evaluator twin of a shape already in
+/// `test_tracked_var_owned_embed_residual_refuses_cleanly_2642` (the generic
+/// evaluator has refused them since #2642), recorded in
+/// `docs/compliance/jq/limitations.md`; a row here answering `[]` again
+/// would be a genuine recovery, not a bug, so it is pinned as refuse-only
+/// rather than asserted to error forever.
+#[test]
+// jq filter literals like `{k:.}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> Result<()> {
+    for (args, input, filter) in [
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | [.] | .[0] | path($x)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | {k:.} | .k | path($x)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | reduce empty as $i (.; .) | path($x)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | reduce (.) as $x (.; ($x.a = 9))",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | try error($x) catch path($x)",
+        ),
+    ] {
+        let mut argv: Vec<&str> = args.to_vec();
+        argv.push(filter);
+        let (stdout, stderr, code) = run_jq_full(&argv, Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3036: `{filter}` is a documented refuse-only residual (real jq \
+             accepts it), got stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2696: a bounded consumer over bare `..` must still answer exactly what
 /// jq answers -- captured live against jq 1.7.1 on the same document as
 /// `test_bare_recurse_family_order_unchanged_by_lazy_sink_2696`. This is the
