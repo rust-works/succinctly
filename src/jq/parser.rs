@@ -172,6 +172,114 @@ const MAX_PATTERN_DEPTH: usize = 256;
 /// the same caveat; the two deliberately share one number.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// The variable [`join_expr`] binds `$idx` to. It contains a space, so no
+/// program can spell it and neither `stream`, `idx_expr` nor `join_expr` can
+/// capture or shadow it.
+pub(crate) const JOIN_IDX_VAR: &str = "JOIN idx";
+
+/// jq 1.7.1's `builtin.jq` definitions of `JOIN`, as an [`Expr`] (#3046):
+///
+/// ```text
+/// def JOIN($idx; idx_expr): [.[] | [., $idx[idx_expr]]];
+/// def JOIN($idx; stream; idx_expr): stream | [., $idx[idx_expr]];
+/// def JOIN($idx; stream; idx_expr; join_expr): stream | [., $idx[idx_expr]] | join_expr;
+/// ```
+///
+/// A `$param` binds each output of its argument in turn, which is the `as`
+/// binding below. `args` holds two to four arguments, `idx` first.
+fn join_expr(mut args: Vec<Expr>) -> Expr {
+    debug_assert!((2..=4).contains(&args.len()), "JOIN takes 2 to 4 arguments");
+    let idx = args.remove(0);
+    let pair = |idx_expr: Expr| {
+        Expr::Array(Box::new(Expr::Comma(vec![
+            Expr::Identity,
+            Expr::IndexExpr {
+                target: Box::new(Expr::Var(JOIN_IDX_VAR.to_string())),
+                key: Box::new(idx_expr),
+            },
+        ])))
+    };
+    let mut args = args.into_iter();
+    let body = match (args.next(), args.next(), args.next()) {
+        (Some(idx_expr), None, None) => {
+            Expr::Array(Box::new(Expr::Pipe(vec![Expr::Iterate, pair(idx_expr)])))
+        }
+        (Some(stream), Some(idx_expr), None) => Expr::Pipe(vec![stream, pair(idx_expr)]),
+        (Some(stream), Some(idx_expr), Some(join)) => {
+            Expr::Pipe(vec![stream, pair(idx_expr), join])
+        }
+        _ => unreachable!("parse_join_expr passes two to four arguments"),
+    };
+    Expr::As {
+        expr: Box::new(idx),
+        var: JOIN_IDX_VAR.to_string(),
+        body: Box::new(body),
+    }
+}
+
+/// The arguments [`join_expr`] was built from, in call order, or `None` if
+/// `expr` is not one of its desugarings -- what lets a user `def JOIN(..)`
+/// still shadow it (#2036's `builtin_fallback`, read back by `resolve.rs`).
+/// The inverse of `join_expr`, kept beside it so the two cannot drift.
+pub(crate) fn join_expr_into_args(expr: Expr) -> Result<Vec<Expr>, Expr> {
+    let Expr::As {
+        expr: idx,
+        var,
+        body,
+    } = expr
+    else {
+        return Err(expr);
+    };
+    if var != JOIN_IDX_VAR {
+        return Err(Expr::As {
+            expr: idx,
+            var,
+            body,
+        });
+    }
+    let idx_expr_of = |pair: Expr| match pair {
+        Expr::Array(inner) => match *inner {
+            Expr::Comma(mut items) if items.len() == 2 => match items.pop() {
+                Some(Expr::IndexExpr { key, .. }) => *key,
+                _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
+            },
+            _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
+        },
+        _ => unreachable!("join_expr's pair is `[., $idx[idx_expr]]`"),
+    };
+    let mut args = alloc::vec![*idx];
+    match *body {
+        // JOIN/2: `[.[] | pair]`
+        Expr::Array(inner) => match *inner {
+            Expr::Pipe(mut stages) if stages.len() == 2 => {
+                args.push(idx_expr_of(stages.pop().expect("two stages")));
+            }
+            _ => unreachable!("join_expr's JOIN/2 body is `[.[] | pair]`"),
+        },
+        // JOIN/3: `stream | pair`; JOIN/4: `stream | pair | join_expr`
+        Expr::Pipe(stages) => {
+            let mut stages = stages.into_iter();
+            args.push(stages.next().expect("stream"));
+            args.push(idx_expr_of(stages.next().expect("pair")));
+            args.extend(stages);
+        }
+        _ => unreachable!("join_expr builds an array or a pipe"),
+    }
+    Ok(args)
+}
+
+/// [`join_expr_into_args`]'s arity, without moving anything.
+pub(crate) fn join_expr_arity(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::As { var, body, .. } if var == JOIN_IDX_VAR => Some(match body.as_ref() {
+            Expr::Array(_) => 2,
+            Expr::Pipe(stages) => stages.len() + 1,
+            _ => unreachable!("join_expr builds an array or a pipe"),
+        }),
+        _ => None,
+    }
+}
+
 /// The one definition of "does a bare identifier (function/parameter name,
 /// zero-arg call, `def` name) start here" -- underscore included, since jq
 /// accepts `_` as an identifier-start character throughout and
@@ -2082,6 +2190,9 @@ impl<'a> Parser<'a> {
                     self.parse_reduce_expr()
                 } else if self.matches_keyword("foreach") {
                     self.parse_foreach_expr()
+                } else if self.matches_keyword("JOIN") {
+                    self.reject_unless_jq_extensions("JOIN")?;
+                    self.parse_shadowable_special_form(keyword_start, "JOIN", Self::parse_join_expr)
                 } else if self.matches_keyword("limit") {
                     self.reject_unless_jq_extensions("limit")?;
                     self.parse_shadowable_special_form(
@@ -2546,6 +2657,42 @@ impl<'a> Parser<'a> {
             n: Box::new(n),
             expr: Box::new(expr),
         })
+    }
+
+    /// Parse `JOIN($idx; idx_expr)`, `JOIN($idx; stream; idx_expr)` or
+    /// `JOIN($idx; stream; idx_expr; join_expr)` (#3046).
+    ///
+    /// jq defines all three in `builtin.jq`, so they desugar to exactly those
+    /// definitions ([`join_expr`]) rather than getting evaluator arms of
+    /// their own. A wrong arity rewinds jq-mode-only, as
+    /// [`Self::parse_limit_expr`] does.
+    fn parse_join_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
+        self.consume_keyword("JOIN");
+        self.skip_ws();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
+        }
+        self.next();
+        let mut args = Vec::new();
+        loop {
+            self.skip_ws();
+            args.push(self.parse_expr()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(';') if args.len() < 4 => {
+                    self.next();
+                }
+                Some(')') if args.len() >= 2 => {
+                    self.next();
+                    return Ok(join_expr(args));
+                }
+                Some(')') if self.mode == ParserMode::Jq => {
+                    return self.wrong_arity_call_from_parsed(start_pos, args);
+                }
+                _ => return self.wrong_arity_or_expect(start_pos, ')', args),
+            }
+        }
     }
 
     /// Parse an until expression.
@@ -3883,7 +4030,8 @@ impl<'a> Parser<'a> {
                 | Expr::Error(_)
                 | Expr::Builtin(_)
                 | Expr::Break(_)
-        ) || matches!(&original, Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }));
+        ) || matches!(&original, Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }))
+            || join_expr_arity(&original).is_some();
         if !is_recognized_special_form_shape {
             return original;
         }
@@ -5752,6 +5900,14 @@ impl<'a> Parser<'a> {
             self.reject_unless_jq_extensions("mktime")?;
             self.consume_keyword("mktime");
             return Ok(Some(Builtin::Mktime));
+        }
+        if self.matches_keyword("format") {
+            self.reject_unless_jq_extensions("format")?;
+            let keyword_start = self.pos;
+            self.consume_keyword("format");
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|name| Builtin::FormatNamed(Box::new(name))));
         }
         if self.matches_keyword("strftime") {
             self.reject_unless_jq_extensions("strftime")?;

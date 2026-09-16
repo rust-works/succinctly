@@ -248,6 +248,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::LastStream(e)
         | Builtin::IsEmpty(e)
         | Builtin::Strftime(e)
+        | Builtin::FormatNamed(e)
         | Builtin::Strptime(e)
         | Builtin::Match(e)
         | Builtin::Capture(e)
@@ -547,6 +548,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::LastStream(e) => Builtin::LastStream(Box::new(f(e))),
         Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(f(e))),
         Builtin::Strftime(e) => Builtin::Strftime(Box::new(f(e))),
+        Builtin::FormatNamed(e) => Builtin::FormatNamed(Box::new(f(e))),
         Builtin::Strptime(e) => Builtin::Strptime(Box::new(f(e))),
         Builtin::Match(e) => Builtin::Match(Box::new(f(e))),
         Builtin::Capture(e) => Builtin::Capture(Box::new(f(e))),
@@ -1702,6 +1704,7 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Localtime
             | Builtin::Mktime
             | Builtin::Strftime(_)
+            | Builtin::FormatNamed(_)
             | Builtin::Strptime(_)
             | Builtin::Todate
             | Builtin::Fromdate

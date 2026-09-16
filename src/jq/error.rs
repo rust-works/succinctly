@@ -923,6 +923,17 @@ impl EvalError {
         Self::new("strptime/1 requires string inputs and arguments")
     }
 
+    /// `<name> is not a valid format` for a string, `<type> (<value>) is not
+    /// a valid format` for anything else (#3046) -- `format(name)`'s refusal,
+    /// both wordings captured from jq 1.7.1 (`"x" | format("nope")`,
+    /// `"x" | format(1)`).
+    pub fn not_a_valid_format(name: &OwnedValue) -> Self {
+        match name {
+            OwnedValue::String(s) => Self::new(format!("{s} is not a valid format")),
+            other => Self::new(format!("{} is not a valid format", describe(other))),
+        }
+    }
+
     /// `<type> (<value>) cannot be <format>-formatted, only array` (#929).
     ///
     /// Raised by `@csv`/`@tsv` for a non-array top-level value — confirmed

@@ -1658,6 +1658,10 @@ pub enum Builtin {
     Mktime,
     /// `strftime(fmt)` - format broken-down time as string
     Strftime(Box<Expr>),
+    /// `format(name)` - apply the `@name` format named by `name`'s value
+    /// (#3046). jq's own dynamic spelling of `@text`/`@json`/`@csv`/...;
+    /// only jq's format names are accepted, without the `@`.
+    FormatNamed(Box<Expr>),
     /// `strptime(fmt)` - parse string to broken-down time
     Strptime(Box<Expr>),
     /// `todate` - convert Unix timestamp to ISO 8601 date string (alias for todateiso8601)
