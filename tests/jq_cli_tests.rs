@@ -17890,6 +17890,68 @@ fn test_null_target_non_numeric_slice_bound_refused_at_write_2853() -> Result<()
     Ok(())
 }
 
+/// #2927: a slice write can re-read a target that *stopped* being null
+/// between path resolution and write -- an earlier path in the same
+/// fan-out (`(.a, .a["x":]) = VALUE`) replaces `.a` with `VALUE` before the
+/// second path's write runs. jq's `setpath` re-reads `root`'s *current*
+/// kind at that point, so the refusal depends on it: `Sliceable`
+/// (array/string) and `Null` both still complain about the non-integer
+/// bound, while anything else answers `Cannot index <kind> with object`
+/// without looking at the bound at all -- mirroring
+/// `SliceTargetKind::of_type_name`'s own three-way split. Every row is a
+/// live jq 1.7.1 capture.
+#[test]
+fn test_slice_write_refusal_is_kind_aware_when_target_changed_before_write_2927() -> Result<()> {
+    const INTEGERS: &str = "Array/string slice indices must be integers";
+
+    for (value, expected) in [
+        ("5", "Cannot index number with object"),
+        (r#""hi""#, INTEGERS),
+        ("[1]", INTEGERS),
+        ("{}", "Cannot index object with object"),
+        ("true", "Cannot index boolean with object"),
+    ] {
+        let filter = format!(r#"(.a, .a["x":]) = {value}"#);
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":null}"#))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains(expected),
+            "{filter}: stderr: {stderr:?} (expected {expected:?})"
+        );
+    }
+
+    // `|=` with a real update filter, not just plain `=` -- same kind-aware
+    // refusal, confirming the fix isn't specific to the assignment operator.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.a, .a["x":]) |= (. + 1)"#],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+
+    // Not a regression on the root-stays-null case: an *unrelated* first
+    // path leaves `.a` null, so the refusal stays the plain integers error.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.b, .a["x":]) = 5"#],
+        Some(r#"{"a":null,"b":null}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains(INTEGERS), "stderr: {stderr:?}");
+
+    // `del()`/`|= empty` still no-ops regardless of kind -- `delpaths` never
+    // parses the descriptor at all, so this arm's kind check is never
+    // reached.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"(.a, .a["x":]) |= empty"#], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "{}");
+
+    Ok(())
+}
+
 /// #2853 (must-not-change): the rows that would break if
 /// `slice_has_non_integer_bound` were widened past `SliceBoundKey::Raw`, or
 /// if the null-target arm leaked to a non-null target.
