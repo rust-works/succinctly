@@ -56746,5 +56746,29 @@ fn test_imported_module_def_can_call_its_sibling_2989() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "1");
 
+    // The retry missing too is an ordinary compile error, not a silent pass:
+    // a name that is neither a sibling nor a builtin still fails, and is still
+    // attributed to the module that wrote it. This is the arm that decides
+    // what happens when `alias::name` does not resolve either -- without it
+    // the reachability walk could record no edge and quietly skip the body.
+    std::fs::write(dir.path().join("y.jq"), "def f: 1; def g: nosuchthing;\n")?;
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "-L", &lib, r#"import "y" as a; a::g"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("nosuchthing/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("y.jq"),
+        "attributed to the module that wrote it: {stderr:?}"
+    );
+    // ...and its resolvable sibling is unaffected by the failure.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "-L", &lib, r#"import "y" as a; a::f"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
     Ok(())
 }
