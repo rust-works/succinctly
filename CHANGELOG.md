@@ -181,9 +181,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an erroring `f` twice, and an unbounded walk printed each node's whole fan-out
   before descending instead of interleaving. The same held for `cond`, and for
   `path(recurse(f))`. Each output is now visited from inside `f`'s own sink,
-  within a native stack budget measured as the walk descends and shared with
-  `def` recursion's frame guard; past it (only synthetic chains get there) the
-  old per-node order resumes for the remaining levels.
+  within a native stack budget measured as the walk descends (512 KiB, so it is
+  safe on any thread, and charged on `def` recursion's frame guard); past it --
+  a few dozen levels deep, depending on `f` -- the old per-node order resumes
+  for the remaining levels.
 
 - **A called `def` inside a builtin's argument, or a destructuring key, is a
   compile error** (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then
