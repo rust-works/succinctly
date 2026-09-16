@@ -1213,6 +1213,16 @@ fn recurse_levels_keep_the_read_only_operand_scope_2918() -> Result<()> {
     )?;
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), "[0,0,0]");
+
+    // And `cond`, which runs inside `f`'s sink as well: an absent-key read
+    // there must see the scope, or it prunes the walk.
+    let (output, code) = run_yq_stdin(
+        r#"([recurse((.n + 1) as $m | select($m < 3) | {"n": $m}; ([.zzz | key] | length) == 0)] | length) + 0"#,
+        "n: 0\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "3");
     Ok(())
 }
 

@@ -35258,7 +35258,14 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
 
     /// `select(cond) | r` for one child of `f`: visit `child` once per truthy
     /// output of `cond`, each before `cond` is asked for its next (#627).
+    ///
+    /// Called from inside `f`'s own sink, where a lazy operand in `f` may
+    /// have suspended the walk's read-only scope the same way it does for
+    /// the no-`cond` path into [`Self::visit`] -- `cond` needs the same
+    /// re-establishment `visit` gives its own delivery, not just the visit
+    /// this gates.
     fn gate(&mut self, cond: &Expr, child: OwnedValue, level: u32) -> Option<RecurseAbort> {
+        let _scope = self.budget.scope();
         let mut abort = None;
         let flow = eval_each_owned::<S>(cond, &child, false, &mut |verdict| {
             if verdict.is_truthy() {
@@ -35651,6 +35658,12 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     /// `select(cond) | r` for one child of `f`. `cond` runs to completion
     /// even when `open` is false (a null node's child, #856), so its side
     /// effects and escape still happen; only the visits are withheld.
+    ///
+    /// Called from inside `f`'s own sink, where a lazy operand in `f` may
+    /// have suspended the walk's read-only scope the same way it does for
+    /// the no-`cond` path into [`Self::visit`] -- `cond` needs the same
+    /// re-establishment `visit` gives its own delivery, not just the visit
+    /// this gates.
     fn gate(
         &mut self,
         cond: &Expr,
@@ -35658,6 +35671,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
         open: bool,
         level: u32,
     ) -> Option<RecurseAbort> {
+        let _scope = self.budget.scope();
         let mut abort = None;
         let flow = eval_each_owned::<S>(cond, &child.value, false, &mut |verdict| {
             if open && verdict.is_truthy() {
