@@ -57844,9 +57844,13 @@ fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()>
         ),
         // #2937: the math builtins widen with a bare cast, and the floor
         // family (and `length`) print exact digits where jq has a double.
+        // The `sqrt` row moved once already, from `...647` to `...646`, when
+        // #3045 replaced a Newton iteration with the platform's correctly
+        // rounded `sqrt`; the remaining ulp is the bare-cast widening of the
+        // literal (jq rounds it to 17 digits first), which is #2937's.
         (
             "869389897822472004 | sqrt",
-            "932410798.8555647",
+            "932410798.8555646",
             "932410798.8555645",
         ),
         (
