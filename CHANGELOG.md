@@ -127,6 +127,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--seq -s` error locations follow where jq's parser last failed** (#2947).
+  Whether a runtime error can name a file and line, or must answer
+  `(at <unknown>)`, was decided by a heuristic over the text after the last RS
+  byte. It is not a property of that record: jq renders `<unknown>` only when
+  `jq_util_input_read_more` closes a stream already at `feof`, which it is made
+  to do by its parser returning an *error* — the one outcome that returns early
+  and makes `main` read again. Which errors are fatal is then decided by jq's
+  `fgets` chunking over a `char buf[4096]`, so only one detected on the
+  stream's final buffer loses the position.
+
+  So the bytes *after* a failure decide the answer, and the same record now
+  answers differently depending on them: `\x1e[0,]` is `<unknown>` and
+  `\x1e[0,]\n` is line 1; `\x1e0\x1e` is `<unknown>` and `\x1e0\x1e\n` is
+  line 1. A newline is not simply "recovery", though — one swallowed by an
+  unterminated string is just more string, and `\x1e"unterm\n` stays
+  `<unknown>`. Nor is the chunk a line: `\x1e[0,]` padded with spaces to 4094
+  bytes is `<unknown>` and one byte more is line 0, with no newline in either.
+
+  Three further families come out right for the same reason rather than
+  needing their own rules: a final RS preceded by an abandoned token, a stream
+  with no RS byte anywhere (which jq abandons, down to an empty one), and an
+  empty trailing *file*, which jq opens — and opening is what restores the
+  filename, so `a.json` holding `\x1e[0,]` beside an empty `b.json` reports
+  `b.json:0`.
+
+  Emitted values are unchanged. Verified by differential sweep against jq
+  1.7.1 over ~34,700 cases — single-file, every multi-file split, randomised,
+  and invalid-UTF-8/BOM — comparing exit code, stdout and stderr, with the
+  harness first validated against a known-bad build.
+
 - **An assignment applies each write as its path resolves, stopping on the
   first failure** (#2267). jq's `=` is
   `reduce path(paths) as $p (.; setpath($p; $value))` — one path pulled, its
