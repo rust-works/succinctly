@@ -173,6 +173,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A called `def` inside a builtin's argument is a compile error again**
+  (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then failed at runtime,
+  exit 5, where jq refuses to compile it, exit 3 with no output -- and on
+  `null` input it reported `Cannot iterate over null` instead, a different
+  error entirely, because the builtin now ran before the check that should
+  have stopped it. Affected every builtin whose argument is rebuilt during
+  resolution (`map`, `select`, `with_entries`, `any(f)`, `all(f)`, ...).
+
+  #2740's reachability pass, which rightly skips a `def` nobody calls, keys
+  each def by its body's heap address. Resolution clones a builtin's operand
+  before walking it, and the clone moved every body inside to an address the
+  pass had never seen -- so called and uncalled defs alike were skipped. The
+  key is now carried across the clone rather than the check being loosened:
+  an *uncalled* def with a bad body still compiles, exactly as in jq, which a
+  simpler fix would have broken. Verified against jq 1.7.1 over 3,744
+  generated programs: 612 divergences fixed, none introduced.
+
 - **`--seq -s` error locations follow where jq's parser last failed** (#2947).
   Whether a runtime error can name a file and line, or must answer
   `(at <unknown>)`, was decided by a heuristic over the text after the last RS
