@@ -19,11 +19,11 @@ use succinctly::jq::eval_generic::{
     to_owned_checked as generic_to_owned_checked, to_owned_cursor, GenericResult, LazyElem,
     MAX_NESTING_DEPTH,
 };
-use succinctly::jq::walk::{map_builtin_subexprs, stamp_loc_file};
+use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
-    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Program, StreamStats,
-    MAX_VALUE_TREE_DEPTH,
+    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Pattern, Program,
+    StreamStats, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, JsonString, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -1063,6 +1063,23 @@ impl ModuleLoader {
 
 /// Recursively rewrite NamespacedCall expressions to regular FuncCall expressions
 /// by transforming `namespace::func(args)` to `namespace::func(args)` as a regular call
+/// Rewrite every computed-key `Expr` inside a `reduce`/`foreach`/`as {...}`
+/// pattern list (#2677's `ObjectKey::Expr`) the same way
+/// [`rewrite_namespaced_calls`] rewrites everywhere else -- see #2957:
+/// `Expr::Reduce`/`Expr::Foreach`/`Expr::AsPattern` carry a `Vec<Pattern>`
+/// that a hand-rolled match previously passed through untouched, so a
+/// namespaced call reachable only from a destructuring key
+/// (`. as {(m::f): $v}`) reached evaluation as a raw `NamespacedCall`.
+/// `map_pattern_subexprs` is the one exhaustive definition of what a pattern
+/// contains, matching the fix `called_func_names` already applies to the same
+/// blind spot.
+fn rewrite_namespaced_calls_in_patterns(patterns: Vec<Pattern>) -> Vec<Pattern> {
+    patterns
+        .iter()
+        .map(|p| map_pattern_subexprs(p, &mut |key| rewrite_namespaced_calls(key.clone())))
+        .collect()
+}
+
 fn rewrite_namespaced_calls(expr: Expr) -> Expr {
     match expr {
         // #1371: parse-time only, so neither can occur -- both are built by
@@ -1191,7 +1208,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             update,
         } => Expr::Reduce {
             input: Box::new(rewrite_namespaced_calls(*input)),
-            patterns,
+            patterns: rewrite_namespaced_calls_in_patterns(patterns),
             init: Box::new(rewrite_namespaced_calls(*init)),
             update: Box::new(rewrite_namespaced_calls(*update)),
         },
@@ -1203,7 +1220,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             extract,
         } => Expr::Foreach {
             input: Box::new(rewrite_namespaced_calls(*input)),
-            patterns,
+            patterns: rewrite_namespaced_calls_in_patterns(patterns),
             init: Box::new(rewrite_namespaced_calls(*init)),
             update: Box::new(rewrite_namespaced_calls(*update)),
             extract: extract.map(|e| Box::new(rewrite_namespaced_calls(*e))),
@@ -1238,7 +1255,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             body,
         } => Expr::AsPattern {
             expr: Box::new(rewrite_namespaced_calls(*expr)),
-            patterns,
+            patterns: rewrite_namespaced_calls_in_patterns(patterns),
             body: Box::new(rewrite_namespaced_calls(*body)),
         },
         Expr::StringInterpolation(parts) => {
