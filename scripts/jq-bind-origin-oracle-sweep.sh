@@ -253,6 +253,39 @@ fold-alt-limit-outside	{"a":1}	[limit(1; path(foreach (1,2) as [$a] ?// $b (.; .
 alt-untracked-stage-refuses	{"a":1}	path(5 | . as {a:$v} ?// $v | .b?)
 alt-untracked-stage-zero-output	{"a":1}	path(5 | 5 as {a:$v} ?// $v | empty)
 alt-untracked-stage-marker-head	{"a":1}	path(. as $x | 5 | $x as {a:$q} ?// $z | $q)
+in-evaluator-input-write	{"a":1} {"a":1}	input | . as $x | {a:1} | ($x.a = 9)
+in-evaluator-inputs-write	{"a":1} {"a":1}	[inputs] | .[0] | . as $x | {a:1} | ($x.a = 9)
+in-evaluator-line-sibling-write	{"a":1}	. as $x | {a:1} | (input_line_number, ($x.a = 9))
+in-evaluator-line-sibling-del	{"a":1}	. as $x | {a:1} | (input_line_number, del($x.a))
+in-evaluator-line-sibling-path	{"a":1}	. as $x | {a:1} | (input_line_number, path($x))
+in-evaluator-line-bind-write	{"a":1}	. as $x | {a:1} | input_line_number as $n | ($x.a = 9)
+in-evaluator-fold-update-write	{"a":1}	reduce (1) as $i (.; . as $x | {a:1} | ($x.a = 9))
+in-evaluator-update-rhs-write	{"a":1}	[.] | .[] |= (. as $x | {a:1} | ($x.a = 9))
+in-evaluator-with-entries-path	{"a":1}	with_entries(.value |= (. as $x | 1 | path($x)))
+in-evaluator-empty-object-write	{} {}	input | . as $x | {} | ($x.a = 9)
+in-evaluator-empty-array-write	[] []	input | . as $x | [] | ($x[0] = 9)
+in-evaluator-catch-rebuilt-write	{"a":1}	. as $x | try error({a:1}) catch ($x.a = 9)
+in-evaluator-catch-rebuilt-write-input	{"a":1} {"a":1}	input | . as $x | try error({a:1}) catch ($x.a = 9)
+in-evaluator-isempty-write	{"a":1}	. as $x | isempty({a:1} | ($x.a = 9))
+in-evaluator-any-write	{"a":1}	. as $x | any({a:1}; ($x.a = 9))
+in-evaluator-control-no-route	{"a":1}	. as $x | {a:1} | ($x.a = 9)
+in-evaluator-control-first	{"a":1}	first(. as $x | {a:1} | ($x.a = 9))
+in-evaluator-control-map	{"a":1}	map(. as $x | {a:1} | ($x.a = 9))
+in-evaluator-input-direct-write	{"a":1} {"a":1}	input | . as $x | ($x.a) = 9
+in-evaluator-input-direct-del	{"a":1} {"a":1}	input | . as $x | del($x.a)
+in-evaluator-input-first-path	{"a":1} {"a":1}	input | . as $x | first(.) | path($x)
+in-evaluator-input-select-path	{"a":1} {"a":1}	input | . as $x | select(true) | path($x)
+in-evaluator-input-empty-object-direct	{} {}	input | . as $x | ($x.a) = 9
+in-evaluator-input-scalar-direct	"s" "s"	input | . as $x | ($x) = 9
+in-evaluator-update-rhs-direct	{"a":1}	[.] | .[] |= (. as $x | ($x.a = 9))
+in-evaluator-fold-update-direct	{"a":1}	reduce (1) as $i (.; . as $x | ($x.a = 9))
+in-evaluator-catch-own-value	{"a":1}	. as $x | try error($x) catch path($x)
+in-evaluator-catch-own-value-write	{"a":1}	. as $x | try ($x | error) catch ($x.a = 9)
+in-evaluator-input-embed-array	{"a":1} {"a":1}	input | . as $x | [.] | .[0] | path($x)
+in-evaluator-input-embed-object	{"a":1} {"a":1}	input | . as $x | {k:.} | .k | path($x)
+in-evaluator-input-reduce-empty	{"a":1} {"a":1}	input | . as $x | reduce empty as $i (.; .) | path($x)
+in-evaluator-input-fold-source	{"a":1} {"a":1}	input | reduce (.) as $x (.; ($x.a = 9))
+in-evaluator-input-catch-own-value	{"a":1} {"a":1}	input | . as $x | try error($x) catch path($x)
 CASES_EOF
 )
 
@@ -287,6 +320,11 @@ carried-register-passthrough:pre-existing (#2042): once the register is only *ca
 alt-untracked-stage-zero-output:#2979 family B -- on an untracked stage the walk's verdict is a guess, so its refusal propagates rather than retrying; jq retries onto $v and answers nothing
 alt-untracked-stage-marker-head:#2979 family B -- MUST stay a refusal: the marker is the register in jq (["a"]); a retry would bind $z instead, and del/= would write through it
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
+in-evaluator-input-embed-array:#3036 -- the in-evaluator twin of the #2642 owned-embed residual: `[.] | .[0]` materializes the element as an owned copy, which re-enters eval.rs as a fresh document (limitations.md, #3036)
+in-evaluator-input-embed-object:#3036 -- same as in-evaluator-input-embed-array for `{k:.} | .k`
+in-evaluator-input-reduce-empty:#3036 -- same as in-evaluator-input-embed-array for a fold that returns its accumulator unchanged
+in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
+in-evaluator-input-catch-own-value:#3036 -- on the input-queue route the marker carries no node witness, so `try_payload_root` cannot prove the payload is its node; the generic route keeps it accepted
 REFUSE_EOF
 )
 
