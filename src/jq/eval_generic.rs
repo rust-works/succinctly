@@ -58,7 +58,7 @@ use super::eval::{
     classify_skip_n, clear_nonretryable_stop, collapse_vec, collect_pattern_var_names,
     compare_key_arrays, compare_values, debug_assert_materialization_error, demote_rebuilt_markers,
     each_path_on_owned, each_recurse_walk, enter_def_call_frame, entries_to_object,
-    eval_each_owned, eval_full as full_eval, extract_pattern_bindings,
+    eval_each_owned, eval_each_owned_bridged, eval_full as full_eval, extract_pattern_bindings,
     extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
     fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
     index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
@@ -71,12 +71,13 @@ use super::eval::{
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
     stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
     streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_vars, suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
-    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    substitute_vars, suppresses, tonumber_from_str, try_payload_root, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, RootWitness, SliceTargetKind,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -2905,7 +2906,7 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     let root = RootWitness::of(cursor.as_ref());
     let expr = demote_rebuilt_markers(expr, &root);
     match bridge_ambient_input::<_, S>(&expr, &value, cursor) {
-        Ok(owned) => eval_each_owned::<S>(&expr, &owned, optional, &mut |v| {
+        Ok(owned) => eval_each_owned_bridged::<S>(&expr, &owned, optional, &mut |v| {
             sink.push(GenericItem::Owned(v))
         }),
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
@@ -3142,7 +3143,7 @@ fn eval_each_owned_collect<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     let mut collected: Vec<OwnedValue> = Vec::new();
-    let flow = eval_each_owned::<S>(expr, input, optional, &mut |v| {
+    let flow = eval_each_owned_bridged::<S>(expr, input, optional, &mut |v| {
         collected.push(v);
         Demand::Continue
     });
@@ -5371,7 +5372,7 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         // marker `expr` carries that isn't proven to be this document node.
         let root = RootWitness::of(Some(&cursor));
         let expr = demote_rebuilt_markers(expr, &root);
-        return match crate::jq::eval::eval_each_owned::<S>(&expr, &owned, false, &mut owned_sink) {
+        return match eval_each_owned_bridged::<S>(&expr, &owned, false, &mut owned_sink) {
             Flow::Exhausted => None,
             // Kept for the same reason as the streaming branch below.
             Flow::Stopped { pending } => pending,
@@ -6948,20 +6949,17 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
             cursor,
         );
     }
-    // #2642 review: NOT demoted here, deliberately -- `error($x)` raises a
-    // bound marker's own value verbatim (no rebuild at all), and jq's own
-    // `catch` handler runs against that exact same `jv`, so `path($x)`
-    // inside the handler is legitimately trackable (`. as $x | try
-    // error($x) catch path($x)` is `[]` in jq, confirmed live). Blanket
-    // `Owned` demotion here was tried and reverted: it cannot distinguish
-    // "a genuine rebuild happened" from "the payload IS the marker's own
-    // value, unchanged," and wrongly refused the latter. Left as a known,
-    // narrower gap (a payload that *is* a rebuilt copy still wrongly
-    // certifies here) rather than fixing this specific class under time
-    // pressure -- tracked in the #2642 follow-up.
+    // #3036: the handler's `Snapshot` markers are checked against the
+    // payload's own node (`try_payload_root`) before crossing into
+    // `eval.rs`: `error($x)` keeps `$x` certifiable, a value-equal rebuild
+    // (`error({a:1})` on `{"a":1}`) no longer is -- the fabrication #2642's
+    // review left open here.
     let run_catch = |payload: &OwnedValue| -> GenericResult<V> {
         match catch {
-            Some(catch_expr) => eval_each_owned_collect::<S, V>(catch_expr, payload, optional),
+            Some(catch_expr) => {
+                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(inner));
+                eval_each_owned_collect::<S, V>(&catch_expr, payload, optional)
+            }
             None => GenericResult::None,
         }
     };
@@ -9395,7 +9393,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
         let mut produced_any = false;
         let mut budget_control = None;
         let mut budget = super::eval::REPEAT_WIDTH_BUDGET;
-        let flow = eval_each_owned::<S>(&f, &owned, optional, &mut |v| {
+        let flow = eval_each_owned_bridged::<S>(&f, &owned, optional, &mut |v| {
             produced_any = true;
             if let Some(control) = super::eval::charge_budget(&mut budget, "repeat") {
                 stopped = true;
@@ -9654,15 +9652,21 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Escaped(Control::Error(e))
         }
         Flow::Escaped(Control::Error(e)) => match catch {
-            Some(catch_expr) => {
-                run_try_handler_generic::<S, V>(catch_expr, e.payload(), optional, cursor, sink)
-            }
+            Some(catch_expr) => run_try_handler_generic::<S, V>(
+                catch_expr,
+                e.payload(),
+                &try_payload_root(expr),
+                optional,
+                cursor,
+                sink,
+            ),
             None => Flow::Exhausted,
         },
         Flow::Escaped(Control::Break(_)) => match catch {
             Some(catch_expr) => run_try_handler_generic::<S, V>(
                 catch_expr,
                 OwnedValue::Null,
+                &RootWitness::Owned,
                 optional,
                 cursor,
                 sink,
@@ -9683,28 +9687,31 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
 fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
     handler: &Expr,
     payload: OwnedValue,
+    payload_root: &RootWitness,
     optional: bool,
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #3036: see `try_payload_root`. Demoted ahead of both routes below;
+    // the identity pipe's own witness for the payload position is `Owned`
+    // too (`OwnedIdentity::kept(c).rebuilt()`), so the two agree.
+    let handler = demote_rebuilt_markers(handler, payload_root);
+    let handler: &Expr = &handler;
     if let Some(c) = cursor {
         let stages = owned_identity_body_stages(handler);
         if needs_path_context(handler) && owned_identity_pipe_supported(stages) {
             return eval_owned_identity_pipe::<S, V>(
                 stages,
                 Cow::Owned(payload),
-                OwnedIdentity::kept(c),
+                // #3036: the payload stands at the stage's position but is
+                // not the node's own value.
+                OwnedIdentity::kept(c).rebuilt(),
                 optional,
                 sink,
             );
         }
     }
-    // #2642 review: NOT demoted here, deliberately -- see `run_catch`'s
-    // identical sibling comment (`try_single_generic`, same file) for why:
-    // `error($x)` raises a marker's own value verbatim, and jq's `catch`
-    // runs against that same `jv`, so blanket demotion here wrongly refused
-    // a legitimately-trackable case. Left as a narrower, pre-existing gap.
-    eval_each_owned::<S>(handler, &payload, optional, &mut |o| {
+    eval_each_owned_bridged::<S>(handler, &payload, optional, &mut |o| {
         sink.push(GenericItem::Owned(o))
     })
 }
@@ -9795,6 +9802,7 @@ fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>) -> BindOrigi
         base: id.base.map(|c| (c.node_id(), c.document_token())),
         chain: id.ancestors.clone(),
         key_node: id.key_node,
+        exact: id.exact,
     }
 }
 
@@ -9829,15 +9837,18 @@ fn identity_from_origin<V: DocumentValue>(
             base: None,
             chain,
             key_node,
+            exact,
         } => Some(OwnedIdentity {
             base: None,
             ancestors: chain.clone(),
             key_node: *key_node,
+            exact: *exact,
         }),
         BindOrigin::Owned {
             base: Some((node, document)),
             chain,
             key_node,
+            exact,
         } => {
             let anchor = anchor?;
             if anchor.document_token() != *document {
@@ -9847,6 +9858,7 @@ fn identity_from_origin<V: DocumentValue>(
                 base: Some(anchor.at_node_id(*node)?),
                 ancestors: chain.clone(),
                 key_node: *key_node,
+                exact: *exact,
             })
         }
     }
@@ -16584,7 +16596,7 @@ fn owned_nav_children<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
 ) -> (Vec<(Option<OwnedValue>, OwnedValue)>, Option<Control>) {
-    let (values, control) = owned_identity_values::<S>(expr, value, optional);
+    let (values, control) = owned_identity_values::<S>(expr, value, optional, &RootWitness::Owned);
     let children = match expr {
         // Mode decides the slice component (ADR-0018): real yq keeps the
         // container's position (`.c[0:1] | path` is `["c"]`, `.c[0:1] | .[0]
@@ -17528,7 +17540,8 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
                     PathNode::Absent => Rc::new(OwnedValue::Null),
                     PathNode::Owned(v) => Rc::clone(v),
                 };
-                let (values, control) = owned_identity_values::<S>(&slice, &value, false);
+                let (values, control) =
+                    owned_identity_values::<S>(&slice, &value, false, &RootWitness::Owned);
                 path_context_push_owned_children(
                     tpos,
                     values.into_iter().map(|v| (component.clone(), v)).collect(),
@@ -17848,7 +17861,8 @@ fn path_context_getpath_walk_one<S: EvalSemantics, V: DocumentValue>(
                     let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::tracked_value(
                         OwnedValue::array_from(vec![component.clone()]),
                     ))));
-                    let (values, control) = owned_identity_values::<S>(&segment, &value, false);
+                    let (values, control) =
+                        owned_identity_values::<S>(&segment, &value, false, &RootWitness::Owned);
                     path_context_push_owned_children(
                         cpos,
                         values
@@ -17985,7 +17999,8 @@ fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
         return Ok(());
     };
     let resolved = path_context_resolve_at_pos::<S, V>(handler, pos).map_err(Control::Error)?;
-    let (values, control) = owned_identity_values::<S>(&resolved, &payload, false);
+    let (values, control) =
+        owned_identity_values::<S>(&resolved, &payload, false, &RootWitness::Owned);
     for v in values {
         out.push(PathContextPos {
             node: PathNode::Owned(Rc::new(v)),
@@ -20741,15 +20756,12 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                 match route {
                     AbsentRestRoute::Constants => {
                         match path_context_resolve_absent_stages::<S, V>(rest, pos) {
-                            // #2642 review: NOT demoted here, deliberately --
-                            // `PathNode::Owned` can carry a live ancestor's
-                            // own value reached through this walk's own
-                            // cursor-native navigation, which a blanket
-                            // `Owned` witness cannot distinguish from a
-                            // genuine rebuild. Left as a narrower,
-                            // pre-existing gap rather than threading `pos`'s
-                            // own identity through under time pressure --
-                            // tracked in the #2642 follow-up.
+                            // #3036: `eval_each_owned` demotes every
+                            // `Snapshot` marker in `resolved` -- an absent
+                            // position holds no node, and a `PathNode::Owned`
+                            // is by definition a value that is not one
+                            // (the array a slice built, a handler's output),
+                            // so nothing here can be a marker's own node.
                             Ok(resolved) => {
                                 eval_each_owned::<S>(&resolved, &owned, false, &mut |v| {
                                     sink.push(GenericItem::Owned(v))
@@ -22676,6 +22688,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 struct OwnedIdentity<V: DocumentValue> {
     base: Option<V::Cursor>,
     ancestors: Vec<(Rc<OwnedValue>, OwnedValue)>,
+    /// The owned root *is* `base`'s own value, unrebuilt (#3036): set by
+    /// [`OwnedIdentity::kept`] and cleared by every stage rule that places
+    /// a new value at the same position (`sort`, `to_entries`, a write, a
+    /// `catch` payload). `base`/`ancestors` model yq *position*, which a
+    /// rebuilt value keeps; this models jq *node identity*, which it does
+    /// not -- the difference is what [`owned_identity_root`] needs, and
+    /// keying on `ancestors.is_empty()` alone would certify `sort`'s new
+    /// array as the node it stands on.
+    exact: bool,
     /// This value *is* the key `key` emitted (#2471). It stands at the same
     /// position -- `path`/`parent` answer exactly as they did for the node
     /// `key` was asked of -- but a key has no key of its own, so a second
@@ -22691,6 +22712,7 @@ impl<V: DocumentValue> Clone for OwnedIdentity<V> {
             base: self.base,
             ancestors: self.ancestors.clone(),
             key_node: self.key_node,
+            exact: self.exact,
         }
     }
 }
@@ -22709,6 +22731,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             base: Some(base),
             ancestors: Vec::new(),
             key_node: false,
+            exact: true,
         }
     }
 
@@ -22718,6 +22741,31 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             base: None,
             ancestors: Vec::new(),
             key_node: false,
+            exact: false,
+        }
+    }
+
+    /// The same position, holding a value that is no longer `base`'s own
+    /// (#3036) -- see [`OwnedIdentity::exact`].
+    fn rebuilt(mut self) -> Self {
+        self.exact = false;
+        self
+    }
+
+    /// The [`RootWitness`] an expression evaluated over this identity's value
+    /// is checked against before it crosses into `eval.rs` (#3036, closing
+    /// #2642's owned-identity residual): the base node itself when the
+    /// value *is* that node's own, unrebuilt value, and `Owned` -- which
+    /// demotes every `Snapshot` marker -- for a rebuilt value, a detached
+    /// one, or a position inside an owned tree. Never `ancestors.is_empty()`
+    /// alone: the `Keeps` rule leaves `sort`'s new array with an empty chain
+    /// at the input's position, and certifying a marker against it would
+    /// write through a copy.
+    fn root_witness(&self) -> RootWitness {
+        if self.exact && self.ancestors.is_empty() {
+            RootWitness::of(self.base.as_ref())
+        } else {
+            RootWitness::Owned
         }
     }
 
@@ -22737,6 +22785,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             ancestors,
             // A child of a key node is an ordinary node again.
             key_node: false,
+            exact: self.exact,
         }
     }
 
@@ -24046,7 +24095,8 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
         Expr::IndexExpr { target, key } => {
             let key_expr =
                 owned_identity_resolve_component::<S, V>(key, id).map_err(Control::Error)?;
-            let (keys, keys_control) = owned_identity_values::<S>(&key_expr, value, optional);
+            let (keys, keys_control) =
+                owned_identity_values::<S>(&key_expr, value, optional, &id.root_witness());
             // #2495: re-running `key_expr` a second time to compute
             // `values` (the pre-fix shape of this arm) doubles any side
             // effect it has of its own -- `halt_error`/`debug`/`stderr`
@@ -24083,6 +24133,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                     }),
                     value,
                     optional,
+                    &id.root_witness(),
                 )
             } else {
                 owned_identity_values::<S>(
@@ -24092,6 +24143,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                     }),
                     value,
                     optional,
+                    &id.root_witness(),
                 )
             };
             let control = combine_owned_identity_controls(keys_control, values_control);
@@ -24137,6 +24189,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                 }),
                 value,
                 optional,
+                &id.root_witness(),
             );
             let Some((target_value, target_id)) =
                 owned_identity_operand::<S, V>(target, value, id, optional)
@@ -24155,7 +24208,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
             }
             let bound = |e: &Option<Expr>| -> (Vec<OwnedValue>, Option<Control>) {
                 match e {
-                    Some(e) => owned_identity_values::<S>(e, value, optional),
+                    Some(e) => owned_identity_values::<S>(e, value, optional, &id.root_witness()),
                     None => (vec![OwnedValue::Null], None),
                 }
             };
@@ -24221,11 +24274,13 @@ fn owned_identity_getpath_step<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), Control> {
     let path_expr =
         owned_identity_resolve_component::<S, V>(path_expr, id).map_err(Control::Error)?;
-    let (paths, paths_control) = owned_identity_values::<S>(&path_expr, value, optional);
+    let (paths, paths_control) =
+        owned_identity_values::<S>(&path_expr, value, optional, &id.root_witness());
     let (values, values_control) = owned_identity_values::<S>(
         &Expr::Builtin(Builtin::GetPath(Box::new(path_expr))),
         value,
         optional,
+        &id.root_witness(),
     );
     // Zipped for the same reason the `Expr::IndexExpr` arm above is: a
     // non-array argument raises in the owned evaluator, which is where that
@@ -24281,23 +24336,22 @@ fn owned_child_at(value: &OwnedValue, component: &OwnedValue) -> OwnedValue {
 /// gaps: a `halt`/`break` inside a computed component disappearing
 /// entirely, and a value a step already answered being lost to a later
 /// component's own error.
+///
+/// `root` is what `expr`'s `Snapshot` markers are checked against before
+/// crossing into `eval.rs` (#3036, closing the #2642 review's deliberate
+/// gap here): [`OwnedIdentity::root_witness`] when the caller stands at a
+/// tracked position, so a marker frozen from that very node survives
+/// (`.foo | . as $x | (parent, ($x.a = 9))`), and `RootWitness::Owned`
+/// otherwise.
 fn owned_identity_values<S: EvalSemantics>(
     expr: &Expr,
     value: &OwnedValue,
     optional: bool,
+    root: &RootWitness,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    // #2642 review: NOT demoted here, deliberately -- this helper is called
-    // from `eval_owned_identity_stages` (the `Expr::If` condition arm),
-    // which stands at an `OwnedIdentity`-tracked position that can be a
-    // genuine, unrebuilt document node (`id.base`/`id.ancestors`); blanket
-    // `Owned` demotion here doesn't know that and wrongly refuses a
-    // legitimately-trackable case whenever a sibling `key`/`parent`/`path`
-    // read forces this route. Left as a narrower, pre-existing gap (this
-    // call site does not get #2642's fix) rather than threading `id`'s own
-    // identity through under time pressure -- tracked in the #2642
-    // follow-up.
+    let expr = demote_rebuilt_markers(expr, root);
     let mut values = Vec::new();
-    let flow = eval_each_owned::<S>(expr, value, optional, &mut |v| {
+    let flow = eval_each_owned_bridged::<S>(&expr, value, optional, &mut |v| {
         values.push(v);
         Demand::Continue
     });
@@ -24436,7 +24490,11 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
         // node or not -- the flag is the bound identity's own, not this
         // stage's to clear.
         OwnedIdentityRule::Bound => placed,
-        _ => placed.with_key_node(rule == OwnedIdentityRule::KeyNode),
+        // #3036: every other rule places a value the stage *built* at the
+        // position -- the same position, no longer the same node.
+        _ => placed
+            .rebuilt()
+            .with_key_node(rule == OwnedIdentityRule::KeyNode),
     }))
 }
 
@@ -24615,7 +24673,8 @@ fn owned_identity_bind_values<S: EvalSemantics, V: DocumentValue>(
         Ok(e) => e,
         Err(e) => return (Vec::new(), Some(Control::Error(e))),
     };
-    let (values, control) = owned_identity_values::<S>(&resolved, value, optional);
+    let (values, control) =
+        owned_identity_values::<S>(&resolved, value, optional, &id.root_witness());
     let control = control.or_else(|| escaped.into_inner());
     (values.into_iter().map(|v| (v, None)).collect(), control)
 }
@@ -25800,7 +25859,8 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (counts, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let (counts, control) =
+                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
             let depth = match id.path() {
                 Ok(path) => path.len(),
                 Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -25853,7 +25913,8 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (conds, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let (conds, control) =
+                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
             for c in conds {
                 let branch = if c.is_truthy() {
                     then_branch
@@ -25913,7 +25974,8 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (counts, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let (counts, control) =
+                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
             for n_value in counts {
                 let take = match classify_limit_n(n_value) {
                     Ok(LimitN::Unlimited) => None,
@@ -26024,7 +26086,8 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
                 };
-            let (bound_values, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let (bound_values, control) =
+                owned_identity_values::<S>(&resolved, &value, optional, &id.root_witness());
             let control = control.or_else(|| escaped.into_inner());
             let mut names: Vec<String> = Vec::new();
             collect_pattern_var_names(pattern, &mut names);
@@ -26094,16 +26157,18 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Break(name) => Flow::Escaped(Control::Break(name.clone())),
         // Nothing to place: the ordinary evaluator raises what these raise.
-        // #2642 review: `Expr::Error`'s own message expression could embed a
-        // `Snapshot` marker, but NOT demoted here, deliberately -- `value`
-        // stands at an `OwnedIdentity`-tracked position that can be a
-        // genuine, unrebuilt document node, which a blanket `Owned` witness
-        // cannot distinguish from a real rebuild. Left as a narrower,
-        // pre-existing gap -- tracked in the #2642 follow-up.
+        // #3036: `Expr::Error`'s own message expression can embed a
+        // `Snapshot` marker, checked against this position's own node
+        // (`OwnedIdentity::root_witness`) rather than a blanket `Owned`
+        // witness, which the #2642 review found wrongly refused a genuine,
+        // unrebuilt node here.
         Expr::Error(_)
         | Expr::Builtin(
             Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
-        ) => eval_each_owned::<S>(stage, &value, optional, &mut |_| Demand::Continue),
+        ) => {
+            let stage = demote_rebuilt_markers(stage, &id.root_witness());
+            eval_each_owned_bridged::<S>(&stage, &value, optional, &mut |_| Demand::Continue)
+        }
         _ => {
             let Some(rule) = owned_identity_rule(stage) else {
                 unreachable!("owned_identity_pipe_supported admits ruled stages only")
@@ -26166,6 +26231,14 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             } else {
                 stage
             };
+            // #3036: the stage crosses into `eval.rs` from this position, so
+            // its `Snapshot` markers are checked against the node the
+            // position holds -- `OwnedIdentity::root_witness` names it only
+            // for the node's own unrebuilt value, and demotes everything
+            // otherwise -- rather than the blanket `Owned` witness the
+            // #2642 review tried and reverted here.
+            let stage_expr = demote_rebuilt_markers(stage_expr, &id.root_witness());
+            let stage_expr: &Expr = &stage_expr;
             let mut downstream: Option<Flow> = None;
             let mut emit = |output: OwnedValue| -> Demand {
                 let flow = match owned_identity_after_stage::<S, V>(
@@ -26224,20 +26297,14 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         | Expr::AlternativeAssign { .. }
                 ) =>
                 {
-                    // #2642 review: NOT demoted here, deliberately -- same
-                    // reasoning as `owned_identity_values`'s own comment:
-                    // `id` can carry a genuine, unrebuilt document node
-                    // (`id.base`) a blanket `Owned` witness can't see. Left
-                    // as a narrower, pre-existing gap -- tracked in the
-                    // #2642 follow-up.
                     match id.path() {
                         Ok(path) => with_path_base(&path, || {
-                            eval_each_owned::<S>(stage_expr, &value, optional, &mut emit)
+                            eval_each_owned_bridged::<S>(stage_expr, &value, optional, &mut emit)
                         }),
                         Err(e) => Flow::Escaped(Control::Error(e)),
                     }
                 }
-                None => eval_each_owned::<S>(stage_expr, &value, optional, &mut emit),
+                None => eval_each_owned_bridged::<S>(stage_expr, &value, optional, &mut emit),
             };
             match downstream {
                 Some(flow) => flow,
@@ -26299,16 +26366,19 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
         return Ok(None);
     };
     let id = OwnedIdentity::kept(cursor);
+    // #3036: `output` is what `stage` built at the cursor's position, not
+    // the cursor's own value -- see `OwnedIdentity::exact`. The rules that
+    // go through `owned_identity_after_stage` below clear it there.
     match rule {
-        OwnedIdentityRule::Keeps => Ok(Some(id)),
+        OwnedIdentityRule::Keeps => Ok(Some(id.rebuilt())),
         // #2471: `key` at the cursor boundary -- the emitted key stands
         // where the node stood, flagged so a second `key` emits nothing.
-        OwnedIdentityRule::KeyNode => Ok(Some(id.with_key_node(true))),
+        OwnedIdentityRule::KeyNode => Ok(Some(id.rebuilt().with_key_node(true))),
         OwnedIdentityRule::Detaches => Ok(Some(OwnedIdentity::detached())),
         OwnedIdentityRule::DetachesContainer => Ok(Some(if cursor.is_container() {
             OwnedIdentity::detached()
         } else {
-            id
+            id.rebuilt()
         })),
         OwnedIdentityRule::LeftOperand
         | OwnedIdentityRule::Extremum
