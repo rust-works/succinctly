@@ -53,14 +53,15 @@ use super::document::{
 use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
-    boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
-    classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
-    collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    demote_rebuilt_markers, each_path_on_owned, each_recurse_walk, enter_def_call_frame,
-    entries_to_object, eval_each_owned, eval_full as full_eval, extract_pattern_bindings,
-    extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
-    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
-    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
+    boolean_fanout_bools, boolean_fanout_each, cache_shared_chain_value, cached_shared_chain_value,
+    cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
+    clear_nonretryable_stop, collapse_vec, collect_pattern_var_names, compare_values,
+    debug_assert_materialization_error, demote_rebuilt_markers, each_path_on_owned,
+    each_recurse_walk, enter_def_call_frame, entries_to_object, eval_each_owned,
+    eval_full as full_eval, extract_pattern_bindings, extract_single_pattern_binding,
+    finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
+    foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
+    index_in_array_bounds, index_one_owned as index_owned_by_key, is_dollar_safe_chain_key,
     is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
     owned_bound_to_i64, owned_to_expr, owned_to_string, pattern_alternatives_var_names,
@@ -614,6 +615,42 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, Eval
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
     // depth-0 entry point only.
     debug_assert_materialization_error(&result);
+    result
+}
+
+/// Generic-evaluator twin of `eval::eval_shared_chain_link` -- see that
+/// function's own doc comment for the full reasoning (#3012). Consulted only
+/// for a [`is_pure_chain_link`] node, so `inner`'s own evaluation is always
+/// single-valued by construction; the `Result` here is purely
+/// [`to_owned`]/[`to_owned_cursor`]'s own nesting-depth guard
+/// (`MAX_NESTING_DEPTH`), not multi-valuedness -- on `Err`, this simply
+/// declines to cache and returns the original result unchanged, same as
+/// today.
+fn eval_shared_chain_link_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Rc<Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let key = Rc::as_ptr(inner) as usize;
+    // #3012: mirrors `eval::eval_shared_chain_link`'s own dollar-only gate
+    // -- a bare-scoped `Rc` must always re-derive fresh.
+    if !is_dollar_safe_chain_key(key) {
+        return eval_single::<S, V>(inner, value, optional, cursor);
+    }
+    if let Some(cached) = cached_shared_chain_value(key) {
+        return GenericResult::Owned(cached);
+    }
+    let result = eval_single::<S, V>(inner, value, optional, cursor);
+    let owned = match &result {
+        GenericResult::One(v) => to_owned(v).ok(),
+        GenericResult::OneCursor(c) => to_owned_cursor(c).ok(),
+        GenericResult::Owned(v) => Some(v.clone()),
+        _ => None,
+    };
+    if let Some(owned) = owned {
+        cache_shared_chain_value(key, owned);
+    }
     result
 }
 
@@ -8660,7 +8697,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Shared(inner) => {
             if is_pure_chain_link(inner) {
-                drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
+                // #3012: memoized for the rest of the live call lineage --
+                // see `eval_shared_chain_link_generic`'s own doc comment.
+                drain_result_generic(
+                    eval_shared_chain_link_generic::<S, V>(inner, value, optional, cursor),
+                    sink,
+                )
             } else {
                 eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
             }

@@ -2895,6 +2895,18 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1371: an argument captured at call time. Transparent to
         // evaluation -- it is the substitution passes, not this one, that
         // must treat it as opaque.
+        //
+        // #3012: a `is_pure_chain_link` node -- the shape a `$`-bound
+        // recursive parameter's dereference chain always has -- goes
+        // through the memoizing wrapper instead of a bare re-evaluation, so
+        // a deep chain (`def d($n): ... d($n - 1) ...`) is `O(1)` to
+        // dereference once its own level has already been touched once,
+        // rather than `O(depth)` every time. Anything else keeps today's
+        // unconditional re-evaluation -- see `eval_shared_chain_link`'s own
+        // doc comment for why that's required, not just simpler.
+        Expr::Shared(inner) if is_pure_chain_link(inner) => {
+            eval_shared_chain_link::<W, S>(inner, value, optional)
+        }
         Expr::Shared(inner) => eval_single::<W, S>(inner, value, optional),
         Expr::NamespacedCall {
             namespace,
@@ -5621,7 +5633,9 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Shared(inner) => {
             if is_pure_chain_link(inner) {
-                drain_result(eval_single::<W, S>(inner, value, optional), sink)
+                // #3012: memoized for the rest of the live call lineage --
+                // see `eval_shared_chain_link`'s own doc comment.
+                drain_result(eval_shared_chain_link::<W, S>(inner, value, optional), sink)
             } else {
                 eval_each::<W, S>(inner, value, optional, sink)
             }
@@ -53085,40 +53099,179 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// applies unconditionally in both configurations.
 #[cfg(feature = "std")]
 mod ambient_frame_depth {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
+
+    use super::OwnedValue;
 
     thread_local! {
         static CURRENT: Cell<u32> = const { Cell::new(0) };
+        // #3012: `Rc::as_ptr(inner) as usize` -> the single `OwnedValue` a
+        // pure `Expr::Shared` chain link (see `is_pure_chain_link`)
+        // evaluated to, so a `$`-bound recursive parameter's dereference
+        // chain doesn't get re-walked from scratch at every recursion
+        // level. Keyed on raw pointer identity of the `Rc` the permanently
+        // memoized `BoundBody` tree owns forever (see `eval_shared_chain_link`'s
+        // own doc comment for why that makes the key ABA-safe), never on
+        // depth or call count.
+        static SHARED_CHAIN_CACHE: RefCell<HashMap<usize, OwnedValue>> =
+            RefCell::new(HashMap::new());
+        // #3012: which `SHARED_CHAIN_CACHE` keys are even *eligible* to be
+        // read or written -- see `mark_dollar_safe`'s own doc comment for
+        // why this exists at all (a `$`-bound reference may be cached; the
+        // *identical* `Rc` reused for a bare reference to the same
+        // parameter name must never be, and nothing else about the node's
+        // shape tells the two apart). Populated once, permanently, by
+        // `bind_def_call_params` when it constructs a `$`-scoped
+        // substitution -- unlike `SHARED_CHAIN_CACHE`/`INSERTED_KEYS`, this
+        // is never purged by a `Guard`: eligibility is a structural fact
+        // about which *namespace* a given `Rc` was built for, fixed
+        // forever the moment that `Rc` is allocated, not a per-invocation
+        // value.
+        static DOLLAR_SAFE_KEYS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+        // One entry per live `Guard`, holding exactly the keys *that*
+        // guard inserted into `SHARED_CHAIN_CACHE` -- so `Guard::drop`
+        // purges only its own frame's entries, never a sibling's or an
+        // ancestor's still-live ones (#3012).
+        static INSERTED_KEYS: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn get() -> u32 {
         CURRENT.with(Cell::get)
     }
 
+    /// Records that `key` (an `Rc<Expr>`'s pointer identity) was built by
+    /// [`super::dollar_safe_shared`] for a `$`-scoped substitution, and is
+    /// therefore safe for [`cache_shared_value`]/[`cached_shared_value`] to
+    /// treat as "evaluated once, reusable for the rest of this call lineage"
+    /// (#3012).
+    ///
+    /// A `$`-bound parameter is evaluated exactly once per invocation in
+    /// real jq (`def f($x): BODY` desugars to `def f(x): x as $x | BODY`,
+    /// and `x as $x` binds once, up front) -- caching is a safe refinement
+    /// of that semantics, not a behavior change. A **bare** reference to
+    /// the same declared name is the opposite: real jq re-evaluates it
+    /// fresh at every reference site, using whatever `.` is ambient *there*
+    /// (confirmed live: `def d(n): if n == 0 then [] else (n | d(n-1)) +
+    /// [n] end; 3 | d(.)` is `[2,3]` in jq 1.7.1 -- caching this shape gives
+    /// `[1,2,3]` instead, a real regression measured while building this
+    /// fix). A `$`-style [`Param`] binds *both* namespaces to the identical
+    /// argument text, and `bind_def_call_params` used to wrap both in the
+    /// same `Rc` -- indistinguishable by pointer identity alone -- so this
+    /// registry only exists because [`dollar_safe_shared`] is now the
+    /// *only* place that produces a marked key: every bare-scoped
+    /// substitution (including a `$`-style parameter's own bare namespace)
+    /// still goes through a plain, unmarked `Expr::Shared(Rc::new(..))` and
+    /// is therefore never looked up here.
+    ///
+    /// Permanent, not `Guard`-scoped: eligibility never changes once an
+    /// `Rc` exists, so there is nothing to purge.
+    pub(crate) fn mark_dollar_safe(key: usize) {
+        DOLLAR_SAFE_KEYS.with(|s| {
+            s.borrow_mut().insert(key);
+        });
+    }
+
+    /// Whether `key` was marked by [`mark_dollar_safe`] (#3012).
+    pub(crate) fn is_dollar_safe(key: usize) -> bool {
+        DOLLAR_SAFE_KEYS.with(|s| s.borrow().contains(&key))
+    }
+
+    /// Looks up a value [`cache_shared_value`] cached earlier in this same
+    /// still-live call lineage. See that function's own doc comment for the
+    /// scoping guarantee (#3012).
+    pub(crate) fn cached_shared_value(key: usize) -> Option<OwnedValue> {
+        SHARED_CHAIN_CACHE.with(|c| c.borrow().get(&key).cloned())
+    }
+
+    /// Caches `value` for `key`, visible to every dereference of the same
+    /// key for the remainder of the *currently innermost live* [`Guard`]'s
+    /// scope (and any guard nested inside it), and automatically purged
+    /// when that guard drops (#3012).
+    ///
+    /// A no-op if no `Guard` is currently live -- a value with no owning
+    /// frame to purge it could otherwise outlive its rightful scope, so it
+    /// is never inserted in the first place. In practice every call site
+    /// this is reached from is already nested inside `enter_def_call_frame`'s
+    /// own guard, so this only matters for future callers.
+    pub(crate) fn cache_shared_value(key: usize, value: OwnedValue) {
+        INSERTED_KEYS.with(|s| {
+            let mut stack = s.borrow_mut();
+            let Some(top) = stack.last_mut() else {
+                return;
+            };
+            top.push(key);
+            SHARED_CHAIN_CACHE.with(|c| {
+                c.borrow_mut().insert(key, value);
+            });
+        });
+    }
+
     /// Raises the ambient depth to at least `frames` for the caller's scope,
     /// restoring the previous value on drop — so a call that has returned
     /// (or a sibling call not nested inside this one) never inherits it.
+    ///
+    /// #3012: also owns this scope's share of [`SHARED_CHAIN_CACHE`] --
+    /// every key inserted via [`cache_shared_value`] while this guard is the
+    /// innermost live one is removed again on drop, so a value computed
+    /// during one dynamic invocation of a `DefCall` node can never be read
+    /// back during a *different* dynamic invocation of the same
+    /// (permanently memoized, per [`super::BoundBody`]) node -- a separate
+    /// document reusing the same compiled query, a sibling backtrack branch
+    /// of the same call site, or any other re-entry all correctly see a
+    /// fresh, empty cache for that node.
     #[must_use]
     pub(crate) struct Guard(u32);
 
     pub(crate) fn enter(frames: u32) -> Guard {
         let previous = get();
         CURRENT.with(|c| c.set(previous.max(frames)));
+        INSERTED_KEYS.with(|s| s.borrow_mut().push(Vec::new()));
         Guard(previous)
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
             CURRENT.with(|c| c.set(self.0));
+            let keys = INSERTED_KEYS
+                .with(|s| s.borrow_mut().pop())
+                .unwrap_or_default();
+            if !keys.is_empty() {
+                SHARED_CHAIN_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    for key in keys {
+                        cache.remove(&key);
+                    }
+                });
+            }
         }
     }
 }
 
 #[cfg(not(feature = "std"))]
 mod ambient_frame_depth {
+    use super::OwnedValue;
+
     pub(crate) fn get() -> u32 {
         0
     }
+
+    /// `no_std` has no `thread_local!`, so the `$`-bound recursive
+    /// parameter cache (#3012) is simply never populated -- every lookup
+    /// misses and every recursive dereference falls back to today's
+    /// (correct, just quadratic) re-walk. Not a regression: `no_std` never
+    /// had this optimization to begin with.
+    pub(crate) fn mark_dollar_safe(_key: usize) {}
+
+    pub(crate) fn is_dollar_safe(_key: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn cached_shared_value(_key: usize) -> Option<OwnedValue> {
+        None
+    }
+
+    pub(crate) fn cache_shared_value(_key: usize, _value: OwnedValue) {}
 
     pub(crate) struct Guard;
 
@@ -53183,6 +53336,54 @@ pub(crate) fn enter_def_call_frame(frames: u32) -> ambient_frame_depth::Guard {
     ambient_frame_depth::enter(frames)
 }
 
+/// Public (crate-visible) face of [`ambient_frame_depth::cached_shared_value`]
+/// -- `ambient_frame_depth` itself is private to this module, so
+/// `eval_generic.rs`'s own `eval_shared_chain_link_generic` reaches the cache
+/// through this and [`cache_shared_chain_value`] instead (#3012).
+pub(crate) fn cached_shared_chain_value(key: usize) -> Option<OwnedValue> {
+    ambient_frame_depth::cached_shared_value(key)
+}
+
+/// Public (crate-visible) face of [`ambient_frame_depth::cache_shared_value`]
+/// -- see [`cached_shared_chain_value`]'s own doc comment (#3012).
+pub(crate) fn cache_shared_chain_value(key: usize, value: OwnedValue) {
+    ambient_frame_depth::cache_shared_value(key, value);
+}
+
+/// Public (crate-visible) face of [`ambient_frame_depth::is_dollar_safe`] --
+/// see [`cached_shared_chain_value`]'s own doc comment for why this indirection
+/// exists, and [`ambient_frame_depth::mark_dollar_safe`]'s for why the check
+/// itself is required (#3012).
+pub(crate) fn is_dollar_safe_chain_key(key: usize) -> bool {
+    ambient_frame_depth::is_dollar_safe(key)
+}
+
+/// Wraps `arg` in an `Expr::Shared`, marking the new `Rc` eligible for
+/// [`eval_shared_chain_link`]'s cache (#3012).
+///
+/// The **only** constructor a `$`-scoped substitution may use -- a
+/// bare-scoped one (including a `$`-style [`Param`]'s own bare namespace)
+/// must keep using a plain `Expr::Shared(Rc::new(..))`, unmarked, so it is
+/// never mistaken for a value safe to reuse across references. See
+/// [`ambient_frame_depth::mark_dollar_safe`]'s own doc comment for why the
+/// two must never share one `Rc`.
+///
+/// [`bind_def_call_params`]'s two combined-walk paths (the common,
+/// no-duplicate-name one and the duplicate-name one) both use this for
+/// their dollar-scoped entries. [`sequential_param_substitution`] -- the
+/// `>32`/`>64`-parameter fallback, unreachable in practice -- deliberately
+/// does **not**: it still wraps a `$`-style parameter's single combined
+/// `ParamSubst` in a plain, unmarked `Expr::Shared`, exactly as every path
+/// here did before #3012. That is a missed optimization for that
+/// vanishingly rare case, not a correctness gap -- an unmarked `Rc` simply
+/// never hits the cache, falling back to the pre-#3012 re-derive-every-time
+/// behavior.
+fn dollar_safe_shared(arg: &Expr) -> Expr {
+    let rc = Rc::new(arg.clone());
+    ambient_frame_depth::mark_dollar_safe(Rc::as_ptr(&rc) as usize);
+    Expr::Shared(rc)
+}
+
 /// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
 /// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
 /// instead of preserving demand-driven laziness (#1371 follow-up).
@@ -53227,6 +53428,59 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
             is_pure_chain_link(left) && is_pure_chain_link(right)
         }
         _ => false,
+    }
+}
+
+/// Evaluates a `Shared` chain link (see [`is_pure_chain_link`]) with the
+/// result memoized for the rest of the live call lineage (#3012).
+///
+/// Every reference to the *same* `$`-bound recursion parameter within one
+/// recursive descent shares the identical `Rc<Expr>` (`bind_def_call_params`
+/// clones the `Rc`, not the value it points to), so keying on `Rc::as_ptr`
+/// and consulting [`ambient_frame_depth::cached_shared_value`] turns the
+/// `O(depth)` re-walk `def d($n): ... d($n - 1) ...` used to pay at every
+/// level into an `O(1)` cache hit once the referenced level has already been
+/// dereferenced once -- which, for this shape, is always before a deeper
+/// level's own chain is even constructed (the deeper level's argument
+/// expression embeds the shallower one, but nothing forces its evaluation
+/// until *that* level's own body runs).
+///
+/// Only a single-valued result (`One`/`OneCursor`/`Owned`) is ever cached;
+/// anything else (`Many`, `ManyOwned`, a `Partial` prefix, `None`, an error,
+/// a break/halt) falls through uncached, exactly as before this existed --
+/// caching is a strict refinement, never a behavior change, for any shape it
+/// doesn't help.
+fn eval_shared_chain_link<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    inner: &Rc<Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let key = Rc::as_ptr(inner) as usize;
+    // #3012: caching is only sound for a `$`-scoped substitution (see
+    // `dollar_safe_shared`'s own doc comment) -- a bare one must always
+    // re-derive fresh, exactly as before this cache existed.
+    if !ambient_frame_depth::is_dollar_safe(key) {
+        return eval_single::<W, S>(inner, value, optional);
+    }
+    if let Some(cached) = ambient_frame_depth::cached_shared_value(key) {
+        return QueryResult::Owned(cached);
+    }
+    let result = eval_single::<W, S>(inner, value, optional);
+    if let Some(owned) = cacheable_owned(&result) {
+        ambient_frame_depth::cache_shared_value(key, owned);
+    }
+    result
+}
+
+/// The owned value to cache for a [`QueryResult`], or `None` for any shape
+/// [`eval_shared_chain_link`] must not memoize (#3012) -- see that
+/// function's own doc comment.
+fn cacheable_owned<W: Clone + AsRef<[u64]>>(result: &QueryResult<'_, W>) -> Option<OwnedValue> {
+    match result {
+        QueryResult::One(v) => Some(to_owned_lossy(v)),
+        QueryResult::OneCursor(c) => Some(to_owned_lossy(&c.value())),
+        QueryResult::Owned(v) => Some(v.clone()),
+        _ => None,
     }
 }
 
@@ -53467,18 +53721,38 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         // Checked before the `collect` (review): past the ceiling the vec
         // would be built -- one `arg.clone()` and `Rc::new` per parameter --
         // only to be thrown away by the fallback.
-        if params.len() > MAX_COMBINED_PARAM_SUBSTS {
-            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 64 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
+        //
+        // #3012: a `$`-style parameter contributes up to *two* entries below
+        // (a bare-scoped one and a separately-`Rc`'d dollar-scoped one -- see
+        // why under `dollar_safe_shared`'s own doc comment), so the ceiling
+        // is checked against that doubled bound, same as the duplicate-name
+        // path below already does.
+        if params.len() * 2 > MAX_COMBINED_PARAM_SUBSTS {
+            return sequential_param_substitution(body, params, args); // omni-dev: coverage tolerate-line reason="unreachable in practice: a def with more than 32 parameters; the fallback exists so ScopeMask's one-bit-per-parameter u64 is a performance ceiling rather than a correctness limit (#2633)"
         }
-        let subs: Vec<ParamSubst<'_>> = params
-            .iter()
-            .zip(args.iter())
-            .map(|(param, arg)| ParamSubst {
+        let mut subs: Vec<ParamSubst<'_>> = vec_with_capacity(params.len());
+        for (param, arg) in params.iter().zip(args.iter()) {
+            // #3012: a bare-scoped substitution must never be cached (a
+            // bare reference is re-evaluated fresh at every reference site
+            // in real jq; a `$`-scoped one is evaluated exactly once) -- so
+            // the two can no longer share one `Rc`, unlike pre-#3012, where
+            // a `$`-style `Param` bound both namespaces off the identical
+            // `Expr::Shared`. `dollar_safe_shared` is the only constructor
+            // that marks its `Rc` eligible for `eval_shared_chain_link`'s
+            // cache, so only the dollar-scoped entry uses it.
+            subs.push(ParamSubst {
                 name: param.name(),
                 arg: Expr::Shared(Rc::new(arg.clone())),
-                scope: SubstScope::for_param(param),
-            })
-            .collect();
+                scope: BARE_NAMESPACE_ONLY,
+            });
+            if param.is_dollar() {
+                subs.push(ParamSubst {
+                    name: param.name(),
+                    arg: dollar_safe_shared(arg),
+                    scope: DOLLAR_NAMESPACE_ONLY,
+                });
+            }
+        }
         if subs.is_empty() {
             return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
         }
@@ -53530,9 +53804,12 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         });
 
         if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
+            // #3012: `dollar_safe_shared`, not a plain `Expr::Shared(Rc::new(..))`
+            // -- this entry only ever feeds the dollar namespace (see
+            // `DOLLAR_NAMESPACE_ONLY` above), so it's always safe to mark.
             subs.push(ParamSubst {
                 name,
-                arg: Expr::Shared(Rc::new(dollar_arg.clone())),
+                arg: dollar_safe_shared(dollar_arg),
                 scope: DOLLAR_NAMESPACE_ONLY,
             });
         }
@@ -55321,6 +55598,95 @@ mod tests {
         assert!(
             !Rc::ptr_eq(&first, &third),
             "a different FuncDefBound must compute its own Rc, not see another node's cache"
+        );
+    }
+
+    /// #3012: a key cached under one `Guard`'s scope must be gone once that
+    /// guard drops, so a sibling call reaching the same (permanently
+    /// memoized, per `BoundBody`) node afterward -- a separate document
+    /// reusing the same compiled query, or a separate backtrack branch of
+    /// the same call site -- never sees a stale value from the branch
+    /// before it.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_shared_chain_cache_purged_when_guard_drops_3012() {
+        let key = 0xdead_beef_usize;
+        {
+            let _guard = enter_def_call_frame(0);
+            ambient_frame_depth::cache_shared_value(key, OwnedValue::Int(1));
+            assert_eq!(
+                ambient_frame_depth::cached_shared_value(key),
+                Some(OwnedValue::Int(1))
+            );
+        }
+        assert_eq!(
+            ambient_frame_depth::cached_shared_value(key),
+            None,
+            "a key must not survive the guard that inserted it dropping"
+        );
+
+        // A second, unrelated guard entered afterward must not inherit
+        // anything the first one left behind -- there is nothing to
+        // inherit, since the drop above already purged it.
+        let _guard = enter_def_call_frame(0);
+        assert_eq!(ambient_frame_depth::cached_shared_value(key), None);
+    }
+
+    /// #3012: a value cached while an *outer* guard is the innermost live
+    /// one must still be visible once a *nested* guard becomes innermost --
+    /// this is exactly what lets a deep recursion's own dereference of an
+    /// ancestor level's already-cached value hit, instead of re-deriving it
+    /// (the whole point of the cache). Only the nested guard's *own*
+    /// insertions are purged when it drops; the outer guard's remain live
+    /// until *it* drops.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_shared_chain_cache_visible_to_nested_guard_3012() {
+        let outer_key = 0x1111_usize;
+        let nested_key = 0x2222_usize;
+        let _outer = enter_def_call_frame(0);
+        ambient_frame_depth::cache_shared_value(outer_key, OwnedValue::Int(7));
+        {
+            let _nested = enter_def_call_frame(1);
+            assert_eq!(
+                ambient_frame_depth::cached_shared_value(outer_key),
+                Some(OwnedValue::Int(7)),
+                "a nested guard must still see an outer guard's still-live cache entry"
+            );
+            ambient_frame_depth::cache_shared_value(nested_key, OwnedValue::Int(8));
+            assert_eq!(
+                ambient_frame_depth::cached_shared_value(nested_key),
+                Some(OwnedValue::Int(8))
+            );
+        }
+        assert_eq!(
+            ambient_frame_depth::cached_shared_value(nested_key),
+            None,
+            "the nested guard's own entry must not survive its own drop"
+        );
+        assert_eq!(
+            ambient_frame_depth::cached_shared_value(outer_key),
+            Some(OwnedValue::Int(7)),
+            "the outer guard's entry must survive the nested guard's drop"
+        );
+    }
+
+    /// #3012: [`dollar_safe_shared`] is the only thing that may mark a key
+    /// eligible for the cache -- an arbitrary key (standing in for a
+    /// bare-scoped substitution's `Rc`, which is never marked) must read as
+    /// ineligible.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_dollar_safe_marking_is_opt_in_3012() {
+        let unmarked = 0x3333_usize;
+        assert!(!ambient_frame_depth::is_dollar_safe(unmarked));
+
+        let marked = 0x4444_usize;
+        ambient_frame_depth::mark_dollar_safe(marked);
+        assert!(ambient_frame_depth::is_dollar_safe(marked));
+        assert!(
+            !ambient_frame_depth::is_dollar_safe(unmarked),
+            "marking one key must not mark another"
         );
     }
 
