@@ -53,6 +53,12 @@ pub struct EvalContext {
 /// parameter alias.
 type FuncDefList = Vec<(String, Vec<Param>, Expr)>;
 
+/// One module's dependency defs, grouped by the module each group came from
+/// (#2951), in declaration order. Each group is wrapped in its own barrier
+/// run so a compile error inside it names the right file and the importing
+/// module's alias cannot reach it.
+type DepRuns = Vec<(u32, FuncDefList)>;
+
 /// The run id reserved for `~/.jq`'s own defs (#2951) -- assigned in
 /// [`ModuleLoader::new`] before any module can claim one.
 const AUTO_LOAD_RUN_ID: u32 = 0;
@@ -258,6 +264,23 @@ fn wrap_run(expr: Expr, defs: FuncDefList, id: u32, alias: Option<&str>) -> Expr
     let marker = |name: String| (name, Vec::new(), Expr::Identity);
     let mut bracketed: FuncDefList = Vec::with_capacity(defs.len() + 2);
     bracketed.push(marker(jq::ModuleRun::begin_marker(id, alias)));
+    bracketed.extend(defs);
+    bracketed.push(marker(jq::ModuleRun::end_marker(id)));
+    wrap_defs(expr, bracketed)
+}
+
+/// [`wrap_defs`], bracketed by a non-flooring barrier run (#2951 review).
+///
+/// Used for the dependency defs spliced into a module's own def bodies. See
+/// [`jq::RunMarker::Barrier`] for what a barrier does and, just as
+/// importantly, what it deliberately does not do.
+fn wrap_barrier_run(expr: Expr, defs: FuncDefList, id: u32) -> Expr {
+    if defs.is_empty() {
+        return expr;
+    }
+    let marker = |name: String| (name, Vec::new(), Expr::Identity);
+    let mut bracketed: FuncDefList = Vec::with_capacity(defs.len() + 2);
+    bracketed.push(marker(jq::ModuleRun::barrier_marker(id)));
     bracketed.extend(defs);
     bracketed.push(marker(jq::ModuleRun::end_marker(id)));
     wrap_defs(expr, bracketed)
@@ -663,8 +686,21 @@ impl ModuleLoader {
         Ok(own
             .into_iter()
             .map(|(name, params, body)| {
-                let visible = visible_deps_for(&deps, &name, &params, &body);
-                let wrapped = wrap_defs(body, visible);
+                // Each origin module's contribution is wrapped in its own
+                // barrier run (#2951 review): a dependency's body belongs to
+                // a different file than the chain around it, so the importing
+                // module's alias must not reach it and a compile error in it
+                // must name its own file. A barrier marks that without
+                // hiding names -- sealing these is #2962's own change.
+                //
+                // Groups keep declaration order, and each is wrapped in turn
+                // so the last-declared ends up innermost, exactly as the flat
+                // `wrap_defs` did before the grouping.
+                let mut wrapped = body;
+                for (origin, group) in deps.iter().rev() {
+                    let visible = visible_deps_for(group, &name, &params, &wrapped);
+                    wrapped = wrap_barrier_run(wrapped, visible, *origin);
+                }
                 (name, params, wrapped)
             })
             .collect())
@@ -686,11 +722,12 @@ impl ModuleLoader {
     /// `hj/0 is not defined` even with `def hj: 1234;` in `~/.jq`). They still
     /// leak in today through the top-level chain -- a separate, pre-existing
     /// gap this fix neither widens nor closes.
-    fn module_dep_defs(&mut self, program: &Program) -> Result<FuncDefList, ModuleLoadError> {
-        let mut defs: FuncDefList = Vec::new();
+    fn module_dep_defs(&mut self, program: &Program) -> Result<DepRuns, ModuleLoadError> {
+        let mut defs: DepRuns = Vec::new();
 
         for include in &program.includes {
-            defs.extend(self.load_module(&include.path)?);
+            let id = self.run_id_for(&include.path);
+            defs.push((id, self.load_module(&include.path)?));
         }
 
         // Namespaced exactly as `process_program` does it, and left as
@@ -724,11 +761,14 @@ impl ModuleLoader {
                 continue;
             }
             let namespace = &import.alias;
-            defs.extend(
+            let id = self.run_id_for(&import.path);
+            defs.push((
+                id,
                 self.load_module(&import.path)?
                     .into_iter()
-                    .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body)),
-            );
+                    .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body))
+                    .collect(),
+            ));
         }
 
         Ok(defs)

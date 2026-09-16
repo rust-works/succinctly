@@ -56772,3 +56772,103 @@ fn test_imported_module_def_can_call_its_sibling_2989() -> Result<()> {
 
     Ok(())
 }
+/// #2951 (review): the `alias::name` retry must not reach a *dependency's*
+/// body.
+///
+/// This is the sharpest regression the module boundary could cause, and it
+/// did cause it before the barrier runs went in. A dependency's defs are
+/// spliced into the importing module's def bodies, so without a marker the
+/// innermost open run there is the *import's* -- and a bare call in the
+/// dependency was retried under an alias it has no right to, resolving to a
+/// def it cannot legally see.
+///
+/// `A.jq` includes `B.jq` and also defines `g`. `B.jq`'s `b1` calls bare `g`,
+/// which is undefined *for B*. jq reports `g/0 is not defined at .../B.jq`;
+/// so did succinctly before the boundary existed. The retry briefly made it
+/// answer `1` instead -- a correct error turned into a wrong answer, the one
+/// direction the boundary's soundness argument says cannot happen.
+#[test]
+fn test_import_alias_does_not_reach_a_dependency_body_2951() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("A.jq"),
+        "include \"B\";\ndef g: 1;\ndef f: b1;\n",
+    )?;
+    std::fs::write(dir.path().join("B.jq"), "def b1: g;\n")?;
+    let lib = dir.path().to_string_lossy().to_string();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "-L", &lib, r#"import "A" as ns; ns::f"#], None)?;
+    assert_eq!(
+        code, 3,
+        "B's bare `g` must not be retried as `ns::g` -- stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert_eq!(stdout, "", "briefly answered 1");
+    assert!(stderr.contains("g/0 is not defined"), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("B.jq"),
+        "attributed to the file that wrote the call, as jq does: {stderr:?}"
+    );
+
+    // The same shape under `include` has no alias in play, and is *not*
+    // fixed here -- it answers 1, as it did before this change. That is the
+    // #2962 family: a barrier marks authorship but deliberately does not
+    // hide names, so `B`'s body can still see `A`'s `g` through it. jq
+    // reports `g/0 is not defined` for this too.
+    //
+    // Pinned as the divergence it is, with both halves in one test on
+    // purpose: the pair is what shows the barrier fixed the alias leak
+    // *without* quietly moving #2962's rows. Whoever closes #2962 by
+    // upgrading the barrier to a flooring run updates this half to match the
+    // `import` half above.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", &lib, r#"include "A"; f"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "1",
+        "#2962 is fixed -- this should now be `g/0 is not defined`, like the \
+         `import` form above; update this assertion"
+    );
+
+    Ok(())
+}
+
+/// #2951 (review): a compile error names the file that *wrote* the call, not
+/// whichever module happens to enclose it in the chain.
+///
+/// The `origin` field exists to stop the reporter guessing a position from
+/// the main filter's text. Pointing it at the enclosing module would be
+/// worse than the `<top-level>` it replaced: a confident citation of a file
+/// that does not contain the failing call.
+///
+/// `outer.jq` includes `dep.jq`; the undefined name is written in `dep.jq`.
+/// jq names `dep.jq`.
+#[test]
+fn test_module_error_names_the_file_that_wrote_the_call_2951() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(dir.path().join("dep.jq"), "def uu1: nosuchname;\n")?;
+    std::fs::write(
+        dir.path().join("outer.jq"),
+        "include \"dep\";\ndef q: uu1;\n",
+    )?;
+    let lib = dir.path().to_string_lossy().to_string();
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", &lib, r#"include "outer"; q"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuchname/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+
+    let dep = std::fs::canonicalize(dir.path().join("dep.jq"))?;
+    assert!(
+        stderr.contains(&format!("{}", dep.display())),
+        "should name dep.jq, where the call is written: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("outer.jq"),
+        "must not name the merely-enclosing module: {stderr:?}"
+    );
+
+    Ok(())
+}
