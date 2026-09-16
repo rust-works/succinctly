@@ -2054,6 +2054,44 @@ fn report_unresolved_call(
     }
 }
 
+/// Report one unbound `$name` against `source` (the main filter, or a
+/// module's own text), placing it at its `taken`-th recorded site when there
+/// is one and falling back to a text search from `resume_from` otherwise --
+/// [`report_unresolved_call`]'s twin for variables.
+fn report_unbound_var(
+    name: &str,
+    location: &str,
+    source: &str,
+    var_sites: &[jq::VarSite],
+    taken: &mut usize,
+    resume_from: &mut usize,
+) {
+    let from_table = var_sites
+        .iter()
+        .filter(|v| v.name == name)
+        .nth(*taken)
+        .map(|v| v.offset);
+    if let Some(offset) = from_table {
+        *taken += 1;
+        *resume_from = offset + name.len() + 1;
+        let (line_no, line_text, column) = line_at_offset(source, offset);
+        eprintln!("jq: error: ${name} is not defined at {location}, line {line_no}:");
+        eprintln!("{line_text}{}", " ".repeat(column));
+        return;
+    }
+
+    match locate_identifier_from(source, &format!("${name}"), *resume_from) {
+        Some((line_no, line_text, column, end)) => {
+            *resume_from = end;
+            eprintln!("jq: error: ${name} is not defined at {location}, line {line_no}:");
+            eprintln!("{line_text}{}", " ".repeat(column));
+        }
+        None => {
+            eprintln!("jq: error: ${name} is not defined at {location}");
+        }
+    }
+}
+
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
@@ -2081,6 +2119,11 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // text-search fallback -- see the `origin` branch's own doc comment for
     // why a module needs one too.
     let mut module_call_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
+    // The variable counterparts of the three module maps above (#2962).
+    let mut module_var_diagnostics: HashMap<u32, Option<(String, Vec<jq::VarSite>)>> =
+        HashMap::new();
+    let mut module_vars_consumed: HashMap<(u32, &str), usize> = HashMap::new();
+    let mut module_var_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
 
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
@@ -2168,8 +2211,37 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     resume,
                 );
             }
-            jq::ResolveError::Var(jq::UnboundVar { name }) => {
-                let taken = vars_consumed.entry(name.as_str()).or_insert(0);
+            jq::ResolveError::Var(jq::UnboundVar { name, origin }) => {
+                // #2962: a module body's unbound variable is reported against
+                // that module's own file, as jq does -- the same route the
+                // `Call` arm's `origin` branch takes, with the module's own
+                // variable sites.
+                if let Some(id) = origin {
+                    let at = loader
+                        .run_origin(*id)
+                        .map_or_else(|| "<module>".to_string(), ToString::to_string);
+                    let cached = module_var_diagnostics.entry(*id).or_insert_with(|| {
+                        std::fs::read_to_string(&at).ok().map(|source| {
+                            let sites = jq::collect_var_sites(&source, jq::ParserMode::Jq, true);
+                            (source, sites)
+                        })
+                    });
+                    match cached {
+                        Some((source, var_sites)) => {
+                            let taken = module_vars_consumed
+                                .entry((*id, name.as_str()))
+                                .or_insert(0);
+                            let resume = module_var_resume_from
+                                .entry((*id, name.as_str()))
+                                .or_insert(0);
+                            report_unbound_var(name, &at, source, var_sites, taken, resume);
+                        }
+                        None => {
+                            eprintln!("jq: error: ${name} is not defined at {at}");
+                        }
+                    }
+                    continue;
+                }
                 // #2734: prefer the real reference position from `var_sites`
                 // over the text-search fallback -- a blind search for
                 // `${name}` can land inside a string literal, or on an
@@ -2179,49 +2251,19 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // ambiguity this still can't resolve (two same-named
                 // references differing only by lexical scope), the same
                 // known limitation `jq::CallSite` has for calls (#2635).
-                let from_table = var_sites
-                    .iter()
-                    .filter(|v| v.name == *name)
-                    .nth(*taken)
-                    .map(|v| v.offset);
-                if let Some(offset) = from_table {
-                    *taken += 1;
-                    var_resume_from.insert(name.as_str(), offset + name.len() + 1);
-                    let (line_no, line_text, column) = line_at_offset(filter, offset);
-                    eprintln!("jq: error: ${name} is not defined at <top-level>, line {line_no}:");
-                    eprintln!("{line_text}{}", " ".repeat(column));
-                    continue;
-                }
-
-                // Fallback, for the same reason `call_sites` needs one: a
-                // variable reference inlined from an `include`d module or
-                // `~/.jq` has no occurrence in `filter`'s own text at all --
-                // exercised by this arm's `None` branch below (test:
-                // `test_unbound_variable_from_included_module_omits_the_location_2734`).
-                // The `Some` branch, kept for structural symmetry with the
-                // `Call` arm above, is not known to have a live repro for
-                // variables specifically: `call_sites` can under-record
-                // relative to a blind text search because calls carry
-                // retry/shadow/builtin-fallback machinery a second,
-                // simpler re-parse can diverge on (`Parser::shadow_retry_budget`,
-                // `builtin_fallback`) -- a `$name` token has no equivalent
-                // mechanism, so nothing here is known to make `var_sites`
-                // miss an entry `locate_identifier_from` would still find.
-                let needle = format!("${name}");
-                let start_from = var_resume_from.get(name.as_str()).copied().unwrap_or(0);
-
-                match locate_identifier_from(filter, &needle, start_from) {
-                    Some((line_no, line_text, column, end)) => {
-                        var_resume_from.insert(name.as_str(), end);
-                        eprintln!(
-                            "jq: error: ${name} is not defined at <top-level>, line {line_no}:"
-                        );
-                        eprintln!("{line_text}{}", " ".repeat(column));
-                    }
-                    None => {
-                        eprintln!("jq: error: ${name} is not defined at <top-level>");
-                    }
-                }
+                //
+                // The fallback, for the same reason `call_sites` needs one:
+                // a variable reference inlined from `~/.jq` has no
+                // occurrence in `filter`'s own text at all. `var_sites` is
+                // not known to under-record relative to a blind text search
+                // for variables specifically: calls carry retry/shadow/
+                // builtin-fallback machinery a second, simpler re-parse can
+                // diverge on (`Parser::shadow_retry_budget`,
+                // `builtin_fallback`), while a `$name` token has no
+                // equivalent mechanism.
+                let taken = vars_consumed.entry(name.as_str()).or_insert(0);
+                let resume = var_resume_from.entry(name.as_str()).or_insert(0);
+                report_unbound_var(name, "<top-level>", filter, &var_sites, taken, resume);
             }
         }
     }
