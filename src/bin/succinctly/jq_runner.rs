@@ -3297,7 +3297,7 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 
     // Build named object from context.named
     let named_obj: IndexMap<String, OwnedValue> = context.named.clone();
-    args_obj.insert("named".to_string(), OwnedValue::Object(named_obj));
+    args_obj.insert("named".to_string(), OwnedValue::Object(named_obj.into()));
 
     // Build positional array from context.positional
     args_obj.insert(
@@ -3305,7 +3305,7 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
         OwnedValue::Array(context.positional.clone()),
     );
 
-    OwnedValue::Object(args_obj)
+    OwnedValue::Object(args_obj.into())
 }
 
 /// Get the filter expression from arguments.

@@ -123,7 +123,7 @@ pub use resolve::{
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
-    jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr, OwnedValue,
+    jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr, ObjectMap, OwnedValue,
     MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191

@@ -48,7 +48,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
                 let value = yaml_to_owned_value(field.value());
                 map.insert(key, value);
             }
-            OwnedValue::Object(map)
+            OwnedValue::Object(map.into())
         }
         YamlValue::Sequence(elements) => {
             let mut arr = Vec::new();

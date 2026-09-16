@@ -1357,7 +1357,7 @@ mod tests {
         let mut obj = IndexMap::new();
         obj.insert("z".to_string(), OwnedValue::Int(1));
         obj.insert("a".to_string(), OwnedValue::Int(2));
-        let value = OwnedValue::Object(obj);
+        let value = OwnedValue::Object(obj.into());
 
         let opts = JsonFormatOpts {
             indent: "",
@@ -1536,7 +1536,7 @@ mod tests {
             json_sourced: false,
         };
         assert_eq!(
-            format_json(&OwnedValue::Object(obj), &opts),
+            format_json(&OwnedValue::Object(obj.into()), &opts),
             r#"{"k\u00e9":"a\u0008\u0085\u00e9"}"#
         );
     }
@@ -1705,7 +1705,7 @@ mod tests {
         };
         assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
         assert_eq!(
-            format_json(&OwnedValue::Object(IndexMap::new()), &pretty),
+            format_json(&OwnedValue::Object(IndexMap::new().into()), &pretty),
             "{}"
         );
     }
@@ -1717,7 +1717,7 @@ mod tests {
             "é".to_string(),
             OwnedValue::Array(vec![OwnedValue::String("ü".to_string())]),
         );
-        let value = OwnedValue::Object(obj);
+        let value = OwnedValue::Object(obj.into());
         let opts = JsonFormatOpts {
             indent: "  ",
             sort_keys: false,

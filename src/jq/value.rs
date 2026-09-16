@@ -17,6 +17,8 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
+use core::ops::{Deref, DerefMut};
+
 use indexmap::IndexMap;
 
 use super::error::EvalError;
@@ -1735,6 +1737,170 @@ fn try_positive_shifted_plain(
     format_positive_shifted_plain(sign, &full_mantissa_str, shifted_exp, digit_count)
 }
 
+/// The backing store for [`OwnedValue::Object`]: an
+/// `IndexMap<String, OwnedValue>` held behind a single pointer (#3000).
+///
+/// `IndexMap` is 72 bytes inline, which made `Object` the widest
+/// [`OwnedValue`] arm and forced *every* value — every array element, every
+/// map entry, every bare `Null` — to be 72 bytes wide. With the map boxed
+/// here, `NumberLiteral(NumberRepr, Box<str>)` becomes the widest arm at
+/// exactly 32 bytes and the discriminant packs into `NumberRepr`'s own
+/// niche, so `size_of::<OwnedValue>()` is 32: a 55% cut on every element of
+/// every `Vec<OwnedValue>`, on every route, eager and streaming alike. The
+/// cost is one extra allocation and one extra pointer chase per object.
+///
+/// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
+/// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,
+/// shared and mutable forms, and [`From`]/[`FromIterator`] build one from
+/// anything an `IndexMap` can be built from — so `OwnedValue::Object(map)`
+/// patterns keep reading and writing the map exactly as before. Only
+/// *construction* from a bare `IndexMap` needs a `.into()`.
+///
+/// Note for downstream users: this is a **breaking change** to the shape of
+/// the `OwnedValue::Object` variant. Construct with
+/// [`OwnedValue::object_from`] (or `IndexMap::….into()`) and read through
+/// [`OwnedValue::as_object`]/[`OwnedValue::as_object_mut`], whose signatures
+/// are unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObjectMap(ObjectMapInner);
+
+/// [`ObjectMap`]'s inner representation, boxed in the shipped build.
+///
+/// The `unboxed-object-map` feature swaps it back to a plain inline
+/// `IndexMap` so a *functionally pre-#3000* binary can be built from this
+/// branch's own source shape. That binary is the layout-bias holdout the
+/// A/B in #3000 subtracts (see `docs/guides/benchmarking.md`); it is a
+/// measurement tool only and must never be enabled in a shipped build.
+#[cfg(not(feature = "unboxed-object-map"))]
+type ObjectMapInner = Box<IndexMap<String, OwnedValue>>;
+
+/// See [`ObjectMapInner`]'s boxed twin — measurement-only holdout shape.
+#[cfg(feature = "unboxed-object-map")]
+type ObjectMapInner = IndexMap<String, OwnedValue>;
+
+/// Wrap an owned `IndexMap` in whichever [`ObjectMapInner`] is in effect.
+#[cfg(not(feature = "unboxed-object-map"))]
+#[inline]
+fn object_map_wrap(map: IndexMap<String, OwnedValue>) -> ObjectMapInner {
+    Box::new(map)
+}
+
+/// See [`object_map_wrap`]'s boxed twin.
+#[cfg(feature = "unboxed-object-map")]
+#[inline]
+fn object_map_wrap(map: IndexMap<String, OwnedValue>) -> ObjectMapInner {
+    map
+}
+
+/// Unwrap whichever [`ObjectMapInner`] is in effect back to an owned
+/// `IndexMap`.
+#[cfg(not(feature = "unboxed-object-map"))]
+#[inline]
+fn object_map_unwrap(inner: ObjectMapInner) -> IndexMap<String, OwnedValue> {
+    *inner
+}
+
+/// See [`object_map_unwrap`]'s boxed twin.
+#[cfg(feature = "unboxed-object-map")]
+#[inline]
+fn object_map_unwrap(inner: ObjectMapInner) -> IndexMap<String, OwnedValue> {
+    inner
+}
+
+impl ObjectMap {
+    /// An empty object map.
+    #[inline]
+    pub fn new() -> Self {
+        Self::from(IndexMap::new())
+    }
+
+    /// An empty object map with room for `capacity` entries.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::from(IndexMap::with_capacity(capacity))
+    }
+
+    /// Consume this map, yielding the `IndexMap` it wraps.
+    #[inline]
+    pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
+        object_map_unwrap(self.0)
+    }
+}
+
+impl Deref for ObjectMap {
+    type Target = IndexMap<String, OwnedValue>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ObjectMap {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<IndexMap<String, OwnedValue>> for ObjectMap {
+    #[inline]
+    fn from(map: IndexMap<String, OwnedValue>) -> Self {
+        Self(object_map_wrap(map))
+    }
+}
+
+impl From<ObjectMap> for IndexMap<String, OwnedValue> {
+    #[inline]
+    fn from(map: ObjectMap) -> Self {
+        map.into_index_map()
+    }
+}
+
+impl FromIterator<(String, OwnedValue)> for ObjectMap {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = (String, OwnedValue)>>(iter: I) -> Self {
+        Self::from(IndexMap::from_iter(iter))
+    }
+}
+
+impl Extend<(String, OwnedValue)> for ObjectMap {
+    #[inline]
+    fn extend<I: IntoIterator<Item = (String, OwnedValue)>>(&mut self, iter: I) {
+        self.0.extend(iter);
+    }
+}
+
+impl IntoIterator for ObjectMap {
+    type Item = (String, OwnedValue);
+    type IntoIter = indexmap::map::IntoIter<String, OwnedValue>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_index_map().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ObjectMap {
+    type Item = (&'a String, &'a OwnedValue);
+    type IntoIter = indexmap::map::Iter<'a, String, OwnedValue>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut ObjectMap {
+    type Item = (&'a String, &'a mut OwnedValue);
+    type IntoIter = indexmap::map::IterMut<'a, String, OwnedValue>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
 /// An owned JSON value.
 ///
 /// This is used for values that are constructed during evaluation
@@ -1772,8 +1938,9 @@ pub enum OwnedValue {
     String(String),
     /// JSON array
     Array(Vec<Self>),
-    /// JSON object (IndexMap preserves insertion order like jq)
-    Object(IndexMap<String, Self>),
+    /// JSON object (insertion order preserved like jq; the map is held
+    /// behind one pointer -- see [`ObjectMap`] for why)
+    Object(ObjectMap),
 }
 
 impl OwnedValue {
@@ -2104,7 +2271,7 @@ impl OwnedValue {
 
     /// Create an empty object.
     pub fn object() -> Self {
-        Self::Object(IndexMap::new())
+        Self::Object(IndexMap::new().into())
     }
 
     /// Create an object from key-value pairs.
@@ -3330,6 +3497,115 @@ impl<T: Into<Self>> From<Vec<T>> for OwnedValue {
 mod tests {
     use super::*;
 
+    /// #3000: the whole point of [`ObjectMap`] is that `OwnedValue` stops
+    /// paying `IndexMap`'s 72 inline bytes on *every* value. Pinned so a
+    /// future variant that reintroduces a wide payload can't silently undo
+    /// it -- every `Vec<OwnedValue>` element, every map entry and every
+    /// bare `Null` costs this.
+    ///
+    /// 32 is `NumberLiteral(NumberRepr, Box<str>)` -- 16 + 16 -- with the
+    /// discriminant packed into `NumberRepr`'s own niche; boxing the object
+    /// map is what demotes `Object` from widest arm to 8 bytes. The
+    /// `unboxed-object-map` holdout deliberately restores the 72-byte
+    /// layout, so this assertion only holds for the shipped shape. Same
+    /// 64-bit gate as the crate's other exact-size pins (`EvalError`,
+    /// `Expr`): 32-bit targets shrink the pointer-sized fields.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[cfg(not(feature = "unboxed-object-map"))]
+    fn owned_value_is_32_bytes_because_its_object_map_is_boxed_3000() {
+        assert_eq!(
+            core::mem::size_of::<OwnedValue>(),
+            32,
+            "size_of::<OwnedValue>() moved -- every array element, object entry and \
+             scalar pays this. See #3000 before re-pinning."
+        );
+        assert_eq!(
+            core::mem::size_of::<ObjectMap>(),
+            core::mem::size_of::<usize>(),
+            "ObjectMap must stay one pointer wide -- that is what keeps Object from \
+             being OwnedValue's widest arm again"
+        );
+    }
+
+    /// The holdout build's own pin: `unboxed-object-map` must actually
+    /// restore the pre-#3000 layout, or the A/B it exists for is measuring
+    /// two boxed binaries against each other and reporting the difference as
+    /// code-layout bias.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[cfg(feature = "unboxed-object-map")]
+    fn unboxed_object_map_holdout_restores_the_pre_3000_layout_3000() {
+        assert_eq!(core::mem::size_of::<OwnedValue>(), 72);
+        assert_eq!(
+            core::mem::size_of::<ObjectMap>(),
+            core::mem::size_of::<IndexMap<String, OwnedValue>>()
+        );
+    }
+
+    /// [`ObjectMap`] exists to be invisible: every way the 500-odd
+    /// `OwnedValue::Object(..)` sites read or build the map has to keep
+    /// working through the wrapper. One test per conversion/iteration impl,
+    /// since each is the only thing standing between a call site and a
+    /// compile error.
+    #[test]
+    fn object_map_is_transparent_to_its_callers_3000() {
+        // From<IndexMap> / Deref (read side).
+        let map = ObjectMap::from(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("a"), Some(&OwnedValue::Int(1)));
+
+        // DerefMut (write side) and Extend.
+        let mut map = map;
+        map.insert("c".to_string(), OwnedValue::Int(3));
+        map.extend([("d".to_string(), OwnedValue::Int(4))]);
+        assert_eq!(map.len(), 4);
+        if let Some(v) = map.get_mut("a") {
+            *v = OwnedValue::Int(10);
+        }
+
+        // IntoIterator for &ObjectMap and &mut ObjectMap.
+        let keys: Vec<&str> = (&map).into_iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "c", "d"]);
+        for (_, v) in &mut map {
+            *v = OwnedValue::Int(0);
+        }
+
+        // IntoIterator for ObjectMap (owned) and FromIterator.
+        let rebuilt: ObjectMap = map.clone().into_iter().collect();
+        assert_eq!(rebuilt, map);
+
+        // Round-trip back out to a bare IndexMap, both spellings.
+        let plain: IndexMap<String, OwnedValue> = rebuilt.clone().into();
+        assert_eq!(plain.len(), 4);
+        assert_eq!(rebuilt.into_index_map(), plain);
+
+        // Constructors.
+        assert!(ObjectMap::new().is_empty());
+        assert!(ObjectMap::default().is_empty());
+        let sized = ObjectMap::with_capacity(8);
+        assert!(sized.is_empty());
+        assert!(sized.capacity() >= 8);
+    }
+
+    /// `as_object`/`as_object_mut` keep returning a bare `&IndexMap`
+    /// (#3000's public-API promise): the boxing is not supposed to show up
+    /// in either signature, only in the variant's own payload.
+    #[test]
+    fn as_object_accessors_still_hand_out_a_bare_index_map_3000() {
+        let mut value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let read: &IndexMap<String, OwnedValue> = value.as_object().unwrap();
+        assert_eq!(read.len(), 1);
+        let write: &mut IndexMap<String, OwnedValue> = value.as_object_mut().unwrap();
+        write.insert("b".to_string(), OwnedValue::Int(2));
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert!(OwnedValue::Int(1).as_object().is_none());
+        assert!(OwnedValue::Int(1).as_object_mut().is_none());
+    }
+
     /// #1171: a leading-dot number literal (with or without a `-` sign)
     /// must preserve its own source spelling as a `NumberLiteral`, not
     /// degrade to a plain lossy `Float` -- direct unit coverage of both
@@ -3444,7 +3720,10 @@ mod tests {
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
         assert_eq!(OwnedValue::String(String::new()).type_name(), "string");
         assert_eq!(OwnedValue::Array(vec![]).type_name(), "array");
-        assert_eq!(OwnedValue::Object(IndexMap::new()).type_name(), "object");
+        assert_eq!(
+            OwnedValue::Object(IndexMap::new().into()).type_name(),
+            "object"
+        );
     }
 
     #[test]
@@ -3506,7 +3785,10 @@ mod tests {
         // Object keys take the same treatment as values.
         let mut obj = IndexMap::new();
         obj.insert("k\u{85}\u{8}".to_string(), OwnedValue::Int(1));
-        assert_eq!(OwnedValue::Object(obj).to_json(), "{\"k\u{85}\\b\":1}");
+        assert_eq!(
+            OwnedValue::Object(obj.into()).to_json(),
+            "{\"k\u{85}\\b\":1}"
+        );
     }
 
     /// Whatever `to_json` emits has to parse back to the value it came from —
@@ -3562,7 +3844,10 @@ mod tests {
             OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
-        assert_eq!(OwnedValue::object(), OwnedValue::Object(IndexMap::new()));
+        assert_eq!(
+            OwnedValue::object(),
+            OwnedValue::Object(IndexMap::new().into())
+        );
         let obj = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         assert_eq!(obj.as_object().unwrap().get("a"), Some(&OwnedValue::Int(1)));
     }
@@ -3633,7 +3918,7 @@ mod tests {
     fn test_as_object_and_mut() {
         let mut map = IndexMap::new();
         map.insert("a".to_string(), OwnedValue::Int(1));
-        let mut v = OwnedValue::Object(map);
+        let mut v = OwnedValue::Object(map.into());
         assert_eq!(v.as_object().unwrap().len(), 1);
         v.as_object_mut()
             .unwrap()
@@ -3744,7 +4029,7 @@ mod tests {
         assert_ne!(OwnedValue::Float(0.0), OwnedValue::Null);
         assert_ne!(
             OwnedValue::Array(vec![]),
-            OwnedValue::Object(IndexMap::new())
+            OwnedValue::Object(IndexMap::new().into())
         );
     }
 
@@ -5941,7 +6226,7 @@ mod tests {
             OwnedValue::String(String::new()),
             OwnedValue::String("s".into()),
             OwnedValue::Array(Vec::new()),
-            OwnedValue::Object(indexmap::IndexMap::new()),
+            OwnedValue::Object(indexmap::IndexMap::new().into()),
         ] {
             assert!(v.identical(&v), "not reflexive: {v:?}");
         }
