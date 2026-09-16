@@ -25154,18 +25154,22 @@ fn test_module_search_path_falls_through_to_a_later_dir_2395() -> Result<()> {
 }
 
 /// #2395: a module whose own text does not parse is a compile error, exit 3 --
-/// not a panic, and not a silently ignored module. jq 1.7.1 also exits 3 here
-/// (its wording names the file by *absolute* resolved path and reports a
-/// line + echoed source, where succinctly reports the module path as given
-/// on the command line and a byte position -- unlike the sibling
-/// `module not found` wording gap, #2703 does not close this one: jq's own
-/// source-echo padding for a syntax error is not a fixed formula -- see
-/// #2703's own follow-up note -- so it stays a documented, unfixed
-/// divergence for now).
+/// not a panic, and not a silently ignored module.
+///
+/// #2703 closed the shape half of this path: jq 1.7.1 names the module by
+/// its resolved *absolute* path (`/var/folders/…`, not the `-L` path as
+/// given), reports `at … , line N:` with the module's own echoed source
+/// line, leaves a blank line, and closes with `jq: 1 compile error` -- all
+/// reproduced here. The message *wording* (`unexpected character ';',
+/// expected expression`) is still succinctly's own: jq's `syntax error,
+/// unexpected ';' (Unix shell quoting issues?)` phrasing is a function of
+/// its bison parse state, and jq's source-echo padding is not a fixed
+/// formula (see `docs/compliance/jq/limitations.md` #2703).
 #[test]
 fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(temp_dir.path().join("bad.jq"), "def broken: ( ;\n")?;
+    let canonical = std::fs::canonicalize(temp_dir.path())?;
     let (output, code) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
@@ -25180,8 +25184,27 @@ fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("module error") && stderr.contains("parse error in module"),
-        "stderr: {stderr:?}"
+        stderr.contains("jq: error:") && stderr.contains("line 1:"),
+        "the jq line-header is missing: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "at {}, line 1:",
+            canonical.join("bad.jq").display()
+        )),
+        "the module is not named by its resolved absolute path: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("\ndef broken: ( ;"),
+        "the module's echoed source line is missing: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("\n\njq: 1 compile error"),
+        "the blank line + trailer are missing: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("jq: module error") && !stderr.contains("parse error in module"),
+        "the pre-#2703 flat shape is back: {stderr:?}"
     );
     Ok(())
 }
@@ -43310,14 +43333,35 @@ fn test_resolution_pass_accepts_every_legal_scope_shape_1473() -> Result<()> {
 
 /// A plain syntax error is jq's compile error too: exit 3, and no second,
 /// stray `Error: compile error` line from `anyhow`'s own reporting (#1473).
+///
+/// The report is jq's shape too, since #2703: `jq: error: … at
+/// <top-level>, line N:`, the echoed source line, and the `jq: 1 compile
+/// error` trailer -- not the flat `jq: compile error: parse error at
+/// position N: …` of before. The *wording* (here `unexpected end of
+/// input`) is succinctly's own; jq says `syntax error, unexpected end of
+/// file (Unix shell quoting issues?)` -- sometimes with an appended
+/// expect-list -- which is per-parse-state phrasing (see
+/// `docs/compliance/jq/limitations.md` #2703).
 #[test]
 fn test_syntax_error_exits_with_the_compile_error_code_1473() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "1 +"], Some("null"))?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(stderr.contains("compile error"), "stderr: {stderr:?}");
     assert!(
+        stderr.contains("unexpected end of input at <top-level>, line 1:"),
+        "the jq line-header is missing: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("\n1 +   \njq: 1 compile error"),
+        "the echoed line + trailer are missing: {stderr:?}"
+    );
+    assert!(
         !stderr.contains("Error: compile error"),
         "the stray anyhow line is back: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("parse error at position"),
+        "the pre-#2703 flat shape is back: {stderr:?}"
     );
     Ok(())
 }
