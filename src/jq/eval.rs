@@ -23329,6 +23329,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             &input,
             terminal,
             optional,
+            RetryResumes::Yes,
             &mut |result, path| {
                 // `false, false` for the two yq no-op flags, as the eager route's
                 // own `yq_noop` computes to in jq mode.
@@ -23577,8 +23578,12 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Vec::new()
         };
         let pristine = result.clone();
-        let outcome =
-            stream_path_writes::<S>(path_expr, &pristine, &mut result, &mut |result, path| {
+        let outcome = stream_path_writes::<S>(
+            path_expr,
+            &pristine,
+            &mut result,
+            RetryResumes::No,
+            &mut |result, path| {
                 let pos = positioned.then(|| UpdatePos {
                     path: base.clone(),
                     base_len: base.len(),
@@ -23588,7 +23593,8 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // mode.
                 update_path::<S>(result, path, filter_expr, false, false, pos.as_ref())
                     .map(|_wrote| ())
-            });
+            },
+        );
         return match outcome {
             StreamedWrites::Done => QueryResult::Owned(result),
             StreamedWrites::ResolutionFailed(escape) | StreamedWrites::WriteFailed(escape) => {
@@ -24357,6 +24363,7 @@ fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &StandardJson<'a, W>,
     terminal: Option<Control>,
     optional: bool,
+    retry_resumes: RetryResumes,
     write: &mut dyn FnMut(&mut OwnedValue, &Expr) -> Result<(), EvalEscape>,
 ) -> QueryResult<'a, W> {
     // #1953: a non-decode-failure `to_owned` error respects `optional` like
@@ -24368,7 +24375,7 @@ fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let mut result = pristine.clone();
 
-    match stream_path_writes::<S>(path_expr, &pristine, &mut result, write) {
+    match stream_path_writes::<S>(path_expr, &pristine, &mut result, retry_resumes, write) {
         // A resolution escape discards everything, writes included -- the
         // eager arm's `Err((_, escape))` did the same with its
         // already-resolved prefix, and jq's `reduce` likewise discards its
@@ -24400,6 +24407,26 @@ fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
+}
+
+/// Whether a `?//` retry inside the path clears a write escape an earlier
+/// alternative parked (#2974 review).
+///
+/// jq differs by operator, and each answer is captured from jq 1.7.1:
+///
+/// - **`=`** (`_assign`): the `reduce` carries on with the retried
+///   alternative's paths, so a retry that writes successfully succeeds --
+///   `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is
+///   `[1]`. [`RetryResumes::Yes`].
+/// - **`|=` and `op=`/`//=`** (`_modify`): any retry corrupts jq's accumulator,
+///   and the call fails with `Paths must be specified as an array` whatever
+///   the retry does. Keeping the earlier escape keeps the exit code jq has
+///   (a different message; recorded in `limitations.md`), where clearing it
+///   would succeed where jq fails. [`RetryResumes::No`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryResumes {
+    Yes,
+    No,
 }
 
 /// How [`stream_path_writes`] ended.
@@ -24444,6 +24471,7 @@ fn stream_path_writes<S: EvalSemantics>(
     path_expr: &Expr,
     pristine: &OwnedValue,
     result: &mut OwnedValue,
+    retry_resumes: RetryResumes,
     write: &mut dyn FnMut(&mut OwnedValue, &Expr) -> Result<(), EvalEscape>,
 ) -> StreamedWrites {
     // `alias_identity::redirect_paths`/`mirror_after_write`, which the eager
@@ -24456,13 +24484,17 @@ fn stream_path_writes<S: EvalSemantics>(
         "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
     );
     let mut parked: Option<Control> = None;
-    let resolved =
-        resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, &mut |path| match write(
-            result, &path,
-        ) {
+    let resolved = resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, &mut |path| {
+        // A path arriving after a stop means a `?//` in `path_expr` retried
+        // the next alternative (#2974 review): see [`RetryResumes`].
+        if retry_resumes == RetryResumes::Yes {
+            parked = None;
+        }
+        match write(result, &path) {
             Ok(()) => Demand::Continue,
             Err(escape) => stop_with_escape(&mut parked, escape.into()),
-        });
+        }
+    });
     // Reclaim the parked escape, clearing the side channel it set.
     let parked = match resume_from_escape(parked, Flow::Exhausted) {
         Flow::Escaped(control) => Some(EvalEscape::from(control)),
@@ -24611,6 +24643,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             &input,
             terminal,
             optional,
+            RetryResumes::No,
             &mut |result, path| {
                 update_path::<S>(result, path, &filter, false, false, None).map(|_wrote| ())
             },

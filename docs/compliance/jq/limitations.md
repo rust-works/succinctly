@@ -3085,8 +3085,13 @@ One jq 1.7.1 quirk is deliberately not reproduced: a `?//` retry that re-enters 
 after a write already succeeded corrupts jq's `reduce` accumulator and fails with `Paths must
 be specified as an array`, having fired the target three times
 (`(. as $x ?// $y | (.|stderr)[(0,1)]) += "x"` on `[1,2]`). That is jq's VM stack, not a
-rule. succinctly retries once per alternative and raises the last alternative's own write
-error (`number (1) and string ("x") cannot be added`), firing the target twice.
+rule, and it fires on *any* retry through `_modify`, even one whose writes all succeed.
+succinctly keeps the first failed write's own error instead (`number (1) and string ("x")
+cannot be added`, here after firing the target twice), which keeps jq's exit code. `=` is
+different in jq, and succinctly follows it: `_assign`'s `reduce` carries on with the retried
+alternative, so `(. as $x ?// $y | .[if $x == null then 0 else -5 end]) = 1` on `[1]` is `[1]`
+(it raised `Out of bounds negative array index` here before #2974's review). A retry that
+resolves no path at all is a jq quirk too, `null` for `=`, and is not reproduced.
 
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
