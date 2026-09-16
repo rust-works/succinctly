@@ -976,8 +976,6 @@ impl ModuleLoader {
     }
 }
 
-/// Recursively rewrite NamespacedCall expressions to regular FuncCall expressions
-/// by transforming `namespace::func(args)` to `namespace::func(args)` as a regular call
 /// Rewrite every computed-key `Expr` inside a `reduce`/`foreach`/`as {...}`
 /// pattern list (#2677's `ObjectKey::Expr`) the same way
 /// [`rewrite_namespaced_calls`] rewrites everywhere else -- see #2957:
@@ -995,6 +993,8 @@ fn rewrite_namespaced_calls_in_patterns(patterns: Vec<Pattern>) -> Vec<Pattern> 
         .collect()
 }
 
+/// Recursively rewrite NamespacedCall expressions to regular FuncCall expressions
+/// by transforming `namespace::func(args)` to `namespace::func(args)` as a regular call
 fn rewrite_namespaced_calls(expr: Expr) -> Expr {
     match expr {
         // #1371: parse-time only, so neither can occur -- both are built by
