@@ -122,8 +122,7 @@ pub use parser::{
 };
 pub use resolve::{
     call_arity, resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleRun, ResolveError,
-    RunMarker,
-    UnboundVar, UnresolvedCall,
+    RunMarker, UnboundVar, UnresolvedCall,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
