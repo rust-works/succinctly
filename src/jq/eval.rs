@@ -53121,19 +53121,42 @@ mod ambient_frame_depth {
         // why this exists at all (a `$`-bound reference may be cached; the
         // *identical* `Rc` reused for a bare reference to the same
         // parameter name must never be, and nothing else about the node's
-        // shape tells the two apart). Populated once, permanently, by
-        // `bind_def_call_params` when it constructs a `$`-scoped
-        // substitution -- unlike `SHARED_CHAIN_CACHE`/`INSERTED_KEYS`, this
-        // is never purged by a `Guard`: eligibility is a structural fact
-        // about which *namespace* a given `Rc` was built for, fixed
-        // forever the moment that `Rc` is allocated, not a per-invocation
-        // value.
+        // shape tells the two apart). Populated by `bind_def_call_params`
+        // when it constructs a `$`-scoped substitution, and purged on the
+        // same `Guard`-drop schedule as `SHARED_CHAIN_CACHE` -- see
+        // `INSERTED_DOLLAR_SAFE_KEYS`'s own doc comment for why a key here
+        // cannot outlive the `Rc` it names, same as a `SHARED_CHAIN_CACHE`
+        // entry can't.
         static DOLLAR_SAFE_KEYS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
         // One entry per live `Guard`, holding exactly the keys *that*
         // guard inserted into `SHARED_CHAIN_CACHE` -- so `Guard::drop`
         // purges only its own frame's entries, never a sibling's or an
         // ancestor's still-live ones (#3012).
         static INSERTED_KEYS: RefCell<Vec<Vec<usize>>> = const { RefCell::new(Vec::new()) };
+        // The `DOLLAR_SAFE_KEYS` twin of `INSERTED_KEYS` -- one entry per
+        // live `Guard`, holding exactly the keys *that* guard marked via
+        // `mark_dollar_safe` (#3012).
+        //
+        // A mark must not outlive the `Rc` it names: `dollar_safe_shared`
+        // only ever runs while the level it's substituting for is already
+        // the innermost live `Guard` (the same ordering `cache_shared_value`
+        // relies on), and that `Rc` is embedded in the substituted body that
+        // level's own evaluation owns -- so the `Rc`, and every reference to
+        // its address, is gone by the time that same `Guard` drops. Without
+        // this, a key stayed marked forever after its `Rc` was freed, so a
+        // *later*, unrelated `Rc<Expr>` allocated at the same (by-then
+        // reused) address -- built for an ordinary bare-scoped substitution,
+        // never through `dollar_safe_shared` -- would be misread as
+        // dollar-safe by nothing more than address coincidence, silently
+        // caching a value real jq requires to be re-evaluated fresh at
+        // every reference. `Rc<Expr>` is a fixed allocation size regardless
+        // of which `Expr` variant it stores, so this was not a remote
+        // corner case: any `Expr::Shared(Rc::new(..))` built anywhere
+        // shortly after a dollar-marked `Rc`'s owning `Guard` dropped was a
+        // same-size-class candidate for the allocator to hand back that
+        // exact address.
+        static INSERTED_DOLLAR_SAFE_KEYS: RefCell<Vec<Vec<usize>>> =
+            const { RefCell::new(Vec::new()) };
     }
 
     pub(crate) fn get() -> u32 {
@@ -53164,11 +53187,20 @@ mod ambient_frame_depth {
     /// still goes through a plain, unmarked `Expr::Shared(Rc::new(..))` and
     /// is therefore never looked up here.
     ///
-    /// Permanent, not `Guard`-scoped: eligibility never changes once an
-    /// `Rc` exists, so there is nothing to purge.
+    /// `Guard`-scoped, same as [`cache_shared_value`]: a no-op if no `Guard`
+    /// is currently live, and otherwise purged when the *currently
+    /// innermost live* `Guard` drops -- see [`INSERTED_DOLLAR_SAFE_KEYS`]'s
+    /// own doc comment for why a mark must not outlive that (#3012).
     pub(crate) fn mark_dollar_safe(key: usize) {
-        DOLLAR_SAFE_KEYS.with(|s| {
-            s.borrow_mut().insert(key);
+        INSERTED_DOLLAR_SAFE_KEYS.with(|s| {
+            let mut stack = s.borrow_mut();
+            let Some(top) = stack.last_mut() else {
+                return;
+            };
+            top.push(key);
+            DOLLAR_SAFE_KEYS.with(|d| {
+                d.borrow_mut().insert(key);
+            });
         });
     }
 
@@ -53211,15 +53243,19 @@ mod ambient_frame_depth {
     /// restoring the previous value on drop — so a call that has returned
     /// (or a sibling call not nested inside this one) never inherits it.
     ///
-    /// #3012: also owns this scope's share of [`SHARED_CHAIN_CACHE`] --
-    /// every key inserted via [`cache_shared_value`] while this guard is the
-    /// innermost live one is removed again on drop, so a value computed
-    /// during one dynamic invocation of a `DefCall` node can never be read
-    /// back during a *different* dynamic invocation of the same
-    /// (permanently memoized, per [`super::BoundBody`]) node -- a separate
-    /// document reusing the same compiled query, a sibling backtrack branch
-    /// of the same call site, or any other re-entry all correctly see a
-    /// fresh, empty cache for that node.
+    /// #3012: also owns this scope's share of [`SHARED_CHAIN_CACHE`] and
+    /// [`DOLLAR_SAFE_KEYS`] -- every key inserted via [`cache_shared_value`]
+    /// or marked via [`mark_dollar_safe`] while this guard is the innermost
+    /// live one is removed again on drop. For `SHARED_CHAIN_CACHE`, that
+    /// means a value computed during one dynamic invocation of a `DefCall`
+    /// node can never be read back during a *different* dynamic invocation
+    /// of the same (permanently memoized, per [`super::BoundBody`]) node --
+    /// a separate document reusing the same compiled query, a sibling
+    /// backtrack branch of the same call site, or any other re-entry all
+    /// correctly see a fresh, empty cache for that node. For
+    /// `DOLLAR_SAFE_KEYS`, it means a mark can never outlive the `Rc` it
+    /// names -- see [`INSERTED_DOLLAR_SAFE_KEYS`]'s own doc comment for why
+    /// that matters.
     #[must_use]
     pub(crate) struct Guard(u32);
 
@@ -53227,6 +53263,7 @@ mod ambient_frame_depth {
         let previous = get();
         CURRENT.with(|c| c.set(previous.max(frames)));
         INSERTED_KEYS.with(|s| s.borrow_mut().push(Vec::new()));
+        INSERTED_DOLLAR_SAFE_KEYS.with(|s| s.borrow_mut().push(Vec::new()));
         Guard(previous)
     }
 
@@ -53241,6 +53278,17 @@ mod ambient_frame_depth {
                     let mut cache = c.borrow_mut();
                     for key in keys {
                         cache.remove(&key);
+                    }
+                });
+            }
+            let dollar_safe_keys = INSERTED_DOLLAR_SAFE_KEYS
+                .with(|s| s.borrow_mut().pop())
+                .unwrap_or_default();
+            if !dollar_safe_keys.is_empty() {
+                DOLLAR_SAFE_KEYS.with(|d| {
+                    let mut keys = d.borrow_mut();
+                    for key in dollar_safe_keys {
+                        keys.remove(&key);
                     }
                 });
             }
@@ -55678,6 +55726,7 @@ mod tests {
     #[test]
     #[cfg(feature = "std")]
     fn test_dollar_safe_marking_is_opt_in_3012() {
+        let _guard = enter_def_call_frame(0);
         let unmarked = 0x3333_usize;
         assert!(!ambient_frame_depth::is_dollar_safe(unmarked));
 
@@ -55687,6 +55736,47 @@ mod tests {
         assert!(
             !ambient_frame_depth::is_dollar_safe(unmarked),
             "marking one key must not mark another"
+        );
+    }
+
+    /// #3012 follow-up: a mark must not survive the `Guard` that inserted it
+    /// dropping, exactly like a `SHARED_CHAIN_CACHE` entry
+    /// (`test_shared_chain_cache_purged_when_guard_drops_3012` above) --
+    /// otherwise the mark outlives the `Rc<Expr>` it names (which is
+    /// embedded in that same guard's substituted body and freed no later
+    /// than the guard drops), and a *different*, unrelated `Rc<Expr>` the
+    /// allocator later hands back the same address to -- built for an
+    /// ordinary bare-scoped substitution, never through `dollar_safe_shared`
+    /// -- would be misread as dollar-safe by address coincidence alone,
+    /// letting a bare (dynamically-scoped) reference get silently cached.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_dollar_safe_mark_purged_when_guard_drops_3012() {
+        let key = 0x5555_usize;
+        {
+            let _guard = enter_def_call_frame(0);
+            ambient_frame_depth::mark_dollar_safe(key);
+            assert!(ambient_frame_depth::is_dollar_safe(key));
+        }
+        assert!(
+            !ambient_frame_depth::is_dollar_safe(key),
+            "a mark must not survive the guard that inserted it dropping -- otherwise a later, \
+             unrelated Rc<Expr> reusing this address would be wrongly treated as dollar-safe"
+        );
+    }
+
+    /// #3012 follow-up: marking with no `Guard` currently live is a no-op,
+    /// mirroring [`cache_shared_value`]'s own no-op case -- a mark with no
+    /// owning frame to purge it could otherwise outlive its rightful scope,
+    /// so (like the value cache) it is never inserted in the first place.
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_dollar_safe_marking_without_a_live_guard_is_a_no_op_3012() {
+        let key = 0x6666_usize;
+        ambient_frame_depth::mark_dollar_safe(key);
+        assert!(
+            !ambient_frame_depth::is_dollar_safe(key),
+            "marking outside any live guard must not stick"
         );
     }
 
