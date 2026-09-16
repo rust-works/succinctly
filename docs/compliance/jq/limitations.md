@@ -376,8 +376,8 @@ matched *neither*: 163/400 on `tan`, 92 on `cosh`, 43 on `exp` against Apple's; 
 42 against glibc's. Its `sqrt` was a Newton iteration, off on 161/400 against every libm.
 Since #3045, `jq::math` (`src/jq/math.rs`) binds the platform's C symbols directly under
 `std` — bit-exact on every sampled input of every builtin against the platform's own jq
-(`scripts/jq-libm-oracle-sweep.sh`, 0 mismatches on Apple silicon and on x86_64 glibc; the
-pre-fix build reports 1092). The Rust `f64` inherent methods were rejected for the same
+(`scripts/jq-libm-oracle-sweep.sh`, 0 mismatches on Apple silicon and on x86_64 glibc 2.35;
+the pre-fix build reports 1092). The Rust `f64` inherent methods were rejected for the same
 reason the crate was: `f64::atanh` is a formula, several ulps from the C `atanh` on both
 platforms.
 
@@ -390,13 +390,27 @@ What remains, recorded here:
   jq. A musl-static succinctly on Linux carries musl's `tan`, one ulp from the glibc-built
   `jq` next to it on 19/400 inputs; a glibc-dynamic build matches that jq exactly. This is
   the same property real jq has (a musl-built jq prints musl's digits) and is not
-  something succinctly can paper over.
+  something succinctly can paper over. It also means a musl build fails the
+  `math_platform_libm_bits` golden and 5 of 11 rows of `math.rs`'s unit test by
+  construction — both pin inputs on which the crate (musl's algorithms) is the odd one out —
+  so the unit test is gated to glibc/macOS and there is no musl CI leg.
+- **The libm's *version* is part of "the platform" too, and the jq-drift reference is
+  static.** `jq-linux-amd64` 1.7.1 embeds glibc 2.35. glibc 2.39 — Ubuntu 24.04, i.e.
+  every Linux CI leg — rewrote `exp10`: it differs from 2.35's on 137/400 inputs, and now
+  agrees with `pow(10, x)` on 400/400 and with Apple's `__exp10` on 399/400. Every other
+  builtin is bit-identical between 2.35 and 2.39. A dynamically linked succinctly on a 2.39
+  host therefore matches the *system* jq 1.7.1 (which links the same 2.39) on `exp10`, but
+  not the static release binary; this is the one function where "the same platform"
+  and "the jq-drift reference" name different libms. The golden's four `exp10` inputs were
+  checked to agree across Apple, glibc 2.35 and glibc 2.39; any future `exp10` golden row
+  must be too, or jq-drift and the test legs will disagree on it roughly one time in three.
 - **`exp10`** is spelled the way jq spells it: `__exp10` on Apple platforms (jq's own
-  `builtin.c` renames it), `exp10` on glibc/musl/Android. On a platform with neither, jq's
-  build defines `exp10/0` as a runtime error ("not found at build time"); succinctly
-  answers `pow(10, x)` there instead, which is not bit-exact against anything but beats
-  refusing. Note that `pow(10, x)` and `exp10(x)` are *different* results on glibc
-  (137/400), so `pow(10; .)` is not a spelling of `exp10` on Linux either.
+  `builtin.c` renames it), `exp10` on glibc and musl. On a platform with neither —
+  Android's bionic, the BSDs, MSVC — jq's build defines `exp10/0` as a runtime error ("not
+  found at build time"); succinctly answers `pow(10, x)` there instead, which is not
+  bit-exact against anything but beats refusing. Note that `pow(10, x)` and `exp10(x)` are
+  *different* results on glibc before 2.39 (137/400), so `pow(10; .)` is not a spelling of
+  `exp10` against the release jq either.
 - **Hermetic goldens can only pin the last bit where every libm agrees.** The
   `math_platform_libm_bits` case was built from a per-function sweep, choosing inputs on
   which Apple's libm and glibc agree and the `libm` crate does not, so the one

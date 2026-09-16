@@ -11,10 +11,13 @@
 //! only way to print jq's digits is to call the same library jq does, so
 //! under `std` every function here is a direct `extern "C"` binding to the
 //! platform libm; that is bit-exact against the pinned jq on macOS and
-//! against the release jq on glibc, on every sampled input of every function.
-//! Without `std` there is no platform libm to link, and the `libm` crate
-//! stands in with a recorded last-bit divergence
-//! (`docs/compliance/jq/limitations.md`).
+//! against the release jq on glibc, on every sampled input of every function
+//! -- with one version caveat: that release binary is static and embeds glibc
+//! 2.35, and glibc 2.39 rewrote `exp10` (137/400 differ from 2.35; 2.39's
+//! agrees with `pow(10, x)` on all 400 and with Apple's on 399). Every other
+//! function is identical across 2.35 and 2.39. Without `std` there is no
+//! platform libm to link, and the `libm` crate stands in with a recorded
+//! last-bit divergence (`docs/compliance/jq/limitations.md`).
 //!
 //! These are deliberately the C symbols, not the `f64` inherent methods.
 //! `f64::atanh` is a formula (`0.5 * ((2x) / (1 - x)).ln_1p()`), not a libm
@@ -80,9 +83,10 @@ libm_fns! {
 
 /// jq's `exp10` is whatever the platform calls it: `__exp10` on Apple
 /// platforms (jq's `builtin.c` renames it), `exp10` on glibc and musl. On a
-/// platform with neither, jq's own build defines `exp10/0` as an "not found
-/// at build time" error; succinctly falls back to `pow(10, x)` there instead,
-/// which is not bit-exact against any jq but is the closest value on offer.
+/// platform with neither -- Android's bionic exports none, nor do the BSDs
+/// or MSVC -- jq's own build defines `exp10/0` as a "not found at build time"
+/// error; succinctly falls back to `pow(10, x)` there instead, which is not
+/// bit-exact against any jq but is the closest value on offer.
 #[inline]
 pub(crate) fn exp10(x: f64) -> f64 {
     #[cfg(all(feature = "std", target_vendor = "apple"))]
@@ -96,8 +100,8 @@ pub(crate) fn exp10(x: f64) -> f64 {
     }
     #[cfg(all(
         feature = "std",
-        not(target_vendor = "apple"),
-        any(target_os = "linux", target_os = "android")
+        target_os = "linux",
+        any(target_env = "gnu", target_env = "musl")
     ))]
     {
         extern "C" {
@@ -109,7 +113,7 @@ pub(crate) fn exp10(x: f64) -> f64 {
     #[cfg(all(
         feature = "std",
         not(target_vendor = "apple"),
-        not(any(target_os = "linux", target_os = "android"))
+        not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))
     ))]
     {
         pow(10.0, x)
@@ -133,11 +137,16 @@ mod tests {
     /// the divergent implementation is Rust's own `f64::atanh` formula, off by
     /// several ulps on both platforms). A regression to either the crate or
     /// the inherent methods therefore fails here on both measured platforms.
-    /// Gated to those platforms; the hermetic golden case
-    /// `math_platform_libm_bits` covers the remaining CI legs.
+    /// Gated to those platforms (a musl-libc build prints musl's digits,
+    /// which are the crate's, and fails 5 of these rows by design); the
+    /// hermetic golden case `math_platform_libm_bits` covers the remaining
+    /// CI legs.
     #[cfg(all(
         feature = "std",
-        any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64"))
+        any(
+            target_os = "macos",
+            all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")
+        )
     ))]
     #[test]
     fn platform_libm_matches_the_platform_jq_bit_for_bit() {

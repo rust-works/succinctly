@@ -26,7 +26,11 @@
 # Note the oracle is *this platform's* jq: Apple's libm and glibc disagree
 # with each other on the same inputs (tan 161/400), so comparing a Linux
 # succinctly against goldens captured on macOS would report real jq's own
-# platform dependence, not a succinctly bug.
+# platform dependence, not a succinctly bug. The libm's version counts too:
+# the static `jq-linux-amd64` release binary embeds glibc 2.35, and glibc
+# 2.39 rewrote `exp10`, so on a 2.39 host that binary reports exp10 137/400
+# against a dynamically linked succinctly while the distro's own jq 1.7.1
+# (dynamic, same glibc) reports 0. Every other row is version-independent.
 #
 # Usage:
 #   cargo build --release --features cli
