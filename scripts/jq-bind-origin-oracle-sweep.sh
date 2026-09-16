@@ -38,6 +38,13 @@
 # alternative -- if it ever answered `[]` (or deleted the whole document)
 # the row would classify `mismatch`, not `agree`, and fail the sweep.
 #
+# The `fold-alt-*` and `alt-untracked-stage-*` rows are #2979: a `?//` chain
+# in a fold's own loop pattern, and one on an untracked stage, used to fall to
+# by-value evaluation that could only refuse on an output it emitted. The
+# rows pin jq's four backtracking rules through both fold kinds and both
+# write operators, plus the two refusals kept on purpose (the reasons are in
+# REFUSE_ONLY below and in limitations.md).
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -224,6 +231,28 @@ fold-destructure-accumulator-nav	{"a":[1,2,3],"b":{"c":5}}	path(reduce .b as {c:
 fold-destructure-qq-alt	{"a":[1,2,3],"b":{"c":5}}	path(reduce .b as {c:$x} ?// $z (0; $x))
 fold-destructure-duplicate-key	{"a":[1,2,3],"b":{"c":5}}	path(foreach .b as {c:$x,c:$x} (.; .; $x))
 fold-destructure-nonnull-register	{}	path(foreach (null) as {a:$x} (.; .; $x))
+fold-alt-walk-retry	{"a":[1]}	path(foreach .a as {b:$v} ?// [$v] (.; .; $v))
+fold-alt-walk-retry-reduce	{"a":[1]}	path(reduce .a as {b:$v} ?// [$v] (.; $v))
+fold-alt-update-null-acc	null	path(reduce 1 as $a ?// $b (.; if $b then . else error("x") end))
+fold-alt-update-null-acc-off-register	{"a":1}	path(reduce 1 as $a ?// $b (.; if $b then . else error("x") end))
+fold-alt-terminal-retry	{"a":[1]}	path(foreach .a as [$v] ?// $w (.; .; $w))
+fold-alt-terminal-retry-after-emit	{"a":{"b":1}}	[path(foreach .a as {b:$v} ?// $w (.; .; $v, 1))]
+fold-alt-per-element	{"a":[1,2]}	[path(foreach .a[] as [$x] ?// $y (.; .; $y))]
+fold-alt-last-propagates	{"a":{"b":1}}	path(reduce .a as {b:$v} ?// $w (.; $v))
+fold-alt-outer-var	{"a":1}	path(. as $x | foreach (1) as $y ?// $z (0; $x; .))
+fold-alt-empty-body	{"a":2,"c":2}	path(foreach .a as {a:$v} ?// $v (.c; .; empty))
+fold-alt-empty-body-reduce	{"a":{"b":1},"c":{"b":1}}	path(reduce .a as {b:$v} ?// $v (.c; .) | empty)
+fold-alt-guessed-walk	{"a":2,"c":2}	path(foreach .a as {a:$v} ?// $v (.c; .; $v))
+fold-alt-nested-fold	{"a":2,"c":2,"d":true,"x":{"a":2,"c":{"b":1}},"arr":[2,2,2]}	path(foreach ([.a] | .[0]) as {a:$v0} ?// $v0 (.c; foreach (1) as $i (0; $v0; .); $v0.b?))
+fold-alt-del	{"a":[1]}	del(foreach .a as {b:$v} ?// [$v] (.; .; $v))
+fold-alt-del-refused	{"a":{"b":1},"c":false,"d":{"b":1},"x":{"a":{"b":1},"c":"s"}}	del(foreach . as {a:$v0} ?// [$v0] (.c; ($v0 | .b?); ($v0 | getpath([]) | .b?)))
+fold-alt-update-refused	{"a":{"b":1},"c":{"b":1}}	(foreach .a as {b:$v} ?// $w (.c; .; empty)) |= 5
+fold-alt-assign	{"a":{"b":{"c":1}}}	(foreach .a as {b:$v} ?// $w (.; .; $v | .c)) = "w"
+fold-alt-halt	null	path(foreach (1) as $x ?// $y (null; .; halt_error))
+fold-alt-limit-outside	{"a":1}	[limit(1; path(foreach (1,2) as [$a] ?// $b (.; .; .)))]
+alt-untracked-stage-refuses	{"a":1}	path(5 | . as {a:$v} ?// $v | .b?)
+alt-untracked-stage-zero-output	{"a":1}	path(5 | 5 as {a:$v} ?// $v | empty)
+alt-untracked-stage-marker-head	{"a":1}	path(. as $x | 5 | $x as {a:$q} ?// $z | $q)
 CASES_EOF
 )
 
@@ -255,6 +284,8 @@ destructure-alt-artefact-guard:#2649 artefact guard -- MUST stay a refusal: retr
 destructure-alt-artefact-guard-del:#2649 artefact guard -- the write twin: a retry would delete the whole document where jq deletes .a[0]
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
+alt-untracked-stage-zero-output:#2979 family B -- on an untracked stage the walk's verdict is a guess, so its refusal propagates rather than retrying; jq retries onto $v and answers nothing
+alt-untracked-stage-marker-head:#2979 family B -- MUST stay a refusal: the marker is the register in jq (["a"]); a retry would bind $z instead, and del/= would write through it
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 REFUSE_EOF
 )
