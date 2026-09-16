@@ -34129,6 +34129,177 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
     Ok(())
 }
 
+/// #2947: the `--seq -s` EOF location is decided by *where jq's own parser
+/// last failed*, not by what the trailing record contained.
+///
+/// jq renders `<unknown>` only when `jq_util_input_read_more` closes a
+/// stream that was already at `feof` -- which happens exactly when its
+/// parser hands back an *error* (the one outcome that returns early and
+/// makes `main` call in again) while jq is working on the stream's final
+/// `fgets` buffer. The bytes *after* the failure therefore decide the
+/// answer, and the record text alone cannot: every pair below holds the
+/// same record and differs only in what follows it.
+///
+/// Every expectation is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_slurp_eof_location_follows_last_parse_error_2947() -> Result<()> {
+    // (why, stream, expected line -- `None` meaning `<unknown>`)
+    let cases: &[(&str, &str, Option<usize>)] = &[
+        // --- the four shapes #2947 tabulates ---
+        // A final RS abandons the pending token before it, and nothing
+        // after it restores a position.
+        ("final RS after a number", "\x1e0\x1e", None),
+        ("final RS after a literal", "\x1e true\x1e", None),
+        // A parse error followed by a newline: jq refills a line at a
+        // time, so the refill still has a line to hand over.
+        ("parse error then newline", "\x1e[0,]\n", Some(1)),
+        ("invalid escape then newline", "\x1e\"\\q\"\n", Some(1)),
+        // --- #2947's own controls ---
+        ("final RS after a container", "\x1e[]\x1e", Some(0)),
+        ("number resolved by a newline", "\x1e0\n\x1e", Some(1)),
+        ("later RS resyncs the error", "\x1e[0,]\x1e\n", Some(1)),
+        // Only a *newline* refills; other whitespace is still the same
+        // final buffer, so the position is gone.
+        ("parse error then space", "\x1e[0,] ", None),
+        ("parse error then tab", "\x1e[0,]\t", None),
+        ("parse error then CR", "\x1e[0,]\r", None),
+        // --- the same rule, on the shapes the old heuristic also missed ---
+        ("abandoned number then newline", "\x1e0\x1e\n", Some(1)),
+        ("abandoned literal then newline", "\x1etrue\x1e\n", Some(1)),
+        ("abandoned number then space", "\x1e0\x1e ", None),
+        ("abandoned number then more RS", "\x1e0\x1e\x1e", None),
+        ("newline counts every line", "\x1e[0,]\n\n", Some(2)),
+        ("newline may follow other space", "\x1e[0,] \n", Some(1)),
+        // The discriminator that rules out "a newline always recovers": a
+        // newline inside an unterminated string is just more string, so
+        // the failure still lands at EOF, in the final buffer.
+        (
+            "unterminated string eats the newline",
+            "\x1e\"unterm\n",
+            None,
+        ),
+        ("unfinished object reaches EOF", "\x1e{\"a\":1\n", None),
+        // A recovery can be undone again by a later failure, and vice
+        // versa -- it is the *last* error that decides.
+        ("recovered, then re-lost at EOF", "\x1e[0,]\n\x1e1", None),
+        (
+            "recovered, then a value at EOF",
+            "\x1e[0,]\n\x1e1\n",
+            Some(2),
+        ),
+        ("error only on the final line", "\x1e1\n\x1e[0,]", None),
+        (
+            "error on an earlier line only",
+            "\x1e1\n\x1e[0,]\n",
+            Some(2),
+        ),
+        // --- no RS byte anywhere: jq never syncs onto anything, reports
+        // `Unfinished abandoned text at EOF`, and that error is in the
+        // final buffer for *any* content -- including none at all.
+        ("no RS byte, empty", "", None),
+        ("no RS byte, space", " ", None),
+        ("no RS byte, newline", "\n", None),
+        ("no RS byte, valid JSON", "1\n", None),
+    ];
+    for (why, stream, line) in cases {
+        let (stdout, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[stream])?;
+        assert_eq!(stdout, "", "{why}: {stderr}");
+        assert_eq!(code, 5, "{why}: {stderr}");
+        let location = line.map_or_else(
+            || "<unknown>".to_string(),
+            |line| format!("{}:{line}", paths[0]),
+        );
+        assert_eq!(
+            stderr.lines().last(),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "{why}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2947, across a file boundary: the final `fgets` buffer is measured from
+/// the *last file's* own start, not the stream's.
+///
+/// jq closes a file and clears `current_filename` on the way to opening the
+/// next one, so an empty trailing file is not inert -- opening it is what
+/// puts a reportable position back. A failure in an earlier file is
+/// therefore recoverable in a way the identical failure at the true end of
+/// the stream is not. Every expectation is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_slurp_eof_location_final_buffer_is_per_file_2947() -> Result<()> {
+    /// One stream spread over several files, and where jq points
+    /// afterwards: `at` is `None` for `<unknown>`, else the index of the
+    /// file jq names and the line within it.
+    struct Case<'a> {
+        why: &'a str,
+        files: &'a [&'a str],
+        at: Option<(usize, usize)>,
+    }
+    let case = |why, files, at| Case { why, files, at };
+    let cases: &[Case] = &[
+        // Opening the empty second file restores the position that the
+        // same stream in one file loses (`\x1e[0,]` alone is `<unknown>`).
+        case(
+            "parse error, empty file after",
+            &["\x1e[0,]", ""],
+            Some((1, 0)),
+        ),
+        case(
+            "abandoned number, empty file after",
+            &["\x1e0\x1e", ""],
+            Some((1, 0)),
+        ),
+        case(
+            "newline in the next file",
+            &["\x1e[0,]", "\n"],
+            Some((1, 1)),
+        ),
+        case(
+            "content then newline next file",
+            &["\x1e[0,]", "X\n"],
+            Some((1, 1)),
+        ),
+        // ... but only while the failure stays out of the last file's own
+        // final buffer: a newline *followed* by fresh abandoned text is
+        // back to `<unknown>`.
+        case("newline then abandoned text", &["\x1e[0,]", "\nX"], None),
+        // A truncation that only resolves at real EOF is in the final
+        // buffer wherever the file boundary falls.
+        case("number truncated at real EOF", &["\x1e1", ""], None),
+        case("error in the last file", &["\x1e1\n", "\x1e[0,]"], None),
+        case("nothing to recover into", &["", "\x1e[0,]"], None),
+        // Controls: no failure at all, so nothing to lose.
+        case(
+            "resolved across the boundary",
+            &["\x1e5", " "],
+            Some((1, 0)),
+        ),
+        case(
+            "container then empty file",
+            &["\x1e[]\x1e", ""],
+            Some((1, 0)),
+        ),
+    ];
+    for Case { why, files, at } in cases {
+        let (stdout, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], files)?;
+        assert_eq!(stdout, "", "{why}: {stderr}");
+        assert_eq!(code, 5, "{why}: {stderr}");
+        let location = at.map_or_else(
+            || "<unknown>".to_string(),
+            |(file, line)| format!("{}:{line}", paths[file]),
+        );
+        assert_eq!(
+            stderr.lines().last(),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "{why}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #1549: `input_line_number`'s own *value* (not just the `(at ...)` error
 /// marker #1542 already covers) must report real jq's own answer for "no
 /// line known yet" (`0`) for a dropped `--seq -s` trailing record, not the
