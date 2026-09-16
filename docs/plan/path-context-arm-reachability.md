@@ -1343,10 +1343,63 @@ both of which the eager evaluator had been masking:
 
 **What is left.** The per-position `Vec` clones the measurement attributes the
 cost to (#2572) -- format-independent, ~2-3 days, and the lever that reaches
-most of the remaining penalty; a separate cursor cell for the walk is the
-smaller half (its ceiling is the YAML-minus-JSON gap, ~1.2 us/elem of the
+most of the remaining penalty (closed since, see the #2572 section below); a
+separate cursor cell for the walk is the smaller half (its ceiling is the YAML-minus-JSON gap, ~1.2 us/elem of the
 absent-head shape's 2.9 and nothing measurable on the other two). Neither is
 this change's.
+
+## #2572: the walk's position becomes one shared trail
+
+Date: 2026-09-16. The per-position cost the exit measurement attributed to the
+walk's own `Vec` clones, removed.
+
+**What changed.** `PathContextPos` carried `path: Vec<OwnedValue>` and
+`ancestors: Vec<PathNode<V>>`. Each navigational step rebuilt the path into a
+`PathTrail` (`PathTrail::from_slice`, one allocation and one component clone
+per level), flattened the stepped trail back with `to_vec`, and cloned the
+ancestors; `path_context_step_generic`'s `Expr::Pipe` arm also re-wrapped its
+remaining stages in `Expr::Pipe(rest.to_vec())` per head. The position now
+holds a `PathContextTrail`: an `Rc`-linked chain whose links carry a component
+and the node it was taken from (the old `ancestors[i]` is link `i + 1`'s
+`from`). `path_step_generic` extends through a `StepTrail` trait both trails
+implement, so the one step definition stays shared with `path()` and no
+bridge is left (`from_slice` is deleted). `parent(n)` walks `n` links, `path`
+flattens once where it is emitted, and the pipe step recurses on a slice.
+Links unlink iteratively on drop, since a walk rooted at a nested input
+carries a trail as deep as the document.
+
+**The measurement.** `scripts/ab-cli.py`, base = the merge-base `9d6607978`,
+head = the branch, both `codegen-units=1` + fat LTO, 11 interleaved reps, a
+deterministic corpus of `- k: {x: n}` records (block YAML and JSON twins) at
+1/6/20 MB. `--control` floor on the same corpus: M4 Pro -4.1..+1.9% (yq),
+-3.9..+1.7% (jq); 7950X (`taskset -c 2`) -2.6..+5.2% (yq), -1.5..+2.4% (jq).
+Output identical on all 84 A/B configurations; the path-context oracle sweep
+reports 0 unexpected divergences over 6300 cases. Median change at 1/6/20 MB:
+
+| shape                               | M4 Pro yq       | M4 Pro jq       | 7950X yq        | 7950X jq        |
+|-------------------------------------|-----------------|-----------------|-----------------|-----------------|
+| `[.[] \| .k.x \| parent] \| length` | -24/-23/-24%    | -34/-35/-33%    | -18/-19/-20%    | -24/-25/-28%    |
+| `[.[] \| .k \| select(key == "k")]` | -14/-13/-16%    | -27/-28/-29%    | -11/-11/-15%    | -18/-17/-23%    |
+| `[.[] \| .missing \| parent]`       | -11/-9/-10%     | -17/-16/-18%    | -9/-9/-9%       | -14/-11/-16%    |
+| `[.[] \| key] \| length`            | -15/-15/-17%    | -17/-20/-21%    | -14/-6/-20%     | -21/-26/-24%    |
+| `first(.[] \| key)`                 | -19/-20/-22%    | -24/-28/-30%    | -19/-14/-22%    | -23/-21/-33%    |
+| `[.[] \| .k.x] \| length` (holdout) | +0.3/-0.7/-0.5% | -0.6/+0.1/+0.4% | +0.8/+0.8/+1.1% | +1.6/+0.9/+0.7% |
+
+The holdout does not enter the walk, so what it reads is layout: flat on ARM,
+a consistent ~+1% on x86 that stays inside that box's control range. Peak RSS
+at 20 MB, base -> head: M4 Pro 1051 -> 817 MB (yq) and 1109 -> 822 MB (jq) on
+`[.[] | .k.x | parent]`, 1470 -> 1235 MB and 1514 -> 1242 MB on the
+absent-head shape; the 7950X is essentially unchanged (645 -> 646, 663 -> 640,
+1102 -> 1100, 1106 -> 1089 MB). A `[paths] | length` row was also timed and is
+not reported: in yq mode `paths` is gated behind `--jq-extensions`, so it timed
+the error path, and in jq mode it never enters this walk (flat on both boxes).
+
+**What is left.** The absent-head shape keeps the smallest win on both boxes;
+its remaining term is the missing-key scan itself (#2470/#2482's territory,
+and the YAML-only part the exit measurement named), not the walk. The
+per-stage `heads` `Vec` and `try_path_context_cursor_walk`'s
+collect-then-materialize were left as they are: one allocation per stage, not
+per position.
 
 ## Result
 

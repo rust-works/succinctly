@@ -17521,9 +17521,12 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
 /// ~0.5us per element, so the cost is the walk's own per-position `Vec`
 /// clones (#2572), not the cursor cache -- and the eager route it fell back
 /// to peaked at *twice* the RSS (511 MB vs 245 MB on a 20 MB input). The
-/// walk now takes every head it can model; the accepted cost is +10-13% on
-/// `[.[] | .k.x | parent]`, +20% on `[.[] | .k | select(key == "k")]` and
-/// +38-51% on the absent-head shape (issue #2559).
+/// walk now takes every head it can model; the cost accepted then was +10-13%
+/// on `[.[] | .k.x | parent]`, +20% on `[.[] | .k | select(key == "k")]` and
+/// +38-51% on the absent-head shape (issue #2559). #2572 then removed the
+/// clones (`PathContextTrail`), taking those shapes 18-35%, 11-29% and 9-18%
+/// below the pre-#2572 walk on both an M4 Pro and a 7950X; the plan record
+/// `docs/plan/path-context-arm-reachability.md` has the tables.
 fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     let first = exprs.first()?;
     let (walked, rest): (&[Expr], &[Expr]) = if path_context_pipe_is_walkable(exprs) {

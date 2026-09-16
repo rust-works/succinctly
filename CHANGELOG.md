@@ -920,6 +920,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **The path-context walk no longer clones its position per step** (#2572).
+  `key`/`path`/`parent` over a fan-out (`[.[] | .k.x | parent]`) kept each
+  position's path and ancestors as two owned `Vec`s, so every navigational
+  step rebuilt the whole path into a `PathTrail` and flattened it back out,
+  cloned the ancestors, and -- for a nested pipe stage -- deep-cloned the
+  remaining stages' AST once per head. A position now carries one
+  `Rc`-linked `PathContextTrail` (each link a component plus the node it was
+  taken from), extended through the same `path_step_generic` `path()` uses;
+  a step is one allocation, and `parent(n)` walks `n` links.
+
+  Interleaved A/B against the merge-base, 11 reps, `cgu1+fat` both sides,
+  1/6/20 MB inputs, output identical on all 84 configurations (median
+  change):
+
+  | shape                               | M4 Pro yq       | M4 Pro jq       | 7950X yq        | 7950X jq        |
+  |-------------------------------------|-----------------|-----------------|-----------------|-----------------|
+  | `[.[] \| .k.x \| parent] \| length` | -24/-23/-24%    | -34/-35/-33%    | -18/-19/-20%    | -24/-25/-28%    |
+  | `[.[] \| .k \| select(key == "k")]` | -14/-13/-16%    | -27/-28/-29%    | -11/-11/-15%    | -18/-17/-23%    |
+  | `[.[] \| .missing \| parent]`       | -11/-9/-10%     | -17/-16/-18%    | -9/-9/-9%       | -14/-11/-16%    |
+  | `[.[] \| key] \| length`            | -15/-15/-17%    | -17/-20/-21%    | -14/-6/-20%     | -21/-26/-24%    |
+  | `[.[] \| .k.x] \| length` (holdout) | +0.3/-0.7/-0.5% | -0.6/+0.1/+0.4% | +0.8/+0.8/+1.1% | +1.6/+0.9/+0.7% |
+
+  The holdout never enters the walk; its x86 rows sit inside that box's
+  control range (-2.6..+5.2% yq, -1.5..+2.4% jq). Peak RSS at 20 MB drops on
+  the M4 Pro (1051 -> 817 MB on the first shape in yq mode, 1109 -> 822 MB in
+  jq mode) and is essentially unchanged on the 7950X.
+
 - **A computed assignment path that cannot fan out no longer keeps a second
   whole document** (#2976). #2267's streaming write applies each write as its
   path resolves, so a failed write stops the path generator; the generator has
