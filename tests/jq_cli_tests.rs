@@ -27115,6 +27115,101 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     Ok(())
 }
 
+/// #2979: a `?//` alternation in a fold's loop pattern used to fall back to
+/// by-value evaluation in path position, which refuses only on an output it
+/// emits -- so a construct producing nothing exited 0 where jq refuses
+/// partway through, and `del`/`=`/`|=` wrote through it. Every row is
+/// captured whole from jq 1.7.1 (stdout, stderr, exit code): the issue's
+/// repros, the fuzz's own `= 9` hits, both write operators on a refused
+/// chain (the document must come back unwritten, at exit 5), one family-B
+/// row, and three accepting writes that now go through at jq's path.
+#[test]
+fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
+    let rows: &[(&str, &str, &str, &str, i32)] = &[
+        (
+            "{\"a\":2,\"c\":2,\"d\":true,\"x\":{\"a\":2,\"c\":{\"b\":1}},\"arr\":[2,2,2]}",
+            "path(foreach ([.a] | .[0]) as {a: $v0} ?// $v0 (.c; foreach (1) as $i (0; $v0; .); $v0.b?))",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {\"a\":2,\"c\":2,\"d\":true,\"x\":...\n",
+            5,
+        ),
+        (
+            "{\"a\":{\"b\":1},\"c\":false,\"d\":{\"b\":1},\"x\":{\"a\":{\"b\":1},\"c\":\"s\"}}",
+            "del(foreach . as {a: $v0} ?// [$v0] (.c; ($v0 | .b?); ($v0 | getpath([]) | .b?)))",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element 0 of {\"a\":{\"b\":1},\"c\":false,\"d\"...\n",
+            5,
+        ),
+        (
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
+            "(foreach .a as {b: $v} ?// $w (.c; .; empty)) |= 5",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}\n",
+            5,
+        ),
+        (
+            "{\"a\":1,\"c\":false,\"d\":2,\"x\":{\"a\":1,\"c\":{\"b\":1}}}",
+            "(foreach .x as {a: $v0} ?// {c: $v0} (.a; ($v0 | .b?); ($v0 | first(.[]?)))) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"x\" of {\"a\":1,\"c\":false,\"d\":2,\"x\"...\n",
+            5,
+        ),
+        (
+            "{\"a\":true,\"c\":true,\"d\":1,\"x\":{\"a\":true,\"c\":[{\"b\":1}]},\"arr\":[true,true,2]}",
+            "(foreach .c as {a: $v0} ?// $v0 (.a; ($v0[0]?, $v0); ($v0 | .b?))) = 9",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":true,\"c\":true,\"d\":1,\"...\n",
+            5,
+        ),
+        (
+            "{\"a\":{\"b\":1},\"c\":{\"b\":1}}",
+            "(reduce .a as {b: $v} ?// $v (.c; .) | empty) |= .",
+            "",
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}\n",
+            5,
+        ),
+        (
+            "{\"a\":1}",
+            "path(5 | . as {a: $v} ?// $v | .b?)",
+            "",
+            // jq names `$v`'s body (`element "b" of 5`), retrying past the
+            // walk; here the walk's own refusal stands (see limitations.md).
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 5\n",
+            5,
+        ),
+        (
+            "{\"a\":[1]}",
+            "del(foreach .a as {b: $v} ?// [$v] (.; .; $v))",
+            "{\"a\":[]}\n",
+            "",
+            0,
+        ),
+        (
+            "{\"a\":[1,2]}",
+            "(foreach .a[] as [$x] ?// $y (.; .; $y)) |= . + 10",
+            "{\"a\":[11,12]}\n",
+            "",
+            0,
+        ),
+        (
+            "{\"a\":{\"b\":{\"c\":1}}}",
+            "(foreach .a as {b: $v} ?// $w (.; .; $v | .c)) = \"w\"",
+            "{\"a\":{\"b\":{\"c\":\"w\"}}}\n",
+            "",
+            0,
+        ),
+    ];
+    for (doc, filter, want_stdout, want_stderr, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (*want_stdout, *want_stderr, *want_code),
+            "{doc} | {filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #2962: a module's dependencies are bound in their own scope, as jq binds
 /// a module's block, even though succinctly wraps them inside each def body
 /// that reaches them.

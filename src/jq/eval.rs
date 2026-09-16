@@ -30581,15 +30581,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   navigation, both pre-existing and orthogonal to this pattern
         //   widening).
         //
-        // - **`?//`-alternatives** (`patterns.len() > 1`) still fall
-        //   through: real jq tracks a variable through them too (confirmed
-        //   live: `path(. as $x | reduce (1) as $y ?// $z (0; $x))` is
-        //   `[]`), but #1365's retry machinery
-        //   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`,
-        //   plus its null-fill for names the matching alternative doesn't
-        //   bind) isn't threaded through path-tracking, so refusing is the
-        //   safe answer until it is — a refuse-only divergence, never a
-        //   wrong path, documented in `docs/compliance/jq/limitations.md`.
+        // - **`?//`-alternatives** (`patterns.len() > 1`) are threaded
+        //   through both resolvers since #2979, with jq's own backtracking
+        //   rules (`bind_fold_alternative`, `path_alternative_retries`) and
+        //   #1365's null-fill for names the matching alternative doesn't
+        //   bind. They used to fall through to the by-value catch-all,
+        //   which can only refuse on an output it emits -- so a chain whose
+        //   body produced nothing exited 0 where jq refuses partway through
+        //   the construct, and `del`/`=`/`|=` wrote through it.
         //
         // - **yq mode** stays refuse-only for a destructuring pattern too:
         //   real yq's lexer rejects `reduce`/`foreach`/`path` outright
@@ -30633,10 +30632,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             keep,
             sink,
         ),
-        // A `?//`-alternatives list (either fold kind), or a destructuring
-        // pattern in yq mode, falls back to the ordinary eager evaluator —
-        // see the guarded arms' own doc comment above `Expr::Reduce` for
-        // why.
+        // yq mode's destructuring or `?//` patterns fall back to the
+        // ordinary eager evaluator — see the guarded arms' own doc comment
+        // above `Expr::Reduce` for why.
         Expr::Reduce { .. } | Expr::Foreach { .. } => drain_path_result(
             resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
             sink,
@@ -33993,7 +33991,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // a guess, not jq's verdict -- see the dispatch arm -- so it
                 // never retries (#2979).
                 Err(e) => {
-                    if is_last || (!trackable && e.is_invalid_path_expression()) {
+                    if is_last || (!trackable && is_resolver_refusal(&e)) {
                         return ResolveFlow::Escaped(e.into());
                     }
                     continue;
@@ -34590,7 +34588,7 @@ fn bind_fold_alternative<S: EvalSemantics>(
                         && (!reg.trackable
                             || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
                                 && elem.value == reg.value));
-                    let retryable = !(guessed && error.is_invalid_path_expression());
+                    let retryable = !(guessed && is_resolver_refusal(&error));
                     return Err(FoldBindFailure { error, retryable });
                 }
             };
@@ -34644,6 +34642,14 @@ fn bind_fold_alternative<S: EvalSemantics>(
     })
 }
 
+/// The resolver's own two refusal kinds (#2979): a pattern step or a
+/// navigation on a value that is not the register's node, and a terminal
+/// value that is not a path. Named once so the three `?//` sites below
+/// agree on what "the resolver's own refusal" means.
+fn is_resolver_refusal(e: &EvalError) -> bool {
+    e.is_untracked_navigation_error() || e.is_invalid_path_expression()
+}
+
 /// Whether an escape out of one `?//` alternative's body retries the next
 /// alternative in path position -- [`resolve_as_pattern`]'s rule, shared
 /// with the folds (#2979) so the two cannot drift.
@@ -34658,11 +34664,7 @@ fn bind_fold_alternative<S: EvalSemantics>(
 fn path_alternative_retries(escape: &EvalEscape, is_last: bool) -> bool {
     match escape {
         EvalEscape::Error(e) => {
-            !(is_last
-                || e.is_decode_failure()
-                || e.is_resource_limit()
-                || e.is_untracked_navigation_error()
-                || e.is_invalid_path_expression())
+            !(is_last || e.is_decode_failure() || e.is_resource_limit() || is_resolver_refusal(e))
         }
         EvalEscape::Break(_) => !is_last,
         EvalEscape::Halt(_) => false,
@@ -41805,10 +41807,10 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
 /// [`try_reduce_step_alternatives`]) do not call this, and need not: they
 /// collect their alternative's outputs before anything downstream sees
 /// them, so no sink can have stopped on a refusal mid-attempt for them to
-/// retry past. Path-mode `resolve_reduce`/`resolve_foreach` admit only a
-/// bare `$var` pattern and cannot retry at all. A reclaim of a fold-step
-/// escape ([`reclaim_fold_escape`]) is not an attempt either, and clears
-/// the flag directly rather than through here.
+/// retry past. Path-mode `resolve_reduce`/`resolve_foreach` retry their own
+/// `?//` chains since #2979, and call this per alternative like the loops
+/// above. A reclaim of a fold-step escape ([`reclaim_fold_escape`]) is not
+/// an attempt either, and clears the flag directly rather than through here.
 pub(crate) fn clear_nonretryable_stop() {
     nonretryable_stop::clear();
     terminal_retry::begin_attempt();
@@ -96326,17 +96328,21 @@ mod tests {
             "[(foreach .a as {b: $v} ?// $w (.c; .; empty)) |= 5]",
             Err("Invalid path expression near attempt to access element \"a\" of {\"a\":{\"b\":1},\"c\":{\"b\":1}}"),
         ),
-        // family B: a chain on an untracked stage refuses rather than answering
+        // family B: a chain on an untracked stage refuses rather than
+        // answering -- jq refuses too, on `$v`'s body (`element "b" of 5`)
+        // after retrying past the walk; here the walk's own refusal stands
         (
             "{\"a\":1}",
             "[path(5 | . as {a: $v} ?// $v | .b?)]",
-            Err("Invalid path expression near attempt to access element \"b\" of 5"),
+            Err("Invalid path expression near attempt to access element \"a\" of 5"),
         ),
-        // family B: ...and still answers where the body produces nothing to refuse
+        // family B: the refuse-only cost -- jq answers `[]` here (the walk
+        // fails and `$v`'s body is `empty`), but on an untracked stage the
+        // walk's verdict is a guess, so it propagates rather than retrying
         (
             "{\"a\":1}",
             "[path(5 | 5 as {a: $v} ?// $v | empty)]",
-            Ok(&["[]"]),
+            Err("Invalid path expression near attempt to access element \"a\" of 5"),
         ),
         ];
 
