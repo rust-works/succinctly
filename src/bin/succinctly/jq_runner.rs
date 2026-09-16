@@ -2646,6 +2646,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         if !args.slurp && !args.null_input && !uses_input_builtins {
             // Streaming mode: process each row independently
             let files = get_input_files(&args);
+            // `input_filename` on this route too (#3046 review).
+            jq::cli_context::set_input_names(input_names(&files));
             let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
                 vec![read_stdin_bytes()?]
             } else {
@@ -2656,6 +2658,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             };
 
             for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
+                jq::cli_context::set_current_source(u32::try_from(file_idx).ok());
                 let file = files.get(file_idx).map(|p| p.to_string_lossy().to_string());
 
                 // Build DSV index (memory-efficient with SIMD)
@@ -2777,14 +2780,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         let files = get_input_files(&args);
         // `input_filename`'s names for this route's source tags, which are the
         // indexes into `raw_inputs` below (#3046).
-        jq::cli_context::set_input_names(if files.is_empty() {
-            vec![None]
-        } else {
-            files
-                .iter()
-                .map(|p| Some(p.to_string_lossy().to_string()))
-                .collect()
-        });
+        jq::cli_context::set_input_names(input_names(&files));
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
             vec![read_stdin_bytes()?]
         } else {
@@ -3138,8 +3134,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 },
                 Err(exit_code) => return Ok(exit_code), // Validation error
             };
-        // `input_filename`'s names for this route's source tags (#3046).
-        jq::cli_context::set_input_names(locations.files().to_vec());
+        // `input_filename`'s names for this route's source tags (#3046). Stdin
+        // is one unnamed source, which this table records as no sources at
+        // all.
+        jq::cli_context::set_input_names(if locations.files().is_empty() {
+            vec![None]
+        } else {
+            locations.files().to_vec()
+        });
 
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
@@ -3915,11 +3917,26 @@ fn get_inputs(
     }
 }
 
+/// `input_filename`'s name for each input source tag (#3046): one per file,
+/// or a single unnamed source (stdin) when no file was given.
+fn input_names(files: &[std::path::PathBuf]) -> Vec<Option<String>> {
+    if files.is_empty() {
+        vec![None]
+    } else {
+        files
+            .iter()
+            .map(|p| Some(p.to_string_lossy().to_string()))
+            .collect()
+    }
+}
+
 /// What `get_search_list`/`get_jq_origin`/`get_prog_origin` report for this
 /// run (#3046), each as jq 1.7.1 computes it:
 ///
-/// - the search list is the `-L` directories as given (jq's own default list
-///   otherwise, which [`jq::cli_context`] supplies);
+/// - the search list is the `-L` directories, each resolved to its real path
+///   when it exists and kept as given when it does not (`-L lib` is
+///   `["/abs/cwd/lib"]`, `-L nope` is `["nope"]`), or jq's own default list,
+///   which [`jq::cli_context`] supplies;
 /// - the jq origin is the directory part of the path the binary was invoked
 ///   by, as typed and not resolved -- `.` for a bare name found on `PATH`, the
 ///   symlink's own directory for a symlink (jq 1.7.1: `(cd / && jq -n
@@ -3946,7 +3963,12 @@ fn program_context(args: &JqCommand) -> jq::cli_context::ProgramContext {
         search_list: args
             .library_path
             .iter()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| {
+                std::fs::canonicalize(p)
+                    .unwrap_or_else(|_| p.clone())
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect(),
         jq_origin,
         prog_origin,
