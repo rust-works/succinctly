@@ -53,6 +53,10 @@ pub struct EvalContext {
 /// parameter alias.
 type FuncDefList = Vec<(String, Vec<Param>, Expr)>;
 
+/// The run id reserved for `~/.jq`'s own defs (#2951) -- assigned in
+/// [`ModuleLoader::new`] before any module can claim one.
+const AUTO_LOAD_RUN_ID: u32 = 0;
+
 /// Module loader for resolving and loading jq modules.
 #[derive(Debug)]
 pub struct ModuleLoader {
@@ -72,6 +76,17 @@ pub struct ModuleLoader {
     /// cycle closes. Keyed on the resolved file rather than the written path
     /// so `include "./m"` inside `m.jq` is still caught.
     loading: Vec<(PathBuf, String)>,
+    /// Run id per origin, keyed by canonical file (#2951). One id per
+    /// *source*, not per directive: a module included once and imported twice
+    /// is one id wrapped in three runs, which is right -- the id names where
+    /// a def was written, and each run's own alias is what distinguishes the
+    /// copies.
+    run_ids: BTreeMap<String, u32>,
+    /// `run id -> canonical path`, so a compile error raised inside a module
+    /// body can say which file it came from instead of `<top-level>`.
+    run_origins: BTreeMap<u32, String>,
+    /// Next unused run id. `0` is reserved for `~/.jq`.
+    next_run_id: u32,
 }
 
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
@@ -223,6 +238,29 @@ fn wrap_defs(mut expr: Expr, defs: FuncDefList) -> Expr {
         };
     }
     expr
+}
+
+/// [`wrap_defs`], with the run bracketed by a begin/end marker pair so the
+/// wrapped bodies cannot see anything the chain wraps *around* them (#2951).
+///
+/// This is the whole loader side of the module-scope boundary. See
+/// [`jq::ModuleRun`] for why the boundary is encoded as two extra defs whose
+/// names begin with a NUL byte, and [`jq::ModuleRun::parse`]'s callers in
+/// `resolve.rs` for the one rule that reads them.
+///
+/// An empty run is not bracketed: a boundary with nothing inside it can only
+/// hide names from the code below, never reveal any, and `~/.jq` is usually
+/// absent entirely.
+fn wrap_run(expr: Expr, defs: FuncDefList, id: u32, alias: Option<&str>) -> Expr {
+    if defs.is_empty() {
+        return expr;
+    }
+    let marker = |name: String| (name, Vec::new(), Expr::Identity);
+    let mut bracketed: FuncDefList = Vec::with_capacity(defs.len() + 2);
+    bracketed.push(marker(jq::ModuleRun::begin_marker(id, alias)));
+    bracketed.extend(defs);
+    bracketed.push(marker(jq::ModuleRun::end_marker(id)));
+    wrap_defs(expr, bracketed)
 }
 
 /// Every function name called anywhere inside `expr`, including inside nested
@@ -437,6 +475,7 @@ impl ModuleLoader {
         }
 
         // Handle ~/.jq - can be either a file or directory
+        let mut run_origins: BTreeMap<u32, String> = BTreeMap::new();
         if let Some(home) = std::env::var_os("HOME") {
             let jq_path = PathBuf::from(home).join(".jq");
             if jq_path.is_file() {
@@ -445,6 +484,14 @@ impl ModuleLoader {
                     if let Ok(program) = jq::parse_program(&contents) {
                         // #2774: same stamping as an `include`d module's
                         // defs, using `~/.jq`'s own canonical path.
+                        // Run id 0 is reserved for `~/.jq` (#2951): it is
+                        // wrapped as its own run like any module, so its
+                        // bodies cannot see an `include`d or `import`ed name
+                        // either -- real jq keeps both out.
+                        run_origins.insert(
+                            AUTO_LOAD_RUN_ID,
+                            canonical_or_self(&jq_path).to_string_lossy().into_owned(),
+                        );
                         auto_loaded_defs = extract_and_stamp_func_defs(&program.expr, jq_path);
                     }
                 }
@@ -459,7 +506,38 @@ impl ModuleLoader {
             loaded_modules: BTreeMap::new(),
             auto_loaded_defs,
             loading: Vec::new(),
+            run_ids: BTreeMap::new(),
+            run_origins,
+            next_run_id: AUTO_LOAD_RUN_ID + 1,
         }
+    }
+
+    /// The run id for `module_path`, interned by canonical file so the same
+    /// module included and imported shares one id (#2951).
+    ///
+    /// Falls back to the path as written when the module cannot be resolved:
+    /// the caller is about to fail the load anyway, and a run id is only ever
+    /// a diagnostic key, never a correctness one -- `scan_scope` pairs a
+    /// begin with an end by nesting, not by id.
+    fn run_id_for(&mut self, module_path: &str) -> u32 {
+        let key = resolve_module_in(&self.search_path, module_path).map_or_else(
+            || module_path.to_string(),
+            |p| canonical_or_self(&p).to_string_lossy().into_owned(),
+        );
+        if let Some(&id) = self.run_ids.get(&key) {
+            return id;
+        }
+        let id = self.next_run_id;
+        self.next_run_id += 1;
+        self.run_ids.insert(key.clone(), id);
+        self.run_origins.insert(id, key);
+        id
+    }
+
+    /// The canonical file a run id names, for compile-error attribution.
+    #[must_use]
+    pub fn run_origin(&self, id: u32) -> Option<&str> {
+        self.run_origins.get(&id).map(String::as_str)
     }
 
     /// Load a module if it is not already cached, and borrow its function
@@ -722,14 +800,20 @@ impl ModuleLoader {
         // the `~/.jq` block that follows it.
         for include in program.includes.iter().rev() {
             let defs = self.load_module(&include.path)?;
-            // Wrap expression with function definitions from the included module
-            expr = wrap_defs(expr, defs);
+            // #2951: bracketed as a run, so these defs' own bodies cannot
+            // see the sibling `include`s and `~/.jq` block wrapped around
+            // them. Before this, `def sa: sb;` in one module resolved `sb`
+            // from an unrelated module that merely happened to be included
+            // first -- and reversing the two `include`s made it agree with
+            // jq again, by accident.
+            let id = self.run_id_for(&include.path);
+            expr = wrap_run(expr, defs, id, None);
         }
 
         // `~/.jq`'s own defs: lowest priority of the two unqualified
         // sources (loses to any `include`d module of the same name, but
         // still beats a name that was never `include`d at all).
-        expr = wrap_defs(expr, self.auto_loaded_defs.clone());
+        expr = wrap_run(expr, self.auto_loaded_defs.clone(), AUTO_LOAD_RUN_ID, None);
 
         // Process imports (definitions available under namespace::)
         // Load modules and add their functions with namespace prefixes
@@ -755,7 +839,12 @@ impl ModuleLoader {
                 .into_iter()
                 .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body))
                 .collect();
-            expr = wrap_defs(expr, defs);
+            // The alias rides the begin marker (#2989): only the defs of
+            // *this* run were namespaced, so a bare sibling call inside one
+            // of their bodies is retried as `alias::name` by the resolver,
+            // and only within this run.
+            let id = self.run_id_for(&import.path);
+            expr = wrap_run(expr, defs, id, Some(namespace));
         }
 
         // Transform NamespacedCall expressions to regular FuncCall expressions
@@ -1705,7 +1794,7 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// program's undefined calls and undefined variables by position rather than
 /// grouping by kind (confirmed live: `$bar, foo, $baz` reports all three left
 /// to right), so this function must not re-sort or re-group them.
-fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
+fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
     // first one's. Used only by the text-search fallback below. Calls and
@@ -1732,7 +1821,31 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str) {
 
     for error in errors {
         match error {
-            jq::ResolveError::Call(jq::UnresolvedCall { name, arity }) => {
+            jq::ResolveError::Call(jq::UnresolvedCall {
+                name,
+                arity,
+                origin,
+            }) => {
+                // #2951: a call that failed inside a *module* body has no
+                // occurrence in `filter` at all, so neither the call-site
+                // table nor the text-search fallback below can honestly
+                // place it -- and the fallback can actively mislead, by
+                // finding a coincidental occurrence of the same name in the
+                // main filter and citing that line. `origin` is the first
+                // thing this pass has ever had that distinguishes the two,
+                // so a module-body error now says so and stops there rather
+                // than guessing.
+                //
+                // Real jq goes further and names the module's own path, line
+                // and source echo; doing that needs the module's text
+                // threaded down here, which is #2990.
+                if let Some(id) = origin {
+                    let at = loader
+                        .run_origin(*id)
+                        .map_or_else(|| "<module>".to_string(), ToString::to_string);
+                    eprintln!("jq: error: {name}/{arity} is not defined at {at}");
+                    continue;
+                }
                 let taken = calls_consumed.entry(name.as_str()).or_insert(0);
                 // Matched on arity as well as name (#2085 review, finding 2):
                 // an `f/1` diagnostic must not take a perfectly resolvable
@@ -2113,7 +2226,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // direction of divergence from what this fixes here.
     let compile_errors = jq::resolve_all(&mut expr);
     if !compile_errors.is_empty() {
-        report_compile_errors(&compile_errors, &filter_str);
+        report_compile_errors(&compile_errors, &filter_str, &module_loader);
         return Ok(exit_codes::COMPILE_ERROR);
     }
 

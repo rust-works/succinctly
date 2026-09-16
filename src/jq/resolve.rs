@@ -81,6 +81,22 @@ pub struct UnresolvedCall {
     pub name: String,
     /// How many arguments the call site passed.
     pub arity: usize,
+    /// Which module run the failing call was written in (#2951), or `None`
+    /// for the main filter and `~/.jq`-free top level.
+    ///
+    /// Real jq attributes a module body's compile error to that module --
+    /// `sb/0 is not defined at /abs/path/sibA.jq, line 1:` with the source
+    /// line echoed -- where succinctly could only ever say `<top-level>`,
+    /// because by the time this pass runs every module has been inlined into
+    /// one flat chain and the runner has only the main filter's text. This
+    /// is the run id the loader assigned, which it can map back to a
+    /// canonical path and source.
+    ///
+    /// Lives on this struct rather than on `Expr`: adding a field to
+    /// `Expr::FuncDef` would cost 8 bytes on every `Expr` (see
+    /// [`ModuleRun`]), whereas this is a diagnostic payload built only when
+    /// a call actually fails to resolve.
+    pub origin: Option<u32>,
 }
 
 impl core::fmt::Display for UnresolvedCall {
@@ -378,6 +394,170 @@ const JQ_BUILTIN_ROSTER: &[(&str, usize)] = &[
 /// and truncating is cheaper than cloning a map per node.
 type Scope = Vec<(String, usize)>;
 
+/// The module-run bracket: how a *scope boundary* is encoded in the def
+/// chain, so a module body cannot see names that are merely wrapped around
+/// it (#2951).
+///
+/// # Why a def, and why this name
+///
+/// succinctly inlines every module's defs into one flat `Expr::FuncDef`
+/// chain wrapped around the main filter, so each module body physically sits
+/// nested inside every other unqualified source -- `~/.jq` and every sibling
+/// `include`. Ordinary lexical scoping then resolves outward into them, and
+/// resolves names real jq keeps out. The boundary has to be expressed
+/// *somewhere* in the tree, and the options were costed in #2951's plan:
+///
+/// - A field on [`Expr::FuncDef`] costs 8 bytes on **every** `Expr` (the
+///   discriminant stops riding a niche -- measured for #2283) and eats the
+///   `MAX_EXPR_DEPTH` stack margin. Rejected.
+/// - A side table keyed by node address cannot survive `substitute_vars`,
+///   which rebuilds the tree between the loader and this pass. Rejected.
+/// - Rewriting each module's own defs to a unique prefix (name mangling)
+///   does not close the leak at all: an exported name must stay callable
+///   bare from the main filter, so its bare wrapper stays outside the
+///   sibling's body and is still found. Closing it that way requires
+///   knowing which names are *free* in the module -- which is this pass's
+///   job, not the loader's. Rejected as unsound, not merely expensive.
+///
+/// What is left is to encode the boundary in a value the chain already
+/// carries: a def's own name. A marker is a real `Expr::FuncDef` with an
+/// `Identity` body, whose name begins with a NUL byte. NUL cannot be lexed,
+/// so no call anywhere -- in a module, in the main filter, in `~/.jq` --
+/// can ever name one.
+///
+/// # The rule
+///
+/// The loader brackets every *run* of defs it wraps (each `include`, the
+/// `~/.jq` block, each `import`, and each per-origin group of dependencies
+/// wrapped into a body) between a begin and an end marker:
+///
+/// ```text
+/// def <NUL>run:begin:<id>[:<alias>]: .;   ...the run's defs...   def <NUL>run:end:<id>: .;
+/// ```
+///
+/// Because markers are ordinary `FuncDef`s, both walks in this file already
+/// push them onto their scope stack and truncate them at the right moment --
+/// no walk state has to be threaded through for this to work. Only *lookup*
+/// changes, and it changes once, in [`scan_scope`]: scanning innermost-first,
+/// an end marker opens a closed run (its defs are visible; they are wrapped
+/// *around* the current point) and a begin marker with no matching end is the
+/// **floor** -- everything below it belongs to some other module and is
+/// invisible from here.
+pub struct ModuleRun;
+
+/// One parsed marker name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMarker<'a> {
+    /// Opens a run. Carries the import alias, when the run is an `import`.
+    Begin { id: u32, alias: Option<&'a str> },
+    /// Closes the run with this id.
+    End { id: u32 },
+}
+
+/// The NUL-prefixed sigil no lexable identifier can start with.
+const RUN_BEGIN: &str = "\u{0}run:begin:";
+/// Sibling of [`RUN_BEGIN`].
+const RUN_END: &str = "\u{0}run:end:";
+
+impl ModuleRun {
+    /// The name of the def that opens run `id`, carrying `alias` when the
+    /// run is an `import` (so a bare sibling call inside it can be retried
+    /// as `alias::name` -- #2989).
+    #[must_use]
+    pub fn begin_marker(id: u32, alias: Option<&str>) -> String {
+        match alias {
+            Some(a) => alloc::format!("{RUN_BEGIN}{id}:{a}"),
+            None => alloc::format!("{RUN_BEGIN}{id}"),
+        }
+    }
+
+    /// The name of the def that closes run `id`.
+    #[must_use]
+    pub fn end_marker(id: u32) -> String {
+        alloc::format!("{RUN_END}{id}")
+    }
+
+    /// Parse a def name back into a marker, or `None` for an ordinary def.
+    ///
+    /// One definition shared by the loader (which writes them) and this
+    /// pass (which reads them), so the two can never drift on the spelling.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<RunMarker<'_>> {
+        // Cheapest possible rejection for the overwhelmingly common case:
+        // an ordinary def name cannot start with NUL, so one byte decides.
+        if !name.starts_with('\u{0}') {
+            return None;
+        }
+        if let Some(rest) = name.strip_prefix(RUN_BEGIN) {
+            let (id, alias) = match rest.split_once(':') {
+                Some((id, a)) => (id, Some(a)),
+                None => (rest, None),
+            };
+            return id.parse().ok().map(|id| RunMarker::Begin { id, alias });
+        }
+        name.strip_prefix(RUN_END)
+            .and_then(|id| id.parse().ok())
+            .map(|id| RunMarker::End { id })
+    }
+}
+
+/// What an innermost-first scope scan found, plus the boundary it stopped at.
+pub(crate) struct ScanResult<T> {
+    /// The matching entry, if any was visible from here.
+    pub(crate) hit: Option<T>,
+    /// The innermost open run at this point: its id, and its import alias
+    /// if it has one. `None` at the top level and in the main filter, which
+    /// sit below every end marker and so see everything.
+    pub(crate) run: Option<(u32, Option<String>)>,
+}
+
+/// The one place the module-scope floor is applied.
+///
+/// Walks `scope` innermost-first, handing each ordinary entry to `probe` and
+/// stopping at the first begin marker that has no matching end -- the floor.
+/// Returns whatever `probe` matched (if anything) together with the innermost
+/// open run, which callers need for the `import` retry (#2989) and for
+/// attributing a compile error to the module it came from.
+///
+/// Both walks in this file share it, rather than each spelling the marker
+/// bookkeeping out: the file's own header already flags the two as the pair
+/// that must stay in lock-step, and "which names are visible here" is exactly
+/// the kind of duplicated predicate that diverges silently.
+fn scan_scope<'a, E, T>(
+    scope: &'a [E],
+    name_of: impl Fn(&'a E) -> &'a str,
+    mut probe: impl FnMut(&'a E) -> Option<T>,
+) -> ScanResult<T> {
+    let mut hit = None;
+    // Counts end markers seen but not yet matched by their begin. A run
+    // whose end we have already passed is *closed*: it is wrapped around
+    // this point, so its defs are visible and its begin is not a floor.
+    let mut closed = 0usize;
+    for entry in scope.iter().rev() {
+        match ModuleRun::parse(name_of(entry)) {
+            Some(RunMarker::End { .. }) => closed += 1,
+            Some(RunMarker::Begin { id, alias }) => {
+                if closed > 0 {
+                    closed -= 1;
+                } else {
+                    // An open run: this is the floor. Nothing below it is
+                    // visible from inside this module body.
+                    return ScanResult {
+                        hit,
+                        run: Some((id, alias.map(ToString::to_string))),
+                    };
+                }
+            }
+            None => {
+                if hit.is_none() {
+                    hit = probe(entry);
+                }
+            }
+        }
+    }
+    ScanResult { hit, run: None }
+}
+
 /// A lexical *variable* scope: the `$name`s (without the sigil) visible at a
 /// point in the tree — [`Scope`]'s sibling for #2734, tracked in the same
 /// walk rather than a separate pass (see [`check`]'s doc comment).
@@ -414,13 +594,19 @@ enum ScopeHit {
 
 /// Whether `(name, arity)` resolves against `scope`, and if so, which
 /// `def`'s body it reaches (or that it's a parameter). Innermost first,
-/// mirroring [`in_scope`].
-fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> Option<ScopeHit> {
-    scope
-        .iter()
-        .rev()
-        .find(|(n, a, _)| *a == arity && n == name)
-        .map(|(_, _, hit)| *hit)
+/// mirroring [`in_scope`], and stopping at the module-scope floor
+/// (see [`ModuleRun`]).
+///
+/// Also reports the innermost open run, so the caller can apply the same
+/// `alias::name` retry [`check`] does -- the two passes have to agree on
+/// which def a call reaches, or reachability and checking disagree about
+/// which bodies are compiled at all (#2951).
+fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> ScanResult<ScopeHit> {
+    scan_scope(
+        scope,
+        |(n, _, _)| n.as_str(),
+        |(n, a, hit)| (*a == arity && n == name).then_some(*hit),
+    )
 }
 
 /// Read-only twin of [`builtin_fallback_into_args`]: yields `fallback`'s own
@@ -537,7 +723,7 @@ fn build_call_graph(
         // reachable through a shadowed label (`def error: bogus; label
         // $out | 1`) is still compiled and reported like any other call.
         Expr::Label { body: inner, .. } => {
-            if let Some(ScopeHit::Def(target)) = reach_in_scope(scope, "error", 0) {
+            if let Some(ScopeHit::Def(target)) = reach_in_scope(scope, "error", 0).hit {
                 record_edge(target, graph);
             }
             build_call_graph(inner, scope, enclosing, graph, roots);
@@ -713,7 +899,27 @@ fn build_call_graph(
             } else {
                 args.len()
             };
-            match reach_in_scope(scope, name, arity) {
+            // #2989: inside an `import`ed module a def calls its sibling
+            // by the bare name it is written with, but the chain holds that
+            // sibling under `alias::name`. Retry the bare miss exactly as
+            // `check` does, so both passes agree on which def this call
+            // reaches -- if only `check` retried, the edge would be missing
+            // here and the target body would look unreachable and never be
+            // compiled at all.
+            let scan = reach_in_scope(scope, name, arity);
+            let scan = match (&scan.hit, &scan.run) {
+                (None, Some((_, Some(alias)))) => {
+                    let qualified = alloc::format!("{alias}::{name}");
+                    let retry = reach_in_scope(scope, &qualified, arity);
+                    if retry.hit.is_some() {
+                        retry
+                    } else {
+                        scan
+                    }
+                }
+                _ => scan,
+            };
+            match scan.hit {
                 Some(hit) => {
                     if let ScopeHit::Def(target) = hit {
                         record_edge(target, graph);
@@ -919,9 +1125,19 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
         .any(|&(n, a)| a == arity && n == name)
 }
 
-/// Whether `(name, arity)` resolves against `scope`, innermost first.
-fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
-    scope.iter().rev().any(|(n, a)| *a == arity && n == name)
+/// Whether `(name, arity)` resolves against `scope`, innermost first,
+/// stopping at the module-scope floor (see [`ModuleRun`]).
+///
+/// Returns the innermost open run alongside the hit, which the caller needs
+/// twice: to retry a bare miss as `alias::name` inside an `import`ed module
+/// (#2989), and to attribute the resulting compile error to the module the
+/// call was written in rather than to `<top-level>` (#2951).
+fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
+    scan_scope(
+        scope,
+        |(n, _)| n.as_str(),
+        |(n, a)| (*a == arity && n == name).then_some(()),
+    )
 }
 
 /// Whether `$name` resolves against `var_scope`, innermost first (mirrors
@@ -1211,7 +1427,7 @@ fn check(
         // shadowable-or-untouched gate).
         Expr::Label { name: _, body } => {
             check(body, scope, var_scope, errors, reachable);
-            if in_scope(scope, "error", 0) {
+            if in_scope(scope, "error", 0).hit.is_some() {
                 let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
                 **body = Expr::Try {
                     expr: Box::new(old_body),
@@ -1501,7 +1717,26 @@ fn check(
             } else {
                 args.len()
             };
-            if in_scope(scope, name, arity) {
+            let scan = in_scope(scope, name, arity);
+            // #2989: a def inside an `import`ed module calls its siblings by
+            // the bare name it is written with, but the loader namespaced
+            // them to `alias::name`. Retry the bare miss under the innermost
+            // open run's alias, and on a hit rename the call in place -- this
+            // is already the `&mut` walk that rewrites #2036's shadow
+            // candidates, so evaluation then finds the namespaced def with no
+            // second pass and no evaluator change.
+            let aliased = match (&scan.hit, &scan.run) {
+                (None, Some((_, Some(alias)))) => {
+                    let qualified = alloc::format!("{alias}::{name}");
+                    in_scope(scope, &qualified, arity).hit.map(|()| qualified)
+                }
+                _ => None,
+            };
+            let resolved = scan.hit.is_some() || aliased.is_some();
+            if let Some(qualified) = aliased {
+                *name = qualified;
+            }
+            if resolved {
                 if let Some(fallback) = builtin_fallback.take() {
                     *args = builtin_fallback_into_args(*fallback);
                 }
@@ -1521,6 +1756,7 @@ fn check(
                 errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
+                    origin: scan.run.map(|(id, _)| id),
                 }));
             }
         }
