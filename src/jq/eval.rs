@@ -34873,9 +34873,20 @@ pub(crate) struct RecurseWalkEnd {
 /// does), each native level keeps its node's temporary document alive while
 /// its children's subtrees run, so live reindexed input is bounded by the
 /// sum of the subtree sizes along the current path rather than one node's.
-/// Measured in release, time unchanged: flat on a 10 MB `users` document,
-/// +11% peak on a 10 MB `nested` one (the root's reindex outlives its first
-/// child's), +30% on a 200-deep chain holding its whole bulk at the leaf.
+/// Measured in release, time unchanged; flat on a 10 MB `users` document,
+/// +11% peak on a 10 MB `nested` one (the root's reindex outlives its
+/// first child's), +30% on a 200-deep object chain (`{"k":v,"i":i}`) with a
+/// leaf of 10,000 100-character strings (~1 MB; 1.0 GB -> 1.3 GB).
+///
+/// The overhead is a roughly fixed number of bytes from the native window's
+/// overlapping subtree retention, so its *percentage* depends on how much
+/// of that fixed cost the rest of the document dilutes. A scaling curve on
+/// a second shape -- nested single-element arrays (`.[]?`) with a fixed
+/// 5 MB leaf, at depths spanning the native/queued boundary
+/// ([`RECURSE_NATIVE_STACK_BYTES`]) -- shows this directly: +30% at 20
+/// levels (fully native), +18% at 40 (the boundary), +13% at 100, +7% at
+/// 200 (mostly queued past the budget), the ratio falling as the queued
+/// (unchanged) portion of the walk grows.
 pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
