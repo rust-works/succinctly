@@ -116,6 +116,23 @@ pub(crate) fn stream_bytes(
         .skip(bom_prefix(raw_bytes).consumed)
 }
 
+/// [`stream_bytes`], with each byte's offset in the *undecorated* stream --
+/// BOM bytes counted, though (as there) never yielded.
+///
+/// Absolute offsets, so a caller can compare one against a position it
+/// worked out itself over the same sources: a file boundary, a newline.
+/// Numbering the yielded bytes from zero instead would silently shift
+/// every offset by the BOM's width.
+fn indexed_stream_bytes(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+) -> impl Iterator<Item = (usize, u8)> + '_ {
+    raw_bytes
+        .iter()
+        .flat_map(|(_, raw)| raw.iter().copied())
+        .enumerate()
+        .skip(bom_prefix(raw_bytes).consumed)
+}
+
 /// Hands `emit` every `jq: ignoring parse error: ...` line real jq would
 /// write for this `--seq` stream, in order.
 ///
@@ -123,7 +140,10 @@ pub(crate) fn stream_bytes(
 /// byte, and collecting those first cost ~140x the input in peak RSS
 /// (2 MB of `}` measured at 286 MB, against jq's 2.4 MB). Streaming them
 /// keeps the reader flat.
-pub(crate) fn for_each_warning(raw_bytes: &[(Option<usize>, Vec<u8>)], emit: &mut dyn FnMut(&str)) {
+pub(crate) fn for_each_warning(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    emit: &mut dyn FnMut(&str),
+) -> Option<usize> {
     let bom = bom_prefix(raw_bytes);
     // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
     // `jv_parser_next` -- including the call for the empty final buffer
@@ -139,7 +159,18 @@ pub(crate) fn for_each_warning(raw_bytes: &[(Option<usize>, Vec<u8>)], emit: &mu
         == Some(b'\n');
     let mut reader = Reader::new(bom, emit);
     reader.suppress_eof_warning = bom.malformed && ends_with_newline;
-    reader.run(stream_bytes(raw_bytes).enumerate());
+    reader.run(indexed_stream_bytes(raw_bytes));
+    // The same pass answers `--seq -s`'s EOF-location question; see
+    // [`last_parse_error_offset`], which is this function with the
+    // warnings thrown away.
+    let total = raw_bytes.iter().map(|(_, raw)| raw.len()).sum();
+    reader.last_warning_offset.map(|offset| {
+        if reader.last_warning_at_eof {
+            total
+        } else {
+            offset
+        }
+    })
 }
 
 /// Byte ranges of the values jq yields from one complete `--seq` stream.
@@ -162,26 +193,30 @@ pub(crate) fn value_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 /// whether real jq still has a `file:line` to point a runtime error at, or
 /// answers `<unknown>`; see
 /// [`super::jq_runner::seq_stream_trailing_record_is_dropped`], which owns
-/// the rule and the reasoning. Offsets are into `bytes` and index the same
-/// UTF-8-normalized stream [`value_ranges`] reads, so a caller can compare
-/// one against a position it computed itself (a file boundary, a newline)
-/// in that same buffer.
+/// the rule and the reasoning.
 ///
-/// An `at EOF` diagnostic is recorded at `bytes.len()` -- [`Reader::run`]
-/// advances `offset` past the last byte before calling [`Reader::finish`],
-/// so "detected at real EOF" sorts after every byte, which is exactly how
-/// the caller's comparison needs it.
-pub(crate) fn last_parse_error_offset(bytes: &[u8]) -> Option<usize> {
-    let bom = bom_prefix_from(bytes.iter().copied());
-    let mut ignore = |_: &str| {};
-    let mut reader = Reader::new(bom, &mut ignore);
-    // Same suppression [`for_each_warning`] applies, and for the same
-    // reason: under a malformed BOM jq wipes its accumulated state before
-    // the EOF branch can report on it, so no error is returned to the
-    // caller and the position survives.
-    reader.suppress_eof_warning = bom.malformed && bytes.last() == Some(&b'\n');
-    reader.run(bytes.iter().copied().enumerate().skip(bom.consumed));
-    reader.last_warning_offset
+/// Literally [`for_each_warning`] with the warnings thrown away -- the
+/// stderr diagnostics and this question are the same walk, and the wired
+/// call site runs it once and uses the answer twice rather than paying for
+/// a second pass over the whole stream.
+///
+/// Takes the same raw, pre-UTF-8-substitution sources that function does,
+/// and for the same reason -- a substituted byte is a 3-byte U+FFFD,
+/// which moves every offset *and* can masquerade as a malformed BOM, whose
+/// handling above changes what the reader treats as a record at all.
+/// Offsets are absolute in that raw stream (BOM bytes included in the
+/// count, though never scanned), so a caller can compare one against a
+/// position it computed itself -- a file boundary, a newline -- over the
+/// same sources.
+///
+/// An `at EOF` diagnostic is reported at the stream's length, so that
+/// "detected at real EOF" sorts after every byte -- which is exactly how
+/// the caller's comparison needs it, since EOF is by definition reached on
+/// the final buffer. That is taken from [`Reader::last_warning_at_eof`]
+/// rather than from the running offset: a stream consumed entirely as a
+/// BOM prefix scans no bytes at all, leaving the offset at 0.
+pub(crate) fn last_parse_error_offset(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<usize> {
+    for_each_warning(raw_bytes, &mut |_| {})
 }
 
 /// The kinds jq's parser distinguishes while classifying a failure. It
@@ -280,6 +315,14 @@ struct Reader<'a> {
     /// i.e. where jq's own parser was standing when it last returned an
     /// error to its caller. See [`last_parse_error_offset`].
     last_warning_offset: Option<usize>,
+    /// Whether that warning came from [`Reader::finish`], jq's EOF branch.
+    /// Tracked rather than inferred from the offset: a stream whose bytes
+    /// are *all* consumed as a BOM prefix scans nothing at all, so the
+    /// running offset never leaves 0 and cannot stand in for "at the end".
+    last_warning_at_eof: bool,
+    /// Set once the byte loop is done, so [`Reader::warn`] can tell jq's
+    /// EOF branch apart from a mid-stream detection.
+    at_eof: bool,
     emit: &'a mut dyn FnMut(&str),
 }
 
@@ -309,12 +352,15 @@ impl<'a> Reader<'a> {
             values: Vec::new(),
             suppress_eof_warning: false,
             last_warning_offset: None,
+            last_warning_at_eof: false,
+            at_eof: false,
             emit,
         }
     }
 
     fn warn(&mut self, body: &str) {
         self.last_warning_offset = Some(self.offset);
+        self.last_warning_at_eof = self.at_eof;
         (self.emit)(&format!("jq: ignoring parse error: {body}"));
     }
 
@@ -375,6 +421,7 @@ impl<'a> Reader<'a> {
             self.produced_value = false;
         }
         self.offset = eof_offset;
+        self.at_eof = true;
         self.finish();
     }
 
@@ -723,10 +770,13 @@ impl<'a> Reader<'a> {
         }
         let (line, column) = (self.line, self.column);
         if self.st == St::WaitingForRs {
-            // #1525's template. Unreachable from the wired call site,
-            // which routes a stream with no RS byte to
-            // `seq_no_rs_byte_warning` instead, but kept so this model
-            // stands on its own.
+            // #1525's template. The *stderr* call site never reaches this
+            // -- `for_each_warning` routes a stream with no RS byte to
+            // `seq_no_rs_byte_warning` instead -- but
+            // `last_parse_error_offset` does, and depends on it: this arm
+            // is what makes an RS-less stream (down to an empty one, which
+            // jq abandons just the same) answer `<unknown>` rather than a
+            // position. Not dead code.
             self.warn(&format!(
                 "Unfinished abandoned text at EOF at line {line}, column {column}"
             ));

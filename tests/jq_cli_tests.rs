@@ -34219,6 +34219,127 @@ fn test_jq_seq_slurp_eof_location_follows_last_parse_error_2947() -> Result<()> 
     Ok(())
 }
 
+/// [`run_jq_over_files`], for sources that are not valid UTF-8.
+///
+/// The `&str` form cannot express the bytes #2947's own reader walks --
+/// a lone `\x80`, or a BOM cut in half across a file boundary -- and
+/// writing them as `\u{80}`/`\u{feff}` silently substitutes *valid*
+/// encodings (`C2 80`, a whole `EF BB BF`) that exercise nothing.
+fn run_jq_over_byte_files(
+    args: &[&str],
+    contents: &[&[u8]],
+) -> Result<(String, String, i32, Vec<String>)> {
+    let files: Vec<NamedTempFile> = contents
+        .iter()
+        .map(|body| -> Result<NamedTempFile> {
+            let mut f = NamedTempFile::new()?;
+            f.write_all(body)?;
+            Ok(f)
+        })
+        .collect::<Result<_>>()?;
+    let paths: Vec<String> = files
+        .iter()
+        .map(|f| f.path().to_string_lossy().into_owned())
+        .collect();
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.extend(paths.iter().map(String::as_str));
+    let (stdout, stderr, code) = run_jq_full(&argv, None).expect("byte-level location repro runs");
+    Ok((stdout, stderr, code, paths))
+}
+
+/// #2947, on the two axes a record-shaped view of the question hides: the
+/// stream jq's reader actually walks is **raw bytes**, and jq's buffer is
+/// 4 KiB, not a line. All expectations are jq 1.7.1's own live output.
+///
+/// The three groups guard different things, which is worth keeping
+/// straight when one of them fails:
+///
+/// - The **raw-byte** and **split-BOM** groups already pass on #2947's
+///   parent. They pin behaviour an intermediate version of #2947 broke, by
+///   handing the reader the decoded text (which substitutes an invalid byte
+///   for something that reads as a malformed BOM) and by leaning on the
+///   reader's running offset to mean "at the end" (which a stream consumed
+///   entirely as a BOM never advances). Both were found by review.
+/// - The **4 KiB buffer** group fails on the parent: that one is a
+///   divergence this issue fixes.
+#[test]
+fn test_jq_seq_slurp_eof_location_reads_raw_bytes_and_4k_buffers_2947() -> Result<()> {
+    // An invalid byte becomes a 3-byte U+FFFD once the input is decoded,
+    // and `EF BF` is a *malformed BOM prefix* to the reader -- which flips
+    // it out of `WaitingForRs` and makes it read the replacement character
+    // as a record. Handing the reader the decoded text therefore invented a
+    // parse error, in both directions: `\x80\n` gained a line where jq has
+    // none, and `\x80\x1e` lost the line jq reports.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_byte_files(&["--seq", "-s", "-c", "input_line_number"], &[b"\x80\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    // `--seq` RS-prefixes output too (RFC 7464).
+    assert_eq!(stdout, "\x1e0\n", "{stderr}");
+
+    let (_, stderr, code, paths) =
+        run_jq_over_byte_files(&["--seq", "-s", "-c", r#"error("x")"#], &[b"\x80\x1e"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert_eq!(
+        stderr.lines().last(),
+        Some(format!("jq: error (at {}:0): x", paths[0]).as_str()),
+        "{stderr}"
+    );
+
+    // A *complete* BOM split across files leaves the reader scanning no
+    // bytes at all, so its running offset never leaves zero and cannot
+    // stand in for "at the end". jq abandons the stream either way -- as it
+    // does the unsplit spelling, the control that isolates the split.
+    let whole: &[&[u8]] = &[b"\xef\xbb\xbf"];
+    let split: &[&[u8]] = &[b"\xef", b"\xbb\xbf"];
+    for files in [whole, split] {
+        let (_, stderr, code, _paths) =
+            run_jq_over_byte_files(&["--seq", "-s", "-c", r#"error("x")"#], files)?;
+        assert_eq!(code, 5, "{files:?}: {stderr}");
+        assert_eq!(
+            stderr.lines().last(),
+            Some("jq: error (at <unknown>): x"),
+            "{files:?}: {stderr}"
+        );
+    }
+
+    // jq refills through `fgets(buf, sizeof(buf), f)` on a `char buf[4096]`,
+    // so a chunk ends at a newline *or* after 4095 bytes. At exactly 4095
+    // `fgets` stops on the size limit rather than on EOF, so a further
+    // (empty) buffer follows and the position survives -- one byte less and
+    // the same stream has nothing left to refill from. No newline anywhere
+    // in either, which is what isolates the buffer size as the cause.
+    for (total, line) in [(4094usize, None), (4095, Some(0))] {
+        let stream = format!("\x1e[0,]{}", " ".repeat(total - 5));
+        let (_, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[&stream])?;
+        assert_eq!(code, 5, "total {total}: {stderr}");
+        let location = line.map_or_else(
+            || "<unknown>".to_string(),
+            |line| format!("{}:{line}", paths[0]),
+        );
+        assert_eq!(
+            stderr.lines().last(),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "total {total}: {stderr}"
+        );
+    }
+
+    // ... and the failure has to land in that *last* chunk to matter: the
+    // same malformed record pushed past the first 4095-byte boundary is
+    // `<unknown>` again.
+    let stream = format!("{}\x1e[0,]", " ".repeat(4095));
+    let (_, stderr, code, _paths) =
+        run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[&stream])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert_eq!(
+        stderr.lines().last(),
+        Some("jq: error (at <unknown>): x"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// #2947, across a file boundary: the final `fgets` buffer is measured from
 /// the *last file's* own start, not the stream's.
 ///
