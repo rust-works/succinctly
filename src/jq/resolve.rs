@@ -420,7 +420,9 @@ type Scope = Vec<(String, usize)>;
 ///   job, not the loader's. Rejected as unsound, not merely expensive.
 ///
 /// What is left is to encode the boundary in a value the chain already
-/// carries: a def's own name. A marker is a real `Expr::FuncDef` with an
+/// carries: a def's own name. See `docs/adrs/adr-0023.md` for the full
+/// decision, including why symbolic binding at load time is the eventual
+/// answer and why nothing here blocks it. A marker is a real `Expr::FuncDef` with an
 /// `Identity` body, whose name begins with a NUL byte. NUL cannot be lexed,
 /// so no call anywhere -- in a module, in the main filter, in `~/.jq` --
 /// can ever name one.
@@ -438,7 +440,8 @@ type Scope = Vec<(String, usize)>;
 /// Because markers are ordinary `FuncDef`s, both walks in this file already
 /// push them onto their scope stack and truncate them at the right moment --
 /// no walk state has to be threaded through for this to work. Only *lookup*
-/// changes, and it changes once, in [`scan_scope`]: scanning innermost-first,
+/// changes, and it changes once, in this module's own `scan_scope` (private,
+/// so not linked here): scanning innermost-first,
 /// an end marker opens a closed run (its defs are visible; they are wrapped
 /// *around* the current point) and a begin marker with no matching end is the
 /// **floor** -- everything below it belongs to some other module and is

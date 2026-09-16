@@ -6562,21 +6562,44 @@ kept dependency bodies) or the sealed module scope of
 [#2951](https://github.com/rust-works/succinctly/issues/2951), which subsumes it; the
 second row additionally needs a module's own body resolved at load time, the way jq
 reports it against the module's own file.
+
+**#2951 landed the mechanism that subsumes this, but deliberately did not apply it here.**
+Its run markers seal a *run* of wrapped defs from everything below it; bracketing the
+per-body dependency runs too would close this gap's capture route. Per #2951's own plan
+that flips the first and third rows above from a wrong answer to a compile error —
+`c/0 is not defined` and `g/0 is not defined` — which is still not jq's answer, so it was
+left out rather than trading one divergence for another inside a PR about a different
+axis. Applying the bracket in `load_and_bind_module` is now a small change; deciding
+whether an error is an improvement over a wrong value here is the part that needs a
+decision.
 `test_dependency_capture_by_the_including_defs_scope_2962` (`tests/jq_cli_tests.rs`) pins
 all three so a change to the mechanism cannot make them worse unnoticed.
 
-### Two module-scope gaps that are genuinely open
+### Module-scope gaps that are genuinely open
 
 Found while closing #2865, filed rather than recorded as divergences: a dependency named
 after a builtin cannot shadow that builtin *inside* the module body, because a module's
 own source is parsed with no shadow-candidate seeding
-([#2950](https://github.com/rust-works/succinctly/issues/2950)); and a module body can see
-names it should not — `~/.jq`'s defs, and sibling `include`d modules' defs in a
-declaration-order-dependent way — because every module is inlined into one flat def chain
-([#2951](https://github.com/rust-works/succinctly/issues/2951)). Data imports
+([#2950](https://github.com/rust-works/succinctly/issues/2950)). Data imports
 (`import "f" as $d;`) are also still unimplemented: #2865 records the `$` on `Import::data`
 and resolves the file so a typo is still jq's own `module not found`, but binding the
 variable is [#2956](https://github.com/rust-works/succinctly/issues/2956).
+
+**A module body seeing names it should not** — `~/.jq`'s defs, and sibling `include`d and
+`import`ed modules' defs in a declaration-order-dependent way — **is closed**
+([#2951](https://github.com/rust-works/succinctly/issues/2951)). The loader now brackets
+every run of defs it wraps between two marker defs whose names begin with a NUL byte, and
+`resolve.rs` treats an unmatched begin marker as a scope floor. See
+[ADR-0023](../../adrs/adr-0023.md) for why the boundary is encoded that way rather than as
+a field on `Expr::FuncDef`, a side table, or name mangling.
+
+What remains of that area is diagnostic detail, not scope: a module-body compile error
+names the module's own canonical file, exactly as jq does, but not jq's trailing
+`, line N:` or its echo of the offending source line
+([#2991](https://github.com/rust-works/succinctly/issues/2991)). Two further pre-existing
+divergences in the same reporter are unmeasured and unfiled as their own oracle matrices:
+jq reports module errors in *reverse* include order, and a main-*body* error suppresses
+def errors entirely.
 
 ## Provenance
 
