@@ -23320,7 +23320,29 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             yq_targets.is_none(),
             "jq mode never prepares yq assign targets (#2481)"
         );
-        return eval_assign_streaming::<W, S>(path_expr, &input, rhs_values, terminal, optional);
+        let value = rhs_values
+            .into_iter()
+            .next()
+            .expect("gated on exactly one RHS output");
+        return eval_assign_streaming::<W, S>(
+            path_expr,
+            &input,
+            terminal,
+            optional,
+            &mut |result, path| {
+                // `false, false` for the two yq no-op flags, as the eager route's
+                // own `yq_noop` computes to in jq mode.
+                //
+                // Cloned for *every* path, including the last. The eager route
+                // moves the value into its final path (`is_last_path`), which a
+                // streaming producer cannot know without looking ahead -- and
+                // looking ahead is precisely what must not happen here, since
+                // resolving path N+1 before writing path N is the divergence the
+                // streaming route exists to fix. The cost is exactly one extra
+                // clone per call, on a route already gated to computed paths.
+                set_path::<S>(result, path, value.clone(), false, false).map_err(EvalEscape::from)
+            },
+        );
     }
 
     // Resolve computed keys against the *original* document, before any
@@ -23518,6 +23540,66 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return suppress_or_raise(e, optional),
     };
 
+    // #2522: whether the filter reads its target's position, and the prefix
+    // it stands under -- see the eager loop below.
+    let positioned = needs_path_context(filter_expr)
+        && super::eval_generic::path_context_at_resolvable(filter_expr);
+
+    // #2974: jq's `|=` is `_modify(paths; f)`, a `reduce path(paths) as $p`
+    // that updates one path before asking for the next, so a filter that
+    // raises stops the generator -- `(.|stderr)[(0,1):(2,3)] |= 99` on
+    // `[10,20,30]` fires the target once in jq 1.7.1, not four times -- and
+    // the filter's own side effects interleave with the paths':
+    // `.[(0,1)|debug("p")] |= debug("f")` writes `p f p f`, not `p p f f`.
+    // That second half is visible without any failure at all, which is also
+    // why `(.[] | select(.a > 0)) |= error("x")` on `[{"a":1},"s"]` must raise
+    // `x` from the first path rather than the resolver's `Cannot index
+    // string` from the second.
+    //
+    // `eval_assign`'s gate, minus its right-side count (`|=` has no right
+    // side to fork over), plus two exclusions of this operator's own:
+    //
+    // - `skip_absent_paths`, `sort_keys(f)`'s pre-filter (#2855), needs every
+    //   path before any write. It is yq-only anyway.
+    // - A positioned filter that reads `parent` needs `pre_update`, the
+    //   document with every target vivified before any filter runs. `parent`
+    //   is a succinctly extension with no jq oracle, so that shape keeps the
+    //   eager route rather than invent an ordering.
+    if S::TAG == EvalTag::Jq
+        && !skip_absent_paths
+        && !(positioned && reads_parent(filter_expr))
+        && needs_path_prepass(path_expr)
+        && assignment_path_needs_streaming(path_expr)
+    {
+        let base = if positioned {
+            super::eval_generic::current_path_base()
+        } else {
+            Vec::new()
+        };
+        let pristine = result.clone();
+        let outcome =
+            stream_path_writes::<S>(path_expr, &pristine, &mut result, &mut |result, path| {
+                let pos = positioned.then(|| UpdatePos {
+                    path: base.clone(),
+                    base_len: base.len(),
+                    pre: None,
+                });
+                // `false` for `scalar_noop`, as the eager route computes it in jq
+                // mode.
+                update_path::<S>(result, path, filter_expr, false, false, pos.as_ref())
+                    .map(|_wrote| ())
+            });
+        return match outcome {
+            StreamedWrites::Done => QueryResult::Owned(result),
+            StreamedWrites::ResolutionFailed(escape) | StreamedWrites::WriteFailed(escape) => {
+                match escape {
+                    EvalEscape::Error(_) if optional => QueryResult::None,
+                    other => other.into(),
+                }
+            }
+        };
+    }
+
     // Computed keys resolve against the original document, before any update.
     //
     // `optional` is `|=`'s *own* `?` (`(.a |= f)?`) -- see `eval_assign`'s
@@ -23595,8 +23677,6 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path_base`) plus the components `update_path` walks. Both the snapshot
     // and the gate are paid only for a filter that actually reads a position
     // -- an ordinary `.a |= . + 1` clones nothing and resolves nothing.
-    let positioned = needs_path_context(filter_expr)
-        && super::eval_generic::path_context_at_resolvable(filter_expr);
     let base = if positioned {
         super::eval_generic::current_path_base()
     } else {
@@ -24233,14 +24313,18 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
     }
 }
 
-/// `eval_assign`'s demand-driven write loop (#2267): resolve one path,
-/// apply its write, and stop the path generator the moment a write fails.
+/// The demand-driven write loop for a single-output assignment (#2267, and
+/// #2974 for `op=`/`//=`): resolve one path, apply its write, and stop the
+/// path generator the moment a write fails.
 ///
-/// jq's `reduce path(paths) as $p (.; setpath($p; $value))`, transposed
-/// from this evaluator's own resolve-every-path-then-write-them-all shape.
-/// Only reached under the three conditions stated at the call site; in
-/// particular `rhs_values` always holds exactly one output here, which is
-/// why there is no RHS fork left to do and the result is a single document.
+/// jq's `reduce path(paths) as $p (.; setpath($p; $value))` (`=`) and
+/// `$value as $tmp | _modify(paths; . op $tmp)` (`op=`), transposed from this
+/// evaluator's own resolve-every-path-then-write-them-all shape. Only reached
+/// under the three conditions stated at `eval_assign`'s call site; in
+/// particular the right side has exactly one output here, already folded
+/// into `write`, which is why there is no RHS fork left to do and the result
+/// is a single document. `|=` shares the loop itself,
+/// [`stream_path_writes`], and shapes its own result.
 ///
 /// **Two documents, not one.** `pristine` is what the path generator
 /// resolves against and must stay unmutated for the whole call; `result` is
@@ -24257,8 +24341,9 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
 /// peak RSS): `.[(0,1)] = 0` goes 74.8 MB -> 88.5 MB, **+18%**. That is the
 /// price of the interleave, and it is charged only where a *second path*
 /// can exist: [`assignment_path_needs_streaming`] keeps `.[$k] = 0` on the
-/// eager route (58.9 MB -> 57.5 MB, unchanged), and a static path,
-/// `del(...)` and `|=` are untouched either way. #2976 widened that gate
+/// eager route (58.9 MB -> 57.5 MB, unchanged), and a static path and
+/// `del(...)` are untouched either way. (#2974 put `|=` and `op=` on the same
+/// route, under the same gate.) #2976 widened that gate
 /// from "one inert path" to "at most one path", which took `.[length - 1]`,
 /// `.[(.a | stderr)]` and `(. | debug)[0]` off this route as well: each of
 /// them drops 18-21% (96 MB -> 78.5 MB on an M5 Max), landing exactly where
@@ -24270,9 +24355,9 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
 fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'a, W>,
-    rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
     optional: bool,
+    write: &mut dyn FnMut(&mut OwnedValue, &Expr) -> Result<(), EvalEscape>,
 ) -> QueryResult<'a, W> {
     // #1953: a non-decode-failure `to_owned` error respects `optional` like
     // every other fallible step at this boundary; only a genuine decode
@@ -24281,77 +24366,112 @@ fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(pristine) => pristine,
         Err(e) => return suppress_or_raise(e, optional),
     };
-    let value = rhs_values
-        .into_iter()
-        .next()
-        .expect("caller gated on exactly one RHS output");
     let mut result = pristine.clone();
-    // The first write that failed, parked because the sink's own answer is
-    // a [`Demand`] and cannot carry it out.
-    let mut write_escape: Option<EvalEscape> = None;
 
+    match stream_path_writes::<S>(path_expr, &pristine, &mut result, write) {
+        // A resolution escape discards everything, writes included -- the
+        // eager arm's `Err((_, escape))` did the same with its
+        // already-resolved prefix, and jq's `reduce` likewise discards its
+        // accumulator when the source generator raises.
+        StreamedWrites::ResolutionFailed(escape) => match escape {
+            EvalEscape::Error(_) if optional => QueryResult::None,
+            escape => escape.into(),
+        },
+        // A failed write is atomic for the whole call, exactly as
+        // `fork_rhs_over_paths` makes it atomic per RHS output: with one
+        // output there is no strictly-earlier document to survive it.
+        StreamedWrites::WriteFailed(escape) => match escape {
+            EvalEscape::Error(_) if optional => owned_vec_to_result(Vec::new()),
+            other => partial(Vec::new(), other.into()),
+        },
+        StreamedWrites::Done => {
+            let docs = vec![result];
+            match terminal {
+                None => owned_vec_to_result(docs),
+                Some(Control::Error(e)) => {
+                    if optional {
+                        owned_vec_to_result(docs)
+                    } else {
+                        partial(docs, Control::Error(e))
+                    }
+                }
+                Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+                Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
+            }
+        }
+    }
+}
+
+/// How [`stream_path_writes`] ended.
+enum StreamedWrites {
+    /// Every resolved path was written.
+    Done,
+    /// The path generator itself raised.
+    ResolutionFailed(EvalEscape),
+    /// A write raised, and the generator was stopped there.
+    WriteFailed(EvalEscape),
+}
+
+/// The loop every streaming write shares (#2267, #2974): resolve `path_expr`
+/// against `pristine` one path at a time, hand each to `write` against
+/// `result`, and stop the generator at the first write that raises.
+///
+/// `pristine` must stay unmutated for the whole call (see
+/// [`eval_assign_streaming`]'s "two documents" note); `result` accumulates.
+///
+/// **The parked escape is classified**, through [`stop_with_escape`]. `=`'s
+/// write can only raise a write error, but `|=`'s runs a whole filter, which
+/// can halt, break, or raise anything else, and a `?//` inside `path_expr`
+/// decides whether to retry from the stop the sink answers. An error or a
+/// `break` retries there in jq 1.7.1; a halt never does:
+///
+/// ```console
+/// $ echo '[10,20,30]' | jq '(. as $x ?// $y | (.|stderr)[(0,1)]) |= ("h"|halt_error(3))'
+///   (the target fires once, then halts)
+/// ```
+///
+/// A resolution escape outranks a parked write escape. The generator can
+/// only raise after the sink answered `Continue`, so the two cannot both
+/// describe the same stop; a resolution escape is the later event.
+///
+/// **Re-entrancy.** `write` runs inside the resolver's sink. Nothing the
+/// resolver holds across a sink call is reachable from an evaluated filter
+/// except the `?//` retry side channels, and those are consulted only at a
+/// retry decision, which happens after this sink has returned: a filter's
+/// own `?//` clears them while it runs, and the stop set here is recorded
+/// after the filter has finished.
+fn stream_path_writes<S: EvalSemantics>(
+    path_expr: &Expr,
+    pristine: &OwnedValue,
+    result: &mut OwnedValue,
+    write: &mut dyn FnMut(&mut OwnedValue, &Expr) -> Result<(), EvalEscape>,
+) -> StreamedWrites {
     // `alias_identity::redirect_paths`/`mirror_after_write`, which the eager
-    // route applies around this loop, are yq-only (#1351): no alias table is
+    // routes apply around their loops, are yq-only (#1351): no alias table is
     // ever installed in jq mode, so both are no-ops on this path and are
-    // deliberately absent rather than streamed. The gate above is what keeps
-    // that true.
+    // deliberately absent rather than streamed. The callers' jq-mode gate is
+    // what keeps that true.
     debug_assert!(
         !alias_identity::active(),
         "alias identity is yq-only (#1351); jq mode must not reach the streaming write"
     );
-
-    let resolved = resolve_dynamic_indexes_sink::<S>(path_expr, &pristine, false, &mut |path| {
-        // `false, false` for the two yq no-op flags, as the eager route's
-        // own `yq_noop` computes to in jq mode.
-        //
-        // Cloned for *every* path, including the last. The eager route
-        // moves the value into its final path (`is_last_path`), which a
-        // streaming producer cannot know without looking ahead -- and
-        // looking ahead is precisely what must not happen here, since
-        // resolving path N+1 before writing path N is the divergence this
-        // function exists to fix. The cost is exactly one extra clone per
-        // call, on a route already gated to computed paths.
-        match set_path::<S>(&mut result, &path, value.clone(), false, false) {
+    let mut parked: Option<Control> = None;
+    let resolved =
+        resolve_dynamic_indexes_sink::<S>(path_expr, pristine, false, &mut |path| match write(
+            result, &path,
+        ) {
             Ok(()) => Demand::Continue,
-            Err(e) => {
-                write_escape = Some(EvalEscape::from(e));
-                Demand::Stop
-            }
-        }
-    });
-
-    // A resolution escape discards everything, writes included -- the eager
-    // arm's `Err((_, escape))` did the same with its already-resolved
-    // prefix, and jq's `reduce` likewise discards its accumulator when the
-    // source generator raises.
-    if let Err(escape) = resolved {
-        return match escape {
-            EvalEscape::Error(_) if optional => QueryResult::None,
-            escape => escape.into(),
-        };
-    }
-    // A failed write is atomic for the whole call, exactly as
-    // `fork_rhs_over_paths` makes it atomic per RHS output: with one output
-    // there is no strictly-earlier document to survive it.
-    if let Some(escape) = write_escape {
-        return match escape {
-            EvalEscape::Error(_) if optional => owned_vec_to_result(Vec::new()),
-            other => partial(Vec::new(), other.into()),
-        };
-    }
-
-    let docs = vec![result];
-    match terminal {
-        None => owned_vec_to_result(docs),
-        Some(Control::Error(e)) => {
-            if optional {
-                owned_vec_to_result(docs)
-            } else {
-                partial(docs, Control::Error(e))
-            }
-        }
-        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
-        Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
+            Err(escape) => stop_with_escape(&mut parked, escape.into()),
+        });
+    // Reclaim the parked escape, clearing the side channel it set.
+    let parked = match resume_from_escape(parked, Flow::Exhausted) {
+        Flow::Escaped(control) => Some(EvalEscape::from(control)),
+        _ => None,
+    };
+    match (resolved, parked) {
+        (Err(escape), _) => StreamedWrites::ResolutionFailed(escape),
+        (Ok(()), Some(escape)) => StreamedWrites::WriteFailed(escape),
+        (Ok(()), None) => StreamedWrites::Done,
     }
 }
 
@@ -24452,7 +24572,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
     yq_targets: Option<YqAssignTargets>,
-    build_filter: impl FnMut(OwnedValue) -> Expr,
+    mut build_filter: impl FnMut(OwnedValue) -> Expr,
 ) -> QueryResult<'a, W> {
     let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
         rhs_values,
@@ -24463,6 +24583,39 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
+
+    // #2974: `op=`/`//=` is jq's `$value as $tmp | _modify(paths; . op
+    // $tmp)`, so like `=` (#2267) it stops the path generator at the first
+    // write that fails -- `(.|stderr)[(0,1)] += "x"` on `[1,2]` fires the
+    // target once in jq 1.7.1, not twice. The same three conditions as
+    // `eval_assign`'s, for the same reasons; a multi-output right side keeps
+    // the fork below, which is #2267's still-open re-resolution half.
+    if S::TAG == EvalTag::Jq
+        && rhs_values.len() == 1
+        && needs_path_prepass(path_expr)
+        && assignment_path_needs_streaming(path_expr)
+    {
+        debug_assert!(
+            yq_targets.is_none(),
+            "jq mode never prepares yq assign targets (#2481)"
+        );
+        let value = rhs_values
+            .into_iter()
+            .next()
+            .expect("gated on exactly one RHS output");
+        let filter = build_filter(value);
+        // `false, None`: `scalar_noop` is yq-only, and see the eager arm
+        // below for why this filter reads no target position.
+        return eval_assign_streaming::<W, S>(
+            path_expr,
+            &input,
+            terminal,
+            optional,
+            &mut |result, path| {
+                update_path::<S>(result, path, &filter, false, false, None).map(|_wrote| ())
+            },
+        );
+    }
 
     let (pristine, paths) = match yq_targets {
         // yq mode: already resolved and auto-created before the right side
