@@ -2827,15 +2827,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     return Ok(exit_code);
                 }
             }
-            // Process as JSON stream (handle multiple JSON values in one input)
-            let values = match find_json_values(raw) {
-                Ok(values) => values,
-                Err(offset) => {
-                    let at = InputLocation::at(filename.as_deref(), line_at(raw, offset));
-                    sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
-                    continue;
-                }
-            };
+            // Process as JSON stream (handle multiple JSON values in one input).
+            // Every value before a malformed one is still processed, and the
+            // parse error is reported after them, as jq's incremental parser
+            // does (#2961) -- see the report below the per-value loop.
+            let (values, split_error) = split_json_values(raw);
             // `values`' end offsets are non-decreasing (find_json_values is
             // a single left-to-right scan), so one LineCounter shared across
             // every value in this file keeps the whole loop O(n) (#1213).
@@ -3058,6 +3054,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     return Ok(code);
                 }
             }
+            // The malformed value, reported only once everything before it
+            // has been processed. Moving on to the next file afterwards is
+            // the recorded #355 continue-past-error divergence (jq stops the
+            // whole stream); only the lost prefix was #2961.
+            if let Some(offset) = split_error {
+                let at = InputLocation::at(filename.as_deref(), line_at(raw, offset));
+                sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
+            }
         }
     } else {
         // The materializing path: reads every document up front into a
@@ -3096,29 +3100,30 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             get_input_files(&args).is_empty(),
             std::io::stdin().is_terminal(),
         );
-        let (inputs, locations) = match get_inputs(&args, force_read_under_null_input) {
-            Ok(Ok(inputs)) => inputs,
-            // A malformed or undecodable document is a data error, so it goes
-            // out in jq's own diagnostic shape at exit 5 rather than through
-            // `anyhow` at exit 1 with an `Error:` prefix jq never prints
-            // (#1194). Everything else here really is I/O and keeps the
-            // `anyhow` path.
-            //
-            // Line 0, the same placeholder the lazy path prints when it has
-            // no better position: this route reads the whole stream up front
-            // and fails before any per-document offset exists. Reusing the
-            // existing shape beats introducing a second rendering.
-            Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
-                Ok(MalformedJsonError(err)) => {
-                    let files = get_input_files(&args);
-                    let file = files.first().map(|p| p.to_string_lossy().to_string());
-                    sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
-                    return Ok(DiagStyle::Jq.error_exit_code());
-                }
-                Err(e) => return Err(e),
-            },
-            Err(exit_code) => return Ok(exit_code), // Validation error
-        };
+        let (inputs, locations, trailing_error) =
+            match get_inputs(&args, force_read_under_null_input) {
+                Ok(Ok(inputs)) => inputs,
+                // A malformed or undecodable document is a data error, so it goes
+                // out in jq's own diagnostic shape at exit 5 rather than through
+                // `anyhow` at exit 1 with an `Error:` prefix jq never prints
+                // (#1194). Everything else here really is I/O and keeps the
+                // `anyhow` path.
+                //
+                // Line 0, the same placeholder the lazy path prints when it has
+                // no better position: this route reads the whole stream up front
+                // and fails before any per-document offset exists. Reusing the
+                // existing shape beats introducing a second rendering.
+                Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
+                    Ok(MalformedJsonError(err)) => {
+                        let files = get_input_files(&args);
+                        let file = files.first().map(|p| p.to_string_lossy().to_string());
+                        sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
+                        return Ok(DiagStyle::Jq.error_exit_code());
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(exit_code) => return Ok(exit_code), // Validation error
+            };
 
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
@@ -3159,7 +3164,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     .zip(locations.per_value().iter().copied())
                     .map(|(v, (src, line))| (v, src, line))
                     .collect();
-                jq::seed_remaining_inputs(queue, locations.exhausted(args.slurp));
+                // A stream that turned malformed partway queues its parse
+                // error behind the documents before it (#2961).
+                jq::seed_remaining_inputs_with_error(
+                    queue,
+                    locations.exhausted(args.slurp),
+                    // As a plain error: jq's `try input catch .` catches a
+                    // parse error like any other, where the materializer's
+                    // own error is tagged as an uncatchable decode failure.
+                    trailing_error.map(|t| (EvalError::new(t.error.message), (t.source, t.line))),
+                );
             }
 
             if args.null_input {
@@ -3209,7 +3223,24 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // the very evaluation this loop kicks off, and jq's marker
                 // names where the parser ended up, not where this document
                 // started (#1309, item 4).
-                while let Some(input) = jq::pop_remaining_input() {
+                //
+                // A parse error the stream ended in reaches this loop only if
+                // the filter's own `input` calls did not read it first: the
+                // loop reports it uncaught, at exit 5, and stops -- the prefix
+                // before it already ran, and nothing after it exists (#2961).
+                loop {
+                    let input = match jq::pop_input() {
+                        jq::InputPop::Document(input) => input,
+                        jq::InputPop::ParseError(error) => {
+                            sink.report(
+                                DiagStyle::Jq,
+                                &error,
+                                &ErrorAt::Live(&locations).resolve(),
+                            );
+                            break;
+                        }
+                        jq::InputPop::Exhausted => break,
+                    };
                     // Streaming, not collect-then-write (#1653) -- see
                     // `evaluate_input_streaming`.
                     evaluate_input_streaming(
@@ -3269,6 +3300,15 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     out.flush()?;
                     return Ok(code);
                 }
+            }
+            // The parse error the stream ended in, reported after the
+            // documents before it (#2961).
+            if let Some(t) = trailing_error {
+                sink.report(
+                    DiagStyle::Jq,
+                    &t.error,
+                    &locations.resolve(t.source, t.line),
+                );
             }
         }
     }
@@ -3432,12 +3472,26 @@ fn should_force_read_under_null_input(
     uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
 }
 
+/// A parse error that ended a JSON input stream after a clean prefix of
+/// documents (#2961): the error, and the `(source, line)` jq's marker names
+/// once its parser has stopped there.
+struct TrailingParseError {
+    error: EvalError,
+    source: u32,
+    line: u32,
+}
+
+/// What [`get_inputs`] read: every document, their locations, and -- when a
+/// JSON input stream turned malformed partway -- the parse error that ended
+/// it, to be raised only after the documents before it.
+type Inputs = (Vec<OwnedValue>, InputLocations, Option<TrailingParseError>);
+
 /// Get input values based on arguments.
 /// Returns Err(i32) for validation failures (exit code), Ok(Err) for other errors.
 fn get_inputs(
     args: &JqCommand,
     force_read_under_null_input: bool,
-) -> std::result::Result<Result<(Vec<OwnedValue>, InputLocations)>, i32> {
+) -> std::result::Result<Result<Inputs>, i32> {
     // Null input mode: use null as the single input -- unless the filter
     // itself uses `input`/`inputs`/`input_line_number` (#723), in which case
     // the caller passes `force_read_under_null_input: true` to fall through
@@ -3450,7 +3504,11 @@ fn get_inputs(
     // invocation's input value is.
     if args.null_input && !force_read_under_null_input {
         // jq prints `(at <unknown>)` under -n: there is no input to point at.
-        return Ok(Ok((vec![OwnedValue::Null], InputLocations::unknown())));
+        return Ok(Ok((
+            vec![OwnedValue::Null],
+            InputLocations::unknown(),
+            None,
+        )));
     }
 
     // Get input files
@@ -3685,11 +3743,13 @@ fn get_inputs(
         return Ok(Ok((
             vec![OwnedValue::String(combined)],
             InputLocations::single(at),
+            None,
         )));
     }
 
     // Process based on input mode
     let mut values = Vec::new();
+    let mut trailing_error: Option<TrailingParseError> = None;
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
     // genuinely join content across a file boundary -- real jq's own
@@ -3742,50 +3802,61 @@ fn get_inputs(
                     let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
                     validate_json_input(raw.as_bytes(), filename.as_deref())?;
                 }
-                // Parse as JSON stream
-                let parsed = match parse_json_stream(&raw) {
-                    Ok(p) => p,
-                    Err(e) => return Ok(Err(e)),
-                };
+                // Parse as JSON stream: the clean prefix, and the parse error
+                // that ended it if the stream turned malformed (#2961).
+                let (parsed, parse_error) = parse_json_stream_prefix(&raw);
+                // `--slurp` stays all-or-nothing: jq prints nothing for a
+                // slurped stream it could not finish parsing. The error goes
+                // out in jq's channel at exit 5, like every other malformed
+                // document, rather than through `anyhow` at exit 1.
+                if args.slurp {
+                    if let Some(error) = parse_error {
+                        return Ok(Err(anyhow::Error::from(MalformedJsonError(error))));
+                    }
+                }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
-                // `find_json_values` exists here only to feed
+                // The splitter exists here only to feed
                 // `locations.extend_from_ends`, so slurp mode skips that scan
                 // entirely rather than running it and discarding the result.
-                // Side effect: the divergence check below (`find_json_values`
-                // disagreeing with `parse_json_stream`/`serde_json`) no longer
-                // runs under `--slurp` either -- if the two validators were ever
-                // to disagree on some input, non-slurp mode would still raise
-                // the internal error below, but slurp mode would now silently
-                // proceed. Accepted: the comment above already treats that
-                // divergence as unreachable through this crate's public CLI
-                // surface, so this only narrows *where* an already-believed-dead
-                // safety net runs, not what output a real input can produce.
                 if !args.slurp {
-                    // `parse_json_stream` (above) already validated this exact
-                    // input successfully via `serde_json`, which is strictly
-                    // pickier than `find_json_values`'s own lenient heuristic
-                    // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
-                    // `find_json_values`'s RFC 8259 plus leading-zero *and*
-                    // leading-dot tolerance, #1171) -- so `find_json_values`
-                    // should never fail here in practice; unreachable through
-                    // this crate's own public CLI surface, not exercised by a
-                    // test for that reason (matching this codebase's established
-                    // convention for exhaustive-but-dead defensive arms, e.g.
-                    // #1064). Surfaced as an internal error rather than silently
-                    // reusing a stale/wrong offset list if the two validators
-                    // ever do diverge.
-                    let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
-                        Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
-                        Err(offset) => {
-                            return Ok(Err(anyhow::anyhow!(
-                                "internal error: find_json_values failed at byte {offset} \
-                                 after parse_json_stream already validated this input"
-                            )));
-                        }
-                    };
+                    // The splitter recognizes every span the parse above
+                    // produced a value for (it is the more lenient of the two,
+                    // and the prefix parse materializes from its spans), so
+                    // it cannot come up short here; unreachable through this
+                    // crate's own public CLI surface, and surfaced as an
+                    // internal error rather than silently reusing a stale or
+                    // wrong offset list if that ever stops holding (#1064).
+                    let (spans, _) = split_json_values(raw.as_bytes());
+                    if spans.len() < parsed.len() {
+                        return Ok(Err(anyhow::anyhow!(
+                            "internal error: the JSON splitter found {} values where the \
+                             stream parse found {}",
+                            spans.len(),
+                            parsed.len()
+                        )));
+                    }
+                    let ends: Vec<usize> = spans
+                        .iter()
+                        .take(parsed.len())
+                        .map(|&(_, end)| end)
+                        .collect();
                     locations.extend_from_ends(src, &raw, &ends, parsed.len());
                 }
                 values.extend(parsed);
+                // jq's parser stops at the first malformed value: nothing
+                // after it is read, this file or any later one, and the error
+                // is raised once the documents before it have been (#2961).
+                // Its marker names where the parser stood, which on a file
+                // read in one chunk is every newline in it (`printf '1 2
+                // {invalid} 3\n' | jq -n 'input,input,input'` reports line 1).
+                if let Some(error) = parse_error {
+                    trailing_error = Some(TrailingParseError {
+                        error,
+                        source: u32::try_from(src).unwrap_or(u32::MAX),
+                        line: u32::try_from(line_at(raw.as_bytes(), raw.len())).unwrap_or(u32::MAX),
+                    });
+                    break;
+                }
             }
 
             // Scoped to `!args.slurp` (#1541): under slurp, `locations` is left
@@ -3809,9 +3880,10 @@ fn get_inputs(
         Ok(Ok((
             vec![OwnedValue::Array(values)],
             InputLocations::single(at),
+            None,
         )))
     } else {
-        Ok(Ok((values, locations)))
+        Ok(Ok((values, locations, trailing_error)))
     }
 }
 
@@ -4206,6 +4278,22 @@ fn line_at(bytes: &[u8], end: usize) -> usize {
 /// produced `{}`/no output at all instead of an error (#1171) -- real jq
 /// itself stops at the first parse failure, not skip-and-continue.
 fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, usize> {
+    match split_json_values(bytes) {
+        (values, None) => Ok(values),
+        (_, Some(offset)) => Err(offset),
+    }
+}
+
+/// [`find_json_values`] without discarding what it found before a failure:
+/// every value span up to the first unrecognizable one, and that one's start
+/// offset if there was one.
+///
+/// jq's parser is incremental, so a malformed *later* value cannot retract
+/// the ones before it: `printf '{"ok":1}\n[1,2,' | jq -c .` prints
+/// `{"ok":1}` and then reports the parse error (#2961). The callers that
+/// emit values use this to do the same; the scan itself is unchanged, so the
+/// hot input path does exactly the work it did before.
+fn split_json_values(bytes: &[u8]) -> (Vec<(usize, usize)>, Option<usize>) {
     let mut values = Vec::new();
     let mut pos = 0;
 
@@ -4225,11 +4313,11 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
                 values.push((start, end));
                 pos = end;
             }
-            None => return Err(start),
+            None => return (values, Some(start)),
         }
     }
 
-    Ok(values)
+    (values, None)
 }
 
 /// Where the JSON token starting at `pos` ends, or `None` if no token can
@@ -4430,6 +4518,36 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
             }
         }
     }
+}
+
+/// [`parse_json_stream`] for a document input stream: every value before the
+/// first malformed one, and that one's error, rather than all or nothing
+/// (#2961).
+///
+/// Accepts exactly what [`parse_json_stream`] accepts value by value: the
+/// strict pass first, and on its failure the same splitter-plus-checked-
+/// materializer fallback. The only difference is what a failure keeps.
+/// A splitter failure reads `Invalid JSON text`, the wording the lazy path
+/// already reports for the same failure.
+fn parse_json_stream_prefix(s: &str) -> (Vec<OwnedValue>, Option<EvalError>) {
+    let s = s.trim();
+    if s.is_empty() {
+        return (vec![], None);
+    }
+    if let Ok(values) = parse_json_stream_strict(s) {
+        return (values, None);
+    }
+    let bytes = s.as_bytes();
+    let (spans, split_error) = split_json_values(bytes);
+    let mut values = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match json_bytes_to_owned_value_checked(&bytes[start..end]) {
+            Ok(value) => values.push(value),
+            Err(error) => return (values, Some(error)),
+        }
+    }
+    let error = split_error.map(|_| EvalError::new("Invalid JSON text"));
+    (values, error)
 }
 
 /// The `serde_json`-validated core of [`parse_json_stream`], split out so

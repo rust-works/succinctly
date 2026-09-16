@@ -57334,45 +57334,139 @@ fn test_raw_control_character_rejected_in_keys_and_nested_values_2878() -> Resul
     Ok(())
 }
 
-/// A document whose *second* value holds the control character is rejected
-/// whole: succinctly prints nothing, where jq prints the clean first value
-/// and then exits 5.
-///
-/// The exit code matches; the partial output does not. That difference is
-/// the document splitter's pre-existing all-or-nothing shape, not something
-/// #2878 introduced -- `{"ok":1}` followed by a *truncated* `[1,2,` behaves
-/// exactly the same way on `main`, and has for as long as the splitter has
-/// rejected truncated input. #2878 only routes one more input class into it.
+/// A document whose *second* value holds the control character still prints
+/// its clean first value, then reports the error at exit 5, as jq does
+/// (#2961). #2878 routed this input class into the document splitter's
+/// failure; the splitter used to discard the values before it.
 ///
 /// Asserted on stdout, not just the exit code, because an exit-code-only
-/// assertion would pass whether the clean prefix were printed or not, and
-/// which one happens is the whole content of this divergence (#2878 review).
+/// assertion would pass whether the clean prefix were printed or not.
 #[test]
-fn test_control_character_in_a_later_value_rejects_the_whole_document_2878() -> Result<()> {
-    let mut file = NamedTempFile::new()?;
-    file.write_all(b"{\"ok\":1}\n[\"a\x09b\"]\n")?;
-    file.flush()?;
-    let path = file.path().to_str().expect("temp path is utf-8");
-    let (stdout, _stderr, code) = run_jq_full(&["-c", ".", path], None)?;
-    assert_ne!(code, 0, "the document must be rejected");
-    assert_eq!(
-        stdout, "",
-        "succinctly rejects the document whole, printing no partial output"
+fn test_control_character_in_a_later_value_keeps_the_clean_prefix_2878_2961() -> Result<()> {
+    for body in [
+        &b"{\"ok\":1}\n[\"a\x09b\"]\n"[..],
+        &b"{\"ok\":1}\n[1,2,"[..],
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(body)?;
+        file.flush()?;
+        let path = file.path().to_str().expect("temp path is utf-8");
+        let (stdout, stderr, code) = run_jq_full(&["-c", ".", path], None)?;
+        assert_eq!(
+            code,
+            5,
+            "{:?}: stderr {stderr:?}",
+            String::from_utf8_lossy(body)
+        );
+        assert_eq!(
+            stdout,
+            "{\"ok\":1}\n",
+            "{:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    Ok(())
+}
+
+/// #2961: a JSON input stream that turns malformed partway keeps every value
+/// before the malformed one, on both input routes, where succinctly used to
+/// print nothing (or, on the materializing route, exit 1 through `anyhow`).
+///
+/// jq's model, which every row's stdout and exit code is captured from (jq
+/// 1.7.1): its parser is incremental, so the clean prefix is processed, then
+/// exactly one parse error is delivered -- uncaught from the driver loop (exit
+/// 5), or as an ordinary catchable error to `input`/`inputs` -- and nothing
+/// after it is read, including later files; a read after a caught one is
+/// `break`. Error *wording* is not compared (succinctly says `Invalid JSON
+/// text`, a recorded divergence); its channel is: `jq: error`, never `Error:`.
+#[test]
+fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
+    let fixture = |body: &str| -> Result<NamedTempFile> {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(body.as_bytes())?;
+        file.flush()?;
+        Ok(file)
+    };
+    let truncated = fixture("{\"ok\":1}\n[1,2,")?;
+    let member = fixture("1 2 {invalid} 3\n")?;
+    let unmatched = fixture("1 2 }")?;
+    let unterminated = fixture("1 2 \"abc")?;
+    let good = fixture("1\n2\n")?;
+    let path = |f: &NamedTempFile| f.path().to_str().expect("temp path is utf-8").to_string();
+    let (t1, t3, t4, t5, ok) = (
+        path(&truncated),
+        path(&member),
+        path(&unmatched),
+        path(&unterminated),
+        path(&good),
     );
 
-    // The pre-existing member of the same class, to keep this pinned as
-    // "the splitter's shape" rather than "something the control-character
-    // rule does".
-    let mut trunc = NamedTempFile::new()?;
-    trunc.write_all(b"{\"ok\":1}\n[1,2,")?;
-    trunc.flush()?;
-    let trunc_path = trunc.path().to_str().expect("temp path is utf-8");
-    let (trunc_stdout, _stderr, trunc_code) = run_jq_full(&["-c", ".", trunc_path], None)?;
-    assert_ne!(trunc_code, 0);
-    assert_eq!(
-        trunc_stdout, "",
-        "a truncated later value behaves identically, and predates #2878"
-    );
+    let rows: Vec<(Vec<&str>, &str, i32)> = vec![
+        // The lazy per-file route: identity raw bytes, M2, general, flags.
+        (vec!["-c", ".", &t1], "{\"ok\":1}\n", 5),
+        (vec!["-c", ".", &t4], "1\n2\n", 5),
+        (vec!["-c", ".", &t5], "1\n2\n", 5),
+        (vec!["-c", ".ok", &t1], "1\n", 5),
+        (vec!["-c", "tostring", &t4], "\"1\"\n\"2\"\n", 5),
+        (vec!["-c", "-e", ".", &t1], "{\"ok\":1}\n", 5),
+        (vec!["-c", "-S", ".", &t1], "{\"ok\":1}\n", 5),
+        (vec!["-c", ".", &ok, &t1], "1\n2\n{\"ok\":1}\n", 5),
+        (vec!["-c", "halt", &t3], "", 0),
+        // The materializing route: `--slurp` stays all-or-nothing, but in
+        // jq's channel at exit 5 rather than `anyhow`'s exit 1.
+        (vec!["-c", "-s", ".", &t1], "", 5),
+        (vec!["-c", "-s", ".", &t3], "", 5),
+        // `input`/`inputs`: the prefix, then one error.
+        (vec!["-nc", "input", &t1], "{\"ok\":1}\n", 0),
+        (vec!["-nc", "input", &t3], "1\n", 0),
+        (vec!["-nc", "input, input, input", &t3], "1\n2\n", 5),
+        (vec!["-nc", "[limit(2; inputs)]", &t3], "[1,2]\n", 0),
+        (vec!["-nc", "first(inputs)", &t3], "1\n", 0),
+        (vec!["-nc", "[inputs]", &t3], "", 5),
+        (vec!["-nc", "[inputs]", &t5], "", 5),
+        (vec!["-nc", "[inputs]", &t3, &ok], "", 5),
+        (vec!["-c", "input_line_number", &t4], "0\n0\n", 5),
+        (vec!["-c", "[., input]", &t3], "[1,2]\n", 5),
+        (vec!["-c", "[., (try input catch \"c\")]", &t1], "[{\"ok\":1},\"c\"]\n", 0),
+        (vec!["-c", "[., (try input catch \"c\")]", &t3], "[1,2]\n", 5),
+        (
+            vec!["-nc", "(try input catch null), (try input catch null), (try input catch null), (try input catch .)", &t3],
+            "1\n2\nnull\n\"break\"\n",
+            0,
+        ),
+        // Negative controls: a clean stream is unchanged on both routes.
+        (vec!["-c", ".", &ok], "1\n2\n", 0),
+        (vec!["-nc", "[inputs]", &ok], "[1,2]\n", 0),
+        (vec!["-c", "-s", ".", &ok], "[1,2]\n", 0),
+    ];
+    for (args, want_out, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_full(&args, None)?;
+        assert_eq!(
+            code, want_code,
+            "{args:?}: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert_eq!(stdout, want_out, "{args:?}: stderr {stderr:?}");
+        assert!(
+            !stderr.contains("Error:") && !stderr.contains("Caused by"),
+            "{args:?}: a malformed document is reported in jq's channel: {stderr:?}"
+        );
+        if want_code == 5 {
+            assert!(stderr.starts_with("jq: error"), "{args:?}: {stderr:?}");
+        }
+    }
+
+    // A read after the caught parse error is exhausted, and the marker stays
+    // at the malformed file's position (jq: `(at <file>:1)`).
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "(try input catch null), (try input catch null), (try input catch null), error(\"x\")",
+            &t3,
+        ],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("1\n2\nnull\n", 5));
+    assert!(stderr.ends_with(":1): x\n"), "{stderr:?}");
     Ok(())
 }
 
