@@ -14993,14 +14993,14 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 /// of its ancestor `Vec`, per position per step: O(depth) allocations and
 /// component clones where the step itself is O(1). Extending through this
 /// trait makes a step exactly one allocation for either trail.
-trait StepTrail<V: DocumentValue>: Sized {
+///
+/// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
+trait StepTrail<V: DocumentValue>: Clone {
     /// Components from the root to here; O(1).
     fn trail_depth(&self) -> usize;
     /// The trail one `component` below this one, taken from `from` -- the
     /// node standing at `self`.
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self;
-    /// The same trail, shared (an `Rc` bump).
-    fn share(&self) -> Self;
 }
 
 impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
@@ -15010,10 +15010,6 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 
     fn extend_from(&self, component: OwnedValue, _from: &PathNode<V>) -> Self {
         PathTrail::extend(self, component)
-    }
-
-    fn share(&self) -> Self {
-        Self::clone(self)
     }
 }
 
@@ -15123,10 +15119,6 @@ impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
             from: from.clone(),
             depth: self.depth() + 1,
         })))
-    }
-
-    fn share(&self) -> Self {
-        self.clone()
     }
 }
 
@@ -15297,7 +15289,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     }
     match expr {
         Expr::Identity => {
-            out.push((path.share(), node.clone()));
+            out.push((path.clone(), node.clone()));
             Ok(())
         }
         Expr::Paren(inner) => {
@@ -15614,7 +15606,7 @@ fn path_step_owned<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     for (component, child) in children {
         let next_path = match component {
             Some(component) => path.extend_from(component, node),
-            None => path.share(),
+            None => path.clone(),
         };
         out.push((next_path, PathNode::Owned(Rc::new(child))));
     }
@@ -15722,7 +15714,7 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     // review).
     assert_nesting_depth(path.trail_depth());
     let Some((first, rest)) = exprs.split_first() else {
-        out.push((path.share(), node.clone()));
+        out.push((path.clone(), node.clone()));
         return Ok(());
     };
     if rest.is_empty() {
