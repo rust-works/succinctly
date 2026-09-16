@@ -2116,6 +2116,10 @@ mod tests {
             [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
+                // Not inside any module run: these hand-built trees have no
+                // markers, so the floor is 0 and there is nothing to
+                // attribute the failure to (#2951).
+                origin: None,
             })]
         );
 
@@ -2143,6 +2147,10 @@ mod tests {
             [ResolveError::Call(UnresolvedCall {
                 name: "nosuchfn".into(),
                 arity: 0,
+                // Not inside any module run: these hand-built trees have no
+                // markers, so the floor is 0 and there is nothing to
+                // attribute the failure to (#2951).
+                origin: None,
             })]
         );
     }
@@ -2282,14 +2290,26 @@ mod tests {
     mod unbound_vars {
         use super::*;
 
-        /// Resolve a filter for *every* diagnostic ([`resolve_all`]), joining
-        /// them with `; ` for a compact assertion -- unlike [`resolve`]
-        /// above, which only ever needs the first.
+        /// Resolve a filter for *every* diagnostic ([`resolve_all`]), as
+        /// `Kind(message)` -- unlike [`resolve`] above, which only ever needs
+        /// the first.
+        ///
+        /// Renders each diagnostic's own `Display` (the text the runners
+        /// actually print) behind its kind, rather than `{:?}` of the whole
+        /// struct. The `Debug` form names every field, so it turned any
+        /// addition to a diagnostic's payload into a failure of a test that
+        /// is about *ordering and kind* and nothing else -- #2951's `origin`
+        /// did exactly that. What this test pins is that calls and variables
+        /// interleave by source position; the payload's shape is not part of
+        /// the claim.
         fn resolve_all_strs(filter: &str) -> Vec<String> {
             let mut expr = parse(filter).expect("filter must parse");
             resolve_all(&mut expr)
                 .into_iter()
-                .map(|e| format!("{e:?}"))
+                .map(|e| match e {
+                    ResolveError::Call(c) => format!("Call({c})"),
+                    ResolveError::Var(v) => format!("Var({v})"),
+                })
                 .collect()
         }
 
@@ -2485,9 +2505,9 @@ mod tests {
             assert_eq!(
                 resolve_all_strs("$bar, foo, $baz"),
                 [
-                    r#"Var(UnboundVar { name: "bar" })"#,
-                    r#"Call(UnresolvedCall { name: "foo", arity: 0 })"#,
-                    r#"Var(UnboundVar { name: "baz" })"#,
+                    "Var($bar is not defined)",
+                    "Call(foo/0 is not defined)",
+                    "Var($baz is not defined)",
                 ]
             );
         }
@@ -2505,6 +2525,7 @@ mod tests {
                 [UnresolvedCall {
                     name: "foo".into(),
                     arity: 0,
+                    origin: None,
                 }]
             );
         }

@@ -43068,9 +43068,19 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     );
 
     // Fallback: the module's own `nosuch` has no occurrence in the filter, so
-    // it must be reported with no line marker while the filter's own `nosuch`
-    // on line 3 keeps its position. jq reports only its own; what matters
-    // here is that the second error does not repeat line 3's marker.
+    // it must not borrow a line marker from one, while the filter's own
+    // `nosuch` on line 3 keeps its position.
+    //
+    // jq reports only its own here -- a main-*body* error suppresses def
+    // errors, a separate pre-existing divergence with its own oracle matrix
+    // still to build. What this row pins is that the second error does not
+    // repeat line 3's marker.
+    //
+    // #2951: the module error now names the module's own canonical file
+    // instead of `<top-level>`, which is how jq attributes a module-body
+    // error when it reports one at all. Before that, with nothing to mark a
+    // call as coming from a module, this path was one coincidence away from
+    // citing the *filter's* line for the *module's* error.
     let dir = tempfile::TempDir::new()?;
     std::fs::write(dir.path().join("m.jq"), "def helper: nosuch;\n")?;
     let lib = dir.path().to_string_lossy().to_string();
@@ -43085,9 +43095,13 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
         1,
         "the module's own error must not re-use the filter call's line -- stderr: {stderr:?}"
     );
+    let module_file = std::fs::canonicalize(dir.path().join("m.jq"))?;
     assert!(
-        stderr.contains("nosuch/0 is not defined at <top-level>\n"),
-        "the module call should be reported with no line marker -- stderr: {stderr:?}"
+        stderr.contains(&format!(
+            "nosuch/0 is not defined at {}\n",
+            module_file.display()
+        )),
+        "the module call should name its own file and claim no line -- stderr: {stderr:?}"
     );
 
     Ok(())
