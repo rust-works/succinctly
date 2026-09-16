@@ -458,39 +458,18 @@ pub enum RunMarker<'a> {
     /// `import`, so a bare sibling call inside it can be retried as
     /// `alias::name`.
     Begin { id: u32, alias: Option<&'a str> },
-    /// Opens a run that marks *authorship* without flooring visibility.
-    ///
-    /// Used for the dependency defs spliced into a module's own def bodies.
-    /// Those bodies belong to a different module than the chain wrapped
-    /// around them, which matters for two things that have nothing to do
-    /// with which names are visible:
-    ///
-    /// - **The import alias must not reach them.** A dependency's body is
-    ///   physically nested inside the importing module's run, so without a
-    ///   marker a bare call in it would be retried under *that* module's
-    ///   alias and resolve to a def the dependency cannot legally see. That
-    ///   is a wrong answer where both jq and the pre-boundary code reported
-    ///   a compile error, so it must be blocked.
-    /// - **A compile error belongs to the file that wrote the call**, not to
-    ///   the module that happens to enclose it.
-    ///
-    /// What a barrier deliberately does *not* do is hide names. Sealing
-    /// dependency bodies is #2962's capture route, and closing it moves two
-    /// of that issue's pinned rows from a wrong answer to a compile error --
-    /// still not jq's answer. That trade belongs in its own change; until
-    /// then a barrier fixes what this one broke and nothing else. Upgrading
-    /// a barrier to a [`RunMarker::Begin`] is the whole of that later fix.
-    Barrier { id: u32 },
-    /// Closes the run with this id, whichever kind opened it.
+    /// Closes the run with this id.
     End { id: u32 },
 }
 
 /// The NUL-prefixed sigil no lexable identifier can start with.
 const RUN_BEGIN: &str = "\u{0}run:begin:";
-/// Sibling of [`RUN_BEGIN`], for a run that marks authorship only.
-const RUN_BARRIER: &str = "\u{0}run:barrier:";
 /// Sibling of [`RUN_BEGIN`].
 const RUN_END: &str = "\u{0}run:end:";
+/// The prefix of a dependency renamed out of a def's way (#2962) -- see
+/// [`ModuleRun::renamed_dep`]. Not a marker: [`ModuleRun::parse`] reads it as
+/// an ordinary def, which is what it is.
+const DEP_RENAME: &str = "\u{0}dep:";
 
 impl ModuleRun {
     /// The name of the def that opens run `id`, carrying `alias` when the
@@ -504,14 +483,7 @@ impl ModuleRun {
         }
     }
 
-    /// The name of the def that opens a non-flooring run for `id` -- see
-    /// [`RunMarker::Barrier`].
-    #[must_use]
-    pub fn barrier_marker(id: u32) -> String {
-        alloc::format!("{RUN_BARRIER}{id}")
-    }
-
-    /// The name of the def that closes run `id`, whichever kind opened it.
+    /// The name of the def that closes run `id`.
     #[must_use]
     pub fn end_marker(id: u32) -> String {
         alloc::format!("{RUN_END}{id}")
@@ -535,12 +507,34 @@ impl ModuleRun {
             };
             return id.parse().ok().map(|id| RunMarker::Begin { id, alias });
         }
-        if let Some(id) = name.strip_prefix(RUN_BARRIER) {
-            return id.parse().ok().map(|id| RunMarker::Barrier { id });
-        }
         name.strip_prefix(RUN_END)
             .and_then(|id| id.parse().ok())
             .map(|id| RunMarker::End { id })
+    }
+
+    /// The name a dependency is renamed to when it would otherwise collide
+    /// with the def it is wrapped into (#2962): entry `index` of run `id`'s
+    /// dependency group, originally called `name`.
+    ///
+    /// A dependency bound into a def's body sits *inside* that def's scope,
+    /// so a dependency sharing the def's (name, arity), or named after one of
+    /// its parameters, would shadow the def's own binding for the body. jq
+    /// binds a module's block in its own scope and never has the clash. The
+    /// NUL prefix keeps the new name out of reach of anything a user can
+    /// write, exactly as it does for the markers.
+    #[must_use]
+    pub fn renamed_dep(id: u32, index: usize, name: &str) -> String {
+        alloc::format!("{DEP_RENAME}{id}:{index}:{name}")
+    }
+
+    /// `name` as a user wrote it: [`Self::renamed_dep`] undone, and any other
+    /// name returned unchanged. For messages that name a def, so an internal
+    /// spelling never reaches the terminal.
+    #[must_use]
+    pub fn display_name(name: &str) -> &str {
+        name.strip_prefix(DEP_RENAME)
+            .and_then(|rest| rest.splitn(3, ':').nth(2))
+            .unwrap_or(name)
     }
 }
 
@@ -579,33 +573,19 @@ fn scan_scope<'a, E, T>(
     // end we have already passed is *closed*: it is wrapped around this
     // point, so its defs are visible and its opener is not a floor.
     let mut closed = 0usize;
-    // The innermost *open* run, of either kind -- who wrote the code at this
-    // point in the chain. Set once, by the first one encountered.
-    let mut run: Option<(u32, Option<String>)> = None;
     for entry in scope.iter().rev() {
         match ModuleRun::parse(name_of(entry)) {
             Some(RunMarker::End { .. }) => closed += 1,
-            Some(RunMarker::Barrier { id }) => {
-                if closed > 0 {
-                    closed -= 1;
-                } else if run.is_none() {
-                    // Authorship only: records whose code this is (and so
-                    // stops an enclosing import alias reaching it), but does
-                    // not floor visibility -- keep scanning outward.
-                    run = Some((id, None));
-                }
-            }
             Some(RunMarker::Begin { id, alias }) => {
                 if closed > 0 {
                     closed -= 1;
                 } else {
-                    // An open flooring run: nothing below it is visible from
-                    // inside this module body. A barrier already passed keeps
-                    // its claim on authorship -- it is nearer the call.
-                    if run.is_none() {
-                        run = Some((id, alias.map(ToString::to_string)));
-                    }
-                    return ScanResult { hit: None, run };
+                    // An open run: nothing below it is visible from inside
+                    // this module body, and it names who wrote the code here.
+                    return ScanResult {
+                        hit: None,
+                        run: Some((id, alias.map(ToString::to_string))),
+                    };
                 }
             }
             None => {
@@ -624,7 +604,11 @@ fn scan_scope<'a, E, T>(
             }
         }
     }
-    ScanResult { hit: None, run }
+    // No open run: the top level, or the main filter below every run.
+    ScanResult {
+        hit: None,
+        run: None,
+    }
 }
 
 /// A lexical *variable* scope: the `$name`s (without the sigil) visible at a
@@ -973,13 +957,7 @@ fn build_call_graph(
             args,
             builtin_fallback,
         } => {
-            let arity = if args.is_empty() {
-                builtin_fallback
-                    .as_deref()
-                    .map_or(0, builtin_fallback_arity)
-            } else {
-                args.len()
-            };
+            let arity = call_arity(args, builtin_fallback.as_deref());
             // #2989: inside an `import`ed module a def calls its sibling
             // by the bare name it is written with, but the chain holds that
             // sibling under `alias::name`. Retry the bare miss exactly as
@@ -1344,6 +1322,22 @@ fn bind_patterns(
         check_pattern_keys(pattern, scope, var_scope, errors, reachable);
     }
     pattern_alternatives_var_names(patterns)
+}
+
+/// The arity an `Expr::FuncCall` with these `args` and `builtin_fallback`
+/// was written with.
+///
+/// A shadowable call (#2036) carries its real sub-expressions in the
+/// fallback and leaves `args` empty until this pass resolves it, so `args`
+/// alone reads 0 for it. Public for the module loader, which renames calls
+/// by (name, arity) before this pass has run (#2962).
+#[must_use]
+pub fn call_arity(args: &[Expr], builtin_fallback: Option<&Expr>) -> usize {
+    if args.is_empty() {
+        builtin_fallback.map_or(0, builtin_fallback_arity)
+    } else {
+        args.len()
+    }
 }
 
 /// #2036: the arity `fallback` -- a successfully-parsed builtin or
@@ -1872,13 +1866,7 @@ fn check(
             args,
             builtin_fallback,
         } => {
-            let arity = if args.is_empty() {
-                builtin_fallback
-                    .as_deref()
-                    .map_or(0, builtin_fallback_arity)
-            } else {
-                args.len()
-            };
+            let arity = call_arity(args, builtin_fallback.as_deref());
             let scan = in_scope(scope, name, arity);
             // #2989: a def inside an `import`ed module calls its siblings by
             // the bare name it is written with, but the loader namespaced
@@ -2781,8 +2769,6 @@ mod tests {
                             }
                             None => ModuleRun::begin_marker(rest.parse().expect("id"), None),
                         }
-                    } else if let Some(id) = e.strip_prefix("barrier:") {
-                        ModuleRun::barrier_marker(id.parse().expect("id"))
                     } else if let Some(id) = e.strip_prefix("end:") {
                         ModuleRun::end_marker(id.parse().expect("id"))
                     } else {
@@ -2851,47 +2837,6 @@ mod tests {
             assert_eq!(run, None);
         }
 
-        /// A barrier claims authorship without flooring: names below it stay
-        /// visible, but it is the innermost open run, so an enclosing
-        /// import's alias does not reach past it.
-        ///
-        /// This is the pair of properties the review regression turned on --
-        /// without the alias half, a dependency body resolved a name it
-        /// cannot legally see; without the visibility half, #2962's rows
-        /// would move in a change that is not about them.
-        #[test]
-        fn a_barrier_claims_authorship_without_flooring() {
-            let chain = ["outer", "begin:1@ns", "own", "barrier:9", "dep"];
-            assert!(visible(&chain, "dep"), "the barrier's own defs");
-            assert!(
-                visible(&chain, "own"),
-                "a barrier does not floor: the enclosing run's defs stay \
-                 visible through it, which is what keeps #2962's rows where \
-                 they are"
-            );
-            assert!(
-                !visible(&chain, "outer"),
-                "the enclosing *flooring* run still floors, barrier or not"
-            );
-
-            let scan = in_scope(&scope_of(&chain), "nope", 0);
-            assert_eq!(
-                scan.run,
-                Some((9, None)),
-                "the barrier is the innermost open run, and carries no alias"
-            );
-        }
-
-        /// A *closed* barrier is not an opener at all -- its defs are wrapped
-        /// around this point, so the enclosing import's alias applies again.
-        #[test]
-        fn a_closed_barrier_restores_the_enclosing_run() {
-            let chain = ["begin:1@ns", "own", "barrier:9", "dep", "end:9"];
-            assert!(visible(&chain, "dep"), "the closed barrier's defs");
-            let scan = in_scope(&scope_of(&chain), "nope", 0);
-            assert_eq!(scan.run, Some((1, Some("ns".to_string()))));
-        }
-
         /// `run` is only meaningful when the lookup missed: the scan stops at
         /// the match rather than walking the rest of the stack, which is what
         /// keeps a long def chain from going quadratic.
@@ -2924,6 +2869,21 @@ mod tests {
             );
             for ordinary in ["run:begin:3", "f", "ns::f", "", "beginning"] {
                 assert_eq!(ModuleRun::parse(ordinary), None, "{ordinary:?}");
+            }
+        }
+
+        /// #2962: a renamed dependency is an ordinary def to the scan, and
+        /// its display name is the one the user wrote -- including a name
+        /// that itself contains `:` (an `alias::name`).
+        #[test]
+        fn renamed_deps_are_ordinary_defs_and_display_as_written() {
+            let renamed = ModuleRun::renamed_dep(4, 2, "c");
+            assert_eq!(ModuleRun::parse(&renamed), None);
+            assert_eq!(ModuleRun::display_name(&renamed), "c");
+            let renamed = ModuleRun::renamed_dep(4, 2, "ns::c");
+            assert_eq!(ModuleRun::display_name(&renamed), "ns::c");
+            for ordinary in ["c", "ns::c", ""] {
+                assert_eq!(ModuleRun::display_name(ordinary), ordinary);
             }
         }
     }

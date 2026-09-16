@@ -447,8 +447,14 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 }
 
 /// The dependencies one of a module's own defs can reach, in [`wrap_defs`]
-/// order (#2865): everything its body transitively calls, minus whatever must
-/// not capture a name it uses directly.
+/// order (#2865): everything its body transitively calls, with any
+/// dependency that would capture one of the def's own bindings renamed out of
+/// its way (#2962).
+///
+/// `deps` is one origin module's group, wrapped as run `run` (with `alias`
+/// when it is an `import`). `body` is the def's own body as written, before
+/// any group is wrapped around it: the groups are floored runs, so no group
+/// can call into another, and only the body sees them all.
 ///
 /// ### Dependencies only -- a module's own siblings are deliberately absent
 ///
@@ -466,11 +472,10 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 /// def h(b): a;                   nested: 99, the error silently swallowed
 /// ```
 ///
-/// Sealing cannot repair that, because the captured name is free in the sealed
-/// form too. Leaving siblings in the flat chain is what keeps them bound where
-/// they were written.
+/// Leaving siblings in the flat chain is what keeps them bound where they
+/// were written.
 ///
-/// ### The transitive closure, and why the exclusions are direct-only
+/// ### The transitive closure
 ///
 /// A dependency arrives already carrying its *own* module's dependencies, but
 /// its references to that module's **siblings** are still free -- they were
@@ -479,26 +484,31 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 /// are exports of the same module, so they are in `deps` to be found. With
 /// `inner.jq` = `def g: 42; def k: g;`, `outer.jq` = `include "inner"; def g:
 /// k;`, jq answers `42`: `k`'s `g` is `inner`'s, and it is reached only
-/// through `k`.
+/// through `k`. In an `import` group the siblings carry the alias, and a
+/// dependency's bare call reaches them through `resolve.rs`'s alias retry, so
+/// a bare name also wants its `alias::name`.
 ///
-/// That is also why the two exclusions apply to a name only when the def's
-/// body calls it **directly**:
+/// ### Clashes: renamed, never excluded
+///
+/// The group is wrapped *inside* the def, so its entries shadow two of the
+/// def's own bindings for the body:
 ///
 /// - **The def's own (name, arity).** jq binds a def's own recursive call to
 ///   itself: with `inner`'s `g/0` in scope, `def g: if . == 0 then "base"
-///   else (. - 1 | g) end;` answers `"base"`, so the dependency must not be
-///   wrapped. In the `outer.jq` case above the same dependency *must* be
-///   wrapped -- and there the body never calls `g` itself, so nothing of the
-///   def's own is at stake and it cannot be captured.
+///   else (. - 1 | g) end;` answers `"base"`.
 /// - **A parameter's name, at arity 0.** A parameter binds the bare call-site
 ///   namespace (`Param::Dollar`'s `$g` binds `g` too) and wins: `def f(g): g;
 ///   def q: f(7);` answers `7` in jq even with a dependency `g` in scope.
-///   Again scoped to direct calls, so a dependency reached only through
-///   another one still resolves to the dependency, as it does in jq.
 ///
-/// A body that both uses such a name directly *and* reaches a dependency
-/// needing the other binding cannot be expressed in one chain; that pairing
-/// has no test and no known real shape, and the direct use wins.
+/// The body's own calls to such a name are therefore never the dependency's,
+/// and do not keep it. Another dependency's calls to it *are*, and jq answers
+/// them with the dependency: with `inner.jq` = `def c: 7; def g: c;` and
+/// `mid.jq` = `include "inner"; def c: if . == 0 then g else (. - 1 | c)
+/// end;`, `0 | c` is `7`. Excluding the dependency strands that call (a
+/// compile error once dependency runs floor), and keeping it under its own
+/// name captures the body's. So a clashing dependency that another one needs
+/// is kept under [`jq::ModuleRun::renamed_dep`], and the calls that reach it
+/// are renamed with it -- see [`rename_dep_calls`].
 ///
 /// ### The referenced filter
 ///
@@ -511,12 +521,23 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
 /// #2955. Dropping an unreferenced dependency is unobservable: nothing
 /// resolves to it, and jq agrees an unreferenced dependency whose own body
 /// calls an undefined function is an error in neither tool.
-fn visible_deps_for(deps: &FuncDefList, name: &str, params: &[Param], body: &Expr) -> FuncDefList {
+fn visible_deps_for(
+    deps: &FuncDefList,
+    run: u32,
+    alias: Option<&str>,
+    name: &str,
+    params: &[Param],
+    body: &Expr,
+) -> FuncDefList {
     let param_names: BTreeSet<&str> = params.iter().map(Param::name).collect();
     let arity = params.len();
-    let directly_called = called_func_names(body);
+    let clashes = |dep_name: &str, dep_params: &[Param]| {
+        (dep_name == name && dep_params.len() == arity)
+            || (dep_params.is_empty() && param_names.contains(dep_name))
+    };
 
-    let mut wanted = directly_called.clone();
+    let by_body = called_func_names(body);
+    let mut by_deps = BTreeSet::new();
     let mut keep = vec![false; deps.len()];
 
     // Fixed point: a kept dependency's body can name a sibling of its own
@@ -525,29 +546,134 @@ fn visible_deps_for(deps: &FuncDefList, name: &str, params: &[Param], body: &Exp
     loop {
         let mut grew = false;
         for (i, (dep_name, dep_params, dep_body)) in deps.iter().enumerate() {
-            let excluded = directly_called.contains(dep_name)
-                && ((dep_name == name && dep_params.len() == arity)
-                    || (dep_params.is_empty() && param_names.contains(dep_name.as_str())));
-            if keep[i] || excluded {
+            let wanted = by_deps.contains(dep_name)
+                || (by_body.contains(dep_name) && !clashes(dep_name, dep_params));
+            if keep[i] || !wanted {
                 continue;
             }
-            if wanted.contains(dep_name) {
-                keep[i] = true;
-                let before = wanted.len();
-                wanted.extend(called_func_names(dep_body));
-                grew |= wanted.len() != before;
+            keep[i] = true;
+            let before = by_deps.len();
+            for called in called_func_names(dep_body) {
+                if let Some(alias) = alias {
+                    if !called.contains("::") {
+                        by_deps.insert(format!("{alias}::{called}"));
+                    }
+                }
+                by_deps.insert(called);
             }
+            grew |= by_deps.len() != before;
         }
         if !grew {
             break;
         }
     }
 
-    deps.iter()
-        .zip(keep)
-        .filter(|(_, keep)| *keep)
-        .map(|(dep, _)| dep.clone())
-        .collect()
+    // Each kept entry with its name as written, which the renaming below
+    // compares against: a renamed entry's own name no longer says.
+    let mut kept: Vec<(String, usize, (String, Vec<Param>, Expr))> = Vec::new();
+    let mut renames = Vec::new();
+    for (i, (dep_name, dep_params, dep_body)) in deps.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        let written = (dep_name.clone(), dep_params.len());
+        let bound_as = if clashes(dep_name, dep_params) {
+            let renamed = jq::ModuleRun::renamed_dep(run, i, dep_name);
+            renames.push((kept.len(), renamed.clone()));
+            renamed
+        } else {
+            dep_name.clone()
+        };
+        kept.push((
+            written.0,
+            written.1,
+            (bound_as, dep_params.clone(), dep_body.clone()),
+        ));
+    }
+
+    // A call reaches the renamed entry from the entry's own body (recursion)
+    // and from every later entry, until a later entry of the same (name,
+    // arity) shadows it -- `wrap_defs` nests later entries inside earlier
+    // ones. An earlier entry cannot see it at all.
+    for (at, renamed) in renames {
+        let (old, old_arity) = (kept[at].0.clone(), kept[at].1);
+        for j in at..kept.len() {
+            if j > at && kept[j].0 == old && kept[j].1 == old_arity {
+                break;
+            }
+            let (_, entry_params, entry_body) = &kept[j].2;
+            if old_arity == 0 && entry_params.iter().any(|p| p.name() == old) {
+                continue;
+            }
+            let rewritten = rename_dep_calls(entry_body, &old, old_arity, &renamed, 0);
+            kept[j].2 .2 = rewritten;
+        }
+    }
+
+    kept.into_iter().map(|(_, _, def)| def).collect()
+}
+
+/// `expr` with every call that resolves to `old/arity` renamed to `new`
+/// (#2962), for a dependency [`visible_deps_for`] renamed out of a def's way.
+///
+/// Scope-aware, so a call bound to something else keeps its name:
+///
+/// - a nested def of the same (name, arity) binds its own body and everything
+///   after it;
+/// - a nested def's parameter of that name binds its body, at arity 0;
+/// - a dependency body is already bound, and carries its own dependencies as
+///   runs: a def *inside* a run is floored and cannot see `old` at all, so
+///   its body is left alone, but it is still wrapped around what follows the
+///   run and so still shadows there. `run_depth` counts the runs open along
+///   the current def chain.
+fn rename_dep_calls(expr: &Expr, old: &str, arity: usize, new: &str, run_depth: usize) -> Expr {
+    let mut recurse = |e: &Expr| rename_dep_calls(e, old, arity, new, 0);
+    match expr {
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } => {
+            let then_depth = match jq::ModuleRun::parse(name) {
+                Some(jq::RunMarker::Begin { .. }) => run_depth + 1,
+                Some(jq::RunMarker::End { .. }) => run_depth.saturating_sub(1),
+                None => run_depth,
+            };
+            let same = name == old && params.len() == arity;
+            let param_binds = arity == 0 && params.iter().any(|p| p.name() == old);
+            let body = if run_depth > 0 || same || param_binds {
+                (**body).clone()
+            } else {
+                recurse(body)
+            };
+            let then = if same {
+                (**then).clone()
+            } else {
+                rename_dep_calls(then, old, arity, new, then_depth)
+            };
+            Expr::FuncDef {
+                name: name.clone(),
+                params: params.clone(),
+                body: Box::new(body),
+                then: Box::new(then),
+                bound: FuncDefBound::default(),
+            }
+        }
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } if name == old && jq::call_arity(args, builtin_fallback.as_deref()) == arity => {
+            let mut renamed = succinctly::jq::walk::map_subexprs(expr, &mut recurse);
+            if let Expr::FuncCall { name, .. } = &mut renamed {
+                *name = new.to_string();
+            }
+            renamed
+        }
+        _ => succinctly::jq::walk::map_subexprs(expr, &mut recurse),
+    }
 }
 
 /// `path` resolved through the filesystem, falling back to `path` itself.
@@ -776,18 +902,24 @@ impl ModuleLoader {
             .into_iter()
             .map(|(name, params, body)| {
                 // Each origin module's contribution is wrapped in its own
-                // barrier run (#2951 review): a dependency's body belongs to
-                // a different file than the chain around it, so the importing
-                // module's alias must not reach it and a compile error in it
-                // must name its own file. A barrier marks that without
-                // hiding names -- sealing these is #2962's own change.
+                // run, which floors it (#2962): a dependency's body sees its
+                // own module's names and nothing of the def it is wrapped
+                // into -- not its name, its parameters, or another origin's
+                // group. The run also names the dependency's own file for a
+                // compile error in it, and keeps this module's import alias
+                // from reaching it.
                 //
                 // Groups keep declaration order, and each is wrapped in turn
                 // so the last-declared ends up innermost, exactly as the flat
                 // `wrap_defs` did before the grouping.
+                let visible: Vec<FuncDefList> = deps
+                    .iter()
+                    .map(|(origin, alias, group)| {
+                        visible_deps_for(group, *origin, alias.as_deref(), &name, &params, &body)
+                    })
+                    .collect();
                 let mut wrapped = body;
-                for (origin, alias, group) in deps.iter().rev() {
-                    let visible = visible_deps_for(group, &name, &params, &wrapped);
+                for ((origin, alias, _), visible) in deps.iter().zip(visible).rev() {
                     wrapped = wrap_run(wrapped, visible, *origin, alias.as_deref());
                 }
                 (name, params, wrapped)

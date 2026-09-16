@@ -121,7 +121,8 @@ pub use parser::{
     CallSite, ParseError, ParserMode, VarSite,
 };
 pub use resolve::{
-    resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleRun, ResolveError, RunMarker,
+    call_arity, resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleRun, ResolveError,
+    RunMarker,
     UnboundVar, UnresolvedCall,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};

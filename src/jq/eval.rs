@@ -54786,7 +54786,7 @@ pub(crate) fn bind_def_call<'e>(
             // `EvalError::resource_limit`.
             return Err(EvalError::resource_limit(format!(
                 "{}/{} exceeded maximum recursion depth",
-                def.name,
+                super::resolve::ModuleRun::display_name(&def.name),
                 def.params.len()
             )));
         }
