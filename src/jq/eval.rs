@@ -6035,7 +6035,9 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Flow::Escaped(Control::Error(e)) => match catch {
             Some(catch_expr) => {
-                eval_each_owned::<S>(catch_expr, &e.payload(), optional, &mut |o| {
+                // #3036: see `try_payload_root`.
+                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                eval_each_owned_bridged::<S>(&catch_expr, &e.payload(), optional, &mut |o| {
                     sink(Item::Owned(o))
                 })
             }
@@ -7987,23 +7989,76 @@ fn each_take_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_owned_input` normalizes `One`/`Many` to `Owned`/`ManyOwned`. This is
 /// what lets one primitive serve the owned-surface consumers (`any`/`all`,
 /// `IN`) as well as the cursor ones.
+///
+/// #3036: `input` is an owned value this evaluator is about to re-index into
+/// a throwaway document, so no `Snapshot`-origin `TrackedVar` marker `expr`
+/// carries can name a node of it -- every such marker was frozen from some
+/// earlier document, and the rebuilt copy is a different node however equal
+/// its value. They are demoted here, at the re-entry, for the same reason
+/// the generic evaluator's funnels demote before bridging (#2642): once the
+/// marker reaches `Frame::certifies` there is nothing left to compare. A
+/// caller that has *already* proven its markers against a live cursor
+/// (`RootWitness::of` + [`demote_rebuilt_markers`]) takes
+/// [`eval_each_owned_bridged`] instead, so the proof is not thrown away.
 pub(crate) fn eval_each_owned<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
-        return match result {
-            Ok(Some(v)) => match sink(v) {
-                Demand::Continue => Flow::Exhausted,
-                Demand::Stop => Flow::Stopped { pending: None },
-            },
-            Ok(None) => Flow::Exhausted,
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        };
+    if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
+        return flow;
     }
+    // After the fast path on purpose: it never reaches a resolver, and
+    // demoting rebuilds `expr` whenever it holds a marker at all.
+    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+    eval_each_owned_reindexed::<S>(&expr, input, optional, sink)
+}
 
+/// [`eval_each_owned`] for a reindex bridge whose markers were already
+/// checked against the node being bridged (#2642's funnel sites in
+/// `eval_generic.rs`): a `Snapshot` marker that survived that check *is*
+/// the root of the document built here, and demoting it again would refuse
+/// `. as $x | isempty(($x.a = 9))`-shaped programs jq accepts. Reach for
+/// the demoting twin unless the call is preceded by exactly that check.
+pub(crate) fn eval_each_owned_bridged<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
+        return flow;
+    }
+    eval_each_owned_reindexed::<S>(expr, input, optional, sink)
+}
+
+/// [`eval_owned_fast_path`] delivered through `sink`: `Some` when the fast
+/// path answered, `None` when the caller has to reindex.
+fn eval_each_owned_fast_path<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let result = eval_owned_fast_path::<S>(expr, input, optional)?;
+    Some(match result {
+        Ok(Some(v)) => match sink(v) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        },
+        Ok(None) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    })
+}
+
+/// The reindex half of [`eval_each_owned`]/[`eval_each_owned_bridged`].
+fn eval_each_owned_reindexed<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
     // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
     // `eval_owned_input`.
     let json_str = input.to_json_for_reindex::<S>();
@@ -14285,6 +14340,13 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // map(f)
+    //
+    // #3036: every entry below is a value `to_entries` built, re-indexed
+    // into its own throwaway document, so no `Snapshot` marker in `f` can
+    // name a node of it -- see `eval_each_owned`. Demoted once, not per
+    // entry.
+    let f = demote_rebuilt_markers(f, &RootWitness::Owned);
+    let f: &Expr = &f;
     let mut transformed: Vec<OwnedValue> = Vec::new();
     for entry in entries {
         let entry_json = owned_to_json_bytes::<S>(&entry);
@@ -28823,6 +28885,37 @@ impl RootWitness {
     }
 }
 
+/// What a `catch` handler's `Snapshot` markers are checked against before
+/// they cross into `eval.rs` (#3036): the payload of `try BODY` is an owned
+/// value with no node identity of its own, so it is `Owned` -- which demotes
+/// every marker -- unless `BODY` raises a marker's own value verbatim
+/// (`error($x)`, `$x | error`). jq's `catch` then runs against that same
+/// `jv`, so `. as $x | try error($x) catch path($x)` is `[]` there, and the
+/// node the marker names is the payload's own. Any other body, including a
+/// value-equal rebuild (`error({a:1})` on `{"a":1}`), gets no proof and
+/// refuses -- which is the fabrication #2642's review left open here.
+pub(crate) fn try_payload_root(body: &Expr) -> RootWitness {
+    use super::eval_generic::strip_parens;
+    let raised = match strip_parens(body) {
+        Expr::Error(Some(msg)) => strip_parens(msg),
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [head, Expr::Error(None)] => strip_parens(head),
+            _ => return RootWitness::Owned,
+        },
+        _ => return RootWitness::Owned,
+    };
+    match raised {
+        Expr::TrackedVar(marker) => match &marker.node {
+            Some(BindOrigin::Node { node, document }) => RootWitness::Node {
+                node: *node,
+                document: *document,
+            },
+            _ => RootWitness::Owned,
+        },
+        _ => RootWitness::Owned,
+    }
+}
+
 /// Whether a `Snapshot`-origin marker must be demoted to `Untracked` before
 /// crossing into a resolver invocation rooted at `root` (#2642): its
 /// `Tracked::node` doesn't name `root`'s own document node, so admitting it
@@ -28845,6 +28938,23 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
                 document: root_document,
             },
         ) => node != root_node || document != root_document,
+        // #3036: a binding made inside the owned identity pipe from a
+        // position that *is* a document node's own unrebuilt value
+        // (`OwnedIdentity::exact`, an empty ancestor chain) names that node
+        // exactly as a cursor binding does. A rebuilt value at the same
+        // position (`sort`, a write) clears `exact` and falls through.
+        (
+            Some(BindOrigin::Owned {
+                base: Some((node, document)),
+                chain,
+                exact: true,
+                ..
+            }),
+            RootWitness::Node {
+                node: root_node,
+                document: root_document,
+            },
+        ) if chain.is_empty() => node != root_node || document != root_document,
         // No recorded node (a binding made before #2072's cursor-tracking
         // reached that site), an `Owned`-provenance binding, or an `Owned`
         // root: none of these can prove the marker *is* this root, so the
@@ -28873,10 +28983,7 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
 /// `DeleteTrieBuilder::intern`'s own pointer-keyed memo, `eval.rs`) so `k`
 /// occurrences of one shared marker clone its value once, not `k` times.
 pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> Cow<'e, Expr> {
-    if !any_subexpr(
-        expr,
-        &mut |e| matches!(e, Expr::TrackedVar(marker) if marker_needs_demotion(marker, root)),
-    ) {
+    if !has_demotable_marker(expr, root) {
         return Cow::Borrowed(expr);
     }
 
@@ -28904,6 +29011,16 @@ pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> 
 
     let mut memo = BTreeMap::new();
     Cow::Owned(demote_walk(expr, root, &mut memo))
+}
+
+/// Whether [`demote_rebuilt_markers`] would rebuild `expr` against `root`
+/// -- its own `Cow::Borrowed` precheck, exposed so a caller holding a slice
+/// of stages can ask once before deciding to rebuild any of them.
+fn has_demotable_marker(expr: &Expr, root: &RootWitness) -> bool {
+    any_subexpr(
+        expr,
+        &mut |e| matches!(e, Expr::TrackedVar(marker) if marker_needs_demotion(marker, root)),
+    )
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -41321,6 +41438,12 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         return result.map(|v| v.map(|v| (v, None))).map_err(Control::Error);
     }
 
+    // #3036: an owned value re-indexed here is a fresh document no
+    // `Snapshot` marker can name -- see `eval_each_owned`. After the fast
+    // path on purpose: it never reaches a resolver, and demoting is a
+    // rebuild of `expr` whenever a marker is present.
+    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
     // This is inefficient but correct
@@ -41336,7 +41459,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
+    match eval_single::<Vec<u64>, S>(&expr, cursor.value(), optional).materialize_cursor() {
         QueryResult::One(v) => Ok(Some((to_owned_lossy::<S, _>(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
@@ -41501,6 +41624,10 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #3036: an owned value re-indexed here is a fresh document no
+    // `Snapshot` marker can name -- see `eval_each_owned`.
+    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -41513,7 +41640,7 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
+    detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(&expr, cursor.value(), optional))
 }
 
 /// Own every value in `result` so it stops borrowing the throwaway document
@@ -44322,6 +44449,21 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     use super::eval_generic::{eval_path_context_pipe_detached, reindex_bridge_is_identity};
+    // #3036: `owned` is a stage output this evaluator is about to re-root,
+    // never a node any `Snapshot` marker in `exprs` was frozen from -- see
+    // `eval_each_owned`. Demoted once here, ahead of both routes below: the
+    // detached route places `owned` at no document position at all, and
+    // the reindexed one builds a fresh document.
+    let demoted: Option<Vec<Expr>> = exprs
+        .iter()
+        .any(|e| has_demotable_marker(e, &RootWitness::Owned))
+        .then(|| {
+            exprs
+                .iter()
+                .map(|e| demote_rebuilt_markers(e, &RootWitness::Owned).into_owned())
+                .collect()
+        });
+    let exprs: &[Expr] = demoted.as_deref().unwrap_or(exprs);
     if !reindex_bridge_is_identity(owned) {
         if let Some(result) =
             eval_path_context_pipe_detached::<S, StandardJson<'_, Vec<u64>>>(exprs, owned, optional)
@@ -95808,6 +95950,122 @@ mod tests {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
             other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
         }
+    }
+
+    /// #3036: a marker bound inside the owned identity pipe from a position
+    /// that *is* a document node's own unrebuilt value (`BindOrigin::Owned`
+    /// with `exact`, an empty chain) proves that node exactly as a cursor
+    /// binding does -- and only then. The same origin with `exact` cleared
+    /// (the value at that position was rebuilt: `sort`, a write), with a
+    /// chain (a position inside the owned tree), or against a different
+    /// node, is demoted; so is a `Snapshot` marker with no node at all
+    /// against an `Owned` root, which is what every `eval.rs` re-entry
+    /// checks against.
+    #[test]
+    fn marker_needs_demotion_trusts_only_an_exact_owned_origin_3036() {
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let owned = |exact: bool, chain: Vec<(Rc<OwnedValue>, OwnedValue)>| Tracked {
+            value: value.clone(),
+            origin: Origin::Snapshot,
+            node: Some(BindOrigin::Owned {
+                base: Some((3, 7)),
+                chain,
+                key_node: false,
+                exact,
+            }),
+        };
+        let root = RootWitness::Node {
+            node: 3,
+            document: 7,
+        };
+        assert!(!marker_needs_demotion(&owned(true, Vec::new()), &root));
+        assert!(marker_needs_demotion(&owned(false, Vec::new()), &root));
+        assert!(marker_needs_demotion(
+            &owned(true, vec![(Rc::new(value.clone()), OwnedValue::Int(0))]),
+            &root
+        ));
+        assert!(marker_needs_demotion(
+            &owned(true, Vec::new()),
+            &RootWitness::Node {
+                node: 4,
+                document: 7
+            }
+        ));
+        assert!(marker_needs_demotion(
+            &owned(true, Vec::new()),
+            &RootWitness::Owned
+        ));
+        // The `eval.rs` re-entry rule: a marker with no node at all is
+        // demoted against `Owned`, but never touched when its origin is not
+        // `Snapshot` (an `Untracked` marker already refuses; an `At` marker
+        // is certified by position, not value).
+        let bare = Tracked {
+            value: value.clone(),
+            origin: Origin::Snapshot,
+            node: None,
+        };
+        assert!(marker_needs_demotion(&bare, &RootWitness::Owned));
+        let untracked = Tracked {
+            origin: Origin::Untracked,
+            ..bare.clone()
+        };
+        assert!(!marker_needs_demotion(&untracked, &RootWitness::Owned));
+    }
+
+    /// #3036: `try BODY catch HANDLER`'s handler is checked against the
+    /// payload's own node, which only `error($x)`/`$x | error` on a marker
+    /// that knows its node can name -- every other body, including a
+    /// value-equal rebuild and a marker with no recorded node, yields
+    /// `Owned` and demotes.
+    #[test]
+    fn try_payload_root_names_a_raised_marker_and_nothing_else_3036() {
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let marker = |node: Option<BindOrigin>| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin: Origin::Snapshot,
+                node,
+            }))
+        };
+        let node = BindOrigin::Node {
+            node: 3,
+            document: 7,
+        };
+        let named = RootWitness::Node {
+            node: 3,
+            document: 7,
+        };
+        assert_eq!(
+            try_payload_root(&Expr::Error(Some(Box::new(marker(Some(node.clone())))))),
+            named
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Pipe(vec![
+                marker(Some(node.clone())),
+                Expr::Error(None)
+            ])),
+            named
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Error(Some(Box::new(marker(None))))),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Error(Some(Box::new(Expr::Literal(Literal::Null))))),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&Expr::Pipe(vec![
+                marker(Some(node)),
+                Expr::Identity,
+                Expr::Error(None)
+            ])),
+            RootWitness::Owned
+        );
+        assert_eq!(
+            try_payload_root(&parse("error({\"a\":1})").unwrap()),
+            RootWitness::Owned
+        );
     }
 
     /// #2044: `reestablishes_register`'s `!branch_trackable` conjunct

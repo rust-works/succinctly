@@ -122,10 +122,15 @@ pub struct Tracked {
 ///   construction: a marker with no recorded node (or one bound from an
 ///   already-owned/synthesized value, with nothing to compare) is always
 ///   demoted too, which is why a handful of shapes jq keeps the same `jv`
-///   through (`[.] | .[0]`, `{k:.} | .k`, `. + {}`, `reduce empty as $i
-///   (.; .)`) now refuse instead of silently accepting a copy -- a
-///   documented, accepted residual (#2642's own follow-up), not a new
-///   correctness gap.
+///   through (`{k:.} | .k`, `. + {}`, `reduce empty as $i (.; .)`) now
+///   refuse instead of silently accepting a copy -- a documented, accepted
+///   residual (#2889), not a new correctness gap. #3036 closed the same
+///   hole where the bind *and* the rebuild both run inside `eval.rs` (the
+///   input-queue bridge, a fold's UPDATE, a `|=` right-hand side): every
+///   owned-value re-entry there (`eval_each_owned` and its siblings) demotes
+///   every `Snapshot` marker, since a freshly re-indexed document cannot be
+///   a node any earlier binding was frozen from, and the funnels above take
+///   `eval_each_owned_bridged` so their own proof is kept.
 /// - [`Origin::At`] -- the #2042 witness for a binding whose source
 ///   *navigated*, made inside a `path()`/`del()`/assignment resolution: the
 ///   resolver invocation the binding happened in, and the absolute path
@@ -198,6 +203,13 @@ pub enum BindOrigin {
         /// emits nothing, so the flag has to survive the binding
         /// (`.a.b | key as $x | $x | key` prints nothing in yq v4.53.3).
         key_node: bool,
+        /// The owned root is `base`'s own value, unrebuilt (#3036) -- the
+        /// identity pipe's `OwnedIdentity::exact`, carried so
+        /// `marker_needs_demotion` (`eval.rs`) can prove a marker bound from
+        /// an owned position *is* the document node that position names.
+        /// `base`/`chain` alone cannot: they model yq position, which a
+        /// rebuilt value (`sort`, a write) keeps.
+        exact: bool,
     },
 }
 
