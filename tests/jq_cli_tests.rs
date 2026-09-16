@@ -26696,68 +26696,301 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2962: the documented boundary of #2865's mechanism -- a dependency is
-/// wrapped *inside* the including def's own `Expr::FuncDef`, so that def's
-/// name and parameters are enclosing binders for it, and a name the
-/// dependency reaches on its own can be captured.
+/// #2962: a module's dependencies are bound in their own scope, as jq binds
+/// a module's block, even though succinctly wraps them inside each def body
+/// that reaches them.
 ///
-/// Pinned rather than fixed, and recorded in
-/// `docs/compliance/jq/limitations.md` as a still-open gap (no ADR-0018
-/// rule-4 condition applies). Not a regression: every shape needs a
-/// transitive `include`, which did not work at all before #2865 -- `main`
-/// answers `g/0 is not defined` / `k/0 is not defined` for each. Closing it
-/// needs a targeted rename of the excluded dependency or #2951's sealed
-/// module scope; this test is what makes a change to the mechanism visible.
+/// Every row is captured whole from jq 1.7.1 -- stdout, stderr (with the
+/// module directory as `{dir}`) and exit code -- over the fixture files the
+/// row lists. They cover the three ways the wrap used to leak:
 ///
-/// **When #2962 lands, these assertions become jq's own answers**: `7`,
-/// exit 3 with `b/0 is not defined`, and `[7,[42]]`.
+/// - **A dependency's body saw the def it was wrapped into** -- its name, its
+///   parameters (both namespaces: `def h($g)` binds `g` and `$g`), and other
+///   origins' groups. `R2`, `R4`, `R5`, `R6`, `R18` and `R20` are compile
+///   errors in jq, attributed to the dependency's own file.
+/// - **A dependency sharing the def's (name, arity), or a parameter's name,
+///   was excluded**, stranding the other dependencies that call it (`R1`,
+///   `R8`, `R13`, `R24`, `R27`, `R28`, `R29`, `R31`, `R32`), or captured the
+///   def's own binding (`R3`, `R25`). Such a dependency is now renamed, with
+///   the calls that reach it.
+/// - **The rename is scope-aware**: a nested def of the same name (`R21`), a
+///   parameter (`R22`, `R26`, `R30`), a dependency's own dependency (`R23`),
+///   a later same-name entry (`R27`, `R28`) and declaration order (`R24`)
+///   each keep a call bound where jq binds it.
+///
+/// `R2u`, `R9`, `R11`, `R12`, `R15`, `R16` and `R17` already matched, and are
+/// here so the change cannot move them.
 #[test]
-fn test_dependency_capture_by_the_including_defs_scope_2962() -> Result<()> {
-    // 1. The self-(name, arity) exclusion strands a dependency that another
-    //    kept dependency still calls. jq answers 7.
-    let (_, stderr, code) = run_jq_with_modules(
-        &[
-            ("inner", "def c: 7;\ndef g: c;\n"),
-            (
-                "mid",
-                "include \"inner\";\ndef c: if . == 0 then g else (. - 1 | c) end;\n",
-            ),
-        ],
-        &["-nc", r#"include "mid"; 0 | c"#],
-    )?;
-    assert_eq!(code, 5, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("exceeded maximum recursion depth"),
-        "stderr: {stderr:?}"
+fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
+    type Row<'a> = (
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a str,
+        &'a str,
+        &'a str,
+        i32,
     );
+    let rows: &[Row] = &[
+        (
+            "R1",
+            &[("mid", "include \"inner\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("inner", "def c: 7; def g: c;\n")],
+            "include \"mid\"; 0 | c",
+            "7\n",
+            "",
+            0,
+        ),
+        (
+            "R2",
+            &[("hb", "include \"gb\"; def h(b): g; def q: h(99);\n"), ("gb", "def g: b;\n")],
+            "include \"hb\"; q",
+            "",
+            "jq: error: b/0 is not defined at {dir}/gb.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R2u",
+            &[("hb", "include \"gb\"; def h(b): g; def q: h(99);\n"), ("gb", "def g: b;\n")],
+            "include \"hb\"; 1",
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            "R3",
+            &[("h3", "include \"inner3\"; def h($g): [g, k]; def q: h(7);\n"), ("inner3", "def g: 42; def k: [g];\n")],
+            "include \"h3\"; q",
+            "[7,[42]]\n",
+            "",
+            0,
+        ),
+        (
+            "R4",
+            &[("A", "include \"B\"; def g: 1; def f: b1;\n"), ("B", "def b1: g;\n")],
+            "include \"A\"; f",
+            "",
+            "jq: error: g/0 is not defined at {dir}/B.jq, line 1:\ndef b1: g;        \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R5",
+            &[("h5", "include \"inner5\"; def h($g): k; def q: h(7);\n"), ("inner5", "def k: $g;\n")],
+            "include \"h5\"; q",
+            "",
+            "jq: error: $g is not defined at {dir}/inner5.jq, line 1:\ndef k: $g;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R6",
+            &[("m6", "include \"a6\"; include \"b6\"; def z: y;\n"), ("a6", "def x: 1;\n"), ("b6", "def y: x;\n")],
+            "include \"m6\"; z",
+            "",
+            "jq: error: x/0 is not defined at {dir}/b6.jq, line 1:\ndef y: x;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R8",
+            &[("mid8", "include \"inner8\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("inner8", "def c: 7; def c(f): f; def g: [c, c(8)];\n")],
+            "include \"mid8\"; 0 | c",
+            "[7,8]\n",
+            "",
+            0,
+        ),
+        (
+            "R9",
+            &[("r9", "include \"r9i\"; def c: 100; def q: g;\n"), ("r9i", "def c: if . == 0 then 5 else (. - 1 | c) end; def g: 2 | c;\n")],
+            "include \"r9\"; q",
+            "5\n",
+            "",
+            0,
+        ),
+        (
+            "R11",
+            &[("r11", "include \"r11i\"; def c: 1; def q: [g, c];\n"), ("r11i", "def g: def c: 3; c; def c: 9;\n")],
+            "include \"r11\"; q",
+            "[3,9]\n",
+            "",
+            0,
+        ),
+        (
+            "R12",
+            &[("r12", "include \"r12i\"; def c: 1; def q: g(4);\n"), ("r12i", "def g(c): c; def c: 9;\n")],
+            "include \"r12\"; q",
+            "4\n",
+            "",
+            0,
+        ),
+        (
+            "R13",
+            &[("mid13", "import \"inner\" as i; def c: if . == 0 then i::g else (. - 1 | c) end;\n"), ("inner", "def c: 7; def g: c;\n")],
+            "include \"mid13\"; 0 | c",
+            "7\n",
+            "",
+            0,
+        ),
+        (
+            "R15",
+            &[("r15", "include \"r15i\"; def q: g;\n"), ("r15i", "def g: $x;\n")],
+            "include \"r15\"; q",
+            "\"5\"\n",
+            "",
+            0,
+        ),
+        (
+            "R16",
+            &[("l2f", "include \"l1\"; def c: 2; def g2: c;\n"), ("l1", "def c: 1; def g: c;\n")],
+            "include \"l2f\"; g2",
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            "R17",
+            &[("h17", "include \"inner17\"; def h: def g: 6; [g, k];\n"), ("inner17", "def g: 5; def k: g;\n")],
+            "include \"h17\"; h",
+            "[6,5]\n",
+            "",
+            0,
+        ),
+        (
+            "R18",
+            &[("hib", "import \"ib\" as i; def h(b): i::g; def q: h(99);\n"), ("ib", "def g: b;\n")],
+            "include \"hib\"; q",
+            "",
+            "jq: error: b/0 is not defined at {dir}/ib.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R20",
+            &[("morder", "include \"order\"; def c: 1; def q: g;\n"), ("order", "def g: c; def c: 7;\n")],
+            "include \"morder\"; q",
+            "",
+            "jq: error: c/0 is not defined at {dir}/order.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R21",
+            &[("ma", "include \"ia\"; def c: if . == 0 then [g] else (. - 1 | c) end;\n"), ("ia", "def c: 7; def g: def c: 1; c;\n")],
+            "include \"ma\"; 0 | c",
+            "[1]\n",
+            "",
+            0,
+        ),
+        (
+            "R22",
+            &[("mb", "include \"ib2\"; def c: if . == 0 then k else (. - 1 | c) end;\n"), ("ib2", "def c: 7; def g(c): c; def k: g(3);\n")],
+            "include \"mb\"; 0 | c",
+            "3\n",
+            "",
+            0,
+        ),
+        (
+            "R23",
+            &[("mc", "include \"ic\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("ic", "include \"ic2\"; def c: 7; def g: c;\n"), ("ic2", "def c: 99;\n")],
+            "include \"mc\"; 0 | c",
+            "99\n",
+            "",
+            0,
+        ),
+        (
+            "R24",
+            &[("mk", "include \"ik\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("ik", "def g: c; def c: 7;\n")],
+            "include \"mk\"; 0 | c",
+            "",
+            "jq: error: c/0 is not defined at {dir}/ik.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
+            3,
+        ),
+        (
+            "R25",
+            &[("hl", "include \"gl\"; def h(b): [b, g]; def q: h(99);\n"), ("gl", "def b: 5; def g: b;\n")],
+            "include \"hl\"; q",
+            "[99,5]\n",
+            "",
+            0,
+        ),
+        (
+            "R26",
+            &[("mm", "include \"im\"; def c($x): if $x == 0 then g else c($x - 1) end;\n"), ("im", "def c($x): $x; def g: c(1);\n")],
+            "include \"mm\"; c(0)",
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            "R27",
+            &[("mo", "include \"io\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("io", "def c: 7; def c: 8; def g: c;\n")],
+            "include \"mo\"; 0 | c",
+            "8\n",
+            "",
+            0,
+        ),
+        (
+            "R28",
+            &[("mp", "include \"ip\"; def c: if . == 0 then k else (. - 1 | c) end;\n"), ("ip", "def c: 7; def g: c; def c: 8; def k: [g, c];\n")],
+            "include \"mp\"; 0 | c",
+            "[7,8]\n",
+            "",
+            0,
+        ),
+        (
+            "R29",
+            &[("mq", "include \"iq\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("iq", "def c: 7; def g: [c, $__loc__];\n")],
+            "include \"mq\"; 0 | c | .[0]",
+            "7\n",
+            "",
+            0,
+        ),
+        (
+            "R30",
+            &[("mr", "include \"ir\"; def c(g): if . == 0 then [g, (1 | c(g))] else 0 end; def q: 0 | c(5);\n"), ("ir", "include \"ir2\"; def c: 7; def g: [c, g];\n"), ("ir2", "def g: 1;\n")],
+            "include \"mr\"; q",
+            "[5,0]\n",
+            "",
+            0,
+        ),
+        (
+            "R31",
+            &[("ms", "include \"is\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("is", "def c: 7; def g: reduce (1,2) as $c (0; . + c);\n")],
+            "include \"ms\"; 0 | c",
+            "14\n",
+            "",
+            0,
+        ),
+        (
+            "R32",
+            &[("mt", "import \"it\" as t; include \"it\"; def c: if . == 0 then [g, t::g] else (. - 1 | c) end;\n"), ("it", "def c: 7; def g: c;\n")],
+            "include \"mt\"; 0 | c",
+            "[7,7]\n",
+            "",
+            0,
+        ),
+    ];
 
-    // 2. A parameter satisfies a name the dependency left undefined, so a
-    //    program jq rejects with `b/0 is not defined` (exit 3) answers here.
-    let (stdout, stderr, code) = run_jq_with_modules(
-        &[
-            ("gb", "def g: b;\n"),
-            ("hb", "include \"gb\";\ndef h(b): g;\ndef q: h(99);\n"),
-        ],
-        &["-nc", r#"include "hb"; q"#],
-    )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "99");
-
-    // 3. A parameter captures a dependency reached only indirectly. `h`'s own
-    //    `g` is correctly the parameter; `k`'s `g` should still be 42.
-    let (stdout, stderr, code) = run_jq_with_modules(
-        &[
-            ("inner3", "def g: 42;\ndef k: [g];\n"),
-            (
-                "h3",
-                "include \"inner3\";\ndef h($g): [g, k];\ndef q: h(7);\n",
-            ),
-        ],
-        &["-nc", r#"include "h3"; q"#],
-    )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "[7,[7]]");
-
+    for (id, modules, filter, want_stdout, want_stderr, want_code) in rows {
+        let temp_dir = tempfile::tempdir()?;
+        for (name, contents) in *modules {
+            std::fs::write(temp_dir.path().join(format!("{name}.jq")), contents)?;
+        }
+        let dir = std::fs::canonicalize(temp_dir.path())?;
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc", "--arg", "x", "5", filter]);
+                command
+            },
+            None,
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        let want_stderr = want_stderr.replace("{dir}", &dir.to_string_lossy());
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (*want_stdout, want_stderr.as_str(), *want_code),
+            "{id}: {filter}"
+        );
+    }
     Ok(())
 }
 
@@ -58632,7 +58865,7 @@ fn test_imported_module_def_can_call_its_sibling_2989() -> Result<()> {
 /// body.
 ///
 /// This is the sharpest regression the module boundary could cause, and it
-/// did cause it before the barrier runs went in. A dependency's defs are
+/// did cause it before dependency groups were wrapped as runs of their own. A dependency's defs are
 /// spliced into the importing module's def bodies, so without a marker the
 /// innermost open run there is the *import's* -- and a bare call in the
 /// dependency was retried under an alias it has no right to, resolving to a
@@ -58666,25 +58899,14 @@ fn test_import_alias_does_not_reach_a_dependency_body_2951() -> Result<()> {
         "attributed to the file that wrote the call, as jq does: {stderr:?}"
     );
 
-    // The same shape under `include` has no alias in play, and is *not*
-    // fixed here -- it answers 1, as it did before this change. That is the
-    // #2962 family: a barrier marks authorship but deliberately does not
-    // hide names, so `B`'s body can still see `A`'s `g` through it. jq
-    // reports `g/0 is not defined` for this too.
-    //
-    // Pinned as the divergence it is, with both halves in one test on
-    // purpose: the pair is what shows the barrier fixed the alias leak
-    // *without* quietly moving #2962's rows. Whoever closes #2962 by
-    // upgrading the barrier to a flooring run updates this half to match the
-    // `import` half above.
+    // The same shape under `include` has no alias in play, and is the same
+    // compile error: a dependency's run floors its body, so `B`'s `g` cannot
+    // see `A`'s through it either (#2962).
     let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", &lib, r#"include "A"; f"#], None)?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(
-        stdout.trim_end(),
-        "1",
-        "#2962 is fixed -- this should now be `g/0 is not defined`, like the \
-         `import` form above; update this assertion"
-    );
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("g/0 is not defined"), "stderr: {stderr:?}");
+    assert!(stderr.contains("B.jq"), "stderr: {stderr:?}");
 
     Ok(())
 }
