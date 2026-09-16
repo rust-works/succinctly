@@ -25,7 +25,7 @@
 // for a legitimate single-length site here.
 #![warn(clippy::disallowed_methods)]
 
-#[cfg(not(test))]
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
@@ -8449,7 +8449,7 @@ fn eval_positioned_stage_generic<S: EvalSemantics, V: DocumentValue>(
     match to_owned_cursor(&cursor) {
         Ok(owned) => eval_owned_identity_pipe::<S, V>(
             core::slice::from_ref(expr),
-            owned,
+            Cow::Owned(owned),
             OwnedIdentity::kept(cursor),
             optional,
             sink,
@@ -9501,7 +9501,7 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
         if needs_path_context(handler) && owned_identity_pipe_supported(stages) {
             return eval_owned_identity_pipe::<S, V>(
                 stages,
-                payload,
+                Cow::Owned(payload),
                 OwnedIdentity::kept(c),
                 optional,
                 sink,
@@ -10679,7 +10679,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                 };
                 return eval_owned_identity_pipe::<S, V>(
                     exprs,
-                    owned,
+                    Cow::Owned(owned),
                     OwnedIdentity::kept(root),
                     optional,
                     sink,
@@ -10761,7 +10761,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                     Ok(o) => match owned_identity_leaving_cursor::<S, V>(first, c, &o, optional) {
                         Ok(id) => eval_owned_identity_pipe::<S, V>(
                             rest.stages(),
-                            o,
+                            Cow::Owned(o),
                             id.unwrap_or_else(OwnedIdentity::detached),
                             optional,
                             &mut *sink,
@@ -19416,7 +19416,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
             PathNode::At(c) => match to_owned_cursor(c) {
                 Ok(value) => eval_owned_identity_pipe::<S, V>(
                     rest,
-                    value,
+                    Cow::Owned(value),
                     OwnedIdentity::kept(*c),
                     false,
                     sink,
@@ -19454,9 +19454,13 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                     }
                     AbsentRestRoute::OwnedIdentity => {
                         match path_context_absent_identity::<V>(pos) {
-                            Ok(id) => {
-                                eval_owned_identity_pipe::<S, V>(rest, owned, id, false, sink)
-                            }
+                            Ok(id) => eval_owned_identity_pipe::<S, V>(
+                                rest,
+                                Cow::Owned(owned),
+                                id,
+                                false,
+                                sink,
+                            ),
                             Err(e) => Flow::Escaped(Control::Error(e)),
                         }
                     }
@@ -22994,11 +22998,11 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
         let mut first: Option<(OwnedValue, OwnedIdentity<V>)> = None;
         let flow = eval_owned_identity_stages::<S, V>(
             owned_identity_body_stages(expr),
-            value.clone(),
+            Cow::Borrowed(value),
             id.clone(),
             optional,
             OwnedIdentityTail::Pairs(&mut |v, vid| {
-                first = Some((v, vid));
+                first = Some((v.into_owned(), vid));
                 Flow::Stopped { pending: None }
             }),
         );
@@ -23210,11 +23214,11 @@ fn owned_identity_bind_values<S: EvalSemantics, V: DocumentValue>(
         let mut pairs: Vec<BoundValue> = Vec::new();
         let flow = eval_owned_identity_stages::<S, V>(
             stages,
-            value.clone(),
+            Cow::Borrowed(value),
             id.clone(),
             optional,
             OwnedIdentityTail::Pairs(&mut |v, vid| {
-                pairs.push((v, Some(bind_origin_of_identity(&vid))));
+                pairs.push((v.into_owned(), Some(bind_origin_of_identity(&vid))));
                 Flow::Exhausted
             }),
         );
@@ -23293,7 +23297,7 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
         match eval_owned_identity_spliced::<S, V>(
             &substituted,
             rest,
-            value.clone(),
+            Cow::Borrowed(value),
             id.clone(),
             optional,
             tail.reborrow(),
@@ -23318,7 +23322,13 @@ fn continue_owned_identity_items<S: EvalSemantics, V: DocumentValue>(
     mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
     for (v, vid) in items {
-        match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
+        match eval_owned_identity_stages::<S, V>(
+            rest,
+            Cow::Owned(v),
+            vid,
+            optional,
+            tail.reborrow(),
+        ) {
             Flow::Exhausted => {}
             other => return other,
         }
@@ -23340,7 +23350,7 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     match owned_identity_ancestor(value, id, n) {
         OwnedAncestor::Owned(v, vid) => {
-            eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
+            eval_owned_identity_stages::<S, V>(rest, Cow::Owned(v), vid, optional, tail)
         }
         OwnedAncestor::Node(c) => match tail {
             OwnedIdentityTail::Sink(sink) => {
@@ -23357,7 +23367,7 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
             pairs @ OwnedIdentityTail::Pairs(_) => match to_owned_cursor(&c) {
                 Ok(v) => eval_owned_identity_stages::<S, V>(
                     rest,
-                    v,
+                    Cow::Owned(v),
                     OwnedIdentity::kept(c),
                     optional,
                     pairs,
@@ -23400,7 +23410,7 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     left: &Expr,
     right: &Expr,
     rest: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     mut tail: OwnedIdentityTail<'_, V>,
@@ -23409,7 +23419,7 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     let mut rest_escape: Option<Control> = None;
     let left_flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(left),
-        value.clone(),
+        Cow::Borrowed(&value),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, vid| {
@@ -23608,11 +23618,11 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         let mut outputs: Vec<OwnedValue> = Vec::new();
         let flow = eval_owned_identity_stages::<S, V>(
             stages,
-            member,
+            Cow::Owned(member),
             member_id,
             optional,
             OwnedIdentityTail::Pairs(&mut |v, _| {
-                outputs.push(v);
+                outputs.push(v.into_owned());
                 Flow::Exhausted
             }),
         );
@@ -23718,7 +23728,7 @@ pub(crate) fn eval_path_context_pipe_detached<S: EvalSemantics, V: DocumentValue
     let mut collected: Vec<GenericItem<V>> = Vec::new();
     let flow = eval_owned_identity_pipe::<S, V>(
         exprs,
-        owned.clone(),
+        Cow::Borrowed(owned),
         OwnedIdentity::detached(),
         optional,
         &mut |item| {
@@ -23749,7 +23759,7 @@ pub(crate) fn eval_path_context_pipe_detached<S: EvalSemantics, V: DocumentValue
 /// fallbacks.
 fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     sink: &mut dyn Sink<V>,
@@ -23766,7 +23776,13 @@ enum OwnedIdentityTail<'a, V: DocumentValue> {
     /// a bounded consumer counting its body's outputs, a `try` that has to
     /// tell its body's errors from the rest of the pipe's, a map-family
     /// stage collecting a member's outputs.
-    Pairs(&'a mut dyn FnMut(OwnedValue, OwnedIdentity<V>) -> Flow),
+    ///
+    /// #2829: the value arrives as a [`Cow`], so a stage that runs its body
+    /// more than once -- or that may need the original afterwards, which is
+    /// what `//` does -- can hand each run a borrow instead of cloning the
+    /// whole subtree upfront. The deep copy then happens exactly once, at
+    /// the one place a value genuinely becomes an output.
+    Pairs(&'a mut dyn FnMut(Cow<'_, OwnedValue>, OwnedIdentity<V>) -> Flow),
 }
 
 impl<V: DocumentValue> OwnedIdentityTail<'_, V> {
@@ -23777,10 +23793,14 @@ impl<V: DocumentValue> OwnedIdentityTail<'_, V> {
         }
     }
 
-    fn emit(&mut self, value: OwnedValue, id: OwnedIdentity<V>) -> Flow {
+    /// The one real output boundary: a `Sink` needs an owned value, so this
+    /// is where a borrow finally becomes a clone (#2829). A `Pairs` tail
+    /// forwards the `Cow` untouched, so an enclosing stage that only reads
+    /// it never pays for a copy at all.
+    fn emit(&mut self, value: Cow<'_, OwnedValue>, id: OwnedIdentity<V>) -> Flow {
         match self {
             OwnedIdentityTail::Sink(sink) => {
-                push_one_generic(GenericItem::Owned(value), &mut **sink)
+                push_one_generic(GenericItem::Owned(value.into_owned()), &mut **sink)
             }
             OwnedIdentityTail::Pairs(pairs) => pairs(value, id),
         }
@@ -23794,7 +23814,7 @@ impl<V: DocumentValue> OwnedIdentityTail<'_, V> {
 fn eval_owned_identity_spliced<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
     rest: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     tail: OwnedIdentityTail<'_, V>,
@@ -23823,7 +23843,7 @@ fn stop_owned_identity_rest_escape(slot: &mut Option<Control>, control: Control)
 fn eval_owned_identity_scoped<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
     rest: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     tail: &mut OwnedIdentityTail<'_, V>,
@@ -23862,7 +23882,7 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
     catch: Option<&Expr>,
     rest: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     mut tail: OwnedIdentityTail<'_, V>,
@@ -23897,7 +23917,7 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
     let mut rest_escape: Option<Control> = None;
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(handler),
-        payload,
+        Cow::Owned(payload),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, _| match eval_owned_identity_stages::<S, V>(
@@ -23922,7 +23942,7 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
     body: &Expr,
     take: Option<usize>,
     rest: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     tail: &mut OwnedIdentityTail<'_, V>,
@@ -24036,11 +24056,11 @@ fn owned_identity_prefetch<S: EvalSemantics, V: DocumentValue>(
     let mut values: Vec<OwnedValue> = Vec::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(sub),
-        value.clone(),
+        Cow::Borrowed(value),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, _| {
-            values.push(v);
+            values.push(v.into_owned());
             Flow::Exhausted
         }),
     );
@@ -24107,7 +24127,7 @@ fn owned_identity_live_key_node<V: DocumentValue>(id: &OwnedIdentity<V>) -> Opti
 /// since the identity pass).
 fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
-    value: OwnedValue,
+    value: Cow<'_, OwnedValue>,
     id: OwnedIdentity<V>,
     optional: bool,
     mut tail: OwnedIdentityTail<'_, V>,
@@ -24160,7 +24180,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 // yq v4.53.3).
                 match eval_owned_identity_stages::<S, V>(
                     rest,
-                    output,
+                    Cow::Owned(output),
                     id.clone().with_key_node(false),
                     optional,
                     tail.reborrow(),
@@ -24249,7 +24269,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 };
                 return eval_owned_identity_stages::<S, V>(
                     rest,
-                    key,
+                    Cow::Owned(key),
                     OwnedIdentity::kept(kc).with_key_node(true),
                     optional,
                     tail,
@@ -24258,7 +24278,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             match id.key() {
                 Ok(Some(key)) => eval_owned_identity_stages::<S, V>(
                     rest,
-                    key,
+                    Cow::Owned(key),
                     id.with_key_node(true),
                     optional,
                     tail,
@@ -24270,7 +24290,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
             Ok(path) => eval_owned_identity_stages::<S, V>(
                 rest,
-                OwnedValue::Array(path),
+                Cow::Owned(OwnedValue::Array(path)),
                 id,
                 optional,
                 tail,
@@ -24284,7 +24304,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::FileIndex) => match id.path() {
             Ok(path) => eval_owned_identity_stages::<S, V>(
                 rest,
-                OwnedValue::Int(file_index_for_path(&path)),
+                Cow::Owned(OwnedValue::Int(file_index_for_path(&path))),
                 id,
                 optional,
                 tail,
@@ -24367,7 +24387,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 match eval_owned_identity_spliced::<S, V>(
                     branch,
                     rest,
-                    value.clone(),
+                    Cow::Borrowed(&value),
                     id.clone(),
                     optional,
                     tail.reborrow(),
@@ -24386,7 +24406,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 match eval_owned_identity_spliced::<S, V>(
                     branch,
                     rest,
-                    value.clone(),
+                    Cow::Borrowed(&value),
                     id.clone(),
                     optional,
                     tail.reborrow(),
@@ -24428,7 +24448,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     expr,
                     take,
                     rest,
-                    value.clone(),
+                    Cow::Borrowed(&value),
                     id.clone(),
                     optional,
                     &mut tail,
@@ -24462,7 +24482,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 id.clone(),
                 optional,
                 OwnedIdentityTail::Pairs(&mut |v, vid| {
-                    last = Some((v, vid));
+                    last = Some((v.into_owned(), vid));
                     Flow::Exhausted
                 }),
             );
@@ -24470,7 +24490,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 return Flow::Escaped(control);
             }
             let (v, vid) = last.unwrap_or((OwnedValue::Null, id));
-            eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
+            eval_owned_identity_stages::<S, V>(rest, Cow::Owned(v), vid, optional, tail)
         }
         Expr::AsPattern {
             expr,
@@ -24510,7 +24530,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 match eval_owned_identity_spliced::<S, V>(
                     &substituted,
                     rest,
-                    value.clone(),
+                    Cow::Borrowed(&value),
                     id.clone(),
                     optional,
                     tail.reborrow(),
@@ -24635,7 +24655,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 ) {
                     Ok(Some(oid)) => eval_owned_identity_stages::<S, V>(
                         rest,
-                        output,
+                        Cow::Owned(output),
                         oid,
                         optional,
                         tail.reborrow(),
@@ -24646,7 +24666,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     // detached.
                     Ok(None) => eval_owned_identity_stages::<S, V>(
                         rest,
-                        output,
+                        Cow::Owned(output),
                         OwnedIdentity::detached(),
                         optional,
                         tail.reborrow(),
