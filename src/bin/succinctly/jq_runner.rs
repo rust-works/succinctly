@@ -7106,6 +7106,43 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 mod tests {
     use super::*;
 
+    /// #2951: run ids are interned per resolved module, and a module that
+    /// cannot be resolved still gets one.
+    ///
+    /// The unresolvable arm is not reachable through the CLI -- every caller
+    /// runs after a successful `load_module` -- but it is not dead either:
+    /// it is what keeps `run_id_for` total, and a run id is only ever a
+    /// diagnostic key, never a correctness one (`scan_scope` pairs a begin
+    /// marker with an end by nesting, not by id). Unit-tested rather than
+    /// left as an uncovered defensive line.
+    mod run_id_interning_2951 {
+        use super::*;
+
+        #[test]
+        fn unresolvable_module_still_gets_a_stable_id() {
+            let mut loader = ModuleLoader::new(&[]);
+            let first = loader.run_id_for("no-such-module-anywhere");
+            let again = loader.run_id_for("no-such-module-anywhere");
+            assert_eq!(first, again, "the same path must intern to one id");
+
+            let other = loader.run_id_for("a-different-missing-module");
+            assert_ne!(first, other, "distinct paths get distinct ids");
+
+            // `~/.jq`'s reserved id is never handed out to a module.
+            assert_ne!(first, AUTO_LOAD_RUN_ID);
+            assert_ne!(other, AUTO_LOAD_RUN_ID);
+
+            // Every id maps back to something nameable, which is the only
+            // thing the id is for.
+            assert_eq!(
+                loader.run_origin(first),
+                Some("no-such-module-anywhere"),
+                "an unresolvable module is keyed by the path as written"
+            );
+            assert_eq!(loader.run_origin(u32::MAX), None, "unknown id");
+        }
+    }
+
     /// #1525: `seq_no_rs_byte_warning` direct unit coverage. Every expected
     /// value here was live-verified against the pinned jq 1.7.1 binary
     /// (see `tests/jq_cli_tests.rs`'s CLI-level `_1525` tests for the
