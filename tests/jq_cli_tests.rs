@@ -26701,7 +26701,7 @@ fn test_module_declaring_a_data_import_still_loads_2865() -> Result<()> {
 /// that reaches them.
 ///
 /// Every row is captured whole from jq 1.7.1 -- stdout, stderr (with the
-/// module directory as `{dir}`) and exit code -- over the fixture files the
+/// module directory as `<DIR>`) and exit code -- over the fixture files the
 /// row lists. They cover the three ways the wrap used to leak:
 ///
 /// - **A dependency's body saw the def it was wrapped into** -- its name, its
@@ -26744,7 +26744,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("hb", "include \"gb\"; def h(b): g; def q: h(99);\n"), ("gb", "def g: b;\n")],
             "include \"hb\"; q",
             "",
-            "jq: error: b/0 is not defined at {dir}/gb.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
+            "jq: error: b/0 is not defined at <DIR>/gb.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26768,7 +26768,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("A", "include \"B\"; def g: 1; def f: b1;\n"), ("B", "def b1: g;\n")],
             "include \"A\"; f",
             "",
-            "jq: error: g/0 is not defined at {dir}/B.jq, line 1:\ndef b1: g;        \njq: 1 compile error\n",
+            "jq: error: g/0 is not defined at <DIR>/B.jq, line 1:\ndef b1: g;        \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26776,7 +26776,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("h5", "include \"inner5\"; def h($g): k; def q: h(7);\n"), ("inner5", "def k: $g;\n")],
             "include \"h5\"; q",
             "",
-            "jq: error: $g is not defined at {dir}/inner5.jq, line 1:\ndef k: $g;       \njq: 1 compile error\n",
+            "jq: error: $g is not defined at <DIR>/inner5.jq, line 1:\ndef k: $g;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26784,7 +26784,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("m6", "include \"a6\"; include \"b6\"; def z: y;\n"), ("a6", "def x: 1;\n"), ("b6", "def y: x;\n")],
             "include \"m6\"; z",
             "",
-            "jq: error: x/0 is not defined at {dir}/b6.jq, line 1:\ndef y: x;       \njq: 1 compile error\n",
+            "jq: error: x/0 is not defined at <DIR>/b6.jq, line 1:\ndef y: x;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26856,7 +26856,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("hib", "import \"ib\" as i; def h(b): i::g; def q: h(99);\n"), ("ib", "def g: b;\n")],
             "include \"hib\"; q",
             "",
-            "jq: error: b/0 is not defined at {dir}/ib.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
+            "jq: error: b/0 is not defined at <DIR>/ib.jq, line 1:\ndef g: b;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26864,7 +26864,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("morder", "include \"order\"; def c: 1; def q: g;\n"), ("order", "def g: c; def c: 7;\n")],
             "include \"morder\"; q",
             "",
-            "jq: error: c/0 is not defined at {dir}/order.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
+            "jq: error: c/0 is not defined at <DIR>/order.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26896,7 +26896,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             &[("mk", "include \"ik\"; def c: if . == 0 then g else (. - 1 | c) end;\n"), ("ik", "def g: c; def c: 7;\n")],
             "include \"mk\"; 0 | c",
             "",
-            "jq: error: c/0 is not defined at {dir}/ik.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
+            "jq: error: c/0 is not defined at <DIR>/ik.jq, line 1:\ndef g: c; def c: 7;       \njq: 1 compile error\n",
             3,
         ),
         (
@@ -26984,7 +26984,7 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
         )?;
         let stdout = String::from_utf8(output.stdout)?;
         let stderr = String::from_utf8(output.stderr)?;
-        let want_stderr = want_stderr.replace("{dir}", &dir.to_string_lossy());
+        let want_stderr = want_stderr.replace("<DIR>", &dir.to_string_lossy());
         assert_eq!(
             (stdout.as_str(), stderr.as_str(), code),
             (*want_stdout, want_stderr.as_str(), *want_code),
