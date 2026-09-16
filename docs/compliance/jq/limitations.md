@@ -360,6 +360,60 @@ This is the general "JSON numbers are re-rendered, not echoed" property of the e
 rather than anything specific to errors, and it only shows for float literals whose
 shortest rendering differs from their source spelling.
 
+## The math builtins print the platform libm's last bit, as jq does (#3045)
+
+jq does not compute `sin`, `exp`, `pow`, `sqrt`, ... itself: each is a one-line call into
+the C library it was linked against. Those libraries are not correctly rounded and do not
+agree with each other. Over 400 inputs (`range(1;401) | . * 0.137 - 20`), the pinned
+`/usr/bin/jq` 1.7.1-apple and the `jq-linux-amd64` 1.7.1 release binary print a different
+last digit of `tan` on 161, of `cosh` on 69, of `acos` on 60; `exp`, `log` and `pow` agree
+on all but 0-1. **The reference's floating-point digits are therefore a property of the
+platform**, and [ADR-0018](../../adrs/adr-0018.md)'s pinned reference is "jq 1.7.1 on the
+platform succinctly runs on" (its #3045 amendment).
+
+Before #3045 succinctly used the pure-Rust `libm` crate (a musl port) everywhere, and so
+matched *neither*: 163/400 on `tan`, 92 on `cosh`, 43 on `exp` against Apple's; 19, 41 and
+42 against glibc's. Its `sqrt` was a Newton iteration, off on 161/400 against every libm.
+Since #3045, `jq::math` (`src/jq/math.rs`) binds the platform's C symbols directly under
+`std` — bit-exact on every sampled input of every builtin against the platform's own jq
+(`scripts/jq-libm-oracle-sweep.sh`, 0 mismatches on Apple silicon and on x86_64 glibc; the
+pre-fix build reports 1092). The Rust `f64` inherent methods were rejected for the same
+reason the crate was: `f64::atanh` is a formula, several ulps from the C `atanh` on both
+platforms.
+
+What remains, recorded here:
+
+- **`no_std` builds keep the `libm` crate** — there is no platform libm to link — and so
+  differ from every jq build in the last bit at the rates above. No reference exists for
+  such a build; this is the closest available value, not a divergence anyone can measure.
+- **"The platform" is the C library the succinctly binary itself links**, not the OS's
+  jq. A musl-static succinctly on Linux carries musl's `tan`, one ulp from the glibc-built
+  `jq` next to it on 19/400 inputs; a glibc-dynamic build matches that jq exactly. This is
+  the same property real jq has (a musl-built jq prints musl's digits) and is not
+  something succinctly can paper over.
+- **`exp10`** is spelled the way jq spells it: `__exp10` on Apple platforms (jq's own
+  `builtin.c` renames it), `exp10` on glibc/musl/Android. On a platform with neither, jq's
+  build defines `exp10/0` as a runtime error ("not found at build time"); succinctly
+  answers `pow(10, x)` there instead, which is not bit-exact against anything but beats
+  refusing. Note that `pow(10, x)` and `exp10(x)` are *different* results on glibc
+  (137/400), so `pow(10; .)` is not a spelling of `exp10` on Linux either.
+- **Hermetic goldens can only pin the last bit where every libm agrees.** The
+  `math_platform_libm_bits` case was built from a per-function sweep, choosing inputs on
+  which Apple's libm and glibc agree and the `libm` crate does not, so the one
+  `expected.out` verifies against both jq builds *and* has regression power. The
+  `ubuntu-24.04-arm` leg (glibc aarch64) was not measured before that case was captured —
+  glibc is not built with `-ffp-contract=off`, so a fused multiply-add could in principle
+  move a last bit there; the leg running green is the measurement. The older
+  `math_sin_samples`/`math_cos_samples`/`math_atan_pi` goldens floor to six decimals and
+  stay as they are: they are not wrong, they just cannot see this.
+- **`cbrt`, `tgamma`, `lgamma`, `erf`, `j0`/`y0` and the rest of #3042** are not
+  implemented yet. The sweep behind this section measured them too: the platform C
+  symbols are bit-exact against both jq builds for every one, so #3042 can take the same
+  route — with one trap. On `linux-gnu`, `compiler_builtins` exports its own `cbrt` (a
+  musl port, alongside the exact `sqrt`/`floor`/`fma` family), and the linker binds an
+  `extern "C" cbrt` to it *before* glibc's: 192/400 off the Linux jq, while matching
+  Apple's. Reaching glibc's `cbrt` needs `dlsym` or a rename, not just a declaration.
+
 ## Behaviour and parser gaps
 
 None remain open in this section's own narrative, tracked in
