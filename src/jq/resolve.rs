@@ -1881,16 +1881,15 @@ fn check(
                 // keeps every `def` body where `build_call_graph` found it.
                 // Where it clones, the new args are re-keyed; both address
                 // lists come from `builtin_kids` order, so they pair up.
-                let mut rebased = None;
-                if let Some(fallback) = builtin_fallback.take() {
+                let rebased = builtin_fallback.take().and_then(|fallback| {
                     let cloned_from =
                         matches!(*fallback, Expr::Builtin(_)).then(|| def_body_addrs(&fallback));
                     *args = builtin_fallback_into_args(*fallback);
-                    rebased = cloned_from.map(|from| {
+                    cloned_from.map(|from| {
                         let to = args.iter().flat_map(def_body_addrs).collect();
                         translate_reachable(&from, to, reachable)
-                    });
-                }
+                    })
+                });
                 let reachable = rebased.as_ref().unwrap_or(reachable);
                 for a in args.iter_mut() {
                     check(a, scope, var_scope, errors, reachable);
