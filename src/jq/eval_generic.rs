@@ -35440,6 +35440,92 @@ mod tests {
 
     /// `key`/`parent`/`path` as cursor properties, straight from the tree,
     /// including the document-root edge (#2421) and array indices.
+    /// #2572: a walk step extends the position's trail rather than copying
+    /// it. Every position `.[]` reaches from one node hangs off that node's
+    /// own link -- one allocation per position whatever the depth -- and the
+    /// link records the node it stepped from, which is what `parent` hops
+    /// back to.
+    #[test]
+    fn path_context_step_shares_the_trail_it_extends_2572() {
+        let json = br#"{"a":{"b":[10,20,30]}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let at = |f: &str| match eval_with_cursor(&parse(f).unwrap(), root) {
+            GenericResult::OneCursor(c) => c,
+            other => panic!("`{f}` is not one cursor: {other:?}"),
+        };
+        let root_pos = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(root).unwrap();
+        let mut at_b = Vec::new();
+        path_context_step_generic::<JqSemantics, _>(&parse(".a.b").unwrap(), &root_pos, &mut at_b)
+            .unwrap();
+        let [b] = at_b.as_slice() else {
+            panic!("`.a.b` reaches one position, got {}", at_b.len())
+        };
+        let mut elements = Vec::new();
+        path_context_step_generic::<JqSemantics, _>(&Expr::Iterate, b, &mut elements).unwrap();
+        assert_eq!(elements.len(), 3);
+        let shared = b.trail.0.as_ref().expect("`.a.b` is two links deep");
+        for (i, pos) in elements.iter().enumerate() {
+            let link = pos.trail.0.as_ref().expect("an element is one link deeper");
+            let parent = link
+                .parent
+                .0
+                .as_ref()
+                .expect("the element's parent is `.a.b`");
+            assert!(
+                Rc::ptr_eq(parent, shared),
+                "element {i} copied the trail instead of extending it"
+            );
+            assert_eq!(link.component, OwnedValue::Int(i as i64));
+            assert!(matches!(&link.from, PathNode::At(c) if c.same_node(&at(".a.b"))));
+        }
+        assert_eq!(Rc::strong_count(shared), 1 + elements.len());
+        assert_eq!(
+            elements[2].trail.to_vec(),
+            [
+                OwnedValue::String("a".into()),
+                OwnedValue::String("b".into()),
+                OwnedValue::Int(2)
+            ]
+        );
+        assert_eq!(
+            elements[2].trail.last_component(),
+            Some(&OwnedValue::Int(2))
+        );
+
+        let up = path_context_hop(&elements[2], 2).expect("`.a` is two levels up");
+        assert_eq!(up.trail.to_vec(), [OwnedValue::String("a".into())]);
+        assert!(matches!(up.node, PathNode::At(c) if c.same_node(&at(".a"))));
+        let top = path_context_hop(&elements[2], 3).expect("the root is three levels up");
+        assert_eq!(top.trail.depth(), 0);
+        assert!(matches!(top.node, PathNode::At(c) if c.same_node(&root)));
+        assert!(
+            path_context_hop(&elements[2], 4).is_none(),
+            "above the root"
+        );
+        let stay = path_context_hop(&elements[2], 0).expect("`parent(0)` stays");
+        assert_eq!(stay.trail.depth(), 3);
+    }
+
+    /// #2572: a trail is as deep as the document a walk is rooted in, not
+    /// only as the query, so dropping one must not recurse once per link --
+    /// under a derived drop a million links overflow a test thread's stack.
+    #[test]
+    fn path_context_trail_drops_a_deep_chain_iteratively_2572() {
+        let mut trail: PathContextTrail<crate::json::StandardJson<'static, Vec<u64>>> =
+            PathContextTrail::root();
+        for i in 0..1_000_000 {
+            trail = trail.extend_from(OwnedValue::Int(i), &PathNode::Absent);
+        }
+        assert_eq!(trail.depth(), 1_000_000);
+        // A second handle keeps the chain alive through the first drop, so
+        // the unlink stops at a shared link and the rest goes with the last.
+        let shared = trail.hop(1).expect("one level up").0;
+        drop(trail);
+        assert_eq!(shared.depth(), 999_999);
+        drop(shared);
+    }
+
     #[test]
     fn cursor_properties_answer_from_the_tree_2416() {
         let json = br#"{"a":{"b":[10,20]},"c":1}"#;
