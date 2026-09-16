@@ -3422,19 +3422,49 @@ fn get_inputs(
     // `Some` only for a stream with no RS byte anywhere, which is the one
     // case `jq_seq_reader` is not asked about (#1723). Raw bytes, before
     // the UTF-8 substitution below, because jq counts columns in bytes.
-    if args.seq && !args.raw_input && args.input_dsv.is_none() && !args.null_input {
+    // That same reader walk also answers `--seq -s`'s EOF-location
+    // question, so it runs once here and is used twice -- a second pass
+    // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
+    // (interleaved A/B, release, output-identity gated).
+    let mut seq_last_parse_error = None;
+    let seq_warnings_apply =
+        args.seq && !args.raw_input && args.input_dsv.is_none() && !args.null_input;
+    if seq_warnings_apply {
         // A *malformed* BOM is the one case where "no RS byte anywhere"
         // does not imply #1525's template: it costs jq a `parser_reset`
         // that leaves the parser reading rather than waiting for an RS, so
         // the reader owns that case too (#1723).
         let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
-        match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
-            Some(warning) => eprintln!("{warning}"),
+        seq_last_parse_error = match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
+            Some(warning) => {
+                eprintln!("{warning}");
+                // #1525's arm prints its own template instead of the
+                // reader's, but the location still needs the walk. A
+                // stream with no RS byte anywhere yields nothing, so this
+                // is the degenerate input, never the hot path.
+                crate::jq_seq_reader::last_parse_error_offset(&raw_bytes)
+            }
             None => crate::jq_seq_reader::for_each_warning(&raw_bytes, &mut |warning| {
                 eprintln!("{warning}");
             }),
-        }
+        };
     }
+
+    // Answered here, before the UTF-8 substitution below consumes
+    // `raw_bytes`: the rule reads jq's own byte stream, and a substituted
+    // byte changes both the offsets and the reader's own BOM verdict (see
+    // the function's docs). `-R` takes over entirely from `--seq` for
+    // raw-text mode, keeping the same priority the location has below.
+    let seq_trailing_record_dropped = args.slurp && args.seq && !args.raw_input && {
+        // The gates differ: `--input-dsv` and `-n` skip the warnings but
+        // can still reach the location, so those pay for their own walk.
+        let last_error = if seq_warnings_apply {
+            seq_last_parse_error
+        } else {
+            crate::jq_seq_reader::last_parse_error_offset(&raw_bytes)
+        };
+        seq_stream_trailing_record_is_dropped(&raw_bytes, last_error)
+    };
 
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
@@ -3538,13 +3568,12 @@ fn get_inputs(
     // not `<unknown>`.
     let slurp_eof_line: Option<usize> = if args.slurp {
         raw_inputs.last().and_then(|(_, raw)| {
-            // #1550: the drop check has to read across every file as one
-            // stream, not just `raw_inputs.last()` alone -- a truncated
-            // record's own opening RS byte and its closing/disambiguating
-            // bytes can live in different files.
-            let dropped =
-                args.seq && !args.raw_input && seq_stream_trailing_record_is_dropped(&raw_inputs);
-            if dropped {
+            // #1550: the drop check reads across every file as one stream,
+            // not just `raw_inputs.last()` alone -- a truncated record's
+            // own opening RS byte and its closing/disambiguating bytes can
+            // live in different files. Computed above, where the raw bytes
+            // still exist.
+            if seq_trailing_record_dropped {
                 None
             } else {
                 Some(line_at(raw.as_bytes(), raw.len()))
@@ -4668,19 +4697,26 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 /// has_more)` condition instead, with the filename intact.
 ///
 /// **Which errors are fatal to the position, then, is decided by jq's
-/// `fgets` chunking**: jq refills a line at a time, so an error detected
-/// on any *earlier* line is answered by a refill that still has a line to
-/// hand over (or a next file to open), and the position survives; only an
-/// error detected while jq is working on the stream's **final buffer** --
-/// the bytes after the last newline of the last file, plus the empty
-/// buffer that a newline-terminated stream ends with, where truncations
-/// are finally reported `at EOF` -- leaves nothing to refill from.
+/// `fgets` chunking**: an error detected on a chunk that still has a
+/// refill behind it (or a next file to open) survives; only one detected
+/// while jq is working on the stream's **final buffer** leaves nothing to
+/// refill from. `read_more` calls `fgets(buf, sizeof(buf), f)` on a
+/// `char buf[4096]`, so a chunk ends at a newline or after
+/// [`JQ_FGETS_CHUNK`] bytes, whichever comes first -- and `feof` is set
+/// only by an `fgets` that actually ran out of input, which is why a
+/// chunk ending on a newline, or filling the buffer exactly, is followed
+/// by one more (empty) buffer, where a truncation is finally reported
+/// `at EOF`.
 ///
-/// Hence the whole rule, and why it is one comparison: ask
-/// [`jq_seq_reader::last_parse_error_offset`] (which models jq's `scan()`
-/// loop, so it already knows the *moment of detection* rather than merely
-/// what was wrong) where jq last failed, and check whether that moment
-/// falls inside the final buffer.
+/// Hence the whole rule, and why it is one comparison. `last_parse_error`
+/// is where jq last failed, from the reader that models jq's `scan()` loop
+/// and so already knows the *moment of detection* rather than merely what
+/// was wrong; this function works out where the final buffer starts and
+/// asks whether that moment falls inside it. The caller supplies the
+/// offset because the same walk produces jq's stderr diagnostics -- see
+/// [`jq_seq_reader::for_each_warning`] and its
+/// [`last_parse_error_offset`](jq_seq_reader::last_parse_error_offset)
+/// alias -- and is run once for both.
 ///
 /// Worked examples, all oracle-verified against jq 1.7.1 -- note that the
 /// record text is identical within each pair, and only the bytes *after*
@@ -4693,6 +4729,11 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 /// \x1e0\x1e\n     error on RS  @2, final buffer starts at 4   => file:1
 /// \x1e"unterm\n   error at EOF @9, final buffer starts at 9   => <unknown>
 /// ```
+///
+/// The buffer size is observable, not a detail: `\x1e[0,]` padded with
+/// spaces to 4094 bytes answers `<unknown>`, and one byte more answers
+/// `file:0`, because at 4095 `fgets` stops on the size limit rather than
+/// on EOF, so a further (empty) buffer follows.
 ///
 /// The last of those is why a newline cannot simply be read as "recovery":
 /// it restores the position after a record jq has *finished* rejecting,
@@ -4717,26 +4758,51 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 /// - **A malformed record earlier in the stream**, resynced by a later
 ///   valid record (#1542): its error is not in the final buffer, so the
 ///   position is intact.
-fn seq_stream_trailing_record_is_dropped(raw_inputs: &[(Option<usize>, String)]) -> bool {
-    // jq parses every file as one continuous byte stream (#1571), so the
-    // reader has to see it that way -- a record's opening RS byte and the
-    // bytes that resolve it can live in different files (#1550).
-    let (combined, file_ends) = concat_with_file_ends(raw_inputs);
-    // `file_ends[i]` is file `i`'s exclusive end and file `i+1`'s start,
-    // so the last file starts at the second-to-last entry.
-    let last_file_start = file_ends
-        .len()
-        .checked_sub(2)
-        .map_or(0, |index| file_ends[index]);
-    // The final `fgets` buffer: everything after the last newline *of the
-    // last file*. Scoping it to that file is what keeps an empty (or
-    // newline-free) trailing file from inheriting an earlier file's
-    // failure -- jq opens it, and opening is what restores the filename.
-    let final_buffer_start = combined[last_file_start..]
-        .rfind('\n')
-        .map_or(last_file_start, |index| last_file_start + index + 1);
-    crate::jq_seq_reader::last_parse_error_offset(combined.as_bytes())
-        .is_some_and(|offset| offset >= final_buffer_start)
+fn seq_stream_trailing_record_is_dropped(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    last_parse_error: Option<usize>,
+) -> bool {
+    // Raw bytes, before the UTF-8 substitution `get_inputs` applies, for
+    // the same reason `seq_no_rs_byte_warning` takes them: an invalid byte
+    // becomes a 3-byte U+FFFD, which both moves every offset and changes
+    // what the reader sees. `\x80` substitutes to `EF BF BD`, whose first
+    // two bytes are a *malformed* BOM prefix -- which flips the reader out
+    // of `WaitingForRs` and makes it read the replacement character as a
+    // record. Handing it the normalized string answered `<unknown>` for
+    // `\x80\x1e`, where jq answers line 0.
+    let total = raw_bytes.iter().map(|(_, raw)| raw.len()).sum::<usize>();
+    // jq reads one file at a time, so chunking restarts at the last file's
+    // own start. That is also what keeps an empty (or newline-free)
+    // trailing file from inheriting an earlier file's failure -- jq opens
+    // it, and opening is what restores the filename.
+    let last: &[u8] = raw_bytes.last().map_or(&[], |(_, raw)| raw.as_slice());
+    let last_start = total - last.len();
+
+    // Walk `fgets` chunks forward to the one that sets `feof`.
+    let mut chunk = 0usize;
+    let final_buffer_start = loop {
+        let rest = &last[chunk..];
+        let len = rest
+            .iter()
+            .take(JQ_FGETS_CHUNK)
+            .position(|&byte| byte == b'\n')
+            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1);
+        if chunk + len < last.len() {
+            chunk += len;
+            continue;
+        }
+        // The last chunk holding data. An `fgets` that stopped on a newline
+        // or on the size limit has not reached EOF yet, so an *empty*
+        // buffer follows and that one is final; otherwise this chunk is.
+        let stopped_early = len == JQ_FGETS_CHUNK || (len > 0 && rest[len - 1] == b'\n');
+        break if stopped_early {
+            total
+        } else {
+            last_start + chunk
+        };
+    };
+
+    last_parse_error.is_some_and(|offset| offset >= final_buffer_start)
 }
 
 /// Real jq's own stderr warning ("`jq: ignoring parse error: ...`") for a
@@ -5913,6 +5979,11 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 /// Write a single output value.
 /// ASCII RS (Record Separator) character for JSON sequence format (RFC 7464)
 const ASCII_RS: u8 = 0x1E;
+
+/// The most bytes one of jq's `fgets` refills can hold: `jq_util_input_read_more`
+/// (`src/util.c`) calls `fgets(state->buf, sizeof(state->buf), f)` on a
+/// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
+const JQ_FGETS_CHUNK: usize = 4095;
 
 /// Whether `--seq` should prepend the RS separator to this record (#1913).
 ///
