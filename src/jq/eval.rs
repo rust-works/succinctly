@@ -50783,13 +50783,26 @@ fn builtin_atanh<W: Clone + AsRef<[u64]>>(
 // Note: is_infinite(), is_nan(), is_normal(), is_finite() are available on f64 in no_std
 
 /// Builtin: isinfinite
+///
+/// #2932: a bridged ±Infinity reaches this builtin as
+/// `INFINITY_SENTINEL` (or its negative sibling), which `n.as_f64()` cannot
+/// parse -- without the sentinel check below the predicate would answer
+/// `false` for a genuine infinity, the same gap `builtin_isnan`'s existing
+/// `is_nan_sentinel` check closes for NaN. `isnormal`/`isfinite` do not
+/// share it: the former treats the unparseable token as `false` (jq says an
+/// infinity is not normal), and the latter routes through
+/// `get_float_value_with`, which already decodes both sentinels (#2932).
 fn builtin_isinfinite<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if is_nan_sentinel(n.raw_bytes()) {
+                QueryResult::Owned(OwnedValue::Bool(false))
+            } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
+                QueryResult::Owned(OwnedValue::Bool(true))
+            } else if let Ok(f) = n.as_f64() {
                 QueryResult::Owned(OwnedValue::Bool(f.is_infinite()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -75605,10 +75618,11 @@ mod tests {
     fn test_nan_normals_isinfinite_isnormal_already_correct_613() {
         // Unlike the math builtins above, `normals`/`isinfinite`/`isnormal`
         // already match real jq for a bridged NaN today (verified against
-        // jq-1.7.1): the missing sentinel check makes `n.as_f64()` fail, and
-        // each of these three happens to treat that failure the same way jq
-        // treats NaN itself. Pinned here so it can't silently regress while
-        // nearby code is being touched for #613.
+        // jq-1.7.1): a NaN has no ordinary float spelling, so `n.as_f64()`
+        // fails, and `normals`/`isnormal` treat that failure the same way jq
+        // treats NaN itself, while `isinfinite` forbids it explicitly through
+        // its own `is_nan_sentinel` guard (#2932). Pinned here so it can't
+        // silently regress while nearby code is being touched for #613.
         query!(b"null", "nan | normals", QueryResult::None => {});
         query!(b"null", "nan | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
             assert!(!b);
@@ -75633,6 +75647,46 @@ mod tests {
         });
         query!(br"9e999e999", "length", QueryResult::Owned(OwnedValue::Float(f)) => {
             assert!(f.is_nan());
+        });
+    }
+
+    #[test]
+    fn test_isinfinite_answers_true_for_a_genuine_infinity_2932() {
+        // #2932: `infinite | isinfinite` answered `false` while jq answers
+        // `true` (verified against jq-1.7.1). The bridged value arrives as
+        // `INFINITY_SENTINEL`, which `as_f64()` rejects, and the pre-fix code
+        // let that rejection fall through to `false`. The siblings stay pinned
+        // on the same value: `isfinite` already routes through
+        // `get_float_value_with`'s sentinel decode, `isnormal` has the correct
+        // `false` by virtue of the unparseable token, and `isnan` has its own
+        // sentinel check.
+        query!(b"null", "infinite | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "-(infinite) | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        query!(b"null", "infinite | isfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+        query!(b"null", "infinite | isnormal", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+        query!(b"null", "infinite | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(!b);
+        });
+        // Same #472 collision discipline as
+        // `test_nan_sentinel_collision_with_real_document_is_well_defined`,
+        // flipped to the infinity sentinel: a real document containing the
+        // bridge's number-shaped text is read as the value it spells.
+        query!(br"8e999e999", "isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
+        });
+        // yq mode shares the evaluator path (the `--jq-extensions` surface): a
+        // YAML `.inf` scalar resolves to `f64::INFINITY`, so the predicate must
+        // answer identically there.
+        yq_query!(b"null", "infinite | isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
+            assert!(b);
         });
     }
 
