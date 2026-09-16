@@ -1838,7 +1838,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 //
                 // Real jq goes further and names the module's own path, line
                 // and source echo; doing that needs the module's text
-                // threaded down here, which is #2990.
+                // threaded down here, which is #2991.
                 if let Some(id) = origin {
                     let at = loader
                         .run_origin(*id)

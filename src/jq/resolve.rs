@@ -2287,6 +2287,123 @@ mod tests {
     /// #2734: unbound `$variable` resolution. Every expectation captured
     /// live against the pinned oracle (`/usr/bin/jq`, jq-1.7.1), same
     /// discipline as [`resolve`]'s own doc comment.
+    /// #2951's floor, exercised directly on hand-built scope stacks.
+    ///
+    /// The CLI tests drive the same rule through real files, which is what
+    /// proves the loader and the resolver agree; these pin the rule itself,
+    /// where a failure says which half is wrong instead of just "the program
+    /// compiled when it should not have".
+    mod module_scope_floor {
+        use super::*;
+
+        /// Build a `Scope` from a compact spelling: `"begin:1"` / `"end:1"` /
+        /// `"begin:1@a"` are markers, anything else is a def of that name at
+        /// arity 0.
+        fn scope_of(entries: &[&str]) -> Scope {
+            entries
+                .iter()
+                .map(|e| {
+                    let name = if let Some(rest) = e.strip_prefix("begin:") {
+                        match rest.split_once('@') {
+                            Some((id, alias)) => {
+                                ModuleRun::begin_marker(id.parse().expect("id"), Some(alias))
+                            }
+                            None => ModuleRun::begin_marker(rest.parse().expect("id"), None),
+                        }
+                    } else if let Some(id) = e.strip_prefix("end:") {
+                        ModuleRun::end_marker(id.parse().expect("id"))
+                    } else {
+                        (*e).to_string()
+                    };
+                    (name, 0usize)
+                })
+                .collect()
+        }
+
+        fn visible(entries: &[&str], name: &str) -> bool {
+            in_scope(&scope_of(entries), name, 0).hit.is_some()
+        }
+
+        /// A name below an *open* run's begin marker is invisible -- the
+        /// whole point. `outer` is what `~/.jq` or a sibling `include`
+        /// contributes; `own` is a def of the module we are inside.
+        #[test]
+        fn floor_hides_a_def_below_an_open_run() {
+            assert!(!visible(&["outer", "begin:1", "own"], "outer"));
+            assert!(visible(&["outer", "begin:1", "own"], "own"));
+        }
+
+        /// ...but an *earlier sibling in the same run* stays visible, which
+        /// is how `def f: 1; def g: f;` inside one module keeps working.
+        #[test]
+        fn floor_keeps_an_earlier_sibling_of_the_same_run() {
+            assert!(visible(&["outer", "begin:1", "f", "g"], "f"));
+        }
+
+        /// A *closed* run -- one whose end marker we have already passed
+        /// scanning inward -- is wrapped around this point, so its defs are
+        /// visible and its begin is not a floor. This is the main filter's
+        /// case, and getting it wrong would hide every module from the
+        /// program that included it.
+        #[test]
+        fn a_closed_run_is_visible_and_is_not_a_floor() {
+            let chain = ["outer", "begin:1", "own", "end:1"];
+            assert!(visible(&chain, "own"), "the run's own defs");
+            assert!(visible(&chain, "outer"), "and everything below it");
+        }
+
+        /// Nested runs close in order: an inner closed run inside an outer
+        /// open one must not cancel the outer one's floor. Counting end
+        /// markers rather than matching ids is what makes this work, and it
+        /// is the case that would break if the count were a boolean.
+        #[test]
+        fn a_closed_inner_run_does_not_cancel_an_outer_open_floor() {
+            let chain = ["outer", "begin:1", "own", "begin:2", "dep", "end:2"];
+            assert!(visible(&chain, "dep"), "the closed inner run");
+            assert!(visible(&chain, "own"), "the open outer run's own defs");
+            assert!(!visible(&chain, "outer"), "still floored by run 1");
+        }
+
+        /// The innermost open run is reported, so the caller can retry a
+        /// bare miss under its alias (#2989) and attribute the error to the
+        /// right module.
+        #[test]
+        fn reports_the_innermost_open_run_and_its_alias() {
+            let run = in_scope(&scope_of(&["begin:7@ns", "own"]), "nope", 0).run;
+            assert_eq!(run, Some((7, Some("ns".to_string()))));
+
+            // Below every end marker there is no open run at all: the main
+            // filter sees everything and carries no alias to retry under.
+            let run = in_scope(&scope_of(&["begin:7@ns", "own", "end:7"]), "nope", 0).run;
+            assert_eq!(run, None);
+        }
+
+        /// Marker names round-trip, and an ordinary def is never mistaken
+        /// for one. The NUL prefix is the whole safety argument -- a name a
+        /// user could write would let a filter reach across the boundary.
+        #[test]
+        fn marker_names_round_trip_and_ordinary_names_do_not_parse() {
+            assert_eq!(
+                ModuleRun::parse(&ModuleRun::begin_marker(3, None)),
+                Some(RunMarker::Begin { id: 3, alias: None })
+            );
+            assert_eq!(
+                ModuleRun::parse(&ModuleRun::begin_marker(3, Some("a"))),
+                Some(RunMarker::Begin {
+                    id: 3,
+                    alias: Some("a")
+                })
+            );
+            assert_eq!(
+                ModuleRun::parse(&ModuleRun::end_marker(3)),
+                Some(RunMarker::End { id: 3 })
+            );
+            for ordinary in ["run:begin:3", "f", "ns::f", "", "beginning"] {
+                assert_eq!(ModuleRun::parse(ordinary), None, "{ordinary:?}");
+            }
+        }
+    }
+
     mod unbound_vars {
         use super::*;
 

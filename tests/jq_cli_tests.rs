@@ -43293,7 +43293,7 @@ fn test_unresolved_call_line_search_is_word_bounded_1473() -> Result<()> {
 /// diagnostic now names the module's own canonical file, byte-identical to
 /// jq's (`... is not defined at /abs/path/mymod.jq`). What still differs is
 /// jq's trailing `, line N:` and its echo of the module's source line, which
-/// need the module's *text* threaded down to the reporter; that is #2990.
+/// need the module's *text* threaded down to the reporter; that is #2991.
 ///
 /// Before #2951 this said `at <top-level>` and could do worse than say
 /// nothing: with no `origin` to distinguish a module-body error, the
@@ -56531,6 +56531,220 @@ fn test_preserve_input_keeps_jq_escape_table_2874() -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+/// #2951: a module body must not see names that are merely wrapped around it
+/// in the inlined def chain.
+///
+/// Every row was captured live from `/usr/bin/jq` 1.7.1 against these exact
+/// fixtures. The leak rows are the point; the *control* rows matter just as
+/// much, because the fix works by hiding names and a fix that hides too much
+/// would still pass a test made only of leak rows.
+///
+/// `~/.jq` is exercised by pointing `HOME` at a scratch directory, the same
+/// shape the #2774 tests use.
+#[test]
+fn test_module_body_cannot_see_siblings_or_home_jq_2951() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let lib = dir.path().join("lib");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&lib)?;
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(home.join(".jq"), "def hj: 1234;\n")?;
+    std::fs::write(lib.join("usehj.jq"), "def uh: hj;\n")?;
+    std::fs::write(lib.join("sibA.jq"), "def sa: sb;\n")?;
+    std::fs::write(lib.join("sibB.jq"), "def sb: 77;\n")?;
+    std::fs::write(lib.join("sibA3.jq"), "def sa3: b::sb;\n")?;
+    std::fs::write(lib.join("useboth.jq"), "def useboth: sb + two;\n")?;
+    std::fs::write(lib.join("two.jq"), "def two: 2;\n")?;
+
+    let lib_arg = lib.to_string_lossy().to_string();
+    let run = |filter: &str| -> Result<(String, String, i32)> {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut cmd = Command::new(succinctly_bin());
+                cmd.env("HOME", &home)
+                    .args(["jq", "-nc", "-L", &lib_arg, filter]);
+                cmd
+            },
+            None,
+        )?;
+        Ok((
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            code,
+        ))
+    };
+
+    // --- leaks: each of these used to resolve, and answer a value ---
+
+    // `~/.jq`'s defs are not visible inside a module body.
+    let (out, err, code) = run(r#"include "usehj"; uh"#)?;
+    assert_eq!(code, 3, "stdout: {out:?} stderr: {err:?}");
+    assert_eq!(out, "", "used to print 1234");
+    assert!(err.contains("hj/0 is not defined"), "stderr: {err:?}");
+
+    // A sibling `include`'s defs are not visible either -- in *both* orders.
+    // Before the fix only the second order errored, and it errored for the
+    // wrong reason (`sibB` simply was not wrapped outside `sibA` yet), which
+    // is the tell that this was leakage rather than a scoping rule.
+    for filter in [
+        r#"include "sibB"; include "sibA"; sa"#,
+        r#"include "sibA"; include "sibB"; sa"#,
+    ] {
+        let (out, err, code) = run(filter)?;
+        assert_eq!(code, 3, "{filter}: stdout: {out:?} stderr: {err:?}");
+        assert_eq!(out, "", "{filter}: used to print 77");
+        assert!(
+            err.contains("sb/0 is not defined"),
+            "{filter}: stderr: {err:?}"
+        );
+        // Attributed to the module that wrote the call, as jq attributes it.
+        assert!(
+            err.contains("sibA.jq"),
+            "{filter}: should name the module -- stderr: {err:?}"
+        );
+    }
+
+    // A main-level `import` alias does not reach into a module body either.
+    let (out, err, code) = run(r#"import "sibB" as b; include "sibA3"; sa3"#)?;
+    assert_eq!(code, 3, "stdout: {out:?} stderr: {err:?}");
+    assert_eq!(out, "", "used to print 77");
+    assert!(err.contains("b::sb/0 is not defined"), "stderr: {err:?}");
+
+    // Two leaked names in one module body report two errors, both attributed
+    // to that module -- matching jq's own count and order here.
+    let (out, err, code) = run(r#"include "sibB"; include "two"; include "useboth"; useboth"#)?;
+    assert_eq!(code, 3, "stdout: {out:?} stderr: {err:?}");
+    assert_eq!(out, "", "used to print 79");
+    let sb_at = err.find("sb/0 is not defined");
+    let two_at = err.find("two/0 is not defined");
+    assert!(sb_at.is_some() && two_at.is_some(), "stderr: {err:?}");
+    assert!(sb_at < two_at, "source order, as jq reports it: {err:?}");
+    assert_eq!(err.matches("useboth.jq").count(), 2, "stderr: {err:?}");
+
+    // --- controls: names that must still resolve ---
+
+    // A module's own `include` still reaches its dependency (#2865's rule,
+    // which the floor must not undo).
+    std::fs::write(lib.join("mod1.jq"), "include \"sibB\";\ndef m1: sb;\n")?;
+    let (out, err, code) = run(r#"include "mod1"; m1"#)?;
+    assert_eq!(code, 0, "stderr: {err:?}");
+    assert_eq!(out.trim_end(), "77");
+
+    // A module's own `import` likewise, even when the *main* filter binds the
+    // same alias to something else -- each run carries its own alias.
+    std::fs::write(
+        lib.join("mod2.jq"),
+        "import \"sibB\" as b;\ndef m2: b::sb;\n",
+    )?;
+    let (out, err, code) = run(r#"import "two" as b; include "mod2"; m2"#)?;
+    assert_eq!(code, 0, "stderr: {err:?}");
+    assert_eq!(out.trim_end(), "77");
+
+    // The main filter still sees everything it is meant to: it sits below
+    // every end marker, so its floor is 0.
+    let (out, err, code) = run(r#"include "sibB"; sb"#)?;
+    assert_eq!(code, 0, "stderr: {err:?}");
+    assert_eq!(out.trim_end(), "77");
+    let (out, err, code) = run("hj")?;
+    assert_eq!(code, 0, "~/.jq must still reach the main filter: {err:?}");
+    assert_eq!(out.trim_end(), "1234");
+
+    // A def whose call appears nowhere reachable is never compiled, so its
+    // module's leak is never diagnosed -- jq answers 1 here too.
+    let (out, err, code) = run(r#"include "sibB"; include "sibA"; def x: sa; 1"#)?;
+    assert_eq!(code, 0, "stderr: {err:?}");
+    assert_eq!(out.trim_end(), "1");
+
+    Ok(())
+}
+
+/// #2951: the floor hides names, so the fix's real risk is hiding one it
+/// should not -- and the sharpest version of that is a *builtin*.
+///
+/// A module body's call to a builtin never consults the def chain at all (a
+/// module's source is parsed with no shadow-candidate seeding, so the call is
+/// not an `Expr::FuncCall`), which is why a leaked name could only ever
+/// resolve where jq reports a compile error and never out-shadow a name jq
+/// resolves. That property is what makes a resolver-side floor sufficient,
+/// so it gets its own pin: both orders answer the same, and both match jq.
+#[test]
+fn test_module_scope_floor_does_not_hide_builtins_2951() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(
+        dir.path().join("sibDefLen.jq"),
+        "def length: 99; def map(f): \"mymap\";\n",
+    )?;
+    std::fs::write(
+        dir.path().join("sibLen.jq"),
+        "def sl: length; def sm: map(.+1);\n",
+    )?;
+    let lib = dir.path().to_string_lossy().to_string();
+
+    for filter in [
+        r#"include "sibDefLen"; include "sibLen"; [sl, sm]"#,
+        r#"include "sibLen"; include "sibDefLen"; [sl, sm]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "-L", &lib, filter], Some("[1,2]"))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            "[2,[2,3]]",
+            "{filter}: a sibling defining a builtin's name must not capture a \
+             module body's builtin call, and the floor must not hide the \
+             builtin either -- stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2989: a def inside an `import`ed module calls its siblings by the bare
+/// name it is written with, but the loader namespaced them to `alias::name`.
+///
+/// Fixed as a by-product of #2951's run markers: the import alias rides the
+/// begin marker, so a bare miss inside that run -- and only inside it -- is
+/// retried as `alias::name` and the call renamed in place.
+#[test]
+fn test_imported_module_def_can_call_its_sibling_2989() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(dir.path().join("x.jq"), "def f: 1; def g: f;\n")?;
+    let lib = dir.path().to_string_lossy().to_string();
+
+    // The whole bug: `g`'s body says bare `f`, the chain holds `a::f`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "-L", &lib, r#"import "x" as a; a::g"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
+    // Two aliases for one module: each run retries under its own alias, so
+    // both work and neither reports the other's error.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "-L",
+            &lib,
+            r#"import "x" as a; import "x" as c; [a::g, c::g]"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,1]");
+
+    // The retry must not leak past the run: a bare `f` in the *main* filter
+    // is still undefined, because the main filter is below every end marker
+    // and so carries no alias.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", &lib, r#"import "x" as a; f"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("f/0 is not defined"), "stderr: {stderr:?}");
+
+    // `include` of the same module keeps working: names stay bare there, so
+    // there is nothing to retry.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "-L", &lib, r#"include "x"; g"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
 
     Ok(())
 }
