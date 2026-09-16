@@ -64,7 +64,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
-use super::walk::{builtin_kids, map_builtin_subexprs, BuiltinKids};
+use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Expr, ObjectKey, Pattern, StringPart};
 
 /// A call this pass could not resolve to any in-scope `def`, parameter or
@@ -1867,14 +1867,88 @@ fn check(
         // already uses for its own builtin arm, reusing this function's
         // existing, tested infrastructure rather than hand-writing a
         // second, mutable 207-arm match beside `builtin_kids`.
+        //
+        // #2971: that clone is also what moved every `def` body inside the
+        // operand to a fresh heap address, and `reachable` is keyed by the
+        // addresses `build_call_graph` read off the *original* tree -- so
+        // `check`'s `FuncDef` gate found none of them and skipped each body
+        // as if it were never called. `[1]|map(def g: nosuchfn; g)` compiled,
+        // and failed at runtime (exit 5) where jq refuses to compile it
+        // (exit 3). The gate is right; only its key went stale, so the key is
+        // carried across the clone rather than the gate being weakened.
         Expr::Builtin(builtin) => {
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
-                let mut sub = sub.clone();
-                check(&mut sub, scope, var_scope, errors, reachable);
-                sub
+                let mut copy = sub.clone();
+                let rebased = rebase_reachable(sub, &copy, reachable);
+                check(
+                    &mut copy,
+                    scope,
+                    var_scope,
+                    errors,
+                    rebased.as_ref().unwrap_or(reachable),
+                );
+                copy
             });
         }
     }
+}
+
+/// `reachable`, re-keyed onto `copy` -- a fresh [`Clone`] of `original`
+/// (#2971).
+///
+/// [`build_call_graph`] identifies a `def` by its body's heap address, and a
+/// clone reallocates every `Box` it copies, so none of `original`'s keys
+/// name anything in `copy`. A *move* would not have this problem -- moving
+/// an `Expr` carries its `Box` pointers along unchanged -- which is why
+/// [`check`]'s one clone site, its `Expr::Builtin` arm, is the only place
+/// this is needed.
+///
+/// `original` and `copy` are structurally identical, so walking both with
+/// the same deterministic pre-order walk ([`any_subexpr`]) visits their
+/// `def`s in the same order, and zipping the two address lists pairs each
+/// body with its copy. Only the copies of reachable bodies are kept: every
+/// lookup the subsequent `check(copy, ..)` makes is for a `def` inside
+/// `copy`, so nothing outside it needs a key.
+///
+/// `None` when `original` holds no `def` at all -- the overwhelmingly
+/// common case for a builtin operand -- so the caller keeps using
+/// `reachable` itself and nothing is allocated. Resolution runs once per
+/// program, not per input, so the extra walk scales with program size.
+fn rebase_reachable(
+    original: &Expr,
+    copy: &Expr,
+    reachable: &BTreeSet<usize>,
+) -> Option<BTreeSet<usize>> {
+    let from = def_body_addrs(original);
+    if from.is_empty() {
+        return None;
+    }
+    let to = def_body_addrs(copy);
+    debug_assert_eq!(
+        from.len(),
+        to.len(),
+        "a clone must hold exactly its source's defs, in the same order"
+    );
+    Some(
+        from.iter()
+            .zip(&to)
+            .filter(|(old, _)| reachable.contains(old))
+            .map(|(_, new)| *new)
+            .collect(),
+    )
+}
+
+/// Every `def` body's address in `expr`, in [`any_subexpr`]'s pre-order --
+/// the identity [`build_call_graph`] keys reachability on.
+fn def_body_addrs(expr: &Expr) -> Vec<usize> {
+    let mut addrs = Vec::new();
+    any_subexpr(expr, &mut |node| {
+        if let Expr::FuncDef { body, .. } = node {
+            addrs.push(body.as_ref() as *const Expr as usize);
+        }
+        false
+    });
+    addrs
 }
 
 /// [`check`] over an optional sub-expression.
@@ -2081,6 +2155,74 @@ mod tests {
         // reached), so each def below only calls one already defined.
         assert_eq!(
             resolve("def c: nosuchfn; def b: c; def a: b; a"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+    }
+
+    /// #2971: a `def` inside a builtin's argument is compile-checked when it
+    /// is called. `check` clones each builtin operand before walking it,
+    /// which reallocated the def's body away from the address
+    /// `build_call_graph` recorded as reachable -- so the body was skipped
+    /// and the unresolved call surfaced at runtime instead. One row per
+    /// builtin family the issue confirmed, all oracle-verified against jq
+    /// 1.7.1 (`nosuchfn/0 is not defined`, exit 3).
+    #[test]
+    fn a_called_def_inside_a_builtin_argument_is_checked() {
+        for filter in [
+            "[1]|map(def g: nosuchfn; g)",
+            "[1]|select(def g: nosuchfn; g)",
+            "[1]|with_entries(def g: nosuchfn; g)",
+            "[1]|any(def g: nosuchfn; g)",
+            "[1]|all(def g: nosuchfn; g)",
+        ] {
+            assert_eq!(
+                resolve(filter),
+                Err("nosuchfn/0 is not defined".into()),
+                "{filter}"
+            );
+        }
+    }
+
+    /// #2971's negative control, and the reason the fix re-keys the
+    /// reachability gate instead of dropping it: dropping it passes every
+    /// row above and fails every row here. An *uncalled* def is never
+    /// compiled by jq, wherever it sits (jq 1.7.1: exit 0 for each).
+    #[test]
+    fn an_uncalled_def_inside_a_builtin_argument_is_still_skipped() {
+        for filter in [
+            "[1]|map(def g: nosuchfn; 1)",
+            "[1]|select(def g: nosuchfn; 1)",
+            "[1]|with_entries(def g: nosuchfn; 1)",
+            "[1]|any(def g: nosuchfn; 1)",
+            "[1]|all(def g: nosuchfn; 1)",
+        ] {
+            assert_eq!(resolve(filter), Ok(()), "{filter}");
+        }
+    }
+
+    /// #2971: the rebase has to compose, and has to carry across only what
+    /// was reachable -- not every def it pairs. Each nested builtin clones
+    /// again, so a def two builtins deep is re-keyed twice; and a def whose
+    /// only caller is itself uncalled must stay skipped even though the
+    /// rebase walks straight past it. All oracle-verified against jq 1.7.1.
+    #[test]
+    fn a_def_inside_a_builtin_argument_keeps_whole_program_reachability() {
+        // Two builtins deep: re-keyed at each level.
+        assert_eq!(
+            resolve("[[1]]|map(map(def g: nosuchfn; g))"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+        assert_eq!(resolve("[[1]]|map(map(def g: nosuchfn; 1))"), Ok(()));
+        // Reached only transitively, through another def in the same operand.
+        assert_eq!(
+            resolve("[1]|map(def g: nosuchfn; def h: g; h)"),
+            Err("nosuchfn/0 is not defined".into())
+        );
+        assert_eq!(resolve("[1]|map(def g: nosuchfn; def h: g; 1)"), Ok(()));
+        // The operand sits inside a def: reachable only if that def is.
+        assert_eq!(resolve("def h: map(def g: nosuchfn; g); 1"), Ok(()));
+        assert_eq!(
+            resolve("def h: map(def g: nosuchfn; g); [1]|h"),
             Err("nosuchfn/0 is not defined".into())
         );
     }
