@@ -6815,13 +6815,19 @@ impl<'a> Parser<'a> {
             program.module = Some(self.parse_module_declaration()?);
         }
 
-        // Parse import and include directives
+        // Parse import and include directives. The two kinds live in separate
+        // `Program` lists, but `decl_index` assigns every directive one slot
+        // in the combined source order so a consumer can tell which of an
+        // `import` and an `include` came last (#2857).
+        let mut decl_index = 0usize;
         loop {
             self.skip_ws();
             if self.matches_keyword("import") {
-                program.imports.push(self.parse_import()?);
+                program.imports.push(self.parse_import(decl_index)?);
+                decl_index += 1;
             } else if self.matches_keyword("include") {
-                program.includes.push(self.parse_include()?);
+                program.includes.push(self.parse_include(decl_index)?);
+                decl_index += 1;
             } else {
                 break;
             }
@@ -6918,7 +6924,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse import directive: `import "path" as name;` or `import "path" as $name;`
-    fn parse_import(&mut self) -> Result<Import, ParseError> {
+    fn parse_import(&mut self, decl_index: usize) -> Result<Import, ParseError> {
         self.consume_keyword("import");
         self.skip_ws();
 
@@ -6969,11 +6975,12 @@ impl<'a> Parser<'a> {
             alias,
             data,
             metadata,
+            decl_index,
         })
     }
 
     /// Parse include directive: `include "path";`
-    fn parse_include(&mut self) -> Result<Include, ParseError> {
+    fn parse_include(&mut self, decl_index: usize) -> Result<Include, ParseError> {
         self.consume_keyword("include");
         self.skip_ws();
 
@@ -6998,7 +7005,11 @@ impl<'a> Parser<'a> {
         }
         self.next();
 
-        Ok(Include { path, metadata })
+        Ok(Include {
+            path,
+            metadata,
+            decl_index,
+        })
     }
 
     /// Parse a metadata object: `{ key: value, ... }`

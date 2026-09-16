@@ -3253,24 +3253,30 @@ line (jq's own stand-in for the missing source echo), then the trailer.
 `ModuleLoader::ensure_module_loaded`'s not-found case now reports this exactly; verified
 against jq 1.7.1 for both `include` and `import`.
 
-**Residual gap: which module is named when *more than one* is unresolvable.** jq reports
-the last failing declaration in true source order, regardless of `include`/`import` kind
-or how many resolvable declarations sit between the failures (confirmed live: `include
-"AAA"; include "BBB"; include "CCC"; 1` names `CCC`; interleaving kinds --
-`include "CCC"; import "AAA" as a; 1` names `AAA`, and reversing the two names `CCC` --
-always whichever comes last in the source, not last within its own directive kind). Two
-architectural reasons this codebase can't reproduce that: `Program` stores `includes` and
-`imports` as two separate `Vec`s with no shared position or interleaving order between
-them (unlike `Expr::FuncCall`'s own well-known missing-position problem elsewhere in this
-document, extending `Import`/`Include` the same way is unexplored, not deliberately
-declined); and `ModuleLoader::unqualified_def_names` (#2395) resolves every `include`
-*before* `process_program` ever looks at an `import`, so a failing `import` is never even
-reached when an earlier-declared `include` also fails, regardless of which one jq itself
-would report. Succinctly instead reports the first `include` failure it encounters, or (if
-every `include` resolves) the first failing declaration in whichever of the two
-`process_program` loops runs into one -- includes, then imports, each in their own list
-order. This is a gap #2703's own single-module repro never exercised; tracked separately
-as [#2857](https://github.com/rust-works/succinctly/issues/2857).
+**Closed for *which* module is named when *more than one* unresolvable declaration is spread
+across the top-level `include`s and `import`s (#2857).** jq reports the last failing declaration
+in true source order, regardless of kind or of how many resolvable declarations sit between
+the failures (confirmed live: `include "AAA"; include "BBB"; include "CCC"; 1` names `CCC`;
+interleaving kinds — `include "CCC"; import "AAA" as a; 1` names `AAA`, and reversing the two
+names `CCC` — always whichever comes last in the source, not last within its own directive
+kind). The loader now can: `Program`'s `Import`/`Include` each carry a shared `decl_index`
+(the parser assigns every directive one slot in the combined source order as it scans), and
+both `unqualified_def_names` and `process_program` give every directive its turn to load,
+keeping whichever failure has the highest `decl_index` and reporting it after the loops —
+verified byte-for-byte against jq 1.7.1 across the decide-by-kind, decide-by-position, and
+mixed-success shapes. This closed #2703's recorded residual; the gap below is what the same
+research surfaced as still open.
+
+**Residual gap: a module's *own* dependencies resolve with the old first-failure
+short-circuit, not the source-order rule.** The same `last failing directive` comparison now
+handles every top-level `include`/`import`, but a directive *inside* a module (`module_dep_defs`)
+still returns on its first failure, so a module with several unresolvable `include`s reports
+the first rather than jq's last, and a failing `include` inside a module can shadow a
+later-declared failing `import` in the same module. The `decl_index` machinery would apply
+there unchanged; it was deliberately left out of scope for #2857 (whose repros are all
+top-level) to keep the change reviewable, and jq itself falls back to per-module ordering
+here anyway when the failure is inside a module that a *resolvable* top-level directive
+ultimately pulls in.
 
 **Closed for a syntax error in the main filter.** Route to the same shared reporter
 (`report_syntax_error` in `jq_runner.rs`, factored out of the undefined-name path's inline

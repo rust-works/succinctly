@@ -25089,6 +25089,163 @@ fn test_module_not_found_matches_jq_exactly_2703() -> Result<()> {
     Ok(())
 }
 
+/// #2857: among multiple failing `include`s, jq reports the *last* one in
+/// source order, not the first the loader happens to try.
+///
+/// Before the fix `unqualified_def_names` iterated `program.includes` forward
+/// and bailed on the first failure, so
+/// `include "AAA"; include "BBB"; include "CCC"` reported `AAA` where jq
+/// 1.7.1 reports `CCC` (captured live). The shared `decl_index` on every
+/// directive now lets both load passes keep whichever failure came last.
+#[test]
+fn test_last_failing_include_is_reported_2857() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", r#"include "AAA"; include "BBB"; include "CCC"; 1"#],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(
+        stderr, "jq: error: module not found: CCC\n\njq: 1 compile error\n",
+        "stderr {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2857: the same "last one wins" rule applies across multiple failing
+/// `import`s.
+#[test]
+fn test_last_failing_import_is_reported_2857() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"import "AAA" as a; import "BBB" as b; 1"#], None)?;
+    assert_eq!(code, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(
+        stderr, "jq: error: module not found: BBB\n\njq: 1 compile error\n",
+        "stderr {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2857: the "last failing directive" order is *across kinds* -- an
+/// `include` and an `import` failing in the same program are compared in true
+/// source order, not with one kind always winning because it happens to be
+/// processed first. Both shapes captured live against jq 1.7.1; both modules
+/// are absent here, so both directives fail.
+#[test]
+fn test_last_failing_directive_wins_across_kinds_2857() -> Result<()> {
+    // include first, import second -> the import (the later declaration) wins.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"include "CCC"; import "AAA" as a; 1"#], None)?;
+    assert_eq!(code, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(
+        stderr, "jq: error: module not found: AAA\n\njq: 1 compile error\n",
+        "shape 1 stderr {stderr:?}"
+    );
+
+    // import first, include second -> the include (the later declaration)
+    // wins.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"import "AAA" as a; include "CCC"; 1"#], None)?;
+    assert_eq!(code, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(
+        stderr, "jq: error: module not found: CCC\n\njq: 1 compile error\n",
+        "shape 2 stderr {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2857: a directive that *succeeds* does not mask a later failure -- and a
+/// failure before a success still reports the (only) failing directive, so
+/// the fix neither reports successes nor forgets real failures.
+#[test]
+fn test_last_failing_directive_with_successes_before_and_after_2857() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("real.jq"), "def real: 42;\n")?;
+    std::fs::write(temp_dir.path().join("other.jq"), "def other: 7;\n")?;
+
+    // A later missing directive is still reported, even with a real module
+    // earlier on.
+    for filter in [
+        r#"include "real"; include "AAA"; 1"#,
+        r#"include "real"; import "AAA" as a; 1"#,
+    ] {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc", filter]);
+                command
+            },
+            None,
+        )?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        assert_eq!(
+            stderr, "jq: error: module not found: AAA\n\njq: 1 compile error\n",
+            "{filter}"
+        );
+    }
+
+    // A failing directive before a succeeding module still reports the
+    // failure -- success later on does not swallow it.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "AAA"; include "real"; 1"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr {stderr:?}");
+    assert_eq!(
+        stderr, "jq: error: module not found: AAA\n\njq: 1 compile error\n",
+        "stderr {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2857 guard: the error-selection refactor must not change what happens when
+/// *every* directive resolves -- `process_program`'s wrapping order (last
+/// include innermost, then `~/.jq`, then imports) is load-order-sensitive and
+/// the `continue` on a failed load must not have moved on the success path.
+#[test]
+fn test_mixed_include_import_success_path_unchanged_2857() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("real.jq"), "def real: 42;\n")?;
+    std::fs::write(temp_dir.path().join("other.jq"), "def other: 7;\n")?;
+
+    let (stdout, stderr, code) = {
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["jq", "-L"]).arg(temp_dir.path()).args([
+                    "-nc",
+                    r#"include "real"; import "other" as o; [real, o::other]"#,
+                ]);
+                command
+            },
+            None,
+        )?;
+        (
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            code,
+        )
+    };
+    assert_eq!(
+        stdout.trim_end(),
+        "[42,7]",
+        "stdout {stdout:?} stderr {stderr:?}"
+    );
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
+    Ok(())
+}
+
 /// #2395 guard against re-opening #2036's own confirmed parser DoS: a shadow
 /// candidate nested `depth` deep must not cost `O(2^depth)`. The candidate
 /// name here reaches the parser from a module rather than the filter text, so
