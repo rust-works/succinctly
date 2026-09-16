@@ -62540,6 +62540,25 @@ mod tests {
         ".[(.a // 0)]",
         r#".["\(.k)"]"#,
         r#".[(.k|ltrimstr("x"))]"#,
+        // One row per remaining whitelist arm, so a future edit that widens
+        // an arm has to move a row here rather than silently gain reach --
+        // `every_eager_assignment_path_really_resolves_to_at_most_one_path_2976`
+        // re-derives each one against the resolver.
+        ".[(.a and .b)]",
+        ".[(.a or .b)]",
+        r#".["x\(.k)"]"#,
+        ".[(.a[$k])]",
+        ".[(.a[$m:$n])]",
+        ".[(.k|scalars)]",
+        r#".[(.a|has("k"))]"#,
+        r#".[("k"|in(.a))]"#,
+        r#".[(.a|contains("x"))]"#,
+        ".[(.a|inside(.b))]",
+        r#".[(.a|startswith("x"))]"#,
+        r#".[(.a|endswith("x"))]"#,
+        r#".[(.a|rtrimstr("x"))]"#,
+        r#".[(.a|split(","))]"#,
+        r#".[(.a|join(","))]"#,
         ".[(.a|not)]",
         ".[($k|select(. != null))]",
         ".[(.a == .b)]",
