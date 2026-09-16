@@ -34668,11 +34668,15 @@ fn bind_fold_alternative<S: EvalSemantics>(
             (update, extract, Some(walked))
         }
         Pattern::Var(name) => {
-            let binding = extract_single_pattern_binding::<S>(pattern, &elem.value, false)
-                .map_err(|error| FoldBindFailure {
-                    error,
-                    retryable: true,
-                })?;
+            let binding = match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    return Err(FoldBindFailure {
+                        error,
+                        retryable: true,
+                    })
+                } // omni-dev: coverage tolerate-line reason="unreachable: a bare `$var` pattern has no computed key and no step, so `extract_pattern_bindings` always yields exactly one binding set for it (#2979)"
+            };
             bound_names.push(name.clone());
             if elem.register_path.is_some() {
                 let (var, value) = &binding[0];
@@ -96470,6 +96474,25 @@ mod tests {
             "null",
             "[limit(2; path(foreach range(40000) as $a ?// [$b] ?// $c (.; if $a != null then error(\"x\") else . end; .)))]",
             Ok(&["[[],[]]"]),
+        ),
+        // the emission's own consumer stopping (no EXTRACT) retries too
+        (
+            "{\"a\":[1]}",
+            "path(foreach .a as [$v] ?// $w (.; $w))",
+            Ok(&["[\"a\"]"]),
+        ),
+        // ...and a retry that runs UPDATE (or EXTRACT) is charged, so the
+        // step budget still trips where it did before -- jq answers `[[]]`
+        // and 80000 paths here; the cap is the recorded resource limit
+        (
+            "null",
+            "[path(reduce range(60000) as $a ?// $b (.; if $a != null then error(\"x\") else . end))]",
+            Err("reduce: maximum iterations exceeded"),
+        ),
+        (
+            "null",
+            "[path(foreach range(40000) as $a ?// $b (.; if $a != null then error(\"x\") else . end; ., .))]",
+            Err("foreach: maximum iterations exceeded"),
         ),
         // family B: a chain on an untracked stage refuses rather than
         // answering -- jq refuses too, on `$v`'s body (`element "b" of 5`)
