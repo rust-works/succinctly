@@ -99,9 +99,10 @@ as a single nested step) was split into slice-based helpers (`path_walk_pipe_gen
 
 One unrelated caller, `eval_generic.rs`'s `path_context_step_generic` (the `key`/`parent`/
 `file_index` path-context machinery, a different feature from `path()`/`=`/`del()`), still
-carries its own path as a plain `Vec<OwnedValue>` — out of scope here. `PathTrail::from_slice`
-bridges it into the shared step helpers at the same O(depth) cost it already paid per call,
-so that feature is unchanged, not regressed.
+carried its own path as a plain `Vec<OwnedValue>` — out of scope here, and bridged into the
+shared step helpers by a `PathTrail::from_slice`. #2572 later gave that walk its own
+`Rc`-linked `PathContextTrail` and made `path_step_generic` generic over a `StepTrail` trait
+both trails implement, which deleted the bridge.
 
 ## Results
 
