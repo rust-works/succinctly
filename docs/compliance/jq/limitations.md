@@ -3215,12 +3215,16 @@ Two deliberate remainders:
   [#2085](https://github.com/rust-works/succinctly/issues/2085), since it predates #2037
   and neither of #2037's fixes touch it. Closing either gap for real needs the same source
   position on `Expr::FuncCall` this whole approach exists to avoid adding.
-- **A call reached through an `include`d module or `~/.jq` reports no location at all.** It
-  has no occurrence in the filter source to locate, so the line marker and source echo are
-  dropped rather than a position invented: `nosuchfn/0 is not defined at <top-level>` where
-  jq says `... is not defined at /path/mymod.jq, line 1:` and echoes the module's own line.
-  Name, arity and exit code match. Naming the file would additionally need the originating
-  module threaded through `ModuleLoader`.
+- **Closed: a call reached through an `include`d module or `~/.jq` now names the module's
+  own file, line and source echo.** [#2951](https://github.com/rust-works/succinctly/issues/2951)
+  gave every unresolved call an `origin` (which run it was written in); on top of that,
+  [#2991](https://github.com/rust-works/succinctly/issues/2991) re-derives the module's
+  own text (a second, cold-path-only read of the file `origin` resolves to) and the
+  module's own call-site table, using the same `nth`-occurrence rule and the same
+  text-search fallback (for a namespaced call, which the call-site table never records —
+  `parse_namespaced_call` has no `call_sites.push`) that the main filter's own diagnostics
+  already use. `... is not defined at /path/mymod.jq, line 1:` with the module's own
+  source line echoed, byte-for-byte against jq.
 - **jq's trailing padding on the echoed source line is not reproduced exactly.** jq pads with
   a `%*s` whose width follows the failing node's start column for a simple undefined name but
   points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
@@ -6641,10 +6645,10 @@ every run of defs it wraps between two marker defs whose names begin with a NUL 
 [ADR-0023](../../adrs/adr-0023.md) for why the boundary is encoded that way rather than as
 a field on `Expr::FuncDef`, a side table, or name mangling.
 
-What remains of that area is diagnostic detail, not scope: a module-body compile error
-names the module's own canonical file, exactly as jq does, but not jq's trailing
-`, line N:` or its echo of the offending source line
-([#2991](https://github.com/rust-works/succinctly/issues/2991)). Two further pre-existing
+What remained of that area was diagnostic detail, not scope: a module-body compile error
+named the module's own canonical file, exactly as jq does, but not jq's trailing
+`, line N:` or its echo of the offending source line. Closed by
+[#2991](https://github.com/rust-works/succinctly/issues/2991). Two further pre-existing
 divergences in the same reporter are unmeasured and unfiled as their own oracle matrices:
 jq reports module errors in *reverse* include order, and a main-*body* error suppresses
 def errors entirely.
