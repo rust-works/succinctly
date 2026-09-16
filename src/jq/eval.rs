@@ -62522,7 +62522,7 @@ mod tests {
         ".[-(.n)]",
         ".[(if .a then 0 else 1 end)]",
         ".[first(.k)]",
-        r#".[($k|tostring)]"#,
+        r".[($k|tostring)]",
         ".[keys[0]]",
         ".[(.a // 0)]",
         r#".["\(.k)"]"#,
@@ -62583,7 +62583,7 @@ mod tests {
             // #2976's two recorded refusals (`try`/`reduce`).
             ".a?[$k]",
             ".[][$k]",
-            r#".[try .k catch 0]"#,
+            r".[try .k catch 0]",
             ".[reduce .k as $x (0; .+$x)]",
             ".[(.k as $x | $x)]",
         ];
@@ -62633,8 +62633,8 @@ mod tests {
                 let bytes = doc.as_bytes();
                 let index = JsonIndex::build(bytes);
                 let root = index.root(bytes);
-                let input = to_owned(&root.value())
-                    .unwrap_or_else(|e| panic!("to_owned {doc}: {e:?}"));
+                let input =
+                    to_owned(&root.value()).unwrap_or_else(|e| panic!("to_owned {doc}: {e:?}"));
                 if let Ok(paths) = resolve_dynamic_indexes::<JqSemantics>(&expr, &input, false) {
                     assert!(
                         paths.len() <= 1,
