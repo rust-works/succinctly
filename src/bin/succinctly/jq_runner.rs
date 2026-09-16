@@ -54,10 +54,12 @@ pub struct EvalContext {
 type FuncDefList = Vec<(String, Vec<Param>, Expr)>;
 
 /// One module's dependency defs, grouped by the module each group came from
-/// (#2951), in declaration order. Each group is wrapped in its own barrier
-/// run so a compile error inside it names the right file and the importing
-/// module's alias cannot reach it.
-type DepRuns = Vec<(u32, FuncDefList)>;
+/// (#2951), in declaration order, with the alias an `import` group was
+/// brought in under (`None` for an `include`). Each group is wrapped in its
+/// own flooring run (#2962): a compile error inside it names the right file,
+/// and nothing of the def it is wrapped into -- its name, its parameters, its
+/// module's siblings, the importing module's alias -- is visible inside it.
+type DepRuns = Vec<(u32, Option<String>, FuncDefList)>;
 
 /// The run id reserved for `~/.jq`'s own defs (#2951) -- assigned in
 /// [`ModuleLoader::new`] before any module can claim one.
@@ -366,23 +368,6 @@ fn wrap_run(expr: Expr, defs: FuncDefList, id: u32, alias: Option<&str>) -> Expr
     let marker = |name: String| (name, Vec::new(), Expr::Identity);
     let mut bracketed: FuncDefList = Vec::with_capacity(defs.len() + 2);
     bracketed.push(marker(jq::ModuleRun::begin_marker(id, alias)));
-    bracketed.extend(defs);
-    bracketed.push(marker(jq::ModuleRun::end_marker(id)));
-    wrap_defs(expr, bracketed)
-}
-
-/// [`wrap_defs`], bracketed by a non-flooring barrier run (#2951 review).
-///
-/// Used for the dependency defs spliced into a module's own def bodies. See
-/// [`jq::RunMarker::Barrier`] for what a barrier does and, just as
-/// importantly, what it deliberately does not do.
-fn wrap_barrier_run(expr: Expr, defs: FuncDefList, id: u32) -> Expr {
-    if defs.is_empty() {
-        return expr;
-    }
-    let marker = |name: String| (name, Vec::new(), Expr::Identity);
-    let mut bracketed: FuncDefList = Vec::with_capacity(defs.len() + 2);
-    bracketed.push(marker(jq::ModuleRun::barrier_marker(id)));
     bracketed.extend(defs);
     bracketed.push(marker(jq::ModuleRun::end_marker(id)));
     wrap_defs(expr, bracketed)
@@ -801,9 +786,9 @@ impl ModuleLoader {
                 // so the last-declared ends up innermost, exactly as the flat
                 // `wrap_defs` did before the grouping.
                 let mut wrapped = body;
-                for (origin, group) in deps.iter().rev() {
+                for (origin, alias, group) in deps.iter().rev() {
                     let visible = visible_deps_for(group, &name, &params, &wrapped);
-                    wrapped = wrap_barrier_run(wrapped, visible, *origin);
+                    wrapped = wrap_run(wrapped, visible, *origin, alias.as_deref());
                 }
                 (name, params, wrapped)
             })
@@ -831,7 +816,7 @@ impl ModuleLoader {
 
         for include in &program.includes {
             let id = self.run_id_for(&include.path);
-            defs.push((id, self.load_module(&include.path)?));
+            defs.push((id, None, self.load_module(&include.path)?));
         }
 
         // Namespaced exactly as `process_program` does it, and left as
@@ -868,6 +853,7 @@ impl ModuleLoader {
             let id = self.run_id_for(&import.path);
             defs.push((
                 id,
+                Some(namespace.clone()),
                 self.load_module(&import.path)?
                     .into_iter()
                     .map(|(name, params, body)| (format!("{namespace}::{name}"), params, body))
