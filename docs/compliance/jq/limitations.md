@@ -6684,48 +6684,36 @@ two-def module is 9 MB; a 7-level 40-def chain is 12 MB). Tracked as
 splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
 introduced) instead of by clone.
 
-### A wrapped dependency sits inside the including def's scope — no carve-out; recorded as a still-open gap (#2962)
+### A wrapped dependency sits inside the including def's scope — closed (#2962)
 
 A module's dependencies are bound by wrapping them around the body of each def that
-reaches them, and that wrap nests **inside** the def's own `Expr::FuncDef` — so the def's
-own name (for self-recursion) and its parameters are enclosing binders for every
+reaches them, and that wrap nests **inside** the def's own `Expr::FuncDef`, so the def's
+own name (for self-recursion) and its parameters used to be enclosing binders for every
 dependency in the block. Real jq binds a module's block in its own scope and only then
-links it, so nothing of the caller is ever in scope for it.
+links it, so nothing of the caller is ever in scope for it. Three shapes, confirmed live
+against jq 1.7.1, with what `succinctly jq` answered before #2962:
 
-`visible_deps_for`'s two exclusions are a partial mitigation: they keep a def's own
-recursion and its parameters working for names the body uses **directly**. They cannot
-help a name a dependency reaches on its own, and the two cases pull opposite ways —
-excluding strands the other dependency, keeping it would shadow the def's own binding.
-Three shapes, all confirmed live against jq 1.7.1:
-
-| fixtures | jq 1.7.1 | succinctly |
-|----------|----------|------------|
+| fixtures | jq 1.7.1 | succinctly, before |
+|----------|----------|--------------------|
 | `inner` = `def c: 7; def g: c;`, `mid` = `include "inner"; def c: if . == 0 then g else (. - 1 \| c) end;`, then `0 \| c` | `7` | `g/0 exceeded maximum recursion depth`, exit 5 |
 | `gb` = `def g: b;`, `hb` = `include "gb"; def h(b): g; def q: h(99);`, then `q` | `b/0 is not defined`, exit 3 | `99`, exit 0 |
 | `inner3` = `def g: 42; def k: [g];`, `h3` = `include "inner3"; def h($g): [g, k]; def q: h(7);`, then `q` | `[7,[42]]` | `[7,[7]]` |
 
-None of ADR-0018's four conditions covers this (the output is readable, nothing is
-corrupted or discarded, and the process does not die), so per rule 4 it is recorded here
-as a still-open gap rather than an accepted divergence. It is **not** a regression: every
-shape needs a transitive `include`, which did not work at all before #2865 — `main`
-answers `g/0 is not defined` / `k/0 is not defined` for each. Closing it needs either a
-targeted rename of an excluded dependency (rewriting free calls to it inside the other
-kept dependency bodies) or the sealed module scope of
-[#2951](https://github.com/rust-works/succinctly/issues/2951), which subsumes it; the
-second row additionally needs a module's own body resolved at load time, the way jq
-reports it against the module's own file.
+**Closed** by wrapping each dependency group as a flooring run (the #2951 marker, so a
+dependency body sees nothing of the def it is wrapped into, for `$variables` as well as
+calls), and by **renaming** a dependency that shares the def's (name, arity) or a
+parameter's name, rather than excluding it. The exclusion was what produced the first and
+third rows: it kept the def's own binding for the body but stranded the other dependency
+that called the excluded one. [ADR-0023](../../adrs/adr-0023.md)'s #2962 amendment records
+the mechanism. `test_dependencies_are_bound_in_their_own_scope_2962`
+(`tests/jq_cli_tests.rs`) pins 29 rows, each byte for byte against jq 1.7.1 (stdout, stderr
+and exit code): these three, the scope leaks the floor closes (a parameter, a sibling
+origin's group, a `$`-parameter), and the cases the rename must respect (a nested def or
+parameter of the same name, a dependency's own dependency, a later same-name entry, and
+declaration order).
 
-**#2951 landed the mechanism that subsumes this, but deliberately did not apply it here.**
-Its run markers seal a *run* of wrapped defs from everything below it; bracketing the
-per-body dependency runs too would close this gap's capture route. Per #2951's own plan
-that flips the first and third rows above from a wrong answer to a compile error —
-`c/0 is not defined` and `g/0 is not defined` — which is still not jq's answer, so it was
-left out rather than trading one divergence for another inside a PR about a different
-axis. Applying the bracket in `load_and_bind_module` is now a small change; deciding
-whether an error is an improvement over a wrong value here is the part that needs a
-decision.
-`test_dependency_capture_by_the_including_defs_scope_2962` (`tests/jq_cli_tests.rs`) pins
-all three so a change to the mechanism cannot make them worse unnoticed.
+A module body's unbound `$variable` is now also reported at the module's own file, line
+and source, as jq reports it and as #2991 already did for calls.
 
 ### Module-scope gaps that are genuinely open
 
