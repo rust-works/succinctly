@@ -819,6 +819,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A computed assignment path that cannot fan out no longer keeps a second
+  whole document** (#2976). #2267's streaming write applies each write as its
+  path resolves, so a failed write stops the path generator; the generator has
+  to resolve against an unmutated document while the writes accumulate into
+  another, which is jq's own separation and is observable
+  (`{"a":"b","b":1} | .[(.a,.a)] = 5`). Its gate admitted only paths that
+  resolve to one path *inertly*, which is stricter than the invariant needs.
+
+  `resolve_dynamic_indexes` is `resolve_dynamic_indexes_sink` under an
+  always-`Continue` sink, so the two routes differ in exactly two ways:
+  whether a `Stop` is honoured, and whether writes interleave with resolution.
+  With at most one path neither has anywhere to land -- there is no later path
+  to suppress and no "between" to interleave -- so the count is the whole
+  criterion and purity is not part of it. A side effect on the way to the only
+  path fires identically on both routes, because both reach it through the
+  same resolver call.
+
+  The gate is now `resolves_to_at_most_one_path`, and shapes such as
+  `.[length - 1] = 0`, `.[.n + 1] = 0`, `.[(.a | stderr)] = 0`,
+  `(. | debug)[0] = 0`, `.[first(.k)] = 0` and `.[(.a // 0)] = 0` take the
+  eager route and its single document. `try` and `reduce` are refused despite
+  plausibly qualifying, for reasons recorded on the predicate.
+
+  `.[(0,1)] = 0` is **unchanged** at +18%: every remaining streamed shape
+  genuinely needs both documents, and only structural sharing in `OwnedValue`
+  removes that. A new test runs the resolver over a battery of documents and
+  counts the paths each admitted shape actually produces, so the gate's
+  premise is checked rather than restated.
+
 - **A top-level `//`, `and` or `or` no longer materializes the whole
   document** (#2692). #2476 removed that materialization from
   `eval_single`'s arms, but the CLI's own route is `eval_each_generic`, which

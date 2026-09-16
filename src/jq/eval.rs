@@ -23285,15 +23285,17 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //   with that change). One RHS output means one output document, so
     //   there is nothing for `first`/`limit` to truncate and none of that
     //   class is reachable -- see `limitations.md` and the holdout test.
-    // - **A path whose resolution can be observed.** The streaming route
+    // - **A path that can produce a second path.** The streaming route
     //   keeps a second document (see below), which is worth paying only
-    //   where the interleave is observable at all. `needs_path_prepass`
-    //   false means the expression *is* its own single static path;
-    //   `assignment_path_needs_streaming` false means it resolves to one
-    //   path inertly, so there is no later path for a stopped generator to
-    //   skip and nothing observable while reaching the first. Both keep the
-    //   eager route, which for those shapes produces the identical outcome
-    //   with one document instead of two -- `.[$k] = v` among them.
+    //   where stopping the generator can suppress something.
+    //   `needs_path_prepass` false means the expression *is* its own single
+    //   static path; `assignment_path_needs_streaming` false means it
+    //   resolves to at most one path, so there is no later path for a
+    //   stopped generator to skip. Both keep the eager route, which for
+    //   those shapes produces the identical outcome with one document
+    //   instead of two -- `.[$k] = v` among them. Whether reaching that one
+    //   path is *observable* is not part of the question (#2976): the same
+    //   resolver call fires the same side effects on either route.
     if S::TAG == EvalTag::Jq
         && rhs_values.len() == 1
         && needs_path_prepass(path_expr)
@@ -24238,11 +24240,16 @@ fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
 ///
 /// **Measured** (Apple M-series, release, 1.5 MB / 200,000-element array,
 /// peak RSS): `.[(0,1)] = 0` goes 74.8 MB -> 88.5 MB, **+18%**. That is the
-/// price of the interleave, and it is charged only where the interleave is
-/// observable: [`assignment_path_needs_streaming`] keeps `.[$k] = 0` on the
+/// price of the interleave, and it is charged only where a *second path*
+/// can exist: [`assignment_path_needs_streaming`] keeps `.[$k] = 0` on the
 /// eager route (58.9 MB -> 57.5 MB, unchanged), and a static path,
-/// `del(...)` and `|=` are untouched either way. Reducing it further needs
-/// structural sharing in `OwnedValue`, which no gate here substitutes for.
+/// `del(...)` and `|=` are untouched either way. #2976 widened that gate
+/// from "one inert path" to "at most one path", which took `.[length - 1]`,
+/// `.[(.a | stderr)]` and `(. | debug)[0]` off this route as well.
+///
+/// What is left is irreducible by any gate: `.[(0,1)] = 0` genuinely needs
+/// both documents, and only structural sharing in `OwnedValue` removes its
+/// cost.
 fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'a, W>,
