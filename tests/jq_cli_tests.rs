@@ -46959,6 +46959,23 @@ fn recurse_runs_f_only_on_demand_2693() -> Result<()> {
             dbg("1"),
             0,
         ),
+        // A halt from a deeper level is not a stop a `?//` inside `f` may
+        // retry past (#2918 review): one halt, as in jq.
+        (
+            "[1]",
+            r#"recurse(. as [$a] ?// $a | if type == "number" then ("h\n"|halt_error(3)) else .[] end)"#,
+            "[1]\n1\n".to_string(),
+            "h\n".to_string(),
+            3,
+        ),
+        // An ordinary error does retry there, in jq too.
+        (
+            "[1]",
+            r#"recurse(. as [$a] ?// $a | if type == "number" then error("e") else .[] end)"#,
+            "[1]\n1\n1\n".to_string(),
+            "jq: error (at <stdin>:0): e\n".to_string(),
+            5,
+        ),
         // Unchanged: `cond`'s later `error` is never reached, because the
         // first approved child's own `f` fails first (#854).
         (

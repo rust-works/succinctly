@@ -34938,14 +34938,31 @@ impl RecurseAbort {
 /// Record `end` as the walk's abort and answer [`Demand::Stop`], or
 /// [`Demand::Continue`] when there is none -- the one way a native `recurse`
 /// level tells the generator it runs inside to stop.
+///
+/// The stop carries its reason to a `?//` inside the generator the same way
+/// [`stop_with_escape`] does: a `Halt` or an uncatchable error from a deeper
+/// level, and the [`RECURSE_MAX_ITEMS`] cap, must not read as an ordinary
+/// stop a `?//` alternative retries past. Without it,
+/// `recurse(. as [$a] ?// $a | if type == "number" then ("h"|halt_error(3))
+/// else .[] end)` on `[1]` halted twice where jq halts once.
 fn stop_on_abort(slot: &mut Option<RecurseAbort>, end: Option<RecurseAbort>) -> Demand {
-    match end {
-        None => Demand::Continue,
-        Some(abort) => {
-            *slot = Some(abort);
-            Demand::Stop
+    let Some(abort) = end else {
+        return Demand::Continue;
+    };
+    let abort = match abort {
+        RecurseAbort::Escaped(escape) => {
+            let control = Control::from(escape);
+            mark_nonretryable_escape(&control);
+            RecurseAbort::Escaped(control.into())
         }
-    }
+        RecurseAbort::Capped => {
+            nonretryable_stop::set();
+            RecurseAbort::Capped
+        }
+        stopped @ RecurseAbort::Stopped(_) => stopped,
+    };
+    *slot = Some(abort);
+    Demand::Stop
 }
 
 /// How a native `recurse` level ended, from the abort its sink recorded and
@@ -34989,7 +35006,9 @@ fn native_recurse_end(abort: Option<RecurseAbort>, flow: Flow) -> Option<Recurse
 /// `[recurse(.a?)]`'s 10000-item chain in constant stack, and
 /// `jq_computed_key_tests` still does. The cost of the small cap is only
 /// where the native order stops -- ~40 levels of a reindex-route `f` in
-/// release, a handful in debug -- past which the queued order resumes.
+/// release, a handful in debug -- past which the queued order resumes. The
+/// budget is per thread, not per walk: a `recurse` inside another's `f`
+/// measures from the outermost live level ([`recurse_native_origin`]).
 ///
 /// The distance is also converted to [`MAX_EVAL_FRAMES`]' own unit and charged
 /// on the ambient frame guard, so the walk and `def` recursion share one
@@ -35000,11 +35019,10 @@ fn native_recurse_end(abort: Option<RecurseAbort>, flow: Flow) -> Option<Recurse
 ///
 /// It also carries the one other piece of ambient state a native level has to
 /// restore rather than inherit: whether a yq read-only operand scope was
-/// active when the walk started ([`yq_read_only_context`]). A lazy operand
-/// inside `f` suspends that scope on the way into its own sink, which is
-/// where the next level's `f` now runs, so `(... | recurse((.n + 1) as $m |
-/// ...[.zzz | key]...)) + 0` read the absent key outside the scope from the
-/// second level down where the queued walk read it inside.
+/// active when the walk started ([`yq_read_only_context`]), re-established
+/// around every node's delivery and expansion ([`Self::scope`]), since a
+/// lazy operand inside `f` suspends it on the way into the sink the next
+/// node is visited from.
 #[derive(Clone, Copy)]
 struct RecurseNativeBudget {
     /// A stack address taken when the walk started.
@@ -35018,7 +35036,59 @@ struct RecurseNativeBudget {
 /// The ambient state one native `recurse` level holds while its `f` runs.
 struct RecurseNativeLevel {
     _frames: ambient_frame_depth::Guard,
-    _read_only: yq_read_only_context::Guard,
+    _origin: recurse_native_origin::Guard,
+}
+
+/// The stack address the outermost live native `recurse` level measures
+/// from, so a `recurse` nested inside another's `f` spends from the same
+/// [`RECURSE_NATIVE_STACK_BYTES`] rather than starting a fresh one -- four
+/// nested walks each allowed their own 512 KiB would need 2 MiB between them.
+///
+/// `#[cfg(feature = "std")]` only, like [`ambient_frame_depth`]: a `no_std`
+/// build has no `thread_local!`, so there each walk measures from its own
+/// start, as before this existed.
+#[cfg(feature = "std")]
+mod recurse_native_origin {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ORIGIN: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<usize> {
+        ORIGIN.with(Cell::get)
+    }
+
+    /// Restores the previous origin on drop.
+    #[must_use]
+    pub(crate) struct Guard(Option<usize>);
+
+    /// Record `origin` for the caller's scope, unless an outer level already
+    /// recorded one.
+    pub(crate) fn enter(origin: usize) -> Guard {
+        let previous = get();
+        ORIGIN.with(|o| o.set(Some(previous.unwrap_or(origin))));
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ORIGIN.with(|o| o.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod recurse_native_origin {
+    pub(crate) fn get() -> Option<usize> {
+        None
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_origin: usize) -> Guard {
+        Guard
+    }
 }
 
 /// Stack bytes per [`MAX_EVAL_FRAMES`] frame, from that constant's own
@@ -35044,24 +35114,35 @@ const RECURSE_NATIVE_FRAME_CEILING: u32 = MAX_EVAL_FRAMES / 4;
 impl RecurseNativeBudget {
     fn start() -> Self {
         Self {
-            origin: stack_address(),
+            origin: recurse_native_origin::get().unwrap_or_else(stack_address),
             base_frames: ambient_frame_depth::get(),
             read_only: yq_read_only_context::active(),
         }
     }
 
-    /// Enter native level `level + 1` -- its frame charge and the walk's
-    /// read-only scope, both restored on drop -- or `None` if the walk must
-    /// queue instead.
+    /// Re-establish the yq read-only operand scope the walk started under,
+    /// for one node's delivery and expansion. Everything but the root is
+    /// delivered from inside `f`'s sink, where a lazy operand in `f` has
+    /// suspended that scope -- for the consumer as much as for the next
+    /// level's `f`: `[recurse((.n + 1) as $m | select($m < 3) | {"n": $m}) |
+    /// [.zzz | key] | length] + []` read `[0,1,1]` where the queued walk
+    /// reads `[0,0,0]`.
+    fn scope(self) -> yq_read_only_context::Guard {
+        if self.read_only {
+            yq_read_only_context::enter()
+        } else {
+            yq_read_only_context::suspend()
+        }
+    }
+
+    /// Enter native level `level + 1` -- its frame charge, and the stack
+    /// origin a nested walk inside its `f` measures from, both restored on
+    /// drop -- or `None` if the walk must queue instead.
     fn enter_level(self, level: u32) -> Option<RecurseNativeLevel> {
         let frames = self.next_level(level)?;
         Some(RecurseNativeLevel {
             _frames: ambient_frame_depth::enter(frames),
-            _read_only: if self.read_only {
-                yq_read_only_context::enter()
-            } else {
-                yq_read_only_context::suspend()
-            },
+            _origin: recurse_native_origin::enter(self.origin),
         })
     }
 
@@ -35144,6 +35225,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
     /// Deliver `node`, then its whole subtree. `level` is how many native
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
+        let _scope = self.budget.scope();
         if self.emitted >= RECURSE_MAX_ITEMS {
             return Some(RecurseAbort::Capped);
         }
@@ -35498,6 +35580,7 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
     /// Deliver `node`, then its whole subtree. `level` is how many native
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: PathBranch<'a>, level: u32) -> Option<RecurseAbort> {
+        let _scope = self.budget.scope();
         if self.emitted >= RECURSE_MAX_ITEMS {
             return Some(RecurseAbort::Capped);
         }
@@ -88331,6 +88414,32 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// #2918 review: the native stack budget is per thread, not per walk.
+    /// `recurse(recurse(.[0]?))` nests a new walk inside the outer walk's `f`
+    /// at every node (the inner walk's first output is its own root), so with
+    /// each walk measuring from its own start the nesting grew without bound
+    /// and overflowed the harness's own 2 MiB thread. Values match jq 1.7.1.
+    #[test]
+    fn nested_recurse_walks_share_one_native_stack_budget_2918() {
+        assert_eq!(
+            outputs(
+                b"[[[1]]]",
+                "[limit(3000; recurse(recurse(.[0]?)))] | length"
+            ),
+            vec!["3000"]
+        );
+        #[cfg(feature = "std")]
+        {
+            let far = stack_address() + RECURSE_NATIVE_STACK_BYTES + 4096;
+            let _outer = recurse_native_origin::enter(far);
+            assert_eq!(
+                RecurseNativeBudget::start().next_level(0),
+                None,
+                "a walk nested inside a spent outer walk queues from the start"
+            );
         }
     }
 

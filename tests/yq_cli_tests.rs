@@ -1203,6 +1203,16 @@ fn recurse_levels_keep_the_read_only_operand_scope_2918() -> Result<()> {
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), "[0,0]");
+
+    // The consumer too: every node but the root is delivered from inside
+    // `f`'s sink, where the scope is suspended (#2918 review).
+    let (output, code) = run_yq_stdin(
+        r#"[recurse((.n + 1) as $m | select($m < 3) | {"n": $m}) | [.zzz | key] | length] + []"#,
+        "n: 0\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[0,0,0]");
     Ok(())
 }
 
