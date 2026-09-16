@@ -4646,235 +4646,97 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         .collect()
 }
 
-/// Whether the final record remains unresolved at EOF. This deliberately
-/// retains only the location-related EOF question; values themselves come
-/// from `jq_seq_reader`, whose scan-call boundaries model jq's recovery.
-fn seq_record_ends_unresolved(raw_segment: &str, rs_terminated: bool) -> bool {
-    let bytes = raw_segment.as_bytes();
-    let mut values = Vec::new();
-    let mut pos = 0;
-
-    while pos < bytes.len() {
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-        let Some(end) = scan_one_json_token(bytes, pos) else {
-            return true;
-        };
-        if !seq_value_is_valid(&raw_segment[pos..end]) {
-            return true;
-        }
-        // The delimiter check, and it applies only to *pending* tokens.
-        //
-        // A string, object or array carries its own closing delimiter, so
-        // adjacency cannot mis-split it and jq reads `{"a":1}{"b":2}` and
-        // `"a""b"` as two values apiece -- requiring whitespace after those
-        // dropped records real jq reads fully (a review measured 332 such
-        // regressions). A number or literal has no closing delimiter: it is
-        // "pending" until something confirms it, which is exactly where a
-        // scanner and jq's lexer can disagree.
-        //
-        // What confirms one, oracle-verified: whitespace, or the start of a
-        // self-delimiting value (`1[1]` and `1"a"` are two values in jq).
-        // Anything else -- another digit, a letter, `-`, or structural
-        // punctuation -- means this record is not a clean sequence of
-        // values, and guessing at the boundary is what fabricated output.
-        if seq_token_is_pending(bytes, pos)
-            && bytes
-                .get(end)
-                .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b'"' | b'{' | b'['))
-        {
-            return true;
-        }
-        values.push((pos, end));
-        pos = end;
-    }
-
-    // The only value-level drop that survives: a *pending* token (number or
-    // bare literal) ending the record with no whitespace after it is
-    // ambiguous to jq's incremental scanner, which cannot rule out more
-    // input arriving. `\x1e1 2` is `1`; `\x1e1 2 ` (trailing space) is `1`
-    // and `2`; `\x1etrue\x1e3` is `3` alone.
-    let trailing_unresolved = match values.last() {
-        Some(&(vs, ve)) if !seq_pending_token_is_terminated(bytes, vs, ve, rs_terminated) => {
-            values.pop();
-            true
-        }
-        Some(_) => false,
-        None => true,
-    };
-    trailing_unresolved
-}
-
-/// Whether the token at `start..end` is *pending* -- a number or a bare
-/// `true`/`false`/`null`, neither of which carries a closing delimiter.
+/// Whether `--seq -s`'s runtime-error location is lost entirely -- real
+/// jq answering `(at <unknown>)` where it would otherwise name a file and
+/// line (#1542/#1550/#1568/#2947).
 ///
-/// Strings, objects and arrays are self-delimiting and are never pending:
-/// `"`, `}` and `]` end them unambiguously.
-fn seq_token_is_pending(bytes: &[u8], start: usize) -> bool {
-    matches!(bytes[start], b'-' | b'.' | b'0'..=b'9' | b't' | b'f' | b'n')
-}
-
-/// Whether a *pending* token ending a record was confirmed.
+/// **The mechanism, from jq 1.7.1's own `src/util.c`.** `<unknown>` is not
+/// a property of the trailing record at all: `jq_util_input_get_position`
+/// renders it whenever `current_filename` is not a string, and the only
+/// thing that clears that field is `jq_util_input_read_more` closing the
+/// stream it was already standing on -- which it does on entry, but *only*
+/// when that stream is already at `feof`, and then immediately re-sets the
+/// field if another file follows. So the question reduces to: does jq call
+/// `read_more` one more time after the input is exhausted?
 ///
-/// jq's incremental scanner cannot rule out more input arriving for a token
-/// with no closing delimiter, so one butting against a record boundary may
-/// be abandoned -- but **numbers and literals differ on which boundary**,
-/// and conflating them cost data in both directions:
+/// It does exactly when its parser hands `jq_util_input_next_input` an
+/// **error** rather than a value or a quiet end-of-buffer, because an
+/// error is the one outcome that `return`s early, out of the read/parse
+/// loop, forcing `main` to call back in -- and that call re-enters at the
+/// top, where `jv_parser_remaining() == 0` triggers the fatal `read_more`.
+/// A value, or nothing at all, leaves through the `while (!is_last ||
+/// has_more)` condition instead, with the filename intact.
 ///
-/// | token | at an RS byte | at real EOF |
-/// |-------|---------------|-------------|
-/// | number (`1`) | abandoned | abandoned |
-/// | literal (`true`) | abandoned | **kept** |
-/// | string/array/object | kept | kept |
+/// **Which errors are fatal to the position, then, is decided by jq's
+/// `fgets` chunking**: jq refills a line at a time, so an error detected
+/// on any *earlier* line is answered by a refill that still has a line to
+/// hand over (or a next file to open), and the position survives; only an
+/// error detected while jq is working on the stream's **final buffer** --
+/// the bytes after the last newline of the last file, plus the empty
+/// buffer that a newline-terminated stream ends with, where truncations
+/// are finally reported `at EOF` -- leaves nothing to refill from.
 ///
-/// Checking numbers alone left 92 shapes emitting a `true` jq drops;
-/// checking both at every boundary then dropped `printf '\x1etrue'`, which
-/// jq prints. Both were found by differential sweeps, not by reasoning.
-fn seq_pending_token_is_terminated(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    rs_terminated: bool,
-) -> bool {
-    if bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
-        return true;
-    }
-    match bytes[start] {
-        // A number is truncatable at *either* boundary: more digits could
-        // always follow, so jq abandons it at an RS byte and at real EOF
-        // alike (`\x1e1` and `\x1e1\x1e3` both drop the `1`).
-        b'-' | b'.' | b'0'..=b'9' => false,
-        // A bare literal is truncatable only at an RS byte. At real EOF jq
-        // has seen all the input there will ever be, so `true` is complete:
-        // `printf '\x1etrue'` prints `true`, while `\x1etrue\x1e3` prints
-        // only `3`. Treating the two boundaries alike dropped the EOF case
-        // and lost data real jq (and `main`) keep.
-        b't' | b'f' | b'n' => !rs_terminated,
-        // Self-delimiting: nothing to confirm.
-        _ => true,
-    }
-}
-
-/// Checks a scanned token for the trailing-record EOF location diagnostic.
+/// Hence the whole rule, and why it is one comparison: ask
+/// [`jq_seq_reader::last_parse_error_offset`] (which models jq's `scan()`
+/// loop, so it already knows the *moment of detection* rather than merely
+/// what was wrong) where jq last failed, and check whether that moment
+/// falls inside the final buffer.
 ///
-/// The ordinary path keeps `validate_jq_lenient`'s number and escape
-/// accept-set (#1243/#2012/#2240/#2052). Its recursive validator stops at
-/// 128 containers, though the actual sequence reader accepts deeper values
-/// (#2672). On that specific error, retry with the reader's bounded,
-/// iterative parser rather than widening the standalone stack guard or
-/// mistaking a depth limit for malformed input.
-fn seq_value_is_valid(value_text: &str) -> bool {
-    match validate::validate_jq_lenient(value_text.as_bytes()) {
-        Ok(()) => true,
-        Err(error)
-            if matches!(
-                error.kind,
-                validate::ValidationErrorKind::NestingTooDeep { .. }
-            ) =>
-        {
-            // Frame this isolated token as a complete record. Require the
-            // entire token: recovery can yield a valid suffix of malformed
-            // input, and merely finding a value would accept that suffix.
-            // Pending-number termination in the real stream is still
-            // checked separately by `seq_record_ends_unresolved`.
-            let record = format!("\x1e{value_text} ");
-            matches!(
-                crate::jq_seq_reader::value_ranges(record.as_bytes()).as_slice(),
-                [(1, end)] if *end == value_text.len() + 1
-            )
-        }
-        Err(_) => false,
-    }
-}
-
-/// Whether `raw`'s trailing `--seq` record (RFC 7464, everything after the
-/// last RS byte) leaves real jq's own incremental parser with no EOF
-/// position to report -- distinct from a malformed record *elsewhere* in
-/// the stream, which a later valid record still resyncs after (#1542,
-/// oracle-verified: `\x1e1\n\x1e{"a":1\n\x1e3\n` still reports the trailing
-/// `3`'s own line; only the stream's actual *last* record can trigger this).
+/// Worked examples, all oracle-verified against jq 1.7.1 -- note that the
+/// record text is identical within each pair, and only the bytes *after*
+/// the failure differ:
 ///
-/// Two shapes, both silently swallowed by real jq's own `--seq` reader:
+/// ```text
+/// \x1e[0,]        error on `]` @4, final buffer starts at 0   => <unknown>
+/// \x1e[0,]\n      error on `]` @4, final buffer starts at 6   => file:1
+/// \x1e0\x1e       error on RS  @2, final buffer starts at 0   => <unknown>
+/// \x1e0\x1e\n     error on RS  @2, final buffer starts at 4   => file:1
+/// \x1e"unterm\n   error at EOF @9, final buffer starts at 9   => <unknown>
+/// ```
 ///
-/// - **Genuinely malformed/truncated** -- the EOF scanner reports unresolved
-///   (an unterminated string/object, e.g.), matching
-///   [`parse_json_seq_with_ends`]'s own silent-drop rule (RFC 7464's
-///   recommended failure mode, #1243).
-/// - **A bare number with nothing at all after it before EOF** -- valid
-///   JSON on its own, but jq's streaming number scanner can't rule out more
-///   digits still arriving without seeing a terminating byte (whitespace,
-///   or the start of the next token) after the last one it read, so a
-///   number that happens to butt right up against real EOF is
-///   indistinguishable from one truncated mid-digit. Every other JSON type
-///   has its own unambiguous closing delimiter (`"`, `}`, `]`, the last
-///   letter of `true`/`false`/`null`) and reports normally even with
-///   nothing trailing it -- oracle-verified: `\x1e1\n\x1e2` (bare `2`, no
-///   trailing byte at all) reports `<unknown>`, but the same shape with
-///   `true`/`"s"`/`{}`/`[]`/`null` in place of `2`, or `2` followed by even
-///   one trailing space, all report their own line normally.
+/// The last of those is why a newline cannot simply be read as "recovery":
+/// it restores the position after a record jq has *finished* rejecting,
+/// but a newline swallowed by an unterminated string is just more string,
+/// and the failure still lands at EOF, in the final buffer.
 ///
-/// A third shape needs no record-level check at all: content with **no RS
-/// byte anywhere**. RFC 7464 requires every record to start with one, so
-/// real jq's `--seq` reader never even attempts to read unprefixed text --
-/// it's "abandoned" the instant EOF arrives with nothing synced onto,
-/// oracle-verified as `<unknown>` regardless of what the unprefixed text
-/// actually contains (even fully well-formed JSON). *Empty* content is the
-/// one exception: an empty last file has no text to abandon, so it keeps
-/// #1520's own plain "empty source, EOF at line 0" rule instead (oracle-
-/// verified: an empty last file after a valid one still reports
-/// `emptyfile:0`, not `<unknown>`).
-fn seq_trailing_record_is_dropped(raw: &str) -> bool {
-    let Some((_, tail)) = raw.rsplit_once('\u{1e}') else {
-        return !raw.trim().is_empty();
-    };
-    if tail.trim().is_empty() {
-        return false;
-    }
-    // Dropped when the record ends *unresolved* -- not merely when it
-    // yields nothing. `\x1e"a" 2` yields `"a"` and still leaves real jq
-    // without an EOF position, because its trailing `2` never resolved
-    // (#1542); asking "did it yield anything" got that backwards and broke
-    // two location tests. `seq_record_ends_unresolved` checks the final
-    // ambiguous trailing bare number per value on the untrimmed `tail`,
-    // preserving any terminating whitespace.
-    // `false`: this is the stream's trailing record by construction, so its
-    // end is real EOF, never an RS byte.
-    seq_record_ends_unresolved(tail, false)
-}
-
-/// Whether `--seq -s`'s trailing record, read across every file on the
-/// command line as one continuous byte stream (matching real jq's own `-s`
-/// reader), leaves real jq's incremental parser with no EOF position to
-/// report -- extending [`seq_trailing_record_is_dropped`]'s single-source
-/// check across a file boundary (#1550).
+/// Three shapes fall out of this rule rather than needing their own cases,
+/// each oracle-verified:
 ///
-/// A record's own opening RS byte and its closing bytes can live in
-/// different files, so this walks backward one file at a time: any file
-/// with no RS byte of its own is exactly that record's own continuation (or
-/// a disambiguating trailing byte after an otherwise-bare number, oracle-
-/// verified: `\x1e5` in one file plus a lone trailing space in the next
-/// still resolves normally, not `<unknown>`) and is folded, byte for byte,
-/// onto whatever followed it -- never trimmed or skipped by emptiness --
-/// until a file containing an RS byte is reached, at which point the
-/// single-source check runs against the reassembled tail. `false` (never
-/// dropped) if no file in the whole stream contains an RS byte at all:
-/// per [`seq_trailing_record_is_dropped`]'s own third case, that's
-/// "abandoned" only when there's non-whitespace content to abandon, so an
-/// all-empty stream keeps #1520's own plain "empty source, EOF at line 0"
-/// rule instead.
+/// - **No RS byte anywhere.** RFC 7464 requires every record to start with
+///   one, so jq's reader never syncs onto anything and reports
+///   `Unfinished abandoned text at EOF` -- an error, in the final buffer,
+///   for *any* content including none at all. A lone empty file therefore
+///   answers `<unknown>` too, where a stale local rule used to make
+///   emptiness an exception.
+/// - **An empty trailing file after real content.** It is opened, which
+///   re-sets `current_filename` and zeroes the line, and contributes no
+///   bytes to fail on -- so `a.json` holding `\x1e[0,]` and an empty
+///   `b.json` reports `b.json:0`, not `<unknown>`. Measuring the final
+///   buffer from the *last file's* start, not the stream's, is what gets
+///   this right.
+/// - **A malformed record earlier in the stream**, resynced by a later
+///   valid record (#1542): its error is not in the final buffer, so the
+///   position is intact.
 fn seq_stream_trailing_record_is_dropped(raw_inputs: &[(Option<usize>, String)]) -> bool {
-    let mut suffix = String::new();
-    for (_, raw) in raw_inputs.iter().rev() {
-        if raw.contains('\u{1e}') {
-            return seq_trailing_record_is_dropped(&format!("{raw}{suffix}"));
-        }
-        suffix = format!("{raw}{suffix}");
-    }
-    !suffix.trim().is_empty()
+    // jq parses every file as one continuous byte stream (#1571), so the
+    // reader has to see it that way -- a record's opening RS byte and the
+    // bytes that resolve it can live in different files (#1550).
+    let (combined, file_ends) = concat_with_file_ends(raw_inputs);
+    // `file_ends[i]` is file `i`'s exclusive end and file `i+1`'s start,
+    // so the last file starts at the second-to-last entry.
+    let last_file_start = file_ends
+        .len()
+        .checked_sub(2)
+        .map_or(0, |index| file_ends[index]);
+    // The final `fgets` buffer: everything after the last newline *of the
+    // last file*. Scoping it to that file is what keeps an empty (or
+    // newline-free) trailing file from inheriting an earlier file's
+    // failure -- jq opens it, and opening is what restores the filename.
+    let final_buffer_start = combined[last_file_start..]
+        .rfind('\n')
+        .map_or(last_file_start, |index| last_file_start + index + 1);
+    crate::jq_seq_reader::last_parse_error_offset(combined.as_bytes())
+        .is_some_and(|offset| offset >= final_buffer_start)
 }
 
 /// Real jq's own stderr warning ("`jq: ignoring parse error: ...`") for a
