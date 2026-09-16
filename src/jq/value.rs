@@ -1737,40 +1737,53 @@ fn try_positive_shifted_plain(
     format_positive_shifted_plain(sign, &full_mantissa_str, shifted_exp, digit_count)
 }
 
-/// The backing store for [`OwnedValue::Object`]: an
-/// `IndexMap<String, OwnedValue>` held behind a single pointer (#3000).
+/// The backing store for an object-valued enum arm: an
+/// `IndexMap<String, V>` held behind a single pointer (#3000).
 ///
-/// `IndexMap` is 72 bytes inline, which made `Object` the widest
-/// [`OwnedValue`] arm and forced *every* value — every array element, every
-/// map entry, every bare `Null` — to be 72 bytes wide. With the map boxed
-/// here, `NumberLiteral(NumberRepr, Box<str>)` becomes the widest arm at
-/// exactly 32 bytes and the discriminant packs into `NumberRepr`'s own
-/// niche, so `size_of::<OwnedValue>()` is 32: a 55% cut on every element of
-/// every `Vec<OwnedValue>`, on every route, eager and streaming alike. The
-/// cost is one extra allocation and one extra pointer chase per object --
+/// `IndexMap` is 72 bytes inline. That made `Object` the widest arm of both
+/// [`OwnedValue`] and [`JqValue`](crate::jq::lazy::JqValue) and forced *every*
+/// value of either -- every array element, every map entry, every bare `Null`
+/// -- to be 72 bytes wide. With the map boxed here, `size_of::<OwnedValue>()`
+/// is 32: a 55% cut on every element of every `Vec<OwnedValue>`, on every
+/// route, eager and streaming alike.
+///
+/// **One definition, deliberately.** `OwnedValue` is what a query evaluates
+/// to and `JqValue` is what `jq_runner` prints, and
+/// `JqValue::try_from_owned` converts the first into the second one node at a
+/// time -- freeing each `OwnedValue` object's map and immediately allocating
+/// the `JqValue` one. If the two enums are not the same width, those two
+/// chunk sizes differ and *nothing the conversion frees fits what it then
+/// asks for*: the allocator cannot recycle, and peak RSS grows by the whole
+/// hole even though live heap shrank. #3000's first form boxed only
+/// `OwnedValue` and measured exactly that -- 15% less live heap at peak and
+/// 23% more RSS on `wide_10mb | to_entries`, ~290 bytes of holes per entry
+/// object. Both arms use this type so the sizes move together; the pins
+/// `owned_value_is_32_bytes_because_its_object_map_is_boxed_3000` and
+/// `jq_value_matches_owned_value_width_3000` assert it.
+///
+/// The cost is one extra allocation and one extra pointer chase per object --
 /// charged per object regardless of size, so an *empty* `{}`, which used to
 /// cost nothing on the heap (`IndexMap::new()` does not allocate), now costs a
-/// `malloc`/`free` pair with no offsetting inline saving of its own. That is
-/// the shape of the whole trade: workloads that materialize many small objects
-/// and hold them live pay for it, and everything that moves or copies values
-/// in bulk is paid back at 40 bytes an element.
+/// `malloc`/`free` pair with no offsetting inline saving of its own.
 ///
 /// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
 /// the whole `IndexMap` API, [`IntoIterator`] is implemented for the owned,
 /// shared and mutable forms, and [`From`]/[`FromIterator`] build one from
-/// anything an `IndexMap` can be built from — so `OwnedValue::Object(map)`
-/// patterns keep reading and writing the map exactly as before. Only
-/// *construction* from a bare `IndexMap` needs a `.into()`.
+/// anything an `IndexMap` can be built from -- so `Object(map)` patterns keep
+/// reading and writing the map exactly as before. Only *construction* from a
+/// bare `IndexMap` needs a `.into()`.
 ///
 /// Note for downstream users: this is a **breaking change** to the shape of
 /// the `OwnedValue::Object` variant. Construct with
-/// [`OwnedValue::object_from`] (or `IndexMap::….into()`) and read through
+/// [`OwnedValue::object_from`] (or `IndexMap::....into()`) and read through
 /// [`OwnedValue::as_object`]/[`OwnedValue::as_object_mut`], whose signatures
 /// are unchanged.
-#[derive(Clone, Default, PartialEq)]
-pub struct ObjectMap(ObjectMapInner);
+pub struct ObjectMapOf<V>(ObjectMapInnerOf<V>);
 
-/// [`ObjectMap`]'s inner representation, boxed in the shipped build.
+/// [`OwnedValue::Object`]'s backing store: [`ObjectMapOf`] over `OwnedValue`.
+pub type ObjectMap = ObjectMapOf<OwnedValue>;
+
+/// [`ObjectMapOf`]'s inner representation, boxed in the shipped build.
 ///
 /// The `unboxed-object-map` feature swaps it back to a plain inline
 /// `IndexMap` so a *functionally pre-#3000* binary can be built from this
@@ -1778,13 +1791,13 @@ pub struct ObjectMap(ObjectMapInner);
 /// A/B in #3000 subtracts (see `docs/guides/benchmarking.md`); it is a
 /// measurement tool only and must never be enabled in a shipped build.
 #[cfg(not(feature = "unboxed-object-map"))]
-type ObjectMapInner = Box<IndexMap<String, OwnedValue>>;
+type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
 
-/// See [`ObjectMapInner`]'s boxed twin — measurement-only holdout shape.
+/// See [`ObjectMapInnerOf`]'s boxed twin -- measurement-only holdout shape.
 #[cfg(feature = "unboxed-object-map")]
-type ObjectMapInner = IndexMap<String, OwnedValue>;
+type ObjectMapInnerOf<V> = IndexMap<String, V>;
 
-impl ObjectMap {
+impl<V> ObjectMapOf<V> {
     /// An empty object map.
     #[inline]
     pub fn new() -> Self {
@@ -1800,16 +1813,43 @@ impl ObjectMap {
     /// Consume this map, yielding the `IndexMap` it wraps.
     #[cfg(not(feature = "unboxed-object-map"))]
     #[inline]
-    pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
+    pub fn into_index_map(self) -> IndexMap<String, V> {
         *self.0
     }
 
-    /// See [`ObjectMap::into_index_map`]'s boxed twin -- the holdout shape
+    /// See [`ObjectMapOf::into_index_map`]'s boxed twin -- the holdout shape
     /// holds the map inline, so there is nothing to unbox.
     #[cfg(feature = "unboxed-object-map")]
     #[inline]
-    pub fn into_index_map(self) -> IndexMap<String, OwnedValue> {
+    pub fn into_index_map(self) -> IndexMap<String, V> {
         self.0
+    }
+}
+
+// Hand-written rather than derived: a derive would put a `V: Default` /
+// `V: Clone` bound on the *map*, but an empty or cloned map needs nothing of
+// its value type beyond what the clone itself needs. `OwnedValue` has no
+// `Default` at all, so `#[derive(Default)]` would not even compile here.
+impl<V> Default for ObjectMapOf<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V: Clone> Clone for ObjectMapOf<V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<V: PartialEq> PartialEq for ObjectMapOf<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Through `Deref`, not the field: the field is a `Box` in the
+        // shipped shape and a bare `IndexMap` under `unboxed-object-map`.
+        **self == **other
     }
 }
 
@@ -1818,15 +1858,15 @@ impl ObjectMap {
 /// `Object(ObjectMap({...}))` -- a cosmetic but real change to what a
 /// downstream `println!("{:?}", value)` shows, for a wrapper whose whole
 /// purpose is to be invisible.
-impl core::fmt::Debug for ObjectMap {
+impl<V: core::fmt::Debug> core::fmt::Debug for ObjectMapOf<V> {
     #[inline]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&self.0, f)
+        core::fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl Deref for ObjectMap {
-    type Target = IndexMap<String, OwnedValue>;
+impl<V> Deref for ObjectMapOf<V> {
+    type Target = IndexMap<String, V>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -1834,51 +1874,51 @@ impl Deref for ObjectMap {
     }
 }
 
-impl DerefMut for ObjectMap {
+impl<V> DerefMut for ObjectMapOf<V> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl From<IndexMap<String, OwnedValue>> for ObjectMap {
+impl<V> From<IndexMap<String, V>> for ObjectMapOf<V> {
     #[cfg(not(feature = "unboxed-object-map"))]
     #[inline]
-    fn from(map: IndexMap<String, OwnedValue>) -> Self {
+    fn from(map: IndexMap<String, V>) -> Self {
         Self(Box::new(map))
     }
 
     #[cfg(feature = "unboxed-object-map")]
     #[inline]
-    fn from(map: IndexMap<String, OwnedValue>) -> Self {
+    fn from(map: IndexMap<String, V>) -> Self {
         Self(map)
     }
 }
 
-impl From<ObjectMap> for IndexMap<String, OwnedValue> {
+impl<V> From<ObjectMapOf<V>> for IndexMap<String, V> {
     #[inline]
-    fn from(map: ObjectMap) -> Self {
+    fn from(map: ObjectMapOf<V>) -> Self {
         map.into_index_map()
     }
 }
 
-impl FromIterator<(String, OwnedValue)> for ObjectMap {
+impl<V> FromIterator<(String, V)> for ObjectMapOf<V> {
     #[inline]
-    fn from_iter<I: IntoIterator<Item = (String, OwnedValue)>>(iter: I) -> Self {
+    fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
         Self::from(IndexMap::from_iter(iter))
     }
 }
 
-impl Extend<(String, OwnedValue)> for ObjectMap {
+impl<V> Extend<(String, V)> for ObjectMapOf<V> {
     #[inline]
-    fn extend<I: IntoIterator<Item = (String, OwnedValue)>>(&mut self, iter: I) {
+    fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, iter: I) {
         self.0.extend(iter);
     }
 }
 
-impl IntoIterator for ObjectMap {
-    type Item = (String, OwnedValue);
-    type IntoIter = indexmap::map::IntoIter<String, OwnedValue>;
+impl<V> IntoIterator for ObjectMapOf<V> {
+    type Item = (String, V);
+    type IntoIter = indexmap::map::IntoIter<String, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -1886,9 +1926,9 @@ impl IntoIterator for ObjectMap {
     }
 }
 
-impl<'a> IntoIterator for &'a ObjectMap {
-    type Item = (&'a String, &'a OwnedValue);
-    type IntoIter = indexmap::map::Iter<'a, String, OwnedValue>;
+impl<'a, V> IntoIterator for &'a ObjectMapOf<V> {
+    type Item = (&'a String, &'a V);
+    type IntoIter = indexmap::map::Iter<'a, String, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -1896,9 +1936,9 @@ impl<'a> IntoIterator for &'a ObjectMap {
     }
 }
 
-impl<'a> IntoIterator for &'a mut ObjectMap {
-    type Item = (&'a String, &'a mut OwnedValue);
-    type IntoIter = indexmap::map::IterMut<'a, String, OwnedValue>;
+impl<'a, V> IntoIterator for &'a mut ObjectMapOf<V> {
+    type Item = (&'a String, &'a mut V);
+    type IntoIter = indexmap::map::IterMut<'a, String, V>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {

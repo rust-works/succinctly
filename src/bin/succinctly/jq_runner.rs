@@ -5801,7 +5801,7 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             if remaining.ends_unpaired() {
                 return Err(EvalError::malformed_json_text(parent_cursor.text()));
             }
-            JqValue::Object(map)
+            JqValue::Object(map.into())
         }
         // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
         // (#1194/#1247): a structurally malformed value -- one the
