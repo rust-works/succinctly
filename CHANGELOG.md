@@ -173,6 +173,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`|=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=` update one path at a time, as
+  jq does** (#2974). jq lowers them all to a `reduce` over `path(paths)`, and
+  #2267 had already made `=` stream that way. A failing update now stops the
+  path generator (`(.|stderr)[(0,1):(2,3)] |= 99` fired the target four times,
+  jq once), a filter's side effects interleave with the paths'
+  (`.[(0,1)|debug("p")] |= debug("f")` wrote `p p f f`, jq `p f p f`), and
+  `(.[] | select(.a > 0)) |= error("x")` on `[{"a":1},"s"]` raises the filter's
+  `x` rather than the resolver's `Cannot index string` from a later path. A
+  `?//` in the path never retries past a halt the update raised. Streaming holds
+  a second document, as `=` already did.
+
 - **`recurse(f)`/`recurse(f; cond)` stops between `f`'s own outputs** (#2918).
   jq traverses the first output's whole subtree before asking `f` for the
   second; succinctly ran `f` to completion at every node first. The values were

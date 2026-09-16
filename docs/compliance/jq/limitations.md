@@ -3065,6 +3065,29 @@ into — jq's `reduce` evaluates its source against the outer `.` — which is o
 `{"a":"b","b":1} | .[(.a,.a)] = 5` is `{"a":"b","b":5}`, where resolving the second `.a`
 against the written document would read back `5` and raise.
 
+`|=` and the `op=`/`//=` family followed in
+[#2974](https://github.com/rust-works/succinctly/issues/2974), through the same loop and
+the same gate: jq lowers them to `_modify(paths; f)` and `$v as $tmp | _modify(paths; . op
+$tmp)`, the same `reduce` over `path(paths)`. So `(.|stderr)[(0,1):(2,3)] |= 99` and
+`(.|stderr)[(0,1)] += "x"` fire the target once now, as in jq, and so do `try`/`?`, a
+halting or breaking filter, and a nested `|=`. Unlike `=`, this is visible without any
+failure: the filter now runs between paths, so `.[(0,1)|debug("p")] |= debug("f")` writes
+`p f p f` (it wrote `p p f f`), `.[(input,input)] |= input` reads its inputs in jq's order,
+and `(.[] | select(.a > 0)) |= error("x")` on `[{"a":1},"s"]` raises the filter's `x` from
+the first path rather than `Cannot index string with string "a"` from the second. A write
+that stops the generator classifies its reason for any `?//` inside the path, as jq's own
+backtracking does: an error or `break` retries the next alternative, a halt never does. Two
+shapes keep the eager route: a filter reading `parent` (a succinctly extension with no jq
+ordering to follow, which sees the document with every target already created), and
+`sort_keys(f)`'s skip-absent pre-filter (yq only).
+
+One jq 1.7.1 quirk is deliberately not reproduced: a `?//` retry that re-enters `_modify`
+after a write already succeeded corrupts jq's `reduce` accumulator and fails with `Paths must
+be specified as an array`, having fired the target three times
+(`(. as $x ?// $y | (.|stderr)[(0,1)]) += "x"` on `[1,2]`). That is jq's VM stack, not a
+rule. succinctly retries once per alternative and raises the last alternative's own write
+error (`number (1) and string ("x") cannot be added`), firing the target twice.
+
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
 200,000-element array `.[(0,1)] = 0` costs more peak RSS than the eager `.[$k] = 0`:
@@ -3073,8 +3096,10 @@ streaming route keeps two documents where the eager one keeps one, so on a 1.5 M
 five reps, minimum of each). Both pairs are post-#3000 — before `OwnedValue` shrank from
 72 bytes to 32 they were 92.5 MB against 73.4 MB and 104.7 MB against 75.3 MB on the same
 two machines. A path that provably resolves to **at most one path** stays on the eager
-route and pays none of it — `.[$k] = 0` is the eager number above, as are a static path,
-`del()` and `|=`.
+route and pays none of it — `.[$k] = 0` is the eager number above, as are a static path
+and `del()`. `|=` and `op=` pay it under exactly the same gate, which matters more for
+them, because `(.[] | select(...)) |= f` is a common idiom: see the #2974 measurements
+below.
 
 The count is the whole criterion, and purity is not part of it
 ([#2976](https://github.com/rust-works/succinctly/issues/2976)): the eager and streaming
@@ -3108,7 +3133,9 @@ on a 5,000-shape sweep, and backed out. `first((.|debug("E"))["a"] = (1,2))` fir
 twice under it where jq fires it once, and with `input` in the path it changes stdout;
 `first((.|stderr)["a"] = (1,2))` is pinned as a holdout so a re-attempt fails loudly. The
 streaming write above is deliberately gated to a *single* RHS output for the same reason —
-one output means one output document, so none of that class is reachable from it.
+one output means one output document, so none of that class is reachable from it. The
+`op=`/`//=` family shares both the rule and the gap (`(.|stderr)[(0,1)] += (1,"x")` fires
+twice where jq fires three times, pinned as a #2974 holdout).
 
 ## Reading a path is indexing
 
