@@ -27198,6 +27198,71 @@ fn test_undefined_name_inside_a_called_def_still_a_compile_error_2740() -> Resul
     Ok(())
 }
 
+/// #2971: a `def` inside a builtin's argument, when called, is a
+/// **compile** error -- exit 3 with no output at all, as jq guarantees for a
+/// program that does not compile -- not a runtime one (exit 5).
+///
+/// Asserted on the exit code and on empty stdout, not just the message: a
+/// message check alone could not tell a compile-time rejection from a
+/// runtime failure raised after output had started. One row per builtin
+/// family the issue confirmed. Every expectation is jq 1.7.1's own live
+/// output.
+#[test]
+fn test_called_def_inside_builtin_argument_is_a_compile_error_2971() -> Result<()> {
+    for filter in [
+        "[1]|map(def g: nosuchfn; g)",
+        "[1]|select(def g: nosuchfn; g)",
+        "[1]|with_entries(def g: nosuchfn; g)",
+        "[1]|any(def g: nosuchfn; g)",
+        "[1]|all(def g: nosuchfn; g)",
+        // Two builtins deep: re-keyed at each clone.
+        "[[1]]|map(map(def g: nosuchfn; g))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: a compile error prints nothing");
+        assert!(
+            stderr.contains("nosuchfn/0 is not defined"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+
+    // Where the builtin would fail at runtime first, the two orders do not
+    // merely word the error differently -- they report different errors. jq
+    // compiles before it evaluates, so the undefined name wins; before
+    // #2971 this reported `Cannot iterate over null (null)`, exit 5.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "map(def g: nosuchfn; g)"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined") && !stderr.contains("Cannot iterate"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2971's negative control. The reachability gate this fix re-keys exists
+/// for exactly these: an *uncalled* def is never compiled by jq, wherever it
+/// sits, so its bad body must not become an error. Dropping the gate instead
+/// of fixing its key would pass every row of the test above and fail every
+/// row here. Every expectation is jq 1.7.1's own live output.
+#[test]
+fn test_uncalled_def_inside_builtin_argument_still_compiles_2971() -> Result<()> {
+    for (filter, expected) in [
+        ("[1]|map(def g: nosuchfn; 1)", "[1]"),
+        ("[1]|select(def g: nosuchfn; 1)", "[1]"),
+        ("[1]|any(def g: nosuchfn; 1)", "true"),
+        ("[1]|all(def g: nosuchfn; 1)", "true"),
+        ("[[1]]|map(map(def g: nosuchfn; 1))", "[[1]]"),
+        // Reachable only through a def that is itself never called.
+        ("def h: map(def g: nosuchfn; g); 1", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #1473, the severe half: forward-referencing a not-yet-defined arity
 /// from *within a def's own body* used to silently compute a value, where
 /// real jq rejects it as a compile-time forward reference (`f/2 is not
