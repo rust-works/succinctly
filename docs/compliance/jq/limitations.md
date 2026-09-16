@@ -3047,10 +3047,23 @@ against the written document would read back `5` and raise.
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
 200,000-element array `.[(0,1)] = 0` goes from 74.8 MB to 88.5 MB peak RSS (+18%). A path
-that provably resolves to one path with nothing observable on the way stays on the eager
-route and pays none of it — `.[$k] = 0` is unchanged, as are a static path, `del()` and
-`|=`. jq pays nothing for the same separation because its values are refcounted; closing
-that gap here needs structural sharing in `OwnedValue`, not a better gate.
+that provably resolves to **at most one path** stays on the eager route and pays none of
+it — `.[$k] = 0` is unchanged, as are a static path, `del()` and `|=`.
+
+The count is the whole criterion, and purity is not part of it
+([#2976](https://github.com/rust-works/succinctly/issues/2976)): the eager and streaming
+routes reach their path through the same resolver call, so a side effect, an `input` read
+or a raise on the way to the *only* path happens identically on both. The gate's first
+form also demanded that reaching that path be inert, which charged the second document to
+`.[length - 1] = 0`, `.[(.a | stderr)] = 0` and `(. | debug)[0] = 0` for nothing; those
+are eager now. Two shapes are refused despite plausibly qualifying — `try`, whose count
+depends on no other admitted shape emitting a value and then raising, and `reduce`, whose
+`?//` pattern alternatives are a second fan-out axis — because establishing their count
+means reasoning about something other than their own operands.
+
+What survives is irreducible by any gate: `.[(0,1)] = 0` genuinely needs both documents.
+jq pays nothing for the same separation because its values are refcounted; closing that
+last gap here needs structural sharing in `OwnedValue`, not a better gate.
 
 **Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),

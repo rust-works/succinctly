@@ -17420,6 +17420,92 @@ fn test_assign_write_failure_stops_index_key_generator_2267() -> Result<()> {
     Ok(())
 }
 
+/// #2976: the shapes the streaming gate stopped charging a second document
+/// for, pinned against jq 1.7.1.
+///
+/// These are **regression guards, not discriminators**. #2976's whole
+/// argument is that the eager and the streaming route produce identical
+/// observable behaviour for a one-path shape, so no CLI test can tell which
+/// one ran -- that is what the unit tests on `assignment_path_needs_streaming`
+/// are for. What this pins is the premise: every row below really is one
+/// path, so its stdout, its exit code and the number of times its side
+/// effect fires must not move when the route does.
+///
+/// Every expectation was captured live from `/usr/bin/jq` 1.7.1, not
+/// recalled.
+#[test]
+fn test_one_path_assignments_are_unchanged_by_the_eager_route_2976() -> Result<()> {
+    // (filter, stdin, expected stdout, side-effect needle, expected firings)
+    let rows: &[(&str, &str, &str, Option<&str>)] = &[
+        // Moved off the streaming route by #2976: an observable target, key
+        // or bound, each reaching exactly one path.
+        (r"(.|stderr)[0] = 99", "[10,20,30]", "[99,20,30]\n", Some("[10,20,30]")),
+        (
+            r#".[(.a|stderr)] = 99"#,
+            r#"{"a":"k"}"#,
+            "{\"a\":\"k\",\"k\":99}\n",
+            Some("k"),
+        ),
+        (
+            r"(.|debug)[0:1] = [9]",
+            "[10,20,30]",
+            "[9,20,30]\n",
+            Some(r#"["DEBUG:",[10,20,30]]"#),
+        ),
+        (
+            r".[0:(length|debug)] = [9]",
+            "[10,20,30]",
+            "[9]\n",
+            Some(r#"["DEBUG:",3]"#),
+        ),
+        // Newly eager because the key is computed but single-valued.
+        (r".[length-1] = 99", "[10,20,30]", "[10,20,99]\n", None),
+        (
+            r#".[(.a // 0)] = 99"#,
+            r#"{"a":"k"}"#,
+            "{\"a\":\"k\",\"k\":99}\n",
+            None,
+        ),
+        (
+            r".[first(.k)] = 99",
+            r#"{"k":"z"}"#,
+            "{\"k\":\"z\",\"z\":99}\n",
+            None,
+        ),
+    ];
+    for (filter, stdin, want_stdout, needle) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(stdin))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, *want_stdout, "{filter}: stderr: {stderr:?}");
+        match needle {
+            // Counted, not merely present: a route that resolved the path
+            // twice would still produce the right document.
+            Some(needle) => assert_eq!(
+                stderr.matches(needle).count(),
+                1,
+                "{filter}: jq 1.7.1 fires the side effect once: stderr: {stderr:?}"
+            ),
+            None => assert_eq!(stderr, "", "{filter}: expected a silent run"),
+        }
+    }
+
+    Ok(())
+}
+
+/// #2976: `input` in a key position is one path too, and the document it
+/// consumes is the same one on either route.
+///
+/// Split out from the table above because it needs a second document on
+/// stdin. jq 1.7.1: `[10,20,30]` then `1` gives `[10,99,30]`.
+#[test]
+fn test_input_keyed_assignment_is_unchanged_by_the_eager_route_2976() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r".[input] = 99"], Some("[10,20,30]\n1\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,99,30]\n", "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2267: a *successful* multi-path write still applies every path and
 /// still fires the target once per path. The short-circuit above is a
 /// property of a failing write, not of streaming -- without this, a fix
