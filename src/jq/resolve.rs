@@ -120,6 +120,10 @@ pub struct UnboundVar {
     /// The referenced name, without the `$` sigil — matching [`Expr::Var`]'s
     /// own storage.
     pub name: String,
+    /// The module run the reference was written in, or `None` for the main
+    /// filter -- [`UnresolvedCall::origin`]'s twin, so a module body's
+    /// unbound variable is reported against that module's file (#2962).
+    pub origin: Option<u32>,
 }
 
 impl core::fmt::Display for UnboundVar {
@@ -1262,10 +1266,11 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
     )
 }
 
-/// Whether `$name` resolves against `var_scope`, innermost first (mirrors
-/// [`in_scope`]).
-fn in_var_scope(var_scope: &VarScope, name: &str) -> bool {
-    var_scope.iter().rev().any(|n| n == name)
+/// Whether `$name` resolves against `var_scope`, innermost first, stopping
+/// at the same module-scope floor as [`in_scope`] (#2962): a `$`-parameter
+/// of the def a dependency is spliced into is not the dependency's to see.
+fn in_var_scope(var_scope: &VarScope, name: &str) -> ScanResult<()> {
+    scan_scope(var_scope, String::as_str, |n| (n == name).then_some(()))
 }
 
 /// A pattern's computed keys (`{(EXPR): P}`, #2677) are ordinary
@@ -1543,8 +1548,12 @@ fn check(
         // already resolved, never present on the freshly parsed tree this
         // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
         Expr::Var(name) => {
-            if !in_var_scope(var_scope, name) {
-                errors.push(ResolveError::Var(UnboundVar { name: name.clone() }));
+            let found = in_var_scope(var_scope, name);
+            if found.hit.is_none() {
+                errors.push(ResolveError::Var(UnboundVar {
+                    name: name.clone(),
+                    origin: found.run.map(|(id, _)| id),
+                }));
             }
         }
 
@@ -1731,7 +1740,15 @@ fn check(
             var_scope.truncate(var_outer);
             scope.truncate(with_self);
 
+            // A run marker floors variables as well as functions (#2962), so
+            // it goes on the variable stack too -- for `then` only, since a
+            // marker's own body is `.`.
+            let is_marker = ModuleRun::parse(name).is_some();
+            if is_marker {
+                var_scope.push(name.clone());
+            }
             check(then, scope, var_scope, errors, reachable);
+            var_scope.truncate(var_outer);
             scope.truncate(outer);
         }
 

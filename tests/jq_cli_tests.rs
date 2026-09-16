@@ -44988,19 +44988,17 @@ fn test_namespaced_call_inside_module_body_finds_its_own_line_2991() -> Result<(
 }
 
 /// #2734's own variable-reference sibling to
-/// `test_unresolved_call_from_included_module_omits_the_location_1473`
-/// above: an unbound `$variable` referenced from an included module's `def`
-/// body has no occurrence in the top-level filter's own text either, so the
-/// text-search fallback (`locate_identifier_from`) finds nothing and the
-/// line marker is omitted the same way. jq itself still names the module
-/// file and line here; recorded as the same tracked location gap
-/// (docs/compliance/jq/limitations.md).
+/// `test_unresolved_call_from_included_module_names_its_own_line_2991`: an
+/// unbound `$variable` referenced from an included module's `def` body is
+/// reported against the module's own file, line and source, as jq 1.7.1
+/// reports it (#2962 gave `UnboundVar` the `origin` calls already had).
+/// Captured byte for byte, including the echoed line's column padding.
 #[test]
-fn test_unbound_variable_from_included_module_omits_the_location_2734() -> Result<()> {
+fn test_unbound_variable_from_included_module_names_its_own_line_2962() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(
         temp_dir.path().join("mymod.jq"),
-        "def helper: $nosuch_var_in_module;",
+        "def helper:\n  $nosuch_var_in_module, $nosuch_var_in_module;",
     )?;
 
     let (output, code) = spawn_with_signal_retry(
@@ -45016,15 +45014,19 @@ fn test_unbound_variable_from_included_module_omits_the_location_2734() -> Resul
 
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr: {stderr}");
-    assert!(
-        stderr.contains("$nosuch_var_in_module is not defined at <top-level>"),
-        "stderr: {stderr}"
+    let at = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    let at = at.display();
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $nosuch_var_in_module is not defined at {at}, line 2:\n  \
+             $nosuch_var_in_module, $nosuch_var_in_module;  \n\
+             jq: error: $nosuch_var_in_module is not defined at {at}, line 2:\n  \
+             $nosuch_var_in_module, $nosuch_var_in_module;{}\n\
+             jq: 2 compile errors\n",
+            " ".repeat(25)
+        )
     );
-    assert!(
-        !stderr.contains(", line "),
-        "no line should be claimed for a variable with no in-filter occurrence: {stderr}"
-    );
-    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
 }
 
