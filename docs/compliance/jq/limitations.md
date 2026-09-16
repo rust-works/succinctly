@@ -1309,17 +1309,19 @@ answers `["b"]` — and classified the two residuals appended below):
   jq, and `[recurse(.[]?|debug)]` interleaves.
 
   That descent is native recursion, so it is budgeted by the stack it has actually spent,
-  measured as it goes and charged on the same ambient frame depth `MAX_EVAL_FRAMES` guards
-  `def` recursion with (a quarter of it, ~15 MB of release stack). **What remains** is past that
-  budget: the rest of the subtree is walked with the old explicit stack, where `f` runs to
-  completion per node and the residual above returns for those levels only. Realistic
-  documents never reach it (JSON nesting stops at 256; a simple `f` reaches over a thousand
-  native levels), but a synthetic chain can — a 30-stage pipe inside `f` exhausts it within
-  ~60-90 levels, and `recurse_queues_past_its_native_stack_budget_2918` pins that. Values are
-  identical in both orders. Where `f` takes the reindex bridge (`.[]?` does), each native level
-  also keeps its node's temporary document alive while its children run, so peak memory is
-  bounded by the subtree sizes along the current path rather than one node's — invisible on
-  ordinary documents, ~1.4x on a 200-deep chain holding its whole bulk at the leaf.
+  measured as it goes: at most 512 KiB, so that it stays safe for a library caller on an
+  ordinary 2 MiB thread, and charged on the ambient frame depth `MAX_EVAL_FRAMES` guards `def`
+  recursion with. **What remains** is past that budget: the rest of the subtree is walked with
+  the old explicit stack, where `f` runs to completion per node and the residual above returns
+  for those levels only. How deep the budget reaches depends on `f`'s shape — for
+  `if . < N then .+1 elif … end`, 46 levels in release and 9 in debug — so a document nested
+  deeper than a few dozen levels, or a synthetic chain, sees the old order below that depth;
+  `recurse_queues_past_its_native_stack_budget_2918` pins it. Values are identical in both
+  orders. Where `f` takes the reindex bridge (`.[]?` does), each native level also keeps its
+  node's temporary document alive while its children run, so peak memory is bounded by the
+  subtree sizes along the current path rather than one node's: flat on a 10 MB `users`
+  document, +11% on a 10 MB `nested` one, +30% on a 200-deep chain holding its bulk at the
+  leaf, time unchanged.
   (#2908, once listed as sharing this class, turned out not to need it: its branches were
   already produced lazily and only the terminal was collecting them.)
   Bare `..`/`recurse`/

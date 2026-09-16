@@ -34873,8 +34873,9 @@ pub(crate) struct RecurseWalkEnd {
 /// does), each native level keeps its node's temporary document alive while
 /// its children's subtrees run, so live reindexed input is bounded by the
 /// sum of the subtree sizes along the current path rather than one node's.
-/// That is invisible on ordinary documents and ~1.4x peak memory (time
-/// unchanged) on a 200-deep chain with its whole bulk at the leaf.
+/// Measured in release, time unchanged: flat on a 10 MB `users` document,
+/// +11% peak on a 10 MB `nested` one (the root's reindex outlives its first
+/// child's), +30% on a 200-deep chain holding its whole bulk at the leaf.
 pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
