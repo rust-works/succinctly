@@ -3123,6 +3123,30 @@ smaller, but there are still two of them, and the gap between them did not close
 +37% on the M4 Pro and +30% on the 7950X now, against +26% and +39% before. Only sharing
 removes the second document.
 
+What #2974 costs, measured on generated `users` documents (release, `cgu1+fat`, seven
+interleaved repetitions of each binary, median wall time and maximum peak RSS, outputs
+identical; the baseline is the commit #2974 branched from):
+
+| machine            | size  | filter                                            | base             | #2974            |
+|--------------------|-------|---------------------------------------------------|------------------|------------------|
+| Apple M4 Pro       | 1 MB  | `(.users[] \| select(.age > 30)).score \|= . + 1` | 0.03 s, 34.3 MB  | 0.03 s, 39.6 MB  |
+| Apple M4 Pro       | 10 MB | `(.users[] \| select(.age > 30)).score \|= . + 1` | 0.31 s, 254.3 MB | 0.32 s, 316.0 MB |
+| Apple M4 Pro       | 10 MB | `(.users[] \| select(.age > 30)).score += 1`       | 0.30 s, 253.1 MB | 0.32 s, 312.0 MB |
+| Apple M4 Pro       | 10 MB | `.users[(0,1)].score \|= 0`                        | 0.37 s, 255.0 MB | 0.38 s, 311.3 MB |
+| Apple M4 Pro       | 10 MB | `.users[].score \|= . + 1` (static, control)      | 0.27 s, 198.6 MB | 0.27 s, 198.6 MB |
+| AMD Ryzen 9 7950X  | 1 MB  | `(.users[] \| select(.age > 30)).score \|= . + 1` | 0.05 s, 32.3 MB  | 0.05 s, 38.8 MB  |
+| AMD Ryzen 9 7950X  | 10 MB | `(.users[] \| select(.age > 30)).score \|= . + 1` | 0.51 s, 237.3 MB | 0.58 s, 305.7 MB |
+| AMD Ryzen 9 7950X  | 10 MB | `(.users[] \| select(.age > 30)).score += 1`       | 0.51 s, 237.3 MB | 0.57 s, 300.6 MB |
+| AMD Ryzen 9 7950X  | 10 MB | `.users[(0,1)].score \|= 0`                        | 0.59 s, 254.3 MB | 0.66 s, 322.2 MB |
+| AMD Ryzen 9 7950X  | 10 MB | `.users[].score \|= . + 1` (static, control)      | 0.43 s, 169.2 MB | 0.43 s, 169.1 MB |
+
+So +22 to +29% peak RSS at 10 MB on both machines, and +3 to +7% wall time on the M4 Pro
+against +12 to +14% on the 7950X — the second document's clone, not the interleave. That
+is paid for fidelity under ADR-0018's decision order, where performance only breaks a tie
+between two faithful options. The eager route was not faithful here: it fires side
+effects jq never fires and raises a different error. The same structural sharing
+(#2999) that would retire `=`'s second document retires this one.
+
 **Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
 so `echo '{}' | jq -c '(.|stderr)[("a","b")] = (1,2)'` fires the target four times where
