@@ -34981,7 +34981,16 @@ fn native_recurse_end(abort: Option<RecurseAbort>, flow: Flow) -> Option<Recurse
 /// every arm's frame. So the walk records a stack address when it starts,
 /// and before each level reads how far the stack has actually moved.
 ///
-/// That distance is converted to [`MAX_EVAL_FRAMES`]' own unit and charged
+/// **Sized for any thread, not the CLI's.** The walk descends at most
+/// [`RECURSE_NATIVE_STACK_BYTES`] natively, whatever thread it runs on. A
+/// budget sized for the CLI's 256 MB evaluation thread aborted a library
+/// caller on an ordinary 2 MiB thread: the queued walk had run
+/// `[recurse(.a?)]`'s 10000-item chain in constant stack, and
+/// `jq_computed_key_tests` still does. The cost of the small cap is only
+/// where the native order stops -- ~40 levels of a reindex-route `f` in
+/// release, a handful in debug -- past which the queued order resumes.
+///
+/// The distance is also converted to [`MAX_EVAL_FRAMES`]' own unit and charged
 /// on the ambient frame guard, so the walk and `def` recursion share one
 /// ceiling in both directions: a walk started deep inside `def` recursion
 /// begins with less room, and a `def` reached inside `f` sees the stack the
@@ -35020,13 +35029,15 @@ const RECURSE_NATIVE_BYTES_PER_FRAME: usize = if cfg!(debug_assertions) {
     1536
 };
 
-/// The charge past which a `recurse` walk queues instead of descending: a
-/// quarter of [`MAX_EVAL_FRAMES`] (~15 MB of release stack), so a `def`
-/// reached inside `f` at the deepest native level keeps three quarters of
-/// its budget. Every realistic document is far inside it -- JSON nesting
-/// stops at 256, and a simple `f` reaches over a thousand levels -- so what
-/// the ceiling trades away is only #2918's ordering on synthetic chains
-/// deeper than that, which keep the queued order past it.
+/// The most native stack a `recurse` walk spends before it queues instead:
+/// small enough to leave most of a 2 MiB thread -- Rust's default for a
+/// spawned thread, and cargo's test harness -- to everything else.
+const RECURSE_NATIVE_STACK_BYTES: usize = 512 * 1024;
+
+/// The ambient charge past which a `recurse` walk queues instead of
+/// descending: a quarter of [`MAX_EVAL_FRAMES`], so a walk started deep
+/// inside `def` recursion does not add native stack on top of it, and a
+/// `def` reached inside `f` keeps most of its budget.
 const RECURSE_NATIVE_FRAME_CEILING: u32 = MAX_EVAL_FRAMES / 4;
 
 impl RecurseNativeBudget {
@@ -35058,13 +35069,17 @@ impl RecurseNativeBudget {
     ///
     /// The level about to run has not spent its stack yet, so what is
     /// checked is what the levels above it spent, plus one frame. One level
-    /// can therefore overshoot the ceiling by its own cost; the ceiling is
-    /// a quarter of the guard, and the guard itself carries a 4x margin.
+    /// can therefore overshoot by its own cost, which is what the headroom
+    /// [`RECURSE_NATIVE_STACK_BYTES`] leaves is for.
     fn next_level(self, level: u32) -> Option<u32> {
         if level >= recurse_native_max_levels() {
             return None;
         }
-        let spent = self.origin.abs_diff(stack_address()) / RECURSE_NATIVE_BYTES_PER_FRAME;
+        let spent_bytes = self.origin.abs_diff(stack_address());
+        if spent_bytes > RECURSE_NATIVE_STACK_BYTES {
+            return None;
+        }
+        let spent = spent_bytes / RECURSE_NATIVE_BYTES_PER_FRAME;
         let frames = self
             .base_frames
             .saturating_add(u32::try_from(spent).unwrap_or(u32::MAX))
@@ -88250,14 +88265,13 @@ mod tests {
     /// 0 runs a whole query queued. This is the guard against the two orders'
     /// copies of #490/#627/#635/#636/#842/#854/#856 drifting apart.
     ///
-    /// On an explicitly sized thread: native descent is budgeted for the
-    /// CLI's evaluation thread (2 GiB in debug), not the harness's 2 MiB, and
-    /// the `recurse(.a?)` rows walk 10000 levels.
+    /// On the harness's own 2 MiB thread, deliberately: the `recurse(.a?)`
+    /// rows walk a 10000-level chain, natively until the stack budget and
+    /// queued after, and that must fit an ordinary thread.
     #[test]
     fn recurse_native_and_queued_orders_agree_2918() {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024 * 1024)
-            .spawn(|| {
+        {
+            {
                 let docs: [&[u8]; 3] = [
                     br#"{"a":{"b":[1,2,{"c":null}]},"d":[3,[4,[5]]],"e":null}"#,
                     br#"[[1,2],[3,[4,5]],{"x":{"y":6}}]"#,
@@ -88315,10 +88329,8 @@ mod tests {
                         );
                     }
                 }
-            })
-            .expect("spawn")
-            .join()
-            .expect("recurse must not overflow its thread");
+            }
+        }
     }
 
     /// #2918: native `recurse` descent shares [`MAX_EVAL_FRAMES`] with `def`
@@ -88332,10 +88344,14 @@ mod tests {
         assert!(frames >= 1 && frames <= RECURSE_NATIVE_FRAME_CEILING);
 
         // A walk starting deep inside `def` recursion queues from the start.
+        // (`no_std` has no ambient depth to read, so only the stack and the
+        // level cap bound it there.)
+        #[cfg(feature = "std")]
         {
             let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING);
             assert_eq!(RecurseNativeBudget::start().next_level(0), None);
         }
+        #[cfg(feature = "std")]
         {
             let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING - 1);
             assert_eq!(
@@ -88344,15 +88360,27 @@ mod tests {
             );
         }
 
-        // Stack the walk has already spent is charged: an origin a ceiling's
-        // worth of bytes away leaves no room.
-        let spent = RecurseNativeBudget {
-            origin: stack_address()
-                + RECURSE_NATIVE_BYTES_PER_FRAME * RECURSE_NATIVE_FRAME_CEILING as usize,
+        // Stack the walk has already spent is bounded in bytes ...
+        let spent = |bytes: usize| RecurseNativeBudget {
+            origin: stack_address() + bytes,
             base_frames: 0,
             read_only: false,
         };
-        assert_eq!(spent.next_level(0), None);
+        assert_eq!(spent(RECURSE_NATIVE_STACK_BYTES + 1024).next_level(0), None);
+        // ... and charged on the frame guard while under that bound.
+        let charged = spent(RECURSE_NATIVE_STACK_BYTES / 2)
+            .next_level(0)
+            .expect("half the byte budget leaves room");
+        assert!(charged > 1, "spent stack is charged, not just the level");
+        #[cfg(feature = "std")]
+        {
+            let _guard = enter_def_call_frame(RECURSE_NATIVE_FRAME_CEILING - 1);
+            assert_eq!(
+                spent(RECURSE_NATIVE_STACK_BYTES / 2).next_level(0),
+                None,
+                "the spent-stack charge counts against the ceiling"
+            );
+        }
 
         // The test override caps levels independently of the charge.
         recurse_native_levels_override::with(2, || {
