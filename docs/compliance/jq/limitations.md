@@ -3063,7 +3063,12 @@ means reasoning about something other than their own operands.
 
 What survives is irreducible by any gate: `.[(0,1)] = 0` genuinely needs both documents.
 jq pays nothing for the same separation because its values are refcounted; closing that
-last gap here needs structural sharing in `OwnedValue`, not a better gate.
+last gap here needs structural sharing in `OwnedValue`, not a better gate. That is
+[#2999](https://github.com/rust-works/succinctly/issues/2999)'s work, and this paragraph
+tracks there rather than on #2976, which is done.
+[#3000](https://github.com/rust-works/succinctly/issues/3000) took the first step without
+any sharing at all: `OwnedValue` went from 72 bytes to 32, so *both* documents are now
+smaller, but there are still two of them.
 
 **Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
