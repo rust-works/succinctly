@@ -6907,47 +6907,65 @@ already documents for a *directly* shadowed `break $x` applies identically to a 
 intercepted through #2840's re-raise (`def error: .; label $a | (def f: break $a; label $b | f)`
 sees `null` where jq sees the sentinel) — the same #562 choice, not a new divergence.
 
-**New, narrower gap found while fixing #2840: succinctly's own Try-based re-raise can swallow
-a *self-matching* break that real jq's compiler would reject outright.** `error` in scope at
-`f`'s own lexical position (rather than only at the label's) makes #2687 shadow the `break`
-directly there, before it ever becomes a `Control::Break` at all — so the *shadowing* def has
-to be declared *after* `f`, not before, to isolate this from #2687's own already-documented
-mechanism:
+**A narrower gap found while fixing #2840 — closed by #2964 meanwhile.** With `error` in
+scope at `f`'s own lexical position rather than only at the label's, #2687's shadowing
+would hit the `break` directly there, before it ever became a `Control::Break` — so before
+#2964 the *shadowing* def declared *after* `f` produced a Try-based re-raise that
+swallowed a self-matching break only jq's compiler would reject:
 
 ```console
-$ jq            -nc 'def f: break $x; def error: "S"; label $x | f'
+$ jq -nc 'def f: break $x; def error: "S"; label $x | f'
 jq: error: $*label-x is not defined at <top-level>, line 1:
-def f: break $x; def error: "S"; label $x | f
+def f: break $x; def error: "S"; label $x | f       
 jq: 1 compile error
 $ succinctly jq -nc 'def f: break $x; def error: "S"; label $x | f'
-"S"
+jq: error: $*label-x is not defined at <top-level>, line 1:
+def f: break $x; def error: "S"; label $x | f       
+jq: 1 compile error
 ```
+(The echoed lines above carry jq's caret-echo padding; both streams are byte-identical,
+verified against the pinned oracle.) #2964's compile-time label-scope check is exactly the
+real fix this gap was filed as calling for.
 
 Real jq's own label scoping is lexical at compile time — `break $x` is only valid textually
 inside `label $x | ...`, so `def f: break $x;` (declared *before* the label, where `$x` is
 not yet in scope) fails to compile regardless of whether `f` is ever actually called from
-inside the label, and regardless of any shadowing `def error:` declared afterward. succinctly
-has no such compile-time label-scope check: `break $x` resolves purely by label name at
-runtime (confirmed unshadowed too: `def f: break $x; label $x | f` compiles and runs
-silently, exit 0, no output, where jq rejects it identically at compile time), so a `def`
-declared anywhere can name any label reachable when it happens to run — `f`'s `break $x`
-therefore reaches the label as a genuine, *self-matching* `Control::Break` at runtime (`$x`
-does match the enclosing label), which `eval_label`'s own primitive check would consume
-silently (empty output, confirmed on `main` before #2840). #2840's Try-wrap intercepts it
-first instead, since `Expr::Try`'s catch clause catches *any* `Control::Break` regardless of
-which label it targets (#562) — so once the label's body is Try-wrapped (because `error` is
-in scope at the *label's* own position), a self-matching break arriving this way is diverted
-into the shadowing `error()` call the same as a non-matching one would be, producing `"S"`
-where the pre-#2840 build produced nothing.
+inside the label, and regardless of any shadowing `def error:` declared afterward.
 
-Both directions trace back to the same root: a pre-existing absence of jq's own compile-time
-label-scope check, predating both #2687 and #2840 — without it, this program has no way to
-exist in the first place, so there is no reference answer for succinctly to diverge *from*
-here (jq refuses to compile it at all). #2840 changes *which* wrong answer succinctly gives
-for this one adversarial, only-succinctly-can-construct shape (empty output before, `"S"`
-after) rather than introducing a new kind of divergence; a real fix is the same compile-time
-scope check #2964 already calls for, not a narrower patch to the re-raise itself. Filed as
-[#2964](https://github.com/rust-works/succinctly/issues/2964) rather than chased here.
+**Closed by #2964.** succinctly now applies the same compile-time label-scope check
+(`resolve::check` tracks a `label_scope` of enclosing label names per expression, its
+`Expr::Break` arm reports `$*label-<name> is not defined` with the same `jq: N compile
+error`/exit-3 reporting as the unresolved-call and unbound-variable paths), so
+`def f: break $x; label $x | f` — with or without a shadowing `def error:` — now fails to
+compile byte-for-byte like jq, including the caret-echo padding pointing at the break's own
+column. Four CLI tests pin this under the "compile-time label-scope check" heading.
+
+**Residual: unreferenced `def` bodies are still visited by the resolver, where jq skips
+them.** The occurrence counter that positions the caret is threaded through `resolve_all`'s
+own descent, which visits every `def` body whether or not it is referenced. jq only
+compiles a `def`'s body when the call graph reaches it, so an *unreferenced* def's
+unbound `break` contributes nothing there:
+
+```console
+$ jq            -nc 'def f: break $x; break $x'
+jq: error: $*label-x is not defined at <top-level>, line 1:
+def f: break $x; break $x                 
+jq: 1 compile error
+$ succinctly jq -nc 'def f: break $x; break $x'
+jq: error: $*label-x is not defined at <top-level>, line 1:
+def f: break $x; break $x       
+jq: 1 compile error
+```
+
+Both reject (exit 3, same message and trailer), but the caret differs: jq cites the
+top-level `break $x` (column 17, the only one its reachable call graph sees), succinctly
+cites the def-body `break $x` (column 7, occurrence 0 — the first textual break site,
+because the resolver walked the unreferenced body first). The exit code and the
+error/count lines are identical, so only tooling that parses the echoed column differs;
+per ADR-0018's decision order this is the closest match that keeps the resolver's
+whole-program walk, and closing it would mean resolving def bodies on demand like jq's
+call graph (`resolve_func_calls_all` already visits only reachable calls, but the
+`check` pass that owns the label scope still descends everything).
 
 ### A module `include` cycle is a compile error, where jq segfaults — accepted divergence, ADR-0018 rule 4 (#2865)
 

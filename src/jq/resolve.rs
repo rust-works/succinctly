@@ -147,18 +147,64 @@ impl core::fmt::Display for UnboundVar {
     }
 }
 
-/// One compile-time diagnostic this pass can produce: an unresolved function
-/// call or an unbound `$variable` reference.
+/// A `break $name` this pass could not resolve to any lexically enclosing
+/// `label $name` — [`UnboundVar`]'s sibling for labels (#2964).
 ///
-/// Both kinds interleave in a single, source-ordered list rather than two
-/// separate ones, because real jq's own diagnostics interleave them by
+/// Real jq rejects `break $name` at *compile* time unless it sits lexically
+/// inside a `label $name | …` body: `def f: break $x; label $x | f` is
+/// `$*label-x is not defined`, exit 3, zero output — even though `f` is
+/// never called, because the `def`'s body is compiled at its own position
+/// (where `$x` is not yet scoped). succinctly's evaluator resolves `break`
+/// purely by name against whatever labels are on the dynamic call stack at
+/// *runtime*, silently doing nothing when no matching label is active; this
+/// pass moves that refusal earlier, the same relationship [`UnboundVar`] has
+/// to evaluation's existing runtime refusal.
+///
+/// `name` is stored without the `$` sigil (`Expr::Break`'s own storage) —
+/// note the `*` in jq's message: a label is compiled to a
+/// `$*label-NAME`-named "sentinel" variable, distinct from the user-visible
+/// `$name` a `Var` error quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedLabel {
+    /// The label's name, without the `$` sigil — matching [`Expr::Break`]'s
+    /// own storage.
+    pub name: String,
+    /// Which same-named `break $name` site this diagnostic belongs to
+    /// (0-based, in `super::parser::collect_break_sites`'s source order): when two
+    /// same-named breaks differ only by lexical scope — one bound under an
+    /// enclosing `label $name`, one genuinely unbound — the position
+    /// recovery in `report_compile_errors` (the CLI) must cite the *failing*
+    /// one, and this index is how it threads that decision through the AST,
+    /// which carries no positions. Mirrors the `calls`/`vars` "which
+    /// occurrence" counters in the CLI's own `report_compile_errors`
+    /// (`calls_consumed`/`vars_consumed`).
+    pub occurrence: usize,
+}
+
+impl core::fmt::Display for UnresolvedLabel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "$*label-{} is not defined", self.name)
+    }
+}
+
+/// One compile-time diagnostic this pass can produce: an unresolved function
+/// call, an unbound `$variable` reference, or an out-of-scope `break $label`
+/// (#2964).
+///
+/// All three kinds interleave in a single, source-ordered list rather than
+/// three separate ones, because real jq's own diagnostics interleave them by
 /// position rather than grouping by kind (confirmed live: `$bar, foo, $baz`
-/// reports all three left to right, not variables-then-calls or vice versa)
-/// — only a single combined walk naturally preserves that order.
+/// reports all three left to right) — only a single combined walk naturally
+/// preserves that order. (A label error is reported *with* a call/variable
+/// error at a later position, not instead of one; jq reports every compile
+/// error it finds in one pass, and a missing label is independent of a
+/// missing call.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     Call(UnresolvedCall),
     Var(UnboundVar),
+    /// #2964: a `break $name` outside any lexically enclosing `label $name`.
+    Break(UnresolvedLabel),
 }
 
 /// Every builtin the pinned jq (1.7.1) defines, as `(name, arity)`.
@@ -631,6 +677,16 @@ fn scan_scope<'a, E, T>(
 /// No arity component: unlike a function, a variable binding has no
 /// overload-by-arity concept, so plain name equality is enough.
 type VarScope = Vec<String>;
+
+/// A lexical *label* scope (#2964): the `$label` names (without the sigil)
+/// visible at a point in the tree — [`VarScope`]'s sibling for `break`'s
+/// compile-time label-scope check, tracked in the same walk rather than a
+/// separate pass (see [`check`]'s doc comment).
+///
+/// No arity or value component, same as [`VarScope`] but for `label`
+/// bindings: only the name matters. Restored before returning so a sibling
+/// never sees a label introduced by its neighbour, exactly like `var_scope`.
+type LabelScope = Vec<String>;
 
 /// [`Scope`]'s sibling for [`build_call_graph`] (#2740): each entry also
 /// carries the identity of the `def` it resolves to -- a parameter has none
@@ -1194,6 +1250,14 @@ pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
         .filter_map(|e| match e {
             ResolveError::Call(c) => Some(c),
             ResolveError::Var(_) => None,
+            // #2964: breaks are checked only in jq mode. Real yq marshals
+            // `break`/`label` through its own jq-superset evaluator, where
+            // a break's label scope is resolved at *runtime* much like
+            // succinctly's does — yq has no compile-time label check to
+            // match (mirrors `ResolveError::Var`'s own yq-mode exclusion,
+            // #2981), so folding these into yq's output would make
+            // `succinctly yq` reject programs real yq accepts.
+            ResolveError::Break(_) => None,
         })
         .collect()
 }
@@ -1230,15 +1294,24 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
 
     let mut scope = Scope::new();
     let mut var_scope = VarScope::new();
+    let mut label_scope = LabelScope::new();
+    // #2964: how many `break $name` sites the walk has already visited per
+    // label name, so a diagnostic carries which *occurrence* of the name —
+    // the same "which `$x` actually failed" question `var_scope` can't
+    // answer by itself, resolved here by counting as we go (see
+    // `UnresolvedLabel::occurrence`).
+    let mut break_occurrences: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors = Vec::new();
     let mut occurrences = BTreeMap::new();
     check(
         expr,
         &mut scope,
         &mut var_scope,
+        &mut label_scope,
         &mut errors,
         &reachable,
         &mut occurrences,
+        &mut break_occurrences,
     );
     errors
 }
@@ -1324,30 +1397,52 @@ fn check_pattern_keys(
     pattern: &mut Pattern,
     scope: &mut Scope,
     var_scope: &mut VarScope,
+    label_scope: &mut LabelScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
+    break_occurrences: &mut BTreeMap<String, usize>,
 ) {
     match pattern {
         Pattern::Var(_) => {}
         Pattern::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, var_scope, errors, reachable, occurrences);
+                    check(
+                        k,
+                        scope,
+                        var_scope,
+                        label_scope,
+                        errors,
+                        reachable,
+                        occurrences,
+                        break_occurrences,
+                    );
                 }
                 check_pattern_keys(
                     &mut entry.pattern,
                     scope,
                     var_scope,
+                    label_scope,
                     errors,
                     reachable,
                     occurrences,
+                    break_occurrences,
                 );
             }
         }
         Pattern::Array(patterns) => {
             for p in patterns.iter_mut() {
-                check_pattern_keys(p, scope, var_scope, errors, reachable, occurrences);
+                check_pattern_keys(
+                    p,
+                    scope,
+                    var_scope,
+                    label_scope,
+                    errors,
+                    reachable,
+                    occurrences,
+                    break_occurrences,
+                );
             }
         }
     }
@@ -1364,12 +1459,23 @@ fn bind_patterns(
     patterns: &mut [Pattern],
     scope: &mut Scope,
     var_scope: &mut VarScope,
+    label_scope: &mut LabelScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
+    break_occurrences: &mut BTreeMap<String, usize>,
 ) -> Vec<String> {
     for pattern in patterns.iter_mut() {
-        check_pattern_keys(pattern, scope, var_scope, errors, reachable, occurrences);
+        check_pattern_keys(
+            pattern,
+            scope,
+            var_scope,
+            label_scope,
+            errors,
+            reachable,
+            occurrences,
+            break_occurrences,
+        );
     }
     pattern_alternatives_var_names(patterns)
 }
@@ -1520,9 +1626,11 @@ fn check(
     expr: &mut Expr,
     scope: &mut Scope,
     var_scope: &mut VarScope,
+    label_scope: &mut LabelScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
+    break_occurrences: &mut BTreeMap<String, usize>,
 ) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
@@ -1559,14 +1667,23 @@ fn check(
                 let original = Rc::clone(inner);
                 let target = Rc::make_mut(inner);
                 let rebased = rebase_reachable(&original, target, reachable);
-                check(target, scope, var_scope, errors, &rebased, occurrences);
+                check(
+                    target,
+                    scope,
+                    var_scope,
+                    label_scope,
+                    errors,
+                    &rebased,
+                    occurrences,
+                    break_occurrences,
+                );
             } else {
-                check(Rc::make_mut(inner), scope, var_scope, errors, reachable, occurrences);
+                check(Rc::make_mut(inner), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, scope, var_scope, errors, reachable, occurrences);
+                check(arg, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
@@ -1583,8 +1700,46 @@ fn check(
         | Expr::Format(_)
         | Expr::TrackedVar(_)
         | Expr::Loc { .. }
-        | Expr::Env
-        | Expr::Break(_) => {}
+        | Expr::Env => {}
+
+        // #2964: real jq rejects `break $name` at *compile* time (exit 3)
+        // when there is no lexically enclosing `label $name`, reporting
+        // `$*label-x is not defined` at the `break` keyword's position --
+        // confirmed live against the pinned oracle. The check is
+        // unconditional with respect to the `def error:` shadowing that
+        // #2687 handles: a bare `break $x` outside any label compiles even
+        // when `error/0` is shadowed (oracle: `def error: "S"; break $x`
+        // → `$*label-x is not defined`, rc=3), so this arm fires before
+        // #2687's `wrap_shadowable_call` desugaring can convert the node
+        // into a `FuncCall`. When `def error` *is* in scope at the
+        // break's own position, the `FuncCall` arm's fallback-restore path
+        // (`*expr = *fallback; check(expr, ...)`) re-enters this exact arm
+        // with the bare `Expr::Break` — the same reason `parse_break_expr`
+        // records the site unconditionally regardless of the `error` wrap.
+        //
+        // `break_occurrences` carries *which* same-named break site this
+        // one is — the #2635-class limitation: a break inside an
+        // unreachable `def` body that textually precedes the failing one
+        // shifts the CLI's caret target by one (see the `UnresolvedLabel`
+        // doc comment and the `BreakSite` doc comment for the full
+        // accounting), the exact same class `CallSite`/`VarSite` already
+        // record for calls/variables.
+        Expr::Break(name) => {
+            let n = break_occurrences.entry(name.clone()).or_insert(0);
+            let occurrence = *n;
+            *n += 1;
+            // Label scope is determined at the break's *own* lexical
+            // position — a `label $x` only covers nodes nested inside its
+            // body, not siblings of that body. `label_scope` is a stack
+            // pushed/popped by the `Label` arm below, so this check sees
+            // only genuinely enclosing labels.
+            if !label_scope.iter().rev().any(|l| l == name) {
+                errors.push(ResolveError::Break(UnresolvedLabel {
+                    name: name.clone(),
+                    occurrence,
+                }));
+            }
+        }
 
         // #2734: the leaf this whole pass exists to add. `$ENV`/`$__loc__`
         // never reach here at all -- the parser lowers them straight to
@@ -1608,7 +1763,7 @@ fn check(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner) => check(inner, scope, var_scope, errors, reachable, occurrences),
+        | Expr::Repeat(inner) => check(inner, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences),
 
         // #2840: real jq's `label $x | BODY` intercepts every escape that
         // isn't its own `{"__jq":N}` break sentinel and re-raises it
@@ -1624,8 +1779,10 @@ fn check(
         // it always has, byte-identical AST, zero evaluator cost (mirrors
         // #2687's `break $x` -> `error/0` desugaring's own
         // shadowable-or-untouched gate).
-        Expr::Label { name: _, body } => {
-            check(body, scope, var_scope, errors, reachable, occurrences);
+        Expr::Label { name, body } => {
+            label_scope.push(name.clone());
+            check(body, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            label_scope.pop();
             if in_scope(scope, "error", 0).hit.is_some() {
                 let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
                 **body = Expr::Try {
@@ -1641,7 +1798,7 @@ fn check(
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, scope, var_scope, errors, reachable, occurrences);
+                check(e, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
 
@@ -1698,16 +1855,16 @@ fn check(
             value: right,
             ..
         } => {
-            check(left, scope, var_scope, errors, reachable, occurrences);
-            check(right, scope, var_scope, errors, reachable, occurrences);
+            check(left, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(right, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
         }
 
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
         Expr::As { expr, var, body } => {
-            check(expr, scope, var_scope, errors, reachable, occurrences);
+            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.push(var.clone());
-            check(body, scope, var_scope, errors, reachable, occurrences);
+            check(body, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.pop();
         }
 
@@ -1726,11 +1883,11 @@ fn check(
             patterns,
             body,
         } => {
-            check(expr, scope, var_scope, errors, reachable, occurrences);
+            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
+            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.extend(bound);
-            check(body, scope, var_scope, errors, reachable, occurrences);
+            check(body, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(outer);
         }
 
@@ -1780,7 +1937,7 @@ fn check(
             // scope/`then`, which still need the same treatment either way.
             let body_addr = body.as_ref() as *const Expr as usize;
             if reachable.contains(&body_addr) {
-                check(body, scope, var_scope, errors, reachable, occurrences);
+                check(body, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
             var_scope.truncate(var_outer);
             scope.truncate(with_self);
@@ -1792,15 +1949,15 @@ fn check(
             if is_marker {
                 var_scope.push(name.clone());
             }
-            check(then, scope, var_scope, errors, reachable, occurrences);
+            check(then, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(var_outer);
             scope.truncate(outer);
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope, var_scope, errors, reachable, occurrences);
+            check(expr, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             if let Some(c) = catch.as_deref_mut() {
-                check(c, scope, var_scope, errors, reachable, occurrences);
+                check(c, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
 
@@ -1809,21 +1966,21 @@ fn check(
             then_branch,
             else_branch,
         } => {
-            check(cond, scope, var_scope, errors, reachable, occurrences);
-            check(then_branch, scope, var_scope, errors, reachable, occurrences);
-            check(else_branch, scope, var_scope, errors, reachable, occurrences);
+            check(cond, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(then_branch, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(else_branch, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope, var_scope, errors, reachable, occurrences);
-            check_opt(start.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
-            check_opt(end.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
+            check(target, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check_opt(start.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check_opt(end.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope, var_scope, errors, reachable, occurrences);
-            check_opt(to.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
-            check_opt(step.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
+            check(from, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check_opt(to.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check_opt(step.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
         }
 
         // #2734: `patterns`' vars are bound in `update` only, not `init` --
@@ -1860,12 +2017,12 @@ fn check(
             // line *correctness*, not inter-error print order. Every
             // individual citation still lands on its own correct line
             // either way (confirmed against the same live example).
-            check(input, scope, var_scope, errors, reachable, occurrences);
+            check(input, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, errors, reachable, occurrences);
+            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.extend(bound);
-            check(update, scope, var_scope, errors, reachable, occurrences);
+            check(update, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(outer);
         }
 
@@ -1879,19 +2036,19 @@ fn check(
             update,
             extract,
         } => {
-            check(input, scope, var_scope, errors, reachable, occurrences);
+            check(input, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, errors, reachable, occurrences);
+            let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.extend(bound);
-            check(update, scope, var_scope, errors, reachable, occurrences);
-            check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
+            check(update, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check_opt(extract.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(outer);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
-                check(e, scope, var_scope, errors, reachable, occurrences);
+                check(e, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
 
@@ -1988,6 +2145,23 @@ fn check(
                 let rebased = builtin_fallback.take().and_then(|fallback| {
                     let cloned_from =
                         matches!(*fallback, Expr::Builtin(_)).then(|| def_body_addrs(&fallback));
+                    // #2964 pre-check: when `error` IS in scope (def exists),
+                    // the break fallback is silently discarded by
+                    // `builtin_fallback_into_args`. But real jq still checks
+                    // the break's label scope — `def error: "S"; break $x` →
+                    // `$*label-x is not defined`, rc=3 (confirmed live).
+                    // Check BEFORE discarding.
+                    if let Expr::Break(ref name) = *fallback {
+                        let n = break_occurrences.entry(name.clone()).or_insert(0);
+                        let occurrence = *n;
+                        *n += 1;
+                        if !label_scope.iter().rev().any(|l| l == name) {
+                            errors.push(ResolveError::Break(UnresolvedLabel {
+                                name: name.clone(),
+                                occurrence,
+                            }));
+                        }
+                    }
                     *args = builtin_fallback_into_args(*fallback);
                     cloned_from.map(|from| {
                         let to = args.iter().flat_map(def_body_addrs).collect();
@@ -1996,7 +2170,7 @@ fn check(
                 });
                 let reachable = rebased.as_ref().unwrap_or(reachable);
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, errors, reachable, occurrences);
+                    check(a, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
@@ -2007,11 +2181,11 @@ fn check(
                 // recursive `check` call below counts it exactly once, in
                 // whichever arm the swapped-in `expr` actually matches.
                 *expr = *fallback;
-                check(expr, scope, var_scope, errors, reachable, occurrences);
+                check(expr, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             } else if is_jq_builtin(name, arity) {
                 next_call_occurrence(occurrences, origin, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, errors, reachable, occurrences); // omni-dev: coverage tolerate-line reason="same unreachable arm as the line above"
+                    check(a, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences); // omni-dev: coverage tolerate-line reason="same unreachable arm as the line above"
                 }
             } else {
                 let occurrence_index = next_call_occurrence(occurrences, origin, name, arity);
@@ -2031,23 +2205,23 @@ fn check(
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, scope, var_scope, errors, reachable, occurrences);
+                check(a, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
 
         Expr::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, var_scope, errors, reachable, occurrences);
+                    check(k, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
                 }
-                check(&mut entry.value, scope, var_scope, errors, reachable, occurrences);
+                check(&mut entry.value, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             }
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope, var_scope, errors, reachable, occurrences);
+                    check(e, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
                 }
             }
         }
@@ -2076,7 +2250,16 @@ fn check(
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
-                check(&mut copy, scope, var_scope, errors, &rebased, occurrences);
+                check(
+                    &mut copy,
+                    scope,
+                    var_scope,
+                    label_scope,
+                    errors,
+                    &rebased,
+                    occurrences,
+                    break_occurrences,
+                );
                 copy
             });
         }
@@ -2197,12 +2380,23 @@ fn check_opt(
     expr: Option<&mut Expr>,
     scope: &mut Scope,
     var_scope: &mut VarScope,
+    label_scope: &mut LabelScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
+    break_occurrences: &mut BTreeMap<String, usize>,
 ) {
     if let Some(e) = expr {
-        check(e, scope, var_scope, errors, reachable, occurrences);
+        check(
+            e,
+            scope,
+            var_scope,
+            label_scope,
+            errors,
+            reachable,
+            occurrences,
+            break_occurrences,
+        );
     }
 }
 
@@ -2675,15 +2869,19 @@ mod tests {
 
         let mut scope = Scope::new();
         let mut var_scope = VarScope::new();
+        let mut label_scope = LabelScope::new();
         let mut errors = Vec::new();
         let mut occurrences = BTreeMap::new();
+        let mut break_occurrences = BTreeMap::new();
         check(
             &mut Expr::Shared(Rc::new(unresolved())),
             &mut scope,
             &mut var_scope,
+            &mut label_scope,
             &mut errors,
             &BTreeSet::new(),
             &mut occurrences,
+            &mut break_occurrences,
         );
         assert_eq!(
             errors,
@@ -2700,8 +2898,10 @@ mod tests {
 
         let mut scope = Scope::new();
         let mut var_scope = VarScope::new();
+        let mut label_scope = LabelScope::new();
         let mut errors = Vec::new();
         let mut occurrences = BTreeMap::new();
+        let mut break_occurrences = BTreeMap::new();
         check(
             &mut Expr::DefCall {
                 def: Rc::new(crate::jq::FuncDefData {
@@ -2715,9 +2915,11 @@ mod tests {
             },
             &mut scope,
             &mut var_scope,
+            &mut label_scope,
             &mut errors,
             &BTreeSet::new(),
             &mut occurrences,
+            &mut break_occurrences,
         );
         assert_eq!(
             errors,
@@ -3029,6 +3231,7 @@ mod tests {
                 .map(|e| match e {
                     ResolveError::Call(c) => format!("Call({c})"),
                     ResolveError::Var(v) => format!("Var({v})"),
+                    ResolveError::Break(b) => format!("Break({b})"),
                 })
                 .collect()
         }
@@ -3039,6 +3242,9 @@ mod tests {
                 Some(ResolveError::Var(v)) => Err(format!("{v}")),
                 Some(ResolveError::Call(c)) => {
                     panic!("expected a variable error, got a call error: {c}")
+                }
+                Some(ResolveError::Break(b)) => {
+                    panic!("expected a variable error, got a break error: {b}")
                 }
                 None => Ok(()),
             }
@@ -3269,6 +3475,103 @@ mod tests {
                     occurrence_index: 1,
                 }]
             );
+        }
+    }
+
+    /// #2964: the compile-time `break $name` label-scope check.
+    ///
+    /// Every expectation here was captured from the pinned oracle
+    /// (`/usr/bin/jq`, jq-1.7.1), never from succinctly's own output, and
+    /// each pair of accept/reject cases is oracle-verified on both sides.
+    mod breaks {
+        use super::*;
+
+        fn break_errs(filter: &str) -> Vec<(String, usize)> {
+            let mut expr = parse(filter).expect("filter must parse");
+            resolve_all(&mut expr)
+                .into_iter()
+                .filter_map(|e| match e {
+                    ResolveError::Break(b) => Some((b.name, b.occurrence)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn bare_break_outside_any_label_is_rejected() {
+            assert_eq!(break_errs("break $x"), alloc::vec![("x".into(), 0)]);
+            assert_eq!(break_errs("1, break $x, 2"), alloc::vec![("x".into(), 0)]);
+        }
+
+        #[test]
+        fn break_inside_an_enclosing_label_is_accepted() {
+            assert_eq!(break_errs("label $x | break $x"), Vec::new());
+            assert_eq!(break_errs("label $x | 1, (break $x)"), Vec::new());
+        }
+
+        #[test]
+        fn label_name_is_a_separate_namespace_and_an_unbound_one_fails() {
+            // `label $y | break $x` -- `$x` is not scoped.
+            assert_eq!(
+                break_errs("label $y | break $x"),
+                alloc::vec![("x".into(), 0)]
+            );
+        }
+
+        #[test]
+        fn two_same_named_breaks_differ_only_by_scope_carry_distinct_occurrences() {
+            // `(label $x | break $x), (label $y | break $x)`: the second is
+            // the failing one, and its occurrence (1) is what `collect_break_sites`
+            // indexes on to cite the right source position.
+            assert_eq!(
+                break_errs("(label $x | break $x), (label $y | break $x)"),
+                alloc::vec![("x".into(), 1)]
+            );
+        }
+
+        #[test]
+        fn a_break_in_an_unreferenced_def_body_is_still_checked() {
+            // `def f: break $x; label $x | f` -- jq compiles `f`'s body at
+            // its own position, where no `label $x` is in scope, even though
+            // `f` is only ever called in scope of one.
+            assert_eq!(
+                break_errs("def f: break $x; label $x | f"),
+                alloc::vec![("x".into(), 0)]
+            );
+        }
+
+        #[test]
+        fn a_break_in_a_referenced_def_body_call_site_resolves() {
+            // `label $x | (def f: break $x; f)` -- `f`'s body is lexically
+            // inside the label at its definition, and the call at the label
+            // site resolves. Oracle: rc=0.
+            assert_eq!(break_errs("label $x | (def f: break $x; f)"), Vec::new());
+        }
+
+        #[test]
+        fn def_error_shadowing_does_not_suppress_the_label_check() {
+            // `def error: "S"; break $x` -- jq's label check fires regardless
+            // of a shadowing `def error:`, because the `break`'s own scope is
+            // established before the `error/0` substitution model sees it.
+            assert_eq!(
+                break_errs("def error: \"S\"; break $x"),
+                alloc::vec![("x".into(), 0)]
+            );
+        }
+
+        #[test]
+        fn def_error_shadowing_with_an_in_scope_label_accepts() {
+            assert_eq!(
+                break_errs("def error: \"S\"; label $x | break $x"),
+                Vec::new()
+            );
+        }
+
+        #[test]
+        fn break_is_filtered_from_the_function_only_view() {
+            // yq-facing view: `break $x` is not a function-call error.
+            let mut expr = parse("break $x").expect("filter must parse");
+            assert_eq!(resolve_func_calls_all(&mut expr), Vec::new());
         }
     }
 }
