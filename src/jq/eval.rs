@@ -23966,44 +23966,65 @@ pub(crate) fn yq_assign_rhs_document<S: EvalSemantics>(
     Ok(targets.rhs_document().cloned())
 }
 
-/// Can resolving `expr` as an assignment's path produce a *second* path, or
-/// anything observable on the way to the first?
+/// Can resolving `expr` as an assignment's path produce a *second* path?
 ///
 /// The streaming write ([`eval_assign_streaming`]) exists to stop the path
-/// generator when a write fails, which is only observable if there is a later
-/// path whose resolution does something -- fires a side effect, consumes an
-/// `input`, or raises. When there is provably one path and resolving it is
-/// inert, the eager route produces the identical outcome, and it does so
-/// without the second document the streaming route has to keep. So this
-/// answers "must we stream", conservatively: anything not on the whitelist
-/// below streams.
+/// generator when a write fails. [`resolve_dynamic_indexes`] *is*
+/// [`resolve_dynamic_indexes_sink`] under an always-`Continue` sink, so the
+/// eager and streaming routes differ in exactly two ways: whether a `Stop`
+/// answer is honoured, and whether writes are interleaved with resolution.
+/// With at most one path neither difference has anywhere to land -- there is
+/// no later path for a `Stop` to suppress and no "between" to interleave --
+/// so both routes resolve once (firing whatever that resolution fires),
+/// write once, and produce the identical outcome. The eager one does it with
+/// one document instead of two.
+///
+/// **The count is the criterion, not purity** (#2976). The predicate this
+/// replaced also demanded that reaching the single path be *inert*, which is
+/// stricter than the invariant above needs: a side effect, an `input` read or
+/// a raise on the way to the only path happens identically on both routes,
+/// because both reach it through the same resolver call. That extra
+/// condition charged the second document to `.[length - 1] = v`,
+/// `.[(.a | stderr)] = v` and `(. | debug)[0] = v` for nothing.
+///
+/// So this answers "must we stream", conservatively: anything not on the
+/// whitelist below streams.
 ///
 /// Getting the whitelist *wrong in the admitting direction* would leave
 /// #2267's divergence unfixed for that shape -- never a corruption, and never
 /// worse than the behaviour this issue started from -- which is why it is a
 /// whitelist rather than a denylist.
 fn assignment_path_needs_streaming(expr: &Expr) -> bool {
-    !resolves_to_one_inert_path(expr)
+    !resolves_to_at_most_one_path(expr)
 }
 
-/// Does `expr` resolve to at most one path, with nothing observable happening
-/// while it does? See [`assignment_path_needs_streaming`].
+/// Does `expr` resolve to at most one path? See
+/// [`assignment_path_needs_streaming`].
 ///
-/// `Expr::Optional`/`Expr::Iterate` are deliberately absent. A `?` yields zero
-/// or one path, which would be admissible on the count alone, but #2909's
-/// scope rules make "what its group can fan out to" a question this shape
-/// check should not be re-deciding; an iterate genuinely fans out. Both simply
-/// stream, which is correct and only costs the copy.
-fn resolves_to_one_inert_path(expr: &Expr) -> bool {
+/// Zero paths counts: with no path at all both routes write nothing and
+/// return the document unchanged (`fork_rhs_over_paths` over an empty
+/// `paths` slice pushes its untouched copy, exactly as the streaming loop
+/// returns a `result` no sink call ever reached).
+///
+/// `Expr::Optional`/`Expr::Iterate` are deliberately absent. A `?` yields
+/// zero or one path, which would be admissible on the count alone, but
+/// #2909's scope rules make "what its group can fan out to" a question this
+/// shape check should not be re-deciding; an iterate genuinely fans out.
+/// Both simply stream, which is correct and only costs the copy.
+fn resolves_to_at_most_one_path(expr: &Expr) -> bool {
     match expr {
         // A literal navigation component: exactly one path, no evaluation.
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. } => true,
-        Expr::Paren(inner) => resolves_to_one_inert_path(inner),
-        Expr::Pipe(stages) => stages.iter().all(resolves_to_one_inert_path),
+        Expr::Paren(inner) => resolves_to_at_most_one_path(inner),
+        Expr::Pipe(stages) => stages.iter().all(resolves_to_at_most_one_path),
+        // A path-transparent stage passes its one input path through as one
+        // output path, so `(. | stderr)[0]` and `(. | debug)[0:1]` are one
+        // path each -- the side effect fires on whichever route runs.
+        Expr::Builtin(builtin) => builtin_yields_at_most_one_value(builtin),
         // One target branch indexed by one key is one path. The key is a
         // *value* expression, so it gets the value-side whitelist.
         Expr::IndexExpr { target, key } => {
-            resolves_to_one_inert_path(target) && is_inert_single_value(key)
+            resolves_to_at_most_one_path(target) && yields_at_most_one_value(key)
         }
         Expr::SliceExpr { target, start, end } => {
             // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV
@@ -24012,37 +24033,185 @@ fn resolves_to_one_inert_path(expr: &Expr) -> bool {
             // `jq_seq_reader.rs`/`yq_runner.rs` already make.
             #[allow(clippy::unnecessary_map_or)]
             {
-                resolves_to_one_inert_path(target)
-                    && start.as_deref().map_or(true, is_inert_single_value)
-                    && end.as_deref().map_or(true, is_inert_single_value)
+                resolves_to_at_most_one_path(target)
+                    && start.as_deref().map_or(true, yields_at_most_one_value)
+                    && end.as_deref().map_or(true, yields_at_most_one_value)
             }
         }
         _ => false,
     }
 }
 
-/// Does evaluating `expr` yield exactly one value, with no side effect and no
-/// escape? The key/bound half of [`resolves_to_one_inert_path`].
+/// Does evaluating `expr` yield at most one value? The key/bound half of
+/// [`resolves_to_at_most_one_path`].
 ///
 /// Deliberately *not* [`is_owned_pure_expr`], despite the overlap: that
 /// predicate's job is the #2048 fast path's representation-neutrality (it
 /// admits `Not`/`Compare`/`type` because their results are freshly
 /// constructed, and excludes `Expr::Var` for reasons about what escapes into
-/// an owned tree). The question here is only "one value, nothing observable",
-/// so a bare `$x` belongs and a comparison's freshness is irrelevant. Reusing
-/// that one would mean two callers reading one predicate as two different
-/// rules, which is how this file's own duplicated predicates have drifted
-/// before.
-fn is_inert_single_value(expr: &Expr) -> bool {
+/// an owned tree). The question here is only "how many values", so a bare
+/// `$x` belongs and a comparison's freshness is irrelevant. Reusing that one
+/// would mean two callers reading one predicate as two different rules, which
+/// is how this file's own duplicated predicates have drifted before.
+///
+/// Every composite below recurses into *all* its sub-expressions, because
+/// every one of them fans out: `fanout_arg` takes the cartesian product of a
+/// builtin's argument outputs, `binary_fanout_each` does the same for both
+/// operands, and an `if` fans out over its condition (`.[if (true,false) then
+/// 0 else 1 end]` is two paths in jq 1.7.1, live-checked). One times one is
+/// one; that is the whole rule.
+///
+/// **Two shapes are refused despite being plausibly admissible**, because
+/// establishing their count means reasoning about something other than this
+/// expression's own sub-expressions:
+///
+/// - `Expr::Try`. `try f catch g` composes a `QueryResult::Partial` prefix
+///   with `g`'s outputs, so its count is one only while no admitted shape can
+///   emit a value and *then* raise. That is an invariant over the rest of
+///   this whitelist rather than over `try`'s own operands, and it is not one
+///   a shape check should be silently carrying.
+/// - `Expr::Reduce`. Its count follows `init` (`reduce (1,2) as $x ((0,10);
+///   . + $x)` is two outputs in jq 1.7.1, live-checked, while a fanning
+///   `update` still yields one), but its `?//` pattern alternatives are a
+///   second fan-out axis with its own retry rule. Neither shape appears in a
+///   key position in practice, so both stream.
+fn yields_at_most_one_value(expr: &Expr) -> bool {
     match expr {
+        // Leaves: no sub-expression to fan out.
         Expr::Literal(_)
         | Expr::Var(_)
         | Expr::TrackedVar(_)
         | Expr::Identity
         | Expr::Field(_)
-        | Expr::Index { .. } => true,
-        Expr::Paren(inner) => is_inert_single_value(inner),
-        Expr::Pipe(stages) => stages.iter().all(is_inert_single_value),
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Not
+        | Expr::Format(_) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) => yields_at_most_one_value(inner),
+        // `[f]` collects *every* output of `f` into one array, so it is one
+        // value however `f` fans out. Recursed anyway, to keep this whitelist
+        // to the single rule "one times one is one" -- the shapes that gives
+        // up (`getpath([(1,2)])`) are ones nobody writes, and a uniform rule
+        // is the one that stays correct as variants are added.
+        Expr::Array(inner) => yields_at_most_one_value(inner),
+        // `first(f)` truncates to one output whatever `f` produces, but
+        // recursing keeps this whitelist free of any shape that can emit a
+        // value and then raise -- see `Expr::Try` above, which relies on it.
+        Expr::FirstExpr(inner) => yields_at_most_one_value(inner),
+        Expr::Pipe(stages) => stages.iter().all(yields_at_most_one_value),
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => {
+            yields_at_most_one_value(left) && yields_at_most_one_value(right)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            yields_at_most_one_value(cond)
+                && yields_at_most_one_value(then_branch)
+                && yields_at_most_one_value(else_branch)
+        }
+        // `error`/`error(msg)` yields nothing at all; `msg` is still checked
+        // so this arm never admits a sub-expression the rest refuses.
+        #[allow(clippy::unnecessary_map_or)]
+        Expr::Error(msg) => msg.as_deref().map_or(true, yields_at_most_one_value),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => yields_at_most_one_value(inner),
+        }),
+        Expr::IndexExpr { target, key } => {
+            yields_at_most_one_value(target) && yields_at_most_one_value(key)
+        }
+        Expr::SliceExpr { target, start, end } => {
+            #[allow(clippy::unnecessary_map_or)]
+            {
+                yields_at_most_one_value(target)
+                    && start.as_deref().map_or(true, yields_at_most_one_value)
+                    && end.as_deref().map_or(true, yields_at_most_one_value)
+            }
+        }
+        Expr::Builtin(builtin) => builtin_yields_at_most_one_value(builtin),
+        _ => false,
+    }
+}
+
+/// The builtin half of [`yields_at_most_one_value`]: does this builtin map
+/// one input to at most one output?
+///
+/// Every entry was read off its arm in [`eval_builtin`] before it went on the
+/// list -- each one returns a `QueryResult::One`/`OneCursor`/`Owned`/`None`
+/// (or delegates to a helper that only ever constructs those), never a `Many`
+/// / `ManyOwned` / `Partial`. The argument-taking entries reach their helper
+/// through `fanout_arg`, which takes the cartesian product of the argument's
+/// outputs, so each one recurses into its argument.
+///
+/// Absent by construction: everything else, including the generator family
+/// (`range`, `recurse`, `paths`, `to_entries`'s streaming siblings, the regex
+/// `scan`/`splits`/`match` builtins, `limit`, `inputs`) and every builtin
+/// whose count depends on the *value* rather than the expression.
+fn builtin_yields_at_most_one_value(builtin: &Builtin) -> bool {
+    match builtin {
+        // Type predicates and the type-filter family: `Owned(Bool)`, or
+        // `One(value)`/`None` depending on the input's type. Both are <= 1.
+        Builtin::Type
+        | Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Values
+        | Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects
+        | Builtin::Iterables
+        | Builtin::Scalars => true,
+        // One scalar or container answer per input.
+        Builtin::Length
+        | Builtin::Keys
+        | Builtin::KeysUnsorted
+        | Builtin::Add
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::ToString
+        | Builtin::ToNumber
+        | Builtin::AsciiDowncase
+        | Builtin::AsciiUpcase => true,
+        // `empty` yields zero, which the gate admits -- see
+        // `resolves_to_at_most_one_path`'s doc comment on the zero-path case.
+        Builtin::Empty => true,
+        // Path-transparent: the input passes through unchanged, with a line
+        // written to stderr on the way (#2896 for `getpath`). The write fires
+        // on whichever route runs, which is why it no longer disqualifies.
+        Builtin::Stderr | Builtin::Debug => true,
+        // `debug(msg)` returns `Owned(input)` however many values `msg`
+        // produces, but `msg` is checked anyway, for `Expr::FirstExpr`'s
+        // reason: nothing admitted here may emit and then raise.
+        Builtin::DebugMsg(msg) => yields_at_most_one_value(msg),
+        // `input` reads exactly one document or raises.
+        Builtin::Input => true,
+        // Argument-taking, one answer per argument value.
+        Builtin::Has(arg)
+        | Builtin::In(arg)
+        | Builtin::Select(arg)
+        | Builtin::Contains(arg)
+        | Builtin::Inside(arg)
+        | Builtin::Startswith(arg)
+        | Builtin::Endswith(arg)
+        | Builtin::Ltrimstr(arg)
+        | Builtin::Rtrimstr(arg)
+        | Builtin::Split(arg)
+        | Builtin::Join(arg)
+        | Builtin::GetPath(arg) => yields_at_most_one_value(arg),
         _ => false,
     }
 }
@@ -62291,60 +62460,103 @@ mod tests {
         }
     }
 
-    /// #2267: the streaming write's shape gate, tested directly, because
-    /// both answers produce identical observable behaviour -- that is the
-    /// whole premise of the gate, and it is exactly why a behavioural test
-    /// cannot tell which route ran.
+    /// The shapes [`assignment_path_needs_streaming`] must admit to the
+    /// eager route, i.e. those that resolve to at most one path (#2267,
+    /// widened from "one *inert* path" by #2976).
     ///
-    /// The *admitting* direction is the one with a cost attached (an
-    /// admitted shape keeps the eager route and its single document), so
-    /// each row here is a shape that provably resolves to one path with
-    /// nothing observable on the way.
+    /// Tested directly, because both answers produce identical observable
+    /// behaviour -- that is the whole premise of the gate, and it is exactly
+    /// why a behavioural test cannot tell which route ran. What *is*
+    /// checkable behaviourally is the premise itself, and
+    /// `every_eager_assignment_path_really_resolves_to_at_most_one_path_2976`
+    /// below checks it: it runs the resolver these rows would take and counts
+    /// the paths that actually come out.
+    ///
+    /// The admitting direction is the one with a cost attached (an admitted
+    /// shape keeps the eager route and its single document).
     #[test]
-    fn assignment_paths_that_resolve_to_one_inert_path_skip_streaming_2267() {
-        let eager = [
-            // Literal navigation, including the computed-looking spellings
-            // that are really literal after the parser folds them.
-            ".a",
-            ".a.b.c",
-            ".[0]",
-            ".[0:1]",
-            "(.a)",
-            // A computed key or bound whose own evaluation is one inert
-            // value: a variable, a literal, a navigation, a pipe of those.
-            // `.[$k] = v` is the shape this gate exists to keep cheap.
-            ".[$k]",
-            r#".[("a")]"#,
-            ".[.k]",
-            ".[.a.b]",
-            ".[$k].b",
-            ".a[$k]",
-            ".[(.a | .b)]",
-            ".[0:($n)]",
-            ".[($m):($n)]",
-            ".[($m):]",
-            ".[:($n)]",
-        ];
-        for src in eager {
+    fn assignment_paths_that_resolve_to_at_most_one_path_skip_streaming_2267() {
+        for src in EAGER_ASSIGNMENT_PATHS_2976 {
             let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             assert!(
                 !assignment_path_needs_streaming(&expr),
-                "{src:?} resolves to one inert path, so it must keep the eager route: {expr:?}"
+                "{src:?} resolves to at most one path, so it must keep the eager route: {expr:?}"
             );
         }
     }
 
+    /// Every shape the gate admits to the eager route, and the reason each
+    /// one is there.
+    ///
+    /// #2976 moved five rows here out of the must-stream list: an observable
+    /// key, bound or target is *not* a reason to stream, because the
+    /// observation fires on whichever route runs. Only a second path is.
+    const EAGER_ASSIGNMENT_PATHS_2976: &[&str] = &[
+        // Literal navigation, including the computed-looking spellings
+        // that are really literal after the parser folds them.
+        ".a",
+        ".a.b.c",
+        ".[0]",
+        ".[0:1]",
+        "(.a)",
+        // A computed key or bound whose own evaluation is one value: a
+        // variable, a literal, a navigation, a pipe of those. `.[$k] = v` is
+        // the shape this gate exists to keep cheap.
+        ".[$k]",
+        r#".[("a")]"#,
+        ".[.k]",
+        ".[.a.b]",
+        ".[$k].b",
+        ".a[$k]",
+        ".[(.a | .b)]",
+        ".[0:($n)]",
+        ".[($m):($n)]",
+        ".[($m):]",
+        ".[:($n)]",
+        // #2976, moved from the must-stream list: one path each, reached by
+        // firing a side effect, consuming an `input`, or both -- in key,
+        // bound and target position.
+        ".[(.a|stderr)]",
+        ".[input]",
+        ".[0:(.a|debug)]",
+        "(.|stderr)[0]",
+        "(.|debug)[0:1]",
+        // #2976, newly eager: an arithmetic, comparison, conditional,
+        // alternative, interpolation or builtin key is still one key.
+        ".[length-1]",
+        ".[.n+1]",
+        ".[-(.n)]",
+        ".[(if .a then 0 else 1 end)]",
+        ".[first(.k)]",
+        r#".[($k|tostring)]"#,
+        ".[keys[0]]",
+        ".[(.a // 0)]",
+        r#".["\(.k)"]"#,
+        r#".[(.k|ltrimstr("x"))]"#,
+        ".[(.a|not)]",
+        ".[($k|select(. != null))]",
+        ".[(.a == .b)]",
+        r#".[getpath(["k"])]"#,
+        ".[empty]",
+        r#".[error("x")]"#,
+        r#".[(.a|debug("m"))]"#,
+        ".[0:(.n|length)]",
+    ];
+
     /// #2267: the refusing direction of the same gate -- every shape that
-    /// can produce a second path, or do something observable while
-    /// producing the first, must stream.
+    /// can produce a second path must stream.
     ///
     /// A mistake here is not symmetric with the test above: wrongly
     /// admitting a shape leaves this issue's divergence unfixed for it,
     /// which is why the whitelist is a whitelist. The first two rows are
     /// the issue's own repros A and B, so a regression that silently routed
     /// them eagerly would fail here as well as in `jq_cli_tests`.
+    ///
+    /// This list is also the harness's power check for #2976's widening: a
+    /// gate that admitted everything would pass the eager test above and
+    /// fail here.
     #[test]
-    fn assignment_paths_that_can_fan_out_or_be_observed_stream_2267() {
+    fn assignment_paths_that_can_fan_out_stream_2267() {
         let streamed = [
             // Repro A and repro B: a comma in bound and in key position.
             "(.|stderr)[(0,1):(2,3)]",
@@ -62356,27 +62568,87 @@ mod tests {
             "(.a,.b)[$k]",
             ".[$k][]",
             "(.[]|.a)[$k]",
-            // An observable key/bound: a side effect, an input read, a
-            // raise -- each changes what a stopped generator skips.
-            ".[(.a|stderr)]",
-            ".[input]",
             r#".[(1,error("x"))]"#,
-            ".[0:(.a|debug)]",
-            // An observable *target*, which is where the issue's own repros
-            // put it.
-            "(.|stderr)[0]",
-            "(.|debug)[0:1]",
+            // A fan-out *inside* an otherwise-admissible composite: the
+            // recursion has to reach it (#2976).
+            ".[((0,1)+1)]",
+            ".[(if (true,false) then 0 else 1 end)]",
+            r#".[("a"|select(true,true))]"#,
+            r#".["\((0,1))"]"#,
+            ".[(.a // (0,1))]",
+            r#".[getpath((["a"],["b"]))]"#,
+            // Generators that fan out however inert their arguments are.
+            ".[limit(1; .k)]",
+            ".[(.k|recurse)]",
+            ".[paths]",
+            // A call form: bodies are opaque here, and #2843's shadowing
+            // means even a known name is not a known body (#2976).
+            ".[f]",
             // Shapes deliberately left off the whitelist rather than
-            // reasoned about here (#2909's `?` scope rules, and an iterate).
+            // reasoned about here: #2909's `?` scope rules, an iterate, and
+            // #2976's two recorded refusals (`try`/`reduce`).
             ".a?[$k]",
             ".[][$k]",
+            r#".[try .k catch 0]"#,
+            ".[reduce .k as $x (0; .+$x)]",
+            ".[(.k as $x | $x)]",
         ];
         for src in streamed {
             let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             assert!(
                 assignment_path_needs_streaming(&expr),
-                "{src:?} can fan out or be observed, so it must stream: {expr:?}"
+                "{src:?} can fan out, so it must stream: {expr:?}"
             );
+        }
+    }
+
+    /// #2976: the gate's premise, checked against the resolver instead of
+    /// restated.
+    ///
+    /// [`assignment_path_needs_streaming`] is a *syntactic* claim about a
+    /// semantic property: "this expression cannot produce a second path".
+    /// The two tests above pin what the syntax check answers; this one pins
+    /// that the answer is true, by running
+    /// [`resolve_dynamic_indexes`] -- the same call both the eager and the
+    /// streaming route make -- over a battery of documents and counting.
+    ///
+    /// An `Err` is not a failure: a resolution escape discards everything on
+    /// both routes (`eval_assign`'s `Err((_, escape))` arm and
+    /// `eval_assign_streaming`'s `if let Err(escape)`), so the two remain
+    /// indistinguishable however many paths were produced before it.
+    #[test]
+    fn every_eager_assignment_path_really_resolves_to_at_most_one_path_2976() {
+        let documents = [
+            "null",
+            "true",
+            "0",
+            "2",
+            r#""ab""#,
+            "[]",
+            "[1,2,3]",
+            r#"["a","b"]"#,
+            "{}",
+            r#"{"k":1}"#,
+            r#"{"a":0,"b":1,"k":"a","n":1}"#,
+            r#"{"a":null,"b":null,"k":null,"n":0}"#,
+            r#"{"a":[1,2],"b":{"c":3},"k":0,"n":2}"#,
+        ];
+        for src in EAGER_ASSIGNMENT_PATHS_2976 {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for doc in documents {
+                let bytes = doc.as_bytes();
+                let index = JsonIndex::build(bytes);
+                let root = index.root(bytes);
+                let input = to_owned(&root.value())
+                    .unwrap_or_else(|e| panic!("to_owned {doc}: {e:?}"));
+                if let Ok(paths) = resolve_dynamic_indexes::<JqSemantics>(&expr, &input, false) {
+                    assert!(
+                        paths.len() <= 1,
+                        "{src:?} is on the eager list but resolved to {} paths on {doc}: {paths:?}",
+                        paths.len()
+                    );
+                }
+            }
         }
     }
 
