@@ -490,6 +490,12 @@ struct Parser<'a> {
     /// never `Expr::Var`, so they can never be the subject of an unbound-
     /// variable diagnostic in the first place.
     var_sites: Vec<VarSite>,
+    /// [`Self::var_sites`]'s sibling for `break $name` label-break sites
+    /// (#2964): every `Expr::Break` the parse has built, with the byte
+    /// offset of its `break` keyword. Same shape, same side-table
+    /// rationale: the position is only wanted on the compile-error path,
+    /// and keeping it out of the AST leaves the break nodes untouched.
+    break_sites: Vec<BreakSite>,
     /// #2036 Direction 3: every identifier that appears anywhere after a
     /// `def` keyword in `input`, computed once by [`collect_def_names`] at
     /// construction. A cheap, deliberately *imprecise* over-approximation
@@ -708,6 +714,50 @@ pub fn collect_var_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> 
     sites
 }
 
+/// A `break $name` site in a parsed filter, with the byte offset of its
+/// `break` keyword (#2964).
+///
+/// Consumed only by the CLI's unbound-label diagnostic, which needs to point
+/// at the genuinely failing `break` — a bare text search for `break ${name}`
+/// can land inside a string literal, or on an earlier, genuinely *bound*
+/// break under an enclosing `label $name`, neither of which is the failing
+/// one (#2635's sibling limitation, see [`VarSite`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakSite {
+    /// The broken label's name, without the `$` sigil (matching `Expr::Break`'s
+    /// own storage).
+    pub name: String,
+    /// Byte offset of the `break` keyword in the parsed source.
+    pub offset: usize,
+}
+
+/// Every `break $name` site in `input`, in source order (#2964).
+///
+/// [`collect_var_sites`]'s sibling, same reasoning: a second parse, purely to
+/// recover a position the AST does not carry, only ever run once on the
+/// compile-error path immediately before the process aborts.
+///
+/// Like `var_sites`, this is a table of *all* `break` sites, bound or not,
+/// with no scope information. The occurrence index
+/// (`jq::UnresolvedLabel::occurrence`) is what fingers the failing one when
+/// two same-named breaks differ only by lexical scope — "this break is under
+/// an enclosing `label $x`, that one is not" cannot be told apart by offset
+/// alone. Reachability limits that pairing, exactly as it does for
+/// `collect_var_sites`: `resolve.rs` skips the bodies of *unreferenced* `def`s
+/// (#2740), so if a same-named `break` sits inside an unreferenced `def` body
+/// textually before the failing one, the counter counts only the visited
+/// breaks and the index drifts one short (the #2635-class limitation, on top
+/// of the scope one). Everything else — string-literal decoys, bound breaks
+/// earlier in source — is handled by construction.
+pub fn collect_break_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<BreakSite> {
+    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
+    let _ = parser.parse_program();
+    let mut sites = core::mem::take(&mut parser.break_sites);
+    sites.sort_by_key(|b| b.offset);
+    sites.dedup_by_key(|b| b.offset);
+    sites
+}
+
 /// See [`Parser::shadow_retry_budget`].
 const SHADOW_RETRY_BUDGET: usize = 64;
 
@@ -770,6 +820,7 @@ impl<'a> Parser<'a> {
             expr_depth: 0,
             call_sites: Vec::new(),
             var_sites: Vec::new(),
+            break_sites: Vec::new(),
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
@@ -3384,6 +3435,7 @@ impl<'a> Parser<'a> {
     /// ...) has to recognize for no observable benefit outside that one
     /// `def error: .;` construction.
     fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
+        let keyword_offset = self.pos;
         self.consume_keyword("break");
         self.skip_ws();
 
@@ -3393,6 +3445,18 @@ impl<'a> Parser<'a> {
         }
         self.next();
         let name = self.parse_ident()?;
+
+        // #2964: record the site unconditionally -- before the
+        // `wrap_shadowable_call` wrapper below decides whether this `break`
+        // stays a bare `Expr::Break` or becomes `error(Expr::Break)` under a
+        // shadowing `def error:`. The compile-time label-scope check runs in
+        // `resolve::check` on *both* shapes (the bare leaf arm and, when the
+        // wrapper's `FuncCall` resolves, a pre-check), so the position table
+        // must hold every textual `break`, whatever its final form.
+        self.break_sites.push(BreakSite {
+            name: name.clone(),
+            offset: keyword_offset,
+        });
 
         let node = Expr::Break(name);
         if self.shadowable_defs.contains("error") {

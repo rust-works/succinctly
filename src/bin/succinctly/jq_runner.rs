@@ -2406,6 +2406,14 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // #2734: the same, for `$name` variable references -- see
     // `jq::collect_var_sites`.
     let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
+    // #2964: the same, for `break $name` sites -- see
+    // `jq::collect_break_sites`. Unlike calls/variables, which the resolver
+    // revisits through the same "how many of each name seen so far" logic
+    // this table's `nth` indexes with, a break's *occurrence* is carried in
+    // the diagnostic itself (`UnresolvedLabel.occurrence`) -- the resolver
+    // counts each same-named break it visits, and that count is the table
+    // index, so no separate consuming cursor is needed here.
+    let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
     // How many variables of each name we have already reported, so a
     // repeated undefined `$name` walks its own successive sites in source
     // order -- the same rule `call_resume_from` gives the calls' fallback.
@@ -2540,6 +2548,33 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // the identical shape for calls; this one is #3107.
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
                 report_unbound_var(name, "<top-level>", filter, &var_sites, taken);
+            }
+            jq::ResolveError::Break(jq::UnresolvedLabel { name, occurrence }) => {
+                // #2964: prefer the real `break $name` keyword position from
+                // `break_sites` -- the resolver walked the *reachable* tree,
+                // so `occurrence` counts same-named breaks the walk actually
+                // visited. That index aligns with `break_sites`' source order
+                // because both start at the top-level parse and neither
+                // re-sorts (a break earlier in the table is always visited
+                // first) -- except for one recorded, #2635-class residual:
+                // a same-named break inside an *unreferenced* `def` body
+                // occupies the earlier table slot but is never visited, so
+                // the caret cites the wrong occurrence (see the
+                // `UnresolvedLabel` doc comment).
+                let from_table = break_sites
+                    .iter()
+                    .filter(|b| b.name == *name)
+                    .nth(*occurrence)
+                    .map(|b| b.offset);
+                if let Some(offset) = from_table {
+                    let (line_no, line_text, column) = line_at_offset(filter, offset);
+                    eprintln!(
+                        "jq: error: $*label-{name} is not defined at <top-level>, line {line_no}:"
+                    );
+                    eprintln!("{line_text}{}", " ".repeat(column));
+                } else {
+                    eprintln!("jq: error: $*label-{name} is not defined at <top-level>");
+                }
             }
         }
     }

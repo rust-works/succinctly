@@ -8293,49 +8293,72 @@ fn test_uncaught_error_locations_across_input_modes() -> Result<()> {
     Ok(())
 }
 
+/// #400/#494 for the `break` terminator used to need a runtime diagnostic
+/// ("break $out not in label", exit 5) to reach: an unlabelled `break` was
+/// accepted at *compile* time and only reported once evaluated. #2964 removed
+/// that divergence -- the unlabelled forms below are now compile errors,
+/// byte-for-byte against the pinned oracle ("$*label-out is not defined",
+/// exit 3), the same destination jq takes for the error terminator
+/// (`*_error_after_output` golden cases). The prefix-preservation property
+/// those tests cared about still holds for the labelled (caught) forms, which
+/// jq does accept -- pinned byte-for-byte at the bottom via `label $out`.
 #[test]
 fn test_uncaught_break_after_output_keeps_the_prefix() -> Result<()> {
-    // #400/#494 for the `break` terminator: the outputs a stream produced
-    // before an uncaught `break` still reach stdout, and the break still
-    // drives the diagnostic and the exit code.
-    //
-    // The error terminator is pinned against real jq in
-    // `tests/data/jq-golden/cases/*_error_after_output`. `break` cannot be:
-    // jq rejects an unlabelled `break $out` at *compile* time ("$*label-out
-    // is not defined", exit 3), so there is no oracle for the shape that
-    // reaches this arm. These pin succinctly's own accept-and-report
-    // behavior; the labelled (caught) forms, which jq does accept, are
-    // covered by the `and_break_after_output`, `or_break_after_output` and
-    // `label_break_after_comma` golden cases.
-
     // `run_jq_full` spawns the built binary rather than shelling out to
     // `cargo run`, which would build (and measure) a second, separate
     // binary — under `cargo llvm-cov` only the former is instrumented.
 
     // Lazy raw-bytes path (the default for JSON on stdin).
     let (stdout, stderr, code) = run_jq_full(&["1,2,break $out"], Some("null"))?;
-    assert_eq!(stdout, "1\n2\n");
-    assert!(
-        stderr.contains("break $out not in label"),
-        "expected the break diagnostic, got: {stderr}"
+    assert_eq!(stdout, "");
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         1,2,break $out    \n\
+         jq: 1 compile error\n"
     );
-    assert_eq!(code, 5);
 
     // A prefix built one pipe element at a time, rather than by a comma.
     let (stdout, stderr, code) = run_jq_full(
         &[".[] | if . == 3 then break $out else . end"],
         Some("[1,2,3,4]"),
     )?;
-    assert_eq!(stdout, "1\n2\n");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
-    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         .[] | if . == 3 then break $out else . end                     \n\
+         jq: 1 compile error\n"
+    );
 
     // `--null-input` takes the serde-parsed path instead, which has its own
     // copy of the result conversion.
     let (stdout, stderr, code) = run_jq_full(&["-n", "1,2,break $out"], None)?;
-    assert_eq!(stdout, "1\n2\n");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
-    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         1,2,break $out    \n\
+         jq: 1 compile error\n"
+    );
+
+    // The prefix does still survive a break when a `label $out` encloses it
+    // and catches it -- real jq accepts this shape, byte-for-byte.
+    for (filter, want) in [
+        ("label $out | 1,2,break $out", "1\n2\n"),
+        (
+            ".[] | if . == 3 then (label $out | break $out) else . end",
+            "1\n2\n4\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&[filter], Some("[1,2,3,4]"))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout, want, "`{filter}`");
+        assert_eq!(stderr, "");
+    }
     Ok(())
 }
 
@@ -12906,9 +12929,13 @@ fn test_array_keys_unsorted_sort_keys_path_684() -> Result<()> {
 /// (`generic_result_to_jq_values` in `jq_runner.rs`) has its own
 /// `GenericResult::LazySeq` arm, reached only when the whole parsed query is
 /// itself `map(f)`/`keys_unsorted | map(f)` -- with no further pipe stage to
-/// resolve it into a narrower shape first (#725). Exercise all three
-/// outcomes (success, error, break) directly against the real binary rather
-/// than relying on incidental coverage from another test's query shape.
+/// resolve it into a narrower shape first (#725). Exercise the success and
+/// error outcomes directly against the real binary rather than relying on
+/// incidental coverage from another test's query shape. The `break` outcome
+/// is gone: #2964 rejects the unlabelled `map(break $out)` that used to reach
+/// it at *compile* time, matching jq's `$*label-out is not defined`, so no
+/// such query reaches this arm any more (the third sub-case below pins the
+/// rejection byte-for-byte).
 #[test]
 fn test_top_level_map_lazy_seq_materializes_at_cli_boundary_725() -> Result<()> {
     let (output, _, code) = run_jq_full(&["-c", "map(. + 1)"], Some("[1,2,3]"))?;
@@ -12921,10 +12948,14 @@ fn test_top_level_map_lazy_seq_materializes_at_cli_boundary_725() -> Result<()> 
     assert!(stderr.contains("cannot be added"), "{stderr}");
 
     let (output, stderr, code) = run_jq_full(&["-c", "map(break $out)"], Some("[1,2,3]"))?;
-    assert_eq!(code, 5);
+    assert_eq!(code, 3, "stderr: {stderr:?}");
     assert_eq!(output, "");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
-
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         map(break $out)    \n\
+         jq: 1 compile error\n"
+    );
     Ok(())
 }
 
@@ -12933,7 +12964,9 @@ fn test_top_level_map_lazy_seq_materializes_at_cli_boundary_725() -> Result<()> 
 /// `query_result_to_owned_values`) instead -- forced by `--sort-keys`,
 /// mirroring `test_array_keys_unsorted_sort_keys_path_684` above. This is a
 /// distinct match arm from the lazy-bytes path's, not just a different flag
-/// combination reaching the same code.
+/// combination reaching the same code. As in the lazy-path test, the `break`
+/// outcome is gone: #2964 makes the unlabelled `map(break $out)` that used
+/// to reach it a compile error (pinned byte-for-byte below).
 #[test]
 fn test_top_level_map_lazy_seq_sort_keys_path_725() -> Result<()> {
     let (output, _, code) = run_jq_full(&["--sort-keys", "-c", "map(. + 1)"], Some("[1,2,3]"))?;
@@ -12948,10 +12981,14 @@ fn test_top_level_map_lazy_seq_sort_keys_path_725() -> Result<()> {
 
     let (output, stderr, code) =
         run_jq_full(&["--sort-keys", "-c", "map(break $out)"], Some("[1,2,3]"))?;
-    assert_eq!(code, 5);
+    assert_eq!(code, 3, "stderr: {stderr:?}");
     assert_eq!(output, "");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
-
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         map(break $out)    \n\
+         jq: 1 compile error\n"
+    );
     Ok(())
 }
 
@@ -15898,28 +15935,26 @@ fn test_reduce_propagates_halt_from_init_expression() -> Result<()> {
     Ok(())
 }
 
+/// `parent` is a succinctly extension (no real-jq equivalent), so this is
+/// checked against succinctly's own established compile-error wording. After
+/// #2964 the unlabelled `break $out` inside `parent(n)` is rejected at
+/// *compile* time (exit 3, `$*label-out is not defined`) just as it would be
+/// in jq for any other shape. The *labelled* (caught) sibling form is pinned
+/// in `test_break_via_parentn_argument_reaches_outer_label_833` below.
 #[test]
 fn test_parentn_n_expr_genuinely_uncaught_break_still_errors() -> Result<()> {
-    // No `label $out` anywhere in this filter, so `break $out` raised while
-    // evaluating `parent(n)`'s `n` argument (via `ParentN`'s call to
-    // `eval_owned_expr`) has nowhere to land regardless of #833's fix to
-    // that function -- `eval_owned_expr` now propagates a real
-    // `EvalEscape::Break` instead of collapsing it at this arm, but with no
-    // enclosing label to catch it, it still surfaces as the ordinary
-    // "break $label not in label" top-level diagnostic once fully unwound,
-    // the same as any other genuinely-uncaught break in this file. `parent`
-    // is a succinctly extension (no real-jq equivalent), so this is checked
-    // against succinctly's own established "break $out not in label" wording
-    // (see `test_uncaught_break_after_output_keeps_the_prefix`), not jq. See
-    // `test_break_via_parentn_argument_reaches_outer_label_833` below for
-    // the case where a `label $out` genuinely encloses the call.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", ".a.b | parent(break $out)"],
         Some(r#"{"a":{"b":1}}"#),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(stderr.contains("break $out not in label"), "{stderr}");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-out is not defined at <top-level>, line 1:\n\
+         .a.b | parent(break $out)              \n\
+         jq: 1 compile error\n"
+    );
     Ok(())
 }
 
@@ -46652,6 +46687,85 @@ fn test_call_and_variable_errors_interleave_in_source_order_2734() -> Result<()>
          jq: error: $baz is not defined at <top-level>, line 1:\n\
          $bar, foo, $baz           \n\
          jq: 3 compile errors\n"
+    );
+    Ok(())
+}
+
+// =============================================================================
+// #2964: a `break $name` outside any lexically enclosing `label $name` is a
+// compile error (exit 3), with the same timing and position reporting as an
+// unresolved function call or unbound `$variable` (#1473/#2037/#2085/#2734).
+// Every expectation below was captured live against the pinned oracle
+// (`/usr/bin/jq` 1.7.1). yq mode is untouched by this check -- real yq has no
+// compile-time label check at all, resolving `break` by runtime label scope
+// like succinctly's evaluator does, and `resolve::resolve_func_calls_all`
+// filters `ResolveError::Break` out of the function-only view `yq` consumes.
+// =============================================================================
+
+/// The issue's own minimal repro: a bare `break $x` outside any label.
+/// Byte-for-byte against the pinned oracle, including the caret-echo padding.
+#[test]
+fn test_bare_break_outside_label_is_a_compile_error_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "break $x"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+         break $x\n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// The corrected repro from the issue: `def f: break $x; label $x | f`.
+/// jq compiles `f`'s body at its *own* position, where no `label $x` is in
+/// scope yet, even though the only call to `f` is lexically inside one --
+/// so this fails. Byte-for-byte against the pinned oracle.
+#[test]
+fn test_break_in_unreferenced_def_body_is_still_label_checked_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "def f: break $x; label $x | f"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+         def f: break $x; label $x | f       \n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// A `break $name` *inside* an enclosing `label $name` is fine, and the
+/// label's name is its own namespace, separate from `$variables` (the
+/// `#2734` test above shows the same for `$out` used as a variable).
+#[test]
+fn test_label_scoped_break_compiles_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "label $x | break $x"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// Two same-named breaks differing only by lexical scope: the resolver must
+/// cite the *failing* one (occurrence 1, inside `label $y`), not the first
+/// same-named `break $x` in source (occurrence 0, inside `label $x`, which
+/// is lexically bound). Byte-for-byte against the pinned oracle, including
+/// the caret-echo padding pointing at the second `break`.
+#[test]
+fn test_break_sibling_scope_caret_points_at_failing_break_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "(label $x | break $x), (label $y | break $x)"],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+         (label $x | break $x), (label $y | break $x)                                   \n\
+         jq: 1 compile error\n"
     );
     Ok(())
 }
