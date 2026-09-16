@@ -173,22 +173,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A called `def` inside a builtin's argument is a compile error**
-  (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then failed at runtime,
-  exit 5, where jq refuses to compile it, exit 3 with no output -- and on
-  `null` input it reported `Cannot iterate over null` instead, a different
-  error entirely, because the builtin now ran before the check that should
-  have stopped it. Affected every builtin whose argument is rebuilt during
-  resolution (`map`, `select`, `with_entries`, `any(f)`, `all(f)`, ...).
+- **A called `def` inside a builtin's argument, or a destructuring key, is a
+  compile error** (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then
+  failed at runtime, exit 5, where jq refuses to compile it, exit 3 with no
+  output -- and on `null` input it reported `Cannot iterate over null`, a
+  different error entirely, because the builtin ran before the check that
+  should have stopped it. The same held when the builtin's name was also
+  user-defined (`def select: 1; [1]|map(select(def g: nosuchfn; g))`) and for a
+  def written in a destructuring pattern's computed key
+  (`. as {(def g: nosuchfn; g): $x} | $x`).
 
-  #2740's reachability pass, which rightly skips a `def` nobody calls, keys
-  each def by its body's heap address. Resolution clones a builtin's operand
-  before walking it, and the clone moved every body inside to an address the
-  pass had never seen -- so called and uncalled defs alike were skipped. The
-  key is now carried across the clone rather than the check being loosened:
-  an *uncalled* def with a bad body still compiles, exactly as in jq, which a
-  simpler fix would have broken. Verified against jq 1.7.1 over 3,744
-  generated programs: 612 divergences fixed, none introduced.
+  #2740's reachability pass, which rightly skips a `def` nobody calls, keys each
+  def by its body's heap address. Resolution clones subtrees in three places,
+  and each clone moved the bodies inside to addresses the pass had never seen.
+  The key is now carried across every clone rather than the check being
+  loosened, so an *uncalled* def with a bad body still compiles, exactly as in
+  jq. The pass also now reads pattern keys, which it previously never did.
+
+  Carrying the key has to be done strictly: the enclosing set still names
+  addresses already freed, and the allocator reuses them. An intermediate
+  version consulted it and rejected valid programs whose uncalled def happened
+  to land on a freed address. Verified against jq 1.7.1 over 7,000+ generated
+  programs in debug and release builds, including sequences built to provoke
+  that reuse: no regressions and no false compile errors; of the 360 programs
+  jq rejects with `is not defined`, 348 previously compiled and none now do.
 
 - **`--seq -s` error locations follow where jq's parser last failed** (#2947).
   Whether a runtime error can name a file and line, or must answer
