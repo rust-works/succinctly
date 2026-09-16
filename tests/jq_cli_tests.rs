@@ -33113,6 +33113,129 @@ fn test_jq_namespaced_call_inside_builtin_arg_via_include_1505() -> Result<()> {
     Ok(())
 }
 
+/// Writes `def kf: "a";` into a fresh module directory. Used by the #2957
+/// tests below -- a namespaced call reachable only from a pattern's
+/// computed destructuring key (`{(m::f): $v}`, #2677's `ObjectKey::Expr`).
+fn namespaced_pattern_key_module_dir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("k.jq"), "def kf: \"a\";")?;
+    Ok(dir)
+}
+
+/// #2957: `rewrite_namespaced_calls` (`src/bin/succinctly/jq_runner.rs`) did
+/// not descend into `Expr::Reduce`/`Expr::Foreach`/`Expr::AsPattern`'s
+/// `Vec<Pattern>`, so a namespaced call reachable only from a computed
+/// destructuring key reached evaluation as a raw `Expr::NamespacedCall`
+/// instead of being rewritten to a `FuncCall`, and failed with "module not
+/// loaded" even though the same call resolves fine elsewhere in the same
+/// program. `map_pattern_subexprs` (`jq::walk`) -- the same helper #2865's
+/// `called_func_names` already uses for this exact blind spot -- closes it.
+/// Every expectation below is pinned jq 1.7.1's own output.
+#[test]
+fn test_jq_namespaced_call_in_as_pattern_destructuring_key_2957() -> Result<()> {
+    let dir = namespaced_pattern_key_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "-L",
+            &lib,
+            r#"import "k" as k; . as {(k::kf): $v} | $v"#,
+        ],
+        Some(r#"{"a":1}"#),
+    )
+    .expect("as-pattern computed-key namespaced call repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_jq_namespaced_call_in_reduce_pattern_destructuring_key_2957() -> Result<()> {
+    let dir = namespaced_pattern_key_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "-L",
+            &lib,
+            r#"import "k" as k; reduce ({"a":1}) as {(k::kf): $v} (0; $v)"#,
+        ],
+        None,
+    )
+    .expect("reduce-pattern computed-key namespaced call repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_jq_namespaced_call_in_foreach_pattern_destructuring_key_2957() -> Result<()> {
+    let dir = namespaced_pattern_key_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "-L",
+            &lib,
+            r#"import "k" as k; foreach ({"a":1}) as {(k::kf): $v} (0; $v)"#,
+        ],
+        None,
+    )
+    .expect("foreach-pattern computed-key namespaced call repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+/// The `?//` spelling: the same `Vec<Pattern>` blind spot, on
+/// `Expr::AsPattern`'s alternatives rather than its single pattern.
+#[test]
+fn test_jq_namespaced_call_in_alternative_pattern_destructuring_key_2957() -> Result<()> {
+    let dir = namespaced_pattern_key_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "-L",
+            &lib,
+            r#"import "k" as k; {"a":1} as {(k::kf): $v} ?// {other: $v} | $v"#,
+        ],
+        None,
+    )
+    .expect("?// pattern computed-key namespaced call repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+/// Negative control: a namespaced call in a destructuring key still raises
+/// jq's own "not defined" compile error when the namespace really isn't
+/// imported -- the fix must not turn every computed key into a silent
+/// pass-through, only rewrite the ones `rewrite_namespaced_calls` already
+/// rewrites elsewhere.
+#[test]
+fn test_jq_namespaced_call_in_pattern_key_still_errors_when_unimported_2957() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"{"a":1} | . as {(k::kf): $v} | $v"#], None)
+            .expect("unimported namespaced call in pattern key repro runs");
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("k::kf/0 is not defined"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// The other direction #1309 fixed: the substring scan also *over*-reported,
 /// forcing a filter that merely spells "input" in a field name or a string
 /// literal off the fast path. Output must be identical either way -- these
