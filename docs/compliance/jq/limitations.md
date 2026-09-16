@@ -1048,17 +1048,37 @@ is the revert that established what the other one costs.
    closed by [#2676](https://github.com/rust-works/succinctly/issues/2676) — see the fold
    paragraph below.
 
-2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
-   `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
-   refuses. [#1365](https://github.com/rust-works/succinctly/issues/1365) (`?//`-alternatives
-   support for `reduce`/`foreach`'s own `as` clause) landed after `resolve_reduce`/
-   `resolve_foreach` were designed, adding a retry-with-rollback matrix
-   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`) neither function threads
-   path-tracking through. `resolve_node`'s dispatch arm admits a single pattern alternative
-   only (`patterns.len() == 1`) — a bare `$var` in any mode, or, since
-   [#2676](https://github.com/rust-works/succinctly/issues/2676), a destructuring
-   `Pattern::Object`/`Pattern::Array` in jq mode — and falls to `resolve_leaf`'s catch-all for
-   a `?//` chain of any pattern shape.
+2. **`?//`-alternatives folds are path-tracked** since
+   [#2979](https://github.com/rust-works/succinctly/issues/2979), with jq's backtracking
+   rules: a pattern-walk refusal on a non-last alternative retries the next one with the
+   accumulator untouched; an UPDATE escape retries with the accumulator at UPDATE's last
+   output before it (`null` when there was none); for `foreach`, an escape after the state
+   was stored (EXTRACT, or `path()`'s own terminal refusal) retries from that stored state
+   with what was already emitted kept; the last alternative's escape propagates, and `halt`
+   never retries. `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]`, as
+   in jq, and `del(foreach .a as {b:$v} ?// [$v] (.; .; $v))` on `{"a":[1]}` writes
+   `{"a":[]}`. Before #2979 a chain fell to the by-value catch-all, which refuses only on an
+   output it emits, so `path(foreach .a as {a:$v} ?// $v (.c; .; empty))` exited 0 where jq
+   refuses partway through the construct, and `del`/`=`/`\|=` wrote through it.
+
+   Two refusals remain where jq might answer, both deliberate: the resolver's *own* refusals
+   never retry (a nested pipe carries no register, so `$q[0]` inside an `if` refuses here
+   where jq navigates, and retrying on that artefact would bind a different alternative than
+   jq and write through it), and a walk refusal retries only when it is jq's own verdict.
+   For a source element that is not register-derived, the walk compares the element with
+   the register by value where jq compares nodes; when the two are equal and not
+   `null`/boolean, or the register is lost, the refusal is a guess and propagates instead:
+   `path(foreach .a as {a:$v} ?// $v (.c; .; $v))` on `{"a":2,"c":2}` refuses on both, jq at
+   the pattern step and succinctly without retrying `$v`.
+
+   A `?//` chain of a plain `as` bind on an *untracked* stage no longer falls to the
+   by-value catch-all either: `path(5 \| . as {a:$v} ?// $v \| .b?)` refuses on both (it
+   exited 0 here before). Its first pattern step's refusal propagates instead of retrying,
+   since the register is out of that arm's sight and neither "refuse" nor "retry" can be
+   decided soundly -- so a chain jq answers through the bare alternative with zero outputs,
+   `path(5 \| 5 as {a:$v} ?// $v \| empty)`, refuses here (refuse-only). A single
+   destructuring pattern after a `null` stage is
+   [#3043](https://github.com/rust-works/succinctly/issues/3043).
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an
@@ -1126,8 +1146,7 @@ walk still runs there, purely to reproduce jq's own refusal for the pattern's ow
   of `[1,2,3]` in jq, and `walk_pattern` reproduces that exactly (verbatim wording, not just the
   verdict), since it's the same function #2649 already uses.
 
-`?//`-alternatives stay on the refuse-only path regardless of pattern shape (item 2 above) —
-`patterns.len() > 1` never reaches the walk.
+`?//`-alternatives reach the same walk per alternative since #2979 (item 2 above).
 
 **One further gap is not refuse-only, and is not new here** —
 [#2860](https://github.com/rust-works/succinctly/issues/2860): `foreach`'s own EXTRACT
