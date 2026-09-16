@@ -173,7 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A called `def` inside a builtin's argument is a compile error again**
+- **A called `def` inside a builtin's argument is a compile error**
   (#2971). `[1]|map(def g: nosuchfn; g)` compiled and then failed at runtime,
   exit 5, where jq refuses to compile it, exit 3 with no output -- and on
   `null` input it reported `Cannot iterate over null` instead, a different
