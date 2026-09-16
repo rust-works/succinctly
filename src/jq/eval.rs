@@ -95013,10 +95013,13 @@ mod tests {
         );
         let jq: QueryResult<'_, Vec<u64>> =
             root_path_context_placeholder::<Vec<u64>, JqSemantics>(no_parent_placeholder());
-        match jq {
-            QueryResult::Owned(OwnedValue::Object(map)) => assert!(map.is_empty()),
-            other => panic!("jq mode should hand back the empty object, got {other:?}"),
-        }
+        // `matches!` rather than a `match` with a `panic!` arm: that arm is
+        // unreachable in a passing suite, and a 0-hit line in a diff is worth
+        // avoiding when the assertion reads just as well without one.
+        assert!(
+            matches!(&jq, QueryResult::Owned(OwnedValue::Object(map)) if map.is_empty()),
+            "jq mode should hand back the empty object, got {jq:?}"
+        );
         let yq: QueryResult<'_, Vec<u64>> =
             root_path_context_placeholder::<Vec<u64>, YqSemantics>(no_parent_placeholder());
         assert!(
