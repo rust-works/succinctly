@@ -19,21 +19,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materialized copy, on every route that materializes — `=`, `|=`, `del()`,
   `sort_by`, `to_entries`, `map`, and `succinctly yq`'s DOM path alike.
 
+  `jq::lazy::JqValue` — the representation `succinctly jq` prints through — is
+  boxed the same way and by the same `ObjectMapOf<V>`, and that is not
+  incidental. `JqValue::try_from_owned` converts an `OwnedValue` tree into a
+  `JqValue` tree object by object, freeing each source map and immediately
+  allocating the target one. While both enums were 72 bytes those two chunk
+  sizes were identical and the allocator recycled every freed chunk. Boxing only
+  `OwnedValue` broke that: on a 10 MB wide object, `to_entries` held 15% *less*
+  live heap at peak and 23% *more* RSS, because nothing it freed fit anything it
+  then asked for. Both arms move together now. `size_of::<JqValue>()` is 40, not
+  32 — `Cursor(JsonCursor)` is 32 bytes on its own and has no niche left for the
+  discriminant — so an 8-byte residual remains, pinned and derived in
+  `jq_value_width_tracks_owned_value_3000`.
+
   **Breaking** for anything that pattern-matches the variant: `OwnedValue::Object`
-  now carries a `succinctly::jq::ObjectMap`, not an `IndexMap<String,
-  OwnedValue>`. `ObjectMap` is deliberately transparent — it `Deref`s to the
-  `IndexMap`, iterates in all three forms, and converts both ways with `From` —
-  so a read-side `OwnedValue::Object(map) => map.get(k)` needs no change and only
-  construction needs `.into()` (or `OwnedValue::object_from(pairs)`, which
-  already existed). `as_object`/`as_object_mut` keep their exact signatures and
-  still hand out a bare `&IndexMap`/`&mut IndexMap`.
+  now carries a `succinctly::jq::ObjectMap` (an alias for
+  `ObjectMapOf<OwnedValue>`), not an `IndexMap<String, OwnedValue>`. `ObjectMapOf`
+  is deliberately transparent — it `Deref`s to the `IndexMap`, iterates in all
+  three forms, and converts both ways with `From` — so a read-side
+  `OwnedValue::Object(map) => map.get(k)` needs no change and only construction
+  needs `.into()` (or `OwnedValue::object_from(pairs)`, which already existed).
+  `as_object`/`as_object_mut` keep their exact signatures and still hand out a
+  bare `&IndexMap`/`&mut IndexMap`.
 
-  Three internal exact-size pins moved as a consequence, each re-derived from
-  what it guards rather than bumped: `EvalError` 96 → 56, `GenericResult` 120 →
-  80, `GenericItem` 80 → 72. Smaller is the safe direction for the #1021
-  stack-overflow guard those pins exist for. `size_of::<Expr>()` is unchanged.
+  Four internal exact-size pins moved or were added as a consequence, each
+  derived from what it guards rather than bumped: `EvalError` 96 → 56,
+  `GenericResult` 120 → 80, `GenericItem` 80 → 72, and a new `JqValue` pin at 40.
+  Smaller is the safe direction for the #1021 stack-overflow guard the first
+  three exist for. `size_of::<Expr>()` is unchanged.
 
-  The new `unboxed-object-map` cargo feature restores the old inline layout. It
+  The new `unboxed-object-map` cargo feature restores the old inline layout on
+  both enums at once. It
   exists so the A/B for this change could build a functionally-pre-#3000 binary
   from the *same* source shape and subtract code-layout bias; it is a measurement
   tool, it is not part of any supported configuration, and enabling it undoes the
