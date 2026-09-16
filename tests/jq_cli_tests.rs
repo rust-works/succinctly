@@ -43271,18 +43271,21 @@ fn test_unresolved_call_line_search_is_word_bounded_1473() -> Result<()> {
 }
 
 /// #1473: an unresolvable call reached through an `include`d module has no
-/// occurrence in the filter source, so `locate_identifier_from` finds nothing
-/// and the diagnostic drops the line marker and source echo rather than
-/// inventing a position.
+/// occurrence in the filter source, so the in-filter position machinery
+/// finds nothing and the diagnostic must not invent a position.
 ///
-/// jq names the module file and line here
-/// (`... is not defined at /path/mymod.jq, line 1:` plus the module's own
-/// source line); succinctly reports `at <top-level>` with no location. The
-/// name, arity and exit code match; only the location does not, for the same
-/// reason the in-filter case can cite the wrong occurrence — `Expr::FuncCall`
-/// carries no source position, and modules would additionally need the
-/// originating *file* threaded through `ModuleLoader`. Recorded in
-/// docs/compliance/jq/limitations.md.
+/// **#2951 closed half of this.** The module-scope boundary gave every
+/// unresolved call an `origin` -- which run it was written in -- so the
+/// diagnostic now names the module's own canonical file, byte-identical to
+/// jq's (`... is not defined at /abs/path/mymod.jq`). What still differs is
+/// jq's trailing `, line N:` and its echo of the module's source line, which
+/// need the module's *text* threaded down to the reporter; that is #2990.
+///
+/// Before #2951 this said `at <top-level>` and could do worse than say
+/// nothing: with no `origin` to distinguish a module-body error, the
+/// text-search fallback could find a coincidental occurrence of the same
+/// name in the *main filter* and cite that line. The `, line ` assertion
+/// below pins that it still does not guess.
 #[test]
 fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -43304,9 +43307,13 @@ fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result
 
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr: {stderr}");
+    let module_path = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
     assert!(
-        stderr.contains("nosuchfn_in_module/0 is not defined at <top-level>"),
-        "stderr: {stderr}"
+        stderr.contains(&format!(
+            "nosuchfn_in_module/0 is not defined at {}",
+            module_path.display()
+        )),
+        "the module's own file should be named, as jq names it: {stderr}"
     );
     assert!(
         !stderr.contains(", line "),
