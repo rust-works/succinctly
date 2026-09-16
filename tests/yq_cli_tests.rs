@@ -47220,3 +47220,29 @@ fn yq_output_convention_unchanged_by_the_jsonconvention_fold_2874() -> Result<()
 
     Ok(())
 }
+
+/// #3046: the nine jq builtins #3046 added are not part of yq's syntax (yq
+/// v4.53.3's lexer rejects every one), so yq mode refuses them unless
+/// `--jq-extensions` is passed, like the rest of the jq-only surface.
+#[test]
+fn jq_only_builtins_3046_are_gated_in_yq_mode() -> Result<()> {
+    for filter in [
+        "JOIN({}; .)",
+        "format(\"json\")",
+        "input_filename",
+        "get_search_list",
+        "get_jq_origin",
+        "get_prog_origin",
+        "0 | strflocaltime(\"%Y\")",
+    ] {
+        let (_, code) = run_yq_stdin(filter, "a: 1\n", &[])?;
+        assert_ne!(code, 0, "{filter} must be rejected without --jq-extensions");
+    }
+    let (output, code) = run_yq_stdin(
+        "[1] | format(\"json\")",
+        "a: 1\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!((output.trim(), code), ("\"[1]\"", 0));
+    Ok(())
+}

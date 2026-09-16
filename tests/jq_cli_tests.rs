@@ -43978,6 +43978,347 @@ fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
 // jq-1.7.1) rather than from succinctly's own output.
 // ---------------------------------------------------------------------------
 
+/// #3046: `JOIN/2..4` and `format/1`, every row captured whole (stdout,
+/// stderr, exit code) from jq 1.7.1 -- including a user `def` shadowing each,
+/// and `format`'s refusal of succinctly-only format names.
+#[test]
+fn join_and_format_match_jq_3046() -> Result<()> {
+    let rows = [
+        ("[{\"id\":\"1\",\"n\":\"a\"},{\"id\":\"2\",\"n\":\"b\"}] | INDEX(.id) as $idx | [[\"1\",\"x\"],[\"3\",\"y\"]] | JOIN($idx; .[0])", "[[[\"1\",\"x\"],{\"id\":\"1\",\"n\":\"a\"}],[[\"3\",\"y\"],null]]\n", "", 0),
+        ("[{\"id\":\"1\",\"n\":\"a\"},{\"id\":\"2\",\"n\":\"b\"}] | INDEX(.id) as $idx | [[\"1\",\"x\"],[\"3\",\"y\"]] | [JOIN($idx; ([\"1\",\"x\"],[\"3\",\"y\"]); .[0])]", "[[[\"1\",\"x\"],{\"id\":\"1\",\"n\":\"a\"}],[[\"3\",\"y\"],null]]\n", "", 0),
+        ("[{\"id\":\"1\",\"n\":\"a\"},{\"id\":\"2\",\"n\":\"b\"}] | INDEX(.id) as $idx | [[\"1\",\"x\"],[\"3\",\"y\"]] | [JOIN($idx; ([\"1\",\"x\"],[\"3\",\"y\"]); .[0]; add)]", "", "jq: error (at <unknown>): array ([\"1\",\"x\"]) and object ({\"id\":\"1\",\"...) cannot be added\n", 5),
+        ("{\"1\":{}} as $idx | [[1]] | JOIN($idx; .[0])", "", "jq: error (at <unknown>): Cannot index object with number\n", 5),
+        ("[[1],[2]] | JOIN(({\"1\":\"a\"},{\"2\":\"b\"}); .[0]|tostring)", "[[[1],\"a\"],[[2],null]]\n[[[1],null],[[2],\"b\"]]\n", "", 0),
+        ("[1] | JOIN({})", "", "jq: error: JOIN/1 is not defined at <top-level>, line 1:\n[1] | JOIN({})      \njq: 1 compile error\n", 3),
+        ("def JOIN(a;b): \"mine\"; [1] | JOIN({}; .)", "\"mine\"\n", "", 0),
+        ("def JOIN(a;b;c;d): [a,b,c,d]; JOIN(1;2;3;4)", "[1,2,3,4]\n", "", 0),
+        ("[1,\"a b\",null] | [format(\"csv\"), format(\"tsv\"), format(\"text\"), format(\"json\"), format(\"sh\"), format(\"base64\"), format(\"uri\"), format(\"html\")]", "[\"1,\\\"a b\\\",\",\"1\\ta b\\t\",\"[1,\\\"a b\\\",null]\",\"[1,\\\"a b\\\",null]\",\"1 'a b' null\",\"WzEsImEgYiIsbnVsbF0=\",\"%5B1%2C%22a%20b%22%2Cnull%5D\",\"[1,&quot;a b&quot;,null]\"]\n", "", 0),
+        ("\"aGk=\" | format(\"base64d\")", "\"hi\"\n", "", 0),
+        ("[1] | [format(\"csv\",\"json\")]", "[\"1\",\"[1]\"]\n", "", 0),
+        ("[1] | format(\"@csv\")", "", "jq: error (at <unknown>): @csv is not a valid format\n", 5),
+        ("\"x\" | format(\"nope\")", "", "jq: error (at <unknown>): nope is not a valid format\n", 5),
+        ("\"x\" | format(1)", "", "jq: error (at <unknown>): number (1) is not a valid format\n", 5),
+        ("{\"aaaaaaaaaaaa\":\"bbbbbbbbbbbbbb\"} | format({\"aaaaaaaaaaaa\":\"bbbbbbbbbbbbbb\"})", "", "jq: error (at <unknown>): object ({\"aaaaaaaaa...) is not a valid format\n", 5),
+        ("\"x\" | format(\"urid\")", "", "jq: error (at <unknown>): urid is not a valid format\n", 5),
+        ("\"x\" | format(\"csv\",\"json\")", "", "jq: error (at <unknown>): string (\"x\") cannot be csv-formatted, only array\n", 5),
+        ("def format(f): \"mine\"; [1] | format(\"csv\")", "\"mine\"\n", "", 0),
+    ];
+    for (filter, want_out, want_err, want_code) in rows {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #3046: `strflocaltime` under POSIX `TZ` offset strings, captured from jq
+/// 1.7.1. (An IANA zone name is not resolved by `localtime` either; see
+/// `limitations.md`.)
+#[test]
+fn strflocaltime_matches_jq_3046() -> Result<()> {
+    for (tz, filter, want_out, want_err, want_code) in [
+        (
+            "UTC",
+            "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%S %z %Z\")",
+            "\"1970-01-01T00:00:00 +0000 UTC\"\n",
+            "",
+            0,
+        ),
+        (
+            "UTC",
+            "0 | gmtime | strflocaltime(\"%H %Z\")",
+            "\"00 UTC\"\n",
+            "",
+            0,
+        ),
+        ("UTC", "1.9 | strflocaltime(\"%S\")", "\"01\"\n", "", 0),
+        ("UTC", "(-1.5) | strflocaltime(\"%S\")", "\"59\"\n", "", 0),
+        (
+            "UTC",
+            "[0 | strflocaltime(\"%Y\",\"%H\")]",
+            "[\"1970\",\"00\"]\n",
+            "",
+            0,
+        ),
+        (
+            "UTC",
+            "1700000000 | strflocaltime(\"%A %j %U\")",
+            "\"Tuesday 318 46\"\n",
+            "",
+            0,
+        ),
+        (
+            "EST5EDT",
+            "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%S %z %Z\")",
+            "\"1969-12-31T19:00:00 -0500 EST\"\n",
+            "",
+            0,
+        ),
+        (
+            "EST5EDT",
+            "0 | gmtime | strflocaltime(\"%H %Z\")",
+            "\"00 EST\"\n",
+            "",
+            0,
+        ),
+        ("EST5EDT", "1.9 | strflocaltime(\"%S\")", "\"01\"\n", "", 0),
+        (
+            "EST5EDT",
+            "(-1.5) | strflocaltime(\"%S\")",
+            "\"59\"\n",
+            "",
+            0,
+        ),
+        (
+            "EST5EDT",
+            "[0 | strflocaltime(\"%Y\",\"%H\")]",
+            "[\"1969\",\"19\"]\n",
+            "",
+            0,
+        ),
+        (
+            "EST5EDT",
+            "1700000000 | strflocaltime(\"%A %j %U\")",
+            "\"Tuesday 318 46\"\n",
+            "",
+            0,
+        ),
+        (
+            "UTC-9",
+            "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%S %z %Z\")",
+            "\"1970-01-01T09:00:00 +0900 UTC\"\n",
+            "",
+            0,
+        ),
+        (
+            "UTC-9",
+            "0 | gmtime | strflocaltime(\"%H %Z\")",
+            "\"00 UTC\"\n",
+            "",
+            0,
+        ),
+        ("UTC-9", "1.9 | strflocaltime(\"%S\")", "\"01\"\n", "", 0),
+        ("UTC-9", "(-1.5) | strflocaltime(\"%S\")", "\"59\"\n", "", 0),
+        (
+            "UTC-9",
+            "[0 | strflocaltime(\"%Y\",\"%H\")]",
+            "[\"1970\",\"09\"]\n",
+            "",
+            0,
+        ),
+        (
+            "UTC-9",
+            "1700000000 | strflocaltime(\"%A %j %U\")",
+            "\"Wednesday 319 46\"\n",
+            "",
+            0,
+        ),
+        (
+            "PST8",
+            "0 | strflocaltime(\"%Y-%m-%dT%H:%M:%S %z %Z\")",
+            "\"1969-12-31T16:00:00 -0800 PST\"\n",
+            "",
+            0,
+        ),
+        (
+            "PST8",
+            "0 | gmtime | strflocaltime(\"%H %Z\")",
+            "\"00 PST\"\n",
+            "",
+            0,
+        ),
+        ("PST8", "1.9 | strflocaltime(\"%S\")", "\"01\"\n", "", 0),
+        ("PST8", "(-1.5) | strflocaltime(\"%S\")", "\"59\"\n", "", 0),
+        (
+            "PST8",
+            "[0 | strflocaltime(\"%Y\",\"%H\")]",
+            "[\"1969\",\"16\"]\n",
+            "",
+            0,
+        ),
+        (
+            "PST8",
+            "1700000000 | strflocaltime(\"%A %j %U\")",
+            "\"Tuesday 318 46\"\n",
+            "",
+            0,
+        ),
+        (
+            "UTC",
+            "\"x\" | strflocaltime(\"%H\")",
+            "",
+            "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
+            5,
+        ),
+        (
+            "UTC",
+            "[1970,0,1] | strflocaltime(\"%Y\")",
+            "",
+            "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
+            5,
+        ),
+        (
+            "UTC",
+            "null | strflocaltime(\"%H\")",
+            "",
+            "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
+            5,
+        ),
+    ] {
+        let (output, code) = spawn_jq_with_env(&["-nc", filter], "TZ", tz, None)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want_out, want_err, want_code),
+            "TZ={tz} {filter}"
+        );
+    }
+
+    // A non-string format aborts jq 1.7.1 on an assertion (exit 134); this
+    // raises instead (ADR-0018's "would take the host process down").
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "0 | strflocaltime(1)"], None)?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
+    assert!(stderr.starts_with("jq: error"), "{stderr:?}");
+    Ok(())
+}
+
+/// Runs `succinctly jq` in `dir`.
+fn run_jq_in_dir(
+    dir: &std::path::Path,
+    args: &[&str],
+    input: Option<&str>,
+) -> Result<(String, String, i32)> {
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(args).current_dir(dir);
+            command
+        },
+        input.map(str::as_bytes),
+    )?;
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        code,
+    ))
+}
+
+/// #3046: `input_filename`, `get_search_list`, `get_jq_origin` and
+/// `get_prog_origin`, against jq 1.7.1's answers for the same invocations.
+#[test]
+fn cli_context_builtins_match_jq_3046() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("in.json"), "1\n")?;
+    std::fs::write(dir.path().join("b.json"), "2\n")?;
+    std::fs::create_dir(dir.path().join("sub"))?;
+    std::fs::write(dir.path().join("sub").join("p.jq"), "get_prog_origin")?;
+    let here = std::fs::canonicalize(dir.path())?;
+    let here = here.to_string_lossy();
+
+    for (args, input, want) in [
+        (
+            vec!["-c", "input_filename", "in.json"],
+            None,
+            "\"in.json\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "input_filename"],
+            Some("1"),
+            "\"<stdin>\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "input_filename", "in.json", "b.json"],
+            None,
+            "\"in.json\"\n\"b.json\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "[., input_filename]", "./in.json"],
+            None,
+            "[1,\"./in.json\"]\n".to_string(),
+        ),
+        (
+            vec!["-c", "-s", "input_filename", "in.json", "b.json"],
+            None,
+            "\"b.json\"\n".to_string(),
+        ),
+        (
+            vec!["-c", "-R", "input_filename", "in.json"],
+            None,
+            "\"in.json\"\n".to_string(),
+        ),
+        (vec!["-nc", "input_filename"], None, "null\n".to_string()),
+        (
+            vec![
+                "-nc",
+                "[input_filename, (input|input_filename), input_filename]",
+                "in.json",
+            ],
+            None,
+            "[null,\"in.json\",\"in.json\"]\n".to_string(),
+        ),
+        (
+            vec![
+                "-nc",
+                "[input_filename, ([inputs]|length), input_filename]",
+                "in.json",
+                "b.json",
+            ],
+            None,
+            "[null,2,\"b.json\"]\n".to_string(),
+        ),
+        (
+            vec!["-nc", "get_search_list"],
+            None,
+            "[\"~/.jq\",\"$ORIGIN/../lib/jq\",\"$ORIGIN/../lib\"]\n".to_string(),
+        ),
+        (
+            vec!["-L", "lib", "-L", "/x", "-nc", "get_search_list"],
+            None,
+            "[\"lib\",\"/x\"]\n".to_string(),
+        ),
+        (
+            vec!["-nc", "get_prog_origin"],
+            None,
+            format!("\"{here}\"\n"),
+        ),
+        (
+            vec!["-nc", "-f", "sub/p.jq"],
+            None,
+            format!("\"{here}/sub\"\n"),
+        ),
+        (
+            vec!["-nc", "-f", "./sub/../sub/p.jq"],
+            None,
+            format!("\"{here}/sub\"\n"),
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_in_dir(dir.path(), &args, input)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want.as_str(), 0),
+            "{args:?}: {stderr:?}"
+        );
+    }
+
+    // The directory part of the path the binary was invoked by, as typed.
+    let (stdout, stderr, code) = run_jq_in_dir(dir.path(), &["-nc", "get_jq_origin"], None)?;
+    let invoked_dir = std::path::Path::new(succinctly_bin())
+        .parent()
+        .expect("the test binary path has a directory")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(
+        (stdout.as_str(), code),
+        (format!("\"{invoked_dir}\"\n").as_str(), 0),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
 /// A jq builtin succinctly does not implement must still *compile* when it is
 /// mentioned somewhere evaluation never reaches -- real jq compiles it, so
 /// rejecting it would be a regression #1473's resolution pass introduced.
@@ -43997,12 +44338,12 @@ fn test_unimplemented_jq_builtins_still_compile_when_unreached_1473() -> Result<
         "hypot(.; .)",
         "fma(.; .; .)",
         "frexp",
-        "JOIN(.; .; .; .)",
-        "format(.)",
-        "input_filename",
-        "get_search_list",
-        "strflocaltime(.)",
         "significand",
+        "gamma",
+        "nearbyint",
+        "logb",
+        // `JOIN`, `format`, `input_filename`, `get_search_list` and
+        // `strflocaltime` used to be sampled here; #3046 implemented them.
     ] {
         let filter = format!("if false then {call} else 1 end");
         let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;

@@ -528,6 +528,10 @@ surface (#1512):
 | `pow(base; exp)`                                     | Exponentiation                                |
 | `bsearch(target)`                                    | Binary search index in a sorted array         |
 | `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
+| `strflocaltime(fmt)`                                 | `strftime` in the local zone (#3046)          |
+| `format(name)`                                       | `@name` chosen at run time (#3046)            |
+| `input_filename`                                     | File the current input came from (#3046)      |
+| `get_search_list`, `get_jq_origin`, `get_prog_origin` | Module path / binary / program dirs (#3046)   |
 | `gmtime`, `localtime`, `mktime`                      | jq's date functions (#1907)                   |
 | `todate`, `fromdate`                                 | ISO 8601 shortcuts (#1907)                    |
 | `todateiso8601`, `fromdateiso8601`                   | ISO 8601, fixed format (#1907)                |
@@ -535,6 +539,7 @@ surface (#1512):
 | `min_by(f)`, `max_by(f)`                             | Extremum by a key function (#1714)            |
 | `implode`                                            | Codepoint array to string (#1714)             |
 | `INDEX(idx_expr)`, `INDEX(stream; idx_expr)`         | Build an object keyed by an index expr (#1714)|
+| `JOIN(idx; idx_expr)` and its 3/4-argument forms     | Join a stream against an `INDEX` (#3046)      |
 | `walk(f)`                                            | Recursively transform every node (#1714)      |
 | `floor`, `ceil`, `round`, `sqrt`, `fabs`             | Basic math functions (#1714)                  |
 | `abs`, `trunc`                                       | Absolute value / truncate to integer (#1885)  |
