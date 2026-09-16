@@ -3046,9 +3046,13 @@ against the written document would read back `5` and raise.
 
 That interleave has a price, and it is charged only where it buys something. The
 streaming route keeps two documents where the eager one keeps one, so on a 1.5 MB /
-200,000-element array `.[(0,1)] = 0` goes from 74.8 MB to 88.5 MB peak RSS (+18%). A path
-that provably resolves to **at most one path** stays on the eager route and pays none of
-it — `.[$k] = 0` is unchanged, as are a static path, `del()` and `|=`.
+200,000-element array `.[(0,1)] = 0` costs more peak RSS than the eager `.[$k] = 0`:
+54.4 MB against 74.5 MB on an Apple M4 Pro, 51.5 MB against 66.8 MB on an AMD 7950X
+(interleaved `/usr/bin/time -l`/`-v`, five reps, minimum). Both figures are post-#3000 —
+before `OwnedValue` shrank from 72 bytes to 32 they were 73.4 MB against 92.5 MB and
+75.3 MB against 104.7 MB on the same two machines. A path that provably resolves to
+**at most one path** stays on the eager route and pays none of it — `.[$k] = 0` is the
+eager number above, as are a static path, `del()` and `|=`.
 
 The count is the whole criterion, and purity is not part of it
 ([#2976](https://github.com/rust-works/succinctly/issues/2976)): the eager and streaming
@@ -3067,8 +3071,10 @@ last gap here needs structural sharing in `OwnedValue`, not a better gate. That 
 [#2999](https://github.com/rust-works/succinctly/issues/2999)'s work, and this paragraph
 tracks there rather than on #2976, which is done.
 [#3000](https://github.com/rust-works/succinctly/issues/3000) took the first step without
-any sharing at all: `OwnedValue` went from 72 bytes to 32, so *both* documents are now
-smaller, but there are still two of them.
+any sharing at all: `OwnedValue` went from 72 bytes to 32, so *both* documents above are
+smaller, but there are still two of them, and the gap between them did not close — it is
++37% on the M4 Pro and +30% on the 7950X now, against +26% and +39% before. Only sharing
+removes the second document.
 
 **Still open, tracked on #2267.** jq re-resolves an assignment's path once per
 right-hand-side output (`_assign(paths; $value)` binds `$value` as the outer generator),
