@@ -57467,6 +57467,44 @@ fn malformed_later_value_keeps_the_clean_prefix_2961() -> Result<()> {
     )?;
     assert_eq!((stdout.as_str(), code), ("1\n2\nnull\n", 5));
     assert!(stderr.ends_with(":1): x\n"), "{stderr:?}");
+
+    // #2961 review: the marker names the end of the malformed value's own
+    // line, not the file's last line -- jq 1.7.1 reports 3 and 2 here -- and
+    // `input_line_number` follows it there.
+    let mid_file = fixture("1\n2\n}\n3\n4\n5\n6\n")?;
+    let own_line = fixture("1\n2 }\n\n\n")?;
+    for (file, want_line) in [(&mid_file, 3), (&own_line, 2)] {
+        let (_, stderr, code) = run_jq_full(
+            &["-nc", "(try input catch null), (try input catch null), (try input catch null), error(\"x\")", &path(file)],
+            None,
+        )?;
+        assert_eq!(code, 5, "{stderr:?}");
+        assert!(
+            stderr.ends_with(&format!(":{want_line}): x\n")),
+            "want line {want_line}: {stderr:?}"
+        );
+    }
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-nc",
+            "[input, input, (try input catch 0), input_line_number]",
+            &path(&own_line),
+        ],
+        None,
+    )?;
+    assert_eq!((stdout.as_str(), code), ("[1,2,0,2]\n", 0));
+
+    // #2961 review: `inputs` in a position that collects rather than streams
+    // keeps the documents before the error too.
+    for (filter, want) in [
+        (".a = inputs", "{\"a\":1}\n{\"a\":2}\n"),
+        ("{a: inputs}", "{\"a\":1}\n{\"a\":2}\n"),
+        ("inputs + 1", "2\n3\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter, &t3], None)?;
+        assert_eq!(code, 5, "{filter}: {stderr:?}");
+        assert_eq!(stdout, want, "{filter}");
+    }
     Ok(())
 }
 

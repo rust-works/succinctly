@@ -4455,7 +4455,12 @@ differences remain, both pre-existing: the error reads `Invalid JSON text` where
 parser (`jq: parse error: Unfinished JSON term at EOF at line 2, column 5`, with no `(at …)`
 marker from the driver loop), and on the lazy per-file route a splitter error moves on to the
 next file, where jq stops the whole stream — the [#355](https://github.com/rust-works/succinctly/issues/355)
-continue-past-error rule below. The `input`/`inputs` route stops there, as jq does.
+continue-past-error rule below. The `input`/`inputs` route stops there, as jq does. And the
+`(at …)` marker a later error names after the parse error has been read counts newlines
+through the end of the line the malformed value starts on, which is jq's answer whenever that
+value sits on one line (`1\n2 }\n\n\n` → line 2); for a malformed value spanning several lines
+jq names wherever its parser gave up inside it, and for one cut off at end of input
+`<unknown>`, where succinctly still names the end of its first line.
 
 **The materializing flag routes still validate whatever the filter — down to `-s` and
 `-n`/`input` now, closed by [#2662](https://github.com/rust-works/succinctly/issues/2662)
