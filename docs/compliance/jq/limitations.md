@@ -1320,8 +1320,14 @@ answers `["b"]` — and classified the two residuals appended below):
   orders. Where `f` takes the reindex bridge (`.[]?` does), each native level also keeps its
   node's temporary document alive while its children run, so peak memory is bounded by the
   subtree sizes along the current path rather than one node's: flat on a 10 MB `users`
-  document, +11% on a 10 MB `nested` one, +30% on a 200-deep chain holding its bulk at the
-  leaf, time unchanged.
+  document, +11% on a 10 MB `nested` one, +30% on a 200-deep object chain (`{"k":v,"i":i}`)
+  whose leaf is 10,000 100-character strings (~1 MB; 1.0 GB → 1.3 GB), time unchanged. The overhead is a roughly
+  fixed number of bytes from the native window's overlapping retention, so its *percentage*
+  depends on how much of that fixed cost the rest of the document dilutes: on a second shape
+  — nested single-element arrays with a fixed 5 MB leaf, at depths spanning the native/queued
+  boundary — it falls from +30% at 20 levels (fully native) to +18% at 40 (the boundary),
+  +13% at 100, +7% at 200 (mostly queued past the budget), as the queued (unchanged) portion
+  of the walk grows.
   (#2908, once listed as sharing this class, turned out not to need it: its branches were
   already produced lazily and only the terminal was collecting them.)
   Bare `..`/`recurse`/
