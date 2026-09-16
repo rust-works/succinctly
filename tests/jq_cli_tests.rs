@@ -56872,3 +56872,59 @@ fn test_module_error_names_the_file_that_wrote_the_call_2951() -> Result<()> {
 
     Ok(())
 }
+/// #2829: a `catch` handler that reads path context runs through the
+/// owned-identity pipe, from the cursor the failing stage stood on.
+///
+/// That route (`run_try_handler_generic`'s pipe branch) had no test of its
+/// own — the `Cow` conversion is what surfaced it, because changing the line
+/// made `omni-dev coverage diff` report it as newly uncovered. The route is
+/// reachable in ordinary filters, not defensive, so it gets a pin rather
+/// than an explanation.
+///
+/// `path`/`key` with no argument are succinctly extensions (real jq has
+/// `path(f)` and no `key` at all, both `… is not defined` there), so the
+/// oracle for these rows is the pre-#2829 binary, against which every answer
+/// below is unchanged.
+#[test]
+fn test_try_handler_reads_path_context_from_the_failing_stage_2829() -> Result<()> {
+    let input = r#"{"a":{"b":1}}"#;
+
+    // The handler sees the path of the stage that raised, not the root.
+    let (out, code) = run_jq_stdin(r#".a | try error("x") catch path"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"["a"]"#);
+
+    // Two levels down, to show the path is the *stage's*, not a constant.
+    let (out, code) = run_jq_stdin(r#".a.b | try error("x") catch path"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#"["a","b"]"#);
+
+    // At the root the path is empty rather than absent.
+    let (out, code) = run_jq_stdin(r#"try error("x") catch path"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "[]");
+
+    // `key` takes the same route and answers the last component.
+    let (out, code) = run_jq_stdin(r#".a | try error("x") catch key"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), r#""a""#);
+
+    // A handler with two path-context outputs still threads one per output.
+    let (out, code) = run_jq_stdin(r#".a | try error("x") catch (path, key)"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.lines().collect::<Vec<_>>(), vec![r#"["a"]"#, r#""a""#]);
+
+    // A stage that emits *before* it raises delivers both: the pre-error
+    // output, then the handler's. (Written from a probe truncated to one
+    // line at first, which is exactly the shape that hides the second half.)
+    let (out, code) = run_jq_stdin(r#".a | try (.b, error("x")) catch path"#, input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["1", r#"["a"]"#],
+        "the pre-error output must still be delivered, and the handler must \
+         still run with the failing stage's path"
+    );
+
+    Ok(())
+}
