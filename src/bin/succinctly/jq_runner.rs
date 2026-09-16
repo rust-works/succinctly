@@ -2379,6 +2379,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         return Ok(exit_codes::SUCCESS);
     }
 
+    jq::cli_context::set_program(program_context(&args));
+
     // Build evaluation context from arguments
     let context = build_context(&args)?;
 
@@ -2773,6 +2775,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
         let files = get_input_files(&args);
+        // `input_filename`'s names for this route's source tags, which are the
+        // indexes into `raw_inputs` below (#3046).
+        jq::cli_context::set_input_names(if files.is_empty() {
+            vec![None]
+        } else {
+            files
+                .iter()
+                .map(|p| Some(p.to_string_lossy().to_string()))
+                .collect()
+        });
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
             vec![read_stdin_bytes()?]
         } else {
@@ -2807,6 +2819,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // the sweep that measures them.
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
+            jq::cli_context::set_current_source(u32::try_from(idx).ok());
             let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
             // Validate JSON if --validate flag is set
             if args.validate {
@@ -3125,6 +3138,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 },
                 Err(exit_code) => return Ok(exit_code), // Validation error
             };
+        // `input_filename`'s names for this route's source tags (#3046).
+        jq::cli_context::set_input_names(locations.files().to_vec());
 
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
@@ -3271,6 +3286,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             }
         } else {
             for (idx, input) in inputs.iter().enumerate() {
+                jq::cli_context::set_current_source(
+                    locations.per_value().get(idx).map(|&(source, _)| source),
+                );
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
                 let at = ErrorAt::Fixed(locations.get(idx));
@@ -3897,6 +3915,44 @@ fn get_inputs(
     }
 }
 
+/// What `get_search_list`/`get_jq_origin`/`get_prog_origin` report for this
+/// run (#3046), each as jq 1.7.1 computes it:
+///
+/// - the search list is the `-L` directories as given (jq's own default list
+///   otherwise, which [`jq::cli_context`] supplies);
+/// - the jq origin is the directory part of the path the binary was invoked
+///   by, as typed and not resolved -- `.` for a bare name found on `PATH`, the
+///   symlink's own directory for a symlink (jq 1.7.1: `(cd / && jq -n
+///   get_jq_origin)` is `"."`);
+/// - the program origin is the resolved directory of the `-f` file, or the
+///   working directory.
+fn program_context(args: &JqCommand) -> jq::cli_context::ProgramContext {
+    let jq_origin =
+        std::env::args_os()
+            .next()
+            .map(|argv0| match std::path::Path::new(&argv0).parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.to_string_lossy().to_string(),
+                _ => ".".to_string(),
+            });
+    let prog_origin = match &args.from_file {
+        Some(path) => std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.parent().map(|dir| dir.to_string_lossy().to_string())),
+        None => std::env::current_dir()
+            .ok()
+            .map(|dir| dir.to_string_lossy().to_string()),
+    };
+    jq::cli_context::ProgramContext {
+        search_list: args
+            .library_path
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
+        jq_origin,
+        prog_origin,
+    }
+}
+
 /// 1-based number of the last line carrying content.
 ///
 /// Used only as `extend_from_ends`'s ends/values-mismatch fallback -- *not*
@@ -4029,6 +4085,11 @@ impl InputLocations {
     /// [`UNKNOWN_LINE`] tag, so a value with no real position (#1542) still
     /// answers `<unknown>` once it's popped back off the queue and resolved
     /// via `ErrorAt::Live`, the same as it would through [`get`](Self::get).
+    /// File name per source tag, `None` for stdin.
+    fn files(&self) -> &[Option<String>] {
+        &self.files
+    }
+
     fn per_value(&self) -> &[(u32, u32)] {
         &self.per_value
     }

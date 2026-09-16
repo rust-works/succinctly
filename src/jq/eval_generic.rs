@@ -22024,6 +22024,10 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Input
             | Builtin::Inputs
             | Builtin::InputLineNumber
+            | Builtin::InputFilename
+            | Builtin::GetSearchList
+            | Builtin::GetJqOrigin
+            | Builtin::GetProgOrigin
             | Builtin::Builtins
             | Builtin::ModuleMeta
             | Builtin::Nan

@@ -105,6 +105,9 @@ pub use eval::{
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;
+// #3046: the CLI facts `input_filename`/`get_search_list`/`get_jq_origin`/
+// `get_prog_origin` read.
+pub use eval::cli_context;
 pub use expr::{
     ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound, FuncDefData,
     Import, Include, Literal, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey,
