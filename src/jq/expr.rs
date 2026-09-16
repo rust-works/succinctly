@@ -1662,6 +1662,8 @@ pub enum Builtin {
     /// (#3046). jq's own dynamic spelling of `@text`/`@json`/`@csv`/...;
     /// only jq's format names are accepted, without the `@`.
     FormatNamed(Box<Expr>),
+    /// `strflocaltime(fmt)` - `strftime` in the local zone (#3046)
+    Strflocaltime(Box<Expr>),
     /// `strptime(fmt)` - parse string to broken-down time
     Strptime(Box<Expr>),
     /// `todate` - convert Unix timestamp to ISO 8601 date string (alias for todateiso8601)

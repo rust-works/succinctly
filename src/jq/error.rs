@@ -1590,10 +1590,11 @@ impl EvalError {
         Self::new("mktime requires array inputs")
     }
 
-    /// `strftime/1 requires parsed datetime inputs` — `strftime` on an input
-    /// that's neither a broken-down-time array nor a raw number.
-    pub fn strftime_requires_parsed_datetime_inputs() -> Self {
-        Self::new("strftime/1 requires parsed datetime inputs")
+    /// `<name>/1 requires parsed datetime inputs` — `strftime` or
+    /// `strflocaltime` (#3046) on an input that's neither a broken-down-time
+    /// array nor a raw number.
+    pub fn requires_parsed_datetime_inputs(name: &str) -> Self {
+        Self::new(format!("{name}/1 requires parsed datetime inputs"))
     }
 
     /// `date "<input>" does not match format "<fmt>"` — any `strptime`

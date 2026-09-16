@@ -21983,6 +21983,7 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Stderr
             | Builtin::Strftime(_)
             | Builtin::FormatNamed(_)
+            | Builtin::Strflocaltime(_)
             | Builtin::Strings
             | Builtin::Strptime(_)
             | Builtin::Tan

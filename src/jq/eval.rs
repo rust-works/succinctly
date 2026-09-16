@@ -10679,6 +10679,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Localtime => builtin_localtime::<W>(value, optional),
         Builtin::Mktime => builtin_mktime::<W>(value, optional),
         Builtin::Strftime(fmt) => builtin_strftime::<W, S>(fmt, value, optional),
+        Builtin::Strflocaltime(fmt) => builtin_strflocaltime::<W, S>(fmt, value, optional),
         Builtin::FormatNamed(name) => builtin_format_named::<W, S>(name, value, optional),
         Builtin::Strptime(fmt) => builtin_strptime::<W, S>(fmt, value, optional),
         Builtin::Todate => builtin_todate::<W>(value, optional),
@@ -48771,6 +48772,79 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    strftime_in_zone::<W, S>(fmt_expr, value, optional, None)
+}
+
+/// Builtin: `strflocaltime(fmt)` (#3046) -- `strftime` in the local zone.
+///
+/// A number is first converted to local broken-down time, exactly as
+/// `localtime` converts it; a broken-down-time array is formatted as given,
+/// the local zone describing it. `%z`/`%Z` name the local zone (jq 1.7.1:
+/// `TZ=EST5EDT`, `0 | strflocaltime("%z %Z %H")` is `"-0500 EST 19"`).
+///
+/// The local zone is the one `localtime` already uses, so the two cannot
+/// disagree: a POSIX `TZ` offset string, otherwise UTC. An IANA zone name
+/// (`TZ=Asia/Tokyo`) is not resolved by either, a pre-existing gap recorded
+/// in `limitations.md`.
+///
+/// A non-string format raises, where jq 1.7.1 aborts on an assertion (`0 |
+/// strflocaltime(1)`, exit 134) -- ADR-0018's "would take the host process
+/// down" divergence, the same one `strftime(1)` already takes.
+fn builtin_strflocaltime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    fmt_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    strftime_in_zone::<W, S>(fmt_expr, value, optional, Some(local_zone()))
+}
+
+/// The zone `localtime` converts into: its UTC offset in seconds and the
+/// abbreviation `%Z` prints (#3046).
+struct LocalZone {
+    offset_secs: i64,
+    name: String,
+}
+
+/// The local zone, as `localtime` determines it: a POSIX `TZ` string's
+/// offset and standard-time abbreviation (`EST5EDT` is `-18000`, `EST`), or
+/// UTC when `TZ` is unset or not in that form.
+fn local_zone() -> LocalZone {
+    #[cfg(feature = "std")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        if let Ok(tz) = std::env::var("TZ") {
+            if parse_simple_tz_offset(&tz).is_some() {
+                let name: String = tz.chars().take_while(char::is_ascii_alphabetic).collect();
+                if !name.is_empty() {
+                    return LocalZone {
+                        offset_secs: estimate_local_offset(now),
+                        name,
+                    };
+                }
+            }
+        }
+    }
+    LocalZone {
+        offset_secs: 0,
+        name: String::from("UTC"),
+    }
+}
+
+/// `strftime`'s body, in UTC (`zone: None`) or in `zone` (`strflocaltime`).
+fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    fmt_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    zone: Option<LocalZone>,
+) -> QueryResult<'a, W> {
+    let name = if zone.is_some() {
+        "strflocaltime"
+    } else {
+        "strftime"
+    };
     fanout_arg::<W, S, _>(
         fmt_expr,
         value.clone(),
@@ -48781,7 +48855,12 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let fmt = match fmt_owned {
                 OwnedValue::String(s) => s,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
+                _ => {
+                    return QueryResult::Error(EvalError::type_error(
+                        "string",
+                        &format!("{name} format"),
+                    ))
+                }
             };
 
             // Value should be a broken-down time array, or a raw Unix timestamp
@@ -48807,9 +48886,16 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return QueryResult::Error(EvalError::new("invalid number"));
                     };
 
-                    // Auto-converted the same way `gmtime` converts a raw number.
+                    // Auto-converted the same way `gmtime` converts a raw
+                    // number -- or `localtime`, shifted into `zone`.
+                    let secs = timestamp.trunc() as i64;
+                    let secs = match &zone {
+                        None => Some(secs),
+                        Some(zone) => secs.checked_add(zone.offset_secs),
+                    };
                     let t = match ok_or_result::<W, _>(
-                        broken_down_time_from_unix_secs(timestamp.trunc() as i64),
+                        secs.ok_or_else(EvalError::datetime_out_of_range)
+                            .and_then(broken_down_time_from_unix_secs),
                         optional,
                     ) {
                         Ok(t) => t,
@@ -48847,7 +48933,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                     return QueryResult::None;
                                 }
                                 return QueryResult::Error(
-                                    EvalError::strftime_requires_parsed_datetime_inputs(),
+                                    EvalError::requires_parsed_datetime_inputs(name),
                                 );
                             }
 
@@ -48887,16 +48973,30 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                         _ if optional => return QueryResult::None,
                         _ => {
-                            return QueryResult::Error(
-                                EvalError::strftime_requires_parsed_datetime_inputs(),
-                            )
+                            return QueryResult::Error(EvalError::requires_parsed_datetime_inputs(
+                                name,
+                            ))
                         }
                     }
                 }
             };
 
+            let (zone_offset, zone_name) = match &zone {
+                None => (0, "UTC"),
+                Some(zone) => (zone.offset_secs, zone.name.as_str()),
+            };
             let result = match format_strftime(
-                &fmt, year, month, day, hour, minute, second, weekday, yearday,
+                &fmt,
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                weekday,
+                yearday,
+                zone_offset,
+                zone_name,
             ) {
                 Ok(s) => s,
                 Err(_) if optional => return QueryResult::None,
@@ -48919,6 +49019,8 @@ fn format_strftime(
     second: i64,
     weekday: i64,
     yearday: i64,
+    zone_offset: i64,
+    zone_name: &str,
 ) -> Result<String, EvalError> {
     let overflow = EvalError::broken_down_time_out_of_range;
     let mut result = String::new();
@@ -49003,8 +49105,13 @@ fn format_strftime(
                 Some('T') => result.push_str(&format!("{hour:02}:{minute:02}:{second:02}")),
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
-                Some('z') => result.push_str("+0000"), // UTC offset (we're always UTC for gmtime)
-                Some('Z') => result.push_str("UTC"),
+                // `strftime` formats in UTC; `strflocaltime` passes its zone.
+                Some('z') => {
+                    let sign = if zone_offset < 0 { '-' } else { '+' };
+                    let minutes = zone_offset.unsigned_abs() / 60;
+                    result.push_str(&format!("{sign}{:02}{:02}", minutes / 60, minutes % 60));
+                }
+                Some('Z') => result.push_str(zone_name),
                 Some('s') => result.push_str(
                     &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)?
                         .to_string(),
