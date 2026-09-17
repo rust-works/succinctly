@@ -34223,6 +34223,15 @@ fn test_from_unix_still_rejects_non_numbers_including_arrays_3068() -> Result<()
             "input {input:?}: stderr {stderr:?}"
         );
     }
+    // An out-of-range timestamp still raises through the same
+    // datetime-conversion error `broken_down_time_from_unix_secs` gives
+    // strftime/todate/gmtime, unaffected by decoupling from `todate`.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("from_unix", "1e300", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("error converting number of seconds since epoch to datetime"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
