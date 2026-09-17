@@ -2277,10 +2277,10 @@ fn jq_literal_run_end(text: &[u8], start: usize) -> usize {
 /// truncated or absorbed.
 ///
 /// A word token ends where jq's own literal scanner stops
-/// ([`jq_literal_run_end`]): `nan 1` is two tokens (`null`, `1`, as jq
-/// prints them) while `nan1.5`, `nan(1)` and `nanx` are each one token that
-/// fails to validate -- the same whole-token rule [`special_number_end`]
-/// applies inside a container, and this is that function.
+/// (`jq_literal_run_end`, private): `nan 1` is two tokens (`null`, `1`, as
+/// jq prints them) while `nan1.5`, `nan(1)` and `nanx` are each one token
+/// that fails to validate -- the same whole-token rule `special_number_end`
+/// (private) applies inside a container, and this is that function.
 ///
 /// `start` must point at a byte that can begin either grammar: `-`, `+`,
 /// `.`, an ASCII digit, or one of `n`/`N`/`i`/`I`/`s`/`S`; the caller

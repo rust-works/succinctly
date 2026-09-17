@@ -2537,7 +2537,7 @@ impl OwnedValue {
     /// [`to_json`](Self::to_json) for a value that is about to be **re-read
     /// as a document** rather than printed: identical, except a bare
     /// non-finite `Float` is written as the reindex bridge's own tokens
-    /// (`NAN_SENTINEL`, [`overflow_literal`]) instead of the `null`/`DBL_MAX`
+    /// (`NAN_SENTINEL`, `overflow_literal`) instead of the `null`/`DBL_MAX`
     /// text jq's printer substitutes (#2877).
     ///
     /// Used by the materializing input path (`jq_runner.rs`'s
