@@ -72899,6 +72899,14 @@ mod tests {
                 assert_eq!(s, "1.7976931348623157e+308");
             }
         );
+        // A document-sourced NaN (succinctly's own lenient JSON `NaN`
+        // spelling, #2877) decodes as a NumberLiteral, not the nan
+        // builtin's bare Float above -- both arms must catch it.
+        query!(b"[NaN,1]", "@csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ",1");
+            }
+        );
     }
 
     #[test]
