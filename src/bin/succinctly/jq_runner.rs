@@ -2262,16 +2262,24 @@ fn report_unresolved_call(
     location: &str,
     source: &str,
     call_sites: &[jq::CallSite],
-    taken: &mut usize,
+    occurrence_index: usize,
     resume_from: &mut usize,
 ) {
+    // #2635: `occurrence_index` (from `resolve::UnresolvedCall`, computed
+    // while walking the same tree in the same source order) counts *every*
+    // earlier call to this `(name, arity)` pair, resolved or not -- not
+    // just the earlier ones that also happened to fail, which is what a
+    // simple "how many times have *we* reported this name" counter would
+    // give. That distinction is exactly what made `(def f: 1; f) | f` cite
+    // the resolving `f` inside the parens instead of the failing one after
+    // the pipe: both are `f/0`, but only the second is actually this
+    // error's own occurrence.
     let from_table = call_sites
         .iter()
         .filter(|c| c.name == name && c.arity == arity)
-        .nth(*taken)
+        .nth(occurrence_index)
         .map(|c| c.offset);
     if let Some(offset) = from_table {
-        *taken += 1;
         *resume_from = offset + name.len();
         let (line_no, line_text, column) = line_at_offset(source, offset);
         eprintln!("jq: error: {name}/{arity} is not defined at {location}, line {line_no}:");
@@ -2359,12 +2367,12 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // #2734: the same, for `$name` variable references -- see
     // `jq::collect_var_sites`.
     let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
-    // How many calls/variables of each name we have already reported, so a
-    // repeated undefined name walks its own successive sites in source
+    // How many variables of each name we have already reported, so a
+    // repeated undefined `$name` walks its own successive sites in source
     // order -- the same rule `call_resume_from` gives the calls' fallback.
-    // Separate maps: a call named `f` and a variable named `f` are unrelated
-    // occurrences.
-    let mut calls_consumed: HashMap<&str, usize> = HashMap::new();
+    // Calls no longer need this (#2635): `occurrence_index` already answers
+    // "which occurrence is this" precisely, computed while resolving rather
+    // than approximated while reporting.
     let mut vars_consumed: HashMap<&str, usize> = HashMap::new();
 
     for error in errors {
@@ -2373,6 +2381,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 name,
                 arity,
                 origin,
+                occurrence_index,
             }) => {
                 // #2951: a call that failed inside a *module* body has no
                 // occurrence in `filter` at all, so neither the call-site
@@ -2410,14 +2419,30 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
 
                     match cached {
                         Some((source, call_sites)) => {
+                            // #2635 does not cover a module's own diagnostics:
+                            // `occurrence_index` is computed against the
+                            // fully-inlined tree (main filter + every
+                            // included module), not scoped per module the
+                            // way this module's own, independently re-parsed
+                            // `call_sites` table is -- so this keeps its
+                            // pre-existing (failures-only) counter rather
+                            // than an index that would not line up with it.
                             let taken = module_calls_consumed
                                 .entry((*id, name.as_str()))
                                 .or_insert(0);
+                            let this_occurrence = *taken;
+                            *taken += 1;
                             let resume = module_call_resume_from
                                 .entry((*id, name.as_str()))
                                 .or_insert(0);
                             report_unresolved_call(
-                                name, *arity, &at, source, call_sites, taken, resume,
+                                name,
+                                *arity,
+                                &at,
+                                source,
+                                call_sites,
+                                this_occurrence,
+                                resume,
                             );
                         }
                         None => {
@@ -2426,7 +2451,6 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     }
                     continue;
                 }
-                let taken = calls_consumed.entry(name.as_str()).or_insert(0);
                 let resume = call_resume_from.entry(name.as_str()).or_insert(0);
                 report_unresolved_call(
                     name,
@@ -2434,7 +2458,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     "<top-level>",
                     filter,
                     &call_sites,
-                    taken,
+                    *occurrence_index,
                     resume,
                 );
             }
@@ -2473,8 +2497,8 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // neither of which is the failing reference. See
                 // `jq::VarSite`'s own doc comment for the one class of
                 // ambiguity this still can't resolve (two same-named
-                // references differing only by lexical scope), the same
-                // known limitation `jq::CallSite` has for calls (#2635).
+                // references differing only by lexical scope) -- #2635 fixed
+                // the identical shape for calls; this one is #3107.
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
                 report_unbound_var(name, "<top-level>", filter, &var_sites, taken);
             }

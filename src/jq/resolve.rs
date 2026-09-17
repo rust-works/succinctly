@@ -97,6 +97,21 @@ pub struct UnresolvedCall {
     /// [`ModuleRun`]), whereas this is a diagnostic payload built only when
     /// a call actually fails to resolve.
     pub origin: Option<u32>,
+    /// How many earlier calls to this exact `(name, arity)` pair -- resolved
+    /// *or* unresolved -- [`check`] had already visited, in source order,
+    /// before this one (#2635).
+    ///
+    /// `jq::CallSite` (`parser.rs`) records every generic call's own source
+    /// position, in the same order, regardless of whether it later resolves
+    /// -- so this index is exactly what the runner needs to pick this
+    /// call's own entry out of that table (`call_sites.iter().filter(same
+    /// name/arity).nth(occurrence_index)`) instead of counting *unresolved*
+    /// calls only, which silently cites an earlier, unrelated, *resolved*
+    /// occurrence of the same name+arity when one comes first in the source
+    /// (`(def f: 1; f) | f` cited the resolving `f` inside the parens, not
+    /// the failing one after the pipe -- both are `f/0`, only one is a
+    /// compile error).
+    pub occurrence_index: usize,
 }
 
 impl core::fmt::Display for UnresolvedCall {
@@ -1216,7 +1231,15 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
     let mut scope = Scope::new();
     let mut var_scope = VarScope::new();
     let mut errors = Vec::new();
-    check(expr, &mut scope, &mut var_scope, &mut errors, &reachable);
+    let mut occurrences = BTreeMap::new();
+    check(
+        expr,
+        &mut scope,
+        &mut var_scope,
+        &mut errors,
+        &reachable,
+        &mut occurrences,
+    );
     errors
 }
 
@@ -1225,6 +1248,23 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
     JQ_BUILTIN_ROSTER
         .iter()
         .any(|&(n, a)| a == arity && n == name)
+}
+
+/// Records one more visit to `(name, arity)` -- resolved or not -- and
+/// returns how many earlier visits to that exact pair `occurrences` had
+/// already recorded (#2635). Shared by every terminal arm of `check`'s
+/// `Expr::FuncCall` handling that represents a genuine, distinct call site
+/// (not the "restore the original parse and re-dispatch" arm, which revisits
+/// the same position rather than a new one).
+fn next_call_occurrence(
+    occurrences: &mut BTreeMap<(String, usize), usize>,
+    name: &str,
+    arity: usize,
+) -> usize {
+    let count = occurrences.entry((name.to_string(), arity)).or_insert(0);
+    let index = *count;
+    *count += 1;
+    index
 }
 
 /// Whether `(name, arity)` resolves against `scope`, innermost first,
@@ -1283,20 +1323,28 @@ fn check_pattern_keys(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
+    occurrences: &mut BTreeMap<(String, usize), usize>,
 ) {
     match pattern {
         Pattern::Var(_) => {}
         Pattern::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, var_scope, errors, reachable);
+                    check(k, scope, var_scope, errors, reachable, occurrences);
                 }
-                check_pattern_keys(&mut entry.pattern, scope, var_scope, errors, reachable);
+                check_pattern_keys(
+                    &mut entry.pattern,
+                    scope,
+                    var_scope,
+                    errors,
+                    reachable,
+                    occurrences,
+                );
             }
         }
         Pattern::Array(patterns) => {
             for p in patterns.iter_mut() {
-                check_pattern_keys(p, scope, var_scope, errors, reachable);
+                check_pattern_keys(p, scope, var_scope, errors, reachable, occurrences);
             }
         }
     }
@@ -1315,9 +1363,10 @@ fn bind_patterns(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
+    occurrences: &mut BTreeMap<(String, usize), usize>,
 ) -> Vec<String> {
     for pattern in patterns.iter_mut() {
-        check_pattern_keys(pattern, scope, var_scope, errors, reachable);
+        check_pattern_keys(pattern, scope, var_scope, errors, reachable, occurrences);
     }
     pattern_alternatives_var_names(patterns)
 }
@@ -1470,6 +1519,7 @@ fn check(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
+    occurrences: &mut BTreeMap<(String, usize), usize>,
 ) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
@@ -1506,14 +1556,14 @@ fn check(
                 let original = Rc::clone(inner);
                 let target = Rc::make_mut(inner);
                 let rebased = rebase_reachable(&original, target, reachable);
-                check(target, scope, var_scope, errors, &rebased);
+                check(target, scope, var_scope, errors, &rebased, occurrences);
             } else {
-                check(Rc::make_mut(inner), scope, var_scope, errors, reachable);
+                check(Rc::make_mut(inner), scope, var_scope, errors, reachable, occurrences);
             }
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
-                check(arg, scope, var_scope, errors, reachable);
+                check(arg, scope, var_scope, errors, reachable, occurrences);
             }
         }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
@@ -1555,7 +1605,7 @@ fn check(
         | Expr::Negate(inner)
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
-        | Expr::Repeat(inner) => check(inner, scope, var_scope, errors, reachable),
+        | Expr::Repeat(inner) => check(inner, scope, var_scope, errors, reachable, occurrences),
 
         // #2840: real jq's `label $x | BODY` intercepts every escape that
         // isn't its own `{"__jq":N}` break sentinel and re-raises it
@@ -1572,7 +1622,7 @@ fn check(
         // #2687's `break $x` -> `error/0` desugaring's own
         // shadowable-or-untouched gate).
         Expr::Label { name: _, body } => {
-            check(body, scope, var_scope, errors, reachable);
+            check(body, scope, var_scope, errors, reachable, occurrences);
             if in_scope(scope, "error", 0).hit.is_some() {
                 let old_body = core::mem::replace(body.as_mut(), Expr::Identity);
                 **body = Expr::Try {
@@ -1588,7 +1638,7 @@ fn check(
 
         Expr::Error(inner) => {
             if let Some(e) = inner.as_deref_mut() {
-                check(e, scope, var_scope, errors, reachable);
+                check(e, scope, var_scope, errors, reachable, occurrences);
             }
         }
 
@@ -1645,16 +1695,16 @@ fn check(
             value: right,
             ..
         } => {
-            check(left, scope, var_scope, errors, reachable);
-            check(right, scope, var_scope, errors, reachable);
+            check(left, scope, var_scope, errors, reachable, occurrences);
+            check(right, scope, var_scope, errors, reachable, occurrences);
         }
 
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
         Expr::As { expr, var, body } => {
-            check(expr, scope, var_scope, errors, reachable);
+            check(expr, scope, var_scope, errors, reachable, occurrences);
             var_scope.push(var.clone());
-            check(body, scope, var_scope, errors, reachable);
+            check(body, scope, var_scope, errors, reachable, occurrences);
             var_scope.pop();
         }
 
@@ -1673,11 +1723,11 @@ fn check(
             patterns,
             body,
         } => {
-            check(expr, scope, var_scope, errors, reachable);
+            check(expr, scope, var_scope, errors, reachable, occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
             var_scope.extend(bound);
-            check(body, scope, var_scope, errors, reachable);
+            check(body, scope, var_scope, errors, reachable, occurrences);
             var_scope.truncate(outer);
         }
 
@@ -1727,7 +1777,7 @@ fn check(
             // scope/`then`, which still need the same treatment either way.
             let body_addr = body.as_ref() as *const Expr as usize;
             if reachable.contains(&body_addr) {
-                check(body, scope, var_scope, errors, reachable);
+                check(body, scope, var_scope, errors, reachable, occurrences);
             }
             var_scope.truncate(var_outer);
             scope.truncate(with_self);
@@ -1739,15 +1789,15 @@ fn check(
             if is_marker {
                 var_scope.push(name.clone());
             }
-            check(then, scope, var_scope, errors, reachable);
+            check(then, scope, var_scope, errors, reachable, occurrences);
             var_scope.truncate(var_outer);
             scope.truncate(outer);
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope, var_scope, errors, reachable);
+            check(expr, scope, var_scope, errors, reachable, occurrences);
             if let Some(c) = catch.as_deref_mut() {
-                check(c, scope, var_scope, errors, reachable);
+                check(c, scope, var_scope, errors, reachable, occurrences);
             }
         }
 
@@ -1756,21 +1806,21 @@ fn check(
             then_branch,
             else_branch,
         } => {
-            check(cond, scope, var_scope, errors, reachable);
-            check(then_branch, scope, var_scope, errors, reachable);
-            check(else_branch, scope, var_scope, errors, reachable);
+            check(cond, scope, var_scope, errors, reachable, occurrences);
+            check(then_branch, scope, var_scope, errors, reachable, occurrences);
+            check(else_branch, scope, var_scope, errors, reachable, occurrences);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope, var_scope, errors, reachable);
-            check_opt(start.as_deref_mut(), scope, var_scope, errors, reachable);
-            check_opt(end.as_deref_mut(), scope, var_scope, errors, reachable);
+            check(target, scope, var_scope, errors, reachable, occurrences);
+            check_opt(start.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
+            check_opt(end.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope, var_scope, errors, reachable);
-            check_opt(to.as_deref_mut(), scope, var_scope, errors, reachable);
-            check_opt(step.as_deref_mut(), scope, var_scope, errors, reachable);
+            check(from, scope, var_scope, errors, reachable, occurrences);
+            check_opt(to.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
+            check_opt(step.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
         }
 
         // #2734: `patterns`' vars are bound in `update` only, not `init` --
@@ -1783,12 +1833,12 @@ fn check(
             init,
             update,
         } => {
-            check(input, scope, var_scope, errors, reachable);
-            check(init, scope, var_scope, errors, reachable);
+            check(input, scope, var_scope, errors, reachable, occurrences);
+            check(init, scope, var_scope, errors, reachable, occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
             var_scope.extend(bound);
-            check(update, scope, var_scope, errors, reachable);
+            check(update, scope, var_scope, errors, reachable, occurrences);
             var_scope.truncate(outer);
         }
 
@@ -1801,19 +1851,19 @@ fn check(
             update,
             extract,
         } => {
-            check(input, scope, var_scope, errors, reachable);
-            check(init, scope, var_scope, errors, reachable);
+            check(input, scope, var_scope, errors, reachable, occurrences);
+            check(init, scope, var_scope, errors, reachable, occurrences);
             let outer = var_scope.len();
-            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable);
+            let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
             var_scope.extend(bound);
-            check(update, scope, var_scope, errors, reachable);
-            check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable);
+            check(update, scope, var_scope, errors, reachable, occurrences);
+            check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
             var_scope.truncate(outer);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs.iter_mut() {
-                check(e, scope, var_scope, errors, reachable);
+                check(e, scope, var_scope, errors, reachable, occurrences);
             }
         }
 
@@ -1885,6 +1935,12 @@ fn check(
                 *name = qualified;
             }
             if resolved {
+                // #2635: counts this call towards `occurrences` (a resolved
+                // one still needs to, so a *later* same-name-same-arity call
+                // that fails knows how many earlier occurrences -- resolved
+                // or not -- came before it in the source; see
+                // `UnresolvedCall::occurrence_index`'s own doc comment).
+                next_call_occurrence(occurrences, name, arity);
                 // #2971: of `builtin_fallback_into_args`'s arms only the
                 // `Builtin` one clones -- the rest move their operands, which
                 // keeps every `def` body where `build_call_graph` found it.
@@ -1901,22 +1957,30 @@ fn check(
                 });
                 let reachable = rebased.as_ref().unwrap_or(reachable);
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, errors, reachable);
+                    check(a, scope, var_scope, errors, reachable, occurrences);
                 }
             } else if let Some(fallback) = builtin_fallback.take() {
                 // Not shadowed after all -- restore the original parse in
-                // one move, no cloning.
+                // one move, no cloning. Deliberately does *not* count towards
+                // `occurrences` here: this re-dispatches on the exact same
+                // source position (now a different `Expr` variant, typically
+                // `Expr::Builtin`), not a second, distinct call site -- the
+                // recursive `check` call below counts it exactly once, in
+                // whichever arm the swapped-in `expr` actually matches.
                 *expr = *fallback;
-                check(expr, scope, var_scope, errors, reachable);
+                check(expr, scope, var_scope, errors, reachable, occurrences);
             } else if is_jq_builtin(name, arity) {
+                next_call_occurrence(occurrences, name, arity);
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, errors, reachable);
+                    check(a, scope, var_scope, errors, reachable, occurrences);
                 }
             } else {
+                let occurrence_index = next_call_occurrence(occurrences, name, arity);
                 errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
                     origin: scan.run.map(|(id, _)| id),
+                    occurrence_index,
                 }));
             }
         }
@@ -1928,23 +1992,23 @@ fn check(
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args.iter_mut() {
-                check(a, scope, var_scope, errors, reachable);
+                check(a, scope, var_scope, errors, reachable, occurrences);
             }
         }
 
         Expr::Object(entries) => {
             for entry in entries.iter_mut() {
                 if let ObjectKey::Expr(k) = &mut entry.key {
-                    check(k, scope, var_scope, errors, reachable);
+                    check(k, scope, var_scope, errors, reachable, occurrences);
                 }
-                check(&mut entry.value, scope, var_scope, errors, reachable);
+                check(&mut entry.value, scope, var_scope, errors, reachable, occurrences);
             }
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope, var_scope, errors, reachable);
+                    check(e, scope, var_scope, errors, reachable, occurrences);
                 }
             }
         }
@@ -1973,7 +2037,7 @@ fn check(
             *builtin = map_builtin_subexprs(builtin, &mut |sub| {
                 let mut copy = sub.clone();
                 let rebased = rebase_reachable(sub, &copy, reachable);
-                check(&mut copy, scope, var_scope, errors, &rebased);
+                check(&mut copy, scope, var_scope, errors, &rebased, occurrences);
                 copy
             });
         }
@@ -2096,9 +2160,10 @@ fn check_opt(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
+    occurrences: &mut BTreeMap<(String, usize), usize>,
 ) {
     if let Some(e) = expr {
-        check(e, scope, var_scope, errors, reachable);
+        check(e, scope, var_scope, errors, reachable, occurrences);
     }
 }
 
@@ -2572,12 +2637,14 @@ mod tests {
         let mut scope = Scope::new();
         let mut var_scope = VarScope::new();
         let mut errors = Vec::new();
+        let mut occurrences = BTreeMap::new();
         check(
             &mut Expr::Shared(Rc::new(unresolved())),
             &mut scope,
             &mut var_scope,
             &mut errors,
             &BTreeSet::new(),
+            &mut occurrences,
         );
         assert_eq!(
             errors,
@@ -2588,12 +2655,14 @@ mod tests {
                 // markers, so the floor is 0 and there is nothing to
                 // attribute the failure to (#2951).
                 origin: None,
+                occurrence_index: 0,
             })]
         );
 
         let mut scope = Scope::new();
         let mut var_scope = VarScope::new();
         let mut errors = Vec::new();
+        let mut occurrences = BTreeMap::new();
         check(
             &mut Expr::DefCall {
                 def: Rc::new(crate::jq::FuncDefData {
@@ -2609,6 +2678,7 @@ mod tests {
             &mut var_scope,
             &mut errors,
             &BTreeSet::new(),
+            &mut occurrences,
         );
         assert_eq!(
             errors,
@@ -2619,6 +2689,7 @@ mod tests {
                 // markers, so the floor is 0 and there is nothing to
                 // attribute the failure to (#2951).
                 origin: None,
+                occurrence_index: 0,
             })]
         );
     }
@@ -3136,6 +3207,27 @@ mod tests {
                     name: "foo".into(),
                     arity: 0,
                     origin: None,
+                    occurrence_index: 0,
+                }]
+            );
+        }
+
+        /// #2635: `occurrence_index` counts *every* earlier visit to
+        /// `(name, arity)` -- resolved included -- so the failing `f/0`
+        /// (after the pipe) reports index 1, not 0, even though it is the
+        /// *first and only* one that ends up in `errors`. Confirmed live
+        /// against jq 1.7.1: `f/0 is not defined at <top-level>, line 3:`,
+        /// citing the second `f`, not the first (which resolves).
+        #[test]
+        fn occurrence_index_counts_resolved_calls_too_2635() {
+            let mut expr = parse("(def f: 1;\nf)\n| f").expect("filter must parse");
+            assert_eq!(
+                resolve_func_calls_all(&mut expr),
+                [UnresolvedCall {
+                    name: "f".into(),
+                    arity: 0,
+                    origin: None,
+                    occurrence_index: 1,
                 }]
             );
         }

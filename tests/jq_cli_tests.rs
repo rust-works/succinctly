@@ -45828,6 +45828,52 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085()
     Ok(())
 }
 
+/// #2635: the one shape #2085's call-site table cannot answer on its own --
+/// two occurrences of the *same* name and *same* arity, differing only by
+/// lexical scope, where just one of them resolves. The table has no scope
+/// information (it is a table of calls, not of failures), so it cannot tell
+/// the resolving occurrence apart from the failing one by name+arity alone;
+/// this needs `resolve::check`'s own `occurrence_index` (computed while
+/// walking the scope-aware tree) to know *which* occurrence actually failed.
+/// Every expectation is a live jq 1.7.1 capture.
+#[test]
+fn test_unresolved_call_line_distinguishes_same_scope_shape_2635() -> Result<()> {
+    // The issue's own repro: `def f` is in scope for the first `f` (inside
+    // the parens) but not the second (after the pipe) -- both are `f/0`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "(def f: 1;\nf)\n| f"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("f/0 is not defined at <top-level>, line 3:"),
+        "should cite the failing occurrence (line 3), not the resolving one (line 2) -- stderr: {stderr:?}"
+    );
+
+    // Three occurrences of `g/0`: resolves, fails, resolves again -- the
+    // middle one must be cited, not the first or the third.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(def g: 1; g),\ng,\n(def g: 1; g)"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("g/0 is not defined at <top-level>, line 2:"),
+        "stderr: {stderr:?}"
+    );
+
+    // Two failing occurrences of the same name+arity, each in its own
+    // out-of-scope position -- both fail, so this is the #2037 "walk
+    // successive occurrences" case layered on top of #2635's scope case:
+    // each must cite its own line, neither repeating the other's.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "h\n| h"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("line 1:") && stderr.contains("line 2:"),
+        "each failing occurrence should cite its own line -- stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// An unresolvable call in a branch that is never taken still fails, and fails
 /// before any input is read. jq: `f/3 is not defined`, exit 3.
 #[test]
