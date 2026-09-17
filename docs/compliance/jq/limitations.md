@@ -940,16 +940,31 @@ is the revert that established what the other one costs.
    refuses — and a `catch` handler's
    markers are checked against the payload's own node (`try_payload_root`): `error($x)` and
    `$x | error` raise the marker's node verbatim, as jq's `catch` then sees the same `jv`, so
-   `. as $x | try error($x) catch path($x)` stays `[]`, while a value-equal payload
-   (`try error({a:1}) catch ($x.a = 9)` on `{"a":1}`) no longer certifies. The refuse-only
-   flips this makes are the in-evaluator twins of the embed residual above — a stage that
-   hands its input on as an owned copy is the same node to jq and a fresh document to
-   `eval.rs` — plus two the generic evaluator already refused: on the input-queue route,
-   `input | . as $x | [.] | .[0] | path($x)`, `… | {k:.} | .k | path($x)`, `… | reduce empty
-   as $i (.; .) | path($x)`, `input | reduce (.) as $x (.; ($x.a = 9))` (a fold's loop
-   variable, demoted with the accumulator's re-index, as the generic fold has done since
-   #2642) and `input | . as $x | try error($x) catch path($x)` (an `eval.rs`-minted marker
-   carries no node witness for `try_payload_root` to match) all answer in jq and refuse here.
+   `. as $x | try error($x) catch path($x)` stays `[]` wherever the raise sits in the body
+   (`try (.a | error($x)) catch …`, `try (if .a then error($x) else . end) catch …`), while a
+   value-equal payload (`try error({a:1}) catch ($x.a = 9)` on `{"a":1}`) or a body with two
+   raise sites naming different values no longer certifies. `eval.rs`'s own consumers that
+   hand their *unrebuilt ambient input* to the owned bridge — `any`/`all`/`IN`'s generator,
+   `until`/`while`/`repeat`'s first round, `recurse(f)`'s level 0, `debug(msg)`, `|=` on a
+   lone root path — take the non-demoting bridge, so `. as $x | any(($x.a = 9); true)`,
+   `. as $x | . |= ($x.a = 9)` and `. as $x | until(($x.a = 9) | true; .)` keep answering;
+   a later round, a sub-path, or a second path of the same `|=` (whose root jq's `setpath`
+   has already copied: `. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else .
+   end)` wrote `{"a":9,"b":2}` before this, jq refuses) demotes. The refuse-only flips this
+   makes are the in-evaluator twins of the embed residual above — a stage that hands its
+   input on as an owned copy is the same node to jq and a fresh document to `eval.rs` —
+   plus two the generic evaluator already refused: on the input-queue route, `input | . as
+   $x | S | ($x.a = 9)` for S ∈ {`[.] | .[0]`, `{k:.} | .k`, `[., .] | .[0]`, `reduce empty
+   as $i (.; .)`, `reduce 1 as $i (.; .)`, `foreach 1 as $i (.; .; .)`, `getpath([])`,
+   `nth(0; .)`, `until(true; .)`, `recurse(empty)`, `ltrimstr("x")`, `debug`, `stderr`} (each
+   returns its input, which reaches the next stage as an owned copy; `first(.)`, `select`,
+   `if`, `//`, `try .`, `label`, `limit`, `. as $y | .` keep their cursor and still answer),
+   `input | reduce (.) as $x (.; ($x.a = 9))` (a fold's loop variable, demoted with the
+   accumulator's re-index, as the generic fold has done since #2642),
+   `input | . as $x | try error($x) catch path($x)` (an `eval.rs`-minted marker carries no
+   node witness for `try_payload_root` to match) and `. as $x | any(.; ($x.a = 9))` (`cond`
+   runs on each element `gen` yields as a computed value, even when `gen` is `.`) all
+   answer in jq and refuse here.
    Pinned in `tests/jq_cli_tests.rs` (`*_3036`), swept by
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `in-evaluator-*` rows and fuzzed by
    `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family. The accepting direction — recovering
