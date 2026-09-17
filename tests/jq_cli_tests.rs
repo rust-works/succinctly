@@ -46861,6 +46861,74 @@ fn test_break_occurrence_counters_do_not_cross_module_boundaries_2964() -> Resul
     Ok(())
 }
 
+/// #2964 review finding, documented as an accepted residual in
+/// `docs/compliance/jq/limitations.md` (the "position-recovery site table
+/// can drift" section): `resolve::check` correctly skips an unreferenced
+/// `def`'s body (its own `reachable`-gated visit never counts this `break`),
+/// but `collect_break_sites`' second, reachability-blind textual re-parse
+/// still lists it, so the CLI's caret cites the *unreferenced* `break $x`
+/// (offset/occurrence 0) instead of the real, top-level one the oracle
+/// points at. Pins today's honest (wrong-caret) behavior so a future change
+/// can't silently make the drift worse without a test noticing.
+#[test]
+fn test_break_in_unreferenced_def_body_shifts_the_caret_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "def f: break $x; break $x"], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    // The pinned oracle (`/usr/bin/jq` 1.7.1) instead cites the top-level
+    // `break $x` (17 spaces of padding, not 7) -- see limitations.md.
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             def f: break $x; break $x{}\n\
+             jq: 1 compile error\n",
+            " ".repeat(7)
+        )
+    );
+    Ok(())
+}
+
+/// #2964 review finding, documented as an accepted residual in
+/// `docs/compliance/jq/limitations.md`: `reduce`/`foreach` checks `init`
+/// before the bound pattern's own computed keys (#2734), even though the
+/// pattern is written *first* in source -- matching real jq's own
+/// *diagnostic order* for this construct (init's error reported first).
+/// What it cannot also match is `collect_break_sites`' table, which is
+/// sorted by pure text offset (the pattern key sorts first) -- so each
+/// message's *caret* points at the *other* occurrence's position, even
+/// though the message order and count are correct. Pins today's honest
+/// (swapped-caret) behavior.
+#[test]
+fn test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "reduce (1,2) as {(break $x): $v} (break $x; .+1)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    // The pinned oracle reports the same two messages in the same order, but
+    // with the two caret paddings swapped (34 then 18, `init`'s own break
+    // first) -- see limitations.md.
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             reduce (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
+             jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             reduce (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
+             jq: 2 compile errors\n",
+            " ".repeat(18),
+            " ".repeat(34)
+        )
+    );
+    Ok(())
+}
+
 /// #1687 on the jq side, and #2066's own follow-up fixing the array-valued
 /// half. Plain `succinctly jq` collapses duplicate keys on purpose (#1385,
 /// matching real jq), so the observable surface here is `--preserve-input`,
