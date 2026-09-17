@@ -494,17 +494,20 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
 /// `Int`s that are *not* literals: `+`/`-`/`*` already return a `Float` for
 /// anything past `2^53` (`jq_checked_int_arith`, #2631) and `%` does the
 /// same (`jq_f64_backed_int`); an `Int` that came *from* a double
-/// (`floor`/`ceil`/`round`/`trunc`, `%`'s truncating operands) is exactly
-/// representable, and for such values this function is provably the
-/// identity -- doubles are at least 16 apart on `[10^17, 10^18)` and at
-/// least 128 apart above `10^18`, while the 17-digit rounding moves a
-/// value by at most 5 or 50, so it rounds straight back to the double it
-/// started as; unary minus and `length` produce the exact negation or
-/// magnitude of a literal, and this function is sign-symmetric; and the
-/// reindex bridge re-bakes an `Int` as a `NumberLiteral` of the same
-/// value. The one exact-`i64` producer past `2^53` that is *not* a literal
-/// is `range`, which stays on its documented exact walk
-/// (`docs/compliance/jq/limitations.md`).
+/// (`floor`/`ceil`/`round`/`trunc`'s own result, `length`'s magnitude, `%`'s
+/// truncating operands) is now *always* `<= 2^53` by construction
+/// (`integral_f64_result`/`numeric_length_owned`, #2937 -- past that bound
+/// those builtins return a `Float` instead), so this function is provably
+/// the identity for them regardless of the 17-digit-rounding argument
+/// below; unary minus produces the exact negation of a literal, and this
+/// function is sign-symmetric; and the reindex bridge re-bakes an `Int` as
+/// a `NumberLiteral` of the same value. For a literal proper (the case this
+/// function actually exists for), doubles are at least 16 apart on
+/// `[10^17, 10^18)` and at least 128 apart above `10^18`, while the
+/// 17-digit rounding moves a value by at most 5 or 50, so it rounds
+/// straight back to the double it started as. The one exact-`i64` producer
+/// past `2^53` that is *not* a literal is `range`, which stays on its
+/// documented exact walk (`docs/compliance/jq/limitations.md`).
 ///
 /// yq mode never calls this: real yq's arithmetic is exact `int64`, so its
 /// `Int`-to-`f64` widening stays a plain cast (`int_to_f64`).

@@ -79,6 +79,21 @@ libm_fns! {
     sqrt(x) => sqrt;
     trunc(x) => trunc;
     fabs(x) => fabs;
+    // #2937: `floor`/`ceil`/`round` are IEEE-exact (every conforming
+    // implementation agrees bit for bit, same as `sqrt`/`trunc` above), so
+    // this macro's platform-libm binding isn't load-bearing for correctness
+    // here the way it is for the transcendental functions -- it's added
+    // anyway, for the same reason `sqrt`/`trunc` are, so every function in
+    // this module stays one uniform, auditable binding rather than some
+    // going through the platform and others through the `libm` crate ad
+    // hoc. `round` is C `round` (half away from zero), which is what jq's
+    // own `jvp_number_round`/`jv_number_round` call, not Rust's `f64::round`
+    // (identical rounding rule, different symbol -- keeping the platform
+    // binding here is what pins that jq calls the same C function, not a
+    // same-behaving Rust method that could drift from it later).
+    floor(x) => floor;
+    ceil(x) => ceil;
+    round(x) => round;
     // #3042
     erf(x) => erf;
     erfc(x) => erfc;

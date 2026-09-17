@@ -58616,49 +58616,28 @@ fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()
     Ok(())
 }
 
-/// #2906 left two same-mechanism gaps open (tracked as #2936 and #2937);
-/// this pins their *current* answers so a later change cannot move them
-/// unnoticed, and so the eventual fixes have a test to flip. Each row's jq
-/// 1.7.1 answer is in the comment; succinctly's output was verified
-/// identical before and after #2906. (A third gap, #2938 -- the reindex
-/// bridge re-parsing a computed double as an integer literal -- closed when
-/// #2902 landed; its rows now live in
-/// `test_large_int_literal_rounds_to_17_digits_in_comparisons_2906`.)
+/// #2906's original gap is now fully closed, in three pieces: #2938 -- the
+/// reindex bridge re-parsing a computed double as an integer literal -- when
+/// #2902 landed, its rows now living in
+/// `test_large_int_literal_rounds_to_17_digits_in_comparisons_2906`; #2936 --
+/// a >17-digit float literal parsed with one correct rounding instead of
+/// jq's 17-digit pre-rounding -- pinned below in
+/// `test_float_literal_rounds_to_17_digits_2936`; and #2937 -- the math
+/// builtins widening an operand with a bare cast, and `floor`/`length`
+/// printing a large `Int` literal's exact digits where jq prints the
+/// double -- pinned correct in the `math_operand_widening_2937` jq golden
+/// case (`tests/data/jq-golden/cases/`), replayed by `jq_golden_conformance`
+/// in `tests/jq_golden_tests.rs`. This test now just confirms the sqrt/floor
+/// rows that used to characterize the open gap match jq directly.
 #[test]
 fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()> {
-    for (filter, current, jq_says) in [
-        // #2936 closed the float-literal row: `2.7293109604053567083 + 0`
-        // is jq's `2.7293109604053565` now and lives in
-        // `test_float_literal_rounds_to_17_digits_2936` below.
-        //
-        // #2937: the floor family (and `length`) print exact digits where
-        // jq has a double. The `sqrt` row moved twice -- from `...647` to
-        // `...646` when #3045 replaced a Newton iteration with the
-        // platform's correctly rounded `sqrt`, then to jq's own `...645`
-        // when #2936 routed the cursor-level math readers through
-        // `document_number_f64`, which widens an integer literal the way
-        // jq does; the `floor` row moved with it, from the exact integer
-        // `...064` to the 17-digit-rounded double `...936` printed with
-        // its exact digits (jq prints the same double as `...000`), which
-        // is the display half #2937 still owns.
-        (
-            "869389897822472004 | floor",
-            "869389897822471936",
-            "869389897822472000",
-        ),
-        (
-            "869389897822472004 | length",
-            "869389897822472004",
-            "869389897822472000",
-        ),
+    for (filter, jq_says) in [
+        ("869389897822472004 | floor", "869389897822472000"),
+        ("869389897822472004 | length", "869389897822472000"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
-        assert_eq!(
-            output.trim(),
-            current,
-            "`{filter}` moved -- if it now prints {jq_says} (jq's answer), update this row and close the tracked issue"
-        );
+        assert_eq!(output.trim(), jq_says, "`{filter}`");
     }
     Ok(())
 }

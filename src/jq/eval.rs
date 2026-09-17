@@ -8995,15 +8995,19 @@ pub(crate) fn jq_int_within_exact_f64_range(value: i64) -> bool {
     value.unsigned_abs() <= (1u64 << 53)
 }
 
-/// Wrap a jq-mode integer *result* the way real jq holds it -- as a double.
-/// Within `f64`'s exact-integer range an `Int` is that same double and
-/// prints identically, so it stays exact; past it the value is stored as
-/// the `Float` jq would compute (`r as f64`, one correct rounding, matching
-/// C's `(double)intmax`), so it prints through
+/// Wrap a jq-mode **integer** result the way real jq holds it -- as a
+/// double. Within `f64`'s exact-integer range an `Int` is that same double
+/// and prints identically, so it stays exact; past it the value is stored
+/// as the `Float` jq would compute (`r as f64`, one correct rounding,
+/// matching C's `(double)intmax`), so it prints through
 /// [`jq_bare_float_display`]'s shortest-round-trip formatting rather than
 /// its own exact digits (#2631, #2906), and never becomes an exact `Int`
 /// past `2^53` that [`jq_literal_int_to_f64`] would later mistake for a
-/// literal.
+/// literal. [`integral_f64_result`] is this function's **float**-input
+/// sibling, for a math builtin (`floor`/`ceil`/`round`/`trunc`) whose
+/// result already went through `f64` arithmetic rather than `i64` (#2937) --
+/// same `2^53` boundary and reasoning, plus jq mode's own `-0.0` exception
+/// an integer result never needs.
 fn jq_f64_backed_int(result: i64) -> OwnedValue {
     if jq_int_within_exact_f64_range(result) {
         OwnedValue::Int(result)
@@ -14718,10 +14722,15 @@ pub(crate) fn numeric_length_owned<S: EvalSemantics>(value: OwnedValue) -> Owned
         OwnedValue::Int(rendered.chars().count() as i64)
     } else {
         match value {
-            OwnedValue::Int(i) => match i.checked_abs() {
-                Some(a) => OwnedValue::Int(a),
-                None => OwnedValue::Float(-(i as f64)),
-            },
+            // jq computes `fabs(jv_number_value(x))` -- a double, not an
+            // exact integer (#2937). `Int` here is the same display
+            // optimization `integral_f64_result` uses: exact only up to
+            // `2^53`, past which (including `i64::MIN`, whose magnitude is
+            // `2^63`) the result is the `Float` jq would actually print.
+            OwnedValue::Int(i) if i.unsigned_abs() <= EXACT_F64_INT_BOUND as u64 => {
+                OwnedValue::Int(i.abs())
+            }
+            OwnedValue::Int(i) => OwnedValue::Float(jq_literal_int_to_f64(i).abs()),
             OwnedValue::Float(f) => OwnedValue::Float(f.abs()),
             other => other,
         }
@@ -50574,7 +50583,9 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 /// yq-mode builtin with no yq oracle backing it. Kept numeric-only with its
 /// own pre-existing wording (not real yq's -- that gap is pre-existing and
 /// separate, filed as its own issue) rather than reusing
-/// `broken_down_time_fields`.
+/// `broken_down_time_fields`. `S` widening (#2937) still applies here,
+/// unlike `todate`: this function's own numeric-only parse still goes
+/// through `get_float_value_with`.
 fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
@@ -52339,6 +52350,14 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Like [`get_float_value`], but with a caller-supplied error for the
 /// non-number case — used by `gmtime`/`localtime` to raise jq's own wording
 /// instead of the generic math-function message.
+///
+/// A document number widens through [`json_number_f64::<S>`], the same
+/// literal-rounding accessor `isnan`/`isinfinite`/`isnormal`/`length` use
+/// (#2936) -- so a math builtin's operand gets jq's full 17-significant-digit
+/// rounding, not just the integer-shaped subset #2937 originally covered
+/// with a bespoke `as_i64`/`int_to_f64` fast path (dropped here in favor of
+/// this one shared accessor, per its own doc comment's "add that arm here
+/// rather than at each caller").
 fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
@@ -52367,32 +52386,53 @@ fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-// no_std compatible floor: truncate towards negative infinity
-fn floor_f64(x: f64) -> f64 {
-    let t = x as i64 as f64;
-    if x < t {
-        t - 1.0
-    } else {
-        t
-    }
-}
+/// `Int`'s boundary in [`integral_f64_result`]'s jq-mode arm: past this
+/// magnitude, adjacent integers stop having distinct `f64` representations
+/// (the same `2^53` bound [`jq_int_within_exact_f64_range`] and
+/// [`jq_f64_backed_int`] use for a jq-mode arithmetic *result*, reused here
+/// for a math-builtin result under the identical reasoning).
+const EXACT_F64_INT_BOUND: f64 = 9_007_199_254_740_992.0; // 2^53
 
-// no_std compatible ceil: truncate towards positive infinity
-fn ceil_f64(x: f64) -> f64 {
-    let t = x as i64 as f64;
-    if x > t {
-        t + 1.0
-    } else {
-        t
-    }
-}
+/// yq mode's `Int` boundary in [`integral_f64_result`]: an `int64`'s own
+/// range, `[i64::MIN, i64::MAX]` widened to the half-open `f64` interval
+/// `[-2^63, 2^63)` -- `i64::MAX as f64` itself rounds *up* to `2^63` (`f64`
+/// has no exact representation of `2^63 - 1`), so the exclusive upper bound
+/// is what actually excludes it.
+const I64_RANGE_LOWER_BOUND_AS_F64: f64 = -9_223_372_036_854_775_808.0; // i64::MIN, exact
+const I64_RANGE_UPPER_BOUND_AS_F64: f64 = 9_223_372_036_854_775_808.0; // 2^63
 
-// no_std compatible round: round to nearest integer, half away from zero
-fn round_f64(x: f64) -> f64 {
-    if x >= 0.0 {
-        floor_f64(x + 0.5)
+/// Build the `Int`/`Float` result of `floor`/`ceil`/`round`/`trunc` from
+/// their computed `f64` (#2937).
+///
+/// jq mode stores every number as a double (`jv_number`); an `Int` here is
+/// purely a display optimization for the range where it and jq's own
+/// double agree exactly (`EXACT_F64_INT_BOUND`, `2^53`) -- past that, or for
+/// `-0.0` (which `Int` cannot represent at all), the result stays a `Float`
+/// and prints through the shortest-round-trip formatter, matching jq's own
+/// digits (`(-0.5)|ceil` -> `-0`, `1e19|floor` -> `1e+19`, not
+/// `9223372036854775807`).
+///
+/// yq mode's number model is a genuine `int64`: the result stays an exact
+/// `Int` whenever it actually fits `[-2^63, 2^63)` (including `-0.0 ->
+/// Int(0)`, matching Go's `int64` having no negative zero), and falls back
+/// to `Float` instead of the previous silent saturation to
+/// `i64::MAX`/`i64::MIN` past that range -- a succinctly extension either
+/// way (real yq's lexer rejects `floor` et al outright, so there is no
+/// oracle here), just no longer one that silently corrupts a huge value.
+fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
+    if f.is_nan() {
+        return OwnedValue::Float(f64::NAN);
+    }
+    if S::DECNUMBER_LITERALS {
+        if (f == 0.0 && f.is_sign_negative()) || f.abs() > EXACT_F64_INT_BOUND {
+            OwnedValue::Float(f)
+        } else {
+            OwnedValue::Int(f as i64)
+        }
+    } else if (I64_RANGE_LOWER_BOUND_AS_F64..I64_RANGE_UPPER_BOUND_AS_F64).contains(&f) {
+        OwnedValue::Int(f as i64)
     } else {
-        ceil_f64(x - 0.5)
+        OwnedValue::Float(f)
     }
 }
 
@@ -52402,8 +52442,7 @@ fn builtin_floor<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W, S>(&value, optional) {
-        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
+        Ok(n) => QueryResult::Owned(integral_f64_result::<S>(math::floor(n))),
         Err(r) => r,
     }
 }
@@ -52414,8 +52453,7 @@ fn builtin_ceil<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W, S>(&value, optional) {
-        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
+        Ok(n) => QueryResult::Owned(integral_f64_result::<S>(math::ceil(n))),
         Err(r) => r,
     }
 }
@@ -52426,8 +52464,7 @@ fn builtin_round<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W, S>(&value, optional) {
-        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
+        Ok(n) => QueryResult::Owned(integral_f64_result::<S>(math::round(n))),
         Err(r) => r,
     }
 }
@@ -52438,8 +52475,7 @@ fn builtin_trunc<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match get_float_value::<W, S>(&value, optional) {
-        Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Ok(n) => QueryResult::Owned(OwnedValue::Int(math::trunc(n) as i64)),
+        Ok(n) => QueryResult::Owned(integral_f64_result::<S>(math::trunc(n))),
         Err(r) => r,
     }
 }
@@ -97716,6 +97752,141 @@ mod tests {
         assert!(
             matches!(yq, QueryResult::None),
             "yq mode yields nothing past the root"
+        );
+    }
+
+    /// [`OwnedValue`]'s own `PartialEq` is *jq value equality*
+    /// (`Int(1) == Float(1.0)`), so it cannot tell the two variants apart --
+    /// exactly the distinction these tests exist to check. Bit-exact on the
+    /// `Float` side so it also catches `-0.0` vs `0.0` and a NaN payload,
+    /// neither of which `f64`'s own `PartialEq` distinguishes either.
+    fn is_int(v: &OwnedValue, want: i64) -> bool {
+        matches!(v, OwnedValue::Int(n) if *n == want)
+    }
+    fn is_float_bits(v: &OwnedValue, want: f64) -> bool {
+        matches!(v, OwnedValue::Float(f) if f.to_bits() == want.to_bits())
+    }
+
+    /// #2937: `integral_f64_result`'s two modes at every boundary --
+    /// `2^53` for jq (a display optimization only, both an `Int` and jq's
+    /// double already agree there) and `[-2^63, 2^63)` for yq (an actual
+    /// `int64` range, past which the value no longer fits at all).
+    #[test]
+    fn integral_f64_result_boundaries_2937() {
+        // jq mode: NaN, -0.0, the 2^53 edge, and past it (including +-inf).
+        assert!(matches!(
+            integral_f64_result::<JqSemantics>(f64::NAN),
+            OwnedValue::Float(f) if f.is_nan()
+        ));
+        assert!(is_int(&integral_f64_result::<JqSemantics>(0.0), 0));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(-0.0),
+            -0.0
+        ));
+        assert!(is_int(
+            &integral_f64_result::<JqSemantics>(EXACT_F64_INT_BOUND),
+            9_007_199_254_740_992
+        ));
+        assert!(is_int(
+            &integral_f64_result::<JqSemantics>(-EXACT_F64_INT_BOUND),
+            -9_007_199_254_740_992
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(EXACT_F64_INT_BOUND + 2.0),
+            EXACT_F64_INT_BOUND + 2.0
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(1e17),
+            1e17
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(1e19),
+            1e19
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(-1e19),
+            -1e19
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(f64::INFINITY),
+            f64::INFINITY
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<JqSemantics>(f64::NEG_INFINITY),
+            f64::NEG_INFINITY
+        ));
+
+        // yq mode: NaN, -0.0 -> Int(0) (no negative zero in Go's int64), the
+        // i64::MAX boundary (2^63, exclusive -- i64::MAX itself rounds up to
+        // this as an f64), i64::MIN (inclusive), and past both.
+        assert!(matches!(
+            integral_f64_result::<YqSemantics>(f64::NAN),
+            OwnedValue::Float(f) if f.is_nan()
+        ));
+        assert!(is_int(&integral_f64_result::<YqSemantics>(-0.0), 0));
+        assert!(is_int(
+            &integral_f64_result::<YqSemantics>(i64::MIN as f64),
+            i64::MIN
+        ));
+        assert!(is_int(
+            &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64 - 1024.0),
+            (I64_RANGE_UPPER_BOUND_AS_F64 - 1024.0) as i64
+        ));
+        assert!(
+            is_float_bits(
+                &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64),
+                I64_RANGE_UPPER_BOUND_AS_F64
+            ),
+            "i64::MAX as f64 (2^63) itself must not saturate to an Int"
+        );
+        assert!(is_float_bits(
+            &integral_f64_result::<YqSemantics>(I64_RANGE_LOWER_BOUND_AS_F64 - 1e6),
+            I64_RANGE_LOWER_BOUND_AS_F64 - 1e6
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<YqSemantics>(1e19),
+            1e19
+        ));
+        assert!(is_float_bits(
+            &integral_f64_result::<YqSemantics>(f64::INFINITY),
+            f64::INFINITY
+        ));
+    }
+
+    /// #2937: `numeric_length_owned`'s jq arm is exact only up to `2^53`
+    /// (the same display-optimization bound `integral_f64_result` uses),
+    /// including at `i64::MIN`, whose magnitude (`2^63`) is far past it.
+    #[test]
+    fn numeric_length_owned_widens_past_2937() {
+        assert!(is_float_bits(
+            &numeric_length_owned::<JqSemantics>(OwnedValue::Int(869_389_897_822_472_004)),
+            jq_literal_int_to_f64(869_389_897_822_472_004)
+        ));
+        assert!(is_float_bits(
+            &numeric_length_owned::<JqSemantics>(OwnedValue::Int(i64::MIN)),
+            jq_literal_int_to_f64(i64::MIN).abs()
+        ));
+        assert!(is_int(
+            &numeric_length_owned::<JqSemantics>(OwnedValue::Int(9_007_199_254_740_992)),
+            9_007_199_254_740_992
+        ));
+    }
+
+    /// #2937: `math_operand`'s `Int`/integer-`NumberLiteral` widening under
+    /// both modes, mirroring `get_float_value_with`'s own rule.
+    #[test]
+    fn math_operand_widens_number_literal_2937() {
+        let literal = OwnedValue::NumberLiteral(
+            NumberRepr::Int(869_389_897_822_472_004),
+            "869389897822472004".into(),
+        );
+        assert_eq!(
+            math_operand::<JqSemantics>(&literal, false),
+            Ok(jq_literal_int_to_f64(869_389_897_822_472_004))
+        );
+        assert_eq!(
+            math_operand::<YqSemantics>(&literal, false),
+            Ok(869_389_897_822_472_004_i64 as f64)
         );
     }
 }

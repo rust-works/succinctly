@@ -47694,3 +47694,42 @@ fn test_tz_non_number_wording_unchanged_by_3042() -> Result<()> {
     );
     Ok(())
 }
+
+/// #2937 (yq mode, `--jq-extensions`, a succinctly extension -- real yq's
+/// lexer rejects `floor` outright, so there is no oracle here): yq's own
+/// number model is a genuine `int64`, so `integral_f64_result` keeps
+/// today's plain-cast `Int` wherever it fits, instead of jq mode's `2^53`
+/// display-optimization boundary -- `.a | floor` on a document `!!int`
+/// past `2^53` but within `i64` range stays the same exact (if imprecise)
+/// integer it always printed. Past `i64` range, the previous silent
+/// saturation to `i64::MAX` is replaced with a `Float` instead. Plain
+/// `length` (not gated -- real yq surface) is unaffected either way, since
+/// it answers from the source text, not from any widened `f64`.
+#[test]
+fn test_yq_floor_keeps_int64_cast_and_stops_saturating_2937() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".a | floor",
+        "a: 869389897822472004\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "869389897822472064");
+
+    let (output, code) = run_yq_stdin(
+        ".a | floor",
+        "a: 1e19\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0);
+    assert_ne!(output.trim(), "9223372036854775807", "must not saturate");
+    assert_eq!(output.trim(), "1e+19");
+
+    let (output, code) = run_yq_stdin(
+        ".a | length",
+        "a: 869389897822472004\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "18");
+    Ok(())
+}

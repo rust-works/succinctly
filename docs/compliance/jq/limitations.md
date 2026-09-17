@@ -6257,29 +6257,34 @@ cast that saturates on the arm64 oracle (`as i64` does the same), so
 `9223372036854775807 % 10` is `7` on the pin -- but the cast is undefined behaviour in C,
 and **the x86_64 case is not live-verified**: no x86_64 jq 1.7.1 was available to capture
 this session, so whether it saturates the same way there, yields `INT64_MIN`, or differs by
-compiler/libc is an open question, not a claim to build on (flag for whoever closes
-#2936/#2937/#2938 with x86_64 hardware in reach); and jq parses `-x % y` as `-(x % y)`
+compiler/libc is an open question, not a claim to build on (flag for whoever closes #2936
+with x86_64 hardware in reach); and jq parses `-x % y` as `-(x % y)`
 (unary minus binds looser than
 `%`) where succinctly parses `(-x) % y`, a pre-existing precedence gap that only shows at
 this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
 and data-sourced spellings agree on `-8`).
 
-**The float half closed with #2936** (the next section); **still open, same mechanism**
-(tracked as #2937): `floor`/`ceil`/`round`/`trunc` (and `length`, which is
-`fabs(jv_number_value(x))` in jq) of a large `Int` literal print their exact integer digits
-where jq prints the double (`869389897822472004 | floor` is `869389897822472000` in jq,
-`869389897822471936` here -- the same double, spelled exactly; before #2936 it was the
-unrounded `869389897822472064`). The math builtins' bare-cast widening
-(`869389897822472004 | sqrt` was `…647` here against jq's `…645`) closed as a side effect
-of #2936 routing the cursor-level readers through `document_number_f64`, which widens an
-integer literal the way jq does. A third gap this fix's review found — the reindex
-bridge re-parsing a computed double's printed digits as an *integer* literal before a
-document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array built in
-the filter), so that it then compared exactly against a real literal instead of equal —
-was filed as #2938 and closed by #2902 landing first: the bridge now hands a computed
-float back as a bare `Float`, so `[869389897822472004, (869389897822472000+0), 5] | sort`
-is jq's `[5,869389897822472004,869389897822472000]` here too. The `range` entry above
-stays on the exact `i64` path it documents, unaffected. (The unary-minus entry once cited
+**Closed in two steps.** The math builtins (`floor`, `sqrt`, `pow`, …) widening a large
+`Int` with a bare cast (`869389897822472004 | sqrt` was `…647` here against jq's `…645`)
+closed as a side effect of #2936 routing the cursor-level readers through
+`document_number_f64`, which widens a document number the way jq does (both the integer
+and the float-literal-rounding halves, #2906/#2936's own scope). The sibling gap #2936 left
+open — `floor`/`ceil`/`round`/`trunc` (and `length`, which is `fabs(jv_number_value(x))` in
+jq) of a large `Int` literal printing their exact integer digits where jq prints the double
+(`869389897822472004 | floor` is `869389897822472000` in jq, `869389897822471936` here --
+the same double, spelled exactly; before #2936 it was the unrounded `869389897822472064`)
+-- was filed as #2937 and closed by #2937 itself: `integral_f64_result` builds
+`floor`/`ceil`/`round`/`trunc`'s own `Int`/`Float` result from the computed double directly
+(capped at `2^53` in jq mode, the same display-optimization bound arithmetic results
+already used, rather than an unconditional `Int`), and `numeric_length_owned`'s jq arm gets
+the identical cap. A third gap this fix's review found — the reindex bridge re-parsing a
+computed double's printed digits as an *integer* literal before a document-input builtin
+(`sort`, `unique`, `min`, `max`, `group_by` on an array built in the filter), so that it
+then compared exactly against a real literal instead of equal — was filed as #2938 and
+closed by #2902 landing first: the bridge now hands a computed float back as a bare
+`Float`, so `[869389897822472004, (869389897822472000+0), 5] | sort` is jq's
+`[5,869389897822472004,869389897822472000]` here too. The `range` entry above stays on the
+exact `i64` path it documents, unaffected. (The unary-minus entry once cited
 alongside it here was #2357, since closed by #3044 — see that section for why it no
 longer belongs in this "unaffected" list.)
 
