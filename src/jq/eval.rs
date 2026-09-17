@@ -50420,7 +50420,10 @@ fn builtin_todate<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // 8-element broken-down-time array) and raise the identical
     // `<name>/1 requires parsed datetime inputs` error on anything else --
     // `broken_down_time_fields` is the one shared implementation of that,
-    // also used by `strftime_in_zone`.
+    // also used by `strftime_in_zone`. `S` still threads through to it: its
+    // numeric-timestamp arm reads a document number through
+    // `json_number_f64::<S>` (#2936), same as every other cursor-level
+    // reader in this family.
     let t = match broken_down_time_fields::<W, S>(&value, optional, &None, "strftime") {
         Ok(t) => t,
         Err(r) => return r,
