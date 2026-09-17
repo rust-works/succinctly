@@ -54351,6 +54351,39 @@ fn consumer_argument_positional_read_resolves_on_every_route_jq_2968() -> Result
     Ok(())
 }
 
+/// #3079 in jq mode: the same rows, where the stub answers a silent `false`.
+#[test]
+fn any_all_cond_read_resolves_on_rewritten_routes_jq_3079() -> Result<()> {
+    let doc = r#"{"aa":{"bbb":1,"c":2}}"#;
+    for (filter, want) in [
+        (
+            r#".aa | map_values(any(.; key == "c"))"#,
+            r#"{"bbb":false,"c":true}"#,
+        ),
+        (
+            r#".aa | map_values(any(.; key == "c") | key)"#,
+            r#"{"bbb":"bbb","c":"c"}"#,
+        ),
+        (
+            r#".aa[] |= any(.; key == "c")"#,
+            r#"{"aa":{"bbb":false,"c":true}}"#,
+        ),
+        (
+            r#".aa | with_entries(.value |= any(.; key == "value"))"#,
+            r#"{"bbb":true,"c":true}"#,
+        ),
+        (
+            r#".aa | .bbb = any(.[]; key == "c")"#,
+            r#"{"bbb":true,"c":2}"#,
+        ),
+        (r#".aa | "\(any(.[]; key == "c"))""#, r#""true""#),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "#3079: `{filter}`");
+    }
+    Ok(())
+}
+
 /// #2968: the native probe stops `cond` at its first decisive output, on
 /// both evaluators. Captured live from jq 1.7.1: `[any(1; (true,
 /// ("C"|stderr)))]` prints `[true]` and writes nothing -- `or` breaks out
