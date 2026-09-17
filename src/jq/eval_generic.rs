@@ -19789,7 +19789,15 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         // the rewrite cannot spell as this stage's constants -- refused, as
         // `AnyCond`'s `cond` is, so the pipe keeps the native streaming route.
         Expr::Builtin(Builtin::IsValid(f)) => sub(f),
-        Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond)) => !needs_path_context(cond),
+        // `any(cond)` is `any(.[]; cond)` with a navigating `gen`, so a read
+        // in `cond` takes #3079's route for that shape: the owned identity
+        // pipe runs the stage natively (`eval_owned_identity_any_all` over
+        // `.[]`), and only the caller that supplies the prefetch admits it.
+        Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond)) => {
+            !needs_path_context(cond)
+                || (admits.prefetch
+                    && owned_identity_pipe_supported(owned_identity_body_stages(expr)))
+        }
         Expr::Until { cond, update } | Expr::While { cond, update } => {
             !needs_path_context(cond) && !needs_path_context(update)
         }
@@ -20433,6 +20441,21 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // read inside them, so `needs_path_context` is `false` for the whole
         // construct and the early return above keeps it as written.
         Expr::Builtin(Builtin::IsValid(f)) => Expr::Builtin(Builtin::IsValid(boxed(f)?)),
+        // #2658/#3079: `any(cond)`'s `cond` stands at each element, so the
+        // whole stage is prefetched through the owned identity pipe, as
+        // `any(gen; cond)` under a navigating `gen` is.
+        Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond)) if needs_path_context(cond) => {
+            match at.prefetch {
+                Some(prefetch) => prefetched_literal(prefetch(expr)?),
+                None => {
+                    debug_assert!(
+                        false,
+                        "path_context_resolvable refuses an any(cond) read without a prefetch"
+                    );
+                    expr.clone()
+                }
+            }
+        }
         Expr::Try { expr, catch } => Expr::Try {
             expr: boxed(expr)?,
             catch: catch.as_deref().map(boxed).transpose()?,
@@ -23490,6 +23513,14 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                     return false;
                 }
             }
+            // #2658: `any(cond)` is the same stage over `.[]`.
+            Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond))
+                if needs_path_context(cond) =>
+            {
+                if !body(cond) {
+                    return false;
+                }
+            }
             Expr::AsPattern {
                 expr,
                 patterns,
@@ -25920,6 +25951,34 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Builtin(Builtin::AllCond(gen, cond)) if needs_path_context(cond) => {
             eval_owned_identity_any_all::<S, V>(gen, cond, false, rest, value, id, optional, tail)
+        }
+        // #2658: `any(cond)`/`all(cond)` over a container are the same
+        // stage with `.[]` as `gen`. A scalar input is answered here too,
+        // with `any_all_f`'s own `Cannot iterate over …` before `cond` ever
+        // runs -- not through `.[]`, which in yq mode yields nothing on an
+        // owned scalar instead of raising, and not by falling to the ruled
+        // arm, whose prefetch of this stage would arrive straight back here.
+        Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond)) if needs_path_context(cond) => {
+            let target_truthy = matches!(stage, Expr::Builtin(Builtin::AnyF(_)));
+            if !matches!(&*value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+                if optional {
+                    return Flow::Exhausted;
+                }
+                return Flow::Escaped(Control::Error(EvalError::cannot_iterate_with(
+                    S::TAG,
+                    &value,
+                )));
+            }
+            eval_owned_identity_any_all::<S, V>(
+                &Expr::Iterate,
+                cond,
+                target_truthy,
+                rest,
+                value,
+                id,
+                optional,
+                tail,
+            )
         }
         // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
         // last output, or `null` at this same position when there was none

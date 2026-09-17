@@ -60451,6 +60451,57 @@ fn test_any_all_cond_while_until_native_arms_match_jq_2658() -> Result<()> {
         ("[[1],[2]]", "map(any(.==1))", "[true,false]"),
         ("[1,2]", "any(.==1) and all(.>0)", "true"),
         ("[1,2]", "if any(.==3) then \"y\" else \"n\" end", "\"n\""),
+        // #2658 review: a position read inside `cond` answers the same on
+        // the plain streaming route, beside a position-reading sibling
+        // (the positioned route) and on the owned identity pipe
+        // (`map_values`), and the same as the `any(.[]; cond)` spelling on
+        // each -- `key` is a succinctly extension in jq mode, so these
+        // rows pin route agreement, not a jq answer.
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "[.[] | any(key == \"c\")]",
+            "[true,false]",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "[.[] | any(key == \"c\"), key]",
+            "[true,\"b\",false,\"d\"]",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "[.[] | any(.[]; key == \"c\"), key]",
+            "[true,\"b\",false,\"d\"]",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "map_values(any(key == \"c\"))",
+            "{\"b\":true,\"d\":false}",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "map_values(any(.[]; key == \"c\"))",
+            "{\"b\":true,\"d\":false}",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":5}",
+            "map_values(try any(key == \"c\") catch \"err\")",
+            "{\"b\":true,\"d\":\"err\"}",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            "[.[] | until(key == \"c\"; .c), key]",
+            "[1,\"b\",2,\"d\"]",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            "[.[] | until(key == \"c\"; .c)]",
+            "[1,2]",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"e\":2}}",
+            "[.[] | isvalid(key), key]",
+            "[true,\"b\",true,\"d\"]",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
         assert_eq!(code, 0, "cursor route `{filter}` on {input}: {stderr}");
