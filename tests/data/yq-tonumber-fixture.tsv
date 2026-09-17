@@ -65,6 +65,16 @@ _1.5	0
 -0x1p3	1	!!float	-8.0
 +0x1p3	1	!!float	8.0
 0x1p+3	1	!!float	8.0
+0x1.gp1	0		
+0xg.1p3	0		
+0x1p	0		
+0x1pA	0		
+0x1p+	0		
+0x0p5	1	!!float	0.0
+0x0.0p5	1	!!float	0.0
+0x00p9	1	!!float	0.0
+0x1p999999	0		
+0x1p-999999	1	!!float	0.0
 inf	1	!!float	
 Inf	1	!!float	
 +inf	1	!!float	
@@ -92,6 +102,9 @@ infinities	0
 5e-324	1	!!float	5e-324
 4.9e-324	1	!!float	4.9e-324
 1e-324	1	!!float	1e-324
+1e99_9	0		
+-1e99_9	0		
++1e999	0		
  1 	0		
 1 	0		
 \t1	0		

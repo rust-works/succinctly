@@ -16181,6 +16181,14 @@ fn bn_is_zero(bn: &[u8]) -> bool {
 }
 
 fn bn_mul_add(bn: &mut Vec<u8>, mul: u32, add: u32) {
+    // No trailing-zero trim needed after this: every caller keeps `bn`
+    // minimal (its last/most-significant digit nonzero, or the lone digit
+    // `0` for zero itself) and only ever multiplies by 2, 5, or 16 (never
+    // 0), so the most-significant digit `dk` processed last in the loop
+    // below always has `dk * mul + carry_in >= 2` -- too large to land back
+    // on a `% 10 == 0` result without also producing a nonzero `carry_out`,
+    // which the `while carry > 0` loop then pushes as the new (nonzero)
+    // most-significant digit.
     let mut carry: u64 = add as u64;
     for d in bn.iter_mut() {
         let v = (*d as u64) * (mul as u64) + carry;
@@ -16190,9 +16198,6 @@ fn bn_mul_add(bn: &mut Vec<u8>, mul: u32, add: u32) {
     while carry > 0 {
         bn.push((carry % 10) as u8);
         carry /= 10;
-    }
-    while bn.len() > 1 && *bn.last().expect("bn is never empty") == 0 {
-        bn.pop();
     }
 }
 
