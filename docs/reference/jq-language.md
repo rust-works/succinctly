@@ -180,13 +180,23 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `parent` (yq) - returns parent node of current position
 - [x] `parent(n)` (yq) - returns nth parent node
 
-### Math Functions (34 total)
+### Math Functions (70 total)
 - [x] Basic: `floor`, `ceil`, `round`, `trunc`, `sqrt`, `fabs`, `abs`
 - [x] Exponential: `log`, `log10`, `log2`, `exp`, `exp10`, `exp2`
 - [x] Trigonometric: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
 - [x] 2-arg: `pow(x; y)`, `atan2(y; x)`
 - [x] Hyperbolic: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`
 - [x] Special: `infinite`, `nan`, `isinfinite`, `isnan`, `isnormal`, `isfinite`
+- [x] The rest of jq's libm surface (#3042) — unary: `cbrt`, `erf`, `erfc`, `expm1`,
+      `log1p`, `gamma`, `lgamma`, `tgamma`, `j0`, `j1`, `y0`, `y1`, `logb`, `rint`,
+      `nearbyint`, `significand`, and the array-valued `frexp` (`[mantissa, exponent]`),
+      `modf` (`[fraction, integer]`), `lgamma_r` (`[value, sign]`); 2-arg: `copysign`,
+      `drem`, `fdim`, `fmax`, `fmin`, `fmod`, `hypot`, `jn(n; x)`, `ldexp(x; e)`,
+      `nextafter`, `nexttoward`, `remainder`, `scalb`, `scalbln`, `yn(n; x)`; 3-arg:
+      `fma(x; y; z)`. `pow10` is jq's own runtime error (`pow10/0 not found at build
+      time`), since no platform libm exports it. Every function calls the platform libm,
+      as jq does — see [limitations](../compliance/jq/limitations.md#the-math-builtins-print-the-platform-libms-last-bit-as-jq-does-3045)
+      for what that means for the last digit.
 
 ### I/O & Debug
 - [x] `debug` / `debug(msg)`

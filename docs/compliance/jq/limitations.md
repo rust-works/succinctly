@@ -28,14 +28,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 223 probes in
+Measured against jq-1.7.1 over the 232 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                                |
 |----------------------------------------------|---------------------|--------------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **221/223 = 99.1%** | Byte-identical to jq                                   |
+| **Message text** (both evaluators, verbatim) | **230/232 = 99.1%** | Byte-identical to jq                                   |
 | **Wording divergences**                      | **2**               | Both evaluators raise, but word it differently from jq |
 | **Behaviour / parser gaps**                  | **0**               | succinctly does not raise the error at all             |
 
@@ -420,13 +420,45 @@ What remains, recorded here:
   move a last bit there; the leg running green is the measurement. The older
   `math_sin_samples`/`math_cos_samples`/`math_atan_pi` goldens floor to six decimals and
   stay as they are: they are not wrong, they just cannot see this.
-- **`cbrt`, `tgamma`, `lgamma`, `erf`, `j0`/`y0` and the rest of #3042** are not
-  implemented yet. The sweep behind this section measured them too: the platform C
-  symbols are bit-exact against both jq builds for every one, so #3042 can take the same
-  route — with one trap. On `linux-gnu`, `compiler_builtins` exports its own `cbrt` (a
-  musl port, alongside the exact `sqrt`/`floor`/`fma` family), and the linker binds an
-  `extern "C" cbrt` to it *before* glibc's: 192/400 off the Linux jq, while matching
-  Apple's. Reaching glibc's `cbrt` needs `dlsym` or a rename, not just a declaration.
+- **`cbrt`, `tgamma`, `lgamma`, `erf`, `j0`/`y0` and the rest of #3042** take the same
+  route and are bit-exact against the platform's jq on every sampled input of every
+  function (the sweep's 32 further rows, 0/400 each on Apple silicon and x86_64 glibc).
+  One trap: on `linux-gnu`, `compiler_builtins` exports its own weak `cbrt`, `fmax` and
+  `fmin` (alongside the IEEE-exact `sqrt`/`floor`/`fma` family, which are
+  indistinguishable) and the linker binds an `extern "C"` declaration to those *before*
+  glibc's — `cbrt(27)` came out `3` where glibc's prints `3.0000000000000004` (192/400
+  off the Linux jq), and `fmax` returned the other zero on a `-0`/`0` tie. `jq::math`
+  reaches glibc's through `dlsym(RTLD_NEXT, ..)` for those three
+  (`glibc_next_fns!`); a musl build keeps `compiler_builtins`' copies, which *are* musl's.
+- **Where real jq's own answer is a property of the platform, succinctly prints that
+  platform's**, keyed on what actually decides it, all captured live from `/usr/bin/jq`
+  1.7.1-apple and `jq-linux-amd64` 1.7.1:
+  - `gamma` is `tgamma` on Apple (jq's `builtin.c` `#define`s it, since Apple's own
+    `gamma` is deprecated) and `lgamma` on glibc: `5 | gamma` is `24` there, `3.178...`
+    here.
+  - `scalb(x; y)` takes a *double* exponent, and glibc returns NaN for a non-integral one
+    where Apple's truncates: `scalb(3; 2.9)` is `12` on macOS, `null` on Linux.
+  - `ldexp`/`scalbln`/`jn`/`yn` convert their exponent or order with a C `(int)` cast,
+    which is undefined for NaN, infinities and out-of-range values, and the
+    *architectures* differ: x86-64 yields `INT_MIN` for all of them (`ldexp(3; infinite)`
+    is `0`, `jn(1e10; 0.5)` is `null`), AArch64 saturates and maps NaN to 0
+    (`1.7976931348623157e+308` and `-0`). `math::c_int`/`c_long` reproduce each, keyed
+    on `target_arch`; a Linux AArch64 jq would print the Apple column.
+  - `lgamma_r(0)` reports the sign as `0` on Apple and `1` on glibc.
+  - **The sign of zero on an `fmax`/`fmin` tie is not even stable within a platform.**
+    C leaves it unspecified; glibc 2.35's `fmax(-0.0; 0)` is `0` and 2.39's is `-0`,
+    and Ubuntu 24.04's own `jq` 1.7.1 prints `-0` where a dynamically linked succinctly
+    on the same host prints `0` — the compiler inlined jq's call as a `maxsd`, which
+    never consults `libm.so` at all. Nothing pins these; the golden avoids them and the
+    sweep's inputs never tie.
+  - `pow10` is a runtime error, `Error: pow10/0 not found at build time`, in every jq
+    1.7.1 build (glibc dropped the symbol in 2.27; Apple never had it), and here too.
+- **The hermetic golden `math_libm_family`** was built the same way as
+  `math_platform_libm_bits` above: every row was run through the Apple jq, the static
+  glibc-2.35 jq *and* Ubuntu 24.04's glibc-2.39 jq, compared as text (a JSON-level
+  compare is blind to `-0`), and only the rows all three agree on stayed; the
+  platform-dependent digits (`cbrt(27)`, `lgamma(5)`, `erf(1)`, ...) are pinned per
+  platform by `math.rs`'s gated unit test instead.
 
 ## Behaviour and parser gaps
 
@@ -3375,11 +3407,13 @@ Two deliberate remainders:
   points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
   trailing whitespace either way.
 
-The ~36 jq builtins succinctly does not implement (the libm family, #3042) are exempt from
-the pass via a roster captured from the pinned oracle
-(`tests/data/jq-builtin-names.txt`, regenerated by `./scripts/sync-jq-builtin-names.sh`):
-real jq compiles a mention of one, so rejecting it would be a regression. A *reached* call to
-one still fails at runtime as before.
+Every builtin the pinned jq defines is implemented since #3042 (the libm family) and #3046
+(`JOIN`, `format`, `input_filename`, ...). The roster captured from the pinned oracle
+(`tests/data/jq-builtin-names.txt`, regenerated by `./scripts/sync-jq-builtin-names.sh`)
+still backs the pass for a spelling the parser declines to lower (an arity the dedicated
+parser does not take, a `def`-shadowed name), and
+`test_every_pinned_jq_builtin_is_implemented_1473` sweeps it so that the "unimplemented"
+set stays empty.
 
 `succinctly yq` runs the same pass, keeping yq's uniform `Error: …` wording and exit 1. Real
 yq has no `def` at all — its lexer rejects `def f: 42; f` outright — so succinctly's `def`
