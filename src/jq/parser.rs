@@ -1948,48 +1948,64 @@ impl<'a> Parser<'a> {
                 {
                     let lit = self.parse_number_literal()?;
                     match lit {
-                        // #1035: jq's own grammar treats a leading `-` as
-                        // unary negation, not part of the number token --
+                        // #1035/#3044: jq's own grammar treats a leading `-`
+                        // as unary negation, not part of the number token --
                         // confirmed against jq 1.7.1, where `-1.500`/`-1e2`
                         // print `-1.5`/`-100` (fidelity collapses through
                         // the implied negation) while `1.500`/`1e2` print
-                        // unchanged. yq is the opposite: real yq never
-                        // collapses a negative literal's fidelity either
-                        // (`-1.500`/`-1e2` print back unchanged), so this
-                        // rewrite is jq-only. A plain negative *integer* has
-                        // no alternate spelling to lose (no fraction, no
-                        // exponent), so folding `-` into the token there
-                        // stays unobservable in jq mode either way -- and
-                        // it's what preserves succinctly's
-                        // i64::MIN-exact-literal capability (see
-                        // `test_large_integer_literal_falls_back_to_float`),
-                        // which routing through arithmetic would degrade to
-                        // a lossy float, unlike jq's double-only model.
+                        // unchanged, and (#3044) a plain integer past
+                        // `2^53` collapses the same way (`-869389897822472004`
+                        // prints `-869389897822472000`, matching binary
+                        // `-`/`+`/`*`'s own #2631/#2906 rounding). yq is the
+                        // opposite: real yq never collapses a negative
+                        // literal's fidelity, at any magnitude (confirmed
+                        // live against yq v4.53.3), so this rewrite is
+                        // jq-only.
+                        //
+                        // Below `2^53` a plain negative *integer* has no
+                        // alternate spelling to lose (no fraction, no
+                        // exponent, and the exact `i64` negation already
+                        // *is* what jq's own arithmetic would compute), so
+                        // folding `-` into the token there stays
+                        // unobservable in jq mode -- and it's what keeps
+                        // the hot `.foo.bar[-1]` index path on
+                        // `fold_index_key`'s cheap literal arm instead of
+                        // this `Mul`-folded shape (see that function's own
+                        // `Mul(-1, ..)` arm, which already understands it).
+                        // `jq_int_within_exact_f64_range` (`eval.rs`) is the
+                        // one shared definition of that boundary -- reused
+                        // here rather than re-derived, so the parser's
+                        // decision can never silently drift from the
+                        // evaluator's own rounding threshold.
                         Literal::NumberLiteral(repr, text)
-                            if self.mode == ParserMode::Jq && text.contains(['.', 'e', 'E']) =>
+                            if self.mode == ParserMode::Jq
+                                && !matches!(repr, NumberRepr::Int(n) if crate::jq::eval::jq_int_within_exact_f64_range(n)) =>
                         {
                             // Multiply rather than subtract from zero:
                             // `0.0 - 0.0` is IEEE-754 positive zero,
                             // silently losing the sign of `-0.0`/`-0e0`
                             // (jq itself prints `-0` for these); `-1.0 *
-                            // 0.0` correctly preserves it.
+                            // 0.0` correctly preserves it. (Plain integer
+                            // `0` never reaches this arm at all -- it's
+                            // exactly in range -- so its own already-correct
+                            // literal-echo of `-0` is untouched.)
                             //
-                            // #1062: `repr` is `text`'s (negative) parsed
-                            // value; the split-off literal's own text has
-                            // the sign stripped, so its repr is `-repr`
-                            // (the positive magnitude), not a re-parse.
-                            // `Int` is unreachable here: the guard above
-                            // requires `.`/`e`/`E` in `text`, which
-                            // `parse_i64_or_f64` never resolves to an
-                            // `Int` -- `unreachable!()` rather than a
-                            // silently-wrapping fallback, so a future
-                            // change to that dispatch rule that breaks the
-                            // invariant fails loudly here instead of
-                            // producing a wrong-signed value.
+                            // #1062: for `Float`, `repr` is `text`'s
+                            // (negative) parsed value, so the split-off
+                            // literal's repr is `-repr` (the positive
+                            // magnitude), not a re-parse. For `Int` (#3044:
+                            // now reachable here, past `2^53`), the same
+                            // negation can overflow `i64` for exactly one
+                            // value -- `i64::MIN`, whose positive magnitude
+                            // (`2^63`) doesn't fit `i64` -- so that one case
+                            // falls back to the same `f64` cast `arith_negate`
+                            // would have produced for it; every other `Int`
+                            // negates exactly.
                             let stripped_repr = match repr {
-                                NumberRepr::Int(_) => unreachable!(
-                                    "a '.'/'e'/'E'-containing literal never parses as NumberRepr::Int"
-                                ),
+                                NumberRepr::Int(n) => match n.checked_neg() {
+                                    Some(positive) => NumberRepr::Int(positive),
+                                    None => NumberRepr::Float(-(n as f64)),
+                                },
                                 NumberRepr::Float(f) => NumberRepr::Float(-f),
                             };
                             Ok(Expr::Arithmetic {
@@ -8399,36 +8415,102 @@ mod tests {
 
     #[test]
     fn test_large_integer_literal_falls_back_to_float() {
-        // Literals beyond i64 range degrade to floats like jq (issue #166),
-        // but #1035 keeps the literal's own source spelling rather than
-        // immediately collapsing it to a freshly-formatted f64 -- the value
-        // still *evaluates* as a float (see the `from_number_literal`
-        // conversion), only the AST node's stored text is unaffected here.
+        // A *positive* literal beyond i64 range degrades to a float like jq
+        // (issue #166), but #1035 keeps the literal's own source spelling
+        // rather than immediately collapsing it to a freshly-formatted f64
+        // -- the value still *evaluates* as a float (see the
+        // `from_number_literal` conversion), only the AST node's stored
+        // text is unaffected here. A *negative* literal at the same
+        // magnitude does not stay a bare `Literal` -- see
+        // `test_negative_large_integer_literal_splits_past_2_53_3044` --
+        // since jq's own grammar always treats a leading `-` as unary
+        // minus, computed, never a preserved literal (#3044).
         assert_eq!(
             parse("9999999999999999999").unwrap(),
             Expr::Literal(Literal::number_literal("9999999999999999999".to_string()))
         );
-        assert_eq!(
-            parse("-9999999999999999999").unwrap(),
-            Expr::Literal(Literal::number_literal("-9999999999999999999".to_string()))
-        );
-        // One past the boundary in each direction.
+        // One past the boundary.
         assert_eq!(
             parse("9223372036854775808").unwrap(),
             Expr::Literal(Literal::number_literal("9223372036854775808".to_string()))
         );
-        assert_eq!(
-            parse("-9223372036854775809").unwrap(),
-            Expr::Literal(Literal::number_literal("-9223372036854775809".to_string()))
-        );
-        // Boundary values stay exact integers.
+        // Boundary value stays an exact integer.
         assert_eq!(
             parse("9223372036854775807").unwrap(),
             Expr::Literal(Literal::number_literal("9223372036854775807".to_string()))
         );
+    }
+
+    /// #3044: a negative literal past `2^53`
+    /// ([`crate::jq::eval::jq_int_within_exact_f64_range`]) splits into
+    /// `-1 * <positive literal>` the same way the float/exponent case
+    /// above does, rather than staying a preserved `Literal` -- covering
+    /// both producers of the split-off literal's `Float` repr: a plain
+    /// digit string past `i64::MAX` (never reaches an `Int` repr at all),
+    /// and the one `Int` value whose own negation overflows `i64`
+    /// (`i64::MIN`, magnitude `2^63`).
+    #[test]
+    fn test_negative_large_integer_literal_splits_past_2_53_3044() {
+        let Expr::Arithmetic { left, right, .. } = parse("-9999999999999999999").unwrap() else {
+            panic!("expected an Arithmetic node"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
+        };
+        assert_eq!(*left, Expr::Literal(Literal::Int(-1)));
         assert_eq!(
-            parse("-9223372036854775808").unwrap(),
-            Expr::Literal(Literal::number_literal("-9223372036854775808".to_string()))
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float("9999999999999999999".parse::<f64>().unwrap()),
+                "9999999999999999999".to_string()
+            ))
+        );
+
+        // One past the boundary: the split-off literal is `Int` for every
+        // magnitude that fits `i64`, `Float` only past it.
+        let Expr::Arithmetic { right, .. } = parse("-9223372036854775809").unwrap() else {
+            panic!("expected an Arithmetic node"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
+        };
+        assert_eq!(
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float("9223372036854775809".parse::<f64>().unwrap()),
+                "9223372036854775809".to_string()
+            ))
+        );
+
+        // Exactly `i64::MIN`: still splits (its magnitude, `2^63`, is far
+        // past `2^53`), but the positive magnitude itself doesn't fit
+        // `i64`, so the split-off literal is `Float`, not `Int`.
+        let Expr::Arithmetic { right, .. } = parse("-9223372036854775808").unwrap() else {
+            panic!("expected an Arithmetic node"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
+        };
+        assert_eq!(
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Float(9223372036854775808.0),
+                "9223372036854775808".to_string()
+            ))
+        );
+
+        // Past `2^53` but well within `i64`: the split-off literal stays
+        // an exact `Int`, negated via `arith_mul`'s own #2631/#2906
+        // rounding at evaluation time, not degraded to `Float` here.
+        let Expr::Arithmetic { left, right, .. } = parse("-869389897822472004").unwrap() else {
+            panic!("expected an Arithmetic node"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #3044 pin itself, only formatted if the let-else pattern fails to match (#3044)"
+        };
+        assert_eq!(*left, Expr::Literal(Literal::Int(-1)));
+        assert_eq!(
+            *right,
+            Expr::Literal(Literal::NumberLiteral(
+                NumberRepr::Int(869389897822472004),
+                "869389897822472004".to_string()
+            ))
+        );
+
+        // Below `2^53`: unaffected, still the cheap identity-literal fold
+        // (see `test_literals`'s own `-123` case) -- confirms the new
+        // guard doesn't widen past its intended boundary.
+        assert_eq!(
+            parse("-123").unwrap(),
+            Expr::Literal(Literal::number_literal("-123".to_string()))
         );
     }
 

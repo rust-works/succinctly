@@ -5856,14 +5856,26 @@ jq 1.7.1 still answers empty here, but only because its own unary minus
 collapses a literal this large to a `double` before `range` ever sees it
 (confirmed live: `jq -nc '-9223372036854775758'` prints
 `-9223372036854776000`, already rounded) -- an unrelated, pre-existing
-divergence (see "Unary minus in filter text destroys literal preservation"
-below, #2357), not something
-#2219 changed. The pre-#2219 empty answer matched jq's only by coincidence
-of that unrelated quirk; feeding the same magnitudes in as *data* instead of
-literals (`echo '[-9223372036854775758,-9223372036854775808,-100]' | jq -c
+divergence (see "Unary minus in filter text destroyed literal preservation"
+below, #2357), not something #2219 changed. The pre-#2219 empty answer
+matched jq's only by coincidence of that unrelated quirk; feeding the same
+magnitudes in as *data* instead of literals
+(`echo '[-9223372036854775758,-9223372036854775808,-100]' | jq -c
 '[range(.[0];.[1];.[2])]'`) already showed jq answering
 `[-9223372036854775758]` even before this fix -- the single value #2219 now
-also gives from the literal spelling.
+also gave from the literal spelling.
+
+**Update, #3044:** the #2357 divergence just above is now closed, so this
+section's own repro no longer demonstrates what it did when written --
+`range(-9223372036854775758; -9223372036854775808; -100)` typed literally
+now answers empty in succinctly too, agreeing with jq for the same reason
+jq does (the literal is a computed double before `range` ever sees it).
+The `checked_add`-based overflow-safety fix this whole section documents
+is untouched; it just needs the data-sourced spelling above to reach it
+with these particular magnitudes now, same as it always did in real jq.
+See `test_range_i64_overflow_keeps_exact_prefix_2219`
+(`tests/jq_cli_tests.rs`), which was retargeted to source `from`/`to`/`step`
+from data for this reason.
 
 `eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000)` and its mirror at
 `i64::MIN` (overflow on the very first add, one value already pushed) and
@@ -6021,63 +6033,61 @@ described:
   jq's own hang, as ADR-0018 does not require — is the worse failure mode
   for the realistic inputs this magnitude range covers).
 
-### Unary minus in filter text destroys literal preservation — inherits the `range` divergence's own rule 4(c) grant (#2357)
+### Unary minus in filter text destroyed literal preservation — closed, the accepted-divergence premise was false (#2357, closed by #3044)
 
 Real jq preserves a number literal's exact source spelling through to output (`jq -n
 '1.0'` → `1.0`, `1e10` → `1E+10`), but a *unary minus written in the filter text* breaks
 that: `-1.0` is `negate(1.0)`, a computed `double`, not a preserved literal, so jq's own
-answer at extreme magnitude no longer matches the value as written. succinctly keeps the
-exact value regardless of a leading `-` in the filter. Confirmed live against jq 1.7.1:
-
-```console
-$ jq  -nc -- '-9223372036854775758'      # -9223372036854776000
-$ sjq -nc -- '-9223372036854775758'      # -9223372036854775758
-$ jq  -nc -- '-9007199254740993'         # -9007199254740992
-$ sjq -nc -- '-9007199254740993'         # -9007199254740993
-$ jq  -nc -- '-1.10'                     # -1.1  (agrees -- magnitude-specific)
-$ sjq -nc -- '-1.10'                     # -1.1
-```
-
-Only reachable above `2^53` (where a `double` can no longer hold the literal exactly) — the
-same magnitude floor the `range` divergence above starts at. It is specifically the
-*filter-text* unary minus: the identical value arriving as **data** keeps its exact spelling
-in both tools (unrelated to this divergence, and not the general large-integer class it might
-first look like):
+answer at extreme magnitude no longer matches the value as written. Only reachable above
+`2^53` (where a `double` can no longer hold the literal exactly). It is specifically the
+*filter-text* unary minus: the identical value arriving as **data** keeps its exact
+spelling in both tools, unaffected by any of this:
 
 ```console
 $ echo '[-9223372036854775758]' | jq  -c '.[0]'   # -9223372036854775758
 $ echo '[-9223372036854775758]' | sjq -c '.[0]'   # -9223372036854775758
 ```
 
-**Why this is worth stating explicitly rather than leaving as an obvious consequence of
-jq's own parser:** it silently changes the answer of anything downstream of a negative
-literal at that magnitude, and it produced a real analysis error in this repo before this
-was recorded — the `range` divergence above (`range(-9223372036854775758;
--9223372036854775808; -100)`) used to read as evidence that succinctly's overflow handling
-agreed with jq's, when the agreement was actually two independent bugs' outputs coinciding:
-jq's `[]` came entirely from unary minus collapsing `from` to exactly `i64::MIN` before
-`range` ever ran, not from anything `range` itself computed. Feeding the identical
-magnitudes in as data (where jq keeps its literals) already showed the two tools
-disagreeing on `range` itself, underneath the unary-minus coincidence.
+**Previously accepted as a divergence, on a premise #3044 found false.** succinctly used
+to keep the exact value regardless of a leading `-` in the filter, reasoned as the
+necessary consequence of the `range` divergence's own ADR-0018 rule-4(c) grant above —
+specifically because "`9223372036854775758` negated via `0 - 9223372036854775758`... keeps
+the exact value today," so singling out unary minus for jq's rounding would have been an
+inconsistent special case. #2631/#2906 made that premise false: binary `-`/`+`/`*` have
+rounded a literal past `2^53` since those fixes, so `0 - 9223372036854775758` already
+disagreed with the claim by the time #3044 checked it live — unary minus had become the
+one remaining holdout, not a consistent exception. Closed by matching jq exactly:
 
-**Accepted rather than matched — not a fresh rule-4 exemption, the same one already
-granted above.** This is not an independent divergence needing its own justification: it is
-the necessary consequence of the `range` divergence's own accepted trade-off ("succinctly
-stays on the exact `i64` path where jq's own arithmetic would round, stall, or hang",
-above), which already covers this exact magnitude class under ADR-0018 rule 4(c) —
-avoiding **the same named failure mode** rule 4(c) rejected there: "silently degrading
-large-but-safe integers to `f64`". Making unary minus specifically force that same
-degradation, for the one syntactic shape "a literal token immediately preceded by `-`" and
-no other, would reintroduce precisely that failure mode for this operator alone — while
-`9223372036854775758` negated via `0 - 9223372036854775758`, or the identical magnitude
-arriving as data with its sign already attached, both keep the exact value today. A
-special case narrow enough to catch only the unary-minus spelling would need to specifically
-detect and degrade a literal it would otherwise preserve exactly, which is the regression
-the `range` fix's own rule-4(c) argument already ruled out for this magnitude class, not a
-new argument invented for this operator. ("The other operator does the same thing" is not
-itself a rule-4 condition — the condition being invoked here is 4(c), inherited from the
-`range` entry above, not re-derived from consistency alone.) Pinned by
-`test_unary_minus_destroys_literal_preservation_2357` (`tests/jq_cli_tests.rs`).
+```console
+$ jq  -nc -- '-9223372036854775758'      # -9223372036854776000
+$ sjq -nc -- '-9223372036854775758'      # -9223372036854776000  (was -9223372036854775758)
+$ jq  -nc -- '-9007199254740993'         # -9007199254740992
+$ sjq -nc -- '-9007199254740993'         # -9007199254740992     (was -9007199254740993)
+$ jq  -nc -- '-1.10'                     # -1.1  (agrees -- magnitude-specific, unaffected)
+$ sjq -nc -- '-1.10'                     # -1.1
+```
+
+**Fix:** a literal-adjacent `-` (`-9223372036854775758`, no parens/pipe) now splits into
+`-1 * <positive literal>` in jq mode, the same desugaring `parser.rs` already used for a
+negative float/exponent literal (#1035) — extended from "only when the text contains
+`.`/`e`/`E`" to "whenever the magnitude is outside `jq_int_within_exact_f64_range`"
+(`eval.rs`, made `pub(crate)` for this reuse), so the existing `arith_mul`/
+`jq_checked_int_arith` rounding (#2631/#2906) does the rest. A magnitude within that range
+(the overwhelming majority of real negative literals, e.g. every `.[-1]`-style index) is
+untouched — same AST shape as before, so `fold_index_key`'s existing fast path for a
+literal index is unaffected. The parenthesized/piped spellings (`-(9223372036854775758)`,
+`9223372036854775758 | -.`) go through `arith_negate` (`eval.rs`) instead, which gained the
+matching rounding rule directly. Pinned by
+`test_unary_minus_matches_jq_past_2_53_3044` (`tests/jq_cli_tests.rs`).
+
+**Downstream effect on the `range` divergence above:** `range`'s own accepted exact-`i64`
+fast path is otherwise unchanged, but a bare negative-literal argument past `2^53` no
+longer reaches it directly (it arrives as a computed `Float`, same as every other operand
+this section already rounds) — `range(-9223372036854775758; -9223372036854775808; -100)`
+written literally now agrees with jq's own empty answer, genuinely rather than by the
+coincidence the `range` section above used to describe. Reaching the fast path with these
+exact magnitudes still works, unaffected, via data (`.[0]`/`--argjson`/...) — see
+`test_range_i64_overflow_keeps_exact_prefix_2219` (`tests/jq_cli_tests.rs`).
 
 ### Large-integer arithmetic past `2^53` — closed for `i64` literals: jq rounds a literal to 17 decimal digits *before* the double conversion (#2906)
 
@@ -6165,9 +6175,10 @@ document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array b
 the filter), so that it then compared exactly against a real literal instead of equal —
 was filed as #2938 and closed by #2902 landing first: the bridge now hands a computed
 float back as a bare `Float`, so `[869389897822472004, (869389897822472000+0), 5] | sort`
-is jq's `[5,869389897822472004,869389897822472000]` here too. The `range` entry above and
-the unary-minus entry (#2357) are unaffected — both stay on the exact `i64` path they
-document.
+is jq's `[5,869389897822472004,869389897822472000]` here too. The `range` entry above
+stays on the exact `i64` path it documents, unaffected. (The unary-minus entry once cited
+alongside it here was #2357, since closed by #3044 — see that section for why it no
+longer belongs in this "unaffected" list.)
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 

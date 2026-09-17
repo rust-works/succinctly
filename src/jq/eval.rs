@@ -8861,7 +8861,14 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// integers collapse onto the *same* double (confirmed live against
 /// `/usr/bin/jq` 1.7.1: `-33201876582270392` and `-33201876582270390` both
 /// round to the identical bit pattern).
-fn jq_int_within_exact_f64_range(value: i64) -> bool {
+///
+/// `pub(crate)` since #3044: `parser.rs`'s negative-literal split reuses
+/// this exact bound to decide whether a literal-adjacent `-` needs to fold
+/// into `-1 * <literal>` (matching jq's own always-computed unary minus) or
+/// can stay the cheap identity-literal fold that every small negative
+/// index (`.[-1]`) relies on -- one definition, so the parser's decision
+/// can never silently drift from the evaluator's own rounding threshold.
+pub(crate) fn jq_int_within_exact_f64_range(value: i64) -> bool {
     value.unsigned_abs() <= (1u64 << 53)
 }
 
@@ -9135,41 +9142,51 @@ fn arith_sub<S: EvalSemantics>(
 ///
 /// `Float(f)` negates via Rust's own unary `-`, which correctly flips the
 /// sign bit for every value including `0.0`. `Int(n)` negates via
-/// `checked_neg`/`wrapping_neg` (jq/yq's usual overflow conventions,
-/// matching `arith_sub`'s `0 - n` handling exactly: only `i64::MIN` can
-/// overflow, since `-i64::MIN` doesn't fit in `i64`) -- *except* for jq mode
-/// specifically with `n == 0`, which promotes to `Float(-0.0)` instead of
-/// staying `Int(0)`: unlike `arith_mul`, this function has exactly one
-/// caller (unary minus itself), so special-casing zero here can't
-/// accidentally reinterpret some unrelated expression the way
-/// special-casing `-1 * 0` inside `arith_mul` would have (see this
-/// function's own history above) -- real jq has no separate integer type,
-/// so an all-integer computation that reduces to exactly zero (`-(1-1)`) is
-/// already the double `0.0` there, and negating it naturally yields `-0.0`;
-/// this promotion is the one place `Int` deliberately gives up
-/// exact-integer fidelity to match that.
+/// `wrapping_neg` in yq mode (its usual overflow convention); in jq mode it
+/// mirrors `arith_sub`'s `0 - n` (#2631/#2906, via `jq_checked_int_arith`'s
+/// sibling reasoning): within `jq_int_within_exact_f64_range`, negation is
+/// both exact `i64` arithmetic (the range is far below `i64::MAX`, so it
+/// can't overflow) and what jq's own `f64` arithmetic would compute; past
+/// it, jq has already rounded the literal to a double before negating
+/// (`jq_literal_int_to_f64`, #2906) -- a bare `n as f64` cast disagrees with
+/// that on some 18/19-digit magnitudes, the same gap #2906 closed for
+/// `+`/`-`/`*`. `n == 0` is a further special case, specifically for jq
+/// mode, which promotes to `Float(-0.0)` instead of staying `Int(0)`:
+/// unlike `arith_mul`, this function has exactly one caller (unary minus
+/// itself), so special-casing zero here can't accidentally reinterpret some
+/// unrelated expression the way special-casing `-1 * 0` inside `arith_mul`
+/// would have (see this function's own history above) -- real jq has no
+/// separate integer type, so an all-integer computation that reduces to
+/// exactly zero (`-(1-1)`) is already the double `0.0` there, and negating
+/// it naturally yields `-0.0`; this promotion is the one place `Int`
+/// deliberately gives up exact-integer fidelity to match that.
 ///
-/// **jq-mode only**: real yq has no unary-minus operator at all (confirmed
-/// live against yq v4.53.3: `-.a` is a hard parse error, `'-' expects 2
-/// args but there is 1`) -- succinctly's own support for it in yq mode is
-/// a pre-existing, unrelated extension (#1056 doesn't touch whether it
-/// exists), so there's no oracle to say a zero-valued yq integer field
-/// negating to a float (`-.replicas` on `0` becoming `-0.0` instead of
-/// staying `0`) is the *intended* behavior rather than a surprising type
-/// change to a config value -- caught by code review before reaching
-/// `main`. Leaving yq's `Int(0)` un-promoted keeps this fix scoped to
-/// jq-mode's own verified, oracle-backed convention.
+/// **The past-`2^53` rounding is jq-mode only**: real yq has no unary-minus
+/// operator at all (confirmed live against yq v4.53.3: `-.a` is a hard
+/// parse error, `'-' expects 2 args but there is 1`) -- succinctly's own
+/// support for it in yq mode is a pre-existing, unrelated extension (#1056
+/// doesn't touch whether it exists), so there's no oracle to say a
+/// yq-mode `Int` past that magnitude should round to a double rather than
+/// stay exact. `S::OVERFLOW_WRAPS` gates the whole jq-only branch, matching
+/// every other call site of this rounding model (`arith_add`/`arith_sub`/
+/// `arith_mul`).
+///
+/// Was exact-`i64` unconditionally past `2^53` until #3044: #2357 accepted
+/// that as a divergence on the premise that the alternative,
+/// `0 - <literal>`, also kept the exact value at the time -- #2631/#2906
+/// made that premise false (binary `-`/`+`/`*` already round past `2^53`),
+/// leaving unary minus as the one holdout still keeping exact fidelity
+/// here. See `docs/compliance/jq/limitations.md`'s removed "#2357" entry.
 pub(crate) fn arith_negate<S: EvalSemantics>(operand: OwnedValue) -> Result<OwnedValue, EvalError> {
     match operand.into_plain_number() {
         OwnedValue::Int(0) if S::TAG != EvalTag::Yq => Ok(OwnedValue::Float(-0.0)),
-        OwnedValue::Int(n) => Ok(OwnedValue::Int(if S::OVERFLOW_WRAPS {
-            n.wrapping_neg()
+        OwnedValue::Int(n) => Ok(if S::OVERFLOW_WRAPS {
+            OwnedValue::Int(n.wrapping_neg())
+        } else if jq_int_within_exact_f64_range(n) {
+            OwnedValue::Int(-n)
         } else {
-            match n.checked_neg() {
-                Some(result) => result,
-                None => return Ok(OwnedValue::Float(-(n as f64))),
-            }
-        })),
+            OwnedValue::Float(-jq_literal_int_to_f64(n))
+        }),
         OwnedValue::Float(f) => Ok(OwnedValue::Float(-f)),
         other => Err(EvalError::cannot_be_negated(&other)),
     }
@@ -43334,13 +43351,16 @@ pub(crate) fn range_max_exceeded_error() -> EvalError {
 /// longer falls back to `f64`: `from` itself is a valid `i64` value inside
 /// the requested range, so it is pushed before the overflowing advance ends
 /// the loop, and the single-element answer `[-9223372036854775758]` is kept
-/// exactly rather than discarded. This also happens to match jq's own
-/// answer for the data-sourced spelling of this range (jq's unary minus on a
-/// *literal* collapses to `f64` and diverges here for an unrelated reason,
-/// tracked separately in `docs/compliance/jq/limitations.md`'s #2131
-/// section) -- see `test_eval_range_values_overflow_detection_2131` and the
+/// exactly rather than discarded. Reaching this function with these exact
+/// `i64` arguments needs a data-sourced `from`/`to`/`step` (`.[0]`, an
+/// `--argjson`, ...): a bare filter-text literal this large no longer gets
+/// here at all, since #3044 made jq-mode unary minus collapse it to a
+/// computed `f64` before `range` ever sees it, same as real jq's own
+/// parser always has -- so for that literal spelling both tools now agree
+/// on empty output (`docs/compliance/jq/limitations.md`'s former #2357
+/// section). See `test_eval_range_values_overflow_detection_2131` and the
 /// rest of this module's `#2131`-tagged tests for the sign/step-width
-/// combinations swept to confirm this.
+/// combinations swept to confirm the data-sourced case.
 fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
     to: i64,
@@ -58310,14 +58330,16 @@ mod tests {
     /// `emit`'s *other* match arm, for genuinely non-integer operands.
     #[test]
     fn test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219() {
-        fn range_values(src: &str) -> Vec<OwnedValue> {
-            let json: &[u8] = b"null";
+        fn range_values_from(json: &[u8], src: &str) -> Vec<OwnedValue> {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(src).unwrap();
             let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
             assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
             values
+        }
+        fn range_values(src: &str) -> Vec<OwnedValue> {
+            range_values_from(b"null", src)
         }
 
         // Ordinary small range: every value is an exact Int.
@@ -58351,13 +58373,22 @@ mod tests {
         // already pushed as an exact `Int` before that overflow ends the
         // loop, so it's kept rather than discarded for an `f64`
         // recomputation. (Pre-#2219 this produced no values at all, via a
-        // `?`-triggered bail to `eval_range_values_f64` -- a coincidental,
-        // not deliberate, match with real jq's own answer here: jq's unary
-        // minus collapses a literal this large to a `f64` before `range`
-        // ever sees it, an unrelated divergence tracked in
-        // `docs/compliance/jq/limitations.md`'s #2131 section.)
+        // `?`-triggered bail to `eval_range_values_f64`.)
+        //
+        // #3044 closed the unrelated divergence this comment used to cite
+        // (jq's unary minus collapsing a literal this large to `f64`
+        // before `range` ever sees it, `docs/compliance/jq/limitations.md`'s
+        // former #2357 section): succinctly's own filter-text unary minus
+        // now does the same, so a *bare literal* spelling of this repro no
+        // longer reaches this dispatch arm at all. Sourcing the bounds
+        // from data instead (as `range_values_from` does here) keeps them
+        // exact in both tools, so this still exercises the overflow-safety
+        // fix itself rather than the literal-parsing question #3044 owns.
         assert_eq!(
-            range_values("range(-9223372036854775758;-9223372036854775808;-100)"),
+            range_values_from(
+                b"[-9223372036854775758,-9223372036854775808,-100]",
+                ".[0] as $from | .[1] as $to | .[2] as $step | range($from;$to;$step)"
+            ),
             vec![OwnedValue::Int(-9223372036854775758)]
         );
 
@@ -58382,9 +58413,18 @@ mod tests {
         // the first advance succeeds, the second overflows past `i64::MIN`,
         // and both values computed before that overflow are kept end to
         // end through the full dispatch, not just at the unit level.
+        //
+        // `to`/`step` are sourced from data (#3044): both are past `2^53`
+        // and negative, so writing them as bare filter-text literals would
+        // now route through the same `-1 * <literal>` split as the
+        // assertion above, changing what's under test.
         let big_step = i64::MAX / 2 + 100;
+        let input = format!("[{},{}]", i64::MIN, -big_step);
         assert_eq!(
-            range_values(&format!("range(0;{};{})", i64::MIN, -big_step)),
+            range_values_from(
+                input.as_bytes(),
+                ".[0] as $to | .[1] as $step | range(0;$to;$step)"
+            ),
             vec![OwnedValue::Int(0), OwnedValue::Int(-big_step)]
         );
     }
