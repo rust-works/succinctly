@@ -97840,8 +97840,9 @@ mod tests {
         ));
 
         // yq mode: NaN, -0.0 -> Int(0) (no negative zero in Go's int64), the
-        // i64::MAX boundary (2^63, exclusive -- i64::MAX itself rounds up to
-        // this as an f64), i64::MIN (inclusive), and past both.
+        // i64::MAX boundary (2^63, inclusive -- i64::MAX itself rounds up to
+        // this as an f64, so the identity must stay in range, not be
+        // excluded), i64::MIN (exact, no rounding-up needed), and past both.
         assert!(matches!(
             integral_f64_result::<YqSemantics>(f64::NAN),
             OwnedValue::Float(f) if f.is_nan()
