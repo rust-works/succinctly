@@ -47159,6 +47159,164 @@ fn range_bound_positional_builtin_resolves_on_every_route_2803() -> Result<()> {
     Ok(())
 }
 
+/// #2968: `isempty`/`any(gen; cond)`/`all(gen; cond)`/`IN`/`IN(src; s)`/
+/// `skip` used to bridge to the eager evaluator unconditionally, so a
+/// positional read *inside their arguments* evaluated with no cursor and
+/// answered its no-cursor default -- on every route, direct included, since
+/// the bridge is the arm itself and not one of the #2803 gates.
+///
+/// Same document and discriminating key lengths as
+/// [`range_bound_positional_builtin_resolves_on_every_route_2803`]: `.aa |
+/// key` is `"aa"` (length 2), so `range(0; (key|length))` is `0, 1` once the
+/// read resolves and *empty* while it is stubbed. Every builtin has a row
+/// whose answer flips on that: `isempty` true->false, `any . >= 0`
+/// false->true, `all . < 0` true->false (the `. >= 0` spelling is vacuously
+/// right either way and proves nothing), `IN` on the member `.aa.bbb`
+/// (`1 | IN(0, 1)`), and `skip(0; ..)` forwarding the range's own outputs.
+#[test]
+fn consumer_argument_positional_read_resolves_on_every_route_2968() -> Result<()> {
+    let doc = "aa: {bbb: 1, c: 2}\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    let g = "range(0;(key|length))";
+    let rows: Vec<(String, &str, &str)> = vec![
+        // direct route, one per builtin
+        (format!(".aa | isempty({g})"), "false", "direct isempty"),
+        (format!(".aa | any({g}; . >= 0)"), "true", "direct any"),
+        (format!(".aa | all({g}; . < 0)"), "false", "direct all"),
+        (format!(".aa.bbb | IN({g})"), "true", "direct IN"),
+        (format!(".aa.bbb | IN({g}; 1)"), "true", "direct IN(src; s)"),
+        (format!(".aa | [skip(0; {g})]"), "[0,1]", "direct skip"),
+        (format!(".aa | [skip(1; {g})]"), "[1]", "direct skip(1)"),
+        // the four routes #2803 fixed for `range`, per builtin where the
+        // answer discriminates
+        (
+            format!(r#".aa | "\(isempty({g}))""#),
+            r#""false""#,
+            "interpolation isempty",
+        ),
+        (
+            format!(r#".aa | "\(any({g}; . >= 0))""#),
+            r#""true""#,
+            "interpolation any",
+        ),
+        (
+            format!(r#".aa | "\([skip(1; {g})])""#),
+            r#""[1]""#,
+            "interpolation skip",
+        ),
+        (
+            format!(".aa | .bbb = isempty({g})"),
+            r#"{"bbb":false,"c":2}"#,
+            "assignment RHS isempty",
+        ),
+        (
+            format!(".aa | .bbb = all({g}; . < 0)"),
+            r#"{"bbb":false,"c":2}"#,
+            "assignment RHS all",
+        ),
+        (
+            format!(".aa | .bbb = [skip(1; {g})]"),
+            r#"{"bbb":[1],"c":2}"#,
+            "assignment RHS skip",
+        ),
+        // `map_values` resolves at each *member's* key: `bbb` -> 3 (`0,1,2`),
+        // `c` -> 1 (`0`), so a bound resolved at the container (2) cannot
+        // produce this answer.
+        (
+            format!(".aa | map_values([skip(1; {g})])"),
+            r#"{"bbb":[1,2],"c":[]}"#,
+            "map_values skip",
+        ),
+        (
+            format!(".aa | map_values(any({g}; . == 2))"),
+            r#"{"bbb":true,"c":false}"#,
+            "map_values any",
+        ),
+        (
+            format!(".aa | map_values(IN({g}; 2))"),
+            r#"{"bbb":true,"c":false}"#,
+            "map_values IN(src; s)",
+        ),
+        // absent-key walk: `.zz | key` is `"zz"` (length 2)
+        (
+            format!(".zz | isempty({g})"),
+            "false",
+            "absent walk isempty",
+        ),
+        (format!(".zz | [skip(1; {g})]"), "[1]", "absent walk skip"),
+    ];
+    for (filter, want, route) in &rows {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want, 0),
+            "#2968 [{route}]: `{filter}` -- a stubbed argument answers as if \
+             `key` were absent"
+        );
+    }
+    Ok(())
+}
+
+/// #2968: `cond` is evaluated at each `gen` output's *own* position, not
+/// the stage's, so `key` inside it names the element -- `any(.[]; key ==
+/// "bbb")` is `true` on `{bbb: 1, c: 2}` because the first member's key is
+/// `bbb`, and `all(.[]; (key|length) == 3)` is `false` because `c`'s is not.
+/// The triage found `cond` was evaluated by value per element
+/// (`any_all_probe_element`), with no cursor at all.
+#[test]
+fn any_all_cond_reads_the_element_position_2968() -> Result<()> {
+    let doc = "aa: {bbb: 1, c: 2}\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, want) in [
+        (r#".aa | any(.[]; key == "bbb")"#, "true"),
+        (r#".aa | any(.[]; key == "zz")"#, "false"),
+        (".aa | all(.[]; (key|length) == 3)", "false"),
+        (".aa | all(.[]; (key|length) >= 1)", "true"),
+        // `gen` is `.`, so `cond`'s `.` is the element *with its cursor*;
+        // with `gen` a literal (`any(1; key == "c")`) the rebound value has
+        // no position and `key` is nothing, which is the same rebinding rule
+        // read the other way round.
+        (r#".aa | [.[] | any(.; key == "c")]"#, "[false,true]"),
+        (r#".aa | [.[] | any(1; key == "c")]"#, "[false,false]"),
+        // `parent` from inside `cond` climbs from the element
+        (r#".aa | any(.[]; (parent | keys) == ["bbb","c"])"#, "true"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2968: the native `any`/`all` probe stops at `cond`'s first decisive
+/// output, so a side effect past it never runs -- the eager route wrote `C`
+/// here. A `cond` that is a pipe stage after a generator keeps yq mode's
+/// own rule for a generator that fails part-way (#2326, `first(.[0] |
+/// (true, error("late")))` is `Error: late` on the cursor route and in
+/// real yq), where the owned route used to keep the prefix: recorded in
+/// `docs/compliance/yq/limitations.md`.
+#[test]
+fn any_all_cond_short_circuits_side_effects_2968() -> Result<()> {
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, want, want_err) in [
+        (r#"[any(.[]; (true, ("C"|stderr)))]"#, "[true]", ""),
+        (r#"[all(.[]; (false, ("C"|stderr)))]"#, "[false]", ""),
+        (r#"[any(.[]; (false, ("C"|stderr), true))]"#, "[true]", "C"),
+        (r#"[any(.[]; (true, error("late")))]"#, "[true]", ""),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, "- 1\n- 2\n", &args)?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}` stderr {err:?}");
+        assert_eq!(err.trim(), want_err, "`{filter}`");
+    }
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"[any(.[]; .[0] | (true, error("late")))]"#,
+        "- [1]\n",
+        &args,
+    )?;
+    assert_ne!(code, 0, "`{out}`");
+    assert!(err.contains("late"), "stderr {err:?}");
+    Ok(())
+}
+
 /// #2803 in jq mode, where the same gap presents as an **error** rather than
 /// a quietly empty range.
 ///
