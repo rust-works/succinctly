@@ -25060,6 +25060,27 @@ mod tests {
     /// #2661: the public value-only entry point has no cursor, so `..`
     /// reaches the full-evaluator bridge rather than the native cursor walk.
     /// Its borrowed `Many` must become owned values before the bridge's
+    /// One owned output of `filter` over `json`, rendered as JSON.
+    fn one_owned_json(json: &[u8], filter: &str) -> String {
+        let index = JsonIndex::build(json);
+        let expr = parse(filter).unwrap();
+        match eval_using::<JqSemantics, _>(&expr, index.root(json).value()) {
+            GenericResult::Owned(v) => v.to_json(),
+            other => panic!("expected one owned output, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion the tests below make (#2999)"
+        }
+    }
+
+    /// Edge cases whose one line #2999's construction sweep rewrote in this
+    /// file and which no test had reached before, pinned against jq 1.7.1
+    /// (captured live): the empty-input `transpose` returns and the
+    /// zero-stage `path(.)` walk.
+    #[test]
+    fn touched_empty_array_edge_cases_2999() {
+        assert_eq!(one_owned_json(b"[]", "transpose"), "[]");
+        assert_eq!(one_owned_json(b"[[],[]]", "transpose"), "[]");
+        assert_eq!(one_owned_json(b"[1]", "[path(.)]"), "[[]]");
+    }
+
     /// temporary JSON index is dropped, preserving the complete preorder.
     #[test]
     fn cursorless_recursive_descent_bridge_preserves_values_2661() {
