@@ -215,33 +215,17 @@ DEFAULT_THRESHOLD = 5.0
 # above the observed ARM64 number while still catching a *further*
 # regression on top of this one.
 #
-# `users_keys_unsorted` (#2878): the same row, for the opposite reason -- a
-# drift that is *faster*, on one architecture only. The guard is `abs(drift)`,
-# so direction is irrelevant to whether an override is needed (see 9d555f3f0,
-# which corrected exactly that misreading).
-#
-# #2878 routed the CLI's document splitter through `find_json_escape`, whose
-# `"`/`\`/`< 0x20` predicate is the control-character rule it had to add
-# anyway, replacing a byte-at-a-time scalar loop. Measured by this guard on
-# its own runners against the PR's merge-base (#1582), the two architectures
-# disagree in sign:
-#
-#            users_keys_unsorted   wide_keys_unsorted   users_identity
-#   ARM64          -8.2%                 -1.9%              -1.3%
-#   x86_64         +2.2%                 +0.7%              +0.4%
-#
-# NEON wins the scan; x86_64's movemask path costs slightly more than the
-# scalar loop it replaced, on a fixture whose strings are short (the `users`
-# shape is small records). `users_keys_unsorted` is the smallest query in the
-# matrix, so it shows the largest relative swing in both directions. Only the
-# ARM64 number exceeds `DEFAULT_THRESHOLD`; 10% clears it with headroom while
-# still catching a further move on top of it, in either direction.
-#
-# **Remove this entry once `main` has moved past #2878.** Both overrides here
-# are permanent loosenings of a row whose only job is to be watched -- with
-# `--baseline-binary` on every PR and push run the checked-in file is never
-# consulted, so once the merge-base includes #2878 this row reads ~0% again
-# and the override only blinds it. Tracked by the follow-up filed on #2878.
+# An override is a permanent loosening of a row whose only job is to be
+# watched, so one that covers a *one-off* drift (an accepted improvement, or
+# a cost that only shows against a merge-base predating the change) must go
+# once `main` has moved past the change: with `--baseline-binary` on every
+# PR and push run the checked-in file is never consulted, so the row reads
+# ~0% again from then on and the override only blinds it. The guard is
+# `abs(drift)`, so direction is irrelevant to whether an override is needed
+# (see 9d555f3f0, which corrected exactly that misreading).
+# `users_keys_unsorted` carried one such entry for #2878's document-splitter
+# scan (-8.2% ARM64 / +2.2% x86_64 against its own merge-base) until #2963
+# removed it.
 #
 # `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999):
 # a drift that is *faster* on both architectures. Structural sharing in
@@ -260,13 +244,10 @@ DEFAULT_THRESHOLD = 5.0
 # clear the measured numbers with headroom while still catching a further
 # move on top of them in either direction.
 #
-# **Remove these three entries once `main` has moved past #2999** -- with
-# `--baseline-binary` the checked-in file is never consulted, so once the
-# merge-base includes the change these rows read ~0% again and the overrides
-# only blind them. Tracked by #3077.
+# **Remove these three entries once `main` has moved past #2999** (the rule
+# above). Tracked by #3077.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    "users_keys_unsorted": 10.0,
     "users_del_select": 20.0,
     "users_del_bound_select": 20.0,
     "users_yq_del_select": 12.0,
