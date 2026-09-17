@@ -824,7 +824,7 @@ well-predicted branches is simply shorter.
   gated to aarch64 on the strength of it. The "before" binary on the x86 box was a
   `main` checkout from the start of the issue, and `main` had moved: the two mains time
   +17% apart on `users keys_unsorted` on the 7950X with instruction counts identical to
-  the guard's 0.0% (filed as a follow-up). The A/B rule "the baseline must predate your
+  the guard's 0.0% (filed as #3100). The A/B rule "the baseline must predate your
   first commit" has a companion: it must also be the base your branch is actually on.
 - On x86_64 the probe compiles out (`PREFIX = 0`); before the inlining change the guard
   read every row at ±0.0% against `main` on the 7950X. A build with the word probe enabled on x86_64 too
