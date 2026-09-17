@@ -6985,12 +6985,10 @@ implementation quirk but matches real jq's own diagnostic order for the construc
 
 ```console
 $ jq -nc 'reduce (1,2) as {($x): $v} ($x; .)'
-jq: error: $x is not defined at <top-level>, line 1, column 29:
-    reduce (1,2) as {($x): $v} ($x; .)
-                                ^^
-jq: error: $x is not defined at <top-level>, line 1, column 19:
-    reduce (1,2) as {($x): $v} ($x; .)
-                      ^^
+jq: error: $x is not defined at <top-level>, line 1:
+reduce (1,2) as {($x): $v} ($x; .)                            
+jq: error: $x is not defined at <top-level>, line 1:
+reduce (1,2) as {($x): $v} ($x; .)                  
 jq: 2 compile errors
 ```
 
