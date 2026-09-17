@@ -47446,6 +47446,126 @@ fn any_all_cond_reads_the_element_position_2968() -> Result<()> {
     Ok(())
 }
 
+/// #3079: a positional read inside `any`/`all`'s `cond` on the routes that
+/// resolve reads by constant rewrite. `cond` stands at each `gen` output, so
+/// the rewrite can spell its reads as the stage's constants only when `gen`
+/// is an identity passthrough (`any(.; key == "c")`); a navigating `gen`
+/// (`any(.[]; ..)`) is run natively by the owned identity pipe
+/// (`eval_owned_identity_any_all`, the `map_values` route) or prefetched
+/// through it (interpolation, assignment RHS). Real yq has neither builtin,
+/// so the acceptance criterion is the same as #2968's: every route agrees
+/// with the direct spelling, on a document whose member keys discriminate.
+#[test]
+fn any_all_cond_read_resolves_on_rewritten_routes_3079() -> Result<()> {
+    let doc = "aa: {bbb: 1, c: 2}\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, want, route) in [
+        (
+            r#".aa | [.[] | any(.; key == "c")]"#,
+            "[false,true]",
+            "direct (control)",
+        ),
+        (
+            r#".aa | map_values(any(.; key == "c"))"#,
+            r#"{"bbb":false,"c":true}"#,
+            "map_values, identity gen",
+        ),
+        (
+            r#".aa | map_values(all(.; key == "c"))"#,
+            r#"{"bbb":false,"c":true}"#,
+            "map_values, all",
+        ),
+        (
+            r#".aa | map_values(any(., .; key == "bbb"))"#,
+            r#"{"bbb":true,"c":false}"#,
+            "map_values, comma gen",
+        ),
+        (
+            ".aa | map_values(any(.; (key|length) > 1))",
+            r#"{"bbb":true,"c":false}"#,
+            "map_values, computed cond",
+        ),
+        (
+            r#".aa | map_values(any(.; key == "c") | not)"#,
+            r#"{"bbb":true,"c":false}"#,
+            "map_values, stage after",
+        ),
+        (
+            r#".aa | map_values(any(.; key == "c") | key)"#,
+            r#"{"bbb":"bbb","c":"c"}"#,
+            "map_values, keeps position",
+        ),
+        (
+            r#".aa[] |= any(.; key == "c")"#,
+            r#"{"aa":{"bbb":false,"c":true}}"#,
+            "|= target, identity gen",
+        ),
+        (
+            r#".aa[] |= all(.; key == "c")"#,
+            r#"{"aa":{"bbb":false,"c":true}}"#,
+            "|= target, all",
+        ),
+        (
+            r#".aa[] |= any((if true then . else . end); key == "c")"#,
+            r#"{"aa":{"bbb":false,"c":true}}"#,
+            "|= target, passthrough gen",
+        ),
+        // `with_entries`' entry is `{key, value}`, so `key` inside its `.value`
+        // is `"value"` -- `with_entries(.value |= key)` is `"value"` in real
+        // yq v4.53.3 too.
+        (
+            r#".aa | with_entries(.value |= any(.; key == "value"))"#,
+            r#"{"bbb":true,"c":true}"#,
+            "with_entries",
+        ),
+        (
+            r#".zz |= any(.; key == "zz")"#,
+            r#"{"aa":{"bbb":1,"c":2},"zz":true}"#,
+            "|= vivified target",
+        ),
+        (
+            r#".aa | .bbb = any(.; key == "aa")"#,
+            r#"{"bbb":true,"c":2}"#,
+            "assignment RHS, identity gen",
+        ),
+        (
+            r#".aa | "\(any(.; key == "aa"))""#,
+            r#""true""#,
+            "interpolation, identity gen",
+        ),
+        // navigating `gen`: prefetched through the identity pipe
+        (
+            r#".aa | "\(any(.[]; key == "c"))""#,
+            r#""true""#,
+            "interpolation, navigating gen",
+        ),
+        (
+            r#".aa | "\(all(.[]; (key|length) > 0))""#,
+            r#""true""#,
+            "interpolation, all navigating",
+        ),
+        (
+            r#".aa | .bbb = any(.[]; key == "c")"#,
+            r#"{"bbb":true,"c":2}"#,
+            "assignment RHS, navigating gen",
+        ),
+        (
+            r#".aa | [.[] | "\(any(.; key == "c"))"]"#,
+            r#"["false","true"]"#,
+            "interpolation per member",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#3079 [{route}]: `{filter}` -- a `cond` evaluated with no position \
+             answers `key` as absent"
+        );
+    }
+    Ok(())
+}
+
 /// #2968: the native `any`/`all` probe stops at `cond`'s first decisive
 /// output, so a side effect past it never runs -- the eager route wrote `C`
 /// here. A `cond` that is a pipe stage after a generator keeps yq mode's
