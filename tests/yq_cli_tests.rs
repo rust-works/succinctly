@@ -34235,6 +34235,33 @@ fn test_from_unix_still_rejects_non_numbers_including_arrays_3068() -> Result<()
     Ok(())
 }
 
+/// #3041 (code review): `abs` is `--jq-extensions`-gated jq-only surface in
+/// yq mode (like `todate`/`strftime`), so it's reachable there and must
+/// stay internally consistent with yq mode's own `<` -- which has its own
+/// special case: an ordering comparison against a real `null` operand is
+/// unconditionally `false`, never jq's total order that sorts `null` below
+/// every number (`yq_null_ordering_is_false`, #2483). An earlier version of
+/// this fix hand-rolled the `. < 0` classification instead of reusing the
+/// shared comparator, and unconditionally treated `null` as sorting below
+/// zero regardless of mode -- a self-contradiction within the same binary,
+/// same mode (`null | abs` errored while `null < 0` said `false`),
+/// confirmed live and caught by `/code-review` before merge.
+#[test]
+fn test_abs_agrees_with_yq_modes_own_null_ordering_3041() -> Result<()> {
+    let args = &["--jq-extensions", "-o=json"];
+    let (out, code) = run_yq_stdin("null < 0", "null\n", args)?;
+    assert_eq!(code, 0, "stdout: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    // `abs` must agree: since `null < 0` is `false` here, `if . < 0 then
+    // -. else . end` takes the identity branch and returns `null`
+    // unchanged, not unary minus's "cannot be negated" error.
+    let (out, code) = run_yq_stdin("null | abs", "null\n", args)?;
+    assert_eq!(code, 0, "stdout: {out:?}");
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
 /// #2008 (code review): `fromjson`/`tonumber`'s shared decoder
 /// (`parse_json_string_value` in `eval.rs`, reachable from both jq and yq
 /// mode via the same unparameterized `Builtin::FromJson` dispatch) is not

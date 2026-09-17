@@ -52478,19 +52478,26 @@ fn builtin_fabs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// literal's own spelling (`1.50 | abs` stays `"1.50"`, where `fabs` would
 /// give `1.5`) or reject a string/array/object. Confirmed live against jq
 /// 1.7.1.
+///
+/// The `. < 0` comparison itself goes through `apply_compare_op::<S>`, not
+/// a hand-rolled match -- code review caught a live self-contradiction from
+/// an earlier version that reimplemented jq's ordering by hand: yq mode's
+/// own `<` treats a real `null` operand as always `false`
+/// (`yq_null_ordering_is_false`, #2483), so `null < 0` is `false` there,
+/// but the hand-rolled match unconditionally classified `null` as sorting
+/// below zero regardless of `S`, so `null | abs` errored while `null < 0`
+/// (same binary, same mode) said `false` -- confirmed live against
+/// `succinctly yq --jq-extensions` (`abs` is jq-only surface, gated the
+/// same way there). Routing through the one shared comparator this
+/// codebase already uses for every other `<`/`<=`/`>`/`>=` (`eval_compare`,
+/// `eval_generic`'s own compare arm) closes that gap by construction
+/// instead of needing a second yq-mode special case copied here too.
 fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     let owned = to_owned_lossy(&value);
-    let sorts_below_zero = match &owned {
-        OwnedValue::Null | OwnedValue::Bool(_) => true,
-        OwnedValue::Int(n) => *n < 0, // omni-dev: coverage tolerate-line reason="confirmed live (eprintln! probe): a computed Int reaching abs through the normal evaluator pipe (e.g. (0-5) | abs) arrives re-baked as NumberLiteral(Int, ..) by the reindex bridge, same as #2906 documents elsewhere -- no known producer of a bare Int at this position (#3041)"
-        OwnedValue::Float(f) => *f < 0.0,
-        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => *n < 0,
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f < 0.0,
-        _ => false,
-    };
+    let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &OwnedValue::Int(0));
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
             Ok(v) => QueryResult::Owned(v),
