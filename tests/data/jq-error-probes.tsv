@@ -380,3 +380,11 @@ libm_fma_arg3_string	fma(1; 2; "z")	null
 libm_significand_long_string	significand	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 libm_pow10_string_is_the_stub	pow10	"x"
 libm_fma_checks_a_before_c	fma("x"; 1; "z")	null
+
+# ── <name>/1 requires parsed datetime inputs: todate/todateiso8601 (#3068) ──
+# todate/todateiso8601 are literally strftime(fixed fmt) in jq, so they raise
+# strftime's own message, not the libm family's -- unlike every builtin in
+# the group above.
+todate_string	todate	"x"
+todate_null	todate	null
+todateiso8601_string	todateiso8601	"x"

@@ -45203,18 +45203,19 @@ fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
     Ok(())
 }
 
-/// `todate`/`todateiso8601` on a non-number keep their pre-#3042 wording
-/// (jq's is `strftime/1 requires parsed datetime inputs`, tracked as
-/// #3068); pinned so #3042's move of the libm family onto `number required`
-/// provably did not reach them, and so the eventual fix has a row to flip.
+/// `todate`/`todateiso8601` are literally `strftime(fixed fmt)` in jq, so a
+/// non-number input raises `strftime`'s own message (#3068), not the libm
+/// family's `number required` #3042 moved every other math builtin onto --
+/// `todate` was deliberately left behind at the time, tracked here until
+/// this fix.
 #[test]
-fn test_todate_non_number_wording_unchanged_by_3042() -> Result<()> {
+fn test_todate_non_number_matches_strftime_wording_3068() -> Result<()> {
     for filter in [r#""x" | todate"#, r#""x" | todateiso8601"#] {
         let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 5, "`{filter}`: stderr {stderr:?}");
         assert!(
-            stderr.contains("math function requires number"),
-            "`{filter}` moved -- if it now prints jq's `strftime/1 requires parsed datetime inputs`, close #3068: {stderr:?}"
+            stderr.contains("strftime/1 requires parsed datetime inputs"),
+            "`{filter}`: stderr {stderr:?}"
         );
     }
     Ok(())

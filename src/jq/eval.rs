@@ -49446,6 +49446,142 @@ fn local_zone() -> LocalZone {
     }
 }
 
+/// Parse a value into broken-down-time fields (`year, month, day, hour,
+/// minute, second, weekday, yearday`), accepting either a raw Unix
+/// timestamp number (auto-converted the same way `gmtime`/`localtime`
+/// convert one, shifted into `zone` when given) or an 8-element
+/// broken-down-time array -- the two input shapes `strftime` itself
+/// accepts. Shared by `strftime_in_zone` and `builtin_todate` (#3068):
+/// `todate`/`todateiso8601` are literally `strftime(fixed fmt)` in jq, so
+/// they take the identical two input shapes and the identical
+/// `requires_parsed_datetime_inputs` error on anything else -- `name` is
+/// `"strftime"` for every caller today (`strflocaltime` never reaches
+/// `todate`, which has no zone argument).
+///
+/// Returns the tuple directly, or the `QueryResult` an early exit
+/// (`None`/`Error`) should return, so each caller's own `match .. { Ok(t)
+/// => .., Err(r) => return r }` reads as a single step rather than the
+/// large inline match this replaced.
+///
+/// `(year, month, day, hour, minute, second, weekday, yearday)`.
+type BrokenDownTimeFields = (i64, i64, i64, i64, i64, i64, i64, i64);
+
+fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    zone: &Option<LocalZone>,
+    name: &str,
+) -> Result<BrokenDownTimeFields, QueryResult<'a, W>> {
+    match value {
+        StandardJson::Number(n) => {
+            // Extracted directly rather than via `get_float_value_with`:
+            // `value` is already known to be a `Number` here, so that
+            // helper's generic `not_a_number` case would be unreachable.
+            let timestamp = if is_nan_sentinel(n.raw_bytes()) {
+                f64::NAN
+            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
+                if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            } else if let Ok(f) = n.as_f64() {
+                f
+            } else if optional {
+                return Err(QueryResult::None);
+            } else {
+                return Err(QueryResult::Error(EvalError::new("invalid number")));
+            };
+
+            // Auto-converted the same way `gmtime` converts a raw
+            // number -- or `localtime`, shifted into `zone`.
+            let secs = timestamp.trunc() as i64;
+            let secs = match zone {
+                None => Some(secs),
+                Some(zone) => secs.checked_add(zone.offset_secs),
+            };
+            let t = ok_or_result::<W, _>(
+                secs.ok_or_else(EvalError::datetime_out_of_range)
+                    .and_then(broken_down_time_from_unix_secs),
+                optional,
+            )?;
+            Ok((
+                t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
+            ))
+        }
+        // #1820: `scalar_decode_failure` first, same shape as
+        // `builtin_mktime`'s own fix above -- and for the same
+        // reason, plain `to_owned_lossy` (not `to_owned`) for the
+        // array itself: `get_int` below only ever extracts numbers
+        // (defaulting to 0 for anything else, never a `String`
+        // arm), so a corrupted string in an element it happens not
+        // to need must not fail a conversion that would otherwise
+        // succeed.
+        _ => {
+            if let Some(e) = scalar_decode_failure(value) {
+                return Err(QueryResult::Error(e));
+            }
+            match to_owned_lossy(value) {
+                OwnedValue::Array(arr) => {
+                    // Real jq requires the full 8-element array — weekday and
+                    // yearday included — not just the 6 fields mktime needs.
+                    // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
+                    // errors in real jq for every length 1-7, only succeeding at
+                    // 8. Below 8, this codebase used to default weekday/yearday
+                    // to 0 instead of erroring, which was harmless before this
+                    // PR added specifiers that read those fields (#760) — now it
+                    // would silently produce a wrong date instead of matching
+                    // jq's error.
+                    if arr.len() < 8 {
+                        if optional {
+                            return Err(QueryResult::None);
+                        }
+                        return Err(QueryResult::Error(
+                            EvalError::requires_parsed_datetime_inputs(name),
+                        ));
+                    }
+
+                    let get_int = |idx: usize| -> i64 {
+                        match arr.get(idx) {
+                            Some(OwnedValue::Int(n)) => *n,
+                            Some(OwnedValue::Float(f)) => *f as i64,
+                            Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+                            Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
+                            _ => 0,
+                        }
+                    };
+
+                    // `checked_month_index` (jq's 0-indexed month -> this
+                    // function's 1-indexed month) overflows for an adversarial
+                    // `i64::MAX` array element (#893's panic class, reachable
+                    // here independently of `%s`/`unix_secs_from_broken_down_time`:
+                    // every format path eagerly computes `month`, not just `%s`).
+                    let month = match checked_month_index(get_int(1)) {
+                        Ok(m) => m,
+                        Err(_) if optional => return Err(QueryResult::None),
+                        Err(e) => return Err(QueryResult::Error(e)),
+                    };
+
+                    Ok((
+                        get_int(0),
+                        month,
+                        get_int(2),
+                        get_int(3),
+                        get_int(4),
+                        get_int(5),
+                        get_int(6),
+                        get_int(7),
+                    ))
+                }
+                _ if optional => Err(QueryResult::None),
+                _ => Err(QueryResult::Error(
+                    EvalError::requires_parsed_datetime_inputs(name),
+                )),
+            }
+        }
+    }
+}
+
 /// `strftime`'s body, in UTC (`zone: None`) or in `zone` (`strflocaltime`).
 fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     fmt_expr: &Expr,
@@ -49476,123 +49612,11 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            // Value should be a broken-down time array, or a raw Unix timestamp
-            // number (auto-converted the same way `gmtime` converts one).
-            let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
-                StandardJson::Number(n) => {
-                    // Extracted directly rather than via `get_float_value_with`:
-                    // `value` is already known to be a `Number` here, so that
-                    // helper's generic `not_a_number` case would be unreachable.
-                    let timestamp = if is_nan_sentinel(n.raw_bytes()) {
-                        f64::NAN
-                    } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
-                        if negative {
-                            f64::NEG_INFINITY
-                        } else {
-                            f64::INFINITY
-                        }
-                    } else if let Ok(f) = n.as_f64() {
-                        f
-                    } else if optional {
-                        return QueryResult::None;
-                    } else {
-                        return QueryResult::Error(EvalError::new("invalid number"));
-                    };
-
-                    // Auto-converted the same way `gmtime` converts a raw
-                    // number -- or `localtime`, shifted into `zone`.
-                    let secs = timestamp.trunc() as i64;
-                    let secs = match &zone {
-                        None => Some(secs),
-                        Some(zone) => secs.checked_add(zone.offset_secs),
-                    };
-                    let t = match ok_or_result::<W, _>(
-                        secs.ok_or_else(EvalError::datetime_out_of_range)
-                            .and_then(broken_down_time_from_unix_secs),
-                        optional,
-                    ) {
-                        Ok(t) => t,
-                        Err(r) => return r,
-                    };
-                    (
-                        t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
-                    )
-                }
-                // #1820: `scalar_decode_failure` first, same shape as
-                // `builtin_mktime`'s own fix above -- and for the same
-                // reason, plain `to_owned_lossy` (not `to_owned`) for the
-                // array itself: `get_int` below only ever extracts numbers
-                // (defaulting to 0 for anything else, never a `String`
-                // arm), so a corrupted string in an element it happens not
-                // to need must not fail a conversion that would otherwise
-                // succeed.
-                _ => {
-                    if let Some(e) = scalar_decode_failure(&value) {
-                        return QueryResult::Error(e);
-                    }
-                    match to_owned_lossy(&value) {
-                        OwnedValue::Array(arr) => {
-                            // Real jq requires the full 8-element array — weekday and
-                            // yearday included — not just the 6 fields mktime needs.
-                            // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
-                            // errors in real jq for every length 1-7, only succeeding at
-                            // 8. Below 8, this codebase used to default weekday/yearday
-                            // to 0 instead of erroring, which was harmless before this
-                            // PR added specifiers that read those fields (#760) — now it
-                            // would silently produce a wrong date instead of matching
-                            // jq's error.
-                            if arr.len() < 8 {
-                                if optional {
-                                    return QueryResult::None;
-                                }
-                                return QueryResult::Error(
-                                    EvalError::requires_parsed_datetime_inputs(name),
-                                );
-                            }
-
-                            let get_int = |idx: usize| -> i64 {
-                                match arr.get(idx) {
-                                    Some(OwnedValue::Int(n)) => *n,
-                                    Some(OwnedValue::Float(f)) => *f as i64,
-                                    Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
-                                    Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
-                                        *f as i64
-                                    }
-                                    _ => 0,
-                                }
-                            };
-
-                            // `checked_month_index` (jq's 0-indexed month -> this
-                            // function's 1-indexed month) overflows for an adversarial
-                            // `i64::MAX` array element (#893's panic class, reachable
-                            // here independently of `%s`/`unix_secs_from_broken_down_time`:
-                            // every format path eagerly computes `month`, not just `%s`).
-                            let month = match checked_month_index(get_int(1)) {
-                                Ok(m) => m,
-                                Err(_) if optional => return QueryResult::None,
-                                Err(e) => return QueryResult::Error(e),
-                            };
-
-                            (
-                                get_int(0),
-                                month,
-                                get_int(2),
-                                get_int(3),
-                                get_int(4),
-                                get_int(5),
-                                get_int(6),
-                                get_int(7),
-                            )
-                        }
-                        _ if optional => return QueryResult::None,
-                        _ => {
-                            return QueryResult::Error(EvalError::requires_parsed_datetime_inputs(
-                                name,
-                            ))
-                        }
-                    }
-                }
-            };
+            let (year, month, day, hour, minute, second, weekday, yearday) =
+                match broken_down_time_fields::<W>(&value, optional, &zone, name) {
+                    Ok(t) => t,
+                    Err(r) => return r,
+                };
 
             let (zone_offset, zone_name) = match &zone {
                 None => (0, "UTC"),
@@ -50259,27 +50283,20 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    // Not jq's wording either way (jq says `strftime/1 requires parsed
-    // datetime inputs`, since `todate` is `strftime` there); kept as it was
-    // when #3042 moved the libm family onto `number required`.
-    let timestamp = match get_float_value_with::<W>(&value, optional, || {
-        EvalError::new("math function requires number")
-    }) {
-        Ok(f) => f,
-        Err(r) => return r,
-    };
+    // #3068: `todate`/`todateiso8601` are literally `def todate:
+    // strftime("%Y-%m-%dT%H:%M:%SZ")` in jq, so they accept the identical
+    // two input shapes `strftime` does (a raw Unix timestamp number, or an
+    // 8-element broken-down-time array) and raise the identical
+    // `<name>/1 requires parsed datetime inputs` error on anything else --
+    // `broken_down_time_fields` is the one shared implementation of that,
+    // also used by `strftime_in_zone`.
+    let (year, month, day, hour, minute, second, ..) =
+        match broken_down_time_fields::<W>(&value, optional, &None, "strftime") {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
 
-    // Convert to broken-down time first
-    let secs = timestamp.trunc() as i64;
-    let t = match ok_or_result::<W, _>(broken_down_time_from_unix_secs(secs), optional) {
-        Ok(t) => t,
-        Err(r) => return r,
-    };
-
-    let result = format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        t.year, t.month, t.day, t.hour, t.minute, t.second
-    );
+    let result = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
 
     QueryResult::Owned(OwnedValue::String(result))
 }
@@ -82167,6 +82184,40 @@ mod tests {
     fn test_todate() {
         // todate converts timestamp to ISO 8601 string
         query!(b"0", r"todate",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+    }
+
+    /// #3068: `todate`/`todateiso8601` are literally `strftime(fixed fmt)`
+    /// in jq, so a non-number/non-array input raises `strftime`'s own
+    /// `<name>/1 requires parsed datetime inputs` message, not the math
+    /// family's -- and an 8-element broken-down-time array (the other
+    /// shape `strftime` accepts) succeeds, matching jq
+    /// (`[1970,0,1,0,0,0,4,0] | todate` is `"1970-01-01T00:00:00Z"` there).
+    #[test]
+    fn test_todate_error_message_and_array_input_3068() {
+        for filter in ["todate", "todateiso8601"] {
+            query!(br#""x""#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(e.message, "strftime/1 requires parsed datetime inputs", "`{filter}`");
+                }
+            );
+        }
+        query!(b"null", r"todate",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+        // Too-short array: same error as strftime's own (#760).
+        query!(b"[2024,0,15,0,0,0]", r"todate",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            }
+        );
+        // Full 8-element broken-down-time array: succeeds, matching jq.
+        query!(b"[1970,0,1,0,0,0,4,0]", r"todate",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1970-01-01T00:00:00Z");
             }
