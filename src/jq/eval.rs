@@ -16831,9 +16831,15 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                 let codepoint = match &elem {
                     StandardJson::Number(n) => match n.as_i64() {
                         Ok(i) => i,
-                        // Not a strict integer: either a fractional literal (jq
-                        // truncates it) or the NaN sentinel (jq errors on it,
-                        // matched below since `as_f64` fails for it too).
+                        // Not a strict integer: a fractional literal (jq
+                        // truncates it), an infinity (jq's `U+FFFD`, which
+                        // the saturating `as i64` below reaches on its own),
+                        // or a NaN, on which jq errors -- `number (null)
+                        // can't be imploded` for `[97, nan]` and for a
+                        // document `[97, nan]` alike. The NaN used to fall
+                        // out of `as_f64` *failing* on the bridge's token;
+                        // since #2877 `as_f64` decodes that token (and a
+                        // document `nan`), so the check is explicit.
                         // #1989 review: `scalar_fallback`, not a bare
                         // `if optional {...} else {...}` -- this arm can
                         // never actually see a decode failure (a `Number`
@@ -16844,8 +16850,8 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                         // change to either the error or the ordering rule
                         // can't land on one copy and miss the other.
                         Err(_) => match n.as_f64() {
-                            Ok(f) => f.trunc() as i64,
-                            Err(_) => {
+                            Ok(f) if !f.is_nan() => f.trunc() as i64,
+                            Ok(_) | Err(_) => {
                                 return scalar_fallback(&elem, optional, || {
                                     EvalError::cannot_be_imploded(&to_owned_lossy(&elem))
                                 });
@@ -73222,9 +73228,27 @@ mod tests {
                 "[97, nan] | implode",
                 "number (null) can't be imploded, unicode codepoint needs to be numeric",
             ),
+            // #2877: a *document* NaN reaches the same arm as the builtin's,
+            // and jq errors on both identically.
+            (
+                &br"[97, nan]"[..],
+                "implode",
+                "number (null) can't be imploded, unicode codepoint needs to be numeric",
+            ),
         ] {
             query!(json, filter,
                 QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
+            );
+        }
+        // An infinity is not an error: jq's `U+FFFD`, from the builtin and
+        // from a document alike (`[97, infinite] | implode` is `"a\u{FFFD}"`
+        // in jq 1.7.1, as is `[97, Infinity]` read from input).
+        for (json, filter) in [
+            (&br"null"[..], "[97, infinite] | implode"),
+            (&br"[97, Infinity]"[..], "implode"),
+        ] {
+            query!(json, filter,
+                QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "a\u{FFFD}", "{filter}")
             );
         }
     }
