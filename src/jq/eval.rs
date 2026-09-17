@@ -49488,9 +49488,10 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
             } else if let Ok(f) = n.as_f64() {
                 f
             } else if optional {
-                return Err(QueryResult::None);
+                return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="defensive: a value already matched as StandardJson::Number whose bytes are neither the NaN/infinity sentinel nor a valid f64 is not producible by ordinary JSON parsing, mirroring the identical pre-existing, equally untested arm in get_float_value_with (#3068 extraction, not new)"
             } else {
                 return Err(QueryResult::Error(EvalError::new("invalid number")));
+                // omni-dev: coverage tolerate-line reason="defensive: a value already matched as StandardJson::Number whose bytes are neither the NaN/infinity sentinel nor a valid f64 is not producible by ordinary JSON parsing, mirroring the identical pre-existing, equally untested arm in get_float_value_with (#3068 extraction, not new)"
             };
 
             // Auto-converted the same way `gmtime` converts a raw
@@ -82222,6 +82223,29 @@ mod tests {
                 assert_eq!(s, "1970-01-01T00:00:00Z");
             }
         );
+
+        // NaN and (either-signed) infinity share `broken_down_time_fields`'s
+        // number arm with `strftime`/`gmtime`/`localtime` -- exercised here
+        // via `todate` specifically since, unlike `gmtime` (#3071), both
+        // already match jq exactly: `nan | todate` treats NaN as `0.0`
+        // (confirmed live against jq 1.7.1), and either infinity raises the
+        // same out-of-range error `mktime`'s own overflow path uses.
+        query!(b"null", r"nan | todate",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
+        for filter in ["infinite | todate", "(-infinite) | todate"] {
+            query!(b"null", filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message,
+                        "error converting number of seconds since epoch to datetime",
+                        "`{filter}`"
+                    );
+                }
+            );
+        }
     }
 
     #[test]
