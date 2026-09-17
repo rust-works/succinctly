@@ -4208,7 +4208,7 @@ mod tests {
         let (mut copy, recorded) = share_stats::measure(|| original.clone());
         assert!(recorded.is_empty(), "a clone copies nothing: {recorded:?}");
         let OwnedValue::Array(items) = &copy else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
         };
         assert!(items.is_shared());
 
@@ -4229,7 +4229,7 @@ mod tests {
         );
         assert_eq!(copy.as_array().unwrap().len(), 3);
         let OwnedValue::Array(items) = &copy else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
         };
         assert!(!items.is_shared(), "the write left both handles unique");
 
@@ -4290,7 +4290,7 @@ mod tests {
         assert!(recorded.is_empty(), "{recorded:?}");
         assert_eq!(taken.as_ref(), Some(&nested));
         let OwnedValue::Array(inner) = taken.unwrap() else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
         };
         assert!(inner.is_shared(), "the child is shared, not copied");
         assert_eq!(keep.len(), 2, "the other handle still has both elements");
@@ -4349,7 +4349,7 @@ mod tests {
             .skip(1)
         {
             let (OwnedValue::Object(a), OwnedValue::Object(b)) = (a, b) else {
-                unreachable!()
+                unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
             };
             assert!(a.is_shared() && b.is_shared());
             assert_eq!(a, b);
@@ -4379,7 +4379,7 @@ mod tests {
         let (mut copy, recorded) = share_stats::measure(|| original.clone());
         assert!(recorded.is_empty());
         let OwnedValue::Array(items) = &copy else {
-            unreachable!()
+            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
         };
         assert!(!items.is_shared());
         let ((), recorded) = share_stats::measure(|| {

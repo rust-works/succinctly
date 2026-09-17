@@ -9879,14 +9879,17 @@ fn compare_slices_at_depth<S: EvalSemantics>(
 
 /// Order two `[f]` keys exactly as `compare_values` orders the
 /// `OwnedValue::Array`s they would have been wrapped in.
-fn compare_key_arrays<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> core::cmp::Ordering {
+pub(crate) fn compare_key_arrays<S: EvalSemantics>(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+) -> core::cmp::Ordering {
     compare_slices_at_depth::<S>(a, b, 1)
 }
 
 /// jq equality of two `[f]` keys, as `owned_value_eq` would answer for the
 /// `OwnedValue::Array`s they would have been wrapped in: same length and
 /// element-wise `==` under `S`'s number rules.
-fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
+pub(crate) fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b.iter())
@@ -97653,5 +97656,67 @@ mod share_audit_2999 {
     #[test]
     fn reads_through_a_binding_copy_nothing() {
         assert_forced(&objs(1000), ". as $d | [$d[0], $d[1], ($d | length)]", &[]);
+    }
+}
+
+/// Edge cases whose one line #2999's construction sweep rewrote and which no
+/// test had reached before, pinned against the reference (jq 1.7.1 and yq
+/// v4.53.3, captured live) so the sweep's `.into()` on each is exercised.
+#[cfg(test)]
+mod touched_edge_cases_2999 {
+    use super::*;
+    use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
+    use crate::json::JsonIndex;
+
+    fn one_json<S: EvalSemantics>(json: &[u8], expr: &Expr) -> String {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        match eval::<Vec<u64>, S>(expr, cursor) {
+            QueryResult::Owned(v) => v.to_json(),
+            QueryResult::One(v) => to_owned(&v).unwrap().to_json(),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    fn jq_json(json: &[u8], filter: &str) -> String {
+        one_json::<JqSemantics>(json, &parse(filter).unwrap())
+    }
+
+    fn yq_json(json: &[u8], filter: &str) -> String {
+        let expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
+        one_json::<YqSemantics>(json, &expr)
+    }
+
+    #[test]
+    fn empty_combinations_and_transposes() {
+        assert_eq!(jq_json(b"[]", "combinations"), "[]");
+        assert_eq!(jq_json(b"[1,2]", "[combinations(0)]"), "[[]]");
+        assert_eq!(jq_json(b"[]", "transpose"), "[]");
+        assert_eq!(jq_json(b"[[],[]]", "transpose"), "[]");
+    }
+
+    #[test]
+    fn getpath_through_a_slice_descriptor() {
+        assert_eq!(
+            jq_json(b"[1,2]", r#"getpath([{"start":0,"end":1}])"#),
+            "[1]"
+        );
+        assert_eq!(
+            jq_json(b"[1,[2]]", r#"getpath([{"start":1,"end":2}, 0])"#),
+            "[2]"
+        );
+    }
+
+    #[test]
+    fn literal_shaped_empty_array_and_reparsed_empty_array() {
+        assert_eq!(jq_json(b"{}", ".a = [empty]"), r#"{"a":[]}"#);
+        assert_eq!(jq_json(br#""[]""#, "fromjson"), "[]");
+        assert_eq!(jq_json(b"[1]", "[path(.)]"), "[[]]");
+    }
+
+    #[test]
+    fn yq_zero_arity_path_at_the_root_is_empty() {
+        assert_eq!(yq_json(br#"{"a":1}"#, "path"), "[]");
+        assert_eq!(yq_json(br#"{"a":1}"#, ".a | path"), r#"["a"]"#);
     }
 }

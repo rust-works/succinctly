@@ -89,25 +89,30 @@ struct Events(RefCell<BTreeMap<Site, u64>>);
 
 impl Drop for Events {
     fn drop(&mut self) {
-        if std::env::var_os("SUCCINCTLY_SHARE_STATS").is_none() {
-            return;
+        // Process-global state, so this is exercised by the CLI audit run
+        // (`SUCCINCTLY_SHARE_STATS=1 cargo test -- --nocapture`), not by an
+        // in-process test that would have to set the variable for every
+        // other test thread too; `exit_report` below is what is tested.
+        if std::env::var_os("SUCCINCTLY_SHARE_STATS").is_some() {
+            std::eprint!("{}", exit_report(&self.0.borrow())); // omni-dev: coverage tolerate-line reason="process-global env var; exercised by the CLI audit run, not by an in-process test (#2999)"
         }
-        let events = self.0.borrow();
-        if events.is_empty() {
-            return;
-        }
-        let mut out = String::new();
-        for (site, n) in events.iter() {
-            let _ = writeln!(
-                out,
-                "share-stats {n:>8}  {:<16} {}:{}",
-                site.kind.label(),
-                site.file,
-                site.line
-            );
-        }
-        std::eprint!("{out}");
     }
+}
+
+/// The thread-exit report: one `share-stats`-prefixed line per site, empty
+/// when nothing was forced, so a clean thread prints nothing.
+fn exit_report(events: &BTreeMap<Site, u64>) -> String {
+    let mut out = String::new();
+    for (site, n) in events {
+        let _ = writeln!(
+            out,
+            "share-stats {n:>8}  {:<16} {}:{}",
+            site.kind.label(),
+            site.file,
+            site.line
+        );
+    }
+    out
 }
 
 thread_local! {
@@ -230,5 +235,41 @@ mod tests {
         assert!(text.trim_start().starts_with('2'), "{text}");
         reset();
         assert!(report().is_empty());
+    }
+
+    #[test]
+    fn exit_report_names_every_kind_and_is_empty_when_clean() {
+        assert!(exit_report(&BTreeMap::new()).is_empty());
+        let mut events = BTreeMap::new();
+        for (i, kind) in [
+            Kind::ArrayMakeMut,
+            Kind::ObjectMakeMut,
+            Kind::ArrayUnwrap,
+            Kind::ObjectUnwrap,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            events.insert(
+                Site {
+                    file: "x.rs",
+                    line: i as u32 + 1,
+                    kind,
+                },
+                i as u64 + 1,
+            );
+        }
+        let text = exit_report(&events);
+        assert_eq!(text.lines().count(), 4);
+        for label in [
+            "array make_mut",
+            "object make_mut",
+            "array unwrap",
+            "object unwrap",
+        ] {
+            assert!(text.contains(label), "{text}");
+        }
+        assert!(text.lines().all(|l| l.starts_with("share-stats")), "{text}");
+        assert!(text.contains("x.rs:4"), "{text}");
     }
 }
