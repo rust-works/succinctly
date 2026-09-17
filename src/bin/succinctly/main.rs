@@ -1392,10 +1392,30 @@ fn main() -> Result<()> {
     }
 }
 
+/// Exit after a `jq`/`yq` run.
+///
+/// With the `share-stats` feature and `SUCCINCTLY_SHARE_STATS` set, first
+/// print #2999's copy-on-write audit -- every shared container the run copied
+/// on write or by value, with the call site that forced it -- to stderr.
+/// Nothing is printed otherwise, and the default build has no counters at
+/// all. See `succinctly::jq::share_stats`.
+fn exit_after_run(exit_code: i32) -> ! {
+    #[cfg(feature = "share-stats")]
+    if std::env::var_os("SUCCINCTLY_SHARE_STATS").is_some() {
+        let report = succinctly::jq::share_stats::report();
+        if report.is_empty() {
+            eprintln!("share-stats: no forced copies");
+        } else {
+            eprint!("share-stats: forced copies (count  kind  site)\n{report}");
+        }
+    }
+    std::process::exit(exit_code)
+}
+
 fn run_main() -> Result<()> {
     // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
     if let Some(exit_code) = try_multicall()? {
-        std::process::exit(exit_code);
+        exit_after_run(exit_code);
     }
 
     let cli = Cli::parse();
@@ -1403,11 +1423,11 @@ fn run_main() -> Result<()> {
     match cli.command {
         Command::Jq(args) => {
             let exit_code = jq_runner::run_jq(args)?;
-            std::process::exit(exit_code);
+            exit_after_run(exit_code);
         }
         Command::Yq(args) => {
             let exit_code = yq_runner::run_yq(args)?;
-            std::process::exit(exit_code);
+            exit_after_run(exit_code);
         }
         Command::JqLocate(args) => {
             let exit_code = jq_locate::run_jq_locate(args)?;

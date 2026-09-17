@@ -36,6 +36,7 @@
 //! one line per (kind, file, line) that forced a copy, with its count.
 
 use core::cell::RefCell;
+use core::fmt::Write as _;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -77,8 +78,40 @@ pub struct Site {
     pub kind: Kind,
 }
 
+/// The per-thread recording, with a reporter on drop.
+///
+/// A test thread ends when its test does, so under `cargo test --
+/// --nocapture` with `SUCCINCTLY_SHARE_STATS` set, every test that forced a
+/// copy prints its sites as it finishes -- the whole suite becomes the audit
+/// list with no per-test plumbing. (The CLI exits through `process::exit`,
+/// which skips thread-local destructors, so `main.rs` prints explicitly.)
+struct Events(RefCell<BTreeMap<Site, u64>>);
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        if std::env::var_os("SUCCINCTLY_SHARE_STATS").is_none() {
+            return;
+        }
+        let events = self.0.borrow();
+        if events.is_empty() {
+            return;
+        }
+        let mut out = String::new();
+        for (site, n) in events.iter() {
+            let _ = writeln!(
+                out,
+                "share-stats {n:>8}  {:<16} {}:{}",
+                site.kind.label(),
+                site.file,
+                site.line
+            );
+        }
+        std::eprint!("{out}");
+    }
+}
+
 thread_local! {
-    static EVENTS: RefCell<BTreeMap<Site, u64>> = const { RefCell::new(BTreeMap::new()) };
+    static EVENTS: Events = const { Events(RefCell::new(BTreeMap::new())) };
 }
 
 /// Record one forced copy at `site`.
@@ -87,7 +120,7 @@ thread_local! {
 #[inline]
 pub fn record(site: Site) {
     EVENTS.with(|events| {
-        *events.borrow_mut().entry(site).or_insert(0) += 1;
+        *events.0.borrow_mut().entry(site).or_insert(0) += 1;
     });
 }
 
@@ -111,6 +144,7 @@ pub fn site(kind: Kind) -> Site {
 pub fn count(kind: Kind) -> u64 {
     EVENTS.with(|events| {
         events
+            .0
             .borrow()
             .iter()
             .filter(|(site, _)| site.kind == kind)
@@ -121,17 +155,17 @@ pub fn count(kind: Kind) -> u64 {
 
 /// Total forced copies of every kind on this thread since the last [`reset`].
 pub fn total() -> u64 {
-    EVENTS.with(|events| events.borrow().values().sum())
+    EVENTS.with(|events| events.0.borrow().values().sum())
 }
 
 /// Snapshot of every recorded site with its count, sorted by site.
 pub fn sites() -> Vec<(Site, u64)> {
-    EVENTS.with(|events| events.borrow().iter().map(|(s, n)| (*s, *n)).collect())
+    EVENTS.with(|events| events.0.borrow().iter().map(|(s, n)| (*s, *n)).collect())
 }
 
 /// Forget everything recorded on this thread.
 pub fn reset() {
-    EVENTS.with(|events| events.borrow_mut().clear());
+    EVENTS.with(|events| events.0.borrow_mut().clear());
 }
 
 /// Render the recorded sites as one line each: `count  kind  file:line`.
@@ -139,7 +173,6 @@ pub fn reset() {
 /// Empty when nothing was forced, which is the answer ADR-0024's criterion 4
 /// wants to see.
 pub fn report() -> String {
-    use core::fmt::Write as _;
     let mut out = String::new();
     for (site, n) in sites() {
         let _ = writeln!(

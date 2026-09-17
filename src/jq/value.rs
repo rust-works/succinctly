@@ -1856,6 +1856,23 @@ impl<V> ObjectMapOf<V> {
 }
 
 impl<V: Clone> ObjectMapOf<V> {
+    /// Consume this map, yielding only the value at `key`: moved out when
+    /// this handle is the last one, cloned (a refcount bump for a container,
+    /// a copy for a scalar) when another handle shares the map -- never a
+    /// copy of the whole map to extract one entry (#2999).
+    ///
+    /// The unique case swap-removes, which is O(1) and safe because the map
+    /// is consumed here: nothing observes the order its siblings are left in.
+    #[inline]
+    #[track_caller]
+    pub fn take_entry(mut self, key: &str) -> Option<V> {
+        if self.is_shared() {
+            self.get(key).cloned()
+        } else {
+            self.swap_remove(key)
+        }
+    }
+
     /// Consume this map, yielding the `IndexMap` it wraps -- by move when
     /// this handle was the last one, by copy otherwise.
     #[inline]
@@ -2085,6 +2102,22 @@ impl<V> ArrayOf<V> {
 }
 
 impl<V: Clone> ArrayOf<V> {
+    /// Consume this array, yielding only the element at `index` (`None` when
+    /// out of range): moved out when this handle is the last one, cloned when
+    /// another handle shares the array -- never a copy of the whole array to
+    /// extract one element (#2999). See [`ObjectMapOf::take_entry`].
+    #[inline]
+    #[track_caller]
+    pub fn take_element(mut self, index: usize) -> Option<V> {
+        if index >= self.len() {
+            None
+        } else if self.is_shared() {
+            Some(self[index].clone())
+        } else {
+            Some(self.swap_remove(index))
+        }
+    }
+
     /// Consume this array, yielding the `Vec` it wraps -- by move when this
     /// handle was the last one, by copy otherwise.
     #[inline]
@@ -2786,6 +2819,10 @@ impl OwnedValue {
     }
 
     /// Convert to a mutable array reference, if possible.
+    ///
+    /// A copy-on-write point (#2999): on a shared array this is where the
+    /// copy happens, attributed to this method's caller.
+    #[track_caller]
     pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
             Self::Array(arr) => Some(&mut **arr),
@@ -2802,6 +2839,10 @@ impl OwnedValue {
     }
 
     /// Convert to a mutable object reference, if possible.
+    ///
+    /// A copy-on-write point (#2999): on a shared map this is where the
+    /// copy happens, attributed to this method's caller.
+    #[track_caller]
     pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, Self>> {
         match self {
             Self::Object(obj) => Some(obj),
@@ -4069,6 +4110,270 @@ mod tests {
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert!(OwnedValue::Int(1).as_object().is_none());
         assert!(OwnedValue::Int(1).as_object_mut().is_none());
+    }
+
+    /// [`ArrayVec`] exists to be invisible in the same way (#2999): one
+    /// assertion per conversion/iteration impl, since each is the only thing
+    /// standing between a call site and a compile error.
+    #[test]
+    fn array_vec_is_transparent_to_its_callers_2999() {
+        // From<Vec> / Deref (read side).
+        let items = ArrayVec::from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], OwnedValue::Int(1));
+        assert_eq!(items.first(), Some(&OwnedValue::Int(1)));
+
+        // DerefMut (write side) and Extend.
+        let mut items = items;
+        items.push(OwnedValue::Int(3));
+        items.extend([OwnedValue::Int(4)]);
+        assert_eq!(items.len(), 4);
+        if let Some(v) = items.get_mut(0) {
+            *v = OwnedValue::Int(10);
+        }
+
+        // IntoIterator for &ArrayVec and &mut ArrayVec.
+        let seen: Vec<&OwnedValue> = (&items).into_iter().collect();
+        assert_eq!(seen.len(), 4);
+        for v in &mut items {
+            *v = OwnedValue::Int(0);
+        }
+        assert!(items.iter().all(|v| *v == OwnedValue::Int(0)));
+
+        // IntoIterator for ArrayVec (owned) and FromIterator.
+        let rebuilt: ArrayVec = items.clone().into_iter().collect();
+        assert_eq!(rebuilt, items);
+
+        // Equal to the bare Vec it wraps, in both directions, and round-trips
+        // back out to one, both spellings.
+        let plain: Vec<OwnedValue> = rebuilt.clone().into();
+        assert_eq!(rebuilt, plain);
+        assert_eq!(plain, rebuilt);
+        assert_eq!(rebuilt.into_vec(), plain);
+
+        // `Debug` is transparent (see `object_map_is_transparent_to_its_callers_3000`).
+        let one = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        assert_eq!(
+            alloc::format!("{one:?}"),
+            "Array([Int(1)])",
+            "ArrayVec must not appear in an OwnedValue's Debug output"
+        );
+
+        // Constructors.
+        assert!(ArrayVec::new().is_empty());
+        assert!(ArrayVec::default().is_empty());
+        let sized = ArrayVec::with_capacity(8);
+        assert!(sized.is_empty());
+        assert!(sized.capacity() >= 8);
+    }
+
+    /// `as_array`/`as_array_mut` keep returning a bare `&Vec` (#2999's
+    /// public-API promise, the same one #3000 made for objects).
+    #[test]
+    fn as_array_accessors_still_hand_out_a_bare_vec_2999() {
+        let mut value = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
+        let read: &Vec<OwnedValue> = value.as_array().unwrap();
+        assert_eq!(read.len(), 1);
+        let write: &mut Vec<OwnedValue> = value.as_array_mut().unwrap();
+        write.push(OwnedValue::Int(2));
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        assert!(OwnedValue::Null.as_array().is_none());
+        assert!(OwnedValue::Null.as_array_mut().is_none());
+    }
+
+    /// The mechanism (#2999): a clone shares storage until one side writes,
+    /// the write copies exactly once and leaves the other handle untouched,
+    /// and `share_stats` names the line that copied.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn clone_shares_storage_until_the_first_write_2999() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let original = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let (mut copy, recorded) = share_stats::measure(|| original.clone());
+        assert!(recorded.is_empty(), "a clone copies nothing: {recorded:?}");
+        let OwnedValue::Array(items) = &copy else {
+            unreachable!()
+        };
+        assert!(items.is_shared());
+
+        let (_, recorded) = share_stats::measure(|| {
+            copy.as_array_mut().unwrap().push(OwnedValue::Int(3));
+        });
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let (site, n) = recorded[0];
+        assert_eq!((site.kind, n), (Kind::ArrayMakeMut, 1));
+        assert!(
+            site.file.ends_with("value.rs"),
+            "attributed to as_array_mut's caller, not to the wrapper: {site:?}"
+        );
+        assert_eq!(
+            original.as_array().unwrap().len(),
+            2,
+            "the other handle is untouched"
+        );
+        assert_eq!(copy.as_array().unwrap().len(), 3);
+        let OwnedValue::Array(items) = &copy else {
+            unreachable!()
+        };
+        assert!(!items.is_shared(), "the write left both handles unique");
+
+        // A second write through the now-unique handle copies nothing.
+        let (_, recorded) = share_stats::measure(|| {
+            copy.as_array_mut().unwrap().push(OwnedValue::Int(4));
+        });
+        assert!(recorded.is_empty(), "{recorded:?}");
+
+        // Same contract for objects.
+        let original = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let mut copy = original.clone();
+        let (_, recorded) = share_stats::measure(|| {
+            copy.as_object_mut()
+                .unwrap()
+                .insert("b".to_string(), OwnedValue::Int(2));
+        });
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0.kind, Kind::ObjectMakeMut);
+        assert_eq!(original.as_object().unwrap().len(), 1);
+        assert_eq!(copy.as_object().unwrap().len(), 2);
+    }
+
+    /// Consuming a container by value moves when the handle is unique and
+    /// copies when it is shared -- the by-value-destructure class the audit
+    /// exists to list.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn by_value_consumption_moves_when_unique_and_copies_when_shared_2999() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let unique = ArrayVec::from(vec![OwnedValue::Int(1)]);
+        let (_, recorded) = share_stats::measure(|| unique.into_vec());
+        assert!(recorded.is_empty(), "{recorded:?}");
+
+        let shared = ArrayVec::from(vec![OwnedValue::Int(1)]);
+        let keep = shared.clone();
+        let (v, recorded) = share_stats::measure(|| shared.into_iter().collect::<Vec<_>>());
+        assert_eq!(v.len(), 1);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0.kind, Kind::ArrayUnwrap);
+        assert_eq!(keep.len(), 1, "the surviving handle still reads");
+
+        let map = ObjectMap::from(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
+        let keep = map.clone();
+        let (m, recorded) = share_stats::measure(|| map.into_index_map());
+        assert_eq!(m.len(), 1);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0.kind, Kind::ObjectUnwrap);
+        assert_eq!(keep.len(), 1);
+
+        // Taking one child out of a consumed container never copies the
+        // container, shared or not -- the shared case clones the child only.
+        let nested = OwnedValue::array_from(vec![OwnedValue::Int(7), OwnedValue::Int(8)]);
+        let items = ArrayVec::from(vec![nested.clone(), OwnedValue::Int(1)]);
+        let keep = items.clone();
+        let (taken, recorded) = share_stats::measure(|| items.take_element(0));
+        assert!(recorded.is_empty(), "{recorded:?}");
+        assert_eq!(taken.as_ref(), Some(&nested));
+        let OwnedValue::Array(inner) = taken.unwrap() else {
+            unreachable!()
+        };
+        assert!(inner.is_shared(), "the child is shared, not copied");
+        assert_eq!(keep.len(), 2, "the other handle still has both elements");
+        assert_eq!(keep.take_element(5), None);
+        let unique = ArrayVec::from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        assert_eq!(unique.take_element(1), Some(OwnedValue::Int(2)));
+
+        let map = ObjectMap::from(IndexMap::from([
+            ("a".to_string(), nested.clone()),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        let keep = map.clone();
+        let (taken, recorded) = share_stats::measure(|| map.take_entry("a"));
+        assert!(recorded.is_empty(), "{recorded:?}");
+        assert_eq!(taken.as_ref(), Some(&nested));
+        assert_eq!(keep.len(), 2);
+        assert_eq!(keep.clone().take_entry("zzz"), None);
+        assert_eq!(keep.take_entry("b"), Some(OwnedValue::Int(2)));
+    }
+
+    /// A write copies the *spine* it goes through, not the tree: writing one
+    /// element's field of a shared array of objects copies the array (its
+    /// element handles, not the elements) and that one object. Every other
+    /// object stays one allocation shared by both documents.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn a_write_copies_only_the_spine_it_goes_through_2999() {
+        use crate::jq::share_stats::{self, Kind};
+
+        let doc = OwnedValue::array_from(
+            (0..100)
+                .map(|i| OwnedValue::object_from([("a".to_string(), OwnedValue::Int(i))]))
+                .collect(),
+        );
+        let mut written = doc.clone();
+        let (_, recorded) = share_stats::measure(|| {
+            let items = written.as_array_mut().unwrap();
+            let first = items[0].as_object_mut().unwrap();
+            first.insert("a".to_string(), OwnedValue::Int(-1));
+        });
+        let kinds: Vec<_> = recorded.iter().map(|(s, n)| (s.kind, *n)).collect();
+        assert_eq!(kinds, [(Kind::ArrayMakeMut, 1), (Kind::ObjectMakeMut, 1)]);
+        assert_eq!(
+            doc.as_array().unwrap()[0].as_object().unwrap()["a"],
+            OwnedValue::Int(0)
+        );
+        assert_eq!(
+            written.as_array().unwrap()[0].as_object().unwrap()["a"],
+            OwnedValue::Int(-1)
+        );
+        for (a, b) in doc
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(written.as_array().unwrap().iter())
+            .skip(1)
+        {
+            let (OwnedValue::Object(a), OwnedValue::Object(b)) = (a, b) else {
+                unreachable!()
+            };
+            assert!(a.is_shared() && b.is_shared());
+            assert_eq!(a, b);
+        }
+    }
+
+    /// The holdout's own pin: `unshared-containers` must copy eagerly, or the
+    /// A/B it exists for is measuring two sharing binaries against each other
+    /// and reporting the difference as code-layout bias.
+    #[test]
+    #[cfg(feature = "unshared-containers")]
+    fn unshared_containers_holdout_copies_eagerly_2999() {
+        use crate::jq::share_stats;
+
+        let original = OwnedValue::array_from(vec![OwnedValue::object_from([(
+            "a".to_string(),
+            OwnedValue::Int(1),
+        )])]);
+        let (mut copy, recorded) = share_stats::measure(|| original.clone());
+        assert!(recorded.is_empty());
+        let OwnedValue::Array(items) = &copy else {
+            unreachable!()
+        };
+        assert!(!items.is_shared());
+        let (_, recorded) = share_stats::measure(|| {
+            copy.as_array_mut().unwrap()[0]
+                .as_object_mut()
+                .unwrap()
+                .insert("b".to_string(), OwnedValue::Int(2));
+        });
+        assert!(
+            recorded.is_empty(),
+            "nothing is ever shared, so nothing is ever forced: {recorded:?}"
+        );
+        assert_eq!(
+            original.as_array().unwrap()[0].as_object().unwrap().len(),
+            1
+        );
+        assert_eq!(copy.as_array().unwrap()[0].as_object().unwrap().len(), 2);
     }
 
     /// #1171: a leading-dot number literal (with or without a `-` sign)

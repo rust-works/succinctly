@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`OwnedValue` shares its containers by refcount and copies on write** (#2999,
+  Experiment C of ADR-0024). `OwnedValue::Array` and `OwnedValue::Object` now hold
+  their storage behind an `Rc`, so `OwnedValue::clone()` is one refcount bump per
+  container instead of a deep copy, and a write through a shared handle copies
+  exactly the container it writes (`Rc::make_mut` inside the wrappers' `DerefMut`).
+  The write routes that keep an unmutated document beside a written one — the
+  streaming `=`/`|=` over a multi-path target (`.[(0,1)] = 0`), the per-output fork
+  of a multi-output right side (`.[(0,1)] = (1,2)`), the `.[] = v` fan-out — used to
+  deep-copy the whole document for that separation; they now copy the one `Vec` of
+  element handles they write through, and nested containers they do not touch stay
+  shared. `size_of::<OwnedValue>()` stays 32 and `JqValue` stays 40. Measured
+  numbers are in the PR and in ADR-0024.
+
+  **Breaking** for anything that pattern-matches the variant: `OwnedValue::Array`
+  now carries a `succinctly::jq::ArrayVec` (an alias for `ArrayOf<OwnedValue>`), not
+  a `Vec<OwnedValue>`, and `OwnedValue::Object`'s `ObjectMap` is refcounted rather
+  than boxed. Both wrappers are transparent the same way `ObjectMap` already was —
+  they `Deref` to the `Vec`/`IndexMap`, iterate in all three forms, convert both
+  ways with `From`, and an `ArrayVec` compares equal to a bare `Vec` in either
+  direction — so a read-side `OwnedValue::Array(items) => items.len()` needs no
+  change and only construction needs `.into()` (or `OwnedValue::array_from(vec)`,
+  which already existed). `as_array`/`as_array_mut`/`as_object`/`as_object_mut`
+  keep their exact signatures. `OwnedValue` is no longer `Send`/`Sync` (it never
+  crossed a thread in this crate; nothing in `src/jq` carries either bound).
+
+  Two measurement features come with it, neither for a shipped build:
+  `unshared-containers` swaps the `Rc` for a `Box` in both wrappers (functionally the
+  #3000 layout, the A/B's never-triggering holdout), and `share-stats` records every
+  copy-on-write that actually copied, with the `file:line` that forced it
+  (`SUCCINCTLY_SHARE_STATS=1` on a `--features cli,share-stats` binary prints the
+  list at exit). Every `cfg(test)` build carries the same counters, and
+  `jq::eval::share_audit_2999` pins the copy counts of the write routes above.
+
 - **`size_of::<OwnedValue>()` is 32 bytes, down from 72** (#3000).
   `OwnedValue::Object` held its `IndexMap<String, OwnedValue>` inline, and an
   `IndexMap` is 72 bytes, so `Object` was the widest arm and *every* value paid
@@ -48,12 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Smaller is the safe direction for the #1021 stack-overflow guard the first
   three exist for. `size_of::<Expr>()` is unchanged.
 
-  The new `unboxed-object-map` cargo feature restores the old inline layout on
-  both enums at once. It
-  exists so the A/B for this change could build a functionally-pre-#3000 binary
-  from the *same* source shape and subtract code-layout bias; it is a measurement
-  tool, it is not part of any supported configuration, and enabling it undoes the
-  entire point of the change.
+  An `unboxed-object-map` cargo feature restored the old inline layout on both
+  enums at once, so the A/B for this change could build a functionally-pre-#3000
+  binary from the *same* source shape and subtract code-layout bias. Its
+  measurement is recorded (#3000, ADR-0024) and #2999's `unshared-containers`
+  feature superseded it as the measurement holdout; it no longer exists.
 
 - **A filter now validates only what it *materializes*** (#2692). `select`,
   `if`, `not`, `and`, `or`, `//` and zero-arity `any`/`all` answer through

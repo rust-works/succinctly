@@ -57,23 +57,26 @@ pub enum OwnedValue {
     Int(i64),
     Float(f64),
     String(String),                         // 24 bytes + heap allocation
-    Array(Vec<OwnedValue>),                 // 24 bytes + heap allocation
-    Object(ObjectMap),                      // 8 bytes + heap allocation (#3000)
+    Array(ArrayVec),                        // 8 bytes + heap allocation (#2999)
+    Object(ObjectMap),                      // 8 bytes + heap allocation (#3000, #2999)
 }
 ```
 
 **Memory overhead per value type.** Every arm pays the widest one, so the whole
 table's "stack size" is really `size_of::<OwnedValue>()`, which #3000 took from
 72 bytes to **32** by boxing the object map — `NumberLiteral(NumberRepr,
-Box<str>)` is the widest arm now, and `Object` costs one pointer:
+Box<str>)` is the widest arm now, and `Object` costs one pointer. #2999 then
+put both containers behind an `Rc`, so a clone of any value shares every
+container under it until one side writes (copy-on-write); the widths below are
+unchanged, the heap side gains a 16-byte refcount header per container:
 
 | Type      | Payload    | Heap Overhead           | Notes                        |
 |-----------|------------|-------------------------|------------------------------|
 | Null/Bool | 0-1 bytes  | 0                       | Discriminant only            |
 | Int/Float | 8 bytes    | 0                       | 8-byte value                 |
 | String    | 24 bytes   | len + capacity padding  | Copies source text           |
-| Array     | 24 bytes   | 32×len + capacity       | Recursive overhead           |
-| Object    | 8 bytes    | 72 + ~40×entries + keys | Boxed IndexMap (#3000)       |
+| Array     | 8 bytes    | 40 + 32×len + capacity  | Rc<Vec> (#2999), shared      |
+| Object    | 8 bytes    | 88 + ~40×entries + keys | Rc<IndexMap> (#3000, #2999)  |
 
 **Why OwnedValue is 3-5× the source text:**
 
@@ -82,9 +85,11 @@ Box<str>)` is the widest arm now, and `Object` costs one pointer:
 3. **Vec capacity**: Vecs often allocate 2× needed capacity
 4. **Recursive overhead**: Each nested value has its own allocations
 5. **Alignment padding**: Rust aligns to 8 bytes
-6. **One allocation per object** (#3000): the boxed map costs a `malloc` even
-   for `{}`, which is the trade for every *other* value being 32 bytes instead
-   of 72
+6. **One allocation per container** (#3000, #2999): the refcounted map or
+   `Vec` costs a `malloc` even for `{}`/`[]`, which is the trade for every
+   *other* value being 32 bytes instead of 72 -- and, since #2999, for a
+   clone of a document costing one refcount bump per container instead of a
+   deep copy
 
 ### 3. Result Buffering (Additional 1-2×)
 
