@@ -49435,20 +49435,18 @@ fn local_zone() -> LocalZone {
 /// `"strftime"` for every caller today (`strflocaltime` never reaches
 /// `todate`, which has no zone argument).
 ///
-/// Returns the tuple directly, or the `QueryResult` an early exit
-/// (`None`/`Error`) should return, so each caller's own `match .. { Ok(t)
-/// => .., Err(r) => return r }` reads as a single step rather than the
-/// large inline match this replaced.
-///
-/// `(year, month, day, hour, minute, second, weekday, yearday)`.
-type BrokenDownTimeFields = (i64, i64, i64, i64, i64, i64, i64, i64);
-
+/// Returns the same [`BrokenDownTime`] `broken_down_time_from_unix_secs`
+/// itself returns (by field name, not position, so a future reorder of one
+/// can't silently mismatch the other), or the `QueryResult` an early exit
+/// (`None`/`Error`) should return -- each caller's own `match .. { Ok(t) =>
+/// .., Err(r) => return r }` reads as a single step rather than the large
+/// inline match this replaced.
 fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     optional: bool,
     zone: &Option<LocalZone>,
     name: &str,
-) -> Result<BrokenDownTimeFields, QueryResult<'a, W>> {
+) -> Result<BrokenDownTime, QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
             // Extracted directly rather than via `get_float_value_with`:
@@ -49483,14 +49481,11 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                 None => Some(secs),
                 Some(zone) => secs.checked_add(zone.offset_secs),
             };
-            let t = ok_or_result::<W, _>(
+            ok_or_result::<W, _>(
                 secs.ok_or_else(EvalError::datetime_out_of_range)
                     .and_then(broken_down_time_from_unix_secs),
                 optional,
-            )?;
-            Ok((
-                t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
-            ))
+            )
         }
         // #1820: `scalar_decode_failure` first, same shape as
         // `builtin_mktime`'s own fix above -- and for the same
@@ -49545,16 +49540,16 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                         Err(e) => return Err(QueryResult::Error(e)),
                     };
 
-                    Ok((
-                        get_int(0),
+                    Ok(BrokenDownTime {
+                        year: get_int(0),
                         month,
-                        get_int(2),
-                        get_int(3),
-                        get_int(4),
-                        get_int(5),
-                        get_int(6),
-                        get_int(7),
-                    ))
+                        day: get_int(2),
+                        hour: get_int(3),
+                        minute: get_int(4),
+                        second: get_int(5),
+                        weekday: get_int(6),
+                        yearday: get_int(7),
+                    })
                 }
                 _ if optional => Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
                 _ => Err(QueryResult::Error(
@@ -49595,11 +49590,10 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            let (year, month, day, hour, minute, second, weekday, yearday) =
-                match broken_down_time_fields::<W>(&value, optional, &zone, name) {
-                    Ok(t) => t,
-                    Err(r) => return r,
-                };
+            let t = match broken_down_time_fields::<W>(&value, optional, &zone, name) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
 
             let (zone_offset, zone_name) = match &zone {
                 None => (0, "UTC"),
@@ -49607,14 +49601,14 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             let result = match format_strftime(
                 &fmt,
-                year,
-                month,
-                day,
-                hour,
-                minute,
-                second,
-                weekday,
-                yearday,
+                t.year,
+                t.month,
+                t.day,
+                t.hour,
+                t.minute,
+                t.second,
+                t.weekday,
+                t.yearday,
                 zone_offset,
                 zone_name,
             ) {
@@ -50273,13 +50267,15 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
     // `<name>/1 requires parsed datetime inputs` error on anything else --
     // `broken_down_time_fields` is the one shared implementation of that,
     // also used by `strftime_in_zone`.
-    let (year, month, day, hour, minute, second, ..) =
-        match broken_down_time_fields::<W>(&value, optional, &None, "strftime") {
-            Ok(t) => t,
-            Err(r) => return r,
-        };
+    let t = match broken_down_time_fields::<W>(&value, optional, &None, "strftime") {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
 
-    let result = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+    let result = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    );
 
     QueryResult::Owned(OwnedValue::String(result))
 }
@@ -50421,13 +50417,43 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 // Phase 21: Extended Date/Time functions (yq)
 
 /// Builtin: from_unix - convert Unix epoch to ISO 8601 date string
-/// This is semantically identical to todate/todateiso8601 but with yq naming convention
+///
+/// #3068 review: this used to delegate straight to `builtin_todate`, which
+/// was harmless while `todate` was numeric-only -- but `todate` now also
+/// accepts an 8-element broken-down-time array and raises jq's own
+/// `strftime/1 requires parsed datetime inputs` on anything else, and real
+/// yq's `from_unix` does neither: it rejects an array the same as any other
+/// non-number (confirmed live against yq v4.53.3: `[1970,0,1,0,0,0,4,0] |
+/// from_unix` errors `from_unix only works on numbers, found !!seq
+/// instead`, where jq's `todate` succeeds on it). Delegating unconditionally
+/// would have carried `todate`'s new jq-oracle-backed behavior onto this
+/// yq-mode builtin with no yq oracle backing it. Kept numeric-only with its
+/// own pre-existing wording (not real yq's -- that gap is pre-existing and
+/// separate, filed as its own issue) rather than reusing
+/// `broken_down_time_fields`.
 fn builtin_from_unix<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    // from_unix is the same as todate - converts Unix timestamp to ISO 8601 string
-    builtin_todate::<W>(value, optional)
+    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+        EvalError::new("math function requires number")
+    }) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
+
+    let secs = timestamp.trunc() as i64;
+    let t = match ok_or_result::<W, _>(broken_down_time_from_unix_secs(secs), optional) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
+    let result = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    );
+
+    QueryResult::Owned(OwnedValue::String(result))
 }
 
 /// Builtin: to_unix - convert ISO 8601 date string to Unix epoch
