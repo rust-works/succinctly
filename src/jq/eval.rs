@@ -10590,7 +10590,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::PathNoArg => {
             // PathNoArg requires path context which is handled in eval_pipe_with_context
             // When called without context, return empty path (root position)
-            QueryResult::Owned(OwnedValue::Array(vec![].into()))
+            QueryResult::Owned(OwnedValue::Array(vec![].into())) // omni-dev: coverage tolerate-line reason="unreachable: every entry point supplies path context, so `path` never evaluates without one; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         }
         // `parent`/`parent(n)` with no path context at all is the root
         // position: there is no ancestor to return. Same #2460 rule, and the
@@ -40253,7 +40253,7 @@ fn literal_shaped_expr_to_owned(expr: &Expr, depth: usize) -> Option<OwnedValue>
     match expr {
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
         Expr::Array(inner) => match inner.as_ref() {
-            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::Array(Vec::new().into())),
+            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::Array(Vec::new().into())), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
             Expr::Comma(items) => {
                 let mut out = vec_with_capacity(items.len());
                 for item in items {
@@ -44951,7 +44951,7 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
         // mode.
         (OwnedValue::Object(desc), OwnedValue::Array(arr)) => {
             let bounds = SliceBounds::from_descriptor(desc).ok()?;
-            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec().into());
+            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec().into()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
             get_value_at_path(&sliced, &path[1..])
         }
         (OwnedValue::Object(desc), OwnedValue::String(s)) => {
@@ -51233,7 +51233,7 @@ fn mixed_radix_combinations(
 /// generator-controlled cross products (#1669).
 fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
-        return Ok(vec![OwnedValue::Array(Vec::new().into())]);
+        return Ok(vec![OwnedValue::Array(Vec::new().into())]); // omni-dev: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
     }
 
     // Guard the row width (arrays.len()) against the heaviest type that
@@ -97577,8 +97577,8 @@ mod touched_edge_cases_2999 {
         let cursor = index.root(json);
         match eval::<Vec<u64>, S>(expr, cursor) {
             QueryResult::Owned(v) => v.to_json(),
-            QueryResult::One(v) => to_owned(&v).unwrap().to_json(),
-            other => panic!("unexpected result: {other:?}"),
+            QueryResult::One(v) => to_owned(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
+            other => panic!("unexpected result: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
         }
     }
 
