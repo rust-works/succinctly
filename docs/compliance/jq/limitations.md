@@ -5013,6 +5013,14 @@ Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by
 `test_closed_terms_do_not_validate_2173` (`IN(1, 2)` is deliberately *not* a closed term
 there: it reads `.`).
 
+**Residue.** `cond` stands at each `gen` output's position, which the constant rewriter
+cannot spell as the stage's own, so `path_context_resolvable` refuses a read inside `cond`
+and the routes that depend on that rewrite — `map_values(any(.; key == "c"))`, `.aa[] |=
+any(.; key == "c")`, `with_entries(.value |= any(.; key == "c"))` — still evaluate it with
+no position and answer `false` where the direct spelling `[.[] | any(.; key == "c")]`
+answers `[false,true]`. Pre-existing (the same routes answered the same before #2968) and
+tracked as [#3079](https://github.com/rust-works/succinctly/issues/3079).
+
 Two further behaviours moved with the route, both toward jq: the `any`/`all` probe now stops
 `cond` at its first decisive output on both evaluators, so `[any(1; (true, ("C"|stderr)))]`
 writes nothing (jq 1.7.1: `or` breaks out of its `first`; succinctly wrote `C`), and
