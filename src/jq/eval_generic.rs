@@ -8920,6 +8920,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
         {
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+            // omni-dev: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
         }
         Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_result_generic::<V>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true),
@@ -8936,6 +8937,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
         {
             bridge_to_full_evaluator_flow::<S, V>(expr, value, cursor, optional, sink)
+            // omni-dev: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
         }
         Expr::Until { cond, update } => {
             each_loop_generic::<S, V>(LoopKind::Until, cond, update, value, optional, cursor, sink)
@@ -22592,12 +22594,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             if crate::jq::input_queue_is_active()
                 && crate::jq::walk::uses_input_builtins(&Expr::Builtin(builtin.clone())) =>
         {
+            // omni-dev: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
             bridge_to_full_evaluator::<S, _>(
                 &Expr::Builtin(builtin.clone()),
                 value,
                 cursor,
                 optional,
-            )
+            ) // omni-dev: coverage tolerate-line reason="see above: the input-queue deferral never fires from the CLI"
         }
         Builtin::AnyF(cond) if cursor.is_some() => {
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true)
