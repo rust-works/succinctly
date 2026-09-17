@@ -39516,7 +39516,7 @@ pub(crate) fn as_var_refs(
 /// | path($x)` on input `0` still raises `Invalid path expression` in real
 /// jq, even though the bound value trivially equals `.` there) -- matching
 /// jq's actual rule takes a syntactic passthrough, not mere value equality.
-fn is_identity_passthrough(expr: &Expr) -> bool {
+pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
     match unwrap_paren(expr) {
         Expr::Identity => true,
         // #2042: only a marker frozen from `.` itself is a passthrough of
