@@ -2552,6 +2552,18 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // own arm gives: no observably-wrong repro exists for that case.
         Expr::Reduce { input, init, .. } => needs_path_context(input) || needs_path_context(init),
         Expr::Foreach { input, init, .. } => needs_path_context(input) || needs_path_context(init),
+        // #2968: the short-circuiting consumers have native, cursor-threaded
+        // arms on both generic routes now, so a read inside their arguments
+        // is a read this pipe has to route with position. `cond` is
+        // rebound to each `gen` output (`walk::reads_ambient_value`'s own
+        // arm), but a read there still needs *a* position, so it counts.
+        Expr::Builtin(Builtin::IsEmpty(f) | Builtin::UpperIn(f)) => needs_path_context(f),
+        Expr::Builtin(
+            Builtin::AnyCond(a, b)
+            | Builtin::AllCond(a, b)
+            | Builtin::UpperInSrc(a, b)
+            | Builtin::Skip(a, b),
+        ) => needs_path_context(a) || needs_path_context(b),
         _ => false,
     }
 }
@@ -6462,7 +6474,7 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// error, `skip(9007199254740995;1,2,3,4)` -> `[]`, all matching this function
 /// exactly) -- not the pinned oracle, so still worth re-checking once the pin
 /// itself moves past 1.8, tracked in #1880.
-fn classify_skip_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
+pub(crate) fn classify_skip_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             Ok(i as usize)
@@ -11800,25 +11812,36 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Probes a single element's `cond` output for a match, using the same
-/// prefix-vs-trailing-control split as `eval_limit`/`eval_first_expr`
-/// (`eval_owned_expr_fork`), so a match found before a later error in the
-/// same `cond` application still short-circuits instead of surfacing that
-/// error — jq's own `first(...)`-based definitions only pull one output at
-/// a time, so `cond` yielding `(false, error(...))` for one element must
-/// resolve on the `false` alone.
+/// Probes a single element's `cond` for a match, stopping at the first
+/// *decisive* output -- jq's own `first(...)`-based definitions pull one
+/// output at a time and break on the first that decides, so a later output
+/// of the same `cond` application is never evaluated: `cond` yielding
+/// `(false, error(...))` resolves on the `false` alone, and `[any(1;
+/// (true, ("C"|stderr)))]` writes nothing (jq 1.7.1, captured live).
+/// #2968: used to collect every output first (`eval_owned_expr_fork`),
+/// which got the answer right but ran the side effects past the decision;
+/// now the same rule as `eval_generic.rs`'s `any_all_probe_item_generic`,
+/// so the two routes agree on that row too.
 fn any_all_probe_element<S: EvalSemantics>(
     cond: &Expr,
     elem: &OwnedValue,
     target_truthy: bool,
 ) -> Result<bool, Control> {
-    let (cond_outputs, cond_trailing) = eval_owned_expr_fork::<S>(cond, elem, false);
-    if cond_outputs.iter().any(|c| c.is_truthy() == target_truthy) {
+    let mut decided = false;
+    let flow = eval_each_owned::<S>(cond, elem, false, &mut |out| {
+        if out.is_truthy() == target_truthy {
+            decided = true;
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    if decided {
         return Ok(true);
     }
-    match cond_trailing {
-        Some(control) => Err(control),
-        None => Ok(false),
+    match flow {
+        Flow::Escaped(control) => Err(control),
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(false),
     }
 }
 
