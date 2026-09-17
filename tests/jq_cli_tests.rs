@@ -59438,6 +59438,28 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
             r#"{"foo":[2,1]}"#,
             ".foo | . as $x | sort | (parent | empty), ($x[0] = 9)",
         ),
+        // Off the register inside a resolver, the ambient may be a copy.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | path(5 | select(($x.a = 9) | true))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | path([.a] | .[($x.a = 9 | 0)])",
+        ),
+        (&["-c"][..], r#"{"a":1}"#, ". as $x | (.a, .) |= ($x.a = 9)"),
+        (
+            &["-c"][..],
+            r#"{"foo":[{"a":1},{"a":1}]}"#,
+            ".foo | sort | .[0] | ((path | empty), (. as $y | {a:1} | ($y.a = 9)))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"foo":[{"a":1},{"a":1}]}"#,
+            ".foo | sort | ((path | empty), (.[0] as $y | .[1] | ($y.a = 9)))",
+        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -59671,6 +59693,78 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
             &["-c"][..],
             r#"{"foo":{"a":1}}"#,
             ".foo | . as $x | select(true) | (parent | empty), ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | objects | ((path | empty), ($x.a = 9))",
+            r#"{"a":9}"#,
+        ),
+        // Inside a resolver, a leaf, condition, computed key or bind source
+        // evaluated at a tracked node keeps the invocation's own markers.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | path(select(($x.a = 9) | true))",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | .[($x.a = 9 | "a")] = 5"#,
+            r#"{"a":5}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            r#". as $x | del(.[($x.a = 9 | "a")])"#,
+            "{}",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | path(if ($x.a = 9) then . else . end)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | path(($x.a = 9 | .a) as $q | .a)",
+            r#"["a"]"#,
+        ),
+        // The root path of `|=` in every spelling, and through the
+        // streaming route.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | (.) |= ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | getpath([]) |= ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | first(., .a) |= ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | . |= (try error($x) catch ($x.a = 9))",
+            r#"{"a":9}"#,
+        ),
+        // A bind at a position inside an owned tree names that position
+        // (`OwnedIdentity::root` derived per child).
+        (
+            &["-c"][..],
+            r#"{"foo":[{"a":1},{"a":1}]}"#,
+            ".foo | sort | .[0] | ((path | empty), (. as $y | ($y.a = 9)))",
             r#"{"a":9}"#,
         ),
     ] {

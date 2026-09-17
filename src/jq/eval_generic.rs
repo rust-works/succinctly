@@ -22700,6 +22700,22 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 /// path so that a stage rebuilding the value at a position (`to_entries`
 /// twice over) never has to patch a shared root: `parent` is simply the
 /// last link.
+/// The [`OwnedIdentity::root`] token of `component` under a position with
+/// token `parent` (#3036): a mix of the parent's token and the component's
+/// JSON spelling, so the same path under the same root yields the same
+/// token and a different one otherwise (up to hash collisions, which only
+/// ever accept -- a sibling position of a `Snapshot` marker's node can
+/// still be told apart by the value the marker is then compared to).
+fn owned_child_token(parent: u64, component: &OwnedValue) -> u64 {
+    // FNV-1a over the parent token and the component text.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ parent;
+    for byte in component.to_json().bytes() {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// A fresh [`OwnedIdentity::root`] token. Per thread, since an `Expr` never
 /// crosses threads and two evaluations on different threads never meet.
 fn fresh_owned_root() -> u64 {
@@ -22725,15 +22741,17 @@ struct OwnedIdentity<V: DocumentValue> {
     /// and keying on `ancestors.is_empty()` alone would certify `sort`'s
     /// new array as the node it stands on.
     exact: bool,
-    /// This owned root's own identity (#3036): a token fresh for every root
-    /// the pipe starts ([`OwnedIdentity::kept`]/[`OwnedIdentity::detached`])
+    /// This owned position's own identity (#3036): a token fresh for every
+    /// root the pipe starts ([`OwnedIdentity::kept`]/[`OwnedIdentity::detached`])
     /// and every value a stage rebuilds at a position
-    /// ([`OwnedIdentity::rebuilt`]), shared by every child position under
-    /// it. It is what a marker bound at a *detached* root (`input`, a
-    /// literal, `map`'s output) is certified against -- there is no `base`
-    /// node to name, yet `input | . as $x | ($x.a = 9)` is a write through
-    /// the very value that was bound, and `input | . as $x | {a:1} |
-    /// ($x.a = 9)` is not.
+    /// ([`OwnedIdentity::rebuilt`]), and derived from the parent's for each
+    /// child position ([`OwnedIdentity::child`]), so two identities share a
+    /// token exactly when they name the same position under the same
+    /// unrebuilt root. It is what a marker bound at a *detached* root
+    /// (`input`, a literal, `map`'s output) or inside an owned tree is
+    /// certified against -- there is no `base` node to name, yet `input | .
+    /// as $x | ($x.a = 9)` is a write through the very value that was
+    /// bound, and `input | . as $x | {a:1} | ($x.a = 9)` is not.
     root: u64,
     /// This value *is* the key `key` emitted (#2471). It stands at the same
     /// position -- `path`/`parent` answer exactly as they did for the node
@@ -22798,18 +22816,15 @@ impl<V: DocumentValue> OwnedIdentity<V> {
     /// The [`RootWitness`] an expression evaluated over this identity's value
     /// is checked against before it crosses into `eval.rs` (#3036, closing
     /// #2642's owned-identity residual): the base node itself when the
-    /// value *is* that node's own, unrebuilt value, and `Owned` -- which
-    /// demotes every `Snapshot` marker -- for a position inside an owned
-    /// tree; and this root's own token for anything else (a detached root,
-    /// or a value rebuilt at a position). Never `ancestors.is_empty()`
-    /// alone: the `Keeps` rule leaves `sort`'s new array with an empty chain
-    /// at the input's position, and certifying a marker against the *node*
-    /// there would write through a copy -- which is why a rebuilt value
-    /// answers with a fresh token instead.
+    /// value *is* that node's own, unrebuilt value, and this position's own
+    /// token otherwise (a detached root, a value rebuilt at a position, a
+    /// position inside an owned tree). Never `ancestors.is_empty()` alone:
+    /// the `Keeps` rule leaves `sort`'s new array with an empty chain at the
+    /// input's position, and certifying a marker against the *node* there
+    /// would write through a copy -- which is why a rebuilt value answers
+    /// with a fresh token instead.
     fn root_witness(&self) -> RootWitness {
-        if !self.ancestors.is_empty() {
-            RootWitness::Owned
-        } else if self.exact {
+        if self.exact && self.ancestors.is_empty() {
             RootWitness::of(self.base.as_ref())
         } else {
             RootWitness::OwnedRoot(self.root)
@@ -22825,6 +22840,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
 
     /// The identity of `component` inside `parent`, whose identity is `self`.
     fn child(&self, parent: &Rc<OwnedValue>, component: OwnedValue) -> Self {
+        let root = owned_child_token(self.root, &component);
         let mut ancestors = self.ancestors.clone();
         ancestors.push((Rc::clone(parent), component));
         Self {
@@ -22833,7 +22849,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             // A child of a key node is an ordinary node again.
             key_node: false,
             exact: self.exact,
-            root: self.root,
+            root,
         }
     }
 
@@ -24552,16 +24568,31 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
 /// (#3036): jq's `select`, `debug` and `stderr` return the very `jv` they
 /// were given, so a marker bound before them still names the node after
 /// them -- `.foo | . as $x | select(true) | (parent, ($x.a = 9))` writes in
-/// both jq and `main`. Every other `Keeps` stage (`sort`, `to_entries`,
-/// `tostring`, a write) allocates, and clears the node witness. Kept to
-/// the builtins whose jq definition is `if f then . else empty end` or a
-/// side effect returning `.`; `getpath([])`/`nth(0; .)`/`recurse(empty)`
+/// both jq and `main`, and so do the `select`-defined type filters
+/// (`values`, `objects`, ...). Every other `Keeps` stage (`sort`,
+/// `to_entries`, `tostring`, a write) allocates, and clears the node
+/// witness. Kept to the builtins whose jq definition is `if f then . else
+/// empty end` or a side effect returning `.`; `getpath([])`/`nth(0; .)`/`recurse(empty)`
 /// also pass through in jq but are left rebuilt here, recorded as
 /// refuse-only in `docs/compliance/jq/limitations.md`.
 fn stage_passes_input_through(stage: &Expr) -> bool {
     matches!(
         strip_parens(stage),
-        Expr::Builtin(Builtin::Select(_) | Builtin::Debug | Builtin::DebugMsg(_) | Builtin::Stderr)
+        Expr::Builtin(
+            Builtin::Select(_)
+                | Builtin::Debug
+                | Builtin::DebugMsg(_)
+                | Builtin::Stderr
+                | Builtin::Values
+                | Builtin::Nulls
+                | Builtin::Booleans
+                | Builtin::Numbers
+                | Builtin::Strings
+                | Builtin::Arrays
+                | Builtin::Objects
+                | Builtin::Iterables
+                | Builtin::Scalars
+        )
     )
 }
 
@@ -26437,6 +26468,9 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
     // the cursor's own value -- see `OwnedIdentity::exact`. The rules that
     // go through `owned_identity_after_stage` below clear it there.
     match rule {
+        // `select`/`objects`/`debug`: the copy this stage handed on *is*
+        // the cursor's own value to jq, so the node witness stays.
+        OwnedIdentityRule::Keeps if stage_passes_input_through(stage) => Ok(Some(id)),
         OwnedIdentityRule::Keeps => Ok(Some(id.rebuilt())),
         // #2471: `key` at the cursor boundary -- the emitted key stands
         // where the node stood, flagged so a second `key` emits nothing.
