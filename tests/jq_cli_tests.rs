@@ -45221,6 +45221,50 @@ fn test_todate_non_number_matches_strftime_wording_3068() -> Result<()> {
     Ok(())
 }
 
+/// #3041: real jq defines `abs` as `if . < 0 then -. else . end`, not an
+/// `fabs` alias -- non-numbers pass through unchanged (jq's total ordering
+/// puts strings/arrays/objects above every number), a non-negative number
+/// keeps its own literal spelling instead of being recomputed through
+/// `f64`, and `null`/`false`/`true` (which sort *below* every number) raise
+/// through `-.`'s own "cannot be negated" error. Every row confirmed live
+/// against jq 1.7.1.
+#[test]
+fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
+    for (filter, want) in [
+        (r#""a" | abs"#, r#""a""#),
+        ("[1,2] | abs", "[1,2]"),
+        ("{} | abs", "{}"),
+        ("1.50 | abs", "1.50"),
+        ("(-1.50) | abs", "1.5"),
+        ("(-1) | abs", "1"),
+        ("0 | abs", "0"),
+        ("(-0.0) | abs", "-0"),
+        ("nan | abs", "null"),
+        ("infinite | abs", "1.7976931348623157e+308"),
+    ] {
+        let (stdout, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    for (filter, want_err) in [
+        ("null | abs", "null (null) cannot be negated"),
+        ("false | abs", "boolean (false) cannot be negated"),
+        ("true | abs", "boolean (true) cannot be negated"),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 5, "`{filter}`: stderr {stderr:?}");
+        assert!(stderr.contains(want_err), "`{filter}`: stderr {stderr:?}");
+    }
+
+    // Data-sourced literal preservation, same convention as every other
+    // non-computing pass-through in this codebase.
+    let (stdout, code) = run_jq_stdin(".i | abs", r#"{"i":1.500}"#, &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "1.500");
+    Ok(())
+}
+
 /// A name the pinned jq does *not* define is still an error when reached
 /// (#1473 deferred unresolved calls to runtime; #3042 removed the last real
 /// builtins from that set, so a made-up name is what exercises it now).

@@ -388,3 +388,13 @@ libm_fma_checks_a_before_c	fma("x"; 1; "z")	null
 todate_string	todate	"x"
 todate_null	todate	null
 todateiso8601_string	todateiso8601	"x"
+
+# ── <t> (<v>) cannot be negated: abs on null/false/true (#3041) ────────────
+# abs is `if . < 0 then -. else . end` in jq -- null/false/true sort below
+# every number in jq's total ordering, so they take the `-.` branch and
+# raise unary minus's own error, not a number-required message. Strings/
+# arrays/objects sort *above* every number and pass through with no error,
+# so they have no row here.
+abs_null	abs	null
+abs_false	abs	false
+abs_true	abs	true
