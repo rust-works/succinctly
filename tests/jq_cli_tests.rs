@@ -50445,6 +50445,36 @@ fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
     Ok(())
 }
 
+/// #3044 review follow-up: `fold_index_key`'s own `-1 * <literal>` arm
+/// (`src/jq/parser.rs`) folded straight through to an exact `Expr::Index`/
+/// slice bound regardless of magnitude, so an out-of-range negative index
+/// or slice bound kept the divergence
+/// `test_unary_minus_matches_jq_past_2_53_3044` just closed for every other
+/// spelling -- `path(.[-869389897822472004])` stayed `[-869389897822472004]`
+/// where jq gives `[-869389897822472000]`. A magnitude within range
+/// (`.[-1]`) must keep folding exactly, unaffected.
+#[test]
+fn test_unary_minus_matches_jq_in_index_and_slice_bounds_3044() -> Result<()> {
+    for (filter, want) in [
+        ("path(.[-869389897822472004])", "[-869389897822472000]"),
+        (
+            "path(.[-869389897822472004:])",
+            r#"[{"start":-869389897822472000,"end":null}]"#,
+        ),
+        (
+            "path(.[:-869389897822472004])",
+            r#"[{"start":null,"end":-869389897822472000}]"#,
+        ),
+        ("[1,2,3] | .[-1]", "3"),
+        ("path(.[-123])", "[-123]"),
+    ] {
+        let (stdout, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// A range straddling `2^53` -- the top of jq's own exact-`f64` zone, and
 /// where the earlier, now-replaced `±2^53`-gated fix drew its line -- has no
 /// `i64` overflow risk at all (nowhere near `i64::MIN`/`i64::MAX`), so it
