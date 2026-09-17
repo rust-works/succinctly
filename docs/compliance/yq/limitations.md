@@ -4420,6 +4420,20 @@ deliberately what that gate used to provide incidentally, and checks the materia
 rather than the literal, so a nested `[1e400]` is refused too. Pinned in
 `test_argjson_reject_set_and_overflow_after_2052` (`tests/yq_cli_tests.rs`).
 
+The same split holds for jq's decNumber *spellings*, which
+[#2877](https://github.com/rust-works/succinctly/issues/2877) taught the shared lenient
+validator and JSON dispatchers to read (`nan`, `NaN5`, `sNaN`, `Infinity`, `-inf`, and a
+leading `+`). `succinctly jq` reads them as jq does; yq mode does not move. Plain `-p json`
+goes through the YAML parser and rejects every one of them, as real yq does (`json: invalid
+character a as null`, `invalid character '+' looking for beginning of value`). The
+`--slurp`/`--eval-all`/`--inplace` DOM route and this flag *do* reach the JSON dispatchers,
+and their materializer (`to_owned_canonicalizing_numbers_at_depth`) refuses a non-finite
+word outright -- the same "nowhere to put it" reasoning as the overflow rule above, and the
+same outcome the old `Error: invalid null` gave. A leading `+` is finite and is admitted
+there with the spelling dropped (`--argjson x +1` is `1`, `[+1.500]` is `[1.5]`), which is
+the `007`/`.5` mirroring convention this section already records, not a new rule. Pinned in
+`test_p_json_input_is_unmoved_by_2877` and the same reject-set test.
+
 The swap also brings the stray-comma rejection that materializer already carries
 (`--argjson x '[1,]'`, `'{,}'`, #2262/#2781) to this flag -- previously `serde_json` was the
 only thing refusing them, so this is the same guarantee from a different place, not a new
