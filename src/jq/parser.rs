@@ -641,9 +641,13 @@ pub struct CallSite {
 /// well can still be matched against an unresolved diagnostic for the same
 /// name. `arity` narrows that (an `f/1` diagnostic will not take an `f/2`
 /// site), but same-name *and* same-arity calls that differ only by lexical
-/// scope cannot be told apart here: in `(def f: 1; f) | f` both sites are
-/// `f/0` and only the second fails. Distinguishing those needs positions
-/// threaded through `resolve.rs` itself, tracked at #2635.
+/// scope cannot be told apart *from this table alone*: in `(def f: 1; f) |
+/// f` both sites are `f/0` and only the second fails. #2635 closed that gap
+/// without needing scope information here — `resolve::check` (which does
+/// have scope) now records, per failing call, how many earlier calls to the
+/// same `(name, arity)` it already visited (resolved or not), and the
+/// reporter uses that count to index straight into this table instead of
+/// counting failures on its own.
 ///
 /// Returns whatever was collected before any parse error, since the caller is
 /// already reporting a failure and a partial table still beats a text search.
@@ -687,11 +691,14 @@ pub struct VarSite {
 /// perfectly well can still be matched against an unbound-variable
 /// diagnostic for the same name. Two references of the same name that
 /// differ only by lexical scope (one bound, one not) cannot be told apart
-/// here, the same known limitation `CallSite`'s own doc comment records for
-/// calls (tracked there at #2635) — this closes the more common and more
-/// misleading case instead: a name that merely spells the same as an
-/// unrelated string-literal occurrence, which this table excludes by
-/// construction (only real `$name` reference sites are ever pushed).
+/// here -- `CallSite`'s own doc comment records the identical shape for
+/// calls, closed there by #2635's `occurrence_index`; this table's own
+/// version of that fix is tracked separately at #3107, since it needs the
+/// same `resolve.rs`-side scope-aware counting `UnboundVar` does not carry
+/// yet. This table still closes the more common and more misleading case on
+/// its own: a name that merely spells the same as an unrelated
+/// string-literal occurrence, which it excludes by construction (only real
+/// `$name` reference sites are ever pushed).
 pub fn collect_var_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<VarSite> {
     let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
     let _ = parser.parse_program();
