@@ -49464,11 +49464,16 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                 }
             } else if let Ok(f) = n.as_f64() {
                 f
+            // Defensive: a `Number` whose bytes are neither the NaN/infinity
+            // sentinel nor a valid `f64` is not producible by ordinary JSON
+            // parsing -- mirrors the identical, equally untested arm in
+            // `get_float_value_with` (pre-existing, not new to this
+            // extraction, #3068).
             } else if optional {
-                return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="defensive: a value already matched as StandardJson::Number whose bytes are neither the NaN/infinity sentinel nor a valid f64 is not producible by ordinary JSON parsing, mirroring the identical pre-existing, equally untested arm in get_float_value_with (#3068 extraction, not new)"
+                return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             } else {
                 return Err(QueryResult::Error(EvalError::new("invalid number")));
-                // omni-dev: coverage tolerate-line reason="defensive: a value already matched as StandardJson::Number whose bytes are neither the NaN/infinity sentinel nor a valid f64 is not producible by ordinary JSON parsing, mirroring the identical pre-existing, equally untested arm in get_float_value_with (#3068 extraction, not new)"
+                // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             };
 
             // Auto-converted the same way `gmtime` converts a raw
@@ -49512,7 +49517,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                     // jq's error.
                     if arr.len() < 8 {
                         if optional {
-                            return Err(QueryResult::None);
+                            return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function -- confirmed live (`eprintln!` probe): `[1,2,3] | todate?` reaches `builtin_todate` with `optional=false`, same as bare `todate`. `?`'s suppression happens entirely outside builtin dispatch here, the same 'optional is never true here' shape eval.rs already documents elsewhere for a different function (#2180's Expr::Object tolerate-line note, ~line 7334) (#3068)"
                         }
                         return Err(QueryResult::Error(
                             EvalError::requires_parsed_datetime_inputs(name),
@@ -49521,8 +49526,8 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
 
                     let get_int = |idx: usize| -> i64 {
                         match arr.get(idx) {
-                            Some(OwnedValue::Int(n)) => *n,
-                            Some(OwnedValue::Float(f)) => *f as i64,
+                            Some(OwnedValue::Int(n)) => *n, // omni-dev: coverage tolerate-line reason="every array literal written in filter source, and every array-element JSON parses, decodes to NumberLiteral (#1035), not a bare Int -- Int is for internally-synthesized values spliced post-parse; probed a computed element ([1970,(0+0),..]) and it still decoded as NumberLiteral here, so this arm has no known real producer (#3068)"
+                            Some(OwnedValue::Float(f)) => *f as i64, // omni-dev: coverage tolerate-line reason="same as the Int arm above -- no known real producer of a bare Float array element at this position (#3068)"
                             Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
                             Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
                             _ => 0,
@@ -49536,7 +49541,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                     // every format path eagerly computes `month`, not just `%s`).
                     let month = match checked_month_index(get_int(1)) {
                         Ok(m) => m,
-                        Err(_) if optional => return Err(QueryResult::None),
+                        Err(_) if optional => return Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through this call path -- see the array-length check above (#3068)"
                         Err(e) => return Err(QueryResult::Error(e)),
                     };
 
@@ -49551,7 +49556,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                         get_int(7),
                     ))
                 }
-                _ if optional => Err(QueryResult::None),
+                _ if optional => Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
                 _ => Err(QueryResult::Error(
                     EvalError::requires_parsed_datetime_inputs(name),
                 )),
@@ -82224,10 +82229,16 @@ mod tests {
             );
         }
 
-        // `?` suppresses every early-exit `broken_down_time_fields` has,
-        // shared with `strftime`'s own identical suppression: a too-short
-        // array, a non-array/non-number value, and a month value that
-        // overflows `checked_month_index` (#893's class).
+        // End-to-end `?` behavior over every early-exit `todate` has (a
+        // too-short array, a non-array/non-number value, a month value
+        // overflowing `checked_month_index`) -- confirmed via `eprintln!`
+        // probing that `broken_down_time_fields`'s own `optional` parameter
+        // is never `true` on any of these (the suppression these three
+        // exercise happens entirely outside builtin dispatch here, not
+        // through this function's own `if optional` arms), so this pins the
+        // observable behavior without claiming to cover those arms; see
+        // their own `tolerate-line` markers above for why they're dead code
+        // through every path that currently calls this function.
         for filter in [
             "[1,2,3] | todate?",
             "null | todate?",
@@ -82236,11 +82247,10 @@ mod tests {
             query!(b"null", filter, QueryResult::None => {});
         }
 
-        // An array element that is a *computed* `Int` (not a `NumberLiteral`,
-        // which is what every array literal written directly in filter
-        // source produces, #1035) still resolves through `get_int`'s
-        // `Some(OwnedValue::Int(n))` arm -- reachable via arithmetic on an
-        // array element, unlike the literal-array cases above.
+        // A computed array element still resolves through `get_int`, though
+        // (confirmed live) it still decodes as `NumberLiteral`, not the bare
+        // `Int`/`Float` `get_int` also handles -- see those arms' own
+        // `tolerate-line` markers.
         query!(b"null", "[1970,(0+0),1,0,0,0,4,0] | todate",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1970-01-01T00:00:00Z");
