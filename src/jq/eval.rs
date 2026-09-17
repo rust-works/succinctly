@@ -15815,6 +15815,8 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // plain `Int`/`Float` path where they belong (a
     // `NumberLiteral(Float(inf), "inf")` would make `format_number_jq_compat`
     // emit a bare `inf`, which is not a number in either output language).
+    // The jq-mode `jq_special_number` arm ahead of it (#2877) is the same
+    // rule for the two words Rust's parser lacks.
     if crate::json::validate::is_valid_number(trimmed.as_bytes()) {
         if !yq_mode || !yq_literal_overflows_f64(trimmed) {
             return Ok(OwnedValue::from_number_literal(trimmed));
@@ -15869,6 +15871,15 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // there is nothing here for it to share.
     if yq_mode {
         return tonumber_from_str_yq(s);
+    }
+    // jq reads a number string with the same decNumber grammar as a
+    // document number, so the special-value words are numbers here too
+    // (#2877): `"sNaN" | tonumber` and `"nan12" | tonumber` are `null`
+    // (a real NaN, printed) in jq 1.7.1, and Rust's `parse::<f64>()` below
+    // rejects both. jq mode only by construction -- yq mode has already
+    // returned above with its own grammar (#2960).
+    if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
+        return Ok(OwnedValue::Float(f));
     }
     if let Ok(i) = trimmed.parse::<i64>() {
         return Ok(OwnedValue::Int(i));

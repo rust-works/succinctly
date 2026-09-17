@@ -829,6 +829,16 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             b'n' => {
                 if self.text[text_pos..].starts_with(b"null") {
                     StandardJson::Null
+                } else if special_number_end(self.text, text_pos).is_some() {
+                    // `nan`, `NaN5`: decNumber's NaN shares its first byte
+                    // with `null` (#2877). `null` stays first and
+                    // unchanged, so a genuine null takes no new branch;
+                    // the word test runs only once that prefix test has
+                    // already failed, i.e. in what was the error arm.
+                    StandardJson::Number(JsonNumber {
+                        text: self.text,
+                        start: text_pos,
+                    })
                 } else {
                     StandardJson::Error("invalid null")
                 }
@@ -845,6 +855,31 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 text: self.text,
                 start: text_pos,
             }),
+            // jq's remaining number spellings (#2877), each an error arm
+            // until now so valid RFC 8259 input still reaches none of
+            // them: a leading `+` before a digit or `.` (`+1`, `+.5`,
+            // `+1.2.3` -- the last resolving to one span and then `null`
+            // downstream, exactly as `1.2.3` does), and decNumber's
+            // special words starting with `i`/`I`/`N`/`s`/`S` (`inf`,
+            // `Infinity`, `NaN`, `sNaN12`) or with `+` (`+inf`, `+nan`).
+            // A word that isn't one of those (`infx`, `nanx`, `Nope`) and
+            // a `+` before anything else (`+`, `+-1`, `+x`) stay errors:
+            // #966's "malformed span becomes `null`" precedent covers a
+            // number-*shaped* span only and must not grow to letters.
+            b'+' if matches!(self.text.get(text_pos + 1), Some(b'0'..=b'9' | b'.')) => {
+                StandardJson::Number(JsonNumber {
+                    text: self.text,
+                    start: text_pos,
+                })
+            }
+            b'+' | b'i' | b'I' | b'N' | b's' | b'S'
+                if special_number_end(self.text, text_pos).is_some() =>
+            {
+                StandardJson::Number(JsonNumber {
+                    text: self.text,
+                    start: text_pos,
+                })
+            }
             _ => StandardJson::Error("unexpected character"),
         }
     }
@@ -945,12 +980,13 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     return None;
                 }
             }
-            // Null
+            // Null -- or decNumber's NaN, which shares the first byte
+            // (#2877); the `value_at` arm above explains the ordering.
             b'n' => {
                 if self.text[start..].starts_with(b"null") {
                     start + 4
                 } else {
-                    return None;
+                    special_number_end(self.text, start)?
                 }
             }
             // Number: scan for end of number, matching `value()`'s own
@@ -961,6 +997,14 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             c if c == b'-' || c == b'.' || c.is_ascii_digit() => {
                 nested_number_span(self.text, start)
             }
+            // The #2877 spellings, mirroring `value_at`'s arms exactly:
+            // `nested_number_span` reads a `+digit`/`+.` token (and a
+            // `+`-signed word, through its own word arm) the same way it
+            // reads a `-` one, and a bare word is `special_number_end`'s.
+            b'+' if matches!(self.text.get(start + 1), Some(b'0'..=b'9' | b'.')) => {
+                nested_number_span(self.text, start)
+            }
+            b'+' | b'i' | b'I' | b'N' | b's' | b'S' => special_number_end(self.text, start)?,
             _ => return None,
         };
 
@@ -1981,11 +2025,13 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 ///
 /// `start` must point at a byte that begins a candidate number: `-`, an
 /// ASCII digit, or -- real jq's own number reader is lenient beyond
-/// strict JSON here -- a `.` immediately followed by a digit. Returns
-/// `None` if the bytes at `start` don't actually form a valid number
-/// token (`-e5`, `1e`, a bare `.`, ...).
+/// strict JSON here -- a `.` immediately followed by a digit, or a `+`
+/// (#2877). Returns `None` if the bytes at `start` don't actually form a
+/// valid number token (`-e5`, `1e`, a bare `.`, `+-1`, ...). decNumber's
+/// special words (`nan`, `-Infinity`) are not this function's: see
+/// [`jq_number_token_end`], which tries this grammar first and then those.
 ///
-/// Grammar: optional `-`; an integer part (0+ digits) and/or a
+/// Grammar: optional `-` or `+`; an integer part (0+ digits) and/or a
 /// `.`-prefixed fractional part (`.` + 1+ digits) -- at least one of
 /// the two must supply a digit, so a bare `.` alone is rejected, but a
 /// leading-dot number (`.5`) is accepted; an optional `.`-fraction with
@@ -2023,7 +2069,11 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// design pass.
 pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
-    if i < text.len() && text[i] == b'-' {
+    // A leading `+` (#2877) is peeled exactly like `-`: `+X` is `X` in
+    // jq, so the grammar below decides the rest either way, and a `+`
+    // followed by nothing it accepts (`+`, `+-1`, `+x`) is rejected the
+    // same way `-` alone is.
+    if i < text.len() && (text[i] == b'-' || text[i] == b'+') {
         i += 1;
     }
     let int_start = i;
@@ -2128,7 +2178,12 @@ pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// exponent marker with no digit, ...) still resolves to *one*
 /// recognized span instead of either fabricating a shorter,
 /// wrong-but-valid-looking number or splitting into two adjacent
-/// tokens with no separator between them. `is_valid_number`/
+/// tokens with no separator between them. The one addition since #2877
+/// is a *word* arm, taken only when that greedy loop consumed nothing
+/// after the optional sign and only when the whole word is one of
+/// decNumber's special values ([`special_number_end`]) -- so `nan`,
+/// `-inf` and `+Infinity` are one span each, while `-nope` still yields
+/// exactly the span it always did. `is_valid_number`/
 /// `OwnedValue::from_number_bytes` are what decide, from that whole
 /// span, whether it's safe to treat as a real number (falling back to
 /// `Null` if not) -- matching this crate's own established, tested
@@ -2148,16 +2203,96 @@ pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// they still don't share an implementation.
 fn nested_number_span(text: &[u8], start: usize) -> usize {
     let mut i = start;
-    if i < text.len() && text[i] == b'-' {
+    // `+` as well as `-` (#2877). `+` was already in the greedy class
+    // below, so a `+digit` token's span is unchanged by this; skipping it
+    // here is what lets the empty-body test that follows see `+nan` and
+    // `-inf` as "a sign and then nothing numeric".
+    if i < text.len() && (text[i] == b'-' || text[i] == b'+') {
         i += 1;
     }
+    let body_start = i;
     while i < text.len() {
         match text[i] {
             b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => i += 1,
             _ => break,
         }
     }
+    // Nothing numeric after the (optional) sign: a decNumber special word
+    // (`nan`, `sNaN12`, `-Infinity`, `+inf`, #2877)? Only then, and only if
+    // the whole word validates -- otherwise this returns exactly the span
+    // it always did (`-` for `-nope`, `+` for `+x`), so the #1643
+    // delimiter-gap check keeps rejecting those the way it does today.
+    if i == body_start {
+        if let Some(end) = special_number_end(text, start) {
+            return end;
+        }
+    }
     i
+}
+
+/// Where the token starting at `start` ends, if it is one of decNumber's
+/// special values as jq 1.7.1 reads them (`nan`, `NaN5`, `sNaN`, `inf`,
+/// `Infinity`, with an optional `+`/`-`, case-insensitive --
+/// [`crate::json::validate::jq_special_number`], #2877); `None` otherwise.
+///
+/// The candidate token ends where jq's own literal scanner stops
+/// ([`jq_literal_run_end`]), and the *whole* run has to validate. That is
+/// deliberately stricter than "the longest prefix that validates":
+/// `nan1.5`, `nan-1`, `nan(1)`, `nane5` and `infinity1` are each one
+/// `Invalid numeric literal` to jq, and reading a valid prefix out of them
+/// (`nan1`, `nan`, `nan`, `nan`, `infinity`) would materialize a number
+/// where jq errors -- with the leftover bytes caught only by the #1643 gap
+/// check, which the materializing routes do not run between siblings
+/// (`[nan(1)] | map(.)` would print `[null,1]`). Returning `None` makes the
+/// dispatchers' error arm own them instead.
+fn special_number_end(text: &[u8], start: usize) -> Option<usize> {
+    let end = jq_literal_run_end(text, start);
+    crate::json::validate::jq_special_number(&text[start..end]).map(|_| end)
+}
+
+/// Where the literal token starting at `start` ends under jq 1.7.1's own
+/// scanner: `jv_parse.c`'s `scan` accumulates every byte that is not
+/// whitespace, `"` or one of `[{,:]}` into one token and hands the whole
+/// thing to `check_literal`. So `nan 1` is two tokens, while `nan1.5`,
+/// `nan(1)` and `nanx` are each one token that then fails to validate.
+fn jq_literal_run_end(text: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < text.len()
+        && !text[end].is_ascii_whitespace()
+        && !matches!(text[end], b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}')
+    {
+        end += 1;
+    }
+    end
+}
+
+/// Where the number token starting at `start` ends, under jq 1.7.1's own
+/// reader, for the **top-level document splitter** (#2877).
+///
+/// The caller is `scan_one_json_token` (`src/bin/succinctly/jq_runner.rs`,
+/// and through it `--seq`). The answer is either [`number_literal_end`]'s
+/// decimal grammar, or -- when that finds no number -- one of decNumber's
+/// special values. `None` when the bytes at `start` are neither, so a
+/// malformed top-level token still errors (#1171) rather than being
+/// truncated or absorbed.
+///
+/// A word token ends where jq's own literal scanner stops
+/// ([`jq_literal_run_end`]): `nan 1` is two tokens (`null`, `1`, as jq
+/// prints them) while `nan1.5`, `nan(1)` and `nanx` are each one token that
+/// fails to validate -- the same whole-token rule [`special_number_end`]
+/// applies inside a container, and this is that function.
+///
+/// `start` must point at a byte that can begin either grammar: `-`, `+`,
+/// `.`, an ASCII digit, or one of `n`/`N`/`i`/`I`/`s`/`S`; the caller
+/// decides that `nu…` is `null`'s and not this function's, mirroring jq's
+/// `check_literal`, which sends only `t…`/`f…`/`nu…` down its keyword path
+/// and everything else -- a bare `n` included -- to its number parser.
+#[must_use]
+pub fn jq_number_token_end(text: &[u8], start: usize) -> Option<usize> {
+    if let Some(end) = number_literal_end(text, start) {
+        return Some(end);
+    }
+    special_number_end(text, start)
 }
 
 /// A JSON number that hasn't been parsed yet.
@@ -2193,19 +2328,31 @@ impl<'a> JsonNumber<'a> {
 
     /// Parse as f64.
     ///
-    /// Also decodes the reindex bridge's computed-float token
-    /// (`crate::json::validate::computed_float_token`, #2902), which is
-    /// deliberately unparseable as an ordinary number: every cursor-level
-    /// reader of a bridged document (`length`, the math builtins, dates,
-    /// `isnan`, ...) reaches its value through this one accessor, so the
-    /// decode lives here rather than being repeated at each of them. Only
+    /// Also decodes every spelling the ordinary parse refuses but this
+    /// crate's one raw-bytes decoder,
+    /// [`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes),
+    /// reads as a number: the reindex bridge's computed-float token
+    /// (`crate::json::validate::computed_float_token`, #2902) and its NaN/
+    /// infinity tokens (#472/#1083 -- decoded here since #2877, when the
+    /// `--slurp`/`--seq` input path started writing them), and decNumber's
+    /// special values (#2877: Rust's `f64: FromStr` reads `nan`, `inf`,
+    /// `infinity` and a leading `+` case-insensitively, but rejects a
+    /// signalling NaN `sNaN` and a NaN payload `nan12`, both of which jq
+    /// 1.7.1 accepts). Every cursor-level reader of a document number in
+    /// both evaluators (`length`, the math builtins, dates, `isnan`, the
+    /// generic materializer's `as_f64` arm, ...) reaches its value through
+    /// this one accessor, so the decode lives here rather than being
+    /// repeated at each of them -- and delegating to `from_number_bytes`
+    /// rather than restating its arms keeps the two from drifting. Only
     /// consulted once the ordinary parse has already failed, so a genuine
     /// number pays nothing for it.
     pub fn as_f64(&self) -> Result<f64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
-            crate::json::validate::parse_computed_float_token(bytes).ok_or(JsonError::InvalidNumber)
+            crate::jq::OwnedValue::from_number_bytes(bytes)
+                .as_f64()
+                .ok_or(JsonError::InvalidNumber)
         })
     }
 
@@ -2692,13 +2839,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     /// correctly exits 1. `--preserve-input`/`Preserve` echoes the same
     /// span unsanitized (still nominally a `Number`), so it stays truthy
     /// there -- only `JqCompat` treats a malformed number as falsy.
+    ///
+    /// "Malformed" is "decodes to no number at all" (`as_f64` is `None`,
+    /// i.e. `from_number_bytes` gives `Null`), not "has no preservable
+    /// literal": since #2877 a document `nan`/`Infinity` is a number with no
+    /// literal spelling, and it is truthy in jq even though a NaN *prints*
+    /// as `null` (`jq -ne '[nan] | .[0]'` exits 0). The old literal-based
+    /// test also called `[1.]`'s element falsy while printing it as `1`.
     #[inline]
     fn is_falsy(&self, numbers: JsonConvention) -> bool {
         match self.value() {
             StandardJson::Null | StandardJson::Bool(false) => true,
-            StandardJson::Number(_) => {
-                numbers == JsonConvention::JqCompat && self.value().number_literal().is_none()
-            }
+            StandardJson::Number(n) => numbers == JsonConvention::JqCompat && n.as_f64().is_err(),
             _ => false,
         }
     }
@@ -2849,6 +3001,22 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 let base = zero_stripped.as_deref().unwrap_or(bytes);
                 if crate::json::validate::has_trailing_dot_before_exponent(base) {
                     return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+                }
+                // A leading `+` (#2877): `+X` is `X` in jq, and the
+                // literal is the *unsigned* text, borrowed from the same
+                // span one byte in -- the same peel
+                // `OwnedValue::from_number_bytes` makes, re-running the
+                // four gates above on the unsigned text
+                // (`is_preservable_number_literal` names that exact set).
+                // decNumber's special words (`nan`, `-Infinity`, ...)
+                // deliberately reach none of these gates and return `None`
+                // here: they have no JSON spelling to preserve, so the
+                // caller's `as_f64` fallback hands back the bare value
+                // instead, exactly as `from_number_bytes` does.
+                if let Some(unsigned) = crate::json::validate::strip_leading_plus(bytes) {
+                    if crate::json::validate::is_preservable_number_literal(unsigned) {
+                        return core::str::from_utf8(unsigned).ok().map(Cow::Borrowed);
+                    }
                 }
                 // The semi-index scanner accepts number *spans* more
                 // leniently than RFC 8259 beyond just a leading zero
@@ -6425,6 +6593,233 @@ mod tests {
             assert_eq!(n.as_i64(), Err(JsonError::InvalidNumber), "{token}");
             let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
             assert_eq!(number.number_literal(), None, "{token}");
+        }
+    }
+
+    /// #2877: every spelling jq 1.7.1 reads as a number, nested inside a
+    /// container, is one `Number` node here -- `value()`, `text_range()`
+    /// and `raw_bytes()` agree on its span, `as_f64` gives jq's value, and
+    /// `number_literal()` keeps only a spelling JSON can carry (unsigned).
+    /// Each row's value column was captured live (`printf '[%s]' | jq -c
+    /// '.[0] | [., type, isnan, isinfinite]'`).
+    #[test]
+    fn nested_jq_number_spellings_resolve_to_one_number_node_2877() {
+        // (token, expected f64 or None for NaN, expected `number_literal()`)
+        let rows: &[(&str, Option<f64>, Option<&str>)] = &[
+            ("nan", None, None),
+            ("NaN", None, None),
+            ("-nan", None, None),
+            ("+nan", None, None),
+            ("nan1", None, None),
+            ("sNaN12", None, None),
+            ("inf", Some(f64::INFINITY), None),
+            ("Infinity", Some(f64::INFINITY), None),
+            ("iNfInItY", Some(f64::INFINITY), None),
+            ("+inf", Some(f64::INFINITY), None),
+            ("-inf", Some(f64::NEG_INFINITY), None),
+            ("-Infinity", Some(f64::NEG_INFINITY), None),
+            ("+1", Some(1.0), Some("1")),
+            ("+0", Some(0.0), Some("0")),
+            ("+01", Some(1.0), Some("01")),
+            ("+.5", Some(0.5), Some(".5")),
+            ("+1.500", Some(1.5), Some("1.500")),
+            ("+1e400", Some(f64::INFINITY), Some("1e400")),
+            ("+007.e5", Some(7e5), Some("007.e5")),
+            ("+1.e5", Some(1e5), Some("1.e5")),
+        ];
+        for (token, value, literal) in rows {
+            for (doc, start) in [
+                (format!("[{token}]"), 1),
+                (format!("[{token},2]"), 1),
+                (format!("[0,{token}]"), 3),
+                (format!(r#"{{"a":{token}}}"#), 5),
+            ] {
+                let bytes = doc.as_bytes();
+                let index = JsonIndex::build(bytes);
+                let root = index.root(bytes);
+                let cursor = document_order_cursors(root)
+                    .into_iter()
+                    .find(|c| c.text_position() == Some(start))
+                    .unwrap_or_else(|| panic!("no node at {start} in {doc}"));
+                let StandardJson::Number(n) = cursor.value() else {
+                    panic!(
+                        "{doc}: expected a Number at {start}, got {:?}",
+                        cursor.value()
+                    );
+                };
+                assert_eq!(n.raw_bytes(), token.as_bytes(), "{doc}");
+                assert_eq!(
+                    cursor.text_range(),
+                    Some((start, start + token.len())),
+                    "{doc}"
+                );
+                match value {
+                    None => assert!(n.as_f64().is_ok_and(f64::is_nan), "{doc}"),
+                    Some(v) => assert_eq!(n.as_f64(), Ok(*v), "{doc}"),
+                }
+                let number: StandardJson<'_, Vec<u64>> = StandardJson::Number(n);
+                assert_eq!(
+                    number.number_literal().as_deref(),
+                    *literal,
+                    "{doc}: number_literal"
+                );
+            }
+        }
+    }
+
+    /// #2877: a word that is not one of decNumber's, and a `+` before
+    /// anything but a digit, `.` or such a word, stay in the dispatchers'
+    /// error arms -- they do not become `null` the way a malformed
+    /// number-*shaped* span does (#966), because #966's precedent covers
+    /// digits only. The whole scalar run has to validate: `nan1.5` is one
+    /// node to the index and `Invalid numeric literal` to jq, and reading a
+    /// valid prefix out of it would fabricate a NaN. `nullx`/`truex` are
+    /// deliberately absent -- that prefix match is #3035's, not this
+    /// issue's.
+    #[test]
+    fn non_decnumber_words_and_bare_plus_stay_errors_2877() {
+        for token in [
+            "nana",
+            "nanx",
+            "nan.",
+            "nan1.5",
+            "nan1e3",
+            "nan-1",
+            "nan(1)",
+            "nane5",
+            "qnan",
+            "ssnan",
+            "nA",
+            "Nope",
+            "infin",
+            "infinit",
+            "Infinite",
+            "infinity1",
+            "inf1",
+            "sinf",
+            "infx",
+            "infinityx",
+            "snan.",
+            "+",
+            "+x",
+            "+e5",
+            "+nanx",
+            "+infx",
+            "iu",
+            "s",
+            "S1",
+        ] {
+            for doc in [
+                format!("[{token}]"),
+                format!("[{token},2]"),
+                format!(r#"{{"a":{token}}}"#),
+            ] {
+                let bytes = doc.as_bytes();
+                let index = JsonIndex::build(bytes);
+                let root = index.root(bytes);
+                let child = root.first_child().expect("one child");
+                let child = if doc.starts_with('{') {
+                    child.next_sibling().expect("the value after the key")
+                } else {
+                    child
+                };
+                assert!(
+                    matches!(child.value(), StandardJson::Error(_)),
+                    "{doc}: expected Error, got {:?}",
+                    child.value()
+                );
+                assert_eq!(child.text_range(), None, "{doc}: text_range");
+            }
+        }
+        // `-` before a word keeps today's span (`-` alone), so the #1643
+        // gap check still rejects it downstream -- unchanged by #2877.
+        assert_eq!(nested_number_span(b"[-nope]", 1), 2);
+        assert_eq!(nested_number_span(b"[+x]", 1), 2);
+        // ... while a valid signed word is the whole word.
+        assert_eq!(nested_number_span(b"[-inf]", 1), 5);
+        assert_eq!(nested_number_span(b"[+nan]", 1), 5);
+        assert_eq!(nested_number_span(b"[sNaN12,1]", 1), 7);
+        // A `+digit` span is exactly what the greedy class already gave.
+        assert_eq!(nested_number_span(b"[+1.2.3]", 1), 7);
+        assert_eq!(nested_number_span(b"[+1e0e0]", 1), 7);
+    }
+
+    /// #2877: the top-level splitter's own question. `number_literal_end`
+    /// peels `+` like `-`; `jq_number_token_end` adds the words, ending them
+    /// where jq's literal scanner does (whitespace, `"`, `[{,:]}`), and
+    /// refuses a token that is neither grammar so the splitter errors
+    /// (#1171) instead of truncating.
+    #[test]
+    fn jq_number_token_end_reads_both_grammars_2877() {
+        assert_eq!(number_literal_end(b"+1", 0), Some(2));
+        assert_eq!(number_literal_end(b"+.5e3", 0), Some(5));
+        assert_eq!(number_literal_end(b"+1.500 ", 0), Some(6));
+        for bad in [&b"+"[..], b"+-1", b"++1", b"+e5", b"+x", b"+nan"] {
+            assert_eq!(number_literal_end(bad, 0), None, "{bad:?}");
+        }
+        for (text, end) in [
+            (&b"nan"[..], 3),
+            (b"nan 1", 3),
+            (b"nan\n", 3),
+            (b"NaN5,", 4),
+            (b"sNaN12]", 6),
+            (b"-Infinity}", 9),
+            (b"+inf\"", 4),
+            (b"inf:", 3),
+            (b"+1.500", 6),
+            (b"-.5", 3),
+            (b"007", 3),
+        ] {
+            assert_eq!(jq_number_token_end(text, 0), Some(end), "{text:?}");
+        }
+        for bad in [
+            &b"nanx"[..],
+            b"nan1.5",
+            b"nan(1)",
+            b"nan-1",
+            b"infinity1",
+            b"inf1",
+            b"nul",
+            b"n",
+            b"+",
+            b"+-1",
+            b"-",
+            b"-nope",
+            b"1e",
+        ] {
+            assert_eq!(jq_number_token_end(bad, 0), None, "{bad:?}");
+        }
+    }
+
+    /// #2877: `as_f64` is the funnel every cursor-level reader uses, so it
+    /// has to read what `from_number_bytes` reads -- the reindex bridge's
+    /// NaN/infinity tokens included, now that the `--slurp`/`--seq` input
+    /// path writes them (`OwnedValue::to_json_input_bridge`).
+    #[test]
+    fn json_number_as_f64_decodes_the_bridge_nonfinite_tokens_2877() {
+        // The tokens come from the encoder itself, as the #2902 test above
+        // does: this pins the plumbing, not the spelling.
+        for (f, expected) in [
+            (f64::NAN, None),
+            (f64::INFINITY, Some(f64::INFINITY)),
+            (f64::NEG_INFINITY, Some(f64::NEG_INFINITY)),
+        ] {
+            let token = crate::jq::OwnedValue::Float(f).to_json_input_bridge();
+            assert!(
+                token.parse::<f64>().is_err(),
+                "the bridge token must not be an ordinary number: {token}"
+            );
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let root = index.root(bytes);
+            let StandardJson::Number(n) = root.first_child().expect("one child").value() else {
+                panic!("expected a number");
+            };
+            match expected {
+                None => assert!(n.as_f64().is_ok_and(f64::is_nan), "{token}"),
+                Some(v) => assert_eq!(n.as_f64(), Ok(v), "{token}"),
+            }
         }
     }
 
