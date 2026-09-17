@@ -2568,6 +2568,17 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
             | Builtin::UpperInSrc(a, b)
             | Builtin::Skip(a, b),
         ) => needs_path_context(a) || needs_path_context(b),
+        // #2658: the same for the five constructs that joined them --
+        // `any(cond)`/`all(cond)`'s `cond` stands at each element, `isvalid`'s
+        // `f` at the stage's own input, and a loop's `cond`/`update` at the
+        // input first and at each state after; a read in any of them needs
+        // a position, and the native arms now supply one.
+        Expr::Builtin(Builtin::AnyF(f) | Builtin::AllF(f) | Builtin::IsValid(f)) => {
+            needs_path_context(f)
+        }
+        Expr::Until { cond, update } | Expr::While { cond, update } => {
+            needs_path_context(cond) || needs_path_context(update)
+        }
         _ => false,
     }
 }
@@ -11817,9 +11828,7 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2658: effective values under the mode's duplicate-key rule, as
         // `any_all_f`'s object arm -- see its comment.
         StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
-            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                .into_iter()
-                .map(|f| f.value),
+            effective_fields(&fields, true).into_iter().map(|f| f.value),
             true,
         )),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
@@ -11863,9 +11872,7 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2658: effective values under the mode's duplicate-key rule, as
         // `any_all_f`'s object arm -- see its comment.
         StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
-            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                .into_iter()
-                .map(|f| f.value),
+            effective_fields(&fields, true).into_iter().map(|f| f.value),
             false,
         )),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
@@ -11930,19 +11937,20 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => any_all_f_over::<W, S>(cond, elements, target_truthy),
-        // #2658: the object's *effective* values, under the mode's
-        // duplicate-key rule, exactly as this file's own `Expr::Iterate` arm
-        // walks them (#1385) -- a raw `fields.map(|f| f.value())` probed
-        // both members of `{"a":true,"a":false}`, so `any(.)` answered
-        // `true` where jq 1.7.1 answers `false`. Unreachable from the CLI
-        // until the generic evaluator gained its own `any_all_f_generic`
-        // arm (the bridge's `to_owned` collapsed the keys on the way in);
-        // the library's eager entry point always had it.
+        // #2658: the object's *effective* values -- a repeated key collapsed
+        // onto its last occurrence, in both modes, as the generic `.[]` arm
+        // and `any_all_f_generic` walk them and as real yq's own `.[]`
+        // answers (`{a: true, a: false} | [.[]]` is `[false]` in v4.53.3).
+        // A raw `fields.map(|f| f.value())` probed both members, so
+        // `any(.)` answered `true` where jq 1.7.1 answers `false` (#1385).
+        // Unreachable from the CLI until the generic evaluator gained its
+        // own arm (the bridge's `to_owned` collapsed the keys on the way
+        // in); the library's eager entry point always had it. `true`, not
+        // `S::COLLAPSE_DUPLICATE_KEYS`: that constant governs the *keys*
+        // builtins, where yq keeps every occurrence.
         StandardJson::Object(fields) => any_all_f_over::<W, S>(
             cond,
-            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                .into_iter()
-                .map(|f| f.value),
+            effective_fields(&fields, true).into_iter().map(|f| f.value),
             target_truthy,
         ),
         // #1989: `scalar_fallback`, for the same reason as bare

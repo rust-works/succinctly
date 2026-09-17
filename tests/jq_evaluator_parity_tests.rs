@@ -2666,3 +2666,70 @@ fn test_any_all_cond_isvalid_loops_agree_across_evaluators_2658() {
         assert_eq!(full, generic, "evaluators disagree on `{filter}`");
     }
 }
+
+/// #2658 review: a position read (`key`) inside the five constructs'
+/// arguments answers the same on both evaluators, in both modes, and does
+/// not depend on whether a sibling stage also reads position.
+///
+/// The first round registered the native arms but not the path-context
+/// gates, so `[.[] | any(key == "b")]` took the plain streaming route
+/// (`cond` at the element's cursor: `true`) while `[.[] | any(key == "b"),
+/// key]` -- the same stage with a position-reading sibling -- took the
+/// positioned route, where the stage fell back to the bridge and answered
+/// `key` as `null`. `needs_path_context`, `path_context_single_native`,
+/// `path_context_resolvable` and the absent/preserves/keeps-position gates
+/// now know the five, exactly as #2968 registered its consumers.
+///
+/// The `dup` row is the low finding from the same review: the eager
+/// `any`/`all`/`any(cond)` arms collapse a repeated key onto its last
+/// occurrence in *both* modes (`effective_fields(.., true)`), as the generic
+/// twins and real yq's `.[]` do -- the mode constant is the *keys* rule.
+#[test]
+fn test_position_reads_inside_any_cond_isvalid_loops_agree_2658() {
+    const DOC: &[u8] = br#"{"a":{"b":{"c":1},"d":{"c":2}},"dup":{"a":true,"a":false}}"#;
+    for (filter, expected) in [
+        (".a | [.[] | any(key == \"c\")]", "[true,true]"),
+        (
+            ".a | [.[] | any(key == \"c\"), key]",
+            "[true,\"b\",true,\"d\"]",
+        ),
+        (".a | [.[] | all(key == \"c\")]", "[true,true]"),
+        (".a | any(key == \"b\")", "true"),
+        (".a | [any(key == \"b\"), key]", "[true,\"a\"]"),
+        (".a | [.[] | isvalid(key)]", "[true,true]"),
+        (".a | [.[] | isvalid(key), key]", "[true,\"b\",true,\"d\"]"),
+        (".a | [.[] | until(key == \"c\"; .c)]", "[1,2]"),
+        (
+            ".a | [.[] | until(key == \"c\"; .c), key]",
+            "[1,\"b\",2,\"d\"]",
+        ),
+        (".a | [.[] | [while(key != \"c\"; .c)] | length]", "[1,1]"),
+        (".a.b | until(key == \"a\"; parent) | keys", "[\"b\",\"d\"]"),
+        (".dup | any(.)", "false"),
+        (".dup | all(.)", "false"),
+        (".dup | any", "false"),
+    ] {
+        let (jq_full, jq_generic) = both_evaluator_outputs::<JqSemantics>(DOC, filter);
+        assert_eq!(
+            as_strs(&jq_full),
+            [expected],
+            "jq mode, full evaluator: `{filter}`"
+        );
+        assert_eq!(
+            jq_full, jq_generic,
+            "jq mode: evaluators disagree on `{filter}`"
+        );
+        let (yq_full, yq_generic) = both_evaluator_outputs::<YqSemantics>(DOC, filter);
+        assert_eq!(
+            yq_full, yq_generic,
+            "yq mode: evaluators disagree on `{filter}`"
+        );
+        if filter.starts_with(".dup | any(") || filter.starts_with(".dup | all(") {
+            assert_eq!(
+                as_strs(&yq_full),
+                [expected],
+                "yq mode, full evaluator: `{filter}`"
+            );
+        }
+    }
+}
