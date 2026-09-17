@@ -47965,6 +47965,147 @@ fn test_yq_floor_keeps_int64_cast_and_stops_saturating_2937() -> Result<()> {
         )?;
         assert_eq!(code, 0, "`{filter}`");
         assert_eq!(output.trim(), "9223372036854775807", "`{filter}`");
+
+/// #2658: `any(cond)`/`all(cond)`, `isvalid` and `until`/`while` over an
+/// alias fan-out complete -- the five spellings #2476/#2968 left on the
+/// wildcard bridge.
+///
+/// Same document shape and the same method as
+/// `test_and_or_over_alias_fanout_completes_2476`: N=24, **no wall-clock
+/// bound asserted**. The bridge's first act was a `to_owned` of the whole
+/// ambient input, `O(2^N)` here, so a regression announces itself by hanging
+/// the suite; a threshold would only add flakiness under this suite's own
+/// subprocess contention.
+///
+/// Measured on the two binaries either side of the change (Apple M-series,
+/// release builds, `/usr/bin/time -l`, box not idle -- indicative):
+///
+/// | query (`.aN \| …`, `--jq-extensions`)   | N=20 before        | N=22 before        | after (N=18..24) |
+/// |-----------------------------------------|--------------------|--------------------|------------------|
+/// | `any(length == 2)`                      | 0.85 s / 585 MB    | 3.46 s / 2361 MB   | 0.00 s / 9 MB    |
+/// | `all(length == 2)`                      | 0.72 s / 577 MB    | 4.35 s / 2361 MB   | 0.00 s / 9 MB    |
+/// | `isvalid(.[0])`                         | 0.61 s / 393 MB    | 2.50 s / 1581 MB   | 0.00 s / 8 MB    |
+/// | `until(true; .) \| length`              | 1.60 s / 966 MB    | 4.43 s / 3060 MB   | 0.00 s / 8 MB    |
+/// | `while(false; .)`                       | 0.84 s / 762 MB    | 3.57 s / 3059 MB   | 0.00 s / 8 MB    |
+/// | `until(length == 1; .[0])`              | (not timed)        | 5.60 s / 3198 MB   | 0.00 s / 9 MB    |
+///
+/// The loop that *navigates* (`until(length == 1; .[0])`) is in the table
+/// because the native arm keeps a document state as a cursor at every step;
+/// the bridge copied the state on entry and then again for each emitted
+/// output, so it was the slowest row of all. `any(. == 1)` is deliberately not a row: comparing an aliased
+/// element against a scalar still materializes the element
+/// (`apply_compare_op`), the second exponential term the issue's triage
+/// identified, and its own follow-up.
+///
+/// Real yq rejects every one of these spellings (`bad expression` for
+/// `any(cond)`, `lexer: invalid input text` for the rest, v4.53.3), so they
+/// run under `--jq-extensions` and the baseline is the eager route's own
+/// answer -- which the rows below also pin, unchanged.
+#[test]
+fn test_any_all_cond_isvalid_loops_over_alias_fanout_complete_2658() -> Result<()> {
+    let mut doc = String::from("a0: &a0 [1]\n");
+    for i in 1..=24 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for (filter, want) in [
+        (".a24 | any(length == 2)", "true"),
+        (".a24 | all(length == 2)", "true"),
+        (".a24 | any(length == 3)", "false"),
+        (".a24 | isvalid(.[0])", "true"),
+        (".a24 | isvalid(.x)", "false"),
+        (".a24 | until(true; .) | length", "2"),
+        (".a24 | [while(false; .)] | length", "0"),
+        (".a24 | until(length == 1; .[0]) | .[0]", "1"),
+        (".a24 | [while(length == 2; .[0])] | length", "24"),
+        (".a24 | [limit(3; while(true; .[0]))] | length", "3"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &["--jq-extensions"])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2658: the yq-mode rows the native arms must keep exactly as the eager
+/// route answered them -- there is no yq oracle (real yq rejects every one
+/// of these spellings, so they run under `--jq-extensions`), and the eager
+/// route is the baseline.
+///
+/// Two of them are the reasons `any(cond)` is *not* implemented as
+/// `any(.[]; cond)` although jq defines it so: in yq mode `.[]` on a scalar
+/// yields nothing, so that spelling answers `false`/`true` where the eager
+/// `any_all_f` raises `Cannot iterate over …` in both modes; and the object
+/// arm walks the mapping's *values* under the last-occurrence rule (`{a:
+/// true, a: false} | any(.)` is `false`, as `[.[]]` is `[false]`) rather
+/// than every occurrence, which is what yq's own `keys` rule
+/// (`COLLAPSE_DUPLICATE_KEYS = false`) would have given. `type` is `!!map`
+/// under yq, so the navigating loops here test a length instead.
+#[test]
+fn test_yq_any_all_cond_isvalid_loops_keep_eager_answers_2658() -> Result<()> {
+    for (input, filter, want) in [
+        ("a: 1\nb: 2\n", "any(. == 2)", "true"),
+        ("a: 1\nb: 2\n", "all(. == 1)", "false"),
+        ("a: true\na: false\n", "any(.)", "false"),
+        ("{a: true, a: false}\n", "any(.)", "false"),
+        ("a: false\na: true\n", "all(.)", "true"),
+        (
+            "5\n",
+            "any(. == 5)",
+            "Error: Cannot iterate over number (5)",
+        ),
+        (
+            "str\n",
+            "all(. == 1)",
+            "Error: Cannot iterate over string (\"str\")",
+        ),
+        (
+            "null\n",
+            "any(true)",
+            "Error: Cannot iterate over null (null)",
+        ),
+        ("5\n", "[any(. == 5)?]", "[]"),
+        ("[1.0, 1e2]\n", "any(tostring == \"1.0\")", "true"),
+        (
+            "- 1\n- 2\n- 3\n",
+            "[.[] | until(. > 2; . + 1)]",
+            "- 3\n- 3\n- 3",
+        ),
+        ("0\n", "[while(. < 3; . + 1, . + 2)]", "- 0\n- 1\n- 2\n- 2"),
+        ("[[1], [2, 3]]\n", "until(length == 1; .[0])", "[1]"),
+        ("[]\n", "isvalid(.[])", "false"),
+        ("a: 1\n", "isvalid(.a)", "true"),
+        ("a: 1\n", "isvalid(.a | tonumber)", "true"),
+        ("a: x\n", "isvalid(.a | tonumber)", "false"),
+        ("0\n", "first(while(true; . + 1))", "0"),
+        // Aliases: the arms read through them like any other node.
+        ("a: &x [1, 2]\nb: *x\n", ".b | any(. == 2)", "true"),
+        (
+            "a: &x [1, 2]\nb: *x\n",
+            ".b | until(length == 1; .[1:])",
+            "- 2",
+        ),
+        (
+            "a: &x [1, 2]\nb: *x\n",
+            "[.[] | isvalid(.[0])]",
+            "- true\n- true",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, &["--jq-extensions"])?;
+        if let Some(message) = want.strip_prefix("Error: ") {
+            assert_eq!(
+                code, 1,
+                "`{filter}` on {input:?}: stdout {stdout:?} stderr {stderr:?}"
+            );
+            assert!(
+                stderr.contains(message),
+                "`{filter}` on {input:?}: {stderr:?}"
+            );
+        } else {
+            assert_eq!(code, 0, "`{filter}` on {input:?}: stderr {stderr:?}");
+            assert_eq!(stdout.trim(), want, "`{filter}` on {input:?}");
+        }
     }
     Ok(())
 }

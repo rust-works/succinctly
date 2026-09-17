@@ -2602,3 +2602,67 @@ fn test_float_literal_rounding_agrees_across_evaluators_2936() {
         assert_eq!(full, generic, "evaluators disagree on `{filter}`");
     }
 }
+
+/// #2658: `any(cond)`/`all(cond)`, `isvalid`, `until` and `while` gained
+/// native arms in the generic evaluator; the eager evaluator's own
+/// `any_all_f`/`builtin_isvalid`/`until_step`/`while_step` stay the owned
+/// route's implementation, so the two copies of each rule -- jq's
+/// backtracking loop definitions (#534), `any`'s first-decisive-output
+/// rule, the object-values walk under the last-occurrence duplicate-key rule,
+/// `isvalid`'s no-output/`error` verdicts -- are pinned to agree here
+/// (triage risk (c)). Every output that has a jq oracle is jq 1.7.1's.
+#[test]
+fn test_any_all_cond_isvalid_loops_agree_across_evaluators_2658() {
+    const DOC: &[u8] = br#"{"n":0,"arr":[1,2,3],"nest":[[1],[2,3]],"dup":{"a":true,"a":false},"deep":{"a":{"a":{"a":1}}},"nums":[1.0,1e2],"empty":[]}"#;
+    for (filter, expected) in [
+        (".n | [until(.>3; .+1,.+2)]", "[4,5,4,4,5,4,5,4]"),
+        (".n | [while(.<3; .+1,.+2)]", "[0,1,2,2]"),
+        (
+            ".n | [until((.>1, .>3); .+1)]",
+            "[2,3,4,4,2,3,4,4,2,3,4,4,2,3,4,4]",
+        ),
+        (".n | [while((.<2, .<1); .+1)]", "[0,1,0,1]"),
+        (".n | first(while(true; .+1))", "0"),
+        (".n | [limit(3; while(true; .+1))]", "[0,1,2]"),
+        (".n | [until(.>2; .+1)?]", "[3]"),
+        (".n | [until(error(\"c\"); .)?]", "[]"),
+        (".n | try until(false; error(\"e\")) catch .", "\"e\""),
+        (".nest | until(type==\"number\"; .[0])", "1"),
+        (".deep | until(type!=\"object\"; .a)", "1"),
+        (".arr | [.[] | until(.>2; .+1)]", "[3,3,3]"),
+        (".arr | [while(length > 0; .[1:])] | length", "3"),
+        (".arr | any(.==2)", "true"),
+        (".arr | all(.>1)", "false"),
+        // Object values under the last-occurrence rule, on both routes --
+        // the eager `any_all_f`/`builtin_any`/`builtin_all` walked every
+        // raw member until this issue (`true`, `true`, `false` here).
+        (".dup | any(.)", "false"),
+        (".dup | all(.)", "false"),
+        (".dup | any", "false"),
+        (".dup | all", "false"),
+        (".dup | any(. == true)", "false"),
+        (".nest | all(length>0)", "true"),
+        (".nums | any(tostring==\"1.0\")", "true"),
+        (".nums | any(tostring==\"100\")", "false"),
+        (".arr | any(true, error(\"x\"))", "true"),
+        (".arr | all(false, error(\"x\"))", "false"),
+        (".arr | [any(error(\"e\"))?]", "[]"),
+        (".empty | any(true)", "false"),
+        (".empty | all(false)", "true"),
+        (
+            ".n | try any(.==1) catch .",
+            "\"Cannot iterate over number (0)\"",
+        ),
+        (".arr | isvalid(.[0])", "true"),
+        (".n | isvalid(.[0])", "false"),
+        (".empty | isvalid(.[])", "false"),
+        (".arr | isvalid(.[] | tonumber)", "true"),
+        (".arr | isvalid(1, error(\"x\"))", "false"),
+        (".arr | isvalid(empty)", "false"),
+    ] {
+        let full = full_outputs(DOC, filter);
+        let generic = generic_outputs(DOC, filter);
+        assert_eq!(as_strs(&full), [expected], "full evaluator: `{filter}`");
+        assert_eq!(full, generic, "evaluators disagree on `{filter}`");
+    }
+}
