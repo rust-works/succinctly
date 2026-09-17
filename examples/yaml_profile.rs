@@ -55,7 +55,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
             for elem in elements {
                 arr.push(yaml_to_owned_value(elem));
             }
-            OwnedValue::Array(arr.into())
+            OwnedValue::array_from(arr)
         }
         YamlValue::Alias { target, .. } => {
             if let Some(target_cursor) = target {
@@ -97,7 +97,7 @@ fn main() {
             if values.len() == 1 {
                 values.pop().unwrap()
             } else {
-                OwnedValue::Array(values.into())
+                OwnedValue::array_from(values)
             }
         }
         other => yaml_to_owned_value(other),

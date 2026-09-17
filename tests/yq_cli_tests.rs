@@ -34933,7 +34933,7 @@ fn test_limit_and_nth_generator_n_preserve_duplicate_keys_1687() -> Result<()> {
 /// asserted in prose.
 ///
 /// `group_by` returns an array *of arrays*: `LazySeq` has no nested-lazy form
-/// and `OwnedValue::Array(Vec<OwnedValue>)` cannot hold a cursor, so there is
+/// and `OwnedValue::Array(ArrayVec)` cannot hold a cursor, so there is
 /// no lossless representation for it today -- it keeps the bridge, and real
 /// yq (which does implement it) preserves where succinctly collapses.
 /// `while`/`until` compute their state from step 1 onward, so only the seed

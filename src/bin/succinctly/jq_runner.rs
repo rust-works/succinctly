@@ -1975,10 +1975,12 @@ fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
 /// `EvalError` itself: `anyhow::Error` needs `Send + Sync`, and since #2999
 /// `OwnedValue` holds `Rc`s, so an `EvalError` -- whose payload can be the
 /// raw value of `error(v)` -- no longer is either. Every error that reaches
-/// this wrapper is a decode or nesting-depth failure the evaluator raised
-/// itself, which never carries a value payload; [`Self::new`] checks that in
-/// debug builds and [`Self::to_eval_error`] rebuilds the same error for
-/// [`DiagnosticSink::report`](crate::output::DiagnosticSink::report).
+/// this wrapper today is a decode or nesting-depth failure the evaluator
+/// raised itself, which never carries a value payload; should one ever
+/// arrive, its payload is rendered into the message the way jq prints an
+/// uncaught `error(v)` (the string itself, or the value's JSON), so nothing
+/// is dropped -- only the payload's *type* is lost, so jq's `(not a string)`
+/// suffix would not be appended on this route.
 #[derive(Debug)]
 pub struct MalformedJsonError {
     message: String,
@@ -1988,24 +1990,13 @@ pub struct MalformedJsonError {
 impl MalformedJsonError {
     /// Wrap `err` for the `anyhow` channel.
     pub fn new(err: EvalError) -> Self {
-        let kind = match err.value {
-            EvalErrorPayload::Kind(kind) => Some(kind),
-            EvalErrorPayload::None => None,
-            // Unreachable by construction (see the type's doc comment); in a
-            // release build the message alone is still the right diagnostic.
-            EvalErrorPayload::Value(_) => {
-                debug_assert!(
-                    // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives is a decode or nesting-depth failure the evaluator raised itself, never error(v) (#2999)"
-                    false, // omni-dev: coverage tolerate-line reason="see the debug_assert above (#2999)"
-                    "a malformed-document error never carries an error(v) payload"
-                );
-                None // omni-dev: coverage tolerate-line reason="see the debug_assert above (#2999)"
-            }
+        let (message, kind) = match err.value {
+            EvalErrorPayload::Kind(kind) => (err.message, Some(kind)),
+            EvalErrorPayload::None => (err.message, None),
+            EvalErrorPayload::Value(OwnedValue::String(text)) => (text, None),
+            EvalErrorPayload::Value(value) => (value.to_json(), None),
         };
-        Self {
-            message: err.message,
-            kind,
-        }
+        Self { message, kind }
     }
 
     /// The [`EvalError`] this was built from.
@@ -2870,7 +2861,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         })
                         .collect();
 
-                    let row_value = OwnedValue::Array(fields.into());
+                    let row_value = OwnedValue::array_from(fields);
 
                     // Evaluate expression on this row, streaming (#1653):
                     // each output must reach stdout before the next one is
@@ -3570,7 +3561,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
             let values = parse_json_stream(&contents)?;
             context
                 .named
-                .insert(name.clone(), OwnedValue::Array(values.into()));
+                .insert(name.clone(), OwnedValue::array_from(values));
         }
     }
 
@@ -4092,7 +4083,7 @@ fn get_inputs(
             None => InputLocation::unknown(),
         };
         Ok(Ok((
-            vec![OwnedValue::Array(values.into())],
+            vec![OwnedValue::array_from(values)],
             InputLocations::single(at),
             None,
         )))
@@ -5406,7 +5397,7 @@ fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
                 OwnedValue::String(field_str)
             })
             .collect();
-        values.push(OwnedValue::Array(fields.into()));
+        values.push(OwnedValue::array_from(fields));
     }
 
     values

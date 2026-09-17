@@ -1715,7 +1715,7 @@ mod tests {
         assert_eq!(buf, "-0.0");
 
         buf.clear();
-        OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)].into())
+        OwnedValue::array_from(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
             .stream_json(
                 &mut buf,
                 IndentSpec::COMPACT,
@@ -1758,7 +1758,7 @@ mod tests {
         // but tagged when it would otherwise read back as an int. `2.5`
         // needs no tag — its own `.` is already unambiguous.
         buf.clear();
-        OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)].into())
+        OwnedValue::array_from(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "[!!float 1, 2.5]");
@@ -2031,14 +2031,18 @@ mod tests {
     #[test]
     fn test_stream_array() {
         let mut buf = String::new();
-        OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into())
-            .stream_json(
-                &mut buf,
-                IndentSpec::COMPACT,
-                false,
-                JsonConvention::Preserve,
-            )
-            .unwrap();
+        OwnedValue::array_from(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Int(2),
+            OwnedValue::Int(3),
+        ])
+        .stream_json(
+            &mut buf,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
         assert_eq!(buf, "[1,2,3]");
     }
 
@@ -2071,7 +2075,7 @@ mod tests {
         outer.insert("user".to_string(), OwnedValue::Object(inner.into()));
         outer.insert(
             "tags".to_string(),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
         );
         OwnedValue::Object(outer.into())
             .stream_json(
@@ -2245,7 +2249,7 @@ mod tests {
     #[test]
     fn test_stream_yaml_array_flow_style_multiple_elements() {
         let mut buf = String::new();
-        OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+        OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
             .stream_yaml(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "[1, 2]");
@@ -2259,7 +2263,7 @@ mod tests {
         let mut buf = String::new();
         OwnedValue::Array(
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(1)]),
                 OwnedValue::Int(2),
             ]
             .into(),
@@ -2320,7 +2324,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v].into());
+            v = OwnedValue::array_from(vec![v]);
         }
         v
     }

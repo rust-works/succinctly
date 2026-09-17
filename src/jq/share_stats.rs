@@ -99,20 +99,10 @@ impl Drop for Events {
     }
 }
 
-/// The thread-exit report: one `share-stats`-prefixed line per site, empty
-/// when nothing was forced, so a clean thread prints nothing.
+/// The thread-exit report: [`report`]'s lines with a `share-stats ` prefix,
+/// empty when nothing was forced so a clean thread prints nothing.
 fn exit_report(events: &BTreeMap<Site, u64>) -> String {
-    let mut out = String::new();
-    for (site, n) in events {
-        let _ = writeln!(
-            out,
-            "share-stats {n:>8}  {:<16} {}:{}",
-            site.kind.label(),
-            site.file,
-            site.line
-        );
-    }
-    out
+    format_sites(events.iter(), "share-stats ")
 }
 
 thread_local! {
@@ -124,7 +114,10 @@ thread_local! {
 /// Called by the container wrappers, never directly.
 #[inline]
 pub fn record(site: Site) {
-    EVENTS.with(|events| {
+    // `try_with`, not `with`: instrumentation must never change a program's
+    // outcome, and a copy forced from another thread-local's destructor
+    // (destructor order is unspecified) would otherwise abort the thread.
+    let _ = EVENTS.try_with(|events| {
         *events.0.borrow_mut().entry(site).or_insert(0) += 1;
     });
 }
@@ -144,6 +137,14 @@ pub fn site(kind: Kind) -> Site {
         line: location.line(),
         kind,
     }
+}
+
+/// Record one forced copy of `kind` at the caller's site -- the one call the
+/// container wrappers make, so every instrumented path spells the same thing.
+#[inline]
+#[track_caller]
+pub fn forced(kind: Kind) {
+    record(site(kind));
 }
 
 /// Total forced copies of `kind` recorded on this thread since the last
@@ -180,11 +181,17 @@ pub fn reset() {
 /// Empty when nothing was forced, which is the answer ADR-0024's criterion 4
 /// wants to see.
 pub fn report() -> String {
+    EVENTS.with(|events| format_sites(events.0.borrow().iter(), ""))
+}
+
+/// The one formatter behind [`report`] and the thread-exit dump: `prefix`,
+/// then `count  kind  file:line`, one site per line.
+fn format_sites<'a>(events: impl Iterator<Item = (&'a Site, &'a u64)>, prefix: &str) -> String {
     let mut out = String::new();
-    for (site, n) in sites() {
+    for (site, n) in events {
         let _ = writeln!(
             out,
-            "{n:>8}  {:<16} {}:{}",
+            "{prefix}{n:>8}  {:<16} {}:{}",
             site.kind.label(),
             site.file,
             site.line

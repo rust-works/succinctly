@@ -242,9 +242,34 @@ DEFAULT_THRESHOLD = 5.0
 # `--baseline-binary` on every PR and push run the checked-in file is never
 # consulted, so once the merge-base includes #2878 this row reads ~0% again
 # and the override only blinds it. Tracked by the follow-up filed on #2878.
+#
+# `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999):
+# a drift that is *faster* on both architectures. Structural sharing in
+# `OwnedValue` (ADR-0024, option C) turned the whole-document copy that
+# `del(paths)` kept beside its result for path resolution into a refcount
+# bump, and measured by this guard on its own runners against the PR's
+# merge-base:
+#
+#                          users_del_select   users_del_bound_select   users_yq_del_select
+#   ARM64-Linux                 -13.2%               -13.2%                 -6.5%
+#   x86_64                      -11.3%               -11.3%                 -4.9%
+#
+# Every other row is within +2.3% (`users_path_walk`, the per-emitted-path
+# array's refcount box) and -0.2%. The guard is `abs(drift)`, so an accepted
+# improvement needs the same override a regression would; 20% / 20% / 12%
+# clear the measured numbers with headroom while still catching a further
+# move on top of them in either direction.
+#
+# **Remove these three entries once `main` has moved past #2999** -- with
+# `--baseline-binary` the checked-in file is never consulted, so once the
+# merge-base includes the change these rows read ~0% again and the overrides
+# only blind them. Tracked by the follow-up filed on #2999.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_keys_unsorted": 10.0,
+    "users_del_select": 20.0,
+    "users_del_bound_select": 20.0,
+    "users_yq_del_select": 12.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant

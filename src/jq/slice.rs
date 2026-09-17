@@ -237,7 +237,7 @@ mod tests {
         for bad in [
             OwnedValue::String("a".into()),
             OwnedValue::Bool(true),
-            OwnedValue::Array(Vec::new().into()),
+            OwnedValue::array(),
         ] {
             let obj = desc(&[("start", bad), ("end", OwnedValue::Int(2))]);
             assert_eq!(
