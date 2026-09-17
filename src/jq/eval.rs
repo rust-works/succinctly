@@ -34606,6 +34606,7 @@ fn bind_fold_alternative<S: EvalSemantics>(
             (update, extract, Some(walked))
         }
         Pattern::Var(name) => {
+            // omni-dev: coverage tolerate reason="unreachable arm: a bare `$var` pattern has no computed key and no step, so `extract_pattern_bindings` always yields exactly one binding set for it (#2979)"
             let binding = match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
                 Ok(binding) => binding,
                 Err(error) => {
@@ -34613,7 +34614,7 @@ fn bind_fold_alternative<S: EvalSemantics>(
                         error,
                         retryable: true,
                     })
-                } // omni-dev: coverage tolerate-line reason="unreachable: a bare `$var` pattern has no computed key and no step, so `extract_pattern_bindings` always yields exactly one binding set for it (#2979)"
+                }
             };
             bound_names.push(name.clone());
             if elem.register_path.is_some() {
@@ -96354,15 +96355,18 @@ mod tests {
         ),
         // ...and a retry that runs UPDATE (or EXTRACT) is charged, so the
         // step budget still trips where it did before -- jq answers `[[]]`
-        // and 80000 paths here; the cap is the recorded resource limit
+        // and 240000 paths here; the cap is the recorded resource limit.
+        // Three charges per element (the element, two retried UPDATEs) and
+        // six (the element, one retried UPDATE, four EXTRACT outputs) put
+        // the 100001st charge on the retry sites themselves
         (
             "null",
-            "[path(reduce range(60000) as $a ?// $b (.; if $a != null then error(\"x\") else . end))]",
+            "[path(reduce range(60000) as $a ?// $b ?// $c (.; if $c == null then error(\"x\") else . end))]",
             Err("reduce: maximum iterations exceeded"),
         ),
         (
             "null",
-            "[path(foreach range(40000) as $a ?// $b (.; if $a != null then error(\"x\") else . end; ., .))]",
+            "[path(foreach range(60000) as $a ?// $b (.; if $b == null then error(\"x\") else . end; ., ., ., .))]",
             Err("foreach: maximum iterations exceeded"),
         ),
         // family B: a chain on an untracked stage refuses rather than
