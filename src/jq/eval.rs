@@ -34616,6 +34616,7 @@ fn bind_fold_alternative<S: EvalSemantics>(
                     })
                 }
             };
+            // omni-dev: coverage end
             bound_names.push(name.clone());
             if elem.register_path.is_some() {
                 let (var, value) = &binding[0];
