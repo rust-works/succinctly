@@ -550,6 +550,8 @@ surface (#1512):
 | `asin`, `acos`, `atan`                               | Inverse trig functions (#1837)                |
 | `sin`, `cos`, `tan`                                  | Trig functions (#1837)                        |
 | `asinh`, `acosh`, `atanh`                            | Inverse hyperbolic trig functions (#1837)     |
+| `cbrt`, `erf`, `erfc`, `expm1`, `log1p`, `gamma`, `lgamma`, `tgamma`, `lgamma_r`, `j0`, `j1`, `y0`, `y1`, `frexp`, `modf`, `logb`, `rint`, `nearbyint`, `significand`, `pow10` | The rest of jq's unary libm surface (#3042)   |
+| `copysign`, `drem`, `fdim`, `fmax`, `fmin`, `fmod`, `hypot`, `jn`, `ldexp`, `nextafter`, `nexttoward`, `remainder`, `scalb`, `scalbln`, `yn` (2-arg), `fma` (3-arg) | jq's two- and three-argument libm builtins (#3042) |
 | `skip(n; f)`                                         | Drop the first `n` outputs of `f` (#1882)     |
 | `ascii_downcase`, `ascii_upcase`                     | jq's spellings of `downcase`/`upcase` (#2462) |
 
