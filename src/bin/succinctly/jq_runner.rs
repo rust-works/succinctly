@@ -1993,8 +1993,8 @@ impl MalformedJsonError {
         let (message, kind) = match err.value {
             EvalErrorPayload::Kind(kind) => (err.message, Some(kind)),
             EvalErrorPayload::None => (err.message, None),
-            EvalErrorPayload::Value(OwnedValue::String(text)) => (text, None),
-            EvalErrorPayload::Value(value) => (value.to_json(), None),
+            EvalErrorPayload::Value(OwnedValue::String(text)) => (text, None), // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
+            EvalErrorPayload::Value(value) => (value.to_json(), None), // omni-dev: coverage tolerate-line reason="see the arm above (#2999)"
         };
         Self { message, kind }
     }

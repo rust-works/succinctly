@@ -46762,7 +46762,7 @@ fn peek_static_prefix<'a>(
     for component in prefix {
         current = match (component, current) {
             (Expr::Field(name), OwnedValue::Object(map)) => map.get(name).unwrap_or(NULL_VALUE),
-            (Expr::Field(_), OwnedValue::Null) => NULL_VALUE,
+            (Expr::Field(_), OwnedValue::Null) => NULL_VALUE, // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only which null constant it names"
             (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
