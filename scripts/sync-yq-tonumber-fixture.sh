@@ -57,12 +57,21 @@ SEEDS=(
   # Go hex floats: mandatory p exponent, optional underscore after prefix
   '0x1p3' '0X1p3' '0x1P3' '0x1.8p1' '0x.8p1' '0x1.p1' '0x_1p3' '0x1p-2000'
   '0x10.5' '0xp1' '0x1p2000' '0o1p3' '-0x1p3' '+0x1p3' '0x1p+3'
+  # hex-float structural rejects: invalid mantissa digit, missing/non-digit
+  # exponent, and a genuinely zero mantissa (skips the bignum loop entirely)
+  '0x1.gp1' '0xg.1p3' '0x1p' '0x1pA' '0x1p+' '0x0p5' '0x0.0p5' '0x00p9'
+  # exponent magnitude far past EXP2_CLAMP in both directions -- short-circuits
+  # before the bignum scaling loop runs at all, rather than looping ~5000 times
+  '0x1p999999' '0x1p-999999'
   # Go special words: sign + inf/infinity, unsigned-only nan, case-insensitive
   'inf' 'Inf' '+inf' '-inf' '-Infinity' 'INFINITY' 'infinity' 'NaN' 'nan'
   'NAN' 'nAn' '+nan' '-nan' '.inf' '.nan' 'infin' 'infinityx' 'infinities'
-  # decimal float overflow/underflow (ErrRange only rejects overflow)
+  # decimal float overflow/underflow (ErrRange only rejects overflow) -- both
+  # via the pre-existing RFC 8259 literal-preserving arm (no underscore) and
+  # via yq_parse_float's own path (underscored, so RFC 8259 never sees it)
   '1e-400' '1e999' '-1e999' '1e309' '1.7976931348623157e+308'
-  '1.7976931348623159e+308' '5e-324' '4.9e-324' '1e-324'
+  '1.7976931348623159e+308' '5e-324' '4.9e-324' '1e-324' '1e99_9' '-1e99_9'
+  '+1e999'
   # no trimming in yq mode
   ' 1 ' '1 ' "$(printf '\t1')" ' 0x10 ' "$(printf '1\t')"
   # already-agreeing rows that must not move (RFC 8259 literal-preserving arms)
