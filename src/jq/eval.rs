@@ -76959,7 +76959,7 @@ mod tests {
                 for v in &arr {
                     match v {
                         OwnedValue::Float(f) => assert!(f.is_nan()),
-                        other => panic!("expected a NaN float, got {other:?}"),
+                        other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                     }
                 }
             }
@@ -82389,7 +82389,7 @@ mod tests {
                 assert_eq!(arr[4], OwnedValue::Int(0));
                 match &arr[5] {
                     OwnedValue::Float(f) => assert!(f.is_nan()),
-                    other => panic!("expected a NaN float, got {other:?}"),
+                    other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                 }
                 assert_eq!(arr[6], OwnedValue::Int(4));
                 assert_eq!(arr[7], OwnedValue::Int(0));
@@ -88192,7 +88192,7 @@ mod tests {
                 assert_eq!(arr.len(), 2);
                 match &arr[0] {
                     OwnedValue::Float(f) => assert!(f.is_nan()),
-                    other => panic!("expected a NaN float, got {other:?}"),
+                    other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3071)"
                 }
                 assert_eq!(arr[1], OwnedValue::Int(1));
             }
