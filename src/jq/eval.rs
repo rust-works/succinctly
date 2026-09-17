@@ -97958,21 +97958,37 @@ mod tests {
     }
 
     /// #2937: `math_operand`'s `Int`/integer-`NumberLiteral` widening under
-    /// both modes, mirroring `get_float_value_with`'s own rule.
+    /// both modes, mirroring `get_float_value_with`'s own rule -- and, for
+    /// the float-`NumberLiteral` sibling arm, a direct unit test rather than
+    /// an end-to-end `pow`/`atan2` filter: every input this session tried
+    /// (a filter literal, a document field, and `"2.50" | tonumber`, in
+    /// both jq and yq mode) reaches `math_operand` as a bare `Float`, not a
+    /// `NumberLiteral`, before ever reaching this function -- the
+    /// generator-argument materialization `fanout_two_args_lazy` uses
+    /// evidently normalizes it upstream. Calling `math_operand` directly is
+    /// what actually exercises the arm this function's own `match` commits
+    /// to handling, independent of whether today's evaluator plumbing
+    /// happens to construct that shape on any path yet.
     #[test]
     fn math_operand_widens_number_literal_2937() {
-        let literal = OwnedValue::NumberLiteral(
+        let int_literal = OwnedValue::NumberLiteral(
             NumberRepr::Int(869_389_897_822_472_004),
             "869389897822472004".into(),
         );
         assert_eq!(
-            math_operand::<JqSemantics>(&literal, false),
+            math_operand::<JqSemantics>(&int_literal, false),
             Ok(jq_literal_int_to_f64(869_389_897_822_472_004))
         );
         assert_eq!(
-            math_operand::<YqSemantics>(&literal, false),
+            math_operand::<YqSemantics>(&int_literal, false),
             Ok(869_389_897_822_472_004_i64 as f64)
         );
+
+        // The float sibling is untouched by #2937 (that spelling's own
+        // rounding is #2936's territory) -- both modes just unwrap it.
+        let float_literal = OwnedValue::NumberLiteral(NumberRepr::Float(2.5), "2.50".into());
+        assert_eq!(math_operand::<JqSemantics>(&float_literal, false), Ok(2.5));
+        assert_eq!(math_operand::<YqSemantics>(&float_literal, false), Ok(2.5));
     }
 }
 
