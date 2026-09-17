@@ -10903,13 +10903,13 @@ enum LoopState<V: DocumentValue> {
 impl<V: DocumentValue> LoopState<V> {
     fn from_item<S: EvalSemantics>(item: GenericItem<V>) -> Result<Self, Control> {
         Ok(match item {
-            GenericItem::One(v) => LoopState::Document(v, None),
-            GenericItem::OneCursor(c) => LoopState::Document(c.value(), Some(c)),
-            GenericItem::OneCursorValue(c, v) => LoopState::Document(v, Some(c)),
-            GenericItem::Owned(o) => LoopState::Owned(o),
+            GenericItem::One(v) => Self::Document(v, None),
+            GenericItem::OneCursor(c) => Self::Document(c.value(), Some(c)),
+            GenericItem::OneCursorValue(c, v) => Self::Document(v, Some(c)),
+            GenericItem::Owned(o) => Self::Owned(o),
             item @ (GenericItem::LazyKeys { .. }
             | GenericItem::LazyIndexRange(_)
-            | GenericItem::LazySeq(_)) => LoopState::Owned(generic_item_into_owned::<_, S>(item)?),
+            | GenericItem::LazySeq(_)) => Self::Owned(generic_item_into_owned::<_, S>(item)?),
         })
     }
 
@@ -10918,9 +10918,9 @@ impl<V: DocumentValue> LoopState<V> {
     /// of the computed value, as `until_step`'s `outputs.push(state.clone())`.
     fn emit(&self) -> GenericItem<V> {
         match self {
-            LoopState::Document(_, Some(c)) => GenericItem::OneCursor(*c),
-            LoopState::Document(v, None) => GenericItem::One(v.clone()),
-            LoopState::Owned(o) => GenericItem::Owned(o.clone()),
+            Self::Document(_, Some(c)) => GenericItem::OneCursor(*c),
+            Self::Document(v, None) => GenericItem::One(v.clone()),
+            Self::Owned(o) => GenericItem::Owned(o.clone()),
         }
     }
 
@@ -10929,10 +10929,10 @@ impl<V: DocumentValue> LoopState<V> {
     /// [`any_all_probe_item_generic`] makes per item.
     fn each<S: EvalSemantics>(&self, expr: &Expr, optional: bool, sink: &mut dyn Sink<V>) -> Flow {
         match self {
-            LoopState::Document(v, cursor) => {
+            Self::Document(v, cursor) => {
                 eval_each_generic::<S, V>(expr, v.clone(), optional, *cursor, sink)
             }
-            LoopState::Owned(o) => {
+            Self::Owned(o) => {
                 eval_each_owned::<S>(expr, o, optional, &mut |o| sink.push(GenericItem::Owned(o)))
             }
         }
@@ -11004,8 +11004,8 @@ enum LoopKind {
 impl LoopKind {
     fn name(self) -> &'static str {
         match self {
-            LoopKind::Until => "until",
-            LoopKind::While => "while",
+            Self::Until => "until",
+            Self::While => "while",
         }
     }
 }
@@ -11082,7 +11082,7 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
     loop {
         if *budget == 0 {
             // #2132: uncatchable -- see `EvalError::resource_limit`.
-            return Err(Control::Error(EvalError::resource_limit(&format!(
+            return Err(Control::Error(EvalError::resource_limit(format!(
                 "{}: maximum iterations exceeded",
                 kind.name()
             ))));
