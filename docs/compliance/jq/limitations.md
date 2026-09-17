@@ -7049,6 +7049,30 @@ divergences in the same reporter are unmeasured and unfiled as their own oracle 
 jq reports module errors in *reverse* include order, and a main-*body* error suppresses
 def errors entirely.
 
+### `--slurpfile`'s malformed-JSON detail text is succinctly's own, not jq's (#3051) — accepted divergence
+
+A bad `--slurpfile`/`--rawfile`/`--argjson` argument now exits 2 (jq's usage-error code) with
+a single `jq: ...` line instead of routing through `anyhow`'s generic exit-1 `Error: .../Caused
+by:` block ([#3051](https://github.com/rust-works/succinctly/issues/3051)). The wrapper
+wording matches jq 1.7.1 byte-for-byte, confirmed live, for every case but one:
+
+| filter                                    | jq 1.7.1                                                                                         | succinctly                                                       |
+|--------------------------------------------|---------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
+| `--slurpfile x <missing>`                  | `jq: Bad JSON in --slurpfile x <missing>: Could not open <missing>: No such file or directory`    | byte-identical                                                      |
+| `--rawfile x <missing>`                     | `jq: Bad JSON in --rawfile x <missing>: Could not open <missing>: No such file or directory`      | byte-identical                                                      |
+| `--argjson x '[1,'`                        | `jq: invalid JSON text passed to --argjson` + usage-hint trailer                                  | byte-identical                                                      |
+| `--slurpfile x <truncated JSON>`           | `jq: Bad JSON in --slurpfile x <file>: Unfinished JSON term at EOF at line 2, column 5`            | `jq: Bad JSON in --slurpfile x <file>: Invalid JSON in stream`      |
+
+Only the last row's *inner* detail (after the second `: `) diverges: jq's own line/column
+diagnostic comes from its own hand-written JSON reader, where succinctly's comes from
+`serde_json`'s `Display` for the same failure class. Reproducing jq's exact wording there
+would mean re-deriving its parser's own error-position/message rules for this one CLI-arg
+error path — out of proportion to this issue's own "Low severity" scope, which was the exit
+code and the reporting channel, not this detail text. `--jsonargs` has the identical exit-1
+bug (confirmed live: jq exits 2 for a bad `--jsonargs` value too) but is left unfixed here,
+filed as [#3096](https://github.com/rust-works/succinctly/issues/3096) instead of folded into
+this issue's own narrower scope.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |

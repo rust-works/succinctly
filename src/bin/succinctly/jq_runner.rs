@@ -243,6 +243,42 @@ fn report_module_load_error(e: &ModuleLoadError) {
     }
 }
 
+/// A [`build_context`] failure that jq treats as a *usage* error --
+/// `--argjson`/`--slurpfile`/`--rawfile` given a bad value, an unreadable
+/// file, or malformed JSON -- as opposed to some other, unrelated
+/// `anyhow::Error` `build_context` might still propagate (#3051).
+///
+/// Distinguished the same way [`ModuleLoadError`] is: an opaque
+/// `anyhow::Error` routed through `main`'s own top-level `?` prints a
+/// generic two-part `Error: .../Caused by:` block and exits 1, where jq
+/// prints one line prefixed `jq:` (plus, for `--argjson`, a usage-hint
+/// trailer) and exits 2 (`USAGE_ERROR`) -- confirmed live against jq 1.7.1
+/// for all three flags. `message` is pre-formatted by each call site below
+/// so [`report_usage_error`] only has to print it.
+enum BuildContextError {
+    Usage(String),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for BuildContextError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Strip Rust's `std::io::Error` Display's own `" (os error N)"` suffix,
+/// which has no jq equivalent -- jq's C `strerror()` call never appends an
+/// errno number. Leaves any other message untouched (that suffix is a fixed
+/// tail `io::Error::fmt` always appends after `strerror`'s own text, not a
+/// pattern that occurs elsewhere in it).
+fn strerror_only(e: &std::io::Error) -> String {
+    let full = e.to_string();
+    match full.rsplit_once(" (os error ") {
+        Some((message, _)) => message.to_string(),
+        None => full,
+    }
+}
+
 /// Resolve a module path to a file path within `search_path`.
 ///
 /// A free function rather than a `ModuleLoader` method (#2395). The original
@@ -2558,8 +2594,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     jq::cli_context::set_program(program_context(&args));
 
-    // Build evaluation context from arguments
-    let context = build_context(&args)?;
+    // Build evaluation context from arguments. A bad --argjson/--slurpfile/
+    // --rawfile is jq's own usage error (exit 2, a single `jq: ...` line),
+    // not the generic `anyhow`-reported exit 1 every other `Other` failure
+    // here still takes (#3051).
+    let context = match build_context(&args) {
+        Ok(context) => context,
+        Err(BuildContextError::Usage(message)) => {
+            eprintln!("jq: {message}");
+            return Ok(exit_codes::USAGE_ERROR);
+        }
+        Err(BuildContextError::Other(e)) => return Err(e),
+    };
 
     // Get the filter expression
     let filter_str = get_filter(&args)?;
@@ -3532,7 +3578,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 }
 
 /// Build the evaluation context from command-line arguments.
-fn build_context(args: &JqCommand) -> Result<EvalContext> {
+fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     let mut context = EvalContext::default();
 
     // Process --arg name value pairs
@@ -3544,32 +3590,58 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
         }
     }
 
-    // Process --argjson name value pairs
+    // Process --argjson name value pairs. jq's own wording and usage-hint
+    // trailer, confirmed live (#3051) -- unlike --slurpfile/--rawfile below,
+    // there's no file read here to report a `strerror` detail for.
     for chunk in args.argjson.chunks(2) {
         if let [name, value] = chunk {
-            let json_value = parse_json_value(value)
-                .with_context(|| format!("Invalid JSON for --argjson {name}"))?;
+            // jq's own wording doesn't name the flag's variable (`x`) at all.
+            let json_value = parse_json_value(value).map_err(|_| {
+                BuildContextError::Usage(
+                    "invalid JSON text passed to --argjson\n\
+                     Use jq --help for help with command-line options,\n\
+                     or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
+                        .to_string(),
+                )
+            })?;
             context.named.insert(name.clone(), json_value);
         }
     }
 
-    // Process --slurpfile name file pairs
+    // Process --slurpfile name file pairs. jq wraps both an unreadable file
+    // and malformed JSON in it under the identical "Bad JSON in --slurpfile
+    // ..." wording (#3051, confirmed live) -- succinctly's own detail text
+    // after the colon is not jq's (see `docs/compliance/jq/limitations.md`),
+    // but the flag, exit code (2) and single-line shape now match.
     for chunk in args.slurpfile.chunks(2) {
         if let [name, file] = chunk {
-            let contents = std::fs::read_to_string(file)
-                .with_context(|| format!("Failed to read file for --slurpfile {name}"))?;
-            let values = parse_json_stream(&contents)?;
+            let contents = std::fs::read_to_string(file).map_err(|e| {
+                BuildContextError::Usage(format!(
+                    "Bad JSON in --slurpfile {name} {file}: Could not open {file}: {}",
+                    strerror_only(&e)
+                ))
+            })?;
+            let values = parse_json_stream(&contents).map_err(|e| {
+                BuildContextError::Usage(format!("Bad JSON in --slurpfile {name} {file}: {e}"))
+            })?;
             context
                 .named
                 .insert(name.clone(), OwnedValue::array_from(values));
         }
     }
 
-    // Process --rawfile name file pairs
+    // Process --rawfile name file pairs. Same "Bad JSON in --rawfile ..."
+    // wrapper as --slurpfile above even though a raw file is never actually
+    // parsed as JSON -- jq's own generic arg-file reader uses this wording
+    // unconditionally (#3051, confirmed live).
     for chunk in args.rawfile.chunks(2) {
         if let [name, file] = chunk {
-            let contents = std::fs::read_to_string(file)
-                .with_context(|| format!("Failed to read file for --rawfile {name}"))?;
+            let contents = std::fs::read_to_string(file).map_err(|e| {
+                BuildContextError::Usage(format!(
+                    "Bad JSON in --rawfile {name} {file}: Could not open {file}: {}",
+                    strerror_only(&e)
+                ))
+            })?;
             context
                 .named
                 .insert(name.clone(), OwnedValue::String(contents));
@@ -3581,7 +3653,11 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
         context.positional.push(OwnedValue::String(arg.clone()));
     }
 
-    // Process --jsonargs: values become JSON positional args
+    // Process --jsonargs: values become JSON positional args. Left on the
+    // generic `anyhow` exit-1 path -- real jq also treats a bad --jsonargs
+    // value as a usage error (exit 2), but that's #3051's own scope only for
+    // --argjson/--slurpfile/--rawfile; tracked as a follow-up rather than
+    // folded in here.
     for arg in &args.jsonargs {
         let json_value =
             parse_json_value(arg).with_context(|| format!("Invalid JSON for --jsonargs: {arg}"))?;
