@@ -1248,14 +1248,6 @@ impl Libm1 {
         ("y0", Self::Y0),
         ("y1", Self::Y1),
     ];
-
-    /// The jq name.
-    pub fn name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(_, f)| *f == self)
-            .map_or("", |(n, _)| n)
-    }
 }
 
 /// The two-argument libm builtins (#3042): `f(a; b)`.
@@ -1301,14 +1293,6 @@ impl Libm2 {
         ("scalbln", Self::Scalbln),
         ("yn", Self::Yn),
     ];
-
-    /// The jq name.
-    pub fn name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(_, f)| *f == self)
-            .map_or("", |(n, _)| n)
-    }
 }
 
 /// The three-argument libm builtins (#3042): only `fma(a; b; c)`, the third
@@ -1322,14 +1306,6 @@ pub enum Libm3 {
 impl Libm3 {
     /// Every member with its jq name.
     pub const ALL: [(&'static str, Self); 1] = [("fma", Self::Fma)];
-
-    /// The jq name.
-    pub fn name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(_, f)| *f == self)
-            .map_or("", |(n, _)| n)
-    }
 }
 
 /// Builtin functions supported by jq.
