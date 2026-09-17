@@ -6238,13 +6238,78 @@ rejection, reasoning the value would otherwise materialize as `null`. Both halve
 stopped holding — the materializer preserves the literal spelling (the `--slurpfile` and
 primary-input paths already answered `1E+400`), and the oracle accepts it — so dropping the
 serde gate closed a divergence rather than opening one. `+1`, `nan`/`NaN` and
-`Infinity`/`-Infinity`, which jq also accepts, remain rejected on every input path and are
-tracked as [#2877](https://github.com/rust-works/succinctly/issues/2877): the decoder cannot
-represent them yet, and admitting a spelling it then refuses is the #1247 shape.
+`Infinity`/`-Infinity`, which jq also accepts, stayed rejected on every input path until
+[#2877](https://github.com/rust-works/succinctly/issues/2877) closed them too — the next
+section.
 
 `succinctly yq`'s own `--argjson` keeps the rejection, per ADR-0018 rule 2 -- real yq's JSON
 input path refuses an overflowing literal as well, and yq mode has nowhere to put an
 infinity. See the yq limitations doc for that half.
+
+### jq's decNumber number spellings — `+1`, `nan`, `sNaN12`, `Infinity` — are read on every input path (#2877) — divergence closed, one identity residual
+
+jq 1.7.1 builds with decNumber, and its parser hands every token that is not `t…`/`f…`/`nu…`
+to `decNumberFromString` (`check_literal`, `src/jv_parse.c`), so a JSON *number* there has
+decNumber's grammar: an optional `+` as well as `-`, and the special values `nan`/`sNaN`
+(case-insensitive, optional digit payload) and `inf`/`infinity` (case-insensitive). A NaN is
+a real number (`type` is `"number"`, `isnan` is `true`) that only *prints* as `null`; an
+infinity is a real `f64` infinity clamped to `DBL_MAX` text at print time; `+X` prints
+exactly as `X`. Until #2877 succinctly rejected every one of these on every path:
+
+```console
+$ printf '[nan,+1.500,-Infinity,sNaN12]' | jq -c '., map(type), (.[0]|isnan), (.[2]|isinfinite)'
+[null,1.500,-1.7976931348623157e+308,null]
+["number","number","number","number"]
+true
+true
+$ printf '[nan,+1.500,-Infinity,sNaN12]' | succinctly jq -c .     # before #2877
+[jq: error (at <stdin>:0): Invalid JSON text: invalid keyword 'nan' (expected null, true, or false)
+$ printf '[nan,+1.500,-Infinity,sNaN12]' | succinctly jq -c '., map(type), (.[0]|isnan), (.[2]|isinfinite)'   # after
+[null,1.500,-1.7976931348623157e+308,null]
+["number","number","number","number"]
+true
+true
+```
+
+The same on the primary document (top-level and nested, raw-echo, cursor, materializing and
+`--slurp` routes), `-n input`/`inputs`, `--argjson`, `--jsonargs`, `--slurpfile` and `--seq`
+(whose reader already accepted the grammar and then silently dropped the record), plus
+`tonumber` on `"sNaN"`/`"nan12"`, the two words Rust's own float parser lacks. The reject
+side is jq's too: `nanx`, `nan1.5`, `nan(1)`, `infinity1`, `inf1`, `+-1`, `++1`, `+ 1`,
+`{nan:1}` all stay `Invalid numeric literal` (exit 5) — the whole token has to validate, so a
+valid prefix is never read out of an invalid word. The grammar lives once, in
+`json::validate::jq_special_number`/`strip_leading_plus`; the `--seq` reader that first
+implemented it (#1723) now calls the same function. No ADR: ADR-0018 rule 2 decides this, and
+none of the rule-4 conditions apply. Not the `fromjson` path: its hand-written parser has
+none of the jq leniencies and is
+[#3032](https://github.com/rust-works/succinctly/issues/3032)'s.
+
+`--preserve-input` (a succinctly extension) echoes the source spelling verbatim, as it does
+for `007` and `.5`. yq mode is unmoved: `-p json` goes through the YAML parser and rejects
+every spelling as real yq does, `-p json --slurp`/`--eval-all` and yq's `--argjson` refuse
+the non-finite words at their materializer (that mode has nowhere to put a NaN) and admit a
+leading `+` with the spelling dropped, like the `007`/`.5` they already take.
+
+**The residual — a literal NaN compared with itself.** jq's `jv_equal` short-circuits on
+pointer identity before comparing values, and a parsed number literal is an allocated `jv`,
+so the *same* document NaN is equal to itself there while a computed NaN is not:
+
+| Filter                              | Input        | jq      | succinctly |
+|-------------------------------------|--------------|---------|------------|
+| `.[0] == .[0]`                      | `[nan]`      | `true`  | `false`    |
+| `.[0] as $x \| $x == $x`            | `[nan]`      | `true`  | `false`    |
+| `indices(.[0])`                     | `[nan,NaN]`  | `[0]`   | `[]`       |
+| `.[0] == .[1]`                      | `[nan,NaN]`  | `false` | `false`    |
+| `nan == nan`, `nan as $x \| $x == $x` | (any)      | `false` | `false`    |
+| `. == .`                            | `[nan]`      | `true`  | `false`    |
+
+The last row shows the class predates #2877: the identity short-circuit fires on any
+allocated value holding a NaN, the builtin's array included. `OwnedValue` has no notion of
+value identity (two copies of a NaN are indistinguishable from one), so matching this would
+need a representation change; recorded here on its merits, tracked as
+[#3069](https://github.com/rust-works/succinctly/issues/3069). It is observable only when a
+NaN is compared against the very same NaN; `sort`, `unique`, `group_by` and `<` already agree
+with jq.
 
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 

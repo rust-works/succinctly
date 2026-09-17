@@ -173,6 +173,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq` reads jq's decNumber number spellings on every input path**
+  (#2877). jq 1.7.1 hands every non-keyword token to `decNumberFromString`, so a
+  leading `+` (`+1`, `+.5`, `+1.500`, `+007.e5`) and the special values `nan`,
+  `NaN5`, `sNaN`, `inf`, `Infinity` (any case, optionally signed) are numbers
+  there: a NaN is a real number (`type` is `"number"`, `isnan` is `true`) that
+  only *prints* as `null`, an infinity is a real `f64` infinity printed as the
+  `DBL_MAX` text, and `+X` prints exactly as `X`. Every one of them was rejected
+  here -- on the primary document, `--argjson`, `--jsonargs`, `--slurpfile`,
+  `--slurp`, `input`/`inputs`, and `--seq`, which silently dropped the record.
+  `"sNaN" | tonumber` and `"nan12" | tonumber` read the same grammar. The reject
+  side is jq's too: `nanx`, `nan1.5`, `nan(1)`, `inf1`, `+-1` and `{nan:1}` stay
+  `Invalid numeric literal`. The grammar lives once, in
+  `json::validate::jq_special_number`/`strip_leading_plus`, which the `--seq`
+  reader now shares. A `-e` exit status treats a document `nan` as truthy, as jq
+  does. `succinctly yq` is unmoved: `-p json` rejects every spelling as real yq
+  does, and yq's `--argjson`/`-p json --slurp` refuse the non-finite words. One
+  residual, recorded in `docs/compliance/jq/limitations.md` and tracked as
+  #3069: a document NaN compared against the very same NaN is `true` in jq
+  (`jv_equal`'s pointer identity), `false` here.
+
+  `OwnedValue::from_number_bytes` is `pub` and now reads these spellings;
+  `json::validate` gains `pub fn jq_special_number`, `strip_leading_plus` and
+  `is_preservable_number_literal`, and `json::light` gains
+  `pub fn jq_number_token_end`.
+
 - **`|=`, `+=`, `-=`, `*=`, `/=`, `%=` and `//=` update one path at a time, as
   jq does** (#2974). jq lowers them all to a `reduce` over `path(paths)`, and
   #2267 had already made `=` stream that way. A failing update now stops the
