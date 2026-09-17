@@ -776,15 +776,434 @@ fn test_argjson_reject_set_2052() -> Result<()> {
         assert_eq!(stdout, "", "{value}");
     }
 
-    // 3. #2877: jq accepts all five; the decoder behind this validator cannot
-    //    represent them yet, so lenient mode deliberately does not admit them.
-    for value in ["+1", "nan", "NaN", "Infinity", "-Infinity"] {
+    // 3. #2877 closed the old third group (`+1`, `nan`, `Infinity`): those
+    //    are accepted now, see `test_jq_number_spellings_every_input_path_2877`.
+    //    What stays rejected is every way its two gates can fail to fire --
+    //    a word that is not decNumber's, a NaN with anything but digits
+    //    after it, a `+` before anything but a digit, `.` or such a word --
+    //    each captured as `Invalid numeric literal` from jq 1.7.1, plus the
+    //    rule-4c refusal with a `+` in front.
+    for value in [
+        "nanx",
+        "nana",
+        "nan.",
+        "nan1.5",
+        "nan1e3",
+        "nan-1",
+        "nan(1)",
+        "qnan",
+        "ssnan",
+        "infin",
+        "Infinite",
+        "infinity1",
+        "inf1",
+        "sinf",
+        "infx",
+        "1nan",
+        "+",
+        "++1",
+        "+-1",
+        "-+1",
+        "+ 1",
+        "+e5",
+        "+0x10",
+        "[nanx]",
+        "[+]",
+        "{nan:1}",
+        "[nan1.5,2]",
+        "+5.",
+        "+007.",
+        "+9e999e999",
+        "+1e0e0",
+    ] {
         let (stdout, _stderr, code) = run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
-        assert_ne!(
-            code, 0,
-            "#2877 row must stay rejected until the decoder can read it: {value}"
-        );
+        assert_ne!(code, 0, "--argjson must reject: {value}");
         assert_eq!(stdout, "", "{value}");
+    }
+    Ok(())
+}
+
+// =============================================================================
+// #2877: jq 1.7.1 reads numbers with decNumber's grammar, so a leading `+`
+// (`+1`, `+.5`, `+1.500`) and the special values (`nan`, `NaN5`, `sNaN`,
+// `inf`, `Infinity`, signed or not, any case) are numbers on every input
+// path. Every expectation below was captured live from `/usr/bin/jq` 1.7.1;
+// a NaN is a real number there (`type` is `"number"`, `isnan` is `true`) and
+// only *prints* as `null`, an infinity is a real `f64` infinity clamped to
+// `DBL_MAX` text at print time, and `+X` prints exactly as `X`.
+// =============================================================================
+
+/// The spelling matrix, on every path a number can enter: the primary
+/// document (top-level and nested, on the raw-echo, cursor, materializing
+/// and `--slurp` routes), `-n input`, `--argjson`, `--jsonargs`,
+/// `--slurpfile` and `--seq`. `fromjson` is the one path deliberately absent
+/// -- its hand-written parser has none of the jq leniencies and is #3032's.
+#[test]
+fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
+    // (spelling, jq's printed form)
+    let rows: &[(&str, &str)] = &[
+        ("+1", "1"),
+        ("+0", "0"),
+        ("+01", "1"),
+        ("+.5", "0.5"),
+        ("+1.500", "1.500"),
+        ("+1e400", "1E+400"),
+        ("+1.e5", "1E+5"),
+        ("+.5e3", "5E+2"),
+        ("+007.e5", "7E+5"),
+        ("nan", "null"),
+        ("NaN", "null"),
+        ("nAn", "null"),
+        ("-nan", "null"),
+        ("+nan", "null"),
+        ("nan1", "null"),
+        ("nan0012", "null"),
+        ("sNaN", "null"),
+        ("SNAN12", "null"),
+        ("-sNaN", "null"),
+        ("inf", "1.7976931348623157e+308"),
+        ("INF", "1.7976931348623157e+308"),
+        ("Infinity", "1.7976931348623157e+308"),
+        ("iNfInItY", "1.7976931348623157e+308"),
+        ("+inf", "1.7976931348623157e+308"),
+        ("-inf", "-1.7976931348623157e+308"),
+        ("-Infinity", "-1.7976931348623157e+308"),
+    ];
+    for &(spelling, printed) in rows {
+        let nested = format!("[{spelling},2]");
+        let nested_out = format!("[{printed},2]");
+        let object = format!(r#"{{"a":{spelling}}}"#);
+        let object_out = format!(r#"{{"a":{printed}}}"#);
+
+        // Primary input: top-level, on the raw-echo (`.`), compact
+        // (`-c .`), cursor (`.[0]`), materializing (`map(.)`) and
+        // `--slurp` routes; nested in an array and in an object.
+        for (args, input, expected) in [
+            (vec!["-c", "."], spelling.to_string(), printed.to_string()),
+            (vec!["."], spelling.to_string(), printed.to_string()),
+            (vec!["-c", "."], nested.clone(), nested_out.clone()),
+            (vec!["-c", "map(.)"], nested.clone(), nested_out.clone()),
+            (vec!["-c", ".[0]"], nested.clone(), printed.to_string()),
+            (vec!["-c", "."], object.clone(), object_out.clone()),
+            (vec!["-c", ".a"], object.clone(), printed.to_string()),
+            (
+                vec!["-c", "-s", "."],
+                nested.clone(),
+                format!("[{nested_out}]"),
+            ),
+            (
+                vec!["-c", "-s", ".[0][0]"],
+                nested.clone(),
+                printed.to_string(),
+            ),
+            (vec!["-nc", "input"], nested.clone(), nested_out.clone()),
+            (
+                vec!["-nc", "[inputs]"],
+                format!("{spelling}\n{spelling}"),
+                format!("[{printed},{printed}]"),
+            ),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&args, Some(&input))?;
+            assert_eq!(code, 0, "{args:?} on {input:?}: stderr: {stderr:?}");
+            assert_eq!(stdout.trim_end(), expected, "{args:?} on {input:?}");
+        }
+
+        // `--argjson` / `--jsonargs`, top-level and nested.
+        for (value, expected) in [
+            (spelling, printed.to_string()),
+            (nested.as_str(), nested_out.clone()),
+        ] {
+            let (stdout, stderr, code) =
+                run_jq_full(&["-nc", "--argjson", "x", value, "$x"], None)?;
+            assert_eq!(code, 0, "--argjson {value}: stderr: {stderr:?}");
+            assert_eq!(stdout.trim_end(), expected, "--argjson {value}");
+            let (stdout, stderr, code) =
+                run_jq_full(&["-nc", "$ARGS.positional", "--jsonargs", value], None)?;
+            assert_eq!(code, 0, "--jsonargs {value}: stderr: {stderr:?}");
+            assert_eq!(
+                stdout.trim_end(),
+                format!("[{expected}]"),
+                "--jsonargs {value}"
+            );
+        }
+
+        // `--slurpfile`: one top-level value per line.
+        let mut file = NamedTempFile::new()?;
+        writeln!(file, "{spelling}")?;
+        writeln!(file, "{nested}")?;
+        let path = file.path().to_str().unwrap().to_string();
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--slurpfile", "s", &path, "$s"], None)?;
+        assert_eq!(code, 0, "--slurpfile {spelling}: stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            format!("[{printed},{nested_out}]"),
+            "--slurpfile {spelling}"
+        );
+
+        // `--seq`: the reader's grammar already accepted these tokens and
+        // then dropped the record when materialization failed (#2877's
+        // "no output, no warning, exit 0" row); now it prints them.
+        let input = format!("\u{1e}{nested}\n");
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(&input))?;
+        assert_eq!(code, 0, "--seq {nested}: stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            format!("\u{1e}{nested_out}"),
+            "--seq {nested}"
+        );
+        assert_eq!(stderr, "", "--seq {nested} must not warn");
+    }
+    Ok(())
+}
+
+/// The builtins see the *value*, not the printed form: a document `nan` is a
+/// number that `isnan`, an `Infinity` a number that `isinfinite`, and
+/// `+1.50` keeps its spelling for display while computing as `1.5`. Rows
+/// captured from jq 1.7.1 on the same documents; each is run on the cursor
+/// route and, through `--slurp`, on the reindexed materializing route.
+#[test]
+fn test_jq_number_spellings_builtins_2877() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "[SNAN,+Infinity,NaN5,-Inf,+.5e1,+1.50,-snan00]",
+            "., map(type)",
+            "[null,1.7976931348623157e+308,null,-1.7976931348623157e+308,5,1.50,null]\n\
+             [\"number\",\"number\",\"number\",\"number\",\"number\",\"number\",\"number\"]",
+        ),
+        (
+            "[nan]",
+            ".[0] | [type, isnan, isinfinite, isnormal, tostring, tojson, length, (. < .), (. + 0), (. + 1 | isnan), (. == 1)]",
+            "[\"number\",true,false,false,\"null\",\"null\",null,true,null,true,false]",
+        ),
+        (
+            "[nan, NaN]",
+            "[(.[0] == .[1]), sort, unique, (group_by(.) | length), (map(isnan) | all)]",
+            "[false,[null,null],[null,null],2,true]",
+        ),
+        (
+            "[Infinity, -inf]",
+            "[.[0] | type, isinfinite, (. == 1.7976931348623157e+308), tostring, tojson, length, (. + 1)], [.[1] | tostring, (. - 1)], sort, (.[0] > .[1])",
+            "[\"number\",true,false,\"1.7976931348623157e+308\",\"1.7976931348623157e+308\",1.7976931348623157e+308,1.7976931348623157e+308]\n\
+             [\"-1.7976931348623157e+308\",-1.7976931348623157e+308]\n\
+             [-1.7976931348623157e+308,1.7976931348623157e+308]\n\
+             true",
+        ),
+        (
+            "+1.50",
+            "[., tostring, .+0, length, tojson, type, (. == 1.5)]",
+            "[1.50,\"1.50\",1.5,1.5,\"1.50\",\"number\",true]",
+        ),
+        (
+            r#"{"a":+007,"b":nan}"#,
+            ".,(.a|type),(.b|type),to_entries,[tostream],keys,[.[]],(.a|=.+1),del(.b)",
+            "{\"a\":7,\"b\":null}\n\"number\"\n\"number\"\n[{\"key\":\"a\",\"value\":7},{\"key\":\"b\",\"value\":null}]\n\
+             [[[\"a\"],7],[[\"b\"],null],[[\"b\"]]]\n[\"a\",\"b\"]\n[7,null]\n{\"a\":8,\"b\":null}\n{\"a\":7}",
+        ),
+        // `-e`: a NaN is truthy, as every number is.
+        ("[nan]", ".[0]", "null"),
+    ] {
+        for extra in [&[][..], &["-s", "--argjson", "unused", "0"][..]] {
+            let filter = if extra.is_empty() {
+                filter.to_string()
+            } else {
+                format!(".[0] | {filter}")
+            };
+            let mut args = vec!["-c", "-e"];
+            args.extend_from_slice(extra);
+            args.push(&filter);
+            let (stdout, stderr, code) = run_jq_full(&args, Some(input))?;
+            assert_eq!(code, 0, "{args:?} on {input}: stderr {stderr:?}");
+            let expected: String = expected
+                .lines()
+                .map(str::trim_start)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(stdout.trim_end(), expected, "{args:?} on {input}");
+        }
+    }
+    Ok(())
+}
+
+/// Every way the two #2877 gates can fail to fire keeps erroring on the
+/// document path, matching jq's `Invalid numeric literal` (exit 5): a word
+/// that is not decNumber's, a NaN followed by anything but digits, a `+`
+/// before anything but a digit, `.` or such a word -- and the whole scalar
+/// token has to validate, so `nan1.5` is not read as `nan1` plus leftovers.
+/// The bridge's own tokens with a `+` in front are user text and degrade
+/// like `+1.2.3` (#966's `null`), never to a NaN or an infinity.
+///
+/// Asserted as "does not become a number" on the materializing route as
+/// well as "errors" on the identity route: #3035's pre-existing keyword
+/// prefix match means a *neighbouring* row (`nullx`) does not error today,
+/// so "errors" alone would be the wrong shape for a gate this close to it.
+#[test]
+fn test_jq_number_spellings_reject_set_2877() -> Result<()> {
+    for token in [
+        "nana",
+        "nanx",
+        "nan.",
+        "nan1.5",
+        "nan1e3",
+        "nan-1",
+        "nan(1)",
+        "qnan",
+        "ssnan",
+        "nA",
+        "infin",
+        "infinit",
+        "Infinite",
+        "infinity1",
+        "inf1",
+        "sinf",
+        "infx",
+        "infinityx",
+        "+",
+        "+x",
+        "+e5",
+        "++1",
+        "+-1",
+        "+nanx",
+        "+infx",
+        "snan.",
+    ] {
+        for input in [
+            format!("[{token}]"),
+            format!("[{token},2]"),
+            format!(r#"{{"a":{token}}}"#),
+            token.to_string(),
+        ] {
+            for filter in ["-c .", "-c map(.)", "-c [.[]]"] {
+                if !input.starts_with(['[', '{']) && filter != "-c ." {
+                    continue;
+                }
+                let args: Vec<&str> = filter.split(' ').collect();
+                let (stdout, _stderr, code) = run_jq_full(&args, Some(&input))?;
+                assert_eq!(
+                    code, 5,
+                    "{filter:?} on {input:?} must be a parse error, got {stdout:?}"
+                );
+                assert!(
+                    !stdout.contains("null") && !stdout.contains("e+308"),
+                    "{filter:?} on {input:?} materialized a number: {stdout:?}"
+                );
+            }
+        }
+    }
+    // `{nan:1}`: a key must be a string.
+    let (_, _, code) = run_jq_full(&["-c", "."], Some("{nan:1}"))?;
+    assert_eq!(code, 5);
+    // A digit-led token with letters after it (`1nan`), and a `-`-led one
+    // that is not a decNumber word (`-snan.`, `-nope`): the identity route
+    // rejects both (the #1643 gap check), but the materializing route reads
+    // the `1` / the bare `-` and drops the rest -- exactly as `[1abc]` and
+    // `[-nope]` do today and did before #2877 (`-` was never this issue's
+    // arm). That is #3035's shape (a scalar's trailing bytes go unread),
+    // not a word gate of this issue's, so only the identity half is pinned.
+    // `+0x10` is the same shape: `+X` is `X`, and `[0x10] | map(.)` is `[0]`
+    // today for the same reason.
+    for input in ["[1nan]", "[-snan.]", "[-nope]", "[+0x10]", "[0x10]"] {
+        let (stdout, _, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: {stdout:?}");
+    }
+    // A `+` in front of the bridge's tokens, or of a malformed span, is
+    // #966's `null` -- exactly what the unsigned spelling gives.
+    for (input, expected) in [
+        ("[+9e999e999]", "[null]"),
+        ("[+8e999e999]", "[null]"),
+        ("[+1e0e0]", "[null]"),
+        ("[+1.2.3]", "[null]"),
+        ("[1.2.3]", "[null]"),
+        // `-` before anything is the old number-shaped span (#966), so a
+        // doubled sign led by `-` is `null` as it was before #2877, while
+        // `+-1` above is an error: `+` is admitted only before a digit,
+        // `.` or a decNumber word.
+        ("[-+1]", "[null]"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["-c", "map(.)"], Some(input))?;
+        assert_eq!(code, 0, "{input}");
+        assert_eq!(stdout.trim_end(), expected, "{input}");
+        let (stdout, _stderr, _code) =
+            run_jq_full(&["-c", ".[0] | [isnan, isinfinite]"], Some(input))?;
+        assert_eq!(
+            stdout.trim_end(),
+            "[false,false]",
+            "{input} must not decode as a bridge token"
+        );
+    }
+    Ok(())
+}
+
+/// The widening is jq's accept-set only: strict RFC 8259 validation --
+/// `json validate`, `--validate`, and the library's `validate()` behind
+/// them -- still rejects every one of the new spellings.
+#[test]
+fn test_jq_number_spellings_do_not_leak_into_strict_validation_2877() -> Result<()> {
+    for input in [
+        "+1",
+        "[+1]",
+        "nan",
+        "[nan]",
+        "Infinity",
+        r#"{"a":-inf}"#,
+        "sNaN12",
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(input))?;
+        assert_ne!(code, 0, "--validate must reject {input:?}");
+        assert_eq!(stdout, "", "{input:?}");
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command.args(["json", "validate", "--quiet"]);
+                command
+            },
+            Some(input.as_bytes()),
+        )?;
+        assert_ne!(code, 0, "json validate must reject {input:?}: {output:?}");
+    }
+    Ok(())
+}
+
+/// `--preserve-input` (a succinctly extension, no oracle) echoes the source
+/// spelling verbatim, as it already does for `007` and `.5` -- pinned so it
+/// is a decision, not an accident.
+#[test]
+fn test_jq_number_spellings_preserve_input_echoes_verbatim_2877() -> Result<()> {
+    let input = "[nan,+1,Infinity,007,.5]";
+    let (stdout, _stderr, code) = run_jq_full(&["--preserve-input", "-c", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// `tonumber` reads the same grammar (#2877): the two words Rust's parser
+/// lacks are numbers in jq mode, printed as jq prints a NaN.
+#[test]
+fn test_tonumber_reads_decnumber_specials_2877() -> Result<()> {
+    for (input, expected) in [
+        (r#""sNaN""#, "null"),
+        (r#""nan12""#, "null"),
+        (r#""-sNaN00""#, "null"),
+        (r#""NaN""#, "null"),
+        (r#""Infinity""#, "1.7976931348623157e+308"),
+        (r#""+1.500""#, "1.500"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "tonumber"], Some(input))?;
+        assert_eq!(code, 0, "{input}: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{input}");
+    }
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ".[0] | tonumber | [type, isnan]"],
+        Some(r#"["sNaN"]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"["number",true]"#);
+    for input in [r#""nanx""#, r#""nan1.5""#, r#""inf1""#, r#""+-1""#] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "tonumber"], Some(input))?;
+        assert_eq!(code, 5, "{input}: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid numeric literal"),
+            "{input}: {stderr:?}"
+        );
     }
     Ok(())
 }
