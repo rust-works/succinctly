@@ -9692,20 +9692,25 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    // #3036: see `try_payload_root`. Demoted ahead of both routes below;
-    // the identity pipe's own witness for the payload position is `Owned`
-    // too (`OwnedIdentity::kept(c).rebuilt()`), so the two agree.
+    // #3036: see `try_payload_root`. Demoted ahead of both routes below.
     let handler = demote_rebuilt_markers(handler, payload_root);
     let handler: &Expr = &handler;
     if let Some(c) = cursor {
         let stages = owned_identity_body_stages(handler);
         if needs_path_context(handler) && owned_identity_pipe_supported(stages) {
+            // #3036: the payload stands at the stage's position, and *is*
+            // the node's own value exactly when `try_payload_root` proved
+            // it (`error($x)` on a marker bound from this node); any other
+            // payload is a new value there.
+            let id = if *payload_root == RootWitness::of(Some(&c)) {
+                OwnedIdentity::kept(c)
+            } else {
+                OwnedIdentity::kept(c).rebuilt()
+            };
             return eval_owned_identity_pipe::<S, V>(
                 stages,
                 Cow::Owned(payload),
-                // #3036: the payload stands at the stage's position but is
-                // not the node's own value.
-                OwnedIdentity::kept(c).rebuilt(),
+                id,
                 optional,
                 sink,
             );
@@ -9886,7 +9891,12 @@ fn bound_var_identity<S: EvalSemantics, V: DocumentValue>(
         .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
         .unwrap_or_else(|| {
             if owned_value_eq::<S>(bound, input) {
-                id.clone()
+                // #3036: value equality places the variable at the input's
+                // position, but does not prove it *is* the input's node --
+                // that is exactly the rebuilt-copy hole -- so the identity
+                // it stands at names no node a marker could be certified
+                // against.
+                id.clone().rebuilt()
             } else {
                 OwnedIdentity::detached()
             }
@@ -24529,11 +24539,30 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
         // stage's to clear.
         OwnedIdentityRule::Bound => placed,
         // #3036: every other rule places a value the stage *built* at the
-        // position -- the same position, no longer the same node.
+        // position -- the same position, no longer the same node -- except
+        // the few that hand their input on untouched.
+        _ if stage_passes_input_through(stage) => placed,
         _ => placed
             .rebuilt()
             .with_key_node(rule == OwnedIdentityRule::KeyNode),
     }))
+}
+
+/// Whether `stage` emits its input itself, not a value built from it
+/// (#3036): jq's `select`, `debug` and `stderr` return the very `jv` they
+/// were given, so a marker bound before them still names the node after
+/// them -- `.foo | . as $x | select(true) | (parent, ($x.a = 9))` writes in
+/// both jq and `main`. Every other `Keeps` stage (`sort`, `to_entries`,
+/// `tostring`, a write) allocates, and clears the node witness. Kept to
+/// the builtins whose jq definition is `if f then . else empty end` or a
+/// side effect returning `.`; `getpath([])`/`nth(0; .)`/`recurse(empty)`
+/// also pass through in jq but are left rebuilt here, recorded as
+/// refuse-only in `docs/compliance/jq/limitations.md`.
+fn stage_passes_input_through(stage: &Expr) -> bool {
+    matches!(
+        strip_parens(stage),
+        Expr::Builtin(Builtin::Select(_) | Builtin::Debug | Builtin::DebugMsg(_) | Builtin::Stderr)
+    )
 }
 
 /// [`owned_identity_after_stage`] before the key-node flag is applied.

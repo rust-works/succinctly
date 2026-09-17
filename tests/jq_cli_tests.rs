@@ -59040,6 +59040,46 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
             r#"{"a":1}"#,
             "input | . as $x | ((path | empty), ({a:1} | ($x.a = 9)))",
         ),
+        // A second path of the same `|=` sees a root jq's `setpath` has
+        // already copied (`main` wrote `{"a":9,"b":2}` here); a later
+        // `until`/`recurse` round sees a value `update`/`f` computed; a
+        // `catch` body with two raise sites naming different values proves
+        // nothing.
+        (
+            &["-c"][..],
+            r#"{"a":1,"b":2}"#,
+            r#". as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else . end)"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1,"b":2}"#,
+            ". as $x | (., .) |= ($x.a = 9)",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | until(false; {a:1} | ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | [recurse({a:1}; ($x.a = 9) | true)]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | any({a:1}; ($x.a = 9))",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try (if .a then error($x) else error({a:1}) end) catch path($x)",
+        ),
+        (
+            &["-c"][..],
+            r#"{"foo":[2,1]}"#,
+            ".foo | . as $x | sort | (parent | empty), ($x[0] = 9)",
+        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -59187,6 +59227,94 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
             "input | . as $x | ((path | empty), (. as $y | ($x.a = 9)))",
             r#"{"a":9}"#,
         ),
+        // `eval.rs` consumers that hand their own ambient input to the
+        // owned bridge unrebuilt (`any`/`all`/`IN`'s generator, `until`/
+        // `while`/`repeat`'s first round, `recurse(f)`'s level 0, `debug`'s
+        // message, `|=` on the lone root path): the marker's node is still
+        // the input, so these take the non-demoting bridge. Captured live.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | any(($x.a = 9); true)",
+            "true",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | all(($x.a = 9); true)",
+            "true",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | IN(($x.a = 9))",
+            "false",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | until(($x.a = 9) | true; .)",
+            r#"{"a":1}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | [while(($x.a = 9) | false; .)]",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | [limit(1; repeat(($x.a = 9)))]",
+            r#"[{"a":9}]"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | [recurse(($x.a = 9) | empty)]",
+            r#"[{"a":1}]"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | debug(($x.a = 9))",
+            r#"{"a":1}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | . |= ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (&["-c"][..], r#"{"a":1}"#, ". as $x | . |= del($x.a)", "{}"),
+        // `catch` on a marker raised from anywhere in the body, and on the
+        // identity route.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try (.a | error($x)) catch path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try (if .a then error($x) else . end) catch path($x)",
+            "[]",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try error($x) catch ((parent | empty), ($x.a = 9))",
+            r#"{"a":9}"#,
+        ),
+        // `select`/`debug` hand their input on as the same node in jq, so a
+        // sibling `parent` read must not cost the write.
+        (
+            &["-c"][..],
+            r#"{"foo":{"a":1}}"#,
+            ".foo | . as $x | select(true) | (parent | empty), ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -59240,6 +59368,32 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
             r#"{"a":1}"#,
             "input | . as $x | try error($x) catch path($x)",
         ),
+        // A stage that returns its input as an owned copy on the `eval.rs`
+        // route: jq keeps the `jv`, succinctly cannot tell the copy from a
+        // rebuild.
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | getpath([]) | ($x.a = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | nth(0; .) | ($x.a = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | until(true; .) | ($x.a = 9)",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            r#"input | . as $x | ltrimstr("x") | ($x.a = 9)"#,
+        ),
+        // `cond` runs on each element `gen` yields as a computed value,
+        // even when `gen` is `.`.
+        (&["-c"][..], r#"{"a":1}"#, ". as $x | any(.; ($x.a = 9))"),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
