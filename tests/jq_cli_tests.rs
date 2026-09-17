@@ -46696,10 +46696,17 @@ fn test_call_and_variable_errors_interleave_in_source_order_2734() -> Result<()>
 // compile error (exit 3), with the same timing and position reporting as an
 // unresolved function call or unbound `$variable` (#1473/#2037/#2085/#2734).
 // Every expectation below was captured live against the pinned oracle
-// (`/usr/bin/jq` 1.7.1). yq mode is untouched by this check -- real yq has no
-// compile-time label check at all, resolving `break` by runtime label scope
-// like succinctly's evaluator does, and `resolve::resolve_func_calls_all`
-// filters `ResolveError::Break` out of the function-only view `yq` consumes.
+// (`/usr/bin/jq` 1.7.1). yq mode is untouched by this check -- confirmed live
+// against the pinned Homebrew yq (v4.53.3), its *lexer* rejects `break`/
+// `label` syntax outright (`echo null | yq 'label $x | break $x'` ->
+// `Error: 1:1: lexer: invalid input text "label $x | break..."`), so there
+// is no real-yq-accepted `break` program for a label-scope check (compile-
+// time or runtime) to apply to. `succinctly yq` accepting `label`/`break`
+// syntax at all is a separate, pre-existing divergence from real yq, not
+// something this check introduces or fixes; `resolve::resolve_func_calls_all`
+// simply keeps this new check jq-only by filtering `ResolveError::Break` out
+// of the function-only view `yq` consumes, the same way it already does for
+// `ResolveError::Var`.
 // =============================================================================
 
 /// The issue's own minimal repro: a bare `break $x` outside any label.
@@ -46766,6 +46773,90 @@ fn test_break_sibling_scope_caret_points_at_failing_break_2964() -> Result<()> {
         "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
          (label $x | break $x), (label $y | break $x)                                   \n\
          jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// #2964 review finding: a `break $name` failing inside an `include`d
+/// module's `def` body is reported against that module's own file and line,
+/// not `<top-level>` -- the same route `Call`/`Var` already take for
+/// #2951/#2962. Confirmed live against the pinned oracle that real jq does
+/// the same (it names the module file, never `<top-level>`, for a
+/// module-body compile error of any kind).
+#[test]
+fn test_break_in_included_module_names_its_own_file_2964() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("mymod.jq"), "def f: break $x;\n")?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"include "mymod"; f"#);
+            cmd
+        },
+        None,
+    )?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    let at = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    let at = at.display();
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $*label-x is not defined at {at}, line 1:\n\
+             def f: break $x;{}\n\
+             jq: 1 compile error\n",
+            " ".repeat(7)
+        )
+    );
+    Ok(())
+}
+
+/// #2964 review finding: a label name repeated in *both* an included
+/// module and the main filter must not share one occurrence counter --
+/// `resolve::check` keys `break_occurrences` by `(origin, name)` precisely
+/// so the module's own failing `break $x` and the top-level's own failing
+/// `break $x` each index into their own site table rather than one
+/// stealing the other's slot (which, keyed by name alone, would have
+/// misattributed at least one of the two positions).
+#[test]
+fn test_break_occurrence_counters_do_not_cross_module_boundaries_2964() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("mymod.jq"), "def f: break $x;\n")?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"include "mymod"; f, break $x"#);
+            cmd
+        },
+        None,
+    )?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    let at = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    let at = at.display();
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $*label-x is not defined at {at}, line 1:\n\
+             def f: break $x;{}\n\
+             jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             include \"mymod\"; f, break $x{}\n\
+             jq: 2 compile errors\n",
+            " ".repeat(7),
+            " ".repeat(20)
+        )
     );
     Ok(())
 }

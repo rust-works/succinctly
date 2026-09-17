@@ -169,16 +169,24 @@ pub struct UnresolvedLabel {
     /// The label's name, without the `$` sigil — matching [`Expr::Break`]'s
     /// own storage.
     pub name: String,
-    /// Which same-named `break $name` site this diagnostic belongs to
-    /// (0-based, in `super::parser::collect_break_sites`'s source order): when two
+    /// Which same-named `break $name` site *within this diagnostic's own
+    /// `origin`* this belongs to (0-based, in `super::parser::collect_break_sites`'s
+    /// source order, scoped to whichever file `origin` names): when two
     /// same-named breaks differ only by lexical scope — one bound under an
     /// enclosing `label $name`, one genuinely unbound — the position
     /// recovery in `report_compile_errors` (the CLI) must cite the *failing*
     /// one, and this index is how it threads that decision through the AST,
-    /// which carries no positions. Mirrors the `calls`/`vars` "which
-    /// occurrence" counters in the CLI's own `report_compile_errors`
-    /// (`calls_consumed`/`vars_consumed`).
+    /// which carries no positions. Counted per-`origin` (see that field) so a
+    /// label name repeated in more than one module, or in a module and the
+    /// main filter, does not have one file's breaks consume another's slots.
     pub occurrence: usize,
+    /// Which module run the failing break was written in (#2951), or `None`
+    /// for the main filter — [`UnboundVar::origin`]'s twin: without this, a
+    /// break inside an `import`/`include`d module's `def` body could only
+    /// ever be reported as `<top-level>`, which is not merely imprecise but
+    /// wrong (the position it would otherwise search for belongs to a
+    /// different file's text entirely).
+    pub origin: Option<u32>,
 }
 
 impl core::fmt::Display for UnresolvedLabel {
@@ -1250,13 +1258,22 @@ pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
         .filter_map(|e| match e {
             ResolveError::Call(c) => Some(c),
             ResolveError::Var(_) => None,
-            // #2964: breaks are checked only in jq mode. Real yq marshals
-            // `break`/`label` through its own jq-superset evaluator, where
-            // a break's label scope is resolved at *runtime* much like
-            // succinctly's does — yq has no compile-time label check to
-            // match (mirrors `ResolveError::Var`'s own yq-mode exclusion,
-            // #2981), so folding these into yq's output would make
-            // `succinctly yq` reject programs real yq accepts.
+            // #2964: breaks are checked only in jq mode. Confirmed live
+            // against the pinned Homebrew yq (v4.53.3): its *lexer* rejects
+            // `break`/`label` syntax outright (`echo null | yq 'label $x |
+            // break $x'` -> `Error: 1:1: lexer: invalid input text "label
+            // $x | break..."`), so there is no real-yq-accepted `break`
+            // program for a compile-time (or runtime) label-scope check to
+            // apply to in the first place -- this is not the same situation
+            // `ResolveError::Var`'s yq-mode exclusion is in (#2981, where
+            // `$nope` genuinely is valid, permissive yq syntax verified
+            // against the oracle). `succinctly yq` accepting `label`/`break`
+            // syntax at all, ungated by `--jq-extensions`, is itself a
+            // separate, pre-existing divergence from real yq (tracked
+            // separately, not introduced or fixed here) -- this filter just
+            // keeps this PR's new compile-time check jq-only, matching every
+            // other jq-only construct `--jq-extensions` already gates in yq
+            // mode (see docs/reference/yq-language.md).
             ResolveError::Break(_) => None,
         })
         .collect()
@@ -1300,7 +1317,7 @@ pub fn resolve_all(expr: &mut Expr) -> Vec<ResolveError> {
     // the same "which `$x` actually failed" question `var_scope` can't
     // answer by itself, resolved here by counting as we go (see
     // `UnresolvedLabel::occurrence`).
-    let mut break_occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    let mut break_occurrences: BTreeMap<(Option<u32>, String), usize> = BTreeMap::new();
     let mut errors = Vec::new();
     let mut occurrences = BTreeMap::new();
     check(
@@ -1365,6 +1382,32 @@ fn in_var_scope(var_scope: &VarScope, name: &str) -> ScanResult<()> {
     scan_scope(var_scope, String::as_str, |n| (n == name).then_some(()))
 }
 
+/// Whether `$*label-name` resolves against `label_scope`, innermost first,
+/// stopping at the same module-scope floor as [`in_var_scope`] —
+/// [`in_var_scope`]'s sibling for labels (#2964), sharing the same
+/// `scan_scope` this file's other two lookups go through rather than a
+/// hand-rolled linear scan.
+fn in_label_scope(label_scope: &LabelScope, name: &str) -> ScanResult<()> {
+    scan_scope(label_scope, String::as_str, |n| (n == name).then_some(()))
+}
+
+/// The innermost module run enclosing this point in `label_scope`,
+/// regardless of whether any particular label name matches.
+///
+/// [`in_label_scope`]'s `run` field is a [`ScanResult`] contract detail:
+/// meaningful only on a miss, because the scan stops as soon as it finds a
+/// hit. That is enough to attribute an *unresolved* break to its module, but
+/// [`UnresolvedLabel::occurrence`]'s counter needs a run id for every
+/// visited break, bound or not, so same-named breaks in different files
+/// don't share one counter and drift each other's occurrence index. This is
+/// the same [`scan_scope`] walk with a probe that never matches, so it
+/// always runs to the floor (or the top) instead of stopping early.
+fn enclosing_run(label_scope: &LabelScope) -> Option<u32> {
+    scan_scope(label_scope, String::as_str, |_| None::<()>)
+        .run
+        .map(|(id, _)| id)
+}
+
 /// A pattern's computed keys (`{(EXPR): P}`, #2677) are ordinary
 /// sub-expressions, evaluated in the scope the pattern itself sits in —
 /// *before* any of its own names are bound — so they need the same
@@ -1401,7 +1444,7 @@ fn check_pattern_keys(
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
-    break_occurrences: &mut BTreeMap<String, usize>,
+    break_occurrences: &mut BTreeMap<(Option<u32>, String), usize>,
 ) {
     match pattern {
         Pattern::Var(_) => {}
@@ -1463,7 +1506,7 @@ fn bind_patterns(
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
-    break_occurrences: &mut BTreeMap<String, usize>,
+    break_occurrences: &mut BTreeMap<(Option<u32>, String), usize>,
 ) -> Vec<String> {
     for pattern in patterns.iter_mut() {
         check_pattern_keys(
@@ -1630,7 +1673,7 @@ fn check(
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
-    break_occurrences: &mut BTreeMap<String, usize>,
+    break_occurrences: &mut BTreeMap<(Option<u32>, String), usize>,
 ) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
@@ -1718,14 +1761,25 @@ fn check(
         // records the site unconditionally regardless of the `error` wrap.
         //
         // `break_occurrences` carries *which* same-named break site this
-        // one is — the #2635-class limitation: a break inside an
-        // unreachable `def` body that textually precedes the failing one
-        // shifts the CLI's caret target by one (see the `UnresolvedLabel`
-        // doc comment and the `BreakSite` doc comment for the full
-        // accounting), the exact same class `CallSite`/`VarSite` already
-        // record for calls/variables.
+        // one is, keyed by `(origin, name)` so a label repeated across
+        // module boundaries doesn't have one file's breaks consume
+        // another's slots -- the #2635-class limitation remains within a
+        // single origin: a break inside an unreachable `def` body that
+        // textually precedes the failing one, in the same file, shifts the
+        // CLI's caret target by one (see the `UnresolvedLabel` doc comment
+        // and the `BreakSite` doc comment for the full accounting), the
+        // exact same class `CallSite`/`VarSite` already record for
+        // calls/variables.
         Expr::Break(name) => {
-            let n = break_occurrences.entry(name.clone()).or_insert(0);
+            // `enclosing_run` regardless of whether this break resolves --
+            // both a bound and an unbound break consume a slot in their own
+            // origin's counter, mirroring how every break (bound or not)
+            // occupies a slot in that origin's own `collect_break_sites`
+            // table.
+            let origin = enclosing_run(label_scope);
+            let n = break_occurrences
+                .entry((origin, name.clone()))
+                .or_insert(0);
             let occurrence = *n;
             *n += 1;
             // Label scope is determined at the break's *own* lexical
@@ -1733,10 +1787,11 @@ fn check(
             // body, not siblings of that body. `label_scope` is a stack
             // pushed/popped by the `Label` arm below, so this check sees
             // only genuinely enclosing labels.
-            if !label_scope.iter().rev().any(|l| l == name) {
+            if in_label_scope(label_scope, name).hit.is_none() {
                 errors.push(ResolveError::Break(UnresolvedLabel {
                     name: name.clone(),
                     occurrence,
+                    origin,
                 }));
             }
         }
@@ -1944,13 +1999,22 @@ fn check(
 
             // A run marker floors variables as well as functions (#2962), so
             // it goes on the variable stack too -- for `then` only, since a
-            // marker's own body is `.`.
+            // marker's own body is `.`. #2964: labels get the same floor, for
+            // the same reason -- a `label $x` above an `import`/`include`
+            // must not leak into the module's own `break`s, and a break
+            // inside the module must be attributable back to it (see
+            // `enclosing_run`), neither of which works unless the marker is
+            // visible on `label_scope` too.
             let is_marker = ModuleRun::parse(name).is_some();
             if is_marker {
                 var_scope.push(name.clone());
+                label_scope.push(name.clone());
             }
             check(then, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(var_outer);
+            if is_marker {
+                label_scope.pop();
+            }
             scope.truncate(outer);
         }
 
@@ -1987,48 +2051,44 @@ fn check(
         // `reduce .[] as $x (0; . + $x)` evaluates `init` before any element
         // has been bound. Same union-of-alternatives and computed-key
         // treatment as `Expr::AsPattern` above.
+        //
+        // `init` is checked *before* the pattern's own computed keys here,
+        // even though the pattern is written first
+        // (`reduce EXPR as PATTERN (INIT; UPDATE)`) -- confirmed live this
+        // is not merely an implementation quirk but matches real jq's own
+        // diagnostic order for this construct: `reduce (1,2) as {($x): $v}
+        // ($x; .)` reports `init`'s `$x` (column 29) *before* the pattern
+        // key's `$x` (column 19), i.e. jq's own compiler visits `init`
+        // before the pattern too. A same-named `$var`/`break $x` split
+        // across a computed pattern key and `init` still has its *position*
+        // misattributed against `collect_var_sites`/`collect_break_sites`
+        // (both sorted by pure text offset, so the earlier-in-text pattern
+        // key occupies the table slot init's occurrence index expects) --
+        // an instance of the same #2635-class residual already documented
+        // for the unrelated unreferenced-`def`-body shape, not a new,
+        // independently fixable ordering bug: swapping this visit order to
+        // fix the position match was tried and reverted, since it fixes the
+        // *position* only by making the *order* of the two diagnostics
+        // wrong relative to jq instead.
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
         } => {
-            // #2635 review: `patterns` (its own computed keys) is checked
-            // before `init`, matching source-*text* order -- `SOURCE as
-            // PATTERN (INIT; UPDATE)` writes the pattern before the
-            // parenthesized part, and `collect_call_sites`' table is sorted
-            // by byte offset, purely textual. `occurrence_index` needs this
-            // order specifically for a name repeated across these
-            // positions to land on the right table entry -- it does not
-            // change which var_scope `init` sees (`bind_patterns` only
-            // *checks* `patterns`'s own computed keys here; the names it
-            // returns are not folded into `var_scope` until the explicit
-            // `extend` below).
-            //
-            // Confirmed live this does not make multi-error *reporting*
-            // order match jq exactly: real jq 1.7.1 prints a bare `init`
-            // error before a `patterns` one (`h | reduce empty as {(h): $x}
-            // (h; h)` split across lines reports line 4 before line 3),
-            // its own compile-order artifact unrelated to text position --
-            // an existing, orthogonal divergence class (`resolve_all`'s own
-            // doc comment already notes reporting order is source-order-ish,
-            // not full jq-compile-order fidelity) this reordering does not
-            // newly introduce, since #2635's own scope is per-occurrence
-            // line *correctness*, not inter-error print order. Every
-            // individual citation still lands on its own correct line
-            // either way (confirmed against the same live example).
             check(input, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             let outer = var_scope.len();
             let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
-            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.extend(bound);
             check(update, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.truncate(outer);
         }
 
         // #2734: same rule as `Expr::Reduce` above -- `init` sees no bound
-        // vars, `update`/`extract` both do. #2635 review: same patterns-
-        // before-init reordering, same reasoning.
+        // vars, `update`/`extract` both do. Visit-order rationale (`init`
+        // before the pattern, matching jq's own diagnostic order) is the
+        // same as `Expr::Reduce`'s own doc comment above.
         Expr::Foreach {
             input,
             patterns,
@@ -2037,9 +2097,9 @@ fn check(
             extract,
         } => {
             check(input, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
+            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             let outer = var_scope.len();
             let bound = bind_patterns(patterns, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
-            check(init, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             var_scope.extend(bound);
             check(update, scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
             check_opt(extract.as_deref_mut(), scope, var_scope, label_scope, errors, reachable, occurrences, break_occurrences);
@@ -2152,13 +2212,17 @@ fn check(
                     // `$*label-x is not defined`, rc=3 (confirmed live).
                     // Check BEFORE discarding.
                     if let Expr::Break(ref name) = *fallback {
-                        let n = break_occurrences.entry(name.clone()).or_insert(0);
+                        let origin = enclosing_run(label_scope);
+                        let n = break_occurrences
+                            .entry((origin, name.clone()))
+                            .or_insert(0);
                         let occurrence = *n;
                         *n += 1;
-                        if !label_scope.iter().rev().any(|l| l == name) {
+                        if in_label_scope(label_scope, name).hit.is_none() {
                             errors.push(ResolveError::Break(UnresolvedLabel {
                                 name: name.clone(),
                                 occurrence,
+                                origin,
                             }));
                         }
                     }
@@ -2384,7 +2448,7 @@ fn check_opt(
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
     occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
-    break_occurrences: &mut BTreeMap<String, usize>,
+    break_occurrences: &mut BTreeMap<(Option<u32>, String), usize>,
 ) {
     if let Some(e) = expr {
         check(

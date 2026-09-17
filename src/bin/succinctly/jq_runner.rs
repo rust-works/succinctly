@@ -2370,6 +2370,38 @@ fn report_unbound_var(
     }
 }
 
+/// Report one out-of-scope `break $name` against `source` (the main filter,
+/// or a module's own text), at its `occurrence`-th recorded site --
+/// [`report_unbound_var`]'s sibling for labels (#2964).
+///
+/// Unlike `report_unbound_var`'s `taken`, `occurrence` is not a counter this
+/// function advances: `resolve::check` already counted it while walking the
+/// tree, scoped to this exact `(origin, name)` pair (`UnresolvedLabel`'s own
+/// doc comment), so a single lookup is enough -- there is no second call for
+/// the same name that needs to remember where the first one left off.
+fn report_unresolved_label(
+    name: &str,
+    location: &str,
+    source: &str,
+    break_sites: &[jq::BreakSite],
+    occurrence: usize,
+) {
+    let site = break_sites
+        .iter()
+        .filter(|b| b.name == name)
+        .nth(occurrence);
+    match site {
+        Some(site) => {
+            let (line_no, line_text, column) = line_at_offset(source, site.offset);
+            eprintln!("jq: error: $*label-{name} is not defined at {location}, line {line_no}:");
+            eprintln!("{line_text}{}", " ".repeat(column));
+        }
+        None => {
+            eprintln!("jq: error: $*label-{name} is not defined at {location}");
+        }
+    }
+}
+
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
@@ -2398,6 +2430,12 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     let mut module_var_diagnostics: HashMap<u32, Option<(String, Vec<jq::VarSite>)>> =
         HashMap::new();
     let mut module_vars_consumed: HashMap<(u32, &str), usize> = HashMap::new();
+    // The label counterpart of `module_var_diagnostics` (#2964): a break
+    // inside a module body needs that module's own text and its own
+    // break-site table, the same route `Call`/`Var` already take, keyed by
+    // `origin` rather than `filter`'s own top-level table below.
+    let mut module_break_diagnostics: HashMap<u32, Option<(String, Vec<jq::BreakSite>)>> =
+        HashMap::new();
 
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
@@ -2406,13 +2444,16 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // #2734: the same, for `$name` variable references -- see
     // `jq::collect_var_sites`.
     let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
-    // #2964: the same, for `break $name` sites -- see
-    // `jq::collect_break_sites`. Unlike calls/variables, which the resolver
-    // revisits through the same "how many of each name seen so far" logic
-    // this table's `nth` indexes with, a break's *occurrence* is carried in
-    // the diagnostic itself (`UnresolvedLabel.occurrence`) -- the resolver
-    // counts each same-named break it visits, and that count is the table
-    // index, so no separate consuming cursor is needed here.
+    // #2964: the same, for `break $name` sites written directly in `filter`
+    // -- see `jq::collect_break_sites`. A module-body break uses
+    // `module_break_diagnostics` instead, built lazily from that module's
+    // own source. Unlike calls/variables, which the resolver revisits
+    // through the same "how many of each name seen so far" logic this
+    // table's `nth` indexes with, a break's *occurrence* is carried in the
+    // diagnostic itself (`UnresolvedLabel::occurrence`) -- the resolver
+    // counts each same-named break it visits *within that diagnostic's own
+    // `origin`*, and that count is the table index, so no separate
+    // consuming cursor is needed here.
     let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
     // How many variables of each name we have already reported, so a
     // repeated undefined `$name` walks its own successive sites in source
@@ -2549,32 +2590,46 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
                 report_unbound_var(name, "<top-level>", filter, &var_sites, taken);
             }
-            jq::ResolveError::Break(jq::UnresolvedLabel { name, occurrence }) => {
-                // #2964: prefer the real `break $name` keyword position from
-                // `break_sites` -- the resolver walked the *reachable* tree,
-                // so `occurrence` counts same-named breaks the walk actually
-                // visited. That index aligns with `break_sites`' source order
-                // because both start at the top-level parse and neither
-                // re-sorts (a break earlier in the table is always visited
-                // first) -- except for one recorded, #2635-class residual:
-                // a same-named break inside an *unreferenced* `def` body
-                // occupies the earlier table slot but is never visited, so
-                // the caret cites the wrong occurrence (see the
-                // `UnresolvedLabel` doc comment).
-                let from_table = break_sites
-                    .iter()
-                    .filter(|b| b.name == *name)
-                    .nth(*occurrence)
-                    .map(|b| b.offset);
-                if let Some(offset) = from_table {
-                    let (line_no, line_text, column) = line_at_offset(filter, offset);
-                    eprintln!(
-                        "jq: error: $*label-{name} is not defined at <top-level>, line {line_no}:"
-                    );
-                    eprintln!("{line_text}{}", " ".repeat(column));
-                } else {
-                    eprintln!("jq: error: $*label-{name} is not defined at <top-level>");
+            jq::ResolveError::Break(jq::UnresolvedLabel {
+                name,
+                occurrence,
+                origin,
+            }) => {
+                // #2964: a break inside a module body is reported against
+                // that module's own file, the same route `Call`/`Var` take
+                // above -- `occurrence` was counted scoped to this exact
+                // `origin` (see `UnresolvedLabel`'s own doc comment), so it
+                // indexes straight into that module's own break-site table
+                // with no separate resume counter needed.
+                if let Some(id) = origin {
+                    let at = loader
+                        .run_origin(*id)
+                        .map_or_else(|| "<module>".to_string(), ToString::to_string);
+                    let cached = module_break_diagnostics.entry(*id).or_insert_with(|| {
+                        std::fs::read_to_string(&at).ok().map(|source| {
+                            let sites = jq::collect_break_sites(&source, jq::ParserMode::Jq, true);
+                            (source, sites)
+                        })
+                    });
+                    match cached {
+                        Some((source, break_sites)) => {
+                            report_unresolved_label(name, &at, source, break_sites, *occurrence);
+                        }
+                        None => {
+                            eprintln!("jq: error: $*label-{name} is not defined at {at}");
+                        }
+                    }
+                    continue;
                 }
+                // #2964: the real `break` keyword position from
+                // `break_sites`, not a text search -- see
+                // `jq::BreakSite`'s own doc comment for the one class of
+                // ambiguity this still can't resolve (a same-named break
+                // inside an unreferenced `def` body that textually precedes
+                // the failing one), the same known limitation
+                // `jq::CallSite`/`jq::VarSite` have for calls/variables
+                // (#2635).
+                report_unresolved_label(name, "<top-level>", filter, &break_sites, *occurrence);
             }
         }
     }
