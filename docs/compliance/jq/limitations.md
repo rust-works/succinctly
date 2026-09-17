@@ -1061,7 +1061,8 @@ is the revert that established what the other one costs.
    output it emits, so `path(foreach .a as {a:$v} ?// $v (.c; .; empty))` exited 0 where jq
    refuses partway through the construct, and `del`/`=`/`\|=` wrote through it.
 
-   Three refusals remain where jq might answer, all deliberate: the resolver's *own* refusals
+   Two refusals remain where jq might answer, and one refuses with different wording, all
+   deliberate: the resolver's *own* refusals
    never retry (a nested pipe carries no register, so `$q[0]` inside an `if` refuses here
    where jq navigates, and retrying on that artefact would bind a different alternative than
    jq and write through it), and a walk refusal retries only when it is jq's own verdict.
@@ -1073,10 +1074,11 @@ is the revert that established what the other one costs.
 
    The third is the same "resolver's own refusal never retries" rule landing on a bare
    `$var` alternative instead of a destructuring one: `path(foreach (1) as $x ?// [$z]
-   (null; .; $x))` refuses here on `$x`'s own untrackable-navigation error (`$x` is bound to
-   a SOURCE value that is not itself register-derived — here a literal, not navigation), where
-   live jq 1.7.1 retries into `[$z]`'s own destructuring failure against the same value
-   ("near attempt to access element 0 of 1"). Confirmed narrow: with a realistic
+   (null; .; $x))` refuses here on `$x`'s own refusal ("with result 1"; `$x` is bound to a
+   SOURCE value that is not itself register-derived — here a literal, not navigation), where
+   live jq 1.7.1 retries into `[$z]`'s own destructuring failure against the same value and
+   refuses there ("near attempt to access element 0 of 1"): both exit 5, and only the wording
+   differs. Confirmed narrow: with a realistic
    `.`-navigated source both agree (`path(foreach .a as $x ?// [$z] (null; .; $x))` on
    `{"a":1}` is `["a"]` in both) — the divergence needs a SOURCE that is genuinely not
    navigation-derived at all. Loosening `is_resolver_refusal`'s retry-suppression to special
