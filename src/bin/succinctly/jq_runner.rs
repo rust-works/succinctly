@@ -3308,16 +3308,13 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // the whole stream into one value, so there is no document
                 // position to name. A non-slurped stream keeps its clean prefix
                 // and reports its parse error after it instead (#2961).
-                Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
-                    Ok(malformed) => {
-                        let err = malformed.to_eval_error();
-                        let files = get_input_files(&args);
-                        let file = files.first().map(|p| p.to_string_lossy().to_string());
-                        sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
-                        return Ok(DiagStyle::Jq.error_exit_code());
-                    }
-                    Err(e) => return Err(e),
-                },
+                Ok(Err(e)) => {
+                    let err = e.downcast::<MalformedJsonError>()?.to_eval_error();
+                    let files = get_input_files(&args);
+                    let file = files.first().map(|p| p.to_string_lossy().to_string());
+                    sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
                 Err(exit_code) => return Ok(exit_code), // Validation error
             };
         // `input_filename`'s names for this route's source tags (#3046). Stdin
