@@ -44743,7 +44743,7 @@ fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
             r#"["string (\"z\") number required"]"#,
         ),
         (
-            r#"[try (1 | pow10) catch .]"#,
+            "[try (1 | pow10) catch .]",
             r#"["Error: pow10/0 not found at build time"]"#,
         ),
     ] {

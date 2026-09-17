@@ -1191,12 +1191,12 @@ pub enum FormatType {
 }
 
 /// The unary libm builtins jq exposes beyond the trigonometric/exponential
-/// core (#3042). One `Builtin::Libm1` variant carries the whole family so
-/// that adding a function is a row here and a match arm in the evaluator,
-/// not a new variant threaded through the parser, three walker lists, the
-/// path-rule table and the dispatcher.
+/// core (#3042).
 ///
-/// `.` is the operand; every function is `number -> number` except
+/// One `Builtin::Libm1` variant carries the whole family so that adding a
+/// function is a row here and a match arm in the evaluator, not a new
+/// variant threaded through the parser, three walker lists, the path-rule
+/// table and the dispatcher. `.` is the operand; every function is `number -> number` except
 /// `frexp`/`modf`/`lgamma_r`, which answer a two-element array, and `pow10`,
 /// which is a runtime error in every jq 1.7.1 build (`pow10/0 not found at
 /// build time`) because no platform libm still exports it.
@@ -1258,10 +1258,11 @@ impl Libm1 {
     }
 }
 
-/// The two-argument libm builtins (#3042): `f(a; b)`, where `.` is ignored
-/// and both arguments are generator arguments nested rightmost-outermost, as
-/// for every C-implemented jq builtin (`[ldexp((1,2);(3,4))]` is
-/// `[8,16,16,32]`, captured live).
+/// The two-argument libm builtins (#3042): `f(a; b)`.
+///
+/// `.` is ignored and both arguments are generator arguments nested
+/// rightmost-outermost, as for every C-implemented jq builtin
+/// (`[ldexp((1,2);(3,4))]` is `[8,16,16,32]`, captured live).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Libm2 {
     Copysign,

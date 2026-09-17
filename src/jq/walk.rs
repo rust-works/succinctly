@@ -585,9 +585,9 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::SetPath(a, b) => Builtin::SetPath(Box::new(f(a)), Box::new(f(b))),
         Builtin::Pow(a, b) => Builtin::Pow(Box::new(f(a)), Box::new(f(b))),
         Builtin::Atan2(a, b) => Builtin::Atan2(Box::new(f(a)), Box::new(f(b))),
-        Builtin::Libm2(g, a, b) => Builtin::Libm2(*g, Box::new(f(a)), Box::new(f(b))),
-        Builtin::Libm3(g, a, b, c) => {
-            Builtin::Libm3(*g, Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
+        Builtin::Libm2(func, a, b) => Builtin::Libm2(*func, Box::new(f(a)), Box::new(f(b))),
+        Builtin::Libm3(func, a, b, c) => {
+            Builtin::Libm3(*func, Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
         }
         Builtin::Limit(a, b) => Builtin::Limit(Box::new(f(a)), Box::new(f(b))),
         Builtin::NthStream(a, b) => Builtin::NthStream(Box::new(f(a)), Box::new(f(b))),
