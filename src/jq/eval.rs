@@ -96385,6 +96385,25 @@ mod tests {
             "[path(5 | 5 as {a: $v} ?// $v | empty)]",
             Err("Invalid path expression near attempt to access element \"a\" of 5"),
         ),
+        // third refuse-only case (review): a bare-`$var` alternative bound
+        // to a SOURCE value that is itself not register-derived (here a
+        // literal, not navigation) refuses on its own `$x` reference rather
+        // than retrying into `[$z]`. Live jq 1.7.1 retries here, naming
+        // `[$z]`'s own destructuring failure ("near attempt to access
+        // element 0 of 1") -- but only for this exact non-navigated-source
+        // shape: with a realistic `.`-navigated source both agree
+        // (`path(foreach .a as $x ?// [$z] (null; .; $x))` on `{"a":1}` is
+        // `["a"]` in both). `is_resolver_refusal` treats a bare-var's own
+        // untrackable-navigation error the same as a walk-step artefact
+        // (limitations.md's already-documented `$q[0]`-inside-`if` case, an
+        // UPDATE/EXTRACT-body refusal that correctly does not retry) and
+        // that rule is what stands here too, rather than special-casing
+        // this one shape and risking that documented case regressing.
+        (
+            "null",
+            "[path(foreach (1) as $x ?// [$z] (null; .; $x))]",
+            Err("Invalid path expression with result 1"),
+        ),
         ];
 
         for (doc, filter, want) in rows {
