@@ -47965,6 +47965,9 @@ fn test_yq_floor_keeps_int64_cast_and_stops_saturating_2937() -> Result<()> {
         )?;
         assert_eq!(code, 0, "`{filter}`");
         assert_eq!(output.trim(), "9223372036854775807", "`{filter}`");
+    }
+    Ok(())
+}
 
 /// #2658: `any(cond)`/`all(cond)`, `isvalid` and `until`/`while` over an
 /// alias fan-out complete -- the five spellings #2476/#2968 left on the
