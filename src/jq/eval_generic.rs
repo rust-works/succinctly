@@ -218,13 +218,13 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// A document number's double under `S`'s number model, for the
 /// cursor-level reads in this evaluator that never build an `OwnedValue`
 /// (#2936): the `DocumentValue` twin of `eval.rs`'s `json_number_f64`. The
-/// literal text comes from `number_literal()` (a preservable spelling, both
-/// formats), so a lenient span or a bridge token takes the plain `as_f64()`
-/// exactly as before.
+/// text comes from `number_text()` (the raw span, so a lenient spelling the
+/// funnels do not preserve is still rounded the way jq reads it); a bridge
+/// token or a decNumber word takes the plain `as_f64()` exactly as before.
 fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) -> Option<f64> {
-    match value.number_literal() {
-        Some(literal) => {
-            crate::jq::value::document_number_f64::<S>(literal.as_bytes(), || value.as_f64())
+    match value.number_text() {
+        Some(text) => {
+            crate::jq::value::document_number_f64::<S>(text.as_bytes(), || value.as_f64())
         }
         None => value.as_f64(),
     }
@@ -316,12 +316,15 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         Ok(OwnedValue::from_number_literal::<S>(&literal))
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
-    } else if let Some(f) = value.as_f64() {
+    } else if let Some(f) = document_number_f64_generic::<S, V>(value) {
         // #2438: a document scalar that got this far has no preservable
         // literal left (`number_literal()` answered `None` just above), so
         // this is the boundary where its provenance is still known -- see
         // `OwnedValue::from_document_float`. For JSON input this is reached
-        // only by a lenient span `number_literal()` declines (#966).
+        // only by a lenient span `number_literal()` declines (#966) -- and
+        // jq still reads that span's decimal through its 17-digit rounding
+        // (#2936), which is why the double comes from the mode-aware
+        // accessor rather than the plain `as_f64()`.
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
@@ -565,12 +568,15 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         Ok(OwnedValue::from_number_literal::<S>(&literal))
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
-    } else if let Some(f) = value.as_f64() {
+    } else if let Some(f) = document_number_f64_generic::<S, V>(value) {
         // #2438: a document scalar that got this far has no preservable
         // literal left (`number_literal()` answered `None` just above), so
         // this is the boundary where its provenance is still known -- see
         // `OwnedValue::from_document_float`. For JSON input this is reached
-        // only by a lenient span `number_literal()` declines (#966).
+        // only by a lenient span `number_literal()` declines (#966) -- and
+        // jq still reads that span's decimal through its 17-digit rounding
+        // (#2936), which is why the double comes from the mode-aware
+        // accessor rather than the plain `as_f64()`.
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
@@ -21761,10 +21767,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(OwnedValue::from_number_literal::<S>(&literal))
             } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
-            } else if let Some(f) = value.as_f64() {
+            } else if let Some(f) = document_number_f64_generic::<S, V>(&value) {
                 // #2438: still the document's own value, so it carries the
                 // same provenance the `number_literal()` arm above preserves
-                // -- see `OwnedValue::from_document_float`.
+                // -- see `OwnedValue::from_document_float`; the double is
+                // the mode's (#2936), as in `to_owned_at_depth`.
                 GenericResult::Owned(OwnedValue::from_document_float(f))
             } else if let Some(s) = value.as_str() {
                 match tonumber_from_str(s.as_ref(), S::TAG == EvalTag::Yq) {

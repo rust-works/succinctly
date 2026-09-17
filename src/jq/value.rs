@@ -189,16 +189,19 @@ pub(crate) fn parse_i64_or_f64_in<S: EvalSemantics>(s: &str) -> Option<NumberRep
 ///
 /// The cursor-level builtins (`length`, `isnan`/`isinfinite`/`isnormal`,
 /// `normals`/`finites`, `strftime`'s timestamp, `implode`'s codepoints and
-/// every libm function through `get_float_value`) read a number's value
-/// without ever building an `OwnedValue`, so
+/// every libm function through `get_float_value`) and the generic
+/// materializer's lenient-span fallback read a number's value without ever
+/// building an `OwnedValue`, so
 /// [`OwnedValue::from_number_bytes`]'s mode-aware parse never runs for them.
-/// This is their one accessor: when `bytes` spell a literal (valid RFC 8259
-/// or one of the lenient spellings the funnels preserve, a leading `+`
-/// peeled), jq mode rounds it to 17 significant digits like every other
-/// entry point; anything else -- a bridge token, a decNumber word, a
-/// malformed span -- falls through to `fallback`, the caller's own
-/// mode-less read (`JsonNumber::as_f64`, `V::as_f64`). yq mode always
-/// takes the fallback, which is Go's correctly-rounded parse already.
+/// This is their one accessor: in jq mode, whatever `bytes` spell that
+/// [`jq_literal_text_to_f64`] reads as a decimal -- RFC 8259, the lenient
+/// spellings the funnels preserve, and the ones they do not (a bare
+/// trailing dot, rule 4c's `14455058590201385605.`, which jq still rounds
+/// like any other literal) -- is rounded to 17 significant digits like
+/// every other entry point; anything else -- a bridge token, a decNumber
+/// word, a malformed span -- falls through to `fallback`, the caller's own
+/// mode-less read (`JsonNumber::as_f64`, `V::as_f64`). yq mode always takes
+/// the fallback, which is Go's correctly-rounded parse already.
 ///
 /// #2937 needs the same site set for its `Int` widening; add that arm here
 /// rather than at each caller.
@@ -207,14 +210,11 @@ pub(crate) fn document_number_f64<S: EvalSemantics>(
     fallback: impl FnOnce() -> Option<f64>,
 ) -> Option<f64> {
     if S::DECNUMBER_LITERALS {
-        let literal = crate::json::validate::strip_leading_plus(bytes).unwrap_or(bytes);
-        if crate::json::validate::is_preservable_number_literal(literal) {
-            if let Some(f) = core::str::from_utf8(literal)
-                .ok()
-                .and_then(jq_literal_text_to_f64)
-            {
-                return Some(f);
-            }
+        if let Some(f) = core::str::from_utf8(bytes)
+            .ok()
+            .and_then(jq_literal_text_to_f64)
+        {
+            return Some(f);
         }
     }
     fallback()

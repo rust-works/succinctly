@@ -16026,11 +16026,17 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
         return Ok(OwnedValue::Float(f));
     }
-    if let Ok(i) = trimmed.parse::<i64>() {
-        return Ok(OwnedValue::Int(i));
-    }
-    if let Ok(f) = trimmed.parse::<f64>() {
-        return Ok(OwnedValue::Float(f));
+    // The lenient spellings jq's decNumber reader accepts and this crate
+    // does not keep as a literal (`007`, `5.`, `1.e0`, and a `+` before any
+    // of them): a plain `Int`/`Float`, read under jq's number model
+    // (#2936) -- `"14455058590201385605." | tonumber + 0` is
+    // `14455058590201387000` in jq, the same 17-digit rounding a document
+    // number gets, where Rust's own parse gave `…385000`.
+    if let Some(repr) = super::value::parse_i64_or_f64_in::<JqSemantics>(trimmed) {
+        return Ok(match repr {
+            NumberRepr::Int(i) => OwnedValue::Int(i),
+            NumberRepr::Float(f) => OwnedValue::Float(f),
+        });
     }
     // The probe below is jq's question, and jq's alone. It distinguishes
     // "valid JSON but not a number" from "not valid JSON at all" purely to

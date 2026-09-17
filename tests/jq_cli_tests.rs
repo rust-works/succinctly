@@ -58819,6 +58819,26 @@ fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
             "\"[2.7293109604053567083]\" | fromjson | .[0] + 0",
             "2.7293109604053565",
         ),
+        // the lenient spellings jq's reader accepts and the funnels do not
+        // preserve (rule 4c's bare trailing dot, a redundant leading zero, a
+        // leading `+`) round the same way, through `tonumber` and from a
+        // document on the CLI's own route (second /code-review round)
+        (
+            "\"14455058590201385605.\" | tonumber + 0",
+            "14455058590201387000",
+        ),
+        (
+            "\"014455058590201385605\" | tonumber + 0",
+            "14455058590201387000",
+        ),
+        (
+            "\"+14455058590201385605.e0\" | tonumber + 0",
+            "14455058590201387000",
+        ),
+        (
+            "[14455058590201385605., 014455058590201385605] | map(. + 0)",
+            "[14455058590201387000,14455058590201387000]",
+        ),
     ] {
         let (out, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
