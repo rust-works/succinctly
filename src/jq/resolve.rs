@@ -97,9 +97,9 @@ pub struct UnresolvedCall {
     /// [`ModuleRun`]), whereas this is a diagnostic payload built only when
     /// a call actually fails to resolve.
     pub origin: Option<u32>,
-    /// How many earlier calls to this exact `(name, arity)` pair -- resolved
-    /// *or* unresolved -- [`check`] had already visited, in source order,
-    /// before this one (#2635).
+    /// How many earlier calls to this exact `(name, arity)` pair, in the
+    /// same `origin` scope -- resolved *or* unresolved -- the resolver had
+    /// already visited, in source order, before this one (#2635).
     ///
     /// `jq::CallSite` (`parser.rs`) records every generic call's own source
     /// position, in the same order, regardless of whether it later resolves
