@@ -15082,6 +15082,28 @@ fn format_csv_row_element<S: EvalSemantics>(
     match v {
         OwnedValue::String(s) => Ok(quote_string(s)),
         OwnedValue::Null => Ok(String::new()),
+        // #3070: in jq mode, a NaN element renders as an empty field, not
+        // the word "null" every other format (`@sh`/`@html`/`@text`/
+        // `@json`/`tostring`) gives it -- confirmed live against jq 1.7.1
+        // (`[nan] | @csv` is an empty line, `[nan,1] | @csv` is `,1`). Real
+        // jq's own `f_format` (`src/builtin.c`) only reaches its
+        // `jv_dump_string`-produces-"null" branch for a value that *isn't*
+        // a valid number; a NaN is still `JV_KIND_NUMBER` there, so it
+        // instead falls into the numeric branch's own `isnan` check, which
+        // writes nothing. Infinities stay on the generic path below
+        // (`owned_to_string`) since they format as their finite `f64::MAX`
+        // spelling, matching jq (confirmed live: `[infinite] | @csv`
+        // agrees). yq mode is deliberately excluded: its own `.nan`/`.inf`
+        // YAML spelling for `@csv` (#1060, `numeric_display_string`) is
+        // already correct and has no jq oracle to override it with --
+        // `test_yq_at_csv_special_floats_use_yaml_spelling_1060` caught an
+        // earlier, unconditional version of this arm regressing it.
+        OwnedValue::Float(f) if S::TAG != EvalTag::Yq && f.is_nan() => Ok(String::new()),
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+            if S::TAG != EvalTag::Yq && f.is_nan() =>
+        {
+            Ok(String::new())
+        }
         OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::not_valid_in_csv_row(v)),
         other => Ok(owned_to_string::<S>(other)),
     }
@@ -72787,6 +72809,37 @@ mod tests {
         query!(br#"["a", "b,c", 1, true, null]"#, "@csv",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, r#""a","b,c",1,true,"#);
+            }
+        );
+    }
+
+    /// #3070: a NaN element renders as an empty field, not the word `null`
+    /// every other format (`@sh`/`@html`/`@text`/`@json`/`tostring`) gives
+    /// it -- confirmed live against jq 1.7.1 (`[nan] | @csv` is an empty
+    /// line, `[nan,1] | @csv` is `,1`). Infinity is unaffected: it stays on
+    /// the generic numeric path, formatting as its finite `f64::MAX`
+    /// spelling (also confirmed live).
+    #[test]
+    fn test_format_csv_tsv_nan_element_is_empty_field_3070() {
+        query!(b"null", "[nan] | @csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "");
+            }
+        );
+        query!(b"null", "[nan,1] | @csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, ",1");
+            }
+        );
+        query!(b"null", "[1,nan] | @tsv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1\t");
+            }
+        );
+        // Infinity is unaffected -- stays on the generic numeric path.
+        query!(b"null", "[infinite] | @csv",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1.7976931348623157e+308");
             }
         );
     }
