@@ -96395,7 +96395,7 @@ mod tests {
             match want {
                 Ok(want) => {
                     let got: Vec<String> = got
-                        .collect_owned()
+                        .collect_owned::<JqSemantics>()
                         .iter()
                         .map(OwnedValue::to_json)
                         .collect();
