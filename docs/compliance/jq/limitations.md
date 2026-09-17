@@ -3224,15 +3224,21 @@ depends on no other admitted shape emitting a value and then raising, and `reduc
 means reasoning about something other than their own operands.
 
 What survives is irreducible by any gate: `.[(0,1)] = 0` genuinely needs both documents.
-jq pays nothing for the same separation because its values are refcounted; closing that
-last gap here needs structural sharing in `OwnedValue`, not a better gate. That is
-[#2999](https://github.com/rust-works/succinctly/issues/2999)'s work, and this paragraph
-tracks there rather than on #2976, which is done.
-[#3000](https://github.com/rust-works/succinctly/issues/3000) took the first step without
-any sharing at all: `OwnedValue` went from 72 bytes to 32, so *both* documents above are
-smaller, but there are still two of them, and the gap between them did not close — it is
-+37% on the M4 Pro and +30% on the 7950X now, against +26% and +39% before. Only sharing
-removes the second document.
+jq pays nothing for the same separation because its values are refcounted, and since
+[#2999](https://github.com/rust-works/succinctly/issues/2999) (ADR-0024) so does
+succinctly: `OwnedValue`'s containers are `Rc`-backed and copied on write, so the second
+document is a refcount bump and the write copies only the containers it goes through.
+[#3000](https://github.com/rust-works/succinctly/issues/3000) had first taken `OwnedValue`
+from 72 bytes to 32 without any sharing, which made both documents smaller but left two of
+them. What sharing leaves is the *spine*: for an array of scalars the spine is the whole
+array (a scalar has no sharing granularity, and a number keeps its own boxed spelling), so
+the 200,000-int repro still pays one copy of it — 70.1 MB → 60.2 MB on the M4 Pro and
+66.0 MB → 54.5 MB on the 7950X, against 46.9 MB and 43.1 MB for `.[$k] = 0`, a gap of
++28% and +26% where #3000 left +31% and +29%. For an array of *containers* the spine is
+the array of handles and the gap closes: `.[(0,1)] = 0` on 10 MB of three-key objects went
+from 879 MB to 544 MB on the M4 Pro (−38%) and 984 MB to 596 MB on the 7950X (−39%),
+against 543 MB and 518 MB for the single-path `.[0].a = 1`. Sharing the scalars' strings
+too (ADR-0024's option D) is what would close the rest.
 
 What #2974 costs, measured on generated `users` documents (release, `cgu1+fat`, seven
 interleaved repetitions of each binary, median wall time and maximum peak RSS, outputs
