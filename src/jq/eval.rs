@@ -52485,7 +52485,7 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let owned = to_owned_lossy(&value);
     let sorts_below_zero = match &owned {
         OwnedValue::Null | OwnedValue::Bool(_) => true,
-        OwnedValue::Int(n) => *n < 0,
+        OwnedValue::Int(n) => *n < 0, // omni-dev: coverage tolerate-line reason="confirmed live (eprintln! probe): a computed Int reaching abs through the normal evaluator pipe (e.g. (0-5) | abs) arrives re-baked as NumberLiteral(Int, ..) by the reindex bridge, same as #2906 documents elsewhere -- no known producer of a bare Int at this position (#3041)"
         OwnedValue::Float(f) => *f < 0.0,
         OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => *n < 0,
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f < 0.0,
@@ -52494,7 +52494,7 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
             Ok(v) => QueryResult::Owned(v),
-            Err(_) if optional => QueryResult::None,
+            Err(_) if optional => QueryResult::None, // omni-dev: coverage tolerate-line reason="confirmed live (eprintln! probe): optional is always false in builtin_abs regardless of whether the filter writes abs?, since that suppression happens entirely outside builtin dispatch here -- the same 'optional is never true here' shape eval.rs already documents elsewhere (#2180) (#3041)"
             Err(e) => QueryResult::Error(e),
         }
     } else {
@@ -87545,13 +87545,16 @@ mod tests {
         query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!((n - 7.25).abs() < f64::EPSILON);
         });
-        // A *computed* negative Int (not a NumberLiteral, which is what
-        // every literal in filter source or document data produces, #1035)
-        // still classifies correctly -- reachable via arithmetic, unlike
-        // the literal-input cases above.
+        // A computed value pins the correct result end to end too, though
+        // (confirmed live) it still reaches `builtin_abs` re-baked as a
+        // `NumberLiteral` by the reindex bridge, not the bare `Int` the
+        // classification match also handles -- see that arm's own
+        // `tolerate-line` marker.
         query!(b"null", "(0-5) | abs", QueryResult::Owned(OwnedValue::Int(5)) => {});
         // `?` suppresses the "cannot be negated" error the same way jq's
-        // own unary minus does.
+        // own unary minus does -- end-to-end behavior only, confirmed live
+        // that `optional` itself never reaches `true` inside `builtin_abs`
+        // (see that arm's own `tolerate-line` marker).
         query!(b"null", "null | abs?", QueryResult::None => {});
         // Non-numbers pass straight through -- jq's total ordering puts
         // strings/arrays/objects above every number, so `. < 0` is false.
