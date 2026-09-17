@@ -286,6 +286,17 @@ in-evaluator-input-embed-object	{"a":1} {"a":1}	input | . as $x | {k:.} | .k | p
 in-evaluator-input-reduce-empty	{"a":1} {"a":1}	input | . as $x | reduce empty as $i (.; .) | path($x)
 in-evaluator-input-fold-source	{"a":1} {"a":1}	input | reduce (.) as $x (.; ($x.a = 9))
 in-evaluator-input-catch-own-value	{"a":1} {"a":1}	input | . as $x | try error($x) catch path($x)
+in-evaluator-def-body-write	{"a":1}	. as $x | def f: ($x.a = 9); {a:1} | f
+in-evaluator-def-body-path	{"a":1}	. as $x | def f: path($x); {a:1} | f
+in-evaluator-def-body-update-rhs	{"a":1}	. as $x | def f: del($x.a); . |= ({a:1} | f)
+in-evaluator-def-body-fold	{"a":1}	. as $x | def f: ($x.a = 9); reduce 1 as $i ({a:1}; f)
+in-evaluator-def-body-direct	{"a":1}	. as $x | def f: ($x.a = 9); f
+in-evaluator-def-body-any	{"a":1}	. as $x | def f: ($x.a = 9); any(f; true)
+in-evaluator-catch-error-then-error	{"a":1}	. as $x | try (error($x) | error) catch path($x)
+in-evaluator-resolver-select-cond	{"a":1}	. as $x | path(select(($x.a = 9) | true))
+in-evaluator-resolver-computed-key	{"a":1}	. as $x | .[($x.a = 9 | "a")] = 5
+in-evaluator-update-paren-root	{"a":1}	. as $x | (.) |= ($x.a = 9)
+in-evaluator-update-second-path	{"a":1,"b":2}	. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else . end)
 CASES_EOF
 )
 

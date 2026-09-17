@@ -942,6 +942,8 @@ is the revert that established what the other one costs.
    markers are checked against the payload's own node (`try_payload_root`): `error($x)` and
    `$x | error` raise the marker's node verbatim, as jq's `catch` then sees the same `jv`, so
    `. as $x | try error($x) catch path($x)` stays `[]` wherever the raise sits in the body
+   (a marker inside a resolved `def` body is reached too — `map_subexprs` leaves such a body
+   alone, the demotion walk does not: `. as $x | def f: ($x.a = 9); {a:1} | f` wrote on `main`)
    (`try (.a | error($x)) catch …`, `try (if .a then error($x) else . end) catch …`), while a
    value-equal payload (`try error({a:1}) catch ($x.a = 9)` on `{"a":1}`) or a body with two
    raise sites naming different values no longer certifies. `eval.rs`'s own consumers that

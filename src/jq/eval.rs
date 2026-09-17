@@ -29070,7 +29070,13 @@ pub(crate) fn try_payload_root(body: &Expr) -> RootWitness {
             Expr::Pipe(stages) => match stages.as_slice() {
                 [.., head, tail @ Expr::Error(None)] => {
                     accounted.push(tail as *const Expr);
-                    Some(marker_node(head))
+                    // `error($x) | error`: the head raises first, and the
+                    // walk reaches that site on its own.
+                    if matches!(strip_parens(head), Expr::Error(Some(_))) {
+                        None
+                    } else {
+                        Some(marker_node(head))
+                    }
                 }
                 _ => None,
             },
@@ -29196,6 +29202,31 @@ pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> 
                 return Expr::TrackedVar(Rc::clone(demoted));
             }
             return expr.clone();
+        }
+        // #3036: `map_subexprs` leaves a resolved `DefCall`'s body alone --
+        // right for substitution, whose scope the body already closed over,
+        // but a marker substituted into that body *before* the call was
+        // resolved is exactly what a demotion has to reach (`. as $x | def
+        // f: ($x.a = 9); {a:1} | f`), and `any_subexpr` descends there, so
+        // the precheck already promised it would be handled.
+        if let Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound: _,
+        } = expr
+        {
+            let body = demote_walk(&def.body, root, memo);
+            return Expr::DefCall {
+                def: Rc::new(FuncDefData {
+                    name: def.name.clone(),
+                    params: def.params.clone(),
+                    body,
+                }),
+                args: args.iter().map(|a| demote_walk(a, root, memo)).collect(),
+                frames: *frames,
+                bound: BoundBody::default(),
+            };
         }
         map_subexprs(expr, &mut |child| demote_walk(child, root, memo))
     }
