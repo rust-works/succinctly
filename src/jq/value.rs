@@ -358,11 +358,25 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
         return None;
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        // `parse_literal_exponent` saturates an absurd exponent; clamp far
-        // beyond any double's range so the arithmetic below cannot overflow.
-        exponent10 += parse_literal_exponent(&text[i + 1..])
+        // The exponent must be a sign and at least one digit, and nothing
+        // may follow it: a malformed span (`…901e`, `…5e5e5`) is not a
+        // number here any more than it is to `str::parse`, so the funnels'
+        // lossy fallback still answers #966's `null` for it rather than a
+        // fabricated value (code review of #2936). `parse_literal_exponent`
+        // saturates an over-long digit string; clamp far beyond any
+        // double's range so the arithmetic below cannot overflow.
+        let exp_text = &text[i + 1..];
+        let exp_digits = exp_text.strip_prefix(['+', '-']).unwrap_or(exp_text);
+        if exp_digits.is_empty() || !exp_digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        exponent10 += parse_literal_exponent(exp_text)
             .value()
             .clamp(-(1 << 40), 1 << 40) as i64;
+    } else if i < bytes.len() {
+        // Trailing bytes the mantissa loop stopped on (`1.2.3`, `1-2`):
+        // not a number.
+        return None;
     }
     if kept_len == 0 {
         return Some(if negative { -0.0 } else { 0.0 });
@@ -5700,6 +5714,25 @@ mod tests {
         assert_eq!(significant_digit_count("123456789012345678"), 18);
         assert_eq!(jq_literal_text_to_f64("abc"), None);
         assert_eq!(jq_literal_text_to_f64(""), None);
+        // A malformed span past 17 digits is not a number either (code
+        // review of #2936: an earlier revision read a valid prefix out of
+        // these and fabricated a value where the funnels answer #966's
+        // `null`); the short spellings never reached the slow path.
+        for malformed in [
+            "123456789012345678901e",
+            "123456789012345678901e+",
+            "123456789012345678901.2.3",
+            "1.23456789012345678901e5e5",
+            "123456789012345678901-2",
+            "123456789012345678901e5x",
+        ] {
+            assert_eq!(jq_literal_text_to_f64(malformed), None, "{malformed}");
+            assert_eq!(
+                parse_i64_or_f64_in::<JqSemantics>(malformed),
+                parse_i64_or_f64(malformed),
+                "{malformed}: both modes must refuse it"
+            );
+        }
     }
 
     /// #2906: property check of [`jq_literal_int_to_f64`] over seeded
