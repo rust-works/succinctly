@@ -59460,6 +59460,33 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
             r#"{"foo":[{"a":1},{"a":1}]}"#,
             ".foo | sort | ((path | empty), (.[0] as $y | .[1] | ($y.a = 9)))",
         ),
+        // A marker inside a resolved `def` body (`map_subexprs` does not
+        // walk one; the demotion does), reached through a rebuild.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: ($x.a = 9); {a:1} | f",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: path($x); {a:1} | f",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: del($x.a); . |= ({a:1} | f)",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: ($x.a = 9); reduce 1 as $i ({a:1}; f)",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f(g): ($x.a = g); {a:1} | f(9)",
+        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -59766,6 +59793,25 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
             r#"{"foo":[{"a":1},{"a":1}]}"#,
             ".foo | sort | .[0] | ((path | empty), (. as $y | ($y.a = 9)))",
             r#"{"a":9}"#,
+        ),
+        // A marker inside a resolved `def` body, used without a rebuild.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: ($x.a = 9); f",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | def f: ($x.a = 9); any(f; true)",
+            "true",
+        ),
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | try (error($x) | error) catch path($x)",
+            "[]",
         ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();

@@ -234,12 +234,21 @@ def route_program(rng, d):
     v = "$x"
     prefix = rng.choice(["", "", ".x | "])
     parts = [f". as {v}"]
+    stages = []
     for _ in range(rng.choice([0, 1, 1, 2])):
         stage = rng.choice(REBUILDS)
         if prefix and "DOC" in stage:
             stage = stage.replace("DOC", json.dumps(d["x"]))
-        parts.append(stage.replace("DOC", json.dumps(d)))
-    parts.append(rng.choice(ROOT_USES))
+        stages.append(stage.replace("DOC", json.dumps(d)))
+    use = rng.choice(ROOT_USES)
+    if rng.random() < 0.25:
+        # The use inside a `def` resolved before the rebuild runs: the marker
+        # is substituted into the def body, and the call is what crosses the
+        # rebuild (a `DefCall`'s body is not walked by `map_subexprs`).
+        parts.append(f"def f: {use}; " + " | ".join(stages + ["f"]))
+    else:
+        parts.extend(stages)
+        parts.append(use)
     body = prefix + " | ".join(parts)
     return rng.choice(ROUTES) % body
 

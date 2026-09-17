@@ -22716,17 +22716,12 @@ fn owned_child_token(parent: u64, component: &OwnedValue) -> u64 {
     h
 }
 
-/// A fresh [`OwnedIdentity::root`] token. Per thread, since an `Expr` never
-/// crosses threads and two evaluations on different threads never meet.
+/// A fresh [`OwnedIdentity::root`] token -- a process-wide counter, the
+/// same shape `Frame`'s `NEXT_INVOCATION` uses (`eval.rs`), so it works
+/// under `no_std` too.
 fn fresh_owned_root() -> u64 {
-    thread_local! {
-        static NEXT: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
-    }
-    NEXT.with(|next| {
-        let token = next.get();
-        next.set(token + 1);
-        token
-    })
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 struct OwnedIdentity<V: DocumentValue> {
