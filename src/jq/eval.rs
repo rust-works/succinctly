@@ -15778,8 +15778,11 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// wording here — "cannot parse 'a' as number" against "cannot convert 'a' to
 /// number" — which is exactly the drift #356 is about.
 pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, EvalError> {
-    // jq's JSON parser skips surrounding whitespace, so `" 1 "` is 1.
-    let trimmed = s.trim();
+    // jq's JSON parser skips surrounding whitespace, so `" 1 "` is 1. Real
+    // yq's `tonumber` does *no* trimming at all (`" 1 "`/`"1 "`/`"\t1"` all
+    // error) -- yq mode must see the untouched string here, not jq's
+    // trimmed one (#2960).
+    let trimmed = if yq_mode { s } else { s.trim() };
     // Materialize a JSON-shaped number as a `NumberLiteral` so it keeps its
     // *source spelling*, rather than collapsing it through a bare
     // `parse::<i64>()`/`parse::<f64>()` pair. Both oracles preserve the
@@ -15813,7 +15816,21 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // `NumberLiteral(Float(inf), "inf")` would make `format_number_jq_compat`
     // emit a bare `inf`, which is not a number in either output language).
     if crate::json::validate::is_valid_number(trimmed.as_bytes()) {
-        return Ok(OwnedValue::from_number_literal(trimmed));
+        if !yq_mode || !yq_literal_overflows_f64(trimmed) {
+            return Ok(OwnedValue::from_number_literal(trimmed));
+        }
+        // yq mode only: real yq's `ParseFloat` itself errors (`ErrRange`) on
+        // a magnitude past f64's finite range, so `"1e999"`/`"1e309"` must
+        // reject here rather than fall through to `tonumber_from_str_yq`
+        // below -- an RFC 8259-valid literal never reaches that function's
+        // own grammar (#2960's triage explicitly names this a behaviour
+        // change: `"1e999" | tonumber` now errors, matching the oracle). An
+        // i64-range-overflowing but still-finite-as-a-float literal, e.g.
+        // `9223372036854775808`, is unaffected -- Go's `ParseFloat` accepts
+        // it fine, only `ErrRange` (overflow to +-inf) is a rejection.
+        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string(),
+        )));
     }
     // A leading `+` is the one spelling both oracles accept that JSON does
     // not, and that still has an exact JSON-safe equivalent: drop the sign
@@ -15834,8 +15851,24 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
         if unsigned.starts_with(|c: char| c.is_ascii_digit())
             && crate::json::validate::is_valid_number(unsigned.as_bytes())
         {
+            if yq_mode && yq_literal_overflows_f64(unsigned) {
+                return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+                    s.to_string(),
+                )));
+            }
             return Ok(OwnedValue::from_number_literal(unsigned));
         }
+    }
+    // Past this point jq and yq part ways entirely: jq falls back to Rust's
+    // own `i64`/`f64` grammar (permissive in ways neither oracle is --
+    // trimming, `+nan`, overflow-to-`inf`), which is exactly the gap #2960
+    // is about. yq mode has its own grammar (`tonumber_from_str_yq`, a port
+    // of yq's `tryConvertToNumber`/`parseInt64`/`ParseFloat`) and never
+    // falls through to jq's fallback or JSON-parse-probe error path below --
+    // real yq draws no jq-parse-error/tag-conversion-error distinction, so
+    // there is nothing here for it to share.
+    if yq_mode {
+        return tonumber_from_str_yq(s);
     }
     if let Ok(i) = trimmed.parse::<i64>() {
         return Ok(OwnedValue::Int(i));
@@ -15843,28 +15876,9 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     if let Ok(f) = trimmed.parse::<f64>() {
         return Ok(OwnedValue::Float(f));
     }
-    // The probe below is jq's question, and jq's alone.
-    //
-    // It distinguishes "valid JSON but not a number" from "not valid JSON at
-    // all" purely to pick between two error messages, never to return a
-    // value. **Real yq draws no such distinction**: every non-numeric string
-    // gets the one tag-conversion error, whether or not the text is valid
-    // JSON (yq 4.53.3, captured live -- `[1,2]`, `abc`, `1 2`, `""`, a lone
-    // `\udc00` and a raw control character all answer `cannot convert node
-    // value [...] of tag !!str to number`). So in yq mode there is nothing
-    // for the probe to decide, and asking it anyway is what makes it
-    // wrong: whichever mode we hand `parse_complete_json`, some input
-    // crosses the boundary and lands in jq's parse-error family, which yq
-    // has no equivalent of. `\udc00` does it under yq mode (only yq rejects
-    // a lone surrogate, #2008) and a raw control character does it under jq
-    // mode (only jq rejects one, #2878) -- opposite directions, so no single
-    // flag avoids both. Answering `cannot_parse_as_number` unconditionally
-    // does, and matches the oracle in every case above.
-    if yq_mode {
-        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
-            s.to_string(),
-        )));
-    }
+    // The probe below is jq's question, and jq's alone. It distinguishes
+    // "valid JSON but not a number" from "not valid JSON at all" purely to
+    // pick between two error messages, never to return a value.
     if parse_complete_json(trimmed, false).is_ok() {
         Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
             s.to_string(),
@@ -15872,6 +15886,318 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     } else {
         Err(EvalError::invalid_numeric_literal(s))
     }
+}
+
+/// True when `text` (already RFC 8259-valid JSON number syntax) is a
+/// magnitude Go's `ParseFloat` itself would reject with `ErrRange` --
+/// real yq's `tonumber` errors outright on `"1e999"`/`"1e309"`, it does not
+/// fall back to any other stage. An i64-range-overflowing but
+/// still-float-finite literal (`9223372036854775808`, ~9.2e18) is *not*
+/// this case -- Go's `ParseFloat` accepts it fine at reduced precision, only
+/// an actual overflow to +-infinity is `ErrRange`. Rust's own `f64` parser
+/// never errors on overflow (it saturates to +-inf instead of jq's fallback
+/// below reaching this at all), so infinite-after-parsing is exactly the
+/// signal this needs.
+fn yq_literal_overflows_f64(text: &str) -> bool {
+    text.parse::<f64>().is_ok_and(f64::is_infinite)
+}
+
+/// `tonumber`'s yq-mode grammar (#2960) -- everything RFC 8259 and the
+/// leading-`+` arm above already accepted has returned by this point, so
+/// this only has to decide the strings JSON refuses but real yq's own
+/// `tryConvertToNumber` (`pkg/yqlib/operator_to_number.go` + `lib.go`,
+/// v4.53.3) accepts: underscored/hex/octal integers and Go's `ParseFloat`
+/// grammar (underscored decimals, hex floats, `inf`/`infinity`/`nan`
+/// words). Never falls back to jq's own `parse::<i64>`/`parse::<f64>` --
+/// that fallback's extra leniency (trimming, `+nan`, overflow-to-`inf`) is
+/// exactly the class of divergence this issue closes.
+fn tonumber_from_str_yq(s: &str) -> Result<OwnedValue, EvalError> {
+    if let Some(n) = yq_parse_int64(s) {
+        return Ok(OwnedValue::Int(n));
+    }
+    if let Some(f) = yq_parse_float(s) {
+        return Ok(OwnedValue::Float(f));
+    }
+    Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+        s.to_string(),
+    )))
+}
+
+/// Port of yq's `parseInt64` (`pkg/yqlib/lib.go`, v4.53.3): strip *every*
+/// underscore unconditionally (no positional check, unlike the float
+/// grammar below), then accept a `0x`/`0X` (hex) or `0o` (octal, lowercase
+/// only) prefix -- checked against the string as a whole, so a sign before
+/// the prefix (`-0x10`) defeats the prefix check and falls through to a
+/// plain decimal parse, which then fails on the stray `x` -- or plain
+/// decimal otherwise. `i64::from_str_radix`/`str::parse::<i64>` both accept
+/// a sign *after* where the prefix (if any) was stripped, matching Go's
+/// `strconv.ParseInt`.
+fn yq_parse_int64(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    let stripped: String = s.chars().filter(|&c| c != '_').collect();
+    if let Some(rest) = stripped
+        .strip_prefix("0x")
+        .or_else(|| stripped.strip_prefix("0X"))
+    {
+        i64::from_str_radix(rest, 16).ok()
+    } else if let Some(rest) = stripped.strip_prefix("0o") {
+        i64::from_str_radix(rest, 8).ok()
+    } else {
+        stripped.parse::<i64>().ok()
+    }
+}
+
+/// yq's float stage: Go's `ParseFloat` on the *original*, unstripped string
+/// (no blanket underscore removal the way the int stage above does).
+fn yq_parse_float(s: &str) -> Option<f64> {
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(v) = yq_float_special(s) {
+        return Some(v);
+    }
+    if !yq_underscore_ok(s) {
+        return None;
+    }
+    let (neg, body) = match s.as_bytes().first() {
+        Some(b'+') => (false, &s[1..]),
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if body.len() > 1 && body.as_bytes()[0] == b'0' && matches!(body.as_bytes()[1], b'x' | b'X') {
+        return yq_parse_hex_float(&body[2..], neg);
+    }
+    // Decimal: underscore placement is already validated above, so strip
+    // them and hand the rest to Rust's own correctly-rounded `f64` parser
+    // for both the remaining grammar checks (missing exponent digits, a
+    // stray second `.`, ...) and the value itself -- Go's decimal
+    // `ParseFloat` and Rust's are both correctly rounded, so they agree on
+    // every value both accept. The character-class check keeps this path
+    // from ever seeing a `nan`/`inf`/`infinity` spelling `yq_float_special`
+    // didn't already accept (e.g. `+nan`, which Rust's own parser is happy
+    // to accept but yq is not) -- letting one through here would silently
+    // undo that rejection.
+    let stripped: String = s.chars().filter(|&c| c != '_').collect();
+    if !stripped
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return None;
+    }
+    let value: f64 = stripped.parse().ok()?;
+    if value.is_infinite() {
+        // Go's decimal `ParseFloat` treats overflow as `ErrRange` and
+        // rejects it; Rust's never errors on overflow, it saturates to
+        // +-inf instead. `1e-400` (underflow) is not an error in either.
+        return None;
+    }
+    Some(value)
+}
+
+/// Go's `special()`: an optional sign then case-insensitive `inf`/`infinity`,
+/// or an *unsigned* case-insensitive `nan` -- `+nan`/`-nan` are rejected, so
+/// the bare-`nan` check below must run before, and independently of, the
+/// sign-stripping used for `inf`/`infinity`.
+fn yq_float_special(s: &str) -> Option<f64> {
+    if s.eq_ignore_ascii_case("nan") {
+        return Some(f64::NAN);
+    }
+    let (neg, body) = match s.as_bytes().first() {
+        Some(b'+') => (false, &s[1..]),
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity") {
+        return Some(if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    None
+}
+
+/// Port of Go's `strconv` internal `underscoreOK`: an underscore is valid
+/// only directly between two digits, where a `0b`/`0o`/`0x` base prefix
+/// itself counts as a "digit" for this purpose (so `0x_1p3` is fine but a
+/// bare `_1` is not). This governs float-grammar underscore placement only
+/// -- the int stage above strips unconditionally, matching yq's own
+/// `parseInt64`, which never calls this check.
+fn yq_underscore_ok(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    // `saw` tracks the class of the last character: start, digit-or-prefix,
+    // underscore, or other.
+    #[derive(PartialEq)]
+    enum Saw {
+        Start,
+        Digit,
+        Underscore,
+        Other,
+    }
+    let mut saw = Saw::Start;
+    let mut hex = false;
+    if i + 1 < bytes.len()
+        && bytes[i] == b'0'
+        && matches!(bytes[i + 1].to_ascii_lowercase(), b'b' | b'o' | b'x')
+    {
+        hex = bytes[i + 1].eq_ignore_ascii_case(&b'x');
+        i += 2;
+        saw = Saw::Digit;
+    }
+    while i < bytes.len() {
+        let c = bytes[i];
+        let is_digit = if hex {
+            c.is_ascii_hexdigit()
+        } else {
+            c.is_ascii_digit()
+        };
+        if is_digit {
+            saw = Saw::Digit;
+        } else if c == b'_' {
+            if saw != Saw::Digit {
+                return false;
+            }
+            saw = Saw::Underscore;
+        } else {
+            if saw == Saw::Underscore {
+                return false;
+            }
+            saw = Saw::Other;
+        }
+        i += 1;
+    }
+    saw != Saw::Underscore
+}
+
+/// Go hex floats: `hexdigits ["." hexdigits] ("p"|"P") ["+"|"-"] decdigits`,
+/// the `p` exponent mandatory (unlike C's, where it's optional). `rest` is
+/// everything after the `0x`/`0X` prefix, `neg` is the sign already
+/// stripped by the caller. Converts the mantissa to an *exact* decimal
+/// bignum (no precision loss of its own) scaled by `2^exponent` -- expressed
+/// as `bignum * 5^k * 10^-k` for a negative exponent, since `2^-k = 5^k *
+/// 10^-k` -- and hands that exact decimal string to Rust's own
+/// correctly-rounded `f64` parser. That sidesteps hand-writing round-to-
+/// nearest-even/subnormal/sticky-bit logic entirely: the string already
+/// *is* the exact mathematical value, so whatever rounding Rust's decimal
+/// parser applies is, by construction, the correctly-rounded nearest
+/// double -- the same guarantee Go's own `atofHex` exists to provide.
+fn yq_parse_hex_float(rest: &str, neg: bool) -> Option<f64> {
+    let rest_clean: String = rest.chars().filter(|&c| c != '_').collect();
+    let p_pos = rest_clean.bytes().position(|b| b == b'p' || b == b'P')?;
+    let mantissa_part = &rest_clean[..p_pos];
+    let exp_part = &rest_clean[p_pos + 1..];
+    let exp_value = parse_hex_float_exponent(exp_part)?;
+
+    let (int_digits, frac_digits) = match mantissa_part.find('.') {
+        Some(dot) => (&mantissa_part[..dot], &mantissa_part[dot + 1..]),
+        None => (mantissa_part, ""),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return None;
+    }
+    if !int_digits.bytes().all(|b| b.is_ascii_hexdigit())
+        || !frac_digits.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
+    let mut mant = bn_zero();
+    for c in int_digits.chars().chain(frac_digits.chars()) {
+        let v = c.to_digit(16).expect("validated hex digit above");
+        bn_mul_add(&mut mant, 16, v);
+    }
+    if bn_is_zero(&mant) {
+        return Some(if neg { -0.0 } else { 0.0 });
+    }
+
+    let frac_len = frac_digits.len() as i64;
+    let total_exp2 = exp_value.saturating_sub(frac_len.saturating_mul(4));
+
+    // Far beyond f64's real +-1075 exponent range -- clamps the bignum
+    // scaling loop below to bounded work regardless of how large a
+    // caller-supplied `p` exponent claims to be.
+    const EXP2_CLAMP: i64 = 5000;
+    if total_exp2 > EXP2_CLAMP {
+        return None; // definite overflow
+    }
+    if total_exp2 < -EXP2_CLAMP {
+        return Some(if neg { -0.0 } else { 0.0 }); // definite underflow
+    }
+
+    let decimal = if total_exp2 >= 0 {
+        for _ in 0..total_exp2 {
+            bn_mul_add(&mut mant, 2, 0);
+        }
+        bn_to_decimal_string(&mant)
+    } else {
+        for _ in 0..(-total_exp2) {
+            bn_mul_add(&mut mant, 5, 0);
+        }
+        format!("{}e-{}", bn_to_decimal_string(&mant), -total_exp2)
+    };
+    let value: f64 = decimal.parse().ok()?;
+    if value.is_infinite() {
+        return None; // overflow -- rejected, same as the decimal path above
+    }
+    Some(if neg { -value } else { value })
+}
+
+/// The decimal exponent after a hex float's `p`/`P`: an optional sign then
+/// one or more decimal digits, saturating rather than overflowing on an
+/// absurdly long digit run (`yq_parse_hex_float`'s clamp handles the
+/// resulting magnitude either way).
+fn parse_hex_float_exponent(exp_part: &str) -> Option<i64> {
+    let (sign, digits): (i64, &str) = match exp_part.as_bytes().first() {
+        Some(b'+') => (1, &exp_part[1..]),
+        Some(b'-') => (-1, &exp_part[1..]),
+        _ => (1, exp_part),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.parse::<i64>().unwrap_or(i64::MAX);
+    Some(sign.saturating_mul(magnitude))
+}
+
+/// Little-endian decimal-digit bignum (`bn[0]` is the ones digit), just
+/// large enough to carry a hex float's exact mantissa*2^exponent value
+/// (arbitrary precision, unlike `i64`/`u64`) through to a decimal string
+/// Rust's `f64` parser can round correctly. Schoolbook `O(digits)`
+/// multiply-and-add; only ever multiplied by 2, 5, or 16, and only for a
+/// bounded number of iterations (see `EXP2_CLAMP` above), so this never
+/// grows past roughly `EXP2_CLAMP`'s own digit count.
+fn bn_zero() -> Vec<u8> {
+    vec![0]
+}
+
+fn bn_is_zero(bn: &[u8]) -> bool {
+    bn.len() == 1 && bn[0] == 0
+}
+
+fn bn_mul_add(bn: &mut Vec<u8>, mul: u32, add: u32) {
+    let mut carry: u64 = add as u64;
+    for d in bn.iter_mut() {
+        let v = (*d as u64) * (mul as u64) + carry;
+        *d = (v % 10) as u8;
+        carry = v / 10;
+    }
+    while carry > 0 {
+        bn.push((carry % 10) as u8);
+        carry /= 10;
+    }
+    while bn.len() > 1 && *bn.last().expect("bn is never empty") == 0 {
+        bn.pop();
+    }
+}
+
+fn bn_to_decimal_string(bn: &[u8]) -> String {
+    bn.iter().rev().map(|d| (b'0' + d) as char).collect()
 }
 
 /// Builtin: toboolean - convert to boolean
