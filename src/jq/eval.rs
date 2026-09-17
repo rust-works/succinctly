@@ -40777,6 +40777,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     acc_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
+    resolver_free: bool,
 ) -> (OwnedValue, Option<Control>) {
     let last_idx = substituted_updates.len() - 1;
     let mut state = acc_input;
@@ -40814,7 +40815,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         // UPDATE's last delivered output, the same value the old
         // `update_vals.into_iter().last()` read off the collected `Vec`.
         let mut last_val: Option<OwnedValue> = None;
-        let flow = fold_step_each::<S>(substituted, state, optional, &mut |v| {
+        let flow = fold_step_each::<S>(substituted, state, optional, resolver_free, &mut |v| {
             last_val = Some(v);
             Demand::Continue
         });
@@ -41187,6 +41188,7 @@ fn fold_step_each<S: EvalSemantics>(
     expr: &Expr,
     state: OwnedValue,
     optional: bool,
+    resolver_free: bool,
     on_update: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     match owned_arith_accumulator_shape(expr) {
@@ -41198,8 +41200,23 @@ fn fold_step_each<S: EvalSemantics>(
             Err(_) if optional => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
+        // #3036: `resolver_free` is [`fold_update_is_resolver_free`] of the
+        // fold's own UPDATE, decided once per fold rather than once per
+        // element -- a re-entry's demotion is unobservable without a
+        // resolver, and the walk that decides it was +3% on a tight
+        // `reduce` over 24k elements (7950X).
+        None if resolver_free => eval_each_owned_bridged::<S>(expr, &state, optional, on_update),
         None => eval_each_owned::<S>(expr, &state, optional, on_update),
     }
+}
+
+/// Whether a fold's UPDATE (or EXTRACT) can never start a resolver
+/// invocation, so the per-element re-entry may skip its demotion (#3036).
+/// Static per fold: substituting the loop variable replaces `Expr::Var`
+/// with a marker or a literal and never introduces one of
+/// [`may_enter_resolver_node`]'s shapes.
+fn fold_update_is_resolver_free(update: &Expr) -> bool {
+    !any_subexpr(update, &mut may_enter_resolver_node)
 }
 
 /// The `Identity`/`Field`/`Index` arms of [`eval_owned_fast_path`], factored
@@ -42433,6 +42450,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     state_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
+    resolver_free: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (OwnedValue, Flow) {
     let last_idx = substituted_steps.len() - 1;
@@ -42535,7 +42553,11 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // before reading `ext_control` used to encode
                     // positionally (#494): here they are simply already
                     // pushed by the time the `Flow` is inspected.
-                    eval_each_owned::<S>(ext_expr, &update_val, optional, sink)
+                    if resolver_free {
+                        eval_each_owned_bridged::<S>(ext_expr, &update_val, optional, sink)
+                    } else {
+                        eval_each_owned::<S>(ext_expr, &update_val, optional, sink)
+                    }
                 }
                 // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
                 // $x (init; update)` to `(init; update; .)`), so the push
@@ -42609,7 +42631,13 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             }
         };
 
-        let update_flow = fold_step_each::<S>(substituted_update, state, optional, on_update);
+        let update_flow = fold_step_each::<S>(
+            substituted_update,
+            state,
+            optional,
+            resolver_free,
+            on_update,
+        );
 
         match outcome {
             Some(StepOutcome::Retry(update_val)) => {
@@ -42953,6 +42981,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     drive_source: ForeachSourceDrive<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
+    // #3036: decided once per fold, see `fold_update_is_resolver_free`.
+    let resolver_free =
+        fold_update_is_resolver_free(update) && extract.map_or(true, fold_update_is_resolver_free);
     // Lazily computed on the first fork, then reused for every later one --
     // `#2440`'s zero-INIT-outputs short-circuit is no longer a separate
     // early return this could sit above (see this function's own doc
@@ -42999,8 +43030,14 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
                 invert_dedup,
             );
             let step_state = core::mem::replace(&mut state, OwnedValue::Null);
-            let (new_state, step_flow) =
-                try_foreach_step_alternatives::<S>(&row, step_state, optional, &mut budget, sink);
+            let (new_state, step_flow) = try_foreach_step_alternatives::<S>(
+                &row,
+                step_state,
+                optional,
+                &mut budget,
+                resolver_free,
+                sink,
+            );
             state = new_state;
             match step_flow {
                 Flow::Exhausted => Demand::Continue,
@@ -43089,6 +43126,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     drive_source: ForeachSourceDrive<'_>,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
+    // #3036: decided once per fold, see `fold_update_is_resolver_free`.
+    let resolver_free = fold_update_is_resolver_free(update);
     // Lazily computed on the first fork and reused, for the same reason
     // `foreach_forks` defers it: a zero-output INIT (`reduce halt_error as
     // $x (empty; .)`, which exits 0) must not pay for a `Vec` build it never
@@ -43125,8 +43164,13 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
             .map(|alternative| alternative.map(|(update, _no_extract)| update))
             .collect();
             let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
-            let (new_acc, step_control) =
-                try_reduce_step_alternatives::<S>(&row, step_acc, optional, &mut budget);
+            let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
+                &row,
+                step_acc,
+                optional,
+                &mut budget,
+                resolver_free,
+            );
             acc = new_acc;
             match step_control {
                 None => Demand::Continue,
@@ -78257,10 +78301,11 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
         };
         let mut on_update_calls = 0;
-        let flow = fold_step_each::<JqSemantics>(&expr, OwnedValue::Int(1), true, &mut |_| {
-            on_update_calls += 1;
-            Demand::Continue
-        });
+        let flow =
+            fold_step_each::<JqSemantics>(&expr, OwnedValue::Int(1), true, false, &mut |_| {
+                on_update_calls += 1;
+                Demand::Continue
+            });
         assert_eq!(on_update_calls, 0);
         assert!(matches!(flow, Flow::Exhausted));
     }
