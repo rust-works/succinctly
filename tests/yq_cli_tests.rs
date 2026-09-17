@@ -47564,6 +47564,15 @@ fn any_all_cond_read_resolves_on_rewritten_routes_3079() -> Result<()> {
             r#".aa | map_values([any(.[]; key == "y")])"#,
             r#"{"bbb":[false],"c":[true]}"#,
         ),
+        // a `cond` escape before any decision is the stage's escape
+        (
+            r#".aa | try map_values(any(.[]; key | error("boom"))) catch ."#,
+            r#""boom""#,
+        ),
+        (
+            r#".aa | try map_values(any(.[]; (key == "y"), error("late"))) catch ."#,
+            r#""late""#,
+        ),
     ] {
         let (out, code) = run_yq_stdin(filter, doc, &args)?;
         assert_eq!(
