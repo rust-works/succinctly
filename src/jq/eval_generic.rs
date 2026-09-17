@@ -19040,6 +19040,13 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
             | Builtin::UpperIn(_)
             | Builtin::UpperInSrc(..),
         ) => false,
+        // #2658: `any(cond)`/`all(cond)`/`isvalid` answer a computed
+        // boolean; a loop yields its input (when `cond` decides at once) or
+        // what `update` yields from it.
+        Expr::Builtin(Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_)) => false,
+        Expr::Until { update, .. } | Expr::While { update, .. } => {
+            incoming || step_can_yield_absent(update, incoming)
+        }
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             step_can_yield_absent(inner, incoming)
         }
@@ -19130,6 +19137,13 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
         // #2968: `skip` forwards its body's outputs, cursors intact; the
         // boolean-answering consumers emit a computed value (`_` below).
         Expr::Builtin(Builtin::Skip(_, inner)) => path_context_stage_preserves_node(inner),
+        // #2658: a loop emits its input node as it stands, or what `update`
+        // made of it -- so it preserves the node exactly when `update` does
+        // (`until(cond; .)` and `until(cond; .a)` do, `until(cond; . + 1)`
+        // does not). `any(cond)`/`all(cond)`/`isvalid` compute (`_` below).
+        Expr::Until { update, .. } | Expr::While { update, .. } => {
+            path_context_stage_preserves_node(update)
+        }
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             path_context_stage_preserves_node(inner)
         }
@@ -19329,6 +19343,16 @@ fn path_context_single_native(expr: &Expr) -> bool {
             | Builtin::UpperInSrc(a, b)
             | Builtin::Skip(a, b),
         ) => path_context_single_native(a) && path_context_single_native(b),
+        // #2658: native on both routes (`any_all_f_generic`, `isvalid_generic`
+        // from `eval_builtin`; `each_loop_generic` collected by `eval_single`),
+        // every argument evaluated with a cursor -- `cond` at each element,
+        // a loop's `cond`/`update` at each state that is still a node.
+        Expr::Builtin(Builtin::AnyF(f) | Builtin::AllF(f) | Builtin::IsValid(f)) => {
+            path_context_single_native(f)
+        }
+        Expr::Until { cond, update } | Expr::While { cond, update } => {
+            path_context_single_native(cond) && path_context_single_native(update)
+        }
         // Native since #2416 phase 3 (`build_object_entries_generic`): every
         // key and value expression is evaluated with the cursor.
         Expr::Object(entries) => entries.iter().all(|entry| {
@@ -19759,6 +19783,16 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
                 admits.prefetch && owned_identity_pipe_supported(owned_identity_body_stages(expr))
             }
         }
+        // #2658: `isvalid`'s `f` is evaluated at this stage's own input, so
+        // a read in it resolves like `isempty`'s. `any(cond)`'s `cond` stands
+        // at each element and a loop's `cond`/`update` at each state, which
+        // the rewrite cannot spell as this stage's constants -- refused, as
+        // `AnyCond`'s `cond` is, so the pipe keeps the native streaming route.
+        Expr::Builtin(Builtin::IsValid(f)) => sub(f),
+        Expr::Builtin(Builtin::AnyF(cond) | Builtin::AllF(cond)) => !needs_path_context(cond),
+        Expr::Until { cond, update } | Expr::While { cond, update } => {
+            !needs_path_context(cond) && !needs_path_context(update)
+        }
         Expr::Try { expr, catch } => sub(expr) && catch.as_deref().map_or(true, sub),
         Expr::If {
             cond,
@@ -19912,6 +19946,10 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
         Expr::Limit { expr, .. } => path_context_absent_keeps_position(expr),
         // #2968: `skip` keeps whatever position its body keeps.
         Expr::Builtin(Builtin::Skip(_, inner)) => path_context_absent_keeps_position(inner),
+        // #2658: a loop keeps its position exactly when `update` does.
+        Expr::Until { update, .. } | Expr::While { update, .. } => {
+            path_context_absent_keeps_position(update)
+        }
         Expr::Try { expr, catch } => {
             path_context_absent_keeps_position(expr)
                 && catch
@@ -20390,6 +20428,11 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         Expr::Builtin(Builtin::AllCond(gen, cond)) => {
             Expr::Builtin(Builtin::AllCond(boxed(gen)?, boxed(cond)?))
         }
+        // #2658: `isvalid`'s `f` is rewritten like `isempty`'s. `any(cond)`/
+        // `all(cond)` and the loops never reach here: the gate refuses a
+        // read inside them, so `needs_path_context` is `false` for the whole
+        // construct and the early return above keeps it as written.
+        Expr::Builtin(Builtin::IsValid(f)) => Expr::Builtin(Builtin::IsValid(boxed(f)?)),
         Expr::Try { expr, catch } => Expr::Try {
             expr: boxed(expr)?,
             catch: catch.as_deref().map(boxed).transpose()?,
