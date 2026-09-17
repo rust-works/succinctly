@@ -5061,6 +5061,22 @@ keys say `true`. `.aa |= any(.; key == "aa")` is resolved. Note `with_entries(.v
 key == "value"))`: the entry is `{key, value}`, so `key` there is `"value"` — real yq
 answers `with_entries(.value |= key)` the same way.
 
+[#2658](https://github.com/rust-works/succinctly/issues/2658) gave `any(cond)`/`all(cond)`,
+`isvalid` and `until`/`while` native arms and registered them in the same gates. `any(cond)` is
+`any(.[]; cond)` with a navigating `gen`, so a read in its `cond` takes exactly #3079's three
+routes above (`map_values(any(key == "c"))` runs natively over `.[]`, a scalar member still
+raising `any_all_f`'s own `Cannot iterate over …`) and shares its one remaining gap (`.aa[] |=
+any(key == "c")` answers `false`). `isvalid`'s `f` stands at the stage's own input, so the
+rewrite resolves it everywhere. **A loop whose `cond` or `update` reads position is resolved
+on the streaming route and the positioned pipe (`[.[] | until(key == "c"; .c), key]`), but
+not on the owned identity pipe:** `map_values(until(key == "c"; .c))` still falls to the
+no-cursor evaluator, where `key` is `null` and the loop runs to its step cap or errors. A
+native owned-identity loop (`eval_owned_identity_stages` over each `(value, identity)` state,
+as `eval_owned_identity_any_all` does for one probe) is the fix; it is left recorded here
+because `until`/`while` with a `key`-reading body on the `map_values` route has no reference
+behaviour to match (`key` is not jq's, and real yq's lexer rejects `until`/`while`) and no
+reported user. Pinned in `test_position_reads_inside_any_cond_isvalid_loops_agree_2658`.
+
 Two further behaviours moved with the route, both toward jq: the `any`/`all` probe now stops
 `cond` at its first decisive output on both evaluators, so `[any(1; (true, ("C"|stderr)))]`
 writes nothing (jq 1.7.1: `or` breaks out of its `first`; succinctly wrote `C`), and

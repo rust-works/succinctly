@@ -2705,6 +2705,25 @@ fn test_position_reads_inside_any_cond_isvalid_loops_agree_2658() {
         ),
         (".a | [.[] | [while(key != \"c\"; .c)] | length]", "[1,1]"),
         (".a.b | until(key == \"a\"; parent) | keys", "[\"b\",\"d\"]"),
+        // The owned identity pipe (`map_values`, #3079's route): `any(cond)`
+        // is `any(.[]; cond)` there, scalar members included.
+        (
+            ".a | map_values(any(key == \"c\"))",
+            "{\"b\":true,\"d\":true}",
+        ),
+        (
+            ".a | map_values(any(key == \"x\"))",
+            "{\"b\":false,\"d\":false}",
+        ),
+        (
+            ".a | map_values(all(key == \"c\") | not)",
+            "{\"b\":false,\"d\":false}",
+        ),
+        (
+            ".a.b | map_values(try any(key == \"c\") catch \"scalar\")",
+            "{\"c\":\"scalar\"}",
+        ),
+        (".a.b | map_values(any(key == \"c\")?)", "{}"),
         (".dup | any(.)", "false"),
         (".dup | all(.)", "false"),
         (".dup | any", "false"),
