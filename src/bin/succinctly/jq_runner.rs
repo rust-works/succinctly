@@ -191,12 +191,37 @@ fn report_syntax_error(
     blank_line: bool,
 ) {
     let (line_no, line_text, column) = line_at_offset(source, offset);
-    eprintln!("jq: error: {message} at {location}, line {line_no}:");
-    eprintln!("{line_text}{}", " ".repeat(column));
+    print_position_error(
+        format_args!("{message}"),
+        location,
+        line_no,
+        &line_text,
+        column,
+    );
     if blank_line {
         eprintln!();
     }
     eprintln!("jq: 1 compile error");
+}
+
+/// Print `"{message} at {location}, line {line_no}:"` followed by the
+/// offending source line and its caret-padding -- the two-line position+caret
+/// shape every "compile error at a known byte position" diagnostic in this
+/// file needs ([`report_syntax_error`] and, through [`report_site_error`],
+/// every "name is not defined" report), so a caret-format change (added
+/// column info, a third line, a different style) has exactly one definition
+/// to update. `message` is `std::fmt::Arguments` rather than an owned
+/// `String` so building it (often just a name with a sigil glued on) never
+/// allocates.
+fn print_position_error(
+    message: std::fmt::Arguments,
+    location: &str,
+    line_no: usize,
+    line_text: &str,
+    column: usize,
+) {
+    eprintln!("jq: error: {message} at {location}, line {line_no}:");
+    eprintln!("{line_text}{}", " ".repeat(column));
 }
 
 impl From<anyhow::Error> for ModuleLoadError {
@@ -2321,34 +2346,52 @@ fn report_unresolved_call(
     if let Some(offset) = from_table {
         *resume_from = offset + name.len();
         let (line_no, line_text, column) = line_at_offset(source, offset);
-        eprintln!("jq: error: {name}/{arity} is not defined at {location}, line {line_no}:");
-        eprintln!("{line_text}{}", " ".repeat(column));
+        report_site_error(
+            format_args!("{name}/{arity}"),
+            location,
+            Some((line_no, &line_text, column)),
+        );
         return;
     }
 
     match locate_identifier_from(source, name, *resume_from) {
         Some((line_no, line_text, column, end)) => {
             *resume_from = end;
-            eprintln!("jq: error: {name}/{arity} is not defined at {location}, line {line_no}:");
-            eprintln!("{line_text}{}", " ".repeat(column));
+            report_site_error(
+                format_args!("{name}/{arity}"),
+                location,
+                Some((line_no, &line_text, column)),
+            );
         }
         None => {
-            eprintln!("jq: error: {name}/{arity} is not defined at {location}");
+            report_site_error(format_args!("{name}/{arity}"), location, None);
         }
     }
 }
 
 /// Print one "`header` is not defined"-shaped compile-error line against
-/// `source`, given the site's byte offset if a table lookup found one -- the
-/// print body [`report_unbound_var`] and [`report_unresolved_label`] both
-/// need, shared so a format change (added column info, a third line, a
-/// different caret style) has exactly one definition to update.
-fn report_site_error(header: &str, location: &str, source: &str, offset: Option<usize>) {
-    match offset {
-        Some(offset) => {
-            let (line_no, line_text, column) = line_at_offset(source, offset);
-            eprintln!("jq: error: {header} is not defined at {location}, line {line_no}:");
-            eprintln!("{line_text}{}", " ".repeat(column));
+/// `location`, given the site's resolved `(line_no, line_text, column)` if a
+/// lookup found one -- the print body [`report_unresolved_call`],
+/// [`report_unbound_var`], and [`report_unresolved_label`] all need, on top
+/// of [`print_position_error`]'s own shared caret rendering, so a format
+/// change (added column info, a third line, a different caret style) has
+/// exactly one definition to update. `header` is `std::fmt::Arguments`
+/// rather than an owned `String` so a call site never allocates just to glue
+/// a sigil onto a name.
+fn report_site_error(
+    header: std::fmt::Arguments,
+    location: &str,
+    site: Option<(usize, &str, usize)>,
+) {
+    match site {
+        Some((line_no, line_text, column)) => {
+            print_position_error(
+                format_args!("{header} is not defined"),
+                location,
+                line_no,
+                line_text,
+                column,
+            );
         }
         None => {
             eprintln!("jq: error: {header} is not defined at {location}");
@@ -2379,10 +2422,18 @@ fn report_unbound_var(
         .filter(|v| v.name == name)
         .nth(*taken)
         .map(|v| v.offset);
-    if offset.is_some() {
-        *taken += 1;
+    match offset {
+        Some(offset) => {
+            *taken += 1;
+            let (line_no, line_text, column) = line_at_offset(source, offset);
+            report_site_error(
+                format_args!("${name}"),
+                location,
+                Some((line_no, &line_text, column)),
+            );
+        }
+        None => report_site_error(format_args!("${name}"), location, None),
     }
-    report_site_error(&format!("${name}"), location, source, offset);
 }
 
 /// Report one out-of-scope `break $name` against `source` (the main filter,
@@ -2401,12 +2452,18 @@ fn report_unresolved_label(
     break_sites: &[jq::BreakSite],
     occurrence: usize,
 ) {
-    let offset = break_sites
+    let site = break_sites
         .iter()
         .filter(|b| b.name == name)
         .nth(occurrence)
-        .map(|b| b.offset);
-    report_site_error(&format!("$*label-{name}"), location, source, offset);
+        .map(|b| b.offset)
+        .map(|offset| line_at_offset(source, offset));
+    report_site_error(
+        format_args!("$*label-{name}"),
+        location,
+        site.as_ref()
+            .map(|(line_no, line_text, column)| (*line_no, line_text.as_str(), *column)),
+    );
 }
 
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
