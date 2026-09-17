@@ -54311,6 +54311,127 @@ fn test_truthiness_probes_do_not_trip_the_depth_guard_2692() -> Result<()> {
     Ok(())
 }
 
+/// #2968 in jq mode: the same six consumers, same discriminating document,
+/// where a stubbed positional read presents as a silent wrong answer (the
+/// jq-mode stub is a `null` placeholder). `key`/`parent` are succinctly
+/// extensions in jq mode, so there is no oracle; the acceptance criterion
+/// is the same as #2803's -- every route agrees with the direct read.
+#[test]
+fn consumer_argument_positional_read_resolves_on_every_route_jq_2968() -> Result<()> {
+    let doc = r#"{"aa":{"bbb":1,"c":2}}"#;
+    let g = "range(0;(key|length))";
+    for (filter, want) in [
+        (format!(".aa | isempty({g})"), "false"),
+        (format!(".aa | any({g}; . >= 0)"), "true"),
+        (format!(".aa | all({g}; . < 0)"), "false"),
+        (format!(".aa.bbb | IN({g})"), "true"),
+        (format!(".aa.bbb | IN({g}; 1)"), "true"),
+        (format!(".aa | [skip(1; {g})]"), "[1]"),
+        (format!(r#".aa | "\(isempty({g}))""#), r#""false""#),
+        (
+            format!(".aa | .bbb = all({g}; . < 0)"),
+            r#"{"bbb":false,"c":2}"#,
+        ),
+        (
+            format!(".aa | map_values([skip(1; {g})])"),
+            r#"{"bbb":[1,2],"c":[]}"#,
+        ),
+        (
+            format!(".aa | map_values(any({g}; . == 2))"),
+            r#"{"bbb":true,"c":false}"#,
+        ),
+        (format!(".zz | isempty({g})"), "false"),
+        (r#".aa | any(.[]; key == "bbb")"#.to_string(), "true"),
+        (".aa | all(.[]; (key|length) == 3)".to_string(), "false"),
+    ] {
+        let (out, code) = run_jq_stdin(&filter, doc, &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "#2968: `{filter}`");
+    }
+    Ok(())
+}
+
+/// #2968: the native probe stops `cond` at its first decisive output, on
+/// both evaluators. Captured live from jq 1.7.1: `[any(1; (true,
+/// ("C"|stderr)))]` prints `[true]` and writes nothing -- `or` breaks out
+/// of the `first` in jq's own definition -- where succinctly wrote `C`. The
+/// `input` row reaches `eval.rs`'s own probe through the live-input-queue
+/// deferral, so it pins the eager evaluator's copy of the rule.
+#[test]
+fn any_all_cond_short_circuits_side_effects_2968() -> Result<()> {
+    for (filter, input, want, want_err) in [
+        (r#"[any(1; (true, ("C"|stderr)))]"#, "1", "[true]", ""),
+        (r#"[all(1; (false, ("C"|stderr)))]"#, "1", "[false]", ""),
+        (
+            r#"[any(1; (false, ("C"|stderr), true))]"#,
+            "1",
+            "[true]",
+            "C",
+        ),
+        (r#"any(input; (true, ("C"|stderr)))"#, "1\n2\n", "true", ""),
+        (r#"[any(1; (true, error("late")))]"#, "1", "[true]", ""),
+        (r#"[all(1; (false, error("late")))]"#, "1", "[false]", ""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}` stderr {err:?}");
+        assert_eq!(err.trim(), want_err, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2968: the `?//` terminal rule the native `isempty` twin inherits from
+/// `eval.rs` -- the identity fires even when the outer sink already stopped
+/// (`counted_bool_flow_to_flow_generic`). Captured live from jq 1.7.1 with
+/// input `1`; a port that reused `finish_short_circuit` answers `[false]`.
+/// Every row here now takes the native generic route (the `-n`/document
+/// route no longer bridges), so this is that route's own pin.
+#[test]
+fn isempty_any_in_retry_terminal_rule_on_native_route_2968() -> Result<()> {
+    for (filter, want) in [
+        (
+            r#"[first(isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else empty end))]"#,
+            "[false,true]",
+        ),
+        ("[first(isempty(1 as $x ?// $y | 1))]", "[false,false]"),
+        ("[isempty(isempty(1 as $x ?// $y | 1))]", "[false,false]"),
+        ("[first(any(1 as $x ?// $y | 1; .))]", "[true,true]"),
+        ("[isempty(any(1 as $x ?// $y | 1; .))]", "[false,false]"),
+        ("[first(IN(1 as $x ?// $y | 1))]", "[true,true]"),
+        ("[limit(1; IN(1 as $x ?// $y | 1))]", "[true,true]"),
+        ("[first(IN(1; 1 as $x ?// $y | 1))]", "[true,true]"),
+        ("[first(skip(0; 1 as $x ?// $y | 5, 6))]", "[5,5]"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "1", &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2968: leaving `bridge_to_each_owned_flow` stops the whole-document
+/// materialization the bridge performed, so a consumer whose argument reads
+/// `.b` no longer raises for a fault in `.a` (the #2103/#2173 class -- jq
+/// 1.7.1 exits 5 on every row, it parses eagerly; recorded in
+/// `docs/compliance/jq/limitations.md`). The control row reads the bad leaf
+/// itself and must still raise; bare `.a` is not used as the control
+/// because M2 passthrough never raises there.
+#[test]
+fn consumers_validate_only_what_they_read_2968() -> Result<()> {
+    let doc = r#"{"a":"bad\x","b":5}"#;
+    for (filter, want) in [
+        ("isempty(.b)", "false"),
+        ("any(.b; . == 5)", "true"),
+        ("all(.b; . == 5)", "true"),
+        ("IN(.b; 5)", "true"),
+        (".b | IN(5)", "true"),
+        ("[skip(0; .b)]", "[5]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}` stderr {err:?}");
+    }
+    let (_out, err, code) = run_jq_full(&["-c", "any(.a; length > 0)"], Some(doc))?;
+    assert_eq!(code, 5, "control reads the bad leaf: stderr {err:?}");
+    Ok(())
+}
+
 /// #2173: a filter that reads nothing answers the same on a malformed
 /// document as on a well-formed one, **whatever route its spelling takes**.
 ///
@@ -54395,6 +54516,14 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         ("isempty(1)", "false"),
         ("any(range(3); . > 1)", "true"),
         ("all(range(3); . >= 0)", "true"),
+        // #2968: off the bridge, the six consumers validate only what their
+        // arguments materialize -- `IN(src; s)` and `skip` join the three
+        // above (`IN(s)` compares against `.`, so it reads the document and
+        // is not a closed term); a `.b`-reading argument on a document whose
+        // fault is in `.a` is a separate row in
+        // `consumers_validate_only_what_they_read_2968`.
+        ("IN(1; 1)", "true"),
+        ("[skip(1; 1, 2)]", "[2]"),
         // #2698: `range` with a *closed* bound was already here in spirit
         // (`[range(3)]` above); these pin that the native arm keeps it so on
         // every route, including the ones that used to bridge.
