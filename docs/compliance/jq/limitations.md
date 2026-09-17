@@ -968,9 +968,7 @@ is the revert that established what the other one costs.
    `input | reduce (.) as $x (.; ($x.a = 9))` (a fold's loop variable, demoted with the
    accumulator's re-index, as the generic fold has done since #2642),
    `input | . as $x | try error($x) catch path($x)` (an `eval.rs`-minted marker carries no
-   node witness for `try_payload_root` to match) and `. as $x | any(.; ($x.a = 9))` (`cond`
-   runs on each element `gen` yields as a computed value, even when `gen` is `.`) all
-   answer in jq and refuse here.
+   node witness for `try_payload_root` to match) all answer in jq and refuse here.
    Pinned in `tests/jq_cli_tests.rs` (`*_3036`), swept by
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `in-evaluator-*` rows and fuzzed by
    `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family. The accepting direction — recovering

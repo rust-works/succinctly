@@ -29265,33 +29265,42 @@ fn has_demotable_marker(expr: &Expr, root: &RootWitness) -> bool {
 /// (measured +5% on that shape, both architectures) for no observable
 /// change.
 fn demote_for_owned_reentry(expr: &Expr) -> Cow<'_, Expr> {
-    if !has_demotable_marker(expr, &RootWitness::Owned) || !may_enter_resolver(expr) {
+    // One walk for both questions: this runs once per re-entry, which on a
+    // per-element shape is once per element, so a second pass over a
+    // marker-bearing body was measurable (about +1% on a 7950X).
+    let mut demotable = false;
+    let mut resolver = false;
+    any_subexpr(expr, &mut |e| {
+        demotable |= matches!(e, Expr::TrackedVar(marker)
+            if marker_needs_demotion(marker, &RootWitness::Owned));
+        resolver |= may_enter_resolver_node(e);
+        demotable && resolver
+    });
+    if !(demotable && resolver) {
         return Cow::Borrowed(expr);
     }
     demote_rebuilt_markers(expr, &RootWitness::Owned)
 }
 
-/// Whether evaluating `expr` can start a resolver invocation -- see
-/// [`demote_for_owned_reentry`]. Conservative: every builtin and every call
-/// counts, and [`any_subexpr`] descends into `def` bodies, resolved
-/// `DefCall`s and `Shared` arguments.
-fn may_enter_resolver(expr: &Expr) -> bool {
-    any_subexpr(expr, &mut |e| {
-        matches!(
-            e,
-            Expr::Assign { .. }
-                | Expr::Update { .. }
-                | Expr::CompoundAssign { .. }
-                | Expr::AlternativeAssign { .. }
-                | Expr::MetaAssign { .. }
-                | Expr::Builtin(_)
-                | Expr::FuncCall { .. }
-                | Expr::NamespacedCall { .. }
-                | Expr::DefCall { .. }
-                | Expr::FuncDef { .. }
-                | Expr::Shared(_)
-        )
-    })
+/// Whether evaluating `node` itself can start a resolver invocation -- see
+/// [`demote_for_owned_reentry`], which asks this of every node in the
+/// expression. Conservative: every builtin and every call counts (a `def`
+/// body, a resolved `DefCall` and a `Shared` argument are walked too).
+fn may_enter_resolver_node(node: &Expr) -> bool {
+    matches!(
+        node,
+        Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+            | Expr::MetaAssign { .. }
+            | Expr::Builtin(_)
+            | Expr::FuncCall { .. }
+            | Expr::NamespacedCall { .. }
+            | Expr::DefCall { .. }
+            | Expr::FuncDef { .. }
+            | Expr::Shared(_)
+    )
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
