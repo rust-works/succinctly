@@ -17694,8 +17694,23 @@ fn test_reduce_foreach_if_before_as_is_a_compile_error_3038() -> Result<()> {
         "if true then . end as $z | $z",
         "if true then . else 2 end as $z | $z",
         "1 + reduce empty as $i (.; .) as $z | $z",
+        // Any generic `EXPR?` suppression is also never a Term, regardless
+        // of what it wraps -- even a Term-shaped call like `error("x")`.
+        "1? as $z | $z",
+        "(1)? as $z | $z",
+        "empty? as $z | $z",
+        "(if true then 1 end)? as $z | $z",
+        r#"error("x")? as $z | $z"#,
+        // Unary minus and `try` propagate their operand's term-status.
+        "-reduce (1,2,3) as $i (0;.+$i) as $z | $z",
+        "try if true then 1 end as $z | $z",
+        // reduce/foreach's own dedicated `as` clause carries the identical
+        // restriction on its SOURCE operand.
+        "reduce if true then (1,2) else (3,4) end as $i (0;.+$i)",
+        "foreach if true then (1,2) else (3,4) end as $i (0;.+$i;.)",
+        "reduce reduce (1,2) as $j (0;.+$j) as $i (0;.+$i)",
     ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("1"))?;
+        let (stdout, stderr, code) = run_jq_full(&["-c", "--", filter], Some("1"))?;
         assert_eq!(
             code, 3,
             "`{filter}` should be a compile error (exit 3) -- stdout: {stdout:?} stderr: {stderr:?}"
@@ -17716,11 +17731,28 @@ fn test_reduce_foreach_if_before_as_is_a_compile_error_3038() -> Result<()> {
         (". // 3 as $z | $z", "1"),
         (". == 1 as $z | $z", "true"),
         ("true and true as $z | $z", "true"),
+        // A bare if/reduce/foreach only affects the pipe *stage* it heads
+        // -- a later, unrelated stage's own operand is unaffected.
+        ("reduce empty as $i (.;.) | . as $z | $z", "1"),
+        ("if true then 1 end | . as $z | $z", "1"),
     ] {
         let (stdout, code) = run_jq_stdin(filter, "1", &["-c"])?;
         assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
         assert_eq!(stdout.trim(), want, "`{filter}`");
     }
+
+    // Negating a genuine Term stays legal -- `--` needed since the filter
+    // itself starts with `-`.
+    let (stdout, _stderr, code) = run_jq_full(&["-nc", "--", "-1 as $z | $z"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "-1");
+
+    // `.foo?`/`.[0]?` (the dedicated postfix-optional form) stays a Term,
+    // unlike a generic `EXPR?` suppression -- needs an object input, unlike
+    // the `1`-fed rows above.
+    let (stdout, code) = run_jq_stdin(".a? as $z | $z", r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "1");
 
     Ok(())
 }
