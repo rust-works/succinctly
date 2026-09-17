@@ -52503,21 +52503,21 @@ fn builtin_libm1<W: Clone + AsRef<[u64]>>(
         Libm1::Y1 => float(math::y1(x)),
         Libm1::Frexp => {
             let (m, e) = math::frexp(x);
-            QueryResult::Owned(OwnedValue::Array(vec![
+            QueryResult::Owned(OwnedValue::array_from(vec![
                 OwnedValue::Float(m),
                 OwnedValue::Int(i64::from(e)),
             ]))
         }
         Libm1::Modf => {
             let (frac, int) = math::modf(x);
-            QueryResult::Owned(OwnedValue::Array(vec![
+            QueryResult::Owned(OwnedValue::array_from(vec![
                 OwnedValue::Float(frac),
                 OwnedValue::Float(int),
             ]))
         }
         Libm1::LgammaR => {
             let (v, sign) = math::lgamma_r(x);
-            QueryResult::Owned(OwnedValue::Array(vec![
+            QueryResult::Owned(OwnedValue::array_from(vec![
                 OwnedValue::Float(v),
                 OwnedValue::Int(i64::from(sign)),
             ]))
@@ -91026,7 +91026,7 @@ mod tests {
     fn eval_owned_expr_full_empty_many_is_no_output_not_empty_array_1937() {
         // QueryResult::Many, len() == 0: `.[]` over `{}` produces nothing at
         // all, matching `result_to_owned_full`'s identical rule -- not
-        // `Ok(Some((OwnedValue::Array(vec![]), None)))`.
+        // `Ok(Some((OwnedValue::array_from(vec![]), None)))`.
         let empty_obj = OwnedValue::Object(IndexMap::new().into());
         let expr = parse(".[]").unwrap();
         match eval_owned_expr_full::<JqSemantics>(&expr, &empty_obj, false) {
