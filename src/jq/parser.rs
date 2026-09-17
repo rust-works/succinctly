@@ -573,6 +573,30 @@ struct Parser<'a> {
     /// operators or nesting levels sit above it (`1 + reduce ... as $z`
     /// still needs to reject, since the primary parsed last is the bare
     /// `reduce`, not the `1`).
+    ///
+    /// Also demoted (not just the three named keywords) by a trailing
+    /// generic `?` suppression (`parse_primary_optional`; `error("x")? as
+    /// $z` rejects even though `error("x")` alone is a Term -- the
+    /// dedicated `.foo?`/`.[0]?` postfix-optional form is unaffected, since
+    /// it never reaches that function), and *propagated* rather than fixed
+    /// by unary minus and `try`/`catch` (each parses its own operand via a
+    /// nested `parse_primary()` call and deliberately skips this function's
+    /// own shared "it's a Term" tail on the way out, letting whatever that
+    /// nested call already recorded stand).
+    ///
+    /// **Every arm of `parse_primary_inner` that returns early must set
+    /// this explicitly** (either to its own fixed value, or by leaving it
+    /// alone to propagate) -- there is no compiler-enforced check tying a
+    /// return path to the correct value, and an early draft of this fix
+    /// shipped without several of the leaf resets (`.`, `..`, the `[EXPR]`
+    /// return path, the parked-wrong-arity-call return path), letting a
+    /// stale `false` from a preceding bare `reduce`/`if` leak across a `|`
+    /// into an unrelated later stage's own, unrelated `as` check -- caught
+    /// only by live-oracle testing across many pipe/operator shapes, not by
+    /// the type system. A future arm that omits this needs the same
+    /// discipline; there is currently no cheaper substitute that doesn't
+    /// widen this to a return-type change through every intervening
+    /// precedence level.
     last_primary_is_term: bool,
 }
 
@@ -7110,9 +7134,15 @@ impl<'a> Parser<'a> {
         if self.last_primary_is_term {
             Ok(())
         } else {
+            // #3038 review: this also fires for a trailing `?` suppression
+            // and for unary-minus/`try` propagating a non-Term operand --
+            // "wrap a bare if/reduce/foreach" would be wrong advice there
+            // (there may be no if/reduce/foreach at all, e.g. `1? as $z`),
+            // so the message stays generic about *what* rather than
+            // guessing *why*, matching real jq's own equally generic
+            // wording here ("unexpected as, expecting end of file").
             Err(ParseError::new(
-                "unexpected 'as': the value before 'as' must be a term \
-                 (wrap a bare if/reduce/foreach in parentheses)",
+                "unexpected 'as': the value before 'as' must be a term",
                 self.pos,
             ))
         }
