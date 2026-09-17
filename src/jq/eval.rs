@@ -43890,6 +43890,19 @@ pub(crate) fn range_values_f64(
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
+    // Both `implicit_step` call sites (`each_range`, `each_range_generic`)
+    // only ever pass a positive `RangeNum::Int(1)` step -- the 1-arg/2-arg
+    // grammar has no way to spell a negative one -- so the descending
+    // (`step < 0.0`) branch below is unreachable under `implicit_step` and
+    // was deliberately left with the plain, non-NaN-tolerant comparison
+    // (jq's own further divergence there, on `range/3`'s negative step, is
+    // out of scope here -- #3102). Catches a future caller that breaks this
+    // pairing instead of silently answering `range/3`'s wrong shape.
+    debug_assert!(
+        !implicit_step || step > 0.0,
+        "implicit_step range call with a non-positive step: {step}"
+    );
+
     // The cap check rides in the loop's own compound condition, not a
     // `break` inside it, so the float comparison is never clippy's sole
     // `while` condition (`while_float` fires on that shape specifically,
@@ -49556,6 +49569,13 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(r) => return r,
         };
 
+        // `timestamp`, not `local_secs`: the fraction added back is the
+        // input's own fractional part, unaffected by the whole-second
+        // `local_offset` shift already folded into `local_secs` above --
+        // mirrors gmtime's identical `timestamp`-not-`t.second`-alone use
+        // (#3071). Relies on `local_offset` always being a whole number of
+        // seconds (true today -- `parse_simple_tz_offset` only ever parses
+        // one); a sub-second offset would need this re-derived.
         let result = vec![
             OwnedValue::Int(t.year),
             OwnedValue::Int(t.month - 1),
@@ -76972,6 +76992,16 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "implicit_step range call with a non-positive step")]
+    fn test_range_values_f64_rejects_implicit_step_with_negative_step_3071() {
+        // Neither real call site can construct this (the 1-arg/2-arg
+        // grammar has no way to spell a negative step), so this pins the
+        // guard directly rather than through a filter.
+        let _ = range_values_f64(0.0, 5.0, -1.0, true);
     }
 
     #[test]
