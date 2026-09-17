@@ -4973,6 +4973,56 @@ Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by the 
 rows in `test_closed_terms_do_not_validate_2173` (jq) and
 `range_bounds_validate_only_what_they_read_2698` (yq).
 
+### `isempty`/`any`/`all`/`IN`/`skip` validate only what their arguments materialize (#2968)
+
+The same mechanism again, six constructs over. `isempty(g)`, `any(gen; cond)`,
+`all(gen; cond)`, `IN(s)`, `IN(src; s)` and `skip(n; f)` had no native arm in the generic
+evaluator at all: every spelling reached `eval.rs` through `bridge_to_each_owned_flow`, whose
+first act is the whole-document `to_owned_with_cursor` the #2173 entry describes, so they
+validated everything — and, the reason [#2968](https://github.com/rust-works/succinctly/issues/2968)
+was filed, evaluated their arguments with no cursor, so a positional read inside one
+(`isempty(range(0; (key|length)))`) answered its no-cursor default on every route. All six
+now have native, cursor-threaded arms on both routes (`each_isempty_generic` and siblings,
+collected by `eval_builtin`), with `cond` evaluated at each `gen` output's own position.
+
+On `{"a": "bad\x", "b": 5}`, which jq 1.7.1 rejects at parse time for every filter:
+
+| filter                    | jq 1.7.1 | succinctly before | succinctly now |
+|---------------------------|----------|-------------------|----------------|
+| `isempty(.b)`             | error    | error             | `false`        |
+| `any(.b; . == 5)`         | error    | error             | `true`         |
+| `IN(.b; 5)`               | error    | error             | `true`         |
+| `[skip(0; .b)]`           | error    | error             | `[5]`          |
+| `isempty(.a)`             | error    | error             | `false`        |
+| `[skip(1; .a)]`           | error    | error             | `[]`           |
+| `any(.a; length > 0)`     | error    | error — unchanged | error — unchanged |
+| `.a \| IN("x")`           | error    | error — unchanged | error — unchanged |
+| `[skip(0; .a)]`           | error    | error — unchanged | error — unchanged |
+
+The last three rows are the rule stated positively: an argument that *decodes* the
+malformed scalar still raises. `isempty(.a)` and a dropped `skip` output do not decode it —
+`isempty` asks whether `g` produces anything, as `select`'s truthiness read does under
+[#2692](https://github.com/rust-works/succinctly/issues/2692), and a skipped output's value
+is never read — so they answer, like `.[]` over the same document. `IN(s)` compares `.`
+against each candidate, so it materializes both (`.a | IN("x")` raises; `.b | IN(5)` never
+raised, `.b` being sound). Same in yq mode (`--jq-extensions`), where real yq rejects the
+document at read time.
+
+Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by
+`consumers_validate_only_what_they_read_2968` and the `IN(1; 1)`/`skip` rows in
+`test_closed_terms_do_not_validate_2173` (`IN(1, 2)` is deliberately *not* a closed term
+there: it reads `.`).
+
+Two further behaviours moved with the route, both toward jq: the `any`/`all` probe now stops
+`cond` at its first decisive output on both evaluators, so `[any(1; (true, ("C"|stderr)))]`
+writes nothing (jq 1.7.1: `or` breaks out of its `first`; succinctly wrote `C`), and
+`[skip(1000; .users[])]`-shaped queries no longer re-serialize and re-index the document per
+call (3–15× on a 7 MB `users` document, outputs identical). What the eager route's own doc
+comment feared from leaving the owned bridge — duplicate-key and number-spelling fidelity —
+was re-verified and does not move: `{"a":1,"a":2} | any(.[]; . == 1)` is `false` and
+`[.[] | IN(2)]` is `[true]` on both, `[1.0, 1e2] | [skip(1; .[]) | tostring]` is
+`["100"]` on both.
+
 ### A fault found by walking to it leaves the prefix on stdout
 
 succinctly is a semi-index and finds a malformed document only when the walk reaches the

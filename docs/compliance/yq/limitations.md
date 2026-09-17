@@ -1577,6 +1577,29 @@ jq-mode prefix rule and the yq-mode no-prefix rule are both live, per mode, exac
 requires — an earlier draft of this section claimed the rule applied "uniformly in both modes",
 which was true only before #1534.
 
+### `any`/`all(gen; cond)`'s `cond` follows the cursor route's prefix rule (#2968)
+
+Real yq has none of `isempty`/`any(gen; cond)`/`all(gen; cond)`/`IN`/`skip` (lexer-rejected;
+all six are behind `--jq-extensions`), so the baseline for them in yq mode is succinctly's own
+previous answer. [#2968](https://github.com/rust-works/succinctly/issues/2968) moved all six
+off the eager owned bridge onto native cursor-threaded arms — the positional-read fix it was
+filed for, `any(.[]; key == "b")` being wrong on every route — and one shape moved with it:
+a `cond` that is a pipe whose stage is a generator failing part-way.
+
+```bash
+$ printf -- '- [1]\n' | succinctly yq --jq-extensions '[any(.[]; .[0] | (true, error("late")))]'
+# before: [true]        (the owned route kept the prefix, jq's rule)
+# now:    Error: late   (the cursor route's rule, real yq's)
+```
+
+That is the rule this page already records for the cursor route — `first(.[0] | (true,
+error("late")))` is `Error: late` here and in real yq, which discards a failing generator's
+prefix ([#2326](https://github.com/rust-works/succinctly/issues/2326)) — reached one construct
+over: `cond` is now evaluated at the `gen` output's own position, on that route. A bare
+`cond` generator (`any(.[]; (true, error("late")))`) still answers `[true]`, exactly as
+`first((true, error("late")))` does: the same split `first` already has. The 99-row
+must-not-change sweep behind the PR found no other yq-mode row that moved.
+
 ### Residues
 
 - **`setpath`/`delpaths` count-message wording.** Real yq says `SETPATH: expected single path but
