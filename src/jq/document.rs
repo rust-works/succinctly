@@ -4584,11 +4584,9 @@ mod node_id_reindex_tests {
         // The bridge's own two lines: an owned value, re-serialized with
         // `to_json_for_reindex` (not `to_json`, #561), re-indexed as a
         // fresh document.
-        let owned = OwnedValue::Array(vec![
-            OwnedValue::Int(1),
-            OwnedValue::Int(2),
-            OwnedValue::Int(3),
-        ]);
+        let owned = OwnedValue::Array(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into(),
+        );
         let reindexed_text = owned.to_json_for_reindex::<JqSemantics>();
         let reindexed_bytes = reindexed_text.as_bytes();
         let reindexed = JsonIndex::build(reindexed_bytes);

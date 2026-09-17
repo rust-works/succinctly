@@ -401,7 +401,7 @@ fn test_slice_array_construction_nests() {
                     OwnedValue::Int(1),
                     OwnedValue::Int(2),
                     OwnedValue::Int(3),
-                ])]
+                ].into())]
             );
         }
     );

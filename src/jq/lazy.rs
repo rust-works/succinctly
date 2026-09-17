@@ -875,7 +875,7 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
-    Ok(OwnedValue::Array(keys))
+    Ok(OwnedValue::Array(keys.into()))
 }
 
 /// Materialize a `JqValue::LazyIndexRange` into the `[0, 1, ..., len-1]`
@@ -1007,12 +1007,13 @@ mod tests {
     /// closing the rest is in the PR and in #3000's corrected comment.
     /// Re-pinning this number means re-doing that measurement.
     ///
-    /// Same 64-bit gate and `unboxed-object-map` exemption as the crate's
-    /// other exact-size pins: the holdout deliberately restores the 72-byte
-    /// layout on both enums at once.
+    /// Same 64-bit gate as the crate's other exact-size pins. #2999 made
+    /// both `Object` arms refcounted and `OwnedValue::Array` one pointer too;
+    /// neither moves either width (the pointer is still 8 bytes, `Cursor`
+    /// still 32), and the `unshared-containers` holdout keeps both pointers,
+    /// so this holds in every build shape.
     #[test]
     #[cfg(target_pointer_width = "64")]
-    #[cfg(not(feature = "unboxed-object-map"))]
     fn jq_value_width_tracks_owned_value_3000() {
         assert_eq!(
             core::mem::size_of::<JqValue<'_, alloc::vec::Vec<u64>>>(),
@@ -1031,20 +1032,6 @@ mod tests {
             8,
             "the JqValue/OwnedValue width gap moved; see this test's derivation"
         );
-    }
-
-    /// The holdout twin of [`jq_value_width_tracks_owned_value_3000`]: under
-    /// `unboxed-object-map` both enums must go back to 72, or the A/B is
-    /// comparing two boxed binaries and calling the difference layout bias.
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    #[cfg(feature = "unboxed-object-map")]
-    fn unboxed_holdout_restores_both_widths_3000() {
-        assert_eq!(
-            core::mem::size_of::<JqValue<'_, alloc::vec::Vec<u64>>>(),
-            72
-        );
-        assert_eq!(core::mem::size_of::<OwnedValue>(), 72);
     }
 
     /// #2868: these real JSON cursors must preserve source spelling on
@@ -1148,14 +1135,17 @@ mod tests {
     fn lazy_cursor_materialization_restores_bridge_numbers_2868() {
         use super::super::eval::JqSemantics;
         use crate::json::JsonIndex;
-        let source = OwnedValue::Array(vec![
-            OwnedValue::Float(f64::NAN),
-            OwnedValue::Float(f64::INFINITY),
-            OwnedValue::Float(f64::NEG_INFINITY),
-            // #2902 now bridges finite computed floats with a private token.
-            OwnedValue::Float(2e16),
-            OwnedValue::Float(-0.0),
-        ])
+        let source = OwnedValue::Array(
+            vec![
+                OwnedValue::Float(f64::NAN),
+                OwnedValue::Float(f64::INFINITY),
+                OwnedValue::Float(f64::NEG_INFINITY),
+                // #2902 now bridges finite computed floats with a private token.
+                OwnedValue::Float(2e16),
+                OwnedValue::Float(-0.0),
+            ]
+            .into(),
+        )
         .to_json_for_reindex::<JqSemantics>();
         let index = JsonIndex::build(source.as_bytes());
         let cursor = index.root(source.as_bytes());
@@ -1499,15 +1489,18 @@ mod tests {
         use crate::json::JsonIndex;
 
         for (json, expected) in [
-            (b"[]".as_slice(), OwnedValue::Array(vec![])),
+            (b"[]".as_slice(), OwnedValue::Array(vec![].into())),
             (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
-                OwnedValue::Array(vec![
-                    OwnedValue::from_number_literal("1"),
-                    OwnedValue::from_number_literal("2"),
-                    OwnedValue::from_number_literal("3"),
-                ]),
+                OwnedValue::Array(
+                    vec![
+                        OwnedValue::from_number_literal("1"),
+                        OwnedValue::from_number_literal("2"),
+                        OwnedValue::from_number_literal("3"),
+                    ]
+                    .into(),
+                ),
             ),
         ] {
             let index = JsonIndex::build(json);
@@ -1631,7 +1624,7 @@ mod tests {
         let arr: JqValue<'_, Vec<u64>> = JqValue::Array(vec![JqValue::Int(1), JqValue::Int(2)]);
         assert_eq!(
             arr.into_owned().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
         );
     }
 
@@ -1717,26 +1710,25 @@ mod tests {
     #[test]
     fn test_jqvalue_lazy_index_range_materialize_and_into_owned() {
         let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
-        assert_eq!(empty.materialize().unwrap(), OwnedValue::Array(vec![]));
+        assert_eq!(
+            empty.materialize().unwrap(),
+            OwnedValue::Array(vec![].into())
+        );
 
         let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
         assert_eq!(
             three.materialize().unwrap(),
-            OwnedValue::Array(vec![
-                OwnedValue::Int(0),
-                OwnedValue::Int(1),
-                OwnedValue::Int(2)
-            ])
+            OwnedValue::Array(
+                vec![OwnedValue::Int(0), OwnedValue::Int(1), OwnedValue::Int(2)].into()
+            )
         );
 
         let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
         assert_eq!(
             three.into_owned().unwrap(),
-            OwnedValue::Array(vec![
-                OwnedValue::Int(0),
-                OwnedValue::Int(1),
-                OwnedValue::Int(2)
-            ])
+            OwnedValue::Array(
+                vec![OwnedValue::Int(0), OwnedValue::Int(1), OwnedValue::Int(2)].into()
+            )
         );
     }
 
@@ -2010,7 +2002,7 @@ mod tests {
     fn linear_owned_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v]);
+            v = OwnedValue::Array(vec![v].into());
         }
         v
     }
@@ -2130,10 +2122,13 @@ mod tests {
         };
         assert_eq!(
             lazy_keys_array_to_owned(&fields, true).unwrap(),
-            OwnedValue::Array(vec![
-                OwnedValue::String("b".to_string()),
-                OwnedValue::String("a".to_string()),
-            ])
+            OwnedValue::Array(
+                vec![
+                    OwnedValue::String("b".to_string()),
+                    OwnedValue::String("a".to_string()),
+                ]
+                .into()
+            )
         );
 
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
@@ -2145,7 +2140,7 @@ mod tests {
         };
         assert_eq!(
             lazy_keys_array_to_owned(&fields, true).expect("preserved, not raised (#1642)"),
-            OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+            OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into())
         );
     }
 
@@ -2318,9 +2313,12 @@ mod tests {
             nested_in_array
                 .materialize()
                 .expect("a nested undecodable key is preserved, not raised on (#1642)"),
-            OwnedValue::Array(vec![OwnedValue::Array(vec![OwnedValue::String(
-                "\u{FFFD}\u{FFFD}".to_string()
-            )])])
+            OwnedValue::Array(
+                vec![OwnedValue::Array(
+                    vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into()
+                )]
+                .into()
+            )
         );
 
         let nested_in_object: JqValue<'_, Vec<u64>> =
@@ -2333,7 +2331,9 @@ mod tests {
             OwnedValue::Object(
                 IndexMap::from([(
                     "x".to_string(),
-                    OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+                    OwnedValue::Array(
+                        vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into()
+                    )
                 )])
                 .into()
             )

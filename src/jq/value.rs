@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
+use alloc::rc::Rc;
 use core::ops::{Deref, DerefMut};
 
 use indexmap::IndexMap;
@@ -1737,33 +1738,59 @@ fn try_positive_shifted_plain(
     format_positive_shifted_plain(sign, &full_mantissa_str, shifted_exp, digit_count)
 }
 
+// ---------------------------------------------------------------------------
+// Shared container storage (#3000, #2999)
+// ---------------------------------------------------------------------------
+//
+// `OwnedValue::Array` and `OwnedValue::Object` hold their storage behind one
+// pointer each, wrapped in [`ArrayOf`] / [`ObjectMapOf`]. Two facts fall out
+// of that pointer and both matter:
+//
+// 1. **Width** (#3000). `IndexMap` is 72 bytes inline and made `Object` the
+//    widest arm of `OwnedValue` *and* of `lazy::JqValue`, so every value of
+//    either -- every array element, map entry and bare `Null` -- was 72
+//    bytes. Behind a pointer, `size_of::<OwnedValue>()` is 32: a 55% cut on
+//    every element of every `Vec<OwnedValue>`, on every route.
+// 2. **Sharing** (#2999). In the shipped build that pointer is an `Rc`, so
+//    `OwnedValue::clone()` is a refcount bump per container rather than a
+//    deep copy, and the copy happens lazily -- `DerefMut` runs
+//    `Rc::make_mut`, which clones the storage only if another handle still
+//    shares it. The write routes that must keep an unmutated document
+//    beside a written one (`eval_assign_streaming`, `fork_rhs_over_paths`,
+//    the `Iterate` fan-out in `set_path`) used to deep-copy the whole tree
+//    for that separation; now they copy exactly the spine they write.
+//
+// Copy-on-write is invisible to callers in every way but cost: the crate has
+// no `unsafe` in `src/jq`, so a `&mut` into one handle can never alias
+// another, and no `Send`/`Sync` bound exists anywhere the values travel
+// (`main` runs evaluation on one spawned thread), which is why this is `Rc`
+// and not `Arc`. The one behavioural surface is *when* a copy happens, and
+// [`share_stats`](super::share_stats) records every forced one with its call
+// site so that question is answered by a list, not an A/B.
+//
+// **One definition for both enums, deliberately.** `JqValue::try_from_owned`
+// converts an `OwnedValue` tree into a `JqValue` tree one node at a time,
+// freeing each source map and immediately allocating the destination one. If
+// the two `Object` arms are not the *same* wrapper type, those two heap chunks
+// differ in size and the allocator cannot recycle: #3000's first form boxed
+// only `OwnedValue` and measured 15% less live heap at peak with 23% more RSS
+// on `wide_10mb | to_entries` -- ~290 bytes of allocator hole per entry
+// object. Both enums use `ObjectMapOf`, so a change here moves both at once.
+//
+// The `unshared-containers` cargo feature swaps the `Rc` for a `Box` in both
+// wrappers. That is functionally the #3000 layout built from this source
+// shape: the never-triggering holdout an A/B of the sharing subtracts as
+// code-layout bias (see `docs/guides/benchmarking.md`). Measurement only;
+// never enable it in a shipped build.
+
 /// The backing store for an object-valued enum arm: an
-/// `IndexMap<String, V>` held behind a single pointer (#3000).
+/// `IndexMap<String, V>` held behind a single pointer (#3000), refcounted so
+/// that clones share it until one side writes (#2999).
 ///
-/// `IndexMap` is 72 bytes inline. That made `Object` the widest arm of both
-/// [`OwnedValue`] and [`JqValue`](crate::jq::lazy::JqValue) and forced *every*
-/// value of either -- every array element, every map entry, every bare `Null`
-/// -- to be 72 bytes wide. With the map boxed here, `size_of::<OwnedValue>()`
-/// is 32: a 55% cut on every element of every `Vec<OwnedValue>`, on every
-/// route, eager and streaming alike.
-///
-/// **One definition, deliberately.** `OwnedValue` is what a query evaluates
-/// to and `JqValue` is what `jq_runner` prints, and
-/// `JqValue::try_from_owned` converts the first into the second one node at a
-/// time -- freeing each `OwnedValue` object's map and immediately allocating
-/// the `JqValue` one. If the two enums are not the same width, those two
-/// chunk sizes differ and *nothing the conversion frees fits what it then
-/// asks for*: the allocator cannot recycle, and peak RSS grows by the whole
-/// hole even though live heap shrank. #3000's first form boxed only
-/// `OwnedValue` and measured exactly that -- 15% less live heap at peak and
-/// 23% more RSS on `wide_10mb | to_entries`, ~290 bytes of holes per entry
-/// object. Both arms use this type so the sizes move together; the pins
-/// `owned_value_is_32_bytes_because_its_object_map_is_boxed_3000` and
-/// `jq_value_matches_owned_value_width_3000` assert it.
-///
-/// The cost is one extra allocation and one extra pointer chase per object --
-/// charged per object regardless of size, so an *empty* `{}`, which used to
-/// cost nothing on the heap (`IndexMap::new()` does not allocate), now costs a
+/// The cost is one extra allocation (plus, in the shipped shape, a 16-byte
+/// refcount header) and one extra pointer chase per object -- charged per
+/// object regardless of size, so an *empty* `{}`, which used to cost nothing
+/// on the heap (`IndexMap::new()` does not allocate), now costs a
 /// `malloc`/`free` pair with no offsetting inline saving of its own.
 ///
 /// The indirection is invisible to callers. [`Deref`]/[`DerefMut`] expose
@@ -1773,29 +1800,29 @@ fn try_positive_shifted_plain(
 /// reading and writing the map exactly as before. Only *construction* from a
 /// bare `IndexMap` needs a `.into()`.
 ///
-/// Note for downstream users: this is a **breaking change** to the shape of
-/// the `OwnedValue::Object` variant. Construct with
+/// `DerefMut` and the by-value conversions (`into_index_map`, the owned
+/// `IntoIterator`) are where a shared map is copied; both are
+/// `#[track_caller]` so [`share_stats`](super::share_stats) can name the
+/// line that forced it.
+///
+/// Note for downstream users: the shape of the `OwnedValue::Object` variant
+/// changed in #3000 (boxed) and again in #2999 (refcounted). Construct with
 /// [`OwnedValue::object_from`] (or `IndexMap::....into()`) and read through
 /// [`OwnedValue::as_object`]/[`OwnedValue::as_object_mut`], whose signatures
-/// are unchanged.
+/// are unchanged throughout.
 pub struct ObjectMapOf<V>(ObjectMapInnerOf<V>);
 
 /// [`OwnedValue::Object`]'s backing store: [`ObjectMapOf`] over `OwnedValue`.
 pub type ObjectMap = ObjectMapOf<OwnedValue>;
 
-/// [`ObjectMapOf`]'s inner representation, boxed in the shipped build.
-///
-/// The `unboxed-object-map` feature swaps it back to a plain inline
-/// `IndexMap` so a *functionally pre-#3000* binary can be built from this
-/// branch's own source shape. That binary is the layout-bias holdout the
-/// A/B in #3000 subtracts (see `docs/guides/benchmarking.md`); it is a
-/// measurement tool only and must never be enabled in a shipped build.
-#[cfg(not(feature = "unboxed-object-map"))]
-type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
+/// [`ObjectMapOf`]'s inner representation: refcounted in the shipped build.
+#[cfg(not(feature = "unshared-containers"))]
+type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
 
-/// See [`ObjectMapInnerOf`]'s boxed twin -- measurement-only holdout shape.
-#[cfg(feature = "unboxed-object-map")]
-type ObjectMapInnerOf<V> = IndexMap<String, V>;
+/// See [`ObjectMapInnerOf`]'s shared twin -- the `unshared-containers`
+/// measurement holdout, functionally the #3000 layout.
+#[cfg(feature = "unshared-containers")]
+type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
 
 impl<V> ObjectMapOf<V> {
     /// An empty object map.
@@ -1810,19 +1837,47 @@ impl<V> ObjectMapOf<V> {
         Self::from(IndexMap::with_capacity(capacity))
     }
 
-    /// Consume this map, yielding the `IndexMap` it wraps.
-    #[cfg(not(feature = "unboxed-object-map"))]
+    /// Whether another handle currently shares this map's storage, i.e.
+    /// whether the next write through this handle will copy it.
+    ///
+    /// Always `false` under `unshared-containers`, where every clone already
+    /// copied eagerly.
     #[inline]
-    pub fn into_index_map(self) -> IndexMap<String, V> {
-        *self.0
+    pub fn is_shared(&self) -> bool {
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            Rc::strong_count(&self.0) > 1
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            false
+        }
     }
+}
 
-    /// See [`ObjectMapOf::into_index_map`]'s boxed twin -- the holdout shape
-    /// holds the map inline, so there is nothing to unbox.
-    #[cfg(feature = "unboxed-object-map")]
+impl<V: Clone> ObjectMapOf<V> {
+    /// Consume this map, yielding the `IndexMap` it wraps -- by move when
+    /// this handle was the last one, by copy otherwise.
     #[inline]
+    #[track_caller]
     pub fn into_index_map(self) -> IndexMap<String, V> {
-        self.0
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            match Rc::try_unwrap(self.0) {
+                Ok(map) => map,
+                Err(shared) => {
+                    #[cfg(any(test, feature = "share-stats"))]
+                    super::share_stats::record(super::share_stats::site(
+                        super::share_stats::Kind::ObjectUnwrap,
+                    ));
+                    (*shared).clone()
+                }
+            }
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            *self.0
+        }
     }
 }
 
@@ -1837,6 +1892,8 @@ impl<V> Default for ObjectMapOf<V> {
     }
 }
 
+/// A refcount bump in the shipped shape (the copy is deferred to the first
+/// write through either handle); a deep copy under `unshared-containers`.
 impl<V: Clone> Clone for ObjectMapOf<V> {
     #[inline]
     fn clone(&self) -> Self {
@@ -1847,8 +1904,8 @@ impl<V: Clone> Clone for ObjectMapOf<V> {
 impl<V: PartialEq> PartialEq for ObjectMapOf<V> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // Through `Deref`, not the field: the field is a `Box` in the
-        // shipped shape and a bare `IndexMap` under `unboxed-object-map`.
+        // Through `Deref`, not the field: the field is an `Rc` in the
+        // shipped shape and a `Box` under `unshared-containers`.
         **self == **other
     }
 }
@@ -1874,29 +1931,40 @@ impl<V> Deref for ObjectMapOf<V> {
     }
 }
 
-impl<V> DerefMut for ObjectMapOf<V> {
+/// The copy-on-write point: a shared map is cloned here, once, before the
+/// caller's write reaches it. `V: Clone` is what `Rc::make_mut` needs and is
+/// the only bound the sharing adds anywhere.
+impl<V: Clone> DerefMut for ObjectMapOf<V> {
     #[inline]
+    #[track_caller]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            #[cfg(any(test, feature = "share-stats"))]
+            if Rc::strong_count(&self.0) > 1 {
+                super::share_stats::record(super::share_stats::site(
+                    super::share_stats::Kind::ObjectMakeMut,
+                ));
+            }
+            Rc::make_mut(&mut self.0)
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            &mut self.0
+        }
     }
 }
 
 impl<V> From<IndexMap<String, V>> for ObjectMapOf<V> {
-    #[cfg(not(feature = "unboxed-object-map"))]
     #[inline]
     fn from(map: IndexMap<String, V>) -> Self {
-        Self(Box::new(map))
-    }
-
-    #[cfg(feature = "unboxed-object-map")]
-    #[inline]
-    fn from(map: IndexMap<String, V>) -> Self {
-        Self(map)
+        Self(ObjectMapInnerOf::new(map))
     }
 }
 
-impl<V> From<ObjectMapOf<V>> for IndexMap<String, V> {
+impl<V: Clone> From<ObjectMapOf<V>> for IndexMap<String, V> {
     #[inline]
+    #[track_caller]
     fn from(map: ObjectMapOf<V>) -> Self {
         map.into_index_map()
     }
@@ -1909,18 +1977,20 @@ impl<V> FromIterator<(String, V)> for ObjectMapOf<V> {
     }
 }
 
-impl<V> Extend<(String, V)> for ObjectMapOf<V> {
+impl<V: Clone> Extend<(String, V)> for ObjectMapOf<V> {
     #[inline]
+    #[track_caller]
     fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, iter: I) {
-        self.0.extend(iter);
+        (**self).extend(iter);
     }
 }
 
-impl<V> IntoIterator for ObjectMapOf<V> {
+impl<V: Clone> IntoIterator for ObjectMapOf<V> {
     type Item = (String, V);
     type IntoIter = indexmap::map::IntoIter<String, V>;
 
     #[inline]
+    #[track_caller]
     fn into_iter(self) -> Self::IntoIter {
         self.into_index_map().into_iter()
     }
@@ -1936,13 +2006,250 @@ impl<'a, V> IntoIterator for &'a ObjectMapOf<V> {
     }
 }
 
-impl<'a, V> IntoIterator for &'a mut ObjectMapOf<V> {
+impl<'a, V: Clone> IntoIterator for &'a mut ObjectMapOf<V> {
     type Item = (&'a String, &'a mut V);
     type IntoIter = indexmap::map::IterMut<'a, String, V>;
 
     #[inline]
+    #[track_caller]
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter_mut()
+        (**self).iter_mut()
+    }
+}
+
+/// The backing store for an array-valued enum arm: a `Vec<V>` held behind a
+/// single refcounted pointer (#2999), the array twin of [`ObjectMapOf`].
+///
+/// Before #2999 `OwnedValue::Array` held its `Vec` inline (24 bytes, never
+/// the widest arm, so no width was at stake). Sharing is the entire reason
+/// for this wrapper: the 200,000-element array in #2976's repro *is* the
+/// spine of `.[(0,1)] = 0`, and without element-level sharing keeping the
+/// pristine document beside the written one meant copying every element.
+/// With it, `pristine.clone()` bumps one refcount and the first write copies
+/// the one `Vec` -- 32 bytes per element, and for nested containers a
+/// refcount bump each, never their contents.
+///
+/// The cost is one extra allocation (the `Rc` header plus the `Vec` header)
+/// and one pointer chase per array, including an empty `[]` that used to be
+/// free on the heap. Arrays of many small arrays are where that shows;
+/// #2999's measurements put a number on it.
+///
+/// Same transparency contract as [`ObjectMapOf`]: [`Deref`] to the `Vec`,
+/// [`DerefMut`] as the copy-on-write point, all three [`IntoIterator`]
+/// forms, [`From`]/[`FromIterator`]/[`Extend`], and a `Debug` that prints the
+/// bare `Vec`. Only *construction* from a bare `Vec` needs `.into()` (or
+/// [`OwnedValue::array_from`]).
+pub struct ArrayOf<V>(ArrayInnerOf<V>);
+
+/// [`OwnedValue::Array`]'s backing store: [`ArrayOf`] over `OwnedValue`.
+/// (Unrelated to the `arrayvec` crate.)
+pub type ArrayVec = ArrayOf<OwnedValue>;
+
+/// [`ArrayOf`]'s inner representation: refcounted in the shipped build.
+#[cfg(not(feature = "unshared-containers"))]
+type ArrayInnerOf<V> = Rc<Vec<V>>;
+
+/// See [`ArrayInnerOf`]'s shared twin -- the `unshared-containers`
+/// measurement holdout.
+#[cfg(feature = "unshared-containers")]
+type ArrayInnerOf<V> = Box<Vec<V>>;
+
+impl<V> ArrayOf<V> {
+    /// An empty array.
+    #[inline]
+    pub fn new() -> Self {
+        Self::from(Vec::new())
+    }
+
+    /// An empty array with room for `capacity` elements.
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::from(Vec::with_capacity(capacity))
+    }
+
+    /// Whether another handle currently shares this array's storage, i.e.
+    /// whether the next write through this handle will copy it.
+    ///
+    /// Always `false` under `unshared-containers`.
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            Rc::strong_count(&self.0) > 1
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            false
+        }
+    }
+}
+
+impl<V: Clone> ArrayOf<V> {
+    /// Consume this array, yielding the `Vec` it wraps -- by move when this
+    /// handle was the last one, by copy otherwise.
+    #[inline]
+    #[track_caller]
+    pub fn into_vec(self) -> Vec<V> {
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            match Rc::try_unwrap(self.0) {
+                Ok(vec) => vec,
+                Err(shared) => {
+                    #[cfg(any(test, feature = "share-stats"))]
+                    super::share_stats::record(super::share_stats::site(
+                        super::share_stats::Kind::ArrayUnwrap,
+                    ));
+                    (*shared).clone()
+                }
+            }
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            *self.0
+        }
+    }
+}
+
+impl<V> Default for ArrayOf<V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A refcount bump in the shipped shape; a deep copy under
+/// `unshared-containers`.
+impl<V: Clone> Clone for ArrayOf<V> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<V: PartialEq> PartialEq for ArrayOf<V> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+/// An array compares equal to the bare `Vec` it wraps, in both directions,
+/// so `assert_eq!(items, vec![..])` keeps reading as it did when
+/// `OwnedValue::Array` held a `Vec` -- the same transparency the `Deref`
+/// gives reads.
+impl<V: PartialEq> PartialEq<Vec<V>> for ArrayOf<V> {
+    #[inline]
+    fn eq(&self, other: &Vec<V>) -> bool {
+        **self == *other
+    }
+}
+
+impl<V: PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
+    #[inline]
+    fn eq(&self, other: &ArrayOf<V>) -> bool {
+        *self == **other
+    }
+}
+
+/// Transparent: `{:?}` on an `OwnedValue` prints `Array([...])`, as it always
+/// has.
+impl<V: core::fmt::Debug> core::fmt::Debug for ArrayOf<V> {
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<V> Deref for ArrayOf<V> {
+    type Target = Vec<V>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// The copy-on-write point for arrays; see [`ObjectMapOf`]'s `DerefMut`.
+impl<V: Clone> DerefMut for ArrayOf<V> {
+    #[inline]
+    #[track_caller]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            #[cfg(any(test, feature = "share-stats"))]
+            if Rc::strong_count(&self.0) > 1 {
+                super::share_stats::record(super::share_stats::site(
+                    super::share_stats::Kind::ArrayMakeMut,
+                ));
+            }
+            Rc::make_mut(&mut self.0)
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            &mut self.0
+        }
+    }
+}
+
+impl<V> From<Vec<V>> for ArrayOf<V> {
+    #[inline]
+    fn from(vec: Vec<V>) -> Self {
+        Self(ArrayInnerOf::new(vec))
+    }
+}
+
+impl<V: Clone> From<ArrayOf<V>> for Vec<V> {
+    #[inline]
+    #[track_caller]
+    fn from(array: ArrayOf<V>) -> Self {
+        array.into_vec()
+    }
+}
+
+impl<V> FromIterator<V> for ArrayOf<V> {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
+        Self::from(Vec::from_iter(iter))
+    }
+}
+
+impl<V: Clone> Extend<V> for ArrayOf<V> {
+    #[inline]
+    #[track_caller]
+    fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
+        (**self).extend(iter);
+    }
+}
+
+impl<V: Clone> IntoIterator for ArrayOf<V> {
+    type Item = V;
+    type IntoIter = alloc::vec::IntoIter<V>;
+
+    #[inline]
+    #[track_caller]
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<'a, V> IntoIterator for &'a ArrayOf<V> {
+    type Item = &'a V;
+    type IntoIter = core::slice::Iter<'a, V>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
+    type Item = &'a mut V;
+    type IntoIter = core::slice::IterMut<'a, V>;
+
+    #[inline]
+    #[track_caller]
+    fn into_iter(self) -> Self::IntoIter {
+        (**self).iter_mut()
     }
 }
 
@@ -1981,10 +2288,12 @@ pub enum OwnedValue {
     NumberLiteral(NumberRepr, Box<str>),
     /// JSON string
     String(String),
-    /// JSON array
-    Array(Vec<Self>),
+    /// JSON array (the elements are held behind one refcounted pointer and
+    /// copied on the first write through a shared handle -- see
+    /// [`ArrayVec`] for why)
+    Array(ArrayVec),
     /// JSON object (insertion order preserved like jq; the map is held
-    /// behind one pointer -- see [`ObjectMap`] for why)
+    /// behind one refcounted pointer -- see [`ObjectMap`] for why)
     Object(ObjectMap),
 }
 
@@ -2343,12 +2652,12 @@ impl OwnedValue {
 
     /// Create an empty array.
     pub fn array() -> Self {
-        Self::Array(Vec::new())
+        Self::Array(ArrayVec::new())
     }
 
     /// Create an array from a vector of values.
     pub fn array_from(values: Vec<Self>) -> Self {
-        Self::Array(values)
+        Self::Array(values.into())
     }
 
     /// Create an empty object.
@@ -2479,7 +2788,7 @@ impl OwnedValue {
     /// Convert to a mutable array reference, if possible.
     pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
-            Self::Array(arr) => Some(arr),
+            Self::Array(arr) => Some(&mut **arr),
             _ => None,
         }
     }
@@ -3658,16 +3967,18 @@ mod tests {
     /// bare `Null` costs this.
     ///
     /// 32 is `NumberLiteral(NumberRepr, Box<str>)` -- 16 + 16 -- with the
-    /// discriminant packed into `NumberRepr`'s own niche; boxing the object
-    /// map is what demotes `Object` from widest arm to 8 bytes. The
-    /// `unboxed-object-map` holdout deliberately restores the 72-byte
-    /// layout, so this assertion only holds for the shipped shape. Same
-    /// 64-bit gate as the crate's other exact-size pins (`EvalError`,
+    /// discriminant packed into `NumberRepr`'s own niche; holding the object
+    /// map behind a pointer is what demotes `Object` from widest arm to 8
+    /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
+    /// changes nothing here -- `NumberLiteral` was already the widest arm --
+    /// and is asserted so the shape stays documented. Both wrappers are one
+    /// pointer in every build: `Rc` shipped, `Box` under the
+    /// `unshared-containers` holdout, so this pin has no feature exemption.
+    /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
     /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     #[test]
     #[cfg(target_pointer_width = "64")]
-    #[cfg(not(feature = "unboxed-object-map"))]
-    fn owned_value_is_32_bytes_because_its_object_map_is_boxed_3000() {
+    fn owned_value_is_32_bytes_because_its_containers_are_one_pointer_3000() {
         assert_eq!(
             core::mem::size_of::<OwnedValue>(),
             32,
@@ -3680,20 +3991,10 @@ mod tests {
             "ObjectMap must stay one pointer wide -- that is what keeps Object from \
              being OwnedValue's widest arm again"
         );
-    }
-
-    /// The holdout build's own pin: `unboxed-object-map` must actually
-    /// restore the pre-#3000 layout, or the A/B it exists for is measuring
-    /// two boxed binaries against each other and reporting the difference as
-    /// code-layout bias.
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    #[cfg(feature = "unboxed-object-map")]
-    fn unboxed_object_map_holdout_restores_the_pre_3000_layout_3000() {
-        assert_eq!(core::mem::size_of::<OwnedValue>(), 72);
         assert_eq!(
-            core::mem::size_of::<ObjectMap>(),
-            core::mem::size_of::<IndexMap<String, OwnedValue>>()
+            core::mem::size_of::<ArrayVec>(),
+            core::mem::size_of::<usize>(),
+            "ArrayVec must stay one pointer wide (#2999)"
         );
     }
 
@@ -3873,7 +4174,7 @@ mod tests {
         assert!(OwnedValue::Bool(true).is_truthy());
         assert!(OwnedValue::Int(0).is_truthy()); // 0 is truthy in jq!
         assert!(OwnedValue::String(String::new()).is_truthy()); // "" is truthy in jq!
-        assert!(OwnedValue::Array(vec![]).is_truthy()); // [] is truthy in jq!
+        assert!(OwnedValue::Array(vec![].into()).is_truthy()); // [] is truthy in jq!
     }
 
     #[test]
@@ -3883,7 +4184,7 @@ mod tests {
         assert_eq!(OwnedValue::Int(42).type_name(), "number");
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
         assert_eq!(OwnedValue::String(String::new()).type_name(), "string");
-        assert_eq!(OwnedValue::Array(vec![]).type_name(), "array");
+        assert_eq!(OwnedValue::Array(vec![].into()).type_name(), "array");
         assert_eq!(
             OwnedValue::Object(IndexMap::new().into()).type_name(),
             "object"
@@ -3896,7 +4197,7 @@ mod tests {
         assert_eq!(OwnedValue::String("hello".into()).length(), Some(5));
         assert_eq!(OwnedValue::String("héllo".into()).length(), Some(5)); // Unicode
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]).length(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()).length(),
             Some(2)
         );
         assert_eq!(OwnedValue::Bool(true).length(), None);
@@ -3916,7 +4217,7 @@ mod tests {
             "\"hello\\nworld\""
         );
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]).to_json(),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()).to_json(),
             "[1,2]"
         );
     }
@@ -4003,10 +4304,10 @@ mod tests {
 
     #[test]
     fn test_collection_constructors() {
-        assert_eq!(OwnedValue::array(), OwnedValue::Array(vec![]));
+        assert_eq!(OwnedValue::array(), OwnedValue::Array(vec![].into()));
         assert_eq!(
             OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
         );
         assert_eq!(
             OwnedValue::object(),
@@ -4031,7 +4332,7 @@ mod tests {
         assert!(!OwnedValue::String("1".into()).is_number());
         assert!(!OwnedValue::Bool(true).is_number());
         assert!(!OwnedValue::Null.is_number());
-        assert!(!OwnedValue::Array(vec![]).is_number());
+        assert!(!OwnedValue::Array(vec![].into()).is_number());
     }
 
     #[test]
@@ -4067,12 +4368,12 @@ mod tests {
 
     #[test]
     fn test_as_array_and_mut() {
-        let mut v = OwnedValue::Array(vec![OwnedValue::Int(1)]);
+        let mut v = OwnedValue::Array(vec![OwnedValue::Int(1)].into());
         assert_eq!(v.as_array(), Some(&vec![OwnedValue::Int(1)]));
         v.as_array_mut().unwrap().push(OwnedValue::Int(2));
         assert_eq!(
             v,
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
         );
         assert_eq!(OwnedValue::Null.as_array(), None);
         assert_eq!(OwnedValue::Null.as_array_mut(), None);
@@ -4159,12 +4460,12 @@ mod tests {
     fn test_eq_recurses_through_containers() {
         // `Vec`/`IndexMap` inherit element equality, so containers are numeric-aware too.
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1)]),
-            OwnedValue::Array(vec![OwnedValue::Float(1.0)])
+            OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
+            OwnedValue::Array(vec![OwnedValue::Float(1.0)].into())
         );
         assert_ne!(
-            OwnedValue::Array(vec![OwnedValue::Int(1)]),
-            OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Int(2)])
+            OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
+            OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Int(2)].into())
         );
         assert_eq!(
             OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
@@ -4192,7 +4493,7 @@ mod tests {
         assert_ne!(OwnedValue::Int(0), OwnedValue::Null);
         assert_ne!(OwnedValue::Float(0.0), OwnedValue::Null);
         assert_ne!(
-            OwnedValue::Array(vec![]),
+            OwnedValue::Array(vec![].into()),
             OwnedValue::Object(IndexMap::new().into())
         );
     }
@@ -4202,11 +4503,9 @@ mod tests {
         let v: OwnedValue = vec![1i64, 2, 3].into();
         assert_eq!(
             v,
-            OwnedValue::Array(vec![
-                OwnedValue::Int(1),
-                OwnedValue::Int(2),
-                OwnedValue::Int(3)
-            ])
+            OwnedValue::Array(
+                vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into()
+            )
         );
     }
 
@@ -6252,7 +6551,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v]);
+            v = OwnedValue::Array(vec![v].into());
         }
         v
     }
@@ -6472,7 +6771,7 @@ mod tests {
     /// even though jq considers them equal.
     #[test]
     fn identical_recurses_and_respects_key_order_1360() {
-        let nan_arr = || OwnedValue::Array(vec![OwnedValue::Float(f64::NAN)]);
+        let nan_arr = || OwnedValue::Array(vec![OwnedValue::Float(f64::NAN)].into());
         assert!(nan_arr().identical(&nan_arr()));
         assert_ne!(nan_arr(), nan_arr(), "jq equality still says otherwise");
 
@@ -6511,7 +6810,7 @@ mod tests {
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".nan".into()),
             OwnedValue::String(String::new()),
             OwnedValue::String("s".into()),
-            OwnedValue::Array(Vec::new()),
+            OwnedValue::Array(Vec::new().into()),
             OwnedValue::Object(indexmap::IndexMap::new().into()),
         ] {
             assert!(v.identical(&v), "not reflexive: {v:?}");

@@ -68,20 +68,28 @@ mmap-tests = ["memmap2", "tempfile"]  # Memory-mapped tests
 # Useful for testing broadword performance vs NEON intrinsics.
 broadword-yaml = []
 
-# Measurement-only holdout for #3000: swap `OwnedValue::Object`'s backing map
-# back to an inline `IndexMap` (the pre-#3000, 72-byte-value layout) while
-# keeping the current source shape, so an A/B can subtract code-layout bias
-# from the boxed build's numbers. NEVER enable this in a shipped build -- it
-# undoes the 72 -> 32 byte shrink the default build exists to deliver.
+# Measurement-only holdout for #2999: hold `OwnedValue`'s array and object
+# storage behind a `Box` instead of an `Rc`, i.e. the #3000 layout (32-byte
+# values, no structural sharing) built from the current source shape, so an
+# A/B of the sharing can subtract code-layout bias. NEVER enable this in a
+# shipped build -- it turns every `OwnedValue::clone()` back into a deep copy.
+# It superseded #3000's `unboxed-object-map` (pre-#3000 layout) once that
+# experiment's numbers were recorded.
 #
 # Non-additive, like `portable-popcount`/`broadword-yaml`/`scalar-yaml`/
 # `select-stats` above and below: `--all-features` turns it on, so a
-# `--all-features` build is the *unboxed* layout and the size pins that guard
-# the boxed one are `cfg`'d off in it. That is this repo's existing shape for
-# a measurement flag, and the existing mitigation applies unchanged -- CI
-# lints the shipped shape on its own second `clippy` leg, not only under
-# `--all-features`.
-unboxed-object-map = []
+# `--all-features` build is the *unshared* layout. That is this repo's
+# existing shape for a measurement flag, and the existing mitigation applies
+# unchanged -- CI lints the shipped shape on its own second `clippy` leg, not
+# only under `--all-features`.
+unshared-containers = []
+
+# Record every copy-on-write that actually copied (#2999): a shared array or
+# object written through, or consumed by value, with the file:line that forced
+# it. Zero cost when off; the shipped build carries only the refcount check
+# `Rc::make_mut` needs anyway. Print with `SUCCINCTLY_SHARE_STATS=1` on a
+# `--features cli,share-stats` binary. See `jq::share_stats`.
+share-stats = ["std"]
 
 # Use pure scalar (byte-by-byte) for YAML parsing. Disables all SIMD/broadword.
 # Useful for benchmarking baseline scalar performance.

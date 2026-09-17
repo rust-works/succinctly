@@ -84,6 +84,11 @@ pub mod resolve;
 mod slice;
 pub mod stream;
 pub mod utf8_document;
+// Copy-on-write instrumentation for the shared containers (#2999). Compiled
+// under `std`/`test` like `util::select_stats`; the wrappers' call sites are
+// gated on `share-stats` (or `test`).
+#[cfg(any(feature = "std", test))]
+pub mod share_stats;
 mod value;
 pub mod walk;
 
@@ -128,8 +133,8 @@ pub use resolve::{
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
-    jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr, ObjectMap, ObjectMapOf,
-    OwnedValue, MAX_VALUE_TREE_DEPTH,
+    jq_float_is_scientific, nesting_depth_exceeded_message, ArrayOf, ArrayVec, NumberRepr,
+    ObjectMap, ObjectMapOf, OwnedValue, MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

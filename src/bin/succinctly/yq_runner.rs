@@ -853,7 +853,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
                 arr.push(yaml_to_owned_value(elem_cursor)?);
                 rest = next;
             }
-            Ok(OwnedValue::Array(arr))
+            Ok(OwnedValue::Array(arr.into()))
         }
         YamlValue::Alias { target, .. } => {
             // Resolve the *entire* alias chain first (#1193), not just this
@@ -1253,7 +1253,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         }
         // #2403: same reasoning as the object arm's own check above.
         tail_gap_ok(Some(cursor), last_elem.as_ref(), b']')?;
-        OwnedValue::Array(items)
+        OwnedValue::Array(items.into())
     } else if value.is_null() {
         OwnedValue::Null
     } else if let Some(b) = value.as_bool() {
@@ -5633,7 +5633,10 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
         "named".to_string(),
         OwnedValue::Object(context.named.clone().into()),
     );
-    args_obj.insert("positional".to_string(), OwnedValue::Array(Vec::new()));
+    args_obj.insert(
+        "positional".to_string(),
+        OwnedValue::Array(Vec::new().into()),
+    );
     OwnedValue::Object(args_obj.into())
 }
 
@@ -7478,7 +7481,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
 
             // Create slurped array and evaluate
-            let slurped = OwnedValue::Array(all_docs);
+            let slurped = OwnedValue::Array(all_docs.into());
             let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
             let mut split_doc_state = SplitDocState::new(has_split_doc);
             for result in results {
@@ -8439,7 +8442,7 @@ mod tests {
 
         let mut obj = IndexMap::new();
         obj.insert("k".to_string(), OwnedValue::Int(1));
-        let value = OwnedValue::Array(vec![OwnedValue::Object(obj.into())]);
+        let value = OwnedValue::Array(vec![OwnedValue::Object(obj.into())].into());
 
         let mut obj_comments = IndexMap::new();
         obj_comments.insert(
@@ -8737,7 +8740,7 @@ mod tests {
         assert_eq!(inputs.len(), 3);
 
         // When slurped, they become an array
-        let slurped = OwnedValue::Array(inputs);
+        let slurped = OwnedValue::Array(inputs.into());
         if let OwnedValue::Array(arr) = slurped {
             assert_eq!(arr.len(), 3);
 
@@ -8776,7 +8779,7 @@ mod tests {
         // Test that slurped docs can have length computed
         let yaml = b"---\nname: Alice\n---\nname: Bob\n---\nname: Charlie";
         let inputs = parse_input(yaml, InputFormat::Yaml).unwrap();
-        let slurped = OwnedValue::Array(inputs);
+        let slurped = OwnedValue::Array(inputs.into());
 
         let expr = succinctly::jq::parse("length").unwrap();
         let results = evaluate_input(&slurped, &expr, &mut ErrorSink::default()).unwrap();
@@ -8831,7 +8834,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v]);
+            v = OwnedValue::Array(vec![v].into());
         }
         v
     }
@@ -8956,10 +8959,9 @@ mod tests {
         assert_eq!(map.get("neg"), Some(&OwnedValue::Int(-3)));
         assert_eq!(
             map.get("arr"),
-            Some(&OwnedValue::Array(vec![
-                OwnedValue::Float(1.0),
-                OwnedValue::Int(2)
-            ]))
+            Some(&OwnedValue::Array(
+                vec![OwnedValue::Float(1.0), OwnedValue::Int(2)].into()
+            ))
         );
         assert_eq!(map.get("s"), Some(&OwnedValue::String("x".to_string())));
         assert_eq!(map.get("b"), Some(&OwnedValue::Bool(true)));
@@ -9152,11 +9154,9 @@ mod tests {
         let cursor = index.root(json);
         assert_eq!(
             to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap(),
-            OwnedValue::Array(vec![
-                OwnedValue::Int(1),
-                OwnedValue::Int(2),
-                OwnedValue::Int(3),
-            ])
+            OwnedValue::Array(
+                vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3),].into()
+            )
         );
     }
 
@@ -9267,16 +9267,19 @@ mod tests {
             IndexMap::from([
                 (
                     "a".to_string(),
-                    OwnedValue::Array(vec![
-                        OwnedValue::Int(1),
-                        OwnedValue::Int(2),
-                        OwnedValue::Object(
-                            IndexMap::from([("b".to_string(), OwnedValue::Int(3))]).into(),
-                        ),
-                    ]),
+                    OwnedValue::Array(
+                        vec![
+                            OwnedValue::Int(1),
+                            OwnedValue::Int(2),
+                            OwnedValue::Object(
+                                IndexMap::from([("b".to_string(), OwnedValue::Int(3))]).into(),
+                            ),
+                        ]
+                        .into(),
+                    ),
                 ),
                 ("c".to_string(), OwnedValue::Object(IndexMap::new().into())),
-                ("d".to_string(), OwnedValue::Array(vec![])),
+                ("d".to_string(), OwnedValue::Array(vec![].into())),
             ])
             .into(),
         );
@@ -9621,12 +9624,18 @@ mod tests {
             ),
             // ...including nested, and mixing the number rule in.
             (
-                OwnedValue::Array(vec![OwnedValue::Object(
-                    IndexMap::from_iter([("n".to_string(), OwnedValue::Int(2))]).into(),
-                )]),
-                OwnedValue::Array(vec![OwnedValue::Object(
-                    IndexMap::from_iter([("n".to_string(), OwnedValue::Float(2.0))]).into(),
-                )]),
+                OwnedValue::Array(
+                    vec![OwnedValue::Object(
+                        IndexMap::from_iter([("n".to_string(), OwnedValue::Int(2))]).into(),
+                    )]
+                    .into(),
+                ),
+                OwnedValue::Array(
+                    vec![OwnedValue::Object(
+                        IndexMap::from_iter([("n".to_string(), OwnedValue::Float(2.0))]).into(),
+                    )]
+                    .into(),
+                ),
             ),
         ];
         for (a, b) in equal_pairs {
@@ -9646,8 +9655,8 @@ mod tests {
     /// uselessly coarse.)
     #[test]
     fn owned_value_align_hash_distinguishes_array_order_870() {
-        let a = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        let b = OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(1)]);
+        let a = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into());
+        let b = OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(1)].into());
         assert_ne!(a, b);
         assert_ne!(owned_value_align_hash(&a), owned_value_align_hash(&b));
 
