@@ -34202,6 +34202,30 @@ fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
     Ok(())
 }
 
+/// #3068 review: `from_unix` used to delegate straight to `builtin_todate`,
+/// which was harmless while `todate` was numeric-only. #3068 made `todate`
+/// also accept an 8-element broken-down-time array (matching real jq's
+/// `strftime`, which it's an alias of) -- real yq's own `from_unix` does
+/// not: confirmed live against yq v4.53.3, both a string and an array
+/// error with `from_unix only works on numbers, found !!<type> instead`
+/// (a wording succinctly does not yet match -- a separate, pre-existing
+/// gap, not this issue's), never succeeding on an array the way jq's
+/// `todate` now does. Pins that `from_unix` was decoupled from `todate`'s
+/// new array-acceptance rather than inheriting it, keeping its own
+/// pre-existing (not real yq's) wording and non-zero exit either way.
+#[test]
+fn test_from_unix_still_rejects_non_numbers_including_arrays_3068() -> Result<()> {
+    for input in [r#""x""#, "[1970,0,1,0,0,0,4,0]"] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr("from_unix", input, &[])?;
+        assert_ne!(code, 0, "input {input:?}: stderr {stderr:?}");
+        assert!(
+            stderr.contains("math function requires number"),
+            "input {input:?}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2008 (code review): `fromjson`/`tonumber`'s shared decoder
 /// (`parse_json_string_value` in `eval.rs`, reachable from both jq and yq
 /// mode via the same unparameterized `Builtin::FromJson` dispatch) is not
