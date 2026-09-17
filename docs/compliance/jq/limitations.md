@@ -5018,8 +5018,10 @@ output's position, which the constant rewriter cannot in general spell as the st
 own, so #2968 left `map_values(any(.; key == "c"))` and `.aa[] |= any(.; key == "c")`
 answering `false` where the direct spelling answers `[false,true]`.
 [#3079](https://github.com/rust-works/succinctly/issues/3079) closes that three ways: when
-`gen` is an identity passthrough (`.`, and `is_identity_passthrough`'s other spellings) the
-rewrite *can* express `cond`'s reads, so every rewrite route resolves them; the owned
+`gen` hands the stage's input on unchanged (`.`, or an `if`/`try` every branch of which
+does — deliberately *not* a `$x` frozen elsewhere or `A // B`, whose right side stands
+elsewhere; PR #3087's review caught both) the rewrite *can* express `cond`'s reads, so
+every rewrite route resolves them; the owned
 identity pipe (the `map_values`/`map`/`with_entries` positioned route) runs a navigating
 `gen` natively, probing `cond` from each `(value, identity)` pair
 (`eval_owned_identity_any_all`); and a rewrite route that can prefetch through that pipe

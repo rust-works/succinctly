@@ -62,22 +62,21 @@ use super::eval::{
     extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
     fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
     index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
-    is_dollar_safe_chain_key, is_identity_passthrough, is_pure_chain_link, is_retryable_stop,
-    key_arrays_eq, literal_to_owned, mark_nonretryable_escape, needs_path_context,
-    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
-    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
-    range_max_exceeded_error, range_num, range_values_f64, range_values_int, recurse_walk_flow,
-    reduce_forks, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
-    select_emits, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, RootWitness, SliceTargetKind,
-    YqSemantics,
+    is_dollar_safe_chain_key, is_pure_chain_link, is_retryable_stop, key_arrays_eq,
+    literal_to_owned, mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index,
+    numeric_key_to_index, numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
+    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
+    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
+    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -19219,6 +19218,33 @@ impl ResolveAdmits {
 /// The shared body of the two predicates above. `with_parent` is the *only*
 /// difference between them, so a construct admitted for one is admitted for
 /// the other and the rewriter's arms cover both call sites.
+/// Whether `any`/`all`'s `gen` hands the stage's own input on unchanged, so
+/// `cond`'s `.` -- and every `key`/`path`/`parent` read in it -- stands at
+/// the stage's position and the constant rewrite may resolve it (#3079).
+///
+/// Syntactic and strict, on purpose. `eval::is_identity_passthrough` is the
+/// wrong predicate here despite its name: it serves `as`-binding
+/// trackability, where a runtime value check backstops two deliberate
+/// over-admissions that have no backstop in a rewrite -- a `$x` marker
+/// frozen from `.` at the *binding* stage (`. as $x | .aa[] |= any($x; key
+/// == "bbb")` would answer the member's key for the root), and `A // B`
+/// admitted on `A` alone (on a `null`/`false` input `B`'s value stands
+/// elsewhere). Both were caught by PR #3087's review. `if`/`try` are
+/// admitted exactly as there: every branch that can produce a value is
+/// itself the input, unchanged.
+fn gen_hands_stage_input_on(gen: &Expr) -> bool {
+    match strip_parens(gen) {
+        Expr::Identity => true,
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => gen_hands_stage_input_on(then_branch) && gen_hands_stage_input_on(else_branch),
+        Expr::Try { expr, .. } => gen_hands_stage_input_on(expr),
+        _ => false,
+    }
+}
+
 fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
     if !needs_path_context(expr) {
         // Nothing to resolve. Whatever this is, it evaluates against the
@@ -19263,8 +19289,8 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         // in them resolves like `limit`'s. `cond` is not: it stands at each
         // `gen` output's position, which the rewrite can spell as this
         // stage's constants only when `gen` hands the stage's own input on
-        // unchanged (`any(.; key == "c")`, #3079 -- `is_identity_passthrough`'s
-        // grammar, the same test a `. as $x` bind uses). A `cond` read under
+        // unchanged (`any(.; key == "c")`, #3079 -- `gen_hands_stage_input_on`,
+        // deliberately stricter than a bind's passthrough test). A `cond` read under
         // a navigating `gen` is refused here; the owned identity pipe runs
         // that shape natively (`eval_owned_identity_any_all`), and the
         // streaming route always did.
@@ -19274,7 +19300,7 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond)) => {
             if !needs_path_context(cond) {
                 sub(gen)
-            } else if is_identity_passthrough(gen) {
+            } else if gen_hands_stage_input_on(gen) {
                 sub(gen) && sub(cond)
             } else {
                 // A read under a navigating `gen` is evaluated at the
@@ -19897,7 +19923,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // passthrough; under a navigating `gen` the whole stage is
         // prefetched, exactly as a moving pipe is.
         Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond))
-            if needs_path_context(cond) && !is_identity_passthrough(gen) =>
+            if needs_path_context(cond) && !gen_hands_stage_input_on(gen) =>
         {
             match at.prefetch {
                 Some(prefetch) => prefetched_literal(prefetch(expr)?),
