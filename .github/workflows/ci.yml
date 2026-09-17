@@ -74,7 +74,7 @@ jobs:
   # step is skipped, which is a genuine passing job — not a `skipped` conclusion
   # whose branch-protection semantics vary. Non-required jobs (bench, coverage,
   # perf-guard) below skip wholesale via a job-level `if`.
-  # #3059: the 8 feature-flag `cargo test` invocations below are mutually
+  # #3059: the feature-flag `cargo test` invocations below are mutually
   # independent (no step consumes a prior step's output) and were previously
   # chained sequentially in one job, inflating this leg's wall-clock ~2x
   # versus running them in parallel. Split into matrix legs
@@ -82,7 +82,11 @@ jobs:
   # required-context aggregator, since `Test (x86_64)` is in the branch
   # ruleset's required-status-checks list and a matrix job's per-leg context
   # names (`Test (x86_64) (cli-gated)`, etc.) can never satisfy that exact
-  # literal name on their own.
+  # literal name on their own. #3064 later merged two of the resulting
+  # sub-minute legs back together (see bench-runner-and-sse2-dispatch below)
+  # after this fan-out doubled job count against the org's free-plan
+  # runner-slot ceiling with no net wall-clock win under real merge-queue
+  # contention.
   test-x86:
     name: Test (x86_64)
     needs: test-x86-matrix
@@ -107,22 +111,33 @@ jobs:
           # shared `target/debug/succinctly` binary with a narrower feature
           # set, dropping the `bench` subcommand out from under this test
           # target if it ran in the same invocation.
-          - name: bench-runner-gated
+          #
+          # #3064: combined with the former standalone `sse2-clamped-dispatch`
+          # leg below (each individually sub-minute -- ~18-36s and
+          # ~36s-2min -- so giving each its own dedicated runner nearly
+          # doubled this matrix's job count for no real wall-clock win once
+          # measured against actual merge-queue runner-slot contention; see
+          # the issue for the account-level evidence). Neither invocation
+          # depends on the other or shares mutable state, so chaining them in
+          # one leg is safe -- this doesn't touch the succinctly CLI binary
+          # `cargo run`-spawns, so it can't hit the #1705 re-link hazard the
+          # comment above guards against.
+          #
+          # The second command re-runs the suite with yaml x86 dispatch
+          # clamped to SSE2 (#247): the parser and the light.rs regression
+          # tests then genuinely execute the 16-byte classify path, so a
+          # reintroduced length-derived skip width (#231) fails here instead
+          # of sailing through on AVX2 dispatch. The in-lib contract test
+          # (test_succinctly_simd_env_contract) fails this leg if the clamp
+          # ever stops applying or the value here is typo'd.
+          - name: bench-runner-and-sse2-dispatch
             buildCli: true
-            testCmd: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              SUCCINCTLY_SIMD=sse2 cargo test --verbose
           - name: default
             buildCli: false
             testCmd: cargo test --verbose
-          # Re-run the suite with yaml x86 dispatch clamped to SSE2 (#247): the
-          # parser and the light.rs regression tests then genuinely execute the
-          # 16-byte classify path, so a reintroduced length-derived skip width
-          # (#231) fails here instead of sailing through on AVX2 dispatch. The
-          # in-lib contract test (test_succinctly_simd_env_contract) fails
-          # this leg if the clamp ever stops applying or the value here is
-          # typo'd.
-          - name: sse2-clamped-dispatch
-            buildCli: false
-            testCmd: SUCCINCTLY_SIMD=sse2 cargo test --verbose
           - name: simd
             buildCli: false
             testCmd: cargo test --verbose --features simd
@@ -218,11 +233,16 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: ${{ matrix.testCmd }}
 
-  # #3059: same rationale as test-x86/test-x86-matrix above — the 9
-  # feature-flag `cargo test` invocations plus 3 Clippy variants below are
-  # mutually independent and were previously chained sequentially in one job.
+  # #3059: same rationale as test-x86/test-x86-matrix above — the feature-flag
+  # `cargo test` invocations and Clippy variants below are mutually
+  # independent and were previously chained sequentially in one job.
   # `Test (ARM64)` is a required status check, so this job stays a thin
-  # aggregator over test-arm-matrix's per-leg contexts.
+  # aggregator over test-arm-matrix's per-leg contexts. #3064 later merged
+  # the 3 Clippy variants into the single clippy-all-variants leg below (and,
+  # symmetrically, test-x86-matrix's two sub-minute legs into one) without
+  # giving up the isolation of the genuinely long cli-gated leg -- see #3064
+  # on test-x86 above for the account-level contention evidence driving that
+  # follow-up.
   test-arm:
     name: Test (ARM64)
     needs: test-arm-matrix
@@ -293,18 +313,25 @@ jobs:
           # popcount path in src/bits/popcount.rs, plus the DSV/JSON/util
           # NEON+SVE2 kernels — has only ever been built and tested here,
           # never linted (#388, the ARM half of the same blind spot fixed for
-          # x86_64 in the `clippy` job). Three legs are needed because the
-          # YAML backend selectors are cfg-exclusive (see the `broadword-yaml`
-          # leg above): one build only ever selects one of neon/broadword/scalar.
-          - name: clippy-all-features
+          # x86_64 in the `clippy` job). Three separate `cargo clippy`
+          # invocations are needed because the YAML backend selectors are
+          # cfg-exclusive (see the `broadword-yaml` leg above): one build
+          # only ever selects one of neon/broadword/scalar.
+          #
+          # #3064: chained into a single leg rather than three dedicated
+          # matrix legs -- each individual invocation is well under a minute,
+          # so splitting them across three runners nearly doubled this
+          # matrix's job count for no real wall-clock win once measured
+          # against actual merge-queue runner-slot contention (see the issue
+          # for the account-level evidence). The three `cargo clippy`
+          # invocations don't share mutable state beyond the target/ build
+          # cache, so chaining them is safe.
+          - name: clippy-all-variants
             clippy: true
-            testCmd: cargo clippy --all-targets --all-features -- -D warnings
-          - name: clippy-simd
-            clippy: true
-            testCmd: cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
-          - name: clippy-broadword-yaml
-            clippy: true
-            testCmd: cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+            testCmd: |
+              cargo clippy --all-targets --all-features -- -D warnings
+              cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+              cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
     env:
       # ARM SIMD CI leg (#194, mirroring the x86 pattern from #193): the SVE2
       # suites self-skip (with a visible `SKIPPED` line) when a CPU feature is
@@ -359,10 +386,63 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: ${{ matrix.testCmd }}
 
+  # #3064: converts the previously-sequential 6-step chain below (15m45s in
+  # the run that exposed #3059's contention problem -- the single longest
+  # *real* job in that run, and entirely untouched by #3059 since only
+  # test-x86/test-arm were split) into matrix legs, same required-context
+  # aggregator pattern as test-x86/test-arm above. Unlike those two, this
+  # starts pre-rebalanced at 2 legs rather than fanning out to one leg per
+  # step: #3064 found that maximal fan-out roughly doubled test-x86/test-arm's
+  # job count against this org's free-plan runner-slot ceiling, for zero net
+  # wall-clock win once measured under real merge-queue concurrency (a
+  # trivial gatekeeper job saw a 6m46s pure queue wait -- longer than the
+  # entire per-leg speedup the split was meant to deliver). Only the
+  # genuinely long cli-gated step is isolated onto its own runner; every
+  # other step stays chained in one combined leg, matching the rebalance
+  # applied to test-x86-matrix's bench-runner-and-sse2-dispatch leg and
+  # test-arm-matrix's clippy-all-variants leg below.
   test-macos-arm:
     name: Test (macOS ARM64)
+    needs: test-macos-arm-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All Test (macOS ARM64) matrix legs passed"
+
+  test-macos-arm-matrix:
+    name: Test (macOS ARM64) (${{ matrix.name }})
     needs: gate
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli-gated
+            buildCli: true
+            testCmd: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
+          # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
+          # and must stay isolated from the cli-gated leg above (#1705): its
+          # `cargo run`-spawned CLI subprocesses would otherwise re-link the
+          # shared `target/debug/succinctly` binary with a narrower feature
+          # set, dropping the `bench` subcommand out from under this test
+          # target if it ran in the same invocation. The remaining four
+          # `cargo test` invocations don't share that hazard (none of them
+          # spawn the CLI binary), so they're chained after it in the same
+          # leg rather than each getting a dedicated runner -- see #3064.
+          #
+          # Same no_std cargo-test rationale as test-x86 (#2114) applies to
+          # the last line -- macOS ARM64 is the only leg that builds the
+          # target_arch="aarch64"-gated NEON test modules under Apple's own
+          # toolchain rather than Linux's; a #2083-class std-only-symbol bug
+          # reachable only there was invisible to every CI leg until this
+          # one (#2123).
+          - name: rest
+            buildCli: true
+            testCmd: |
+              cargo test --features cli,bench-runner --test orchestrate_cli_tests
+              cargo test --verbose
+              cargo test --verbose --features simd
+              cargo test --verbose --features portable-popcount
+              cargo test --no-default-features --verbose
     env:
       # Apple Silicon has NEON but no SVE/SVE2, so only NEON is pinned; the
       # SVE2 suites are *expected* to print `SKIPPED` lines on this leg. SVE2
@@ -387,44 +467,15 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        if: needs.gate.outputs.code == 'true'
-        run: cargo build --verbose
+          key: ${{ runner.os }}-cargo-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build CLI (for integration tests)
-        if: needs.gate.outputs.code == 'true'
+        if: needs.gate.outputs.code == 'true' && matrix.buildCli
         run: cargo build --features cli --bin succinctly
 
-      - name: Run cli-gated tests
+      - name: Run
         if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests --test cli_golden_tests --test cli_characterization_tests --test deep_nesting_valid_tests --test jq_cli_tests
-
-      - name: Run bench-runner-gated tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
-
-      - name: Run tests
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose
-
-      - name: Run tests (simd feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features simd
-
-      - name: Run tests (portable-popcount feature)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --verbose --features portable-popcount
-
-      # Same no_std cargo-test rationale as test-x86 (#2114) -- macOS ARM64 is
-      # the only leg that builds the target_arch="aarch64"-gated NEON test
-      # modules under Apple's own toolchain rather than Linux's; a
-      # #2083-class std-only-symbol bug reachable only there was invisible to
-      # every CI leg until this one (#2123).
-      - name: Check no_std compatibility (build + run tests)
-        if: needs.gate.outputs.code == 'true'
-        run: cargo test --no-default-features --verbose
+        run: ${{ matrix.testCmd }}
 
   # Upstream-toolchain leg (#203). Runs the x86_64 test suite on beta and nightly
   # to catch upcoming-compiler breakage (lint changes, soundness fixes, stdlib
