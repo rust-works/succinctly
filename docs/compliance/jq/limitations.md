@@ -6264,16 +6264,15 @@ compiler/libc is an open question, not a claim to build on (flag for whoever clo
 this magnitude (`-9223372036854775807 % 10` is `-7` in jq, `-8` here; the parenthesised
 and data-sourced spellings agree on `-8`).
 
-**Still open, same mechanism, out of #2906's scope** (tracked as #2936 and #2937):
-a *float* literal with more than 17 significant digits, or an integer literal beyond
-`i64`, is still parsed with one correct rounding (`2.7293109604053567083 + 0` is
-`2.7293109604053565` in jq, `2.729310960405357` here) — closing it needs the mode plumbed
-through the number-materialisation funnels, not just the arithmetic (#2936); the math
-builtins (`floor`, `sqrt`, `pow`, …) still widen a large `Int` with a bare cast
-(`869389897822472004 | sqrt` is `932410798.8555645` in jq, `…647` here); and
-`floor`/`ceil`/`round`/`trunc` (and `length`, which is `fabs(jv_number_value(x))` in jq)
-of such a value print their exact integer digits where jq prints the double
-(`869389897822472000`) (all #2937). A third gap this fix's review found — the reindex
+**The float half closed with #2936** (the next section); **still open, same mechanism**
+(tracked as #2937): `floor`/`ceil`/`round`/`trunc` (and `length`, which is
+`fabs(jv_number_value(x))` in jq) of a large `Int` literal print their exact integer digits
+where jq prints the double (`869389897822472004 | floor` is `869389897822472000` in jq,
+`869389897822471936` here -- the same double, spelled exactly; before #2936 it was the
+unrounded `869389897822472064`). The math builtins' bare-cast widening
+(`869389897822472004 | sqrt` was `…647` here against jq's `…645`) closed as a side effect
+of #2936 routing the cursor-level readers through `document_number_f64`, which widens an
+integer literal the way jq does. A third gap this fix's review found — the reindex
 bridge re-parsing a computed double's printed digits as an *integer* literal before a
 document-input builtin (`sort`, `unique`, `min`, `max`, `group_by` on an array built in
 the filter), so that it then compared exactly against a real literal instead of equal —
@@ -6283,6 +6282,51 @@ is jq's `[5,869389897822472004,869389897822472000]` here too. The `range` entry 
 stays on the exact `i64` path it documents, unaffected. (The unary-minus entry once cited
 alongside it here was #2357, since closed by #3044 — see that section for why it no
 longer belongs in this "unaffected" list.)
+
+### Every literal rounds to 17 significant digits before the double conversion, not just an `i64` (#2936) — divergence closed
+
+#2906 modelled `jvp_literal_number_to_double` -- `decNumberReduce` under a DECIMAL64 context
+with `digits` raised to 17, half-even, then a correctly rounded `strtod` -- for `i64` literals
+only. Every fraction, exponent form and integer past `i64` still took Rust's single correctly
+rounded parse, which lands on a different double whenever the 17-digit intermediate sits on
+the other side of a rounding boundary: 2-6% of random 18-30-digit literals (measured against
+`/usr/bin/jq` over 4000 seeded cases; the model matched 4000/4000).
+
+```console
+$ jq  -n '2.7293109604053567083 + 0'         # 2.7293109604053565
+$ sjq -n '2.7293109604053567083 + 0'         # 2.729310960405357   (before #2936)
+$ jq  -n '2.4703282292062327209e-324 + 0'    # 0   -- the subnormal half-way case
+$ jq  -n '1.797693134862315808e308 | isinfinite'   # false -- 17 digits round down to DBL_MAX
+$ jq  -n '2.7293109604053567083 == (2.729310960405357 + 0)'   # false (was true here)
+```
+
+Every entry point jq reads a literal through moves together -- program text, the document on
+the cursor, materializing and `--slurp` routes, `input`/`inputs`, `--argjson`, `--jsonargs`,
+`--slurpfile`, `--seq`, `tonumber`, `fromjson`, and the `|=`/`getpath`/`to_entries`/`tostream`
+shapes -- because the double is fixed where the literal is materialized
+(`OwnedValue::from_number_literal::<S>`/`from_number_bytes::<S>`, the parser's number token)
+rather than at each of the ~50 sites that read a `NumberRepr::Float`. There is no mode-less
+funnel left to default silently to the plain parse. The cursor-level readers that never build an
+`OwnedValue` (`length`, `isnan`/`isinfinite`/`isnormal`, `normals`/`finites`, `strftime`,
+`implode`, every libm builtin through `get_float_value`) read through one accessor,
+`document_number_f64::<S>`, which is also where #2937's `Int` widening belongs.
+
+Display is untouched: a `NumberLiteral` keeps its source text, so `2.7293109604053567083`,
+`| tojson`, `| tostring` and `1.797693134862315808E+308` print as before, and two literals
+still compare exactly by their digits (`2.7293109604053567083 == 2.7293109604053565` is
+`false` in both). That exactness is why `jq_numeric_cmp`'s two-literal shortcut -- doubles
+first, digits on a tie -- had to change with it: an `Int` literal's double now comes from
+`jq_literal_int_to_f64` too, never `as f64`, or `869389897822472001 < 869389897822472004.9`
+(`true` in jq, and here before and after) would have read `false` with only the `Float` side
+rounded.
+
+yq mode is unmoved: real yq parses with Go's correctly rounded `ParseFloat`, so `YqSemantics`
+keeps the plain parse in every funnel, including the reindex bridge under a write and the
+`-p json` DOM route (`test_yq_float_literal_stays_correctly_rounded_unaffected_by_2936`,
+`tests/yq_cli_tests.rs`). No ADR: ADR-0018 rule 3 decides this, and there is no choice between
+behaviours to make. Pinned against jq 1.7.1 on a 2,015-row table
+(`tests/data/jq-literal-17-digit-oracle-2936.tsv`) plus the entry-point matrix in
+`tests/jq_cli_tests.rs` and the two-evaluator rows in `tests/jq_evaluator_parity_tests.rs`.
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 

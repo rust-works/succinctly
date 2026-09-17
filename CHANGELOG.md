@@ -214,6 +214,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq` rounds every number literal to 17 significant digits before
+  the double conversion, as jq does** (#2936). #2906 modelled
+  `jvp_literal_number_to_double` for `i64` literals only; a fraction, an
+  exponent form or an integer past `i64` still took one correctly rounded
+  parse, which differs from jq's double on 2-6% of 18-30-digit literals:
+  `2.7293109604053567083 + 0` is `2.7293109604053565` in jq and was
+  `2.729310960405357` here; `2.4703282292062327209e-324 + 0` is `0`;
+  `1.797693134862315808e308 | isinfinite` is `false`. The double is now
+  fixed where a literal is materialized -- `OwnedValue::from_number_literal`,
+  `from_number_bytes` and the parser's number token all take the evaluator's
+  `EvalSemantics`, with no mode-less form left -- so every entry point moves
+  together: program text, the document on every route, `input`/`inputs`,
+  `--argjson`, `--jsonargs`, `--slurpfile`, `--slurp`, `--seq`, `tonumber`,
+  `fromjson`. The cursor-level readers (`length`, `isnan`/`isinfinite`,
+  `normals`/`finites`, `strftime`, `implode`, the libm builtins) read through
+  one accessor, `document_number_f64`, which also closes #2937's bare-cast
+  widening of a large `Int` in the math builtins (`869389897822472004 | sqrt`
+  is jq's `932410798.8555645` now). `jq_numeric_cmp` widens an `Int` literal
+  through the same 17-digit rounding so its two-literal shortcut stays sound.
+  Display keeps the source spelling, two literals still compare exactly, and
+  `succinctly yq` is unmoved (Go's `ParseFloat` is the plain parse).
+
+  `OwnedValue::from_number_bytes` (`pub`) gains an `S: EvalSemantics`
+  parameter; `eval_generic::to_owned`, `to_owned_checked`, `to_owned_cursor`,
+  `to_owned_all`, `to_owned_all_cursors`, `to_owned_with_comments` and
+  `GenericResult::collect_owned`/`into_owned`/`stream_json`/`stream_yaml`
+  take one too. `OwnedValue::bridge_nonfinite_from_bytes` is new.
+
 - **`succinctly jq` reads jq's decNumber number spellings on every input path**
   (#2877). jq 1.7.1 hands every non-keyword token to `decNumberFromString`, so a
   leading `+` (`+1`, `+.5`, `+1.500`, `+007.e5`) and the special values `nan`,

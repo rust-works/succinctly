@@ -343,7 +343,9 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
     spelled.parse::<f64>().ok()
 }
 
-/// Convert an integer *literal* to `f64` the way real jq 1.7.1 does (#2906).
+/// Convert an integer *literal* to `f64` the way real jq 1.7.1 does (#2906);
+/// [`jq_literal_text_to_f64`] is the same rule for every literal that is
+/// not an exact `i64` (#2936).
 ///
 /// jq keeps every parsed number -- program text, document input,
 /// `tonumber`, `fromjson`, `--argjson` -- as an exact `decNumber` literal,
