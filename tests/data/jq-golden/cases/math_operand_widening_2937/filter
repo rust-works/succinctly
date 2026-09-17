@@ -7,5 +7,6 @@
   "round_precision": [(0.49999999999999994|round), (4503599627370497|round)],
   "length_widening": [(869389897822472004|length), ((869389897822472004|length) == 869389897822472005), (869389897822472004|floor == 869389897822472004)],
   "must_not_change": [(9007199254740993|floor), (123456789012345675|trunc), (2.7293109604053567083|floor), (nan|floor)],
-  "neg_zero_downstream": [[(-0.5|ceil)], [limit((-0.5|ceil); 1,2)]]
+  "neg_zero_downstream": [[(-0.5|ceil)], [limit((-0.5|ceil); 1,2)]],
+  "float_literal_operand": [(2.50 | pow(.;1)), (2.50 | atan2(1;.))]
 }
