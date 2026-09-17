@@ -725,6 +725,25 @@ fn test_bad_argjson_slurpfile_rawfile_exit_2_not_1_3051() -> Result<()> {
     Ok(())
 }
 
+/// `--jsonargs` shares `parse_json_value` with `--argjson` (#2052) and has
+/// the identical exit-1-through-anyhow bug #3051 fixes for the other three
+/// flags -- confirmed live that jq exits 2 here too -- but #3051 named only
+/// `--argjson`/`--slurpfile`/`--rawfile`, so this one stays on the generic
+/// `anyhow` path deliberately, tracked as its own follow-up (#3096). Pins
+/// *today's* (still-1) exit code as a regression anchor: #3096's fix should
+/// flip this assertion, not discover it by accident.
+#[test]
+fn test_bad_jsonargs_still_exits_1_pending_3096() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--jsonargs", "[1,"], None)?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("Error: Invalid JSON for --jsonargs: [1,"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 // =============================================================================
 // #2052: `--argjson`/`--jsonargs` validate through the crate's own RFC 8259
 // validator in jq's accept-set (`json::validate::validate_jq_lenient`),
