@@ -554,6 +554,26 @@ struct Parser<'a> {
     /// Always `None` between calls: every writer returns immediately after
     /// parking, and the sole caller takes it as the first thing it does.
     wrong_arity_call: Option<Expr>,
+    /// #3038: whether the *most recently completed* [`Self::parse_primary_
+    /// inner`] call produced jq's grammar notion of a `Term` (true for
+    /// everything there except a bare, unparenthesized `if`/`reduce`/
+    /// `foreach` -- jq's real grammar has those as `Exp`-level alternatives
+    /// that skip `Term` entirely, only becoming one again once wrapped in
+    /// `(...)`). [`Self::parse_binding`] reads this right after `parse_
+    /// assignment()` returns, immediately before deciding whether a
+    /// following `as` is legal, to reject `reduce ... as $z` the way jq
+    /// does while still accepting `(reduce ...) as $z`.
+    ///
+    /// Reliable without threading a return value through every precedence
+    /// level between `parse_primary` and `parse_binding`: this recursive
+    /// descent parses strictly left-to-right, so whichever primary was
+    /// parsed *last* before control returns to `parse_binding` is always
+    /// the operand immediately to the left of wherever `as` would appear --
+    /// exactly the position jq's grammar cares about, however many binary
+    /// operators or nesting levels sit above it (`1 + reduce ... as $z`
+    /// still needs to reject, since the primary parsed last is the bare
+    /// `reduce`, not the `1`).
+    last_primary_is_term: bool,
 }
 
 /// Where one ordinary function call's identifier begins in the filter source
@@ -722,6 +742,7 @@ impl<'a> Parser<'a> {
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
+            last_primary_is_term: true,
         }
     }
 
@@ -1900,7 +1921,13 @@ impl<'a> Parser<'a> {
     fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_ws();
 
-        match self.peek() {
+        // #3038: every arm below is a `Term` in jq's grammar and falls
+        // through to the tail past the match, which records that -- except
+        // the three `Exp`-only alternatives (`if`/`reduce`/`foreach`),
+        // which `return` early having already recorded the opposite. See
+        // `last_primary_is_term`'s own doc comment for why this single
+        // flag is enough without threading a value through every caller.
+        let result = match self.peek() {
             // Parenthesized expression
             Some('(') => {
                 self.next();
@@ -2228,7 +2255,20 @@ impl<'a> Parser<'a> {
                     self.consume_keyword("not");
                     self.zero_arity_or_wrong_arity_call(keyword_start, Some("not"), Expr::Not)
                 } else if self.matches_keyword("if") {
-                    self.parse_if_expr()
+                    // #3038: bare `if`/`reduce`/`foreach` are `Exp`-level
+                    // alternatives in jq's real grammar, not `Term`s -- only
+                    // `(if ... end)` is one. Early `return` here (and in the
+                    // two arms below) bypasses `parse_primary_inner`'s
+                    // shared "it's a Term" tail down at the function's end,
+                    // which every other arm (including the `(...)` one)
+                    // falls through to. The flag is set *after* parsing,
+                    // not before: `parse_if_expr` recursively parses its own
+                    // branch bodies through this same function, and each of
+                    // those would otherwise overwrite it back to `true` by
+                    // the time this arm's own call returns.
+                    let e = self.parse_if_expr()?;
+                    self.last_primary_is_term = false;
+                    return Ok(e);
                 } else if self.matches_keyword("try") {
                     self.parse_try_expr()
                 } else if self.matches_keyword("error") {
@@ -2238,9 +2278,13 @@ impl<'a> Parser<'a> {
                         Self::parse_error_expr,
                     )
                 } else if self.matches_keyword("reduce") {
-                    self.parse_reduce_expr()
+                    let e = self.parse_reduce_expr()?;
+                    self.last_primary_is_term = false;
+                    return Ok(e);
                 } else if self.matches_keyword("foreach") {
-                    self.parse_foreach_expr()
+                    let e = self.parse_foreach_expr()?;
+                    self.last_primary_is_term = false;
+                    return Ok(e);
                 } else if self.matches_keyword("JOIN") {
                     self.reject_unless_jq_extensions("JOIN")?;
                     self.parse_shadowable_special_form(keyword_start, "JOIN", Self::parse_join_expr)
@@ -2416,7 +2460,9 @@ impl<'a> Parser<'a> {
                 self.pos,
             )),
             None => Err(ParseError::new("unexpected end of input", self.pos)),
-        }
+        }?;
+        self.last_primary_is_term = true;
+        Ok(result)
     }
 
     /// Parse an if-then-else expression.
@@ -7012,6 +7058,21 @@ impl<'a> Parser<'a> {
 
         // Phase 8: simple var; Phase 9: patterns.
         if self.matches_keyword("as") {
+            // #3038: jq's grammar only allows a `Term` immediately before
+            // `as` -- a bare `if`/`reduce`/`foreach` is not one (only
+            // `(if ... end)` etc. are), so jq rejects this at compile time
+            // even though every other operand shape (including one ending
+            // in a binary operator whose *last* operand is a plain Term,
+            // like `1 + 2 as $z`) is fine. Confirmed live against
+            // `/usr/bin/jq` 1.7.1: exit 3, `syntax error, unexpected as,
+            // expecting end of file` for every row this rejects.
+            if !self.last_primary_is_term {
+                return Err(ParseError::new(
+                    "unexpected 'as': the value before 'as' must be a term \
+                     (wrap a bare if/reduce/foreach in parentheses)",
+                    self.pos,
+                ));
+            }
             self.consume_keyword("as");
             self.skip_ws();
             return self.parse_as_pattern(expr);
@@ -8181,6 +8242,38 @@ mod tests {
         assert!(parse("last(1,2)").is_ok());
         assert!(parse("error(1,2)").is_ok());
         assert!(parse("repeat(1,2)").is_ok());
+    }
+
+    /// #3038: a bare (unparenthesized) `if`/`reduce`/`foreach` is not a
+    /// `Term` in jq's grammar, so `as` cannot follow one directly -- jq
+    /// 1.7.1 rejects every row here with a compile error, confirmed live.
+    #[test]
+    fn test_bare_if_reduce_foreach_before_as_is_rejected() {
+        assert!(parse("reduce empty as $i (.; .) as $z | 1").is_err());
+        assert!(parse("foreach (1) as $i (.; .) as $z | $z").is_err());
+        assert!(parse("if true then . end as $z | $z").is_err());
+        assert!(parse("if true then . else 2 end as $z | $z").is_err());
+        // Still rejected embedded in a larger expression: the operand
+        // immediately before `as` is still the bare `reduce`.
+        assert!(parse("1 + reduce empty as $i (.; .) as $z | $z").is_err());
+
+        // The parenthesized form is a genuine `Term` and stays legal, as
+        // does every other operand shape that doesn't involve a bare
+        // if/reduce/foreach at all.
+        assert!(parse("(reduce empty as $i (.; .)) as $z | $z").is_ok());
+        assert!(parse("(if true then . end) as $z | $z").is_ok());
+        assert!(parse("try . as $z | $z").is_ok());
+        assert!(parse("label $f | . as $z | $z").is_ok());
+        assert!(parse("def f: .; f as $z | $z").is_ok());
+        assert!(parse("1 + 2 as $z | $z").is_ok());
+
+        // A bare if/reduce/foreach used *without* a trailing `as` is
+        // unaffected -- this issue is scoped to the `as`-binding position.
+        assert!(parse("if true then . end").is_ok());
+        assert!(parse("reduce (1,2,3) as $i (0; .+$i)").is_ok());
+        assert!(parse("foreach (1,2,3) as $i (0; .+$i; .)").is_ok());
+        assert!(parse("[if true then 1 end]").is_ok());
+        assert!(parse("[reduce (1,2) as $i (0;.+$i)] as $z | $z").is_ok());
     }
 
     /// `reduce`/`foreach`'s init/update/extract and `until`/`while`'s

@@ -17680,6 +17680,51 @@ fn test_multi_byte_character_after_a_token_is_a_compile_error_not_a_panic_2975()
     Ok(())
 }
 
+/// #3038: jq's grammar only allows a `Term` immediately before `as` -- a
+/// bare `if`/`reduce`/`foreach`, not wrapped in `(...)`, is not one (they're
+/// `Exp`-level alternatives instead), so jq 1.7.1 rejects `as` right after
+/// one at compile time, even embedded in a larger expression (`1 + reduce
+/// ... as $z`, since the *last* term-position operand is still the bare
+/// `reduce`). Every row confirmed live against jq 1.7.1.
+#[test]
+fn test_reduce_foreach_if_before_as_is_a_compile_error_3038() -> Result<()> {
+    for filter in [
+        "reduce empty as $i (.; .) as $z | 1",
+        "foreach (1) as $i (.; .) as $z | $z",
+        "if true then . end as $z | $z",
+        "if true then . else 2 end as $z | $z",
+        "1 + reduce empty as $i (.; .) as $z | $z",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("1"))?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` should be a compile error (exit 3) -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "`{filter}`: stdout: {stdout:?}");
+    }
+
+    // Controls: every one of these is accepted by real jq too, and must
+    // keep working -- the parenthesized form is a genuine `Term`, and none
+    // of the others involve a bare if/reduce/foreach at all.
+    for (filter, want) in [
+        ("(reduce empty as $i (.; .)) as $z | $z", "1"),
+        (r"try . as $z | $z", "1"),
+        (r#"try error("x") catch . as $z | $z"#, r#""x""#),
+        ("label $f | . as $z | $z", "1"),
+        ("def f: .; f as $z | $z", "1"),
+        ("1 + 2 as $z | $z", "3"),
+        (". // 3 as $z | $z", "1"),
+        (". == 1 as $z | $z", "true"),
+        ("true and true as $z | $z", "true"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "1", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
+
 /// #2245 (found in review of this fix's own first draft): within one `s`
 /// iteration, `end`'s own trailing escape was checked *before* `target`'s,
 /// so when both escaped in the same iteration the lower-priority `end`
