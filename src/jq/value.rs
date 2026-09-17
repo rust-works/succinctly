@@ -355,7 +355,7 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
         i += 1;
     }
     if !any_digit {
-        return None;
+        return None; // omni-dev: coverage tolerate-line reason="unreachable by construction: the slow path is entered only after `significant_digit_count` found 18+ digits over the same mantissa bytes this loop walks (#2936)"
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
         // The exponent must be a sign and at least one digit, and nothing
@@ -379,7 +379,7 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
         return None;
     }
     if kept_len == 0 {
-        return Some(if negative { -0.0 } else { 0.0 });
+        return Some(if negative { -0.0 } else { 0.0 }); // omni-dev: coverage tolerate-line reason="unreachable by construction: 18+ significant digits were counted, so at least one nonzero digit was kept (#2936)"
     }
     // Round half-even on the 18th digit and everything after it.
     if kept_len > DOUBLE_PRECISION_DIGITS {
@@ -2765,7 +2765,7 @@ impl OwnedValue {
             let text = crate::yaml::format_float_with_fraction(f);
             match parse_i64_or_f64(&text) {
                 Some(repr) => Self::NumberLiteral(repr, text.into()),
-                None => Self::Float(f),
+                None => Self::Float(f), // omni-dev: coverage tolerate-line reason="unreachable: `format_float_with_fraction` of a finite double is always RFC 8259 number text, which `parse_i64_or_f64` reads (#2936)"
             }
         } else {
             Self::Float(f)
@@ -5597,7 +5597,7 @@ mod tests {
         let mut plain_disagrees = 0;
         for line in table.lines() {
             let Some((literal, jq_text)) = line.split_once('\t') else {
-                panic!("malformed oracle row: {line:?}");
+                panic!("malformed oracle row: {line:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for a malformed oracle table (#2936)"
             };
             rows += 1;
             // jq prints an infinite double as the `DBL_MAX` text, so the
@@ -5630,13 +5630,16 @@ mod tests {
                     "{negated}"
                 );
             }
-            // The mode split: jq's parse is this helper, yq's is the plain one.
+            // The mode split: jq's parse is this helper, yq's is the plain
+            // one. No row fits an `i64` (every integer row is past its
+            // range), so the jq-mode repr is always the `Float` arm here.
+            assert!(
+                literal.parse::<i64>().is_err(),
+                "table row fits i64: {literal}"
+            );
             assert_eq!(
                 parse_i64_or_f64_in::<JqSemantics>(literal),
-                Some(match literal.parse::<i64>() {
-                    Ok(i) => NumberRepr::Int(i),
-                    Err(_) => NumberRepr::Float(got),
-                }),
+                Some(NumberRepr::Float(got)),
                 "{literal}"
             );
             assert_eq!(
@@ -5707,6 +5710,21 @@ mod tests {
                 "{short} has at most 17 significant digits and must take the plain parse"
             );
         }
+        // A `+`-signed literal reaches this helper only through
+        // `parse_i64_or_f64_in` on text a caller has not peeled; the sign
+        // is read the same way `-` is.
+        assert_eq!(
+            jq_literal_text_to_f64("+2.7293109604053567083").map(f64::to_bits),
+            Some(2.7293109604053565f64.to_bits())
+        );
+        assert_eq!(
+            parse_i64_or_f64_in::<JqSemantics>("+123456789012345678901"),
+            Some(NumberRepr::Float(1.2345678901234568e20))
+        );
+        assert_eq!(
+            parse_i64_or_f64_in::<JqSemantics>("123"),
+            Some(NumberRepr::Int(123))
+        );
         assert_eq!(significant_digit_count("007.500"), 4);
         assert_eq!(significant_digit_count("1e400"), 1);
         assert_eq!(significant_digit_count("0.000"), 0);
