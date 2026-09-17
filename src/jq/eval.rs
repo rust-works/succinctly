@@ -49472,8 +49472,8 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
             } else if optional {
                 return Err(QueryResult::None); // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             } else {
-                return Err(QueryResult::Error(EvalError::new("invalid number")));
-                // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
+                let e = EvalError::new("invalid number");
+                return Err(QueryResult::Error(e)); // omni-dev: coverage tolerate-line reason="defensive, unreachable via ordinary JSON parsing (#3068)"
             };
 
             // Auto-converted the same way `gmtime` converts a raw
@@ -49527,7 +49527,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                     let get_int = |idx: usize| -> i64 {
                         match arr.get(idx) {
                             Some(OwnedValue::Int(n)) => *n, // omni-dev: coverage tolerate-line reason="every array literal written in filter source, and every array-element JSON parses, decodes to NumberLiteral (#1035), not a bare Int -- Int is for internally-synthesized values spliced post-parse; probed a computed element ([1970,(0+0),..]) and it still decoded as NumberLiteral here, so this arm has no known real producer (#3068)"
-                            Some(OwnedValue::Float(f)) => *f as i64, // omni-dev: coverage tolerate-line reason="same as the Int arm above -- no known real producer of a bare Float array element at this position (#3068)"
+                            Some(OwnedValue::Float(f)) => *f as i64,
                             Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
                             Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
                             _ => 0,
