@@ -42,7 +42,7 @@ fn run_full(json: &[u8], expr: &Expr) -> usize {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(expr, cursor);
-    result.collect_owned().len()
+    result.collect_owned::<JqSemantics>().len()
 }
 
 /// Generic evaluator (`src/jq/eval_generic.rs`) -- the CLI path.
@@ -50,7 +50,7 @@ fn run_generic(json: &[u8], expr: &Expr) -> usize {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     eval_generic::eval_with_cursor(expr, cursor)
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .expect("materializes")
         .len()
 }

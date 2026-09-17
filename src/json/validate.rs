@@ -1339,6 +1339,7 @@ pub(crate) fn parse_computed_float_token(bytes: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jq::JqSemantics;
 
     // ========================================================================
     // computed-float token tests (#2902)
@@ -1682,7 +1683,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    OwnedValue::from_number_bytes(s.as_bytes()),
+                    OwnedValue::from_number_bytes::<JqSemantics>(s.as_bytes()),
                     OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
                 ),
                 "validator admits a number the decoder does not read as one: {s:?}"

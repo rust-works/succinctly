@@ -5564,12 +5564,16 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
         // pushed an otherwise-safe 255-deep document one level past the
         // ceiling here specifically, panicking (exit 101) instead of
         // reporting a clean, catchable error.
-        GenericResult::One(v) => {
-            sink.materialize(DiagStyle::Jq, generic_to_owned_checked(&v), &at.resolve())
-        }
+        GenericResult::One(v) => sink.materialize(
+            DiagStyle::Jq,
+            generic_to_owned_checked::<JqSemantics, _>(&v),
+            &at.resolve(),
+        ),
         GenericResult::OneCursor(c) => sink.materialize(
             DiagStyle::Jq,
-            generic_to_owned_checked(&succinctly::jq::document::DocumentCursor::value(&c)),
+            generic_to_owned_checked::<JqSemantics, _>(
+                &succinctly::jq::document::DocumentCursor::value(&c),
+            ),
             &at.resolve(),
         ),
         GenericResult::Owned(v) => Some(v),
@@ -5597,7 +5601,7 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
         GenericResult::LazyIndexRange(len) => Some(OwnedValue::Array(
             (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
         )),
-        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic::<JqSemantics>() {
             Ok(v) => Some(v),
             Err(jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Jq, &e, &at.resolve());
@@ -5826,7 +5830,13 @@ fn evaluate_m2_fast_path<W: Write>(
     if matches!(result, GenericResult::LazySeq(_)) {
         let mut buf = String::new();
         let stats = result
-            .stream_json(&mut buf, indent, sort_keys, numbers, write_result_newline)
+            .stream_json::<_, JqSemantics>(
+                &mut buf,
+                indent,
+                sort_keys,
+                numbers,
+                write_result_newline,
+            )
             .map_err(|_| anyhow::anyhow!("write error"))?;
         if let Some(code) = stats.halt {
             sink.request_halt(code);
@@ -5842,7 +5852,7 @@ fn evaluate_m2_fast_path<W: Write>(
     } else {
         let mut writer = FmtWriter(out);
         let stats = result
-            .stream_json(
+            .stream_json::<_, JqSemantics>(
                 &mut writer,
                 indent,
                 sort_keys,
@@ -6044,7 +6054,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // one), matching `ManyCursor`'s own per-element `JqValue::Cursor`
         // mapping just above.
         //
-        // `to_owned_cursor(&c)` per `Cursor` element, discarding its `Ok`
+        // `to_owned_cursor::<JqSemantics, _>(&c)` per `Cursor` element, discarding its `Ok`
         // value (#2066 review, #1793 regression): this is the exact function
         // `lazy_elem_to_owned`'s own `Cursor` arm calls, so it re-validates
         // everything `materialize_atomic`'s per-element walk used to --
@@ -6079,7 +6089,9 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                 let converted: Result<Vec<JqValue<'_, W>>, EvalError> = elems
                     .into_iter()
                     .map(|elem| match elem {
-                        LazyElem::Cursor(c) => to_owned_cursor(&c).map(|_| JqValue::Cursor(c)),
+                        LazyElem::Cursor(c) => {
+                            to_owned_cursor::<JqSemantics, _>(&c).map(|_| JqValue::Cursor(c))
+                        }
                         LazyElem::Owned(v) => JqValue::try_from_owned(v),
                     })
                     .collect();
@@ -6612,7 +6624,7 @@ impl LiteralFormatter for JqCompatFormatter {
         // conversion in this crate uses, instead of echoing invalid text
         // verbatim and producing invalid JSON output.
         if !validate::is_valid_number(raw) {
-            return Cow::Owned(match OwnedValue::from_number_bytes(raw) {
+            return Cow::Owned(match OwnedValue::from_number_bytes::<JqSemantics>(raw) {
                 OwnedValue::Int(i) => self.format_int(i),
                 OwnedValue::Float(f) => self.format_float(f),
                 // A leading-dot span (`.5`, `-.5`) is jq-lenient-but-not-
@@ -6940,7 +6952,7 @@ fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<Owned
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     validate_json_delimiters(&cursor, 0)?;
-    generic_to_owned(&cursor.value())
+    generic_to_owned::<JqSemantics, _>(&cursor.value())
 }
 
 /// Print a JqValue as JSON using the provided literal formatter.

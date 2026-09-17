@@ -70,7 +70,7 @@ fn full_outcome(json: &[u8], filter: &str) -> Result<Vec<String>, String> {
     match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
         QueryResult::Error(e) => Err(e.message),
         other => Ok(other
-            .collect_owned()
+            .collect_owned::<JqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect()),
@@ -87,7 +87,7 @@ fn generic_outcome(json: &[u8], filter: &str) -> Result<Vec<String>, String> {
         return Err(e.message.clone());
     }
     Ok(result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .expect("materializes")
         .iter()
         .map(OwnedValue::to_json)
@@ -281,7 +281,7 @@ fn optional_suppresses_the_error() {
             "full evaluator: optional {filter} should be suppressed"
         );
         assert!(
-            full.collect_owned().is_empty(),
+            full.collect_owned::<JqSemantics>().is_empty(),
             "full evaluator: optional {filter} should yield nothing"
         );
 
@@ -291,7 +291,10 @@ fn optional_suppresses_the_error() {
             "generic evaluator: optional {filter} should be suppressed"
         );
         assert!(
-            generic.collect_owned().expect("materializes").is_empty(),
+            generic
+                .collect_owned::<JqSemantics>()
+                .expect("materializes")
+                .is_empty(),
             "generic evaluator: optional {filter} should yield nothing"
         );
     }

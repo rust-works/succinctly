@@ -55,7 +55,7 @@ fn run_paths(json: &str, filter: &str) -> Vec<String> {
         "`{filter}` errored on the depth-{DEPTH} document: {result:?}"
     );
     result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .iter()
         .map(OwnedValue::to_json)
         .collect()

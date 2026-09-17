@@ -144,7 +144,7 @@ fn bench_recurse_clone_depth(c: &mut Criterion) {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
                 let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-                black_box(result.collect_owned().len())
+                black_box(result.collect_owned::<JqSemantics>().len())
             });
         });
     }

@@ -382,7 +382,7 @@ use super::expr::{
     ObjectKey, Origin, Param, Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
-    assert_value_tree_depth, cmp_f64, infinite_float_preview_text, int_to_f64,
+    assert_value_tree_depth, cmp_f64, document_number_f64, infinite_float_preview_text, int_to_f64,
     is_infinity_sentinel, is_nan_sentinel, jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp,
     owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
 };
@@ -1753,11 +1753,11 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// outputs are no longer discarded. This gives the full evaluator the
     /// same materialization surface as the generic (CLI) path, which is what
     /// evaluator-parity tests rely on.
-    pub fn collect_owned(self) -> Vec<OwnedValue> {
+    pub fn collect_owned<S: EvalSemantics>(self) -> Vec<OwnedValue> {
         match self {
-            QueryResult::One(v) => vec![to_owned_lossy(&v)],
-            QueryResult::OneCursor(c) => vec![to_owned_lossy(&c.value())],
-            QueryResult::Many(vs) => vs.iter().map(to_owned_lossy).collect(),
+            QueryResult::One(v) => vec![to_owned_lossy::<S, _>(&v)],
+            QueryResult::OneCursor(c) => vec![to_owned_lossy::<S, _>(&c.value())],
+            QueryResult::Many(vs) => vs.iter().map(to_owned_lossy::<S, _>).collect(),
             QueryResult::None => Vec::new(),
             QueryResult::Error(_) => Vec::new(),
             QueryResult::Owned(o) => vec![o],
@@ -1943,11 +1943,13 @@ pub(crate) fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]
 /// ordinary deep `..`/`recurse` document navigation, which is why this
 /// needs the higher, separately-tuned ceiling rather than
 /// `eval_generic::MAX_NESTING_DEPTH`.
-fn to_owned_lossy<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
-    to_owned_lossy_at_depth(value, 0)
+fn to_owned_lossy<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> OwnedValue {
+    to_owned_lossy_at_depth::<S, W>(value, 0)
 }
 
-fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
+fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     depth: usize,
 ) -> OwnedValue {
@@ -1955,7 +1957,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
+        StandardJson::Number(n) => OwnedValue::from_number_bytes::<S>(n.raw_bytes()),
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -1965,7 +1967,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = (*elements)
-                .map(|e| to_owned_lossy_at_depth(&e, depth + 1))
+                .map(|e| to_owned_lossy_at_depth::<S, W>(&e, depth + 1))
                 .collect();
             OwnedValue::array_from(items)
         }
@@ -1977,7 +1979,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
                     if let Ok(cow) = key_str_val.as_str() {
                         map.insert(
                             cow.into_owned(),
-                            to_owned_lossy_at_depth(&field.value(), depth + 1),
+                            to_owned_lossy_at_depth::<S, W>(&field.value(), depth + 1),
                         );
                     }
                 }
@@ -2038,8 +2040,10 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// before this fix, `StandardJson`'s own
 /// [`DocumentValue`](super::document::DocumentValue) impl making the shared
 /// helper directly usable.
-fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<OwnedValue, EvalError> {
-    let result = to_owned_at_depth(value, None, 0);
+fn to_owned<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    let result = to_owned_at_depth::<S, W>(value, None, 0);
     // #2334: asserted here, at the depth-0 entry point, not inside the
     // recursive `to_owned_at_depth` -- one assert per materialization rather
     // than one per node.
@@ -2059,7 +2063,7 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<Owne
 /// Keep `Option` at this shared boundary for the genuinely cursorless
 /// `to_owned` caller; unlike the yq runner's #2781 call site, it cannot
 /// supply a root cursor without changing the value representation or API.
-fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     cursor: Option<&JsonCursor<'_, W>>,
     depth: usize,
@@ -2068,7 +2072,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
+        StandardJson::Number(n) => OwnedValue::from_number_bytes::<S>(n.raw_bytes()),
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => OwnedValue::String(cow.into_owned()),
             Err(e) => return Err(EvalError::decode_failure(e.message())),
@@ -2089,7 +2093,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 if !elem_cursor.element_gap_ok(is_first) {
                     return Err(elem_cursor.malformed_delimiter_error());
                 }
-                items.push(to_owned_at_depth(
+                items.push(to_owned_at_depth::<S, W>(
                     &elem_cursor.value(),
                     Some(&elem_cursor),
                     depth + 1,
@@ -2138,7 +2142,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 let key = field.checked_key(&f, &map, &mut guard, is_first)?;
                 map.insert(
                     key,
-                    to_owned_at_depth(&field.value, Some(&field.value_cursor), depth + 1)?,
+                    to_owned_at_depth::<S, W>(&field.value, Some(&field.value_cursor), depth + 1)?,
                 );
                 last_field = Some(field.value_cursor);
                 f = rest;
@@ -2226,19 +2230,19 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// undecodable string candidate (a computed index/slice-bound key) must
 /// raise, not silently become `""` and get indexed/compared as though
 /// that were the real key.
-fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(
+fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
     match value {
         StandardJson::Array(_) => Ok(OwnedValue::array()),
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
-        other => to_owned(other),
+        other => to_owned::<S, _>(other),
     }
 }
 
 /// jq truthiness of a borrowed value: everything except `null` and `false`.
 ///
-/// Equivalent to `to_owned_lossy(value).is_truthy()` — [`to_owned_lossy`] maps
+/// Equivalent to `to_owned_lossy::<S, _>(value).is_truthy()` — [`to_owned_lossy`] maps
 /// `StandardJson::Error` to `OwnedValue::Null`, which is falsy — but O(1)
 /// where `to_owned_lossy` deep-copies whole arrays and objects to answer a yes/no
 /// question. That matters for the stream operators, which test *every* output
@@ -2629,7 +2633,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `.map()` here since its `return` would return from the
                 // closure, not this function.
                 let sliced = slice_elements::<W>(elements, *start, *end);
-                match sliced.iter().map(to_owned).collect() {
+                match sliced.iter().map(to_owned::<S, _>).collect() {
                     Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
                     Err(e) => suppress_or_raise(e, optional),
                 }
@@ -2704,7 +2708,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `optional` the same way the sibling `_ if optional` arm
                 // below does -- only a genuine decode failure is
                 // unconditional.
-                let owned = match to_owned(&value) {
+                let owned = match to_owned::<S, _>(&value) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -2755,7 +2759,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Many(results)
             }
             _ => scalar_fallback(&value, optional || S::TAG == EvalTag::Yq, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
             }),
         },
 
@@ -3121,15 +3125,21 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `eval_pipe`'s identical `Many`-branch promotion uses
             // (#1755/#1843's own instance of this exact bug shape).
             QueryResult::One(v) => {
-                if let Err(e) = push_promoted(core::iter::once(v), &mut borrowed, &mut owned) {
+                if let Err(e) =
+                    push_promoted::<_, S>(core::iter::once(v), &mut borrowed, &mut owned)
+                {
                     // #1832 review: `push_promoted` only errors from its
                     // `Some(acc)` arm, so `owned` is always `Some` here --
                     // but go through the same checked resolution every
                     // other terminal arm uses (`eval_pipe`'s matching arms
                     // already did) rather than assume the invariant via
                     // `.expect()` and panic if a future refactor breaks it.
-                    let (prefix, control) =
-                        resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                    let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                        borrowed,
+                        owned,
+                        Vec::new(),
+                        Control::Error(e),
+                    );
                     return partial(prefix, control);
                 }
             }
@@ -3137,21 +3147,26 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 unreachable!("materialize_cursor should have converted this")
             }
             QueryResult::Many(vs) => {
-                if let Err(e) = push_promoted(vs, &mut borrowed, &mut owned) {
-                    let (prefix, control) =
-                        resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                if let Err(e) = push_promoted::<_, S>(vs, &mut borrowed, &mut owned) {
+                    let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                        borrowed,
+                        owned,
+                        Vec::new(),
+                        Control::Error(e),
+                    );
                     return partial(prefix, control);
                 }
             }
             QueryResult::Owned(v) => {
                 if let Err((prefix, e)) =
-                    promote_and_extend(&mut borrowed, &mut owned, core::iter::once(v))
+                    promote_and_extend::<_, S>(&mut borrowed, &mut owned, core::iter::once(v))
                 {
                     return partial(prefix, Control::Error(e));
                 }
             }
             QueryResult::ManyOwned(vs) => {
-                if let Err((prefix, e)) = promote_and_extend(&mut borrowed, &mut owned, vs) {
+                if let Err((prefix, e)) = promote_and_extend::<_, S>(&mut borrowed, &mut owned, vs)
+                {
                     return partial(prefix, Control::Error(e));
                 }
             }
@@ -3162,21 +3177,30 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // collapsing straight to a bare `Error`.
             QueryResult::Error(e) => {
                 let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                    resolve_terminal_prefix::<_, S>(borrowed, owned, Vec::new(), Control::Error(e));
                 return partial(prefix, control);
             }
             QueryResult::Break(label) => {
-                let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Break(label));
+                let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                    borrowed,
+                    owned,
+                    Vec::new(),
+                    Control::Break(label),
+                );
                 return partial(prefix, control);
             }
             QueryResult::Halt(code) => {
-                let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Halt(code));
+                let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                    borrowed,
+                    owned,
+                    Vec::new(),
+                    Control::Halt(code),
+                );
                 return partial(prefix, control);
             }
             QueryResult::Partial(vs, control) => {
-                let (prefix, control) = resolve_terminal_prefix(borrowed, owned, vs, control);
+                let (prefix, control) =
+                    resolve_terminal_prefix::<_, S>(borrowed, owned, vs, control);
                 return partial(prefix, control);
             }
         }
@@ -3238,12 +3262,12 @@ fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let items: Vec<OwnedValue> = match result.materialize_cursor() {
         // STYLE-0012: atomic array construction -- see the statement's own
         // comment just above.
-        QueryResult::One(v) => match to_owned(&v) {
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(v) => vec![v],
             Err(e) => return Err(QueryResult::Error(e)),
         },
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => match vs.iter().map(to_owned).collect::<Result<_, _>>() {
+        QueryResult::Many(vs) => match vs.iter().map(to_owned::<S, _>).collect::<Result<_, _>>() {
             Ok(items) => items,
             Err(e) => return Err(QueryResult::Error(e)),
         },
@@ -3329,7 +3353,7 @@ enum ObjectEscape {
 /// [`partial`] produces. [`result_to_owned_full`]'s dedicated
 /// `Partial(_, Halt) => Err(Halt)` arm exists only because *that* function
 /// keeps a single value and so has no honest prefix to emit alongside it.
-fn stream_outputs_lossy<W: Clone + AsRef<[u64]>>(
+fn stream_outputs_lossy<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result {
@@ -3337,7 +3361,7 @@ fn stream_outputs_lossy<W: Clone + AsRef<[u64]>>(
         QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
         QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
-        other => (other.collect_owned(), None),
+        other => (other.collect_owned::<S>(), None),
     }
 }
 
@@ -3375,16 +3399,16 @@ fn stream_outputs_lossy<W: Clone + AsRef<[u64]>>(
 /// concern at all (object construction's key/value slots and jq-mode string
 /// interpolation, #2022; `fanout_arg`, #2023) -- the count above is about
 /// this one bound-value shape specifically, not a total call-site census.
-fn stream_outputs<W: Clone + AsRef<[u64]>>(
+fn stream_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned(&v) {
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(v) => (vec![v], None),
             Err(e) => (Vec::new(), Some(Control::Error(e))),
         },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => match promote_borrowed(vs) {
+        QueryResult::Many(vs) => match promote_borrowed::<_, S>(vs) {
             Ok(vs) => (vs, None),
             Err((prefix, e)) => (prefix, Some(Control::Error(e))),
         },
@@ -3560,7 +3584,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     eval_object_construction_with::<W, S>(
         entries,
-        &mut |expr| stream_outputs(eval_single::<W, S>(expr, value.clone(), optional)),
+        &mut |expr| stream_outputs::<_, S>(eval_single::<W, S>(expr, value.clone(), optional)),
         optional,
     )
 }
@@ -3690,13 +3714,13 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// anything `promote_borrowed` never reached past it) is dropped
 /// from the reported prefix rather than leaking the old `""` substitution
 /// -- neither silently wrong output nor a silently downgraded halt.
-fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
+fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     borrowed: Vec<StandardJson<'_, W>>,
     owned: Option<Vec<OwnedValue>>,
     extra: Vec<OwnedValue>,
     control: Control,
 ) -> (Vec<OwnedValue>, Control) {
-    match owned.map_or_else(|| promote_borrowed(borrowed), Ok) {
+    match owned.map_or_else(|| promote_borrowed::<_, S>(borrowed), Ok) {
         Ok(mut prefix) => {
             prefix.extend(extra);
             (prefix, control)
@@ -3945,7 +3969,7 @@ fn borrowed_vec_to_result<W>(vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W>
 /// exercised by today's caller," not "cannot happen," so it gets the same
 /// defensible fallback as the plain `Error`/`Break`/`Halt` case instead of an
 /// assertion a future caller could legitimately trip.
-fn finish_result<W: Clone + AsRef<[u64]>>(
+fn finish_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
     trailing: Option<Control>,
 ) -> QueryResult<'_, W> {
@@ -3953,10 +3977,10 @@ fn finish_result<W: Clone + AsRef<[u64]>>(
         return result;
     };
     match result.materialize_cursor() {
-        QueryResult::One(v) => partial(vec![to_owned_lossy(&v)], control),
+        QueryResult::One(v) => partial(vec![to_owned_lossy::<S, _>(&v)], control),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => partial(vec![v], control),
-        QueryResult::Many(vs) => partial(vs.iter().map(to_owned_lossy).collect(), control),
+        QueryResult::Many(vs) => partial(vs.iter().map(to_owned_lossy::<S, _>).collect(), control),
         QueryResult::ManyOwned(vs) => partial(vs, control),
         // No output from `result` itself (e.g. an `optional` filter matched
         // nothing) -- nothing to splice the trailing control onto but the
@@ -4272,7 +4296,7 @@ where
         // live: `succinctly yq 'has(.b)'` on an undecodable `.b` answered
         // `false` instead of raising, pre-fix.
         let (mut args, trailing) =
-            stream_outputs(eval_single::<W, S>(arg_expr, value.clone(), optional));
+            stream_outputs::<_, S>(eval_single::<W, S>(arg_expr, value.clone(), optional));
         if clear_values_when_yq_argument_escaped(&mut args, &trailing) {
             // Fall through with no values: the `match trailing` below turns
             // the escape into a bare `Error`/`Break`/`Halt`.
@@ -4284,7 +4308,7 @@ where
         }
         let mut out: Vec<OwnedValue> = Vec::new();
         for arg in args {
-            if let Some(control) = push_owned_values(body(arg), &mut out) {
+            if let Some(control) = push_owned_values::<_, S>(body(arg), &mut out) {
                 return partial(out, control);
             }
         }
@@ -4312,11 +4336,11 @@ where
         // #1746-shaped bug, in this lazy sink specifically). Same
         // flush-then-stop shape as `body`'s own escape below -- a buffered
         // first result must be flushed ahead of this control too.
-        let owned = match item.into_owned() {
+        let owned = match item.into_owned::<S>() {
             Ok(v) => v,
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
-                    if let Some(control) = push_owned_values(previous, &mut out) {
+                    if let Some(control) = push_owned_values::<_, S>(previous, &mut out) {
                         return stop_with_escape(&mut body_control, control);
                     }
                 }
@@ -4324,7 +4348,7 @@ where
             }
         };
         if let Some(previous) = pending_first.take() {
-            if let Some(control) = push_owned_values(previous, &mut out) {
+            if let Some(control) = push_owned_values::<_, S>(previous, &mut out) {
                 return stop_with_escape(&mut body_control, control);
             }
         }
@@ -4334,14 +4358,14 @@ where
         // or an escaping first result would be parked and the sink would ask
         // for another value anyway -- which is the bug this arm exists to fix.
         if result.is_escape() {
-            if let Some(control) = push_owned_values(result, &mut out) {
+            if let Some(control) = push_owned_values::<_, S>(result, &mut out) {
                 return stop_with_escape(&mut body_control, control);
             } // omni-dev: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
             return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_owned_values` never answers `None` for an `is_escape()` result (#2180)"
         }
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
-        } else if let Some(control) = push_owned_values(result, &mut out) {
+        } else if let Some(control) = push_owned_values::<_, S>(result, &mut out) {
             return stop_with_escape(&mut body_control, control);
         }
         Demand::Continue
@@ -4367,7 +4391,7 @@ where
         // of it.
         Flow::Escaped(control) => {
             if let Some(previous) = pending_first.take() {
-                if let Some(body_control) = push_owned_values(previous, &mut out) {
+                if let Some(body_control) = push_owned_values::<_, S>(previous, &mut out) {
                     return partial(out, body_control);
                 }
             }
@@ -4462,7 +4486,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // that empty string were the real value (a path element, a pattern, a
     // set of regex flags).
     let (mut outers, outer_trailing) =
-        stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
+        stream_outputs::<_, S>(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
         // #1533's other half. Two things had to be established live against
         // the pinned yq v4.53.3 oracle, not assumed:
@@ -4490,7 +4514,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // not an extra one, with the same side-effect profile the loop's
         // first iteration would have had.
         let (mut probe_inners, probe_inner_trailing) =
-            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs::<_, S>(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(inner_e) = apply_arg_fanout(fanout, &mut probe_inners) {
             return match probe_inner_trailing {
                 Some(inner_control) => partial(Vec::new(), inner_control),
@@ -4519,7 +4543,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut out: Vec<OwnedValue> = Vec::new();
     for o in outers {
         let (mut inners, inner_trailing) =
-            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs::<_, S>(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
             // Same reasoning as the outer slot above.
             return match inner_trailing {
@@ -4529,7 +4553,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         for i in inners {
-            if let Some(control) = push_owned_values(body(o.clone(), i), &mut out) {
+            if let Some(control) = push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
                 return partial(out, control);
             }
         }
@@ -4560,10 +4584,10 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `fanout_two_args_lazy`'s own generator-argument sinks -- this function's
 /// prior callers). A new caller that reads string content must use
 /// `Item::into_owned` instead, not this function.
-fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
+fn item_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(item: Item<'_, W>) -> OwnedValue {
     match item {
         Item::Owned(v) => v,
-        Item::Borrowed(v) => to_owned_lossy(&v),
+        Item::Borrowed(v) => to_owned_lossy::<S, _>(&v),
     }
 }
 
@@ -4572,11 +4596,11 @@ fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
 /// code review) -- shared by that function's outer and inner closures,
 /// which were otherwise identical 7-line copies of this match differing
 /// only in which generator's item they decoded.
-fn checked_or_stop<W: Clone + AsRef<[u64]>>(
+fn checked_or_stop<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     item: Item<'_, W>,
     escape: &mut Option<Control>,
 ) -> Result<OwnedValue, Demand> {
-    match item.into_owned() {
+    match item.into_owned::<S>() {
         Ok(v) => Ok(v),
         Err(e) => Err(stop_with_escape(escape, Control::Error(e))),
     }
@@ -4605,16 +4629,16 @@ where
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
         // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
         // for both generators here.
-        let o = match checked_or_stop(outer_item, &mut escape) {
+        let o = match checked_or_stop::<_, S>(outer_item, &mut escape) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
-            let i = match checked_or_stop(inner_item, &mut escape) {
+            let i = match checked_or_stop::<_, S>(inner_item, &mut escape) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
-            match push_owned_values(body(o.clone(), i), &mut out) {
+            match push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
                 Some(control) => stop_with_escape(&mut escape, control),
                 None => Demand::Continue,
             }
@@ -4728,7 +4752,7 @@ pub(crate) fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryRes
 }
 
 /// [`to_owned`] plus [`suppress_or_raise`] in one call, per #2001's
-/// own suggestion: collapses the `match to_owned(&value) { Ok(v) =>
+/// own suggestion: collapses the `match to_owned::<S, _>(&value) { Ok(v) =>
 /// v, Err(e) => return suppress_or_raise(e, optional) }` four-liner this
 /// issue's whole lineage (#1194→#1953→#1972→#1999→#2001) keeps
 /// rediscovering missing at one more call site, into a single call. A macro
@@ -4741,7 +4765,7 @@ pub(crate) fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryRes
 /// twin, not a new one.
 macro_rules! to_owned_or_suppress {
     ($value:expr, $optional:expr) => {
-        match to_owned($value) {
+        match to_owned::<S, _>($value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, $optional),
         }
@@ -4751,7 +4775,7 @@ macro_rules! to_owned_or_suppress {
 /// The collection-level twin of [`to_owned_or_suppress`]: converts
 /// every item of `$iter` with `to_owned`, short-circuiting on the
 /// first error (code review, #1989/#2028) -- was hand-rolled as `match
-/// $iter.map(|v| to_owned(&v)).collect() { Ok(v) => v, Err(e) =>
+/// $iter.map(|v| to_owned::<S, _>(&v)).collect() { Ok(v) => v, Err(e) =>
 /// return suppress_or_raise(e, $optional) }` at three separate call sites
 /// (`builtin_combinations`, `builtin_combinations_n`, `builtin_skip`)
 /// before this consolidation -- the exact "keeps rediscovering missing at
@@ -4760,7 +4784,7 @@ macro_rules! to_owned_or_suppress {
 macro_rules! to_owned_vec_or_suppress {
     ($iter:expr, $optional:expr) => {
         match $iter
-            .map(|v| to_owned(&v))
+            .map(|v| to_owned::<S, _>(&v))
             .collect::<Result<Vec<OwnedValue>, EvalError>>()
         {
             Ok(v) => v,
@@ -4811,7 +4835,7 @@ fn finish_fork<'a, W>(
 /// Used by `try`/`catch` (#400): the body's outputs before the error, then
 /// the catch handler's own result — which may itself be `Partial` if the
 /// handler errors too, in which case the two prefixes concatenate.
-fn prepend<W: Clone + AsRef<[u64]>>(
+fn prepend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     mut prefix: Vec<OwnedValue>,
     result: QueryResult<'_, W>,
 ) -> QueryResult<'_, W> {
@@ -4827,7 +4851,7 @@ fn prepend<W: Clone + AsRef<[u64]>>(
         // .x` on a `.b` whose bytes don't decode), and this splice must
         // raise `EvalError::decode_failure` instead of silently
         // substituting `""`, matching #1755's established rule.
-        QueryResult::One(v) => match to_owned(&v) {
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(owned) => {
                 prefix.push(owned);
                 owned_vec_to_result(prefix)
@@ -4838,7 +4862,7 @@ fn prepend<W: Clone + AsRef<[u64]>>(
             prefix.push(v);
             owned_vec_to_result(prefix)
         }
-        QueryResult::Many(vs) => match promote_borrowed(vs) {
+        QueryResult::Many(vs) => match promote_borrowed::<_, S>(vs) {
             Ok(owned) => {
                 prefix.extend(owned);
                 owned_vec_to_result(prefix)
@@ -4868,10 +4892,10 @@ fn prepend<W: Clone + AsRef<[u64]>>(
 /// for why, and for the variant that exposes it) -- callers that can re-wrap
 /// their own final result via [`partial`] when that trailing control exists
 /// should use `result_to_owned_ctrl` instead (#1164).
-fn result_to_owned<W: Clone + AsRef<[u64]>>(
+fn result_to_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> Result<OwnedValue, EvalEscape> {
-    result_to_owned_ctrl(result).map(|(v, _trailing)| v)
+    result_to_owned_ctrl::<_, S>(result).map(|(v, _trailing)| v)
 }
 
 /// Like [`result_to_owned`], but also returns whether the result carried a
@@ -4891,10 +4915,10 @@ fn result_to_owned<W: Clone + AsRef<[u64]>>(
 /// `Some`, and leave any of its own error paths alone (#833's `ltrimstr(("a",
 /// break $out))` repro: `ltrimstr` computes and returns `"bcabc"`, *then*
 /// unwinds to `$out` -- `"after"` never prints).
-fn result_to_owned_ctrl<W: Clone + AsRef<[u64]>>(
+fn result_to_owned_ctrl<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> Result<(OwnedValue, Option<Control>), EvalEscape> {
-    result_to_owned_full(result)?.ok_or_else(|| EvalError::new("no value").into())
+    result_to_owned_full::<_, S>(result)?.ok_or_else(|| EvalError::new("no value").into())
 }
 
 /// Like [`result_to_owned_ctrl`], but distinguishes "the argument produced
@@ -4916,17 +4940,17 @@ fn result_to_owned_ctrl<W: Clone + AsRef<[u64]>>(
 /// `result_to_owned_ctrl`'s own doc comment documents for the *trailing*
 /// case. A caller migrating to this function must return `QueryResult::None`
 /// on `Ok(None)` instead of treating it as an error.
-fn result_to_owned_full<W: Clone + AsRef<[u64]>>(
+fn result_to_owned_full<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> Result<Option<(OwnedValue, Option<Control>)>, EvalEscape> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => Ok(Some((to_owned_lossy(&v), None))),
+        QueryResult::One(v) => Ok(Some((to_owned_lossy::<S, _>(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
         // An empty `Many`/`ManyOwned` is the same "zero outputs" case as a
         // bare `QueryResult::None` below, not a distinct error -- both mean
         // the argument's generator produced nothing.
-        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned_lossy(v), None))),
+        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned_lossy::<S, _>(v), None))),
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().map(|v| (v, None))),
         // Same "take the first output" policy already applied to
         // `Many`/`ManyOwned` above — a `Partial` prefix is never empty (see
@@ -5065,15 +5089,15 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult
 /// `resolve_leaf`'s general leaf case) -- #1908 audit, this doc comment
 /// having gone stale after #1972 landed is exactly the kind of drift that
 /// audit exists to catch.
-fn push_owned_values_lossy<W: Clone + AsRef<[u64]>>(
+fn push_owned_values_lossy<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => out.push(to_owned_lossy(&v)),
+        QueryResult::One(v) => out.push(to_owned_lossy::<S, _>(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => out.push(v),
-        QueryResult::Many(vs) => out.extend(vs.iter().map(to_owned_lossy)),
+        QueryResult::Many(vs) => out.extend(vs.iter().map(to_owned_lossy::<S, _>)),
         QueryResult::ManyOwned(vs) => out.extend(vs),
         QueryResult::None => {}
         QueryResult::Error(e) => return Some(Control::Error(e)),
@@ -5096,18 +5120,18 @@ fn push_owned_values_lossy<W: Clone + AsRef<[u64]>>(
 /// duplication `stream_outputs` doesn't cover, since this one
 /// pushes into a caller-owned accumulator across a loop rather than
 /// returning a fresh pair) into one definition.
-fn push_owned_values<W: Clone + AsRef<[u64]>>(
+fn push_owned_values<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned(&v) {
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(v) => out.push(v),
             Err(e) => return Some(Control::Error(e)),
         },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => out.push(v),
-        QueryResult::Many(vs) => match promote_borrowed(vs) {
+        QueryResult::Many(vs) => match promote_borrowed::<_, S>(vs) {
             Ok(vs) => out.extend(vs),
             Err((prefix, e)) => {
                 out.extend(prefix);
@@ -5176,9 +5200,9 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// silent `""` substitution for an undecodable borrowed string) is the
     /// same one that rename exists to name at every call site, not hide
     /// behind the unmarked default spelling.
-    fn into_owned_lossy(self) -> OwnedValue {
+    fn into_owned_lossy<S: EvalSemantics>(self) -> OwnedValue {
         match self {
-            Item::Borrowed(v) => to_owned_lossy(&v),
+            Item::Borrowed(v) => to_owned_lossy::<S, _>(&v),
             Item::Owned(v) => v,
         }
     }
@@ -5214,13 +5238,13 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// Release behaviour is [`Self::into_owned_lossy`]'s, unchanged: the
     /// assertion documents and guards an invariant, it does not add a new
     /// failure mode to a path that has none today.
-    fn into_owned_from_owned_producer(self) -> OwnedValue {
+    fn into_owned_from_owned_producer<S: EvalSemantics>(self) -> OwnedValue {
         debug_assert!(
             matches!(self, Item::Owned(_)),
             "a producer pushed Item::Borrowed into a sink whose protocol is \
              owned-only; see Item::into_owned_from_owned_producer (#2025)"
         );
-        self.into_owned_lossy()
+        self.into_owned_lossy::<S>()
     }
 
     /// Truthiness of this item, without decoding it (#2180 WP2a).
@@ -5249,9 +5273,9 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// #2196: named bare `into_owned`, not `_checked` -- mirroring #1989's
     /// own rename, the checked form is this file's unmarked default now,
     /// not the exception that needs flagging.
-    fn into_owned(self) -> Result<OwnedValue, EvalError> {
+    fn into_owned<S: EvalSemantics>(self) -> Result<OwnedValue, EvalError> {
         match self {
-            Item::Borrowed(v) => to_owned(&v),
+            Item::Borrowed(v) => to_owned::<S, _>(&v),
             Item::Owned(v) => Ok(v),
         }
     }
@@ -5485,7 +5509,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // output*, exactly as `builtin_path`'s `to_owned_or_suppress!`
             // does -- `suppresses` is the same predicate, so the two routes
             // cannot disagree about which failures a `?` swallows.
-            let owned = match to_owned(&value) {
+            let owned = match to_owned::<S, _>(&value) {
                 Ok(v) => v,
                 // #2280: defensive, not a live behaviour change -- exactly as
                 // the generic evaluator's own `Builtin::Path` arm records.
@@ -5526,7 +5550,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `combine`'s fallibility is not new risk, `binary_fanout_each`'s
         // `Err` handling was written generically for it from the start
         // (#1481).
-        Expr::Compare { op, left, right } => binary_fanout_each(
+        Expr::Compare { op, left, right } => binary_fanout_each::<_, S>(
             |operand, operand_sink| {
                 eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
             },
@@ -5550,7 +5574,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `eval_binary_fanout` alone, but this arm is what keeps that fix
         // working when arithmetic sits inside `first(...)`/`IN(...)`/another
         // `Compare`/etc.
-        Expr::Arithmetic { op, left, right } => binary_fanout_each(
+        Expr::Arithmetic { op, left, right } => binary_fanout_each::<_, S>(
             |operand, operand_sink| {
                 eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
             },
@@ -6509,7 +6533,7 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n_value = match result_to_owned_full(n_result) {
+    let n_value = match result_to_owned_full::<_, S>(n_result) {
         Ok(None) => return Flow::Exhausted,
         Ok(Some((v, _trailing))) => v,
         Err(e) => return Flow::Escaped(e.into()),
@@ -6665,7 +6689,7 @@ fn take_at_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         seen += 1;
         if at_or_past {
             let item = if materialize {
-                match item.into_owned() {
+                match item.into_owned::<S>() {
                     Ok(v) => Item::Owned(v),
                     Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 }
@@ -6748,7 +6772,7 @@ where
     let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
         // #2023's rule, same as `fanout_arg`'s own lazy sink: an undecodable
         // argument value raises rather than silently becoming `""`.
-        let owned = match item.into_owned() {
+        let owned = match item.into_owned::<S>() {
             Ok(v) => v,
             Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
@@ -6835,7 +6859,7 @@ fn each_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return Demand::Continue;
             }
             // Like the eager skip, only materialize outputs that survive the prefix.
-            match item.into_owned() {
+            match item.into_owned::<S>() {
                 Ok(value) => sink(Item::Owned(value)),
                 Err(error) => stop_with_escape(&mut escape, Control::Error(error)),
             }
@@ -6901,7 +6925,7 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Flow {
     // `to_owned_or_suppress!` returns a `QueryResult`; this arm answers in
     // `Flow`, so the same suppress-or-raise decision is spelled out (#2001).
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -6951,7 +6975,7 @@ fn each_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let current = match to_owned(&value) {
+    let current = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -7183,7 +7207,7 @@ fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(operand, value, optional, &mut |item| {
-        let owned = match item.into_owned() {
+        let owned = match item.into_owned::<S>() {
             Ok(v) => v,
             Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
@@ -7262,7 +7286,7 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // call above -- `.[k]?` suppresses only its own final index step,
             // never an error raised while computing `k`. Same exemption, same
             // reason, as `eval_index_expr`'s own `Item::Borrowed` arm.
-            Item::Borrowed(v) => match to_owned_key_shape(&v) {
+            Item::Borrowed(v) => match to_owned_key_shape::<_, S>(&v) {
                 Ok(k) => k,
                 Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
             },
@@ -7319,7 +7343,7 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StringPart::Expr(expr) => {
             let mut escape: Option<Control> = None;
             let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
-                let owned = match item.into_owned() {
+                let owned = match item.into_owned::<S>() {
                     Ok(v) => v,
                     Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
@@ -7344,7 +7368,7 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// own `split_first` recursion (entry 1 is outermost, the last entry varies
 /// fastest -- see that function's own doc comment for the full multi-output
 /// capture) -- but a key/value slot is now driven through `eval_each` instead
-/// of `stream_outputs(eval_single(...))`, so a `?//` bind inside a slot sees
+/// of `stream_outputs::<_, S>(eval_single(...))`, so a `?//` bind inside a slot sees
 /// a wrapping consumer's [`Demand::Stop`] *while it is still the live top of
 /// the call stack*. An eagerly-collected slot cannot forward that: by the
 /// time its collected `Vec` reaches `sink`, [`each_pattern_alternatives`] has
@@ -7396,7 +7420,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #2022: `into_owned`, not the lossy conversion -- an
                 // undecodable computed key must raise, matching
                 // `stream_outputs`'s own checked conversion.
-                let key_owned = match item.into_owned() {
+                let key_owned = match item.into_owned::<S>() {
                     Ok(v) => v,
                     Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
@@ -7457,7 +7481,7 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(value_expr, value.clone(), optional, &mut |item| {
         // #2022: same checked conversion as the key slot above.
-        let val_owned = match item.into_owned() {
+        let val_owned = match item.into_owned::<S>() {
             Ok(v) => v,
             Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
@@ -7569,7 +7593,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let from_flow = eval_each::<W, S>(from, value.clone(), optional, &mut |from_item| {
-        let from_val = match range_num(&item_to_owned(from_item)) {
+        let from_val = match range_num(&item_to_owned::<_, S>(from_item)) {
             Ok(n) => n,
             Err(e) => {
                 return stop_with_escape_cell(&escape, Control::Error(e));
@@ -7590,7 +7614,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
 
         let to_flow = eval_each::<W, S>(to_expr, value.clone(), optional, &mut |to_item| {
-            let to_val = match range_num(&item_to_owned(to_item)) {
+            let to_val = match range_num(&item_to_owned::<_, S>(to_item)) {
                 Ok(n) => n,
                 Err(e) => {
                     return stop_with_escape_cell(&escape, Control::Error(e));
@@ -7602,7 +7626,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Some(step_expr) => {
                     let step_flow =
                         eval_each::<W, S>(step_expr, value.clone(), optional, &mut |step_item| {
-                            let step_val = match range_num(&item_to_owned(step_item)) {
+                            let step_val = match range_num(&item_to_owned::<_, S>(step_item)) {
                                 Ok(n) => n,
                                 Err(e) => {
                                     return stop_with_escape_cell(&escape, Control::Error(e));
@@ -7742,7 +7766,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// function too -- neither the all-`Borrowed` fast path nor the ordinary,
 /// decodable-content test data it exercises change behavior under the
 /// stricter check).
-fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
+fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     items: Vec<Item<'a, W>>,
 ) -> QueryResult<'a, W> {
     if items.iter().all(|i| matches!(i, Item::Borrowed(_))) {
@@ -7757,7 +7781,7 @@ fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
     }
     let mut out = vec_with_capacity(items.len());
     for item in items {
-        match item.into_owned() {
+        match item.into_owned::<S>() {
             Ok(v) => out.push(v),
             Err(e) => return partial(out, Control::Error(e)),
         }
@@ -7808,7 +7832,7 @@ fn each_take_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// outputs into a [`QueryResult`], so their call sites cannot drift on the
 /// dropped-versus-raised trailing-control rule (#1519). Both sinks stop on
 /// every item they keep, so both have the identical rule.
-fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
+fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     items: Vec<Item<'_, W>>,
     flow: Flow,
 ) -> QueryResult<'_, W> {
@@ -7821,13 +7845,13 @@ fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
         // unconditionally before the call is just as cheap for the empty
         // case (mapping over nothing) and drops the redundant branch.
         Flow::Escaped(control) => partial(
-            items.into_iter().map(Item::into_owned_lossy).collect(),
+            items.into_iter().map(Item::into_owned_lossy::<S>).collect(),
             control,
         ),
         // `_checked`, not the unchecked twin it replaced upstream: an
         // undecodable item must raise rather than silently become "", and a
         // `?//` retry must not be able to launder that (#1820, #1660).
-        Flow::Stopped { .. } | Flow::Exhausted => items_to_result_checked(items),
+        Flow::Stopped { .. } | Flow::Exhausted => items_to_result_checked::<_, S>(items),
     }
 }
 
@@ -7971,7 +7995,7 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
-        sink(item.into_owned_lossy())
+        sink(item.into_owned_lossy::<S>())
     })
 }
 
@@ -7985,7 +8009,7 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
 /// borrowed until an owned/computed body result forces the accumulator to
 /// promote, and a sibling that errors or breaks keeps whatever was already
 /// produced as a `Partial` prefix (#400) rather than discarding it.
-fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
+fn eval_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond_result: QueryResult<'a, W>,
     mut body: impl FnMut(bool) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
@@ -8002,12 +8026,18 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
             // silently-corrupt-on-promotion bug shape already fixed for
             // eval_pipe/eval_comma, just never applied here.
             QueryResult::One(v) => {
-                if let Err(e) = push_promoted(core::iter::once(v), &mut borrowed, &mut owned) {
+                if let Err(e) =
+                    push_promoted::<_, S>(core::iter::once(v), &mut borrowed, &mut owned)
+                {
                     // #1832 review: see eval_comma's matching arm for why
                     // this goes through the checked resolution rather than
                     // `.expect()`-asserting the invariant.
-                    let (prefix, control) =
-                        resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                    let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                        borrowed,
+                        owned,
+                        Vec::new(),
+                        Control::Error(e),
+                    );
                     return partial(prefix, control);
                 }
             }
@@ -8015,42 +8045,56 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
                 unreachable!("materialize_cursor should have converted this")
             }
             QueryResult::Many(vs) => {
-                if let Err(e) = push_promoted(vs, &mut borrowed, &mut owned) {
-                    let (prefix, control) =
-                        resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                if let Err(e) = push_promoted::<_, S>(vs, &mut borrowed, &mut owned) {
+                    let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                        borrowed,
+                        owned,
+                        Vec::new(),
+                        Control::Error(e),
+                    );
                     return partial(prefix, control);
                 }
             }
             QueryResult::Owned(v) => {
                 if let Err((prefix, e)) =
-                    promote_and_extend(&mut borrowed, &mut owned, core::iter::once(v))
+                    promote_and_extend::<_, S>(&mut borrowed, &mut owned, core::iter::once(v))
                 {
                     return partial(prefix, Control::Error(e));
                 }
             }
             QueryResult::ManyOwned(vs) => {
-                if let Err((prefix, e)) = promote_and_extend(&mut borrowed, &mut owned, vs) {
+                if let Err((prefix, e)) = promote_and_extend::<_, S>(&mut borrowed, &mut owned, vs)
+                {
                     return partial(prefix, Control::Error(e));
                 }
             }
             QueryResult::None => {}
             QueryResult::Error(e) => {
                 let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                    resolve_terminal_prefix::<_, S>(borrowed, owned, Vec::new(), Control::Error(e));
                 return partial(prefix, control);
             }
             QueryResult::Break(label) => {
-                let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Break(label));
+                let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                    borrowed,
+                    owned,
+                    Vec::new(),
+                    Control::Break(label),
+                );
                 return partial(prefix, control);
             }
             QueryResult::Halt(code) => {
-                let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Halt(code));
+                let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                    borrowed,
+                    owned,
+                    Vec::new(),
+                    Control::Halt(code),
+                );
                 return partial(prefix, control);
             }
             QueryResult::Partial(vs, control) => {
-                let (prefix, control) = resolve_terminal_prefix(borrowed, owned, vs, control);
+                let (prefix, control) =
+                    resolve_terminal_prefix::<_, S>(borrowed, owned, vs, control);
                 return partial(prefix, control);
             }
         }
@@ -8058,7 +8102,8 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 
     match cond_control {
         Some(control) => {
-            let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
+            let (prefix, control) =
+                resolve_terminal_prefix::<_, S>(borrowed, owned, Vec::new(), control);
             partial(prefix, control)
         }
         None => match owned {
@@ -8145,7 +8190,7 @@ pub(crate) fn select_emits<S: EvalSemantics>(truthy: bool, already_emitted: &mut
 /// own `Expr::Compare`/`Expr::Arithmetic` arms, which pass the identical
 /// [`eval_each`] strategy directly into [`binary_fanout_each`] without going
 /// through this wrapper at all.
-fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
+fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
@@ -8154,7 +8199,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
-    let flow = binary_fanout_each(
+    let flow = binary_fanout_each::<_, S>(
         each_operand,
         left,
         right,
@@ -8162,7 +8207,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
         rules,
         combine,
         &mut |item: Item<'a, W>| {
-            out.push(item.into_owned_from_owned_producer());
+            out.push(item.into_owned_from_owned_producer::<S>());
             Demand::Continue
         },
     );
@@ -8218,15 +8263,15 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// abort-and-signal-`Stop` block. Unlike `combine`'s own error (handled
 /// separately, gated on `optional`), a decode failure is never suppressed
 /// (#1247/#1620), so this always escapes via `Flow::Escaped` regardless.
-fn checked_fanout_operand<W: Clone + AsRef<[u64]>>(
+fn checked_fanout_operand<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     item: Item<'_, W>,
     abort: &mut Option<Flow>,
 ) -> Result<OwnedValue, Demand> {
-    item.into_owned()
+    item.into_owned::<S>()
         .map_err(|e| stop_with_downstream(abort, Flow::Escaped(Control::Error(e))))
 }
 
-fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
+fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
@@ -8264,7 +8309,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
 
     let outer = each_operand(outer_expr, &mut |outer_item: Item<'a, W>| {
         outer_seen += 1;
-        let outer_val = match checked_fanout_operand(outer_item, &mut abort) {
+        let outer_val = match checked_fanout_operand::<_, S>(outer_item, &mut abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
@@ -8272,7 +8317,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
         let mut inner_seen = 0usize;
         let inner = each_operand(inner_expr, &mut |inner_item: Item<'a, W>| {
             inner_seen += 1;
-            let inner_val = match checked_fanout_operand(inner_item, &mut abort) {
+            let inner_val = match checked_fanout_operand::<_, S>(inner_item, &mut abort) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
@@ -8393,7 +8438,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
         // loop above never ran and the inner one was never evaluated at all.
         // Drive it once here and answer each of its outputs from the same
         // table -- and, if it is empty too, answer the both-empty row once.
-        return empty_outer_operand_pass(&each_operand, inner_expr, op, sink);
+        return empty_outer_operand_pass::<_, S>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
 }
@@ -8438,7 +8483,7 @@ fn read_only_operand_strategy<I>(
 /// `1 + key` are both `1`), which is only reproducible by evaluating the
 /// *other* operand in this case -- jq's right-outer/left-inner loop never
 /// reaches `left` at all when `right` is empty.
-fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>>(
+fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     each_operand: &impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     other: &Expr,
     op: EmptyOperandOp,
@@ -8448,7 +8493,7 @@ fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>>(
     let mut other_seen = 0usize;
     let flow = each_operand(other, &mut |other_item: Item<'a, W>| {
         other_seen += 1;
-        let other_val = match checked_fanout_operand(other_item, &mut abort) {
+        let other_val = match checked_fanout_operand::<_, S>(other_item, &mut abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
@@ -8499,7 +8544,7 @@ where
     // undecodable `.a` reported `string ("") cannot be negated` (a
     // catchable, `?`-suppressible error naming content the document never
     // held) instead of the decode failure, which `?` may not suppress.
-    let control = push_owned_values(operand_result, &mut vals);
+    let control = push_owned_values::<_, S>(operand_result, &mut vals);
 
     let mut out: Vec<OwnedValue> = Vec::new();
     for val in vals {
@@ -8869,7 +8914,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     rules: BinaryFanoutRules,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
-    binary_fanout_core(
+    binary_fanout_core::<_, S>(
         move |expr, sink| eval_each::<W, S>(expr, value.clone(), optional, sink),
         left,
         right,
@@ -10082,7 +10127,7 @@ fn eval_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-    eval_fanout(cond_result, |truthy| {
+    eval_fanout::<_, S>(cond_result, |truthy| {
         if truthy {
             eval_single::<W, S>(then_branch, value.clone(), optional)
         } else {
@@ -10149,7 +10194,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
                 None => QueryResult::None,
             };
-            prepend(prefix, handled)
+            prepend::<_, S>(prefix, handled)
         }
         // Same as the plain `Break` case above (#562), but the body
         // produced outputs before breaking: emit them, then run the catch
@@ -10161,7 +10206,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 None => QueryResult::None,
             };
-            prepend(prefix, handled)
+            prepend::<_, S>(prefix, handled)
         }
         // Non-error, non-break results pass through
         other => other,
@@ -10244,8 +10289,8 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // function's own `None` arm below now uses too, so there's no
             // risk of conflating the two.
             let checked = match &msg_result {
-                QueryResult::One(v) => Some(to_owned(v)),
-                QueryResult::Many(vs) => vs.first().map(to_owned),
+                QueryResult::One(v) => Some(to_owned::<S, _>(v)),
+                QueryResult::Many(vs) => vs.first().map(to_owned::<S, _>),
                 _ => None,
             };
             if let Some(checked) = checked {
@@ -10254,7 +10299,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return suppress_or_raise(e, optional),
                 }
             } else {
-                match result_to_owned(msg_result) {
+                match result_to_owned::<_, S>(msg_result) {
                     Ok(v) => v,
                     // `?` swallows only a genuine, catchable error in the
                     // message expression; a halt inside it always escapes
@@ -10279,7 +10324,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // once payload conversion has already succeeded; this one gates the
         // conversion itself), not the same code path, even though both
         // answer to the same ambient `optional`.
-        None => match to_owned(&value) {
+        None => match to_owned::<S, _>(&value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
         },
@@ -10424,7 +10469,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Length & Keys
         Builtin::Length => builtin_length::<W, S>(value, optional),
-        Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
+        Builtin::Utf8ByteLength => builtin_utf8bytelength::<_, S>(value, optional),
         Builtin::Keys => builtin_keys::<W, S>(value, optional, true),
         Builtin::KeysUnsorted => builtin_keys::<W, S>(value, optional, false),
         Builtin::Has(key_expr) => builtin_has::<W, S>(key_expr, value, optional),
@@ -10467,7 +10512,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 5: Array Functions
         Builtin::First => builtin_first::<W>(value, optional),
-        Builtin::Last => builtin_last::<W>(value, optional),
+        Builtin::Last => builtin_last::<W, S>(value, optional),
         Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
         Builtin::Reverse => builtin_reverse::<W, S>(value, optional),
         // #2818: bare `flatten` is jq's `def flatten: flatten(1/0);` --
@@ -10510,7 +10555,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::SortBy(f) => builtin_sort_by::<W, S>(f, value, optional),
 
         // Phase 5: Object Functions
-        Builtin::ToEntries => builtin_to_entries::<W>(value, optional),
+        Builtin::ToEntries => builtin_to_entries::<W, S>(value, optional),
         Builtin::FromEntries => builtin_from_entries::<W, S>(value, optional),
         Builtin::WithEntries(f) => builtin_with_entries::<W, S>(f, value, optional),
 
@@ -10522,7 +10567,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode::<W>(value, optional),
-        Builtin::Implode => builtin_implode::<W>(value, optional),
+        Builtin::Implode => builtin_implode::<W, S>(value, optional),
         #[cfg(feature = "regex")]
         Builtin::Test(re) => builtin_test_regex::<W, S>(re, value, optional),
         #[cfg(not(feature = "regex"))]
@@ -10534,9 +10579,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::UpperIndexStream(stream, idx_expr) => {
             builtin_upper_index_stream::<W, S>(stream, idx_expr, value, optional)
         }
-        Builtin::ToJsonStream => builtin_tojsonstream::<W>(value, optional),
-        Builtin::FromJsonStream => builtin_fromjsonstream::<W>(value, optional),
-        Builtin::ToStream => builtin_tostream::<W>(value, optional),
+        Builtin::ToJsonStream => builtin_tojsonstream::<W, S>(value, optional),
+        Builtin::FromJsonStream => builtin_fromjsonstream::<W, S>(value, optional),
+        Builtin::ToStream => builtin_tostream::<W, S>(value, optional),
         Builtin::FromStream(f) => builtin_fromstream::<W, S>(f, value, optional),
         Builtin::TruncateStream(f) => builtin_truncate_stream::<W, S>(f, value, optional),
         Builtin::GetPath(path) => builtin_getpath::<W, S>(path, value, optional),
@@ -10619,49 +10664,49 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let _ = n_expr; // Unused here, but evaluated in context version
             root_path_context_placeholder::<W, S>(no_parent_placeholder())
         }
-        Builtin::Paths => builtin_paths::<W>(value, optional),
+        Builtin::Paths => builtin_paths::<W, S>(value, optional),
         Builtin::PathsFilter(filter) => builtin_paths_filter::<W, S>(filter, value, optional),
-        Builtin::LeafPaths => builtin_leaf_paths::<W>(value, optional),
+        Builtin::LeafPaths => builtin_leaf_paths::<W, S>(value, optional),
         Builtin::SetPath(path, val) => builtin_setpath::<W, S>(path, val, value, optional),
         Builtin::DelPaths(paths) => builtin_delpaths::<W, S>(paths, value, optional),
 
         // Phase 10: Math Functions
-        Builtin::Floor => builtin_floor::<W>(value, optional),
-        Builtin::Ceil => builtin_ceil::<W>(value, optional),
-        Builtin::Round => builtin_round::<W>(value, optional),
-        Builtin::Sqrt => builtin_sqrt::<W>(value, optional),
-        Builtin::Fabs => builtin_fabs::<W>(value, optional),
-        Builtin::Log => builtin_log::<W>(value, optional),
-        Builtin::Log10 => builtin_log10::<W>(value, optional),
-        Builtin::Log2 => builtin_log2::<W>(value, optional),
-        Builtin::Exp => builtin_exp::<W>(value, optional),
-        Builtin::Exp10 => builtin_exp10::<W>(value, optional),
-        Builtin::Exp2 => builtin_exp2::<W>(value, optional),
+        Builtin::Floor => builtin_floor::<W, S>(value, optional),
+        Builtin::Ceil => builtin_ceil::<W, S>(value, optional),
+        Builtin::Round => builtin_round::<W, S>(value, optional),
+        Builtin::Sqrt => builtin_sqrt::<W, S>(value, optional),
+        Builtin::Fabs => builtin_fabs::<W, S>(value, optional),
+        Builtin::Log => builtin_log::<W, S>(value, optional),
+        Builtin::Log10 => builtin_log10::<W, S>(value, optional),
+        Builtin::Log2 => builtin_log2::<W, S>(value, optional),
+        Builtin::Exp => builtin_exp::<W, S>(value, optional),
+        Builtin::Exp10 => builtin_exp10::<W, S>(value, optional),
+        Builtin::Exp2 => builtin_exp2::<W, S>(value, optional),
         Builtin::Pow(base, exp) => builtin_pow::<W, S>(base, exp, value, optional),
-        Builtin::Sin => builtin_sin::<W>(value, optional),
-        Builtin::Cos => builtin_cos::<W>(value, optional),
-        Builtin::Tan => builtin_tan::<W>(value, optional),
-        Builtin::Asin => builtin_asin::<W>(value, optional),
-        Builtin::Acos => builtin_acos::<W>(value, optional),
-        Builtin::Atan => builtin_atan::<W>(value, optional),
+        Builtin::Sin => builtin_sin::<W, S>(value, optional),
+        Builtin::Cos => builtin_cos::<W, S>(value, optional),
+        Builtin::Tan => builtin_tan::<W, S>(value, optional),
+        Builtin::Asin => builtin_asin::<W, S>(value, optional),
+        Builtin::Acos => builtin_acos::<W, S>(value, optional),
+        Builtin::Atan => builtin_atan::<W, S>(value, optional),
         Builtin::Atan2(y, x) => builtin_atan2::<W, S>(y, x, value, optional),
-        Builtin::Sinh => builtin_sinh::<W>(value, optional),
-        Builtin::Cosh => builtin_cosh::<W>(value, optional),
-        Builtin::Tanh => builtin_tanh::<W>(value, optional),
-        Builtin::Asinh => builtin_asinh::<W>(value, optional),
-        Builtin::Acosh => builtin_acosh::<W>(value, optional),
-        Builtin::Atanh => builtin_atanh::<W>(value, optional),
-        Builtin::Libm1(f) => builtin_libm1::<W>(*f, value, optional),
+        Builtin::Sinh => builtin_sinh::<W, S>(value, optional),
+        Builtin::Cosh => builtin_cosh::<W, S>(value, optional),
+        Builtin::Tanh => builtin_tanh::<W, S>(value, optional),
+        Builtin::Asinh => builtin_asinh::<W, S>(value, optional),
+        Builtin::Acosh => builtin_acosh::<W, S>(value, optional),
+        Builtin::Atanh => builtin_atanh::<W, S>(value, optional),
+        Builtin::Libm1(f) => builtin_libm1::<W, S>(*f, value, optional),
         Builtin::Libm2(f, a, b) => builtin_libm2::<W, S>(*f, a, b, value, optional),
         Builtin::Libm3(f, a, b, c) => builtin_libm3::<W, S>(*f, a, b, c, value, optional),
 
         // Phase 10: Number Classification & Constants
         Builtin::Infinite => QueryResult::Owned(OwnedValue::Float(f64::INFINITY)),
         Builtin::Nan => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
-        Builtin::IsInfinite => builtin_isinfinite::<W>(value, optional),
-        Builtin::IsNan => builtin_isnan::<W>(value, optional),
-        Builtin::IsNormal => builtin_isnormal::<W>(value, optional),
-        Builtin::IsFinite => builtin_isfinite::<W>(value, optional),
+        Builtin::IsInfinite => builtin_isinfinite::<W, S>(value, optional),
+        Builtin::IsNan => builtin_isnan::<W, S>(value, optional),
+        Builtin::IsNormal => builtin_isnormal::<W, S>(value, optional),
+        Builtin::IsFinite => builtin_isfinite::<W, S>(value, optional),
 
         // Phase 10: Debug
         Builtin::Debug => builtin_debug::<W, S>(value, optional),
@@ -10688,7 +10733,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Rtrim => builtin_rtrim::<W>(value, optional),
 
         // Phase 10: Array functions
-        Builtin::Transpose => builtin_transpose::<W>(value, optional),
+        Builtin::Transpose => builtin_transpose::<W, S>(value, optional),
         Builtin::BSearch(x) => builtin_bsearch::<W, S>(x, value, optional),
 
         // Phase 10: Object functions
@@ -10718,8 +10763,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 super::eval_generic::ambient_file_index().unwrap_or(0),
             ))
         }
-        Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
-        Builtin::Pivot => builtin_pivot::<W>(value, optional),
+        Builtin::Shuffle => builtin_shuffle::<W, S>(value, optional),
+        Builtin::Pivot => builtin_pivot::<W, S>(value, optional),
         Builtin::SplitDoc => {
             // split_doc is identity - the output formatting (--- separators)
             // is handled by the yq runner, not here
@@ -10735,7 +10780,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Del(path) => builtin_del::<W, S>(path, value, optional),
         Builtin::SortKeys(path) => builtin_sort_keys::<W, S>(path.as_deref(), value, optional),
         Builtin::SortKeysOneLevel => {
-            let owned = match to_owned(&value) {
+            let owned = match to_owned::<S, _>(&value) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional), // omni-dev: coverage tolerate-line reason="unreachable: only ever constructed by builtin_sort_keys's own eval_update_no_vivify call, whose enclosing eval_update_impl already runs to_owned on the whole document up front (#2855) -- a decode failure anywhere raises there, before this filter ever sees a value to re-decode; confirmed live, `sort_keys(.a)`/`sort_keys(..)` on a document with a decode-failure subtree both raise from the outer to_owned"
             };
@@ -10758,10 +10803,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::GetSearchList => QueryResult::Owned(cli_context::search_list()),
         Builtin::GetJqOrigin => QueryResult::Owned(cli_context::jq_origin()),
         Builtin::GetProgOrigin => QueryResult::Owned(cli_context::prog_origin()),
-        Builtin::Abs => builtin_fabs::<W>(value, optional), // abs is an alias for fabs
+        Builtin::Abs => builtin_fabs::<W, S>(value, optional), // abs is an alias for fabs
         Builtin::Builtins => builtin_builtins::<W>(),
-        Builtin::Normals => builtin_normals::<W>(value),
-        Builtin::Finites => builtin_finites::<W>(value),
+        Builtin::Normals => builtin_normals::<W, S>(value),
+        Builtin::Finites => builtin_finites::<W, S>(value),
 
         // Phase 13: Iteration control
         Builtin::Limit(n_expr, expr) => builtin_limit::<W, S>(n_expr, expr, value, optional),
@@ -10776,24 +10821,24 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::RecurseDown => builtin_recurse::<W, S>(value, optional), // alias for recurse
 
         // Phase 15: Date/Time functions
-        Builtin::Gmtime => builtin_gmtime::<W>(value, optional),
-        Builtin::Localtime => builtin_localtime::<W>(value, optional),
-        Builtin::Mktime => builtin_mktime::<W>(value, optional),
+        Builtin::Gmtime => builtin_gmtime::<W, S>(value, optional),
+        Builtin::Localtime => builtin_localtime::<W, S>(value, optional),
+        Builtin::Mktime => builtin_mktime::<W, S>(value, optional),
         Builtin::Strftime(fmt) => builtin_strftime::<W, S>(fmt, value, optional),
         Builtin::Strflocaltime(fmt) => builtin_strflocaltime::<W, S>(fmt, value, optional),
         Builtin::FormatNamed(name) => builtin_format_named::<W, S>(name, value, optional),
         Builtin::Strptime(fmt) => builtin_strptime::<W, S>(fmt, value, optional),
-        Builtin::Todate => builtin_todate::<W>(value, optional),
+        Builtin::Todate => builtin_todate::<W, S>(value, optional),
         Builtin::Fromdate => builtin_fromdate::<W>(value, optional),
-        Builtin::Todateiso8601 => builtin_todate::<W>(value, optional), // alias for todate
+        Builtin::Todateiso8601 => builtin_todate::<W, S>(value, optional), // alias for todate
         Builtin::Fromdateiso8601 => builtin_fromdate::<W>(value, optional), // alias for fromdate
 
         // Phase 17: Combinations
-        Builtin::Combinations => builtin_combinations::<W>(value, optional),
+        Builtin::Combinations => builtin_combinations::<W, S>(value, optional),
         Builtin::CombinationsN(n) => builtin_combinations_n::<W, S>(n, value, optional),
 
         // Phase 18: Additional math functions
-        Builtin::Trunc => builtin_trunc::<W>(value, optional),
+        Builtin::Trunc => builtin_trunc::<W, S>(value, optional),
 
         // Phase 19: Type conversion
         Builtin::ToBoolean => builtin_toboolean::<W>(value, optional),
@@ -10802,7 +10847,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Skip(n_expr, expr) => builtin_skip::<W, S>(n_expr, expr, value, optional),
 
         // Phase 21: Extended Date/Time functions (yq)
-        Builtin::FromUnix => builtin_from_unix::<W>(value, optional),
+        Builtin::FromUnix => builtin_from_unix::<W, S>(value, optional),
         Builtin::ToUnix => builtin_to_unix::<W>(value, optional),
         Builtin::Tz(zone) => builtin_tz::<W, S>(zone, value, optional),
 
@@ -10864,19 +10909,19 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::Float(f64::INFINITY))
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
-            } else if let Ok(f) = n.as_f64() {
+            } else if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Float(f)))
             } else {
                 QueryResult::Owned(OwnedValue::Int(0))
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy(&value))),
+        _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy::<S, _>(&value))),
     }
 }
 
 /// Builtin: utf8bytelength
-fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
+fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -10887,7 +10932,9 @@ fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned_lossy(&value))),
+        _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned_lossy::<S, _>(
+            &value,
+        ))),
     }
 }
 
@@ -10980,7 +11027,7 @@ fn builtin_keys<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // instead of the generic `has_no_keys` message built from an
             // unchecked `to_owned_lossy`.
             scalar_fallback(&value, optional, || {
-                EvalError::has_no_keys(&to_owned_lossy(&value))
+                EvalError::has_no_keys(&to_owned_lossy::<S, _>(&value))
             })
         }
     }
@@ -11145,7 +11192,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // #2202 (decided, not a bug): this stays an *eager* early return, unlike
     // `builtin_contains`/`builtin_inside`'s own #1800 deferral. Those two fan
-    // `b_expr` out over the cursor and only *consult* `to_owned(&value)`
+    // `b_expr` out over the cursor and only *consult* `to_owned::<S, _>(&value)`
     // lazily inside the per-candidate body -- a poisoned-value shape this
     // function could adopt too (`obj_expr`/`xs` doesn't structurally need an
     // owned `key_owned` up front, only `has($x)`'s eventual comparison does),
@@ -11396,7 +11443,7 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
     let mut already_emitted = false;
-    eval_fanout(cond_result, |truthy| {
+    eval_fanout::<_, S>(cond_result, |truthy| {
         if select_emits::<S>(truthy, &mut already_emitted) {
             QueryResult::One(value.clone())
         } else {
@@ -11424,7 +11471,7 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
             // STYLE-0012: atomic array construction -- see the `map(f)` comment
             // at the top of this loop.
-            QueryResult::One(v) => match to_owned(&v) {
+            QueryResult::One(v) => match to_owned::<S, _>(&v) {
                 Ok(owned) => results.push(owned),
                 Err(e) => return QueryResult::Error(e),
             },
@@ -11434,7 +11481,7 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 for v in &vs {
                     // STYLE-0012: same array-construction atomicity as the
                     // `One` arm above.
-                    match to_owned(v) {
+                    match to_owned::<S, _>(v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return QueryResult::Error(e),
                     }
@@ -11488,7 +11535,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // (#1247/#1620), instead of the generic message built from an
             // unchecked `to_owned_lossy`.
             scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
             })
         }
     }
@@ -11558,14 +11605,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let field_val = field.value;
                 let value_to_insert =
                     match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
-                        QueryResult::One(v) => match to_owned(&v) {
+                        QueryResult::One(v) => match to_owned::<S, _>(&v) {
                             Ok(owned) => Some(owned),
                             Err(e) => return suppress_or_raise(e, optional),
                         },
                         QueryResult::OneCursor(_) => unreachable!(),
                         QueryResult::Owned(v) => Some(v),
                         QueryResult::Many(vs) => match vs.first() {
-                            Some(v) => match to_owned(v) {
+                            Some(v) => match to_owned::<S, _>(v) {
                                 Ok(owned) => Some(owned),
                                 Err(e) => return suppress_or_raise(e, optional),
                             },
@@ -11616,7 +11663,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // to run its delimiter check, then discards it.
                 let elem = cursor.value();
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-                    QueryResult::One(v) => match to_owned(&v) {
+                    QueryResult::One(v) => match to_owned::<S, _>(&v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return suppress_or_raise(e, optional),
                     },
@@ -11624,7 +11671,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => results.push(v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            match to_owned(v) {
+                            match to_owned::<S, _>(v) {
                                 Ok(owned) => results.push(owned),
                                 Err(e) => return suppress_or_raise(e, optional),
                             }
@@ -11667,7 +11714,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1820: scalar_decode_failure first -- same gap as builtin_map's
         // sibling fallback above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -11686,11 +11733,11 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // STYLE-0012: routed, but at the shared `match items` fold below --
         // both this arm and the `Object` one feed the same `Result`, and the
         // audit's routing window stops at the next materialization site.
-        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        StandardJson::Array(elements) => elements.map(|e| to_owned::<S, _>(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
             });
         }
     };
@@ -11717,14 +11764,14 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// soon as an element's truthiness matches it, instead of walking the rest
 /// of the container. `any` looks for a truthy element (`target_truthy =
 /// true`); `all` looks for a falsy one (`target_truthy = false`).
-fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
+fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     elements: impl Iterator<Item = StandardJson<'a, W>>,
     target_truthy: bool,
 ) -> Result<bool, EvalError> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" (truthy) and decide the answer.
     for elem in elements {
-        if to_owned(&elem)?.is_truthy() == target_truthy {
+        if to_owned::<S, _>(&elem)?.is_truthy() == target_truthy {
             return Ok(target_truthy);
         }
     }
@@ -11761,9 +11808,11 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         })
     };
     match value {
-        StandardJson::Array(elements) => owned_bool(any_all_over(elements, true)),
+        StandardJson::Array(elements) => owned_bool(any_all_over::<_, S>(elements, true)),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), true)),
+        StandardJson::Object(fields) => {
+            owned_bool(any_all_over::<_, S>(fields.map(|f| f.value()), true))
+        }
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: `scalar_fallback`, not a bare `_ if optional` + type error.
         // jq mode's wildcard also catches `String`, so an undecodable string
@@ -11774,7 +11823,7 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // gives jq mode the same "decode failure wins over `optional`"
         // ordering the #1247/#1620 rule requires.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -11800,14 +11849,16 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         })
     };
     match value {
-        StandardJson::Array(elements) => owned_bool(any_all_over(elements, false)),
+        StandardJson::Array(elements) => owned_bool(any_all_over::<_, S>(elements, false)),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), false)),
+        StandardJson::Object(fields) => {
+            owned_bool(any_all_over::<_, S>(fields.map(|f| f.value()), false))
+        }
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: same `scalar_fallback` conversion as `builtin_any` above --
         // see its comment for why the jq-mode wildcard needed one too.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -11873,7 +11924,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // string input reported `Cannot iterate over string ("")` (or
         // nothing at all under `?`) rather than the decode failure.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -11895,7 +11946,7 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     for cursor_elem in elements {
-        let elem = match to_owned(&cursor_elem) {
+        let elem = match to_owned::<S, _>(&cursor_elem) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
@@ -12085,7 +12136,10 @@ fn builtin_min<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, never be suppressed by `optional`/`?` (the
         // #1247/#1620 rule) or misreported as an ordinary type error.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::pair_cannot_be_iterated(&to_owned_lossy(&value), &to_owned_lossy(&value))
+            EvalError::pair_cannot_be_iterated(
+                &to_owned_lossy::<S, _>(&value),
+                &to_owned_lossy::<S, _>(&value),
+            )
         }),
     }
 }
@@ -12111,7 +12165,10 @@ fn builtin_max<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         // #1755: same reasoning as builtin_min's own scalar arm above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::pair_cannot_be_iterated(&to_owned_lossy(&value), &to_owned_lossy(&value))
+            EvalError::pair_cannot_be_iterated(
+                &to_owned_lossy::<S, _>(&value),
+                &to_owned_lossy::<S, _>(&value),
+            )
         }),
     }
 }
@@ -12188,7 +12245,7 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // STYLE-0012: this is the `else` of `if optional`, so `optional` is
         // `false` here by construction -- `suppress_or_raise(e, optional)`
         // would be `QueryResult::Error(e)` on every path.
-        let original = match to_owned(&StandardJson::Object(fields)) {
+        let original = match to_owned::<S, _>(&StandardJson::Object(fields)) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
@@ -12230,7 +12287,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .into_iter()
                 .min_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
                 .unwrap();
-            let min = match to_owned(&v) {
+            let min = match to_owned::<S, _>(&v) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -12252,7 +12309,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -12292,7 +12349,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .into_iter()
                 .max_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
                 .unwrap();
-            let max = match to_owned(&v) {
+            let max = match to_owned::<S, _>(&v) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -12312,7 +12369,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: same decode-failure precedence as min_by's own scalar arm
         // above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -12378,7 +12435,7 @@ enum StringEdge {
 /// *total* -- a non-string pattern argument or a non-string input value
 /// passes through unchanged, never an error -- differing only in which edge
 /// they trim.
-fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
+fn trim_edge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     pattern_owned: OwnedValue,
     edge: StringEdge,
@@ -12389,7 +12446,7 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
     // one. #1755: not to_owned_lossy -- a passed-through undecodable value must
     // raise, not silently become "".
     let OwnedValue::String(pattern) = pattern_owned else {
-        return match to_owned(value) {
+        return match to_owned::<S, _>(value) {
             Ok(v) => QueryResult::Owned(v),
             Err(e) => QueryResult::Error(e),
         };
@@ -12421,7 +12478,7 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
         },
         // jq's ltrimstr/rtrimstr are total: a non-string input passes
         // through unchanged.
-        _ => match to_owned(value) {
+        _ => match to_owned::<S, _>(value) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         },
@@ -12446,7 +12503,7 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (ADR-0018), not a divergence. Same for every other `ArgFanout::All`
         // in this family.
         ArgFanout::All,
-        |prefix_owned| trim_edge(&value, prefix_owned, StringEdge::Prefix),
+        |prefix_owned| trim_edge::<_, S>(&value, prefix_owned, StringEdge::Prefix),
     )
 }
 
@@ -12462,7 +12519,7 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         // Real yq has no `rtrimstr` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
-        |suffix_owned| trim_edge(&value, suffix_owned, StringEdge::Suffix),
+        |suffix_owned| trim_edge::<_, S>(&value, suffix_owned, StringEdge::Suffix),
     )
 }
 
@@ -12872,7 +12929,7 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let parts: Result<Vec<String>, EvalError> = elements
                     .map(|e| match &e {
                         StandardJson::Object(fields) if fields.is_empty() => Ok("{}".to_string()),
-                        _ => to_owned_key_shape(&e).map(yq_join_element_part),
+                        _ => to_owned_key_shape::<_, S>(&e).map(yq_join_element_part),
                     })
                     .collect();
                 parts.map(JoinParts::Yq)
@@ -12911,18 +12968,18 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // completely, not just narrows it.
     let parts: Result<Vec<OwnedValue>, EvalError> = match value {
         StandardJson::Array(elements) => {
-            collect_jq_join_parts_until_first_container(elements.map(|e| to_owned(&e)))
+            collect_jq_join_parts_until_first_container(elements.map(|e| to_owned::<S, _>(&e)))
         }
-        StandardJson::Object(fields) => {
-            collect_jq_join_parts_until_first_container(fields.map(|f| to_owned(&f.value())))
-        }
+        StandardJson::Object(fields) => collect_jq_join_parts_until_first_container(
+            fields.map(|f| to_owned::<S, _>(&f.value())),
+        ),
         _ => {
             if let Some(e) = scalar_decode_failure(&value) {
                 return Err(e);
             }
             return Err(EvalError::cannot_iterate_with(
                 S::TAG,
-                &to_owned_lossy(&value),
+                &to_owned_lossy::<S, _>(&value),
             ));
         }
     };
@@ -12940,7 +12997,7 @@ fn collect_jq_join_parts_until_first_container(
     let mut parts = Vec::new();
     for elem in elements {
         // #1755: propagates a decode failure immediately, same as the
-        // `to_owned(&e)?` this replaced -- an undecodable element
+        // `to_owned::<S, _>(&e)?` this replaced -- an undecodable element
         // must raise before the container short-circuit below ever gets a
         // chance to apply to it.
         let part = join_element_part(elem?);
@@ -13030,7 +13087,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `test_builtin_contains_empty_argument_never_demands_the_input_1800`
     // so a later "reconcile the pending decode failure after the fan-out"
     // change can't quietly resurrect it there.
-    let input = to_owned(&value);
+    let input = to_owned::<S, _>(&value);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -13148,7 +13205,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_contains`'s matching comment for the full ordering
     // rationale, the zero-candidate case (`inside(empty)`) included (this
     // function mirrors it exactly).
-    let input = to_owned(&value);
+    let input = to_owned::<S, _>(&value);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -13206,7 +13263,7 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: last - last element (.[-1])
-fn builtin_last<W: Clone + AsRef<[u64]>>(
+fn builtin_last<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -13219,7 +13276,7 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
             } else {
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // element must raise, not silently become "".
-                match to_owned(&items[items.len() - 1]) {
+                match to_owned::<S, _>(&items[items.len() - 1]) {
                     Ok(v) => QueryResult::Owned(v),
                     Err(e) => suppress_or_raise(e, optional),
                 }
@@ -13261,7 +13318,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `index_one` yields a borrowed `QueryResult::One` for the common
         // array case, and `fanout_arg`'s single-output fast path returns it
         // verbatim -- so `[1,2,3] | nth(0)` keeps the zero-copy path
-        // `finish_result(result, None)` used to preserve here.
+        // `finish_result::<_, S>(result, None)` used to preserve here.
         |n| index_one::<W, S>(value.clone(), &n, optional),
     )
 }
@@ -13358,17 +13415,17 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let items: Result<Vec<OwnedValue>, EvalError> = match &value {
         // STYLE-0012: routed at the shared `match items` fold below -- see
         // `builtin_add`'s identical note.
-        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+        StandardJson::Array(elements) => elements.map(|e| to_owned::<S, _>(&e)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
             });
         }
     };
@@ -13588,7 +13645,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // change: `to_owned`'s only error path is
                 // `is_decode_failure()`-tagged, which `suppress_or_raise`
                 // never suppresses regardless of `optional`.
-                let owned_item = match to_owned(&item) {
+                let owned_item = match to_owned::<S, _>(&item) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -13649,7 +13706,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -13706,7 +13763,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -13756,7 +13813,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // change: `to_owned`'s only error path is
                 // `is_decode_failure()`-tagged, which `suppress_or_raise`
                 // never suppresses regardless of `optional`.
-                let owned_item = match to_owned(&item) {
+                let owned_item = match to_owned::<S, _>(&item) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -13792,7 +13849,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -13816,7 +13873,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_be_sorted(&to_owned_lossy(&value))
+            EvalError::cannot_be_sorted(&to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -13855,7 +13912,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // change: `to_owned`'s only error path is
                 // `is_decode_failure()`-tagged, which `suppress_or_raise`
                 // never suppresses regardless of `optional`.
-                let owned_item = match to_owned(&item) {
+                let owned_item = match to_owned::<S, _>(&item) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -13885,7 +13942,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
         }),
     }
 }
@@ -13900,7 +13957,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// keys: an array's keys are its indices, and `[1,2] | to_entries` is
 /// `[{"key":0,"value":1},{"key":1,"value":2}]`. Anything with no keys at all
 /// gets `keys`' own refusal.
-fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
+fn builtin_to_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -13934,7 +13991,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 // needs `collect_cursors_checked` to return resolved
                 // positions too, a shared-trait-signature change with a
                 // wider blast radius than this fix's own #1677 scope.
-                let val = match to_owned(&cursor.value()) {
+                let val = match to_owned::<S, _>(&cursor.value()) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -13976,7 +14033,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 let Some(key) = key_display_string(&field.key) else {
                     return QueryResult::Error(fields.malformed_member_error());
                 };
-                let val = match to_owned(&field.value) {
+                let val = match to_owned::<S, _>(&field.value) {
                     Ok(val) => val,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -13994,7 +14051,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             // scalar fallback was missed. Same guard as builtin_keys'
             // sibling fallback.
             scalar_fallback(&value, optional, || {
-                EvalError::has_no_keys(&to_owned_lossy(&value))
+                EvalError::has_no_keys(&to_owned_lossy::<S, _>(&value))
             })
         }
     }
@@ -14117,17 +14174,17 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let entries: Result<Vec<OwnedValue>, EvalError> = match &value {
         // STYLE-0012: routed at the shared `match entries` fold below -- see
         // `builtin_add`'s identical note.
-        StandardJson::Array(elements) => elements.map(|elem| to_owned(&elem)).collect(),
+        StandardJson::Array(elements) => elements.map(|elem| to_owned::<S, _>(&elem)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned::<S, _>(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy::<S, _>(&value))
             });
         }
     };
@@ -14161,7 +14218,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // `to_entries` owns the input-shape check, so a value with no keys at all
     // reports its sentence and nothing else needs to know the shape.
-    let entries = match builtin_to_entries::<W>(value, optional) {
+    let entries = match builtin_to_entries::<W, S>(value, optional) {
         QueryResult::Owned(OwnedValue::Array(entries)) => entries,
         QueryResult::None => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
@@ -14194,7 +14251,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // fixed anyway for the same structural-consistency reason as
         // `collect_rhs_outputs`'s masked fix (#1778).
         match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
-            QueryResult::One(v) => match to_owned(&v) {
+            QueryResult::One(v) => match to_owned::<S, _>(&v) {
                 Ok(v) => transformed.push(v),
                 Err(e) => return suppress_or_raise(e, optional),
             },
@@ -14202,7 +14259,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => transformed.push(v),
             QueryResult::Many(vs) => {
                 for v in vs {
-                    match to_owned(&v) {
+                    match to_owned::<S, _>(&v) {
                         Ok(v) => transformed.push(v),
                         Err(e) => return suppress_or_raise(e, optional),
                     }
@@ -14258,7 +14315,7 @@ fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
 fn string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<String>, Option<Control>) {
-    let (values, control) = stream_outputs(result);
+    let (values, control) = stream_outputs::<_, S>(result);
     (values.iter().map(owned_to_string::<S>).collect(), control)
 }
 
@@ -14387,7 +14444,7 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                     // undecodable borrowed slot value used to silently
                     // become `""` instead of raising, same root cause as
                     // #1932/#1943's own fast-path consumers.
-                    QueryResult::One(v) => match to_owned(&v) {
+                    QueryResult::One(v) => match to_owned::<S, _>(&v) {
                         Ok(v) => owned_to_string::<S>(&v),
                         Err(e) => return suppress_or_raise(e, optional),
                     },
@@ -14395,7 +14452,7 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                     QueryResult::Owned(v) => owned_to_string::<S>(&v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            match to_owned(v) {
+                            match to_owned::<S, _>(v) {
                                 Ok(v) => owned_to_string::<S>(&v),
                                 Err(e) => return suppress_or_raise(e, optional),
                             }
@@ -15824,7 +15881,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Already a number, return as-is -- this is a passthrough, not a
             // computation, so (like `.`) it keeps the source literal when
             // that literal is valid RFC 8259 syntax (#966).
-            QueryResult::Owned(OwnedValue::from_number_bytes(n.raw_bytes()))
+            QueryResult::Owned(OwnedValue::from_number_bytes::<S>(n.raw_bytes()))
         }
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => match tonumber_from_str(cow.as_ref(), S::TAG == EvalTag::Yq) {
@@ -15835,7 +15892,9 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned_lossy(&value))),
+        _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned_lossy::<S, _>(
+            &value,
+        ))),
     }
 }
 
@@ -15892,7 +15951,16 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // rule for the two words Rust's parser lacks.
     if crate::json::validate::is_valid_number(trimmed.as_bytes()) {
         if !yq_mode || !yq_literal_overflows_f64(trimmed) {
-            return Ok(OwnedValue::from_number_literal(trimmed));
+            // #2936: the literal's double follows the mode -- jq's 17-digit
+            // rounding, yq's plain parse -- exactly as a document number's
+            // does; `tonumber` is one of the entry points jq reads a literal
+            // through (`"2.7293109604053567083" | tonumber + 0` is
+            // `2.7293109604053565` there).
+            return Ok(if yq_mode {
+                OwnedValue::from_number_literal::<YqSemantics>(trimmed)
+            } else {
+                OwnedValue::from_number_literal::<JqSemantics>(trimmed)
+            });
         }
         // yq mode only: real yq's `ParseFloat` itself errors (`ErrRange`) on
         // a magnitude past f64's finite range, so `"1e999"`/`"1e309"` must
@@ -15931,7 +15999,11 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
                     s.to_string(),
                 )));
             }
-            return Ok(OwnedValue::from_number_literal(unsigned));
+            return Ok(if yq_mode {
+                OwnedValue::from_number_literal::<YqSemantics>(unsigned)
+            } else {
+                OwnedValue::from_number_literal::<JqSemantics>(unsigned)
+            });
         }
     }
     // Past this point jq and yq part ways entirely: jq falls back to Rust's
@@ -16425,9 +16497,9 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(&to_owned_lossy(
-            &value,
-        ))),
+        _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(
+            &to_owned_lossy::<S, _>(&value),
+        )),
     }
 }
 
@@ -16505,7 +16577,7 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
         }
         b'-' | b'0'..=b'9' => {
             // number
-            parse_json_number(bytes, pos)
+            parse_json_number(bytes, pos, yq_mode)
         }
         c => Err(format!("unexpected character: '{}'", c as char)),
     }
@@ -16797,7 +16869,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
 }
 
 /// Parse a JSON number
-fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+fn parse_json_number(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
     let start = *pos;
 
     // Optional minus sign
@@ -16852,17 +16924,27 @@ fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String
     let num_str =
         core::str::from_utf8(&bytes[start..*pos]).map_err(|_| "invalid number encoding")?;
 
+    // #2936: `fromjson` is one of the entry points jq reads a literal
+    // through, so its double follows the mode like every other -- jq's
+    // 17-digit rounding, yq's plain parse. This parser predates the
+    // literal-preserving funnels and still hands back a bare `Float`
+    // (#3032 tracks moving it onto them); only the *value* moves here.
+    let to_float = |text: &str, err: &'static str| -> Result<f64, String> {
+        if yq_mode {
+            text.parse::<f64>().map_err(|_| err.to_string())
+        } else {
+            super::value::jq_literal_text_to_f64(text).ok_or_else(|| err.to_string())
+        }
+    };
     if is_float {
-        let f: f64 = num_str.parse().map_err(|_| "invalid float")?;
-        Ok(OwnedValue::Float(f))
+        Ok(OwnedValue::Float(to_float(num_str, "invalid float")?))
     } else {
         // Try integer first
         if let Ok(i) = num_str.parse::<i64>() {
             Ok(OwnedValue::Int(i))
         } else {
             // Fall back to float for large numbers
-            let f: f64 = num_str.parse().map_err(|_| "invalid number")?;
-            Ok(OwnedValue::Float(f))
+            Ok(OwnedValue::Float(to_float(num_str, "invalid number")?))
         }
     }
 }
@@ -16893,7 +16975,7 @@ fn builtin_explode<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: implode - array of codepoints to string
-fn builtin_implode<W: Clone + AsRef<[u64]>>(
+fn builtin_implode<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -16922,11 +17004,11 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                         // discipline once instead of twice, so a later
                         // change to either the error or the ordering rule
                         // can't land on one copy and miss the other.
-                        Err(_) => match n.as_f64() {
+                        Err(_) => match json_number_f64::<S>(n) {
                             Ok(f) if !f.is_nan() => f.trunc() as i64,
                             Ok(_) | Err(_) => {
                                 return scalar_fallback(&elem, optional, || {
-                                    EvalError::cannot_be_imploded(&to_owned_lossy(&elem))
+                                    EvalError::cannot_be_imploded(&to_owned_lossy::<S, _>(&elem))
                                 });
                             }
                         },
@@ -16940,7 +17022,7 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                     // to be checked before `optional` is consulted at all.
                     _ => {
                         return scalar_fallback(&elem, optional, || {
-                            EvalError::cannot_be_imploded(&to_owned_lossy(&elem))
+                            EvalError::cannot_be_imploded(&to_owned_lossy::<S, _>(&elem))
                         })
                     }
                 };
@@ -17077,7 +17159,9 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => QueryResult::None,
-                _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
+                _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
+                    &value,
+                ))),
             }
         },
     )
@@ -17264,7 +17348,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             SearchOccurrence::All => {
                 let mut indices = Vec::new();
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned(&elem) {
+                    let owned = match to_owned::<S, _>(&elem) {
                         Ok(v) => v,
                         Err(e) => return suppress_or_raise(e, optional),
                     };
@@ -17276,7 +17360,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             SearchOccurrence::First => {
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned(&elem) {
+                    let owned = match to_owned::<S, _>(&elem) {
                         Ok(v) => v,
                         Err(e) => return suppress_or_raise(e, optional),
                     };
@@ -17296,7 +17380,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             SearchOccurrence::Last => {
                 let mut last = None;
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned(&elem) {
+                    let owned = match to_owned::<S, _>(&elem) {
                         Ok(v) => v,
                         Err(e) => return suppress_or_raise(e, optional),
                     };
@@ -17440,7 +17524,7 @@ fn rindex_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: tojsonstream - convert to JSON text stream format (simplified)
-fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
+fn builtin_tojsonstream<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -17487,7 +17571,7 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: fromjsonstream - convert from JSON text stream format (simplified)
-fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
+fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -17508,7 +17592,7 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
             // an inconsistency with no live-reachable effect today (same
             // `eval_try`-catches-it-one-level-up reasoning as the rest of
             // this lineage) but worth closing for its own sake.
-            match to_owned(&value) {
+            match to_owned::<S, _>(&value) {
                 Ok(v) => QueryResult::Owned(v),
                 Err(e) => suppress_or_raise(e, optional),
             }
@@ -17619,7 +17703,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // governs the path-shape check below, never a decode failure); a #1194
     // malformed-member error is ordinary like any other and
     // `suppress_or_raise` lets `optional` suppress it instead.
-    let root = match to_owned(value) {
+    let root = match to_owned::<S, _>(value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -18357,9 +18441,9 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 },
                 _ if optional => return QueryResult::None,
                 _ => {
-                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
-                        &value,
-                    )))
+                    return QueryResult::Error(EvalError::cannot_be_matched(
+                        &to_owned_lossy::<S, _>(&value),
+                    ))
                 }
             };
 
@@ -18787,7 +18871,7 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
 /// (`eval_owned_input`, not `eval_owned_expr`, so the stream survives long
 /// enough for `result_to_owned` to see more than one element), matching what
 /// the pre-#826 code already did when it pre-evaluated the whole replacement
-/// once via `result_to_owned(eval_single(...))`. Non-fatal, if not fully
+/// once via `result_to_owned::<_, S>(eval_single(...))`. Non-fatal, if not fully
 /// jq-correct, is the stopgap this function commits to until the follow-up
 /// lands.
 ///
@@ -18855,7 +18939,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // for the pinning tests.
     let materialized =
         eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
-    let (values, trailing) = stream_outputs_lossy(materialized);
+    let (values, trailing) = stream_outputs_lossy::<_, S>(materialized);
     if let Some(control) = trailing {
         return Err(partial(Vec::new(), control));
     }
@@ -19170,9 +19254,9 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 },
                 _ if optional => return QueryResult::None,
                 _ => {
-                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
-                        &value,
-                    )))
+                    return QueryResult::Error(EvalError::cannot_be_matched(
+                        &to_owned_lossy::<S, _>(&value),
+                    ))
                 }
             };
 
@@ -19241,9 +19325,9 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 },
                 _ if optional => return QueryResult::None,
                 _ => {
-                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
-                        &value,
-                    )))
+                    return QueryResult::Error(EvalError::cannot_be_matched(
+                        &to_owned_lossy::<S, _>(&value),
+                    ))
                 }
             };
 
@@ -19428,9 +19512,9 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 },
                 _ if optional => return QueryResult::None,
                 _ => {
-                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
-                        &value,
-                    )))
+                    return QueryResult::Error(EvalError::cannot_be_matched(
+                        &to_owned_lossy::<S, _>(&value),
+                    ))
                 }
             };
 
@@ -19483,7 +19567,11 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
+        _ => {
+            return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
+                &value,
+            )))
+        }
     };
 
     // Build regex
@@ -19673,7 +19761,7 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
             // "no flags at all", silently answering with the wrong match
             // semantics instead of raising.
             let (raw_flags_values, trailing) =
-                stream_outputs(eval_single::<W, S>(flags_expr, value.clone(), optional));
+                stream_outputs::<_, S>(eval_single::<W, S>(flags_expr, value.clone(), optional));
             let mut resolved_pattern: Option<String> = None;
             let mut flags = vec_with_capacity(raw_flags_values.len());
             for raw_flags in raw_flags_values {
@@ -19836,7 +19924,7 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         value.clone(),
         optional,
         &mut |pattern, global_flags| {
-            scan_with_resolved_pattern::<W>(pattern, global_flags, value.clone(), optional)
+            scan_with_resolved_pattern::<W, S>(pattern, global_flags, value.clone(), optional)
         },
     )
 }
@@ -19864,7 +19952,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let OwnedValue::String(pattern) = raw_pattern else {
                 return QueryResult::Error(EvalError::is_not_a_string(&raw_pattern));
             };
-            scan_with_resolved_pattern::<W>(&pattern, "g", value.clone(), optional)
+            scan_with_resolved_pattern::<W, S>(&pattern, "g", value.clone(), optional)
         },
     )
 }
@@ -19886,7 +19974,7 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `scan("a"; "z")` reports "gz is not a valid modifier string", not "z is
 /// not a valid modifier string".
 #[cfg(feature = "regex")]
-fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
+fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     pattern: &str,
     global_flags: &str,
     value: StandardJson<'a, W>,
@@ -19899,7 +19987,11 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
+        _ => {
+            return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
+                &value,
+            )))
+        }
     };
 
     // Build regex
@@ -19961,7 +20053,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // here, matching how `sub`'s own yq-mode arm never evaluates its
     // `replacement`/`flags` either.
     if S::TAG == EvalTag::Yq {
-        return yq_split_ignores_arguments::<W>(&value, optional);
+        return yq_split_ignores_arguments::<W, S>(&value, optional);
     }
     fanout_regex_pattern_with_collected_flags::<W, S>(
         re_expr,
@@ -19970,7 +20062,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         value.clone(),
         optional,
         &mut |pattern, global_flags| {
-            split_regex_resolved::<W>(pattern, global_flags, &value, optional)
+            split_regex_resolved::<W, S>(pattern, global_flags, &value, optional)
         },
     )
 }
@@ -19986,7 +20078,7 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// unrelated to arity) rather than `builtin_split`'s -- the two already
 /// diverge on this wording and #1439 doesn't unify them.
 #[cfg(feature = "regex")]
-fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>>(
+fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -19996,7 +20088,9 @@ fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(value))),
+        _ => {
+            return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(value)))
+        }
     };
     QueryResult::Owned(OwnedValue::Array(
         split_into_individual_chars(&input).into(),
@@ -20022,7 +20116,7 @@ fn split_into_individual_chars(s: &str) -> Vec<OwnedValue> {
 /// resolved — the body of [`builtin_split_regex`], run once per output of its
 /// pattern generator (#1279).
 #[cfg(feature = "regex")]
-fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
+fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     pattern: &str,
     global_flags: &[String],
     value: &StandardJson<'a, W>,
@@ -20035,7 +20129,9 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(value))),
+        _ => {
+            return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(value)))
+        }
     };
 
     // One match list per flags value, concatenated in flags order -- see
@@ -20083,7 +20179,7 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         value.clone(),
         optional,
         &mut |pattern, global_flags| {
-            splits_with_resolved_pattern::<W>(pattern, global_flags, value.clone(), optional)
+            splits_with_resolved_pattern::<W, S>(pattern, global_flags, value.clone(), optional)
         },
     )
 }
@@ -20114,7 +20210,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let OwnedValue::String(pattern) = raw_pattern else {
                 return QueryResult::Error(EvalError::is_not_a_string(&raw_pattern));
             };
-            splits_with_resolved_pattern::<W>(
+            splits_with_resolved_pattern::<W, S>(
                 &pattern,
                 core::slice::from_ref(&global),
                 value.clone(),
@@ -20132,7 +20228,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// can't route back through `builtin_splits_with_flags`'s own pattern
 /// evaluation without evaluating `re_expr` twice.
 #[cfg(feature = "regex")]
-fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
+fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     pattern: &str,
     global_flags: &[String],
     value: StandardJson<'a, W>,
@@ -20145,7 +20241,11 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
+        _ => {
+            return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
+                &value,
+            )))
+        }
     };
 
     // One match list per flags value, concatenated in flags order -- jq's
@@ -20193,7 +20293,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
 /// holding whatever pushed successfully before the failing element,
 /// matching the #400 "keep the prefix" policy every other control arm in
 /// both loops follows.
-fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
+fn push_promoted<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     rs: impl IntoIterator<Item = StandardJson<'a, W>>,
     borrowed: &mut Vec<StandardJson<'a, W>>,
     owned: &mut Option<Vec<OwnedValue>>,
@@ -20201,7 +20301,7 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
     match owned {
         Some(acc) => {
             for r in rs {
-                acc.push(to_owned(&r)?);
+                acc.push(to_owned::<S, _>(&r)?);
             }
             Ok(())
         }
@@ -20220,12 +20320,12 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
 /// `Many` arm (#1908), whose catch-handler result has no `Owned`/`ManyOwned`
 /// sibling to wait for. Returns whatever converted successfully so far as
 /// the `Err` payload's own prefix.
-fn promote_borrowed<W: Clone + AsRef<[u64]>>(
+fn promote_borrowed<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     borrowed: Vec<StandardJson<'_, W>>,
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
     let mut acc = vec_with_capacity(borrowed.len());
     for b in &borrowed {
-        match to_owned(b) {
+        match to_owned::<S, _>(b) {
             Ok(v) => acc.push(v),
             Err(e) => return Err((acc, e)),
         }
@@ -20244,13 +20344,13 @@ fn promote_borrowed<W: Clone + AsRef<[u64]>>(
 /// `Some` branch, `owned` already promoted by an earlier call), or
 /// `core::mem::take` already moved everything out of it into
 /// `promote_borrowed`.
-fn promote_and_extend<W: Clone + AsRef<[u64]>>(
+fn promote_and_extend<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     borrowed: &mut Vec<StandardJson<'_, W>>,
     owned: &mut Option<Vec<OwnedValue>>,
     values: impl IntoIterator<Item = OwnedValue>,
 ) -> Result<(), (Vec<OwnedValue>, EvalError)> {
     if owned.is_none() {
-        *owned = Some(promote_borrowed(core::mem::take(borrowed))?);
+        *owned = Some(promote_borrowed::<_, S>(core::mem::take(borrowed))?);
     }
     owned.as_mut().unwrap().extend(values);
     Ok(())
@@ -20266,7 +20366,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if exprs.iter().any(needs_path_context) {
         // #1755: to_owned, not to_owned_lossy -- an undecodable input
         // must raise, not silently become "" for the path-context walk.
-        let owned = match to_owned(&value) {
+        let owned = match to_owned::<S, _>(&value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
         };
@@ -20302,7 +20402,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 match eval_pipe::<W, S>(rest, v, optional).materialize_cursor() {
                     QueryResult::One(r) => {
                         if let Err(e) =
-                            push_promoted(core::iter::once(r), &mut borrowed, &mut owned)
+                            push_promoted::<_, S>(core::iter::once(r), &mut borrowed, &mut owned)
                         {
                             // #1832: push_promoted's own error already came
                             // from a checked conversion, but `owned` could
@@ -20310,7 +20410,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // refactor -- go through the same checked
                             // resolution as every other terminal arm rather
                             // than assume the invariant silently.
-                            let (prefix, control) = resolve_terminal_prefix(
+                            let (prefix, control) = resolve_terminal_prefix::<_, S>(
                                 borrowed,
                                 owned,
                                 Vec::new(),
@@ -20321,8 +20421,8 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Many(rs) => {
-                        if let Err(e) = push_promoted(rs, &mut borrowed, &mut owned) {
-                            let (prefix, control) = resolve_terminal_prefix(
+                        if let Err(e) = push_promoted::<_, S>(rs, &mut borrowed, &mut owned) {
+                            let (prefix, control) = resolve_terminal_prefix::<_, S>(
                                 borrowed,
                                 owned,
                                 Vec::new(),
@@ -20332,14 +20432,17 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                     QueryResult::Owned(r) => {
-                        if let Err((prefix, e)) =
-                            promote_and_extend(&mut borrowed, &mut owned, core::iter::once(r))
-                        {
+                        if let Err((prefix, e)) = promote_and_extend::<_, S>(
+                            &mut borrowed,
+                            &mut owned,
+                            core::iter::once(r),
+                        ) {
                             return partial(prefix, Control::Error(e));
                         }
                     }
                     QueryResult::ManyOwned(rs) => {
-                        if let Err((prefix, e)) = promote_and_extend(&mut borrowed, &mut owned, rs)
+                        if let Err((prefix, e)) =
+                            promote_and_extend::<_, S>(&mut borrowed, &mut owned, rs)
                         {
                             return partial(prefix, Control::Error(e));
                         }
@@ -20348,12 +20451,16 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // A downstream error/break no longer discards outputs
                     // already piped through from earlier elements (#400).
                     QueryResult::Error(e) => {
-                        let (prefix, control) =
-                            resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Error(e));
+                        let (prefix, control) = resolve_terminal_prefix::<_, S>(
+                            borrowed,
+                            owned,
+                            Vec::new(),
+                            Control::Error(e),
+                        );
                         return partial(prefix, control);
                     }
                     QueryResult::Break(label) => {
-                        let (prefix, control) = resolve_terminal_prefix(
+                        let (prefix, control) = resolve_terminal_prefix::<_, S>(
                             borrowed,
                             owned,
                             Vec::new(),
@@ -20362,7 +20469,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return partial(prefix, control);
                     }
                     QueryResult::Halt(code) => {
-                        let (prefix, control) = resolve_terminal_prefix(
+                        let (prefix, control) = resolve_terminal_prefix::<_, S>(
                             borrowed,
                             owned,
                             Vec::new(),
@@ -20372,7 +20479,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     QueryResult::Partial(rs, control) => {
                         let (prefix, control) =
-                            resolve_terminal_prefix(borrowed, owned, rs, control);
+                            resolve_terminal_prefix::<_, S>(borrowed, owned, rs, control);
                         return partial(prefix, control);
                     }
                 }
@@ -20474,8 +20581,8 @@ fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
             QueryResult::Owned(r) => all_results.push(r),
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::ManyOwned(rs) => all_results.extend(rs),
-            QueryResult::One(r) => all_results.push(to_owned_lossy(&r)),
-            QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned_lossy)),
+            QueryResult::One(r) => all_results.push(to_owned_lossy::<S, _>(&r)),
+            QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned_lossy::<S, _>)),
             QueryResult::None => {}
             QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
             QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
@@ -21246,7 +21353,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `owned` out of the closure's environment outright would only
             // let the closure implement `FnOnce`, which `eval_each`'s sink
             // parameter can't accept.
-            let (prefix, control) = resolve_terminal_prefix(
+            let (prefix, control) = resolve_terminal_prefix::<_, S>(
                 core::mem::take(&mut borrowed),
                 owned.take(),
                 Vec::new(),
@@ -21365,7 +21472,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             promote: {
                                 if owned.is_none() {
                                     owned = Some(
-                                        match promote_borrowed(core::mem::take(&mut borrowed)) {
+                                        match promote_borrowed::<_, S>(core::mem::take(&mut borrowed)) {
                                             Ok(v) => v,
                                             // An earlier key's own undecodable value
                                             // predates this key's target generator in
@@ -21466,7 +21573,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // #1746/#1755/#1790/#1832 shape this file's other
                                 // terminal-control prefixes already guard against.
                                 QueryResult::One(v) => {
-                                    if let Err(e) = push_promoted(
+                                    if let Err(e) = push_promoted::<_, S>(
                                         core::iter::once(v),
                                         &mut borrowed,
                                         &mut owned,
@@ -21518,7 +21625,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         // `promote_and_extend`/`push_promoted` already do
                         // internally for this exact conversion (#353/#1755/#1790).
                         if owned.is_none() {
-                            owned = Some(match promote_borrowed(core::mem::take(&mut borrowed)) {
+                            owned = Some(match promote_borrowed::<_, S>(core::mem::take(&mut borrowed)) {
                                 Ok(v) => v,
                                 // #2138: this secondary promotion failure used
                                 // to have to choose between a pending
@@ -21608,7 +21715,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // own final index step, never an error raised while
                 // computing `k` -- see the pre-#2138 arm this replaces for
                 // the jq 1.7.1 capture that settles it.
-                let k = match to_owned_key_shape(&v) {
+                let k = match to_owned_key_shape::<_, S>(&v) {
                     Ok(k) => k,
                     Err(e) => escape_with_prefix!(Control::Error(e)),
                 };
@@ -21677,7 +21784,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             control => {
                 let (prefix, control) =
-                    resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
+                    resolve_terminal_prefix::<_, S>(borrowed, owned, Vec::new(), control);
                 return partial(prefix, control);
             }
         },
@@ -21914,7 +22021,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // -- inlined here so the raise arm can fold
                                 // `out` in via `escape!` instead, same as
                                 // `suppress_or_raise`'s own logic.
-                                QueryResult::One(v) => match to_owned(&v) {
+                                QueryResult::One(v) => match to_owned::<S, _>(&v) {
                                     Ok(v) => out.push(v),
                                     Err(err) if suppresses(&err, optional) => {}
                                     Err(err) => escape!(Control::Error(err)),
@@ -22107,7 +22214,7 @@ fn pull_slice_bound<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut decode_failure: Option<EvalError> = None;
     let mut item_sink = |item: Item<'a, W>| -> Demand {
         let raw = match item {
-            Item::Borrowed(v) => match to_owned_key_shape(&v) {
+            Item::Borrowed(v) => match to_owned_key_shape::<_, S>(&v) {
                 Ok(k) => k,
                 Err(e) => {
                     decode_failure = Some(e);
@@ -23231,9 +23338,9 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // does so through [`eval_full`], never through here, so the two cannot
     // recurse into each other.
     if needs_path_context(expr) {
-        return generic_to_query_result(super::eval_generic::eval_with_cursor_using::<S, _>(
-            expr, cursor,
-        ));
+        return generic_to_query_result::<_, S>(
+            super::eval_generic::eval_with_cursor_using::<S, _>(expr, cursor),
+        );
     }
     eval_full::<W, S>(expr, cursor)
 }
@@ -23258,11 +23365,11 @@ pub(crate) fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// phase 3). Lazy variants are materialized first; a cursor stays a cursor
 /// where [`QueryResult`] can hold one, and a batch of cursors becomes their
 /// values -- `QueryResult` has no `ManyCursor`.
-fn generic_to_query_result<W: Clone + AsRef<[u64]>>(
+fn generic_to_query_result<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: super::eval_generic::GenericResult<StandardJson<'_, W>>,
 ) -> QueryResult<'_, W> {
     use super::eval_generic::GenericResult;
-    match result.materialize_lazy() {
+    match result.materialize_lazy::<S>() {
         GenericResult::One(v) => QueryResult::One(v),
         GenericResult::OneCursor(c) => QueryResult::OneCursor(c),
         GenericResult::Many(vs) => QueryResult::Many(vs),
@@ -23460,7 +23567,7 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .collect();
 
     let result = super::eval_generic::eval_yq_documents_together::<S, _>(expr, &inputs);
-    detach_from_temp_document(generic_to_query_result(result))
+    detach_from_temp_document::<_, S>(generic_to_query_result::<_, S>(result))
 }
 
 // =============================================================================
@@ -23614,7 +23721,7 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if S::TAG != EvalTag::Yq || needs_path_prepass(path_expr) {
         return Ok(YqAssignNoopCheck::NotChecked);
     }
-    let pristine = to_owned(input)?;
+    let pristine = to_owned::<S, _>(input)?;
     // A static path (the only kind reaching this point) never actually
     // evaluates `path_expr` -- `resolve_dynamic_indexes`'s own fast path
     // is an unconditional `Ok(vec![path_expr.clone()])` -- so this can't
@@ -23851,7 +23958,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // respects `optional` like every other fallible step at this
             // boundary (per this function's own doc comment above) -- only
             // a genuine decode failure is unconditional.
-            let pristine = match to_owned(&input) {
+            let pristine = match to_owned::<S, _>(&input) {
                 Ok(pristine) => pristine,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -24003,7 +24110,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // step at this boundary (see this function's own `resolve_dynamic_indexes`
     // arm and `eval_assign`'s matching comment below) -- only a genuine
     // decode failure is unconditional.
-    let mut result = match to_owned(&input) {
+    let mut result = match to_owned::<S, _>(&input) {
         Ok(result) => result,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -24254,7 +24361,7 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         None => eval_single::<W, S>(value_expr, input.clone(), optional),
     };
     match evaluated.materialize_cursor() {
-        QueryResult::One(v) => match to_owned(&v) {
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
             Ok(owned) => Ok((vec![owned], None)),
             Err(e) => Err(suppress_or_raise(e, optional)),
         },
@@ -24262,7 +24369,7 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             unreachable!("materialize_cursor should have converted this")
         }
         QueryResult::Owned(v) => Ok((vec![v], None)),
-        QueryResult::Many(vs) => match vs.iter().map(to_owned).collect() {
+        QueryResult::Many(vs) => match vs.iter().map(to_owned::<S, _>).collect() {
             Ok(owned) => Ok((owned, None)),
             Err(e) => Err(QueryResult::Error(e)),
         },
@@ -24440,7 +24547,7 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (pristine, paths) = match resolved {
         Some(pair) => pair,
         None => {
-            let pristine = match to_owned(input) {
+            let pristine = match to_owned::<S, _>(input) {
                 Ok(pristine) => pristine,
                 Err(e) => return Err(suppress_or_raise(e, optional)),
             };
@@ -24836,7 +24943,7 @@ fn eval_assign_streaming<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1953: a non-decode-failure `to_owned` error respects `optional` like
     // every other fallible step at this boundary; only a genuine decode
     // failure is unconditional. Same rule as the eager arm this replaces.
-    let pristine = match to_owned(input) {
+    let pristine = match to_owned::<S, _>(input) {
         Ok(pristine) => pristine,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -25127,7 +25234,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // like the sibling `resolve_dynamic_indexes` arm just below (and
             // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
             // decode failure is unconditional.
-            let pristine = match to_owned(&input) {
+            let pristine = match to_owned::<S, _>(&input) {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -28207,7 +28314,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         // as an empty filter and silently assigns `null` instead of halting
         // (#791).
         QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
-        other => Ok(other.collect_owned()),
+        other => Ok(other.collect_owned::<S>()),
     }
 }
 
@@ -28271,7 +28378,7 @@ fn eval_owned_multi_keep_partial<S: EvalSemantics>(
 ) -> (Vec<OwnedValue>, Option<EvalEscape>) {
     let result = eval_owned_input::<Vec<u64>, S>(expr, input, false);
     let mut out = Vec::new();
-    let escape = push_owned_values_lossy(result, &mut out).map(EvalEscape::from);
+    let escape = push_owned_values_lossy::<_, S>(result, &mut out).map(EvalEscape::from);
     (out, escape)
 }
 
@@ -36041,7 +36148,7 @@ fn each_recurse<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Flow {
     // #1755: `to_owned`, not `to_owned_lossy` -- an undecodable root must
     // raise, not silently become `""` and get visited as if it were real.
-    let root = match to_owned(&value) {
+    let root = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
@@ -39849,7 +39956,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // bound value used to silently become `""` here instead of raising; the
     // already-converted prefix still runs through the body below before the
     // decode failure surfaces as the terminal control.
-    let (bound_values, bound_control) = stream_outputs(bound_result.materialize_cursor());
+    let (bound_values, bound_control) = stream_outputs::<_, S>(bound_result.materialize_cursor());
 
     // For each bound value, substitute and evaluate the body. #1902/#1934:
     // [`push_owned_values`] folds an undecodable body output into
@@ -39863,7 +39970,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
-        if let Some(control) = push_owned_values(body_result, &mut all_results) {
+        if let Some(control) = push_owned_values::<_, S>(body_result, &mut all_results) {
             return partial(all_results, control);
         }
     }
@@ -40960,7 +41067,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
-        QueryResult::One(v) => Ok(Some((to_owned_lossy(&v), None))),
+        QueryResult::One(v) => Ok(Some((to_owned_lossy::<S, _>(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
         // #1937 (round 2, after `/code-review` caught a worse regression in
@@ -40992,9 +41099,9 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         // still out of scope per #1522's design doc.
         QueryResult::Many(vs) => match vs.len() {
             0 => Ok(None),
-            1 => Ok(Some((to_owned_lossy(&vs[0]), None))),
+            1 => Ok(Some((to_owned_lossy::<S, _>(&vs[0]), None))),
             _ => Ok(Some((
-                OwnedValue::Array(vs.iter().map(to_owned_lossy).collect()),
+                OwnedValue::Array(vs.iter().map(to_owned_lossy::<S, _>).collect()),
                 None,
             ))),
         },
@@ -41136,7 +41243,7 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    detach_from_temp_document(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
+    detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
 }
 
 /// Own every value in `result` so it stops borrowing the throwaway document
@@ -41149,13 +41256,15 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// exactly the "duplicated predicates diverge silently" shape (#106) --
 /// `Partial` is stream-preserving here and collapsing it would be an easy,
 /// silent way for the two copies to disagree.
-fn detach_from_temp_document<'a, W: Clone + AsRef<[u64]>>(
+fn detach_from_temp_document<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, Vec<u64>>,
 ) -> QueryResult<'a, W> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => QueryResult::Owned(to_owned_lossy(&v)),
+        QueryResult::One(v) => QueryResult::Owned(to_owned_lossy::<S, _>(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => QueryResult::ManyOwned(vs.iter().map(to_owned_lossy).collect()),
+        QueryResult::Many(vs) => {
+            QueryResult::ManyOwned(vs.iter().map(to_owned_lossy::<S, _>).collect())
+        }
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
         QueryResult::None => QueryResult::None,
@@ -41844,10 +41953,15 @@ fn drive_lazy<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     let mut escape: Option<Control> = None;
-    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| match item.into_owned() {
-        Ok(v) => per_item(v),
-        Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
-    });
+    let flow = eval_each::<W, S>(
+        expr,
+        value,
+        optional,
+        &mut |item| match item.into_owned::<S>() {
+            Ok(v) => per_item(v),
+            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+        },
+    );
     // Raw, not suppressed: `foreach_forks` adjudicates a drive's own
     // trailing escape against the ambient `?` itself, at the point where it
     // also stops every untried fork -- suppressing here would turn a caught
@@ -41870,7 +41984,7 @@ fn drive_eager<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     per_item: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
     let (values, control) =
-        stream_outputs(eval_single::<W, S>(expr, value, optional).materialize_cursor());
+        stream_outputs::<_, S>(eval_single::<W, S>(expr, value, optional).materialize_cursor());
     for v in values {
         if per_item(v) == Demand::Stop {
             // The step itself ended; `foreach_forks` already holds the
@@ -42589,7 +42703,7 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // already be decode-checked by the time it gets here, not just the
     // `!satisfied` branch below -- see `items_to_result_checked`'s own doc
     // comment for why its unchecked predecessor didn't cover this.
-    let result = items_to_result_checked(taken);
+    let result = items_to_result_checked::<_, S>(taken);
     match flow {
         // Stopped because `n` outputs arrived: jq's own `foreach ... break
         // $out` fires here, so nothing past that point is ever reached and a
@@ -42623,7 +42737,8 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // flushed `pending_first`'s decode failure over the
                 // argument's trailing control, and the same shape `eval_as`'s
                 // own bound-control-vs-fallback match already uses.
-                let final_control = push_owned_values(result, &mut prefix).unwrap_or(control);
+                let final_control =
+                    push_owned_values::<_, S>(result, &mut prefix).unwrap_or(control);
                 partial(prefix, final_control)
             }
         }
@@ -42642,7 +42757,7 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1519: normally a one-element `Vec`; a `?//` chain under this consumer
     // legitimately yields one item per alternative.
     let (items, flow) = each_take_first::<W, S>(expr, value, optional);
-    take_stopping_items_to_result(items, flow)
+    take_stopping_items_to_result::<_, S>(items, flow)
 }
 
 /// Evaluate `last(expr)` - take last output.
@@ -42743,7 +42858,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // consumer legitimately yields one item per alternative, and a
             // later alternative's own error still raises after it.
             let (items, flow) = each_take_nth::<W, S>(expr, value.clone(), optional, n);
-            take_stopping_items_to_result(items, flow)
+            take_stopping_items_to_result::<_, S>(items, flow)
         },
     )
 }
@@ -42792,7 +42907,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // that case the same way the sibling `finish_fork` call two lines down
     // already does, while still raising a genuine decode failure
     // unconditionally either way.
-    let initial = match to_owned(&value) {
+    let initial = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -42897,7 +43012,7 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755/#1953: to_owned, not to_owned_lossy -- see `eval_until`'s
     // identical reasoning, including the `suppress_or_raise` treatment of
     // a non-decode-failure `Err`.
-    let initial = match to_owned(&value) {
+    let initial = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -43041,7 +43156,7 @@ fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -43085,7 +43200,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755/#1953: to_owned, not to_owned_lossy -- see `eval_until`'s
     // identical reasoning, including the `suppress_or_raise` treatment of
     // a non-decode-failure `Err`.
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -43214,7 +43329,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
     let flow = each_range::<W, S>(from, to, step, value, optional, &mut |item| {
-        out.push(item.into_owned_lossy());
+        out.push(item.into_owned_lossy::<S>());
         Demand::Continue
     });
 
@@ -43532,7 +43647,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755: to_owned, not to_owned_lossy -- an undecodable root value
     // must raise, not silently become "" and get visited/output as if it
     // were the real value.
-    let root = match to_owned(&value) {
+    let root = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -43590,7 +43705,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // #1755: to_owned, not to_owned_lossy -- see `builtin_recurse_f`'s
     // identical reasoning.
-    let root = match to_owned(&value) {
+    let root = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -43628,7 +43743,7 @@ fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // identical reasoning (this function also finishes via `finish_fork`),
     // including the `suppress_or_raise` treatment of a non-decode-failure
     // `Err`.
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -43866,7 +43981,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         if let Some(result) =
             eval_path_context_pipe_detached::<S, StandardJson<'_, Vec<u64>>>(exprs, owned, optional)
         {
-            return detach_from_temp_document(generic_to_query_result(result));
+            return detach_from_temp_document::<_, S>(generic_to_query_result::<_, S>(result));
         }
     }
 
@@ -43879,7 +43994,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let result =
         super::eval_generic::eval_path_context_pipe_with_cursor::<S, _>(exprs, cursor, optional);
-    detach_from_temp_document(generic_to_query_result(result))
+    detach_from_temp_document::<_, S>(generic_to_query_result::<_, S>(result))
 }
 
 /// Classify `parent(n)`'s count argument into a validated ancestor-hop
@@ -44515,7 +44630,7 @@ fn collect_tostream_events(
 }
 
 /// Builtin: tostream - jq-compatible stream of `[path,value]` / `[path]` events
-fn builtin_tostream<W: Clone + AsRef<[u64]>>(
+fn builtin_tostream<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -44559,7 +44674,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Break(label) => return QueryResult::Break(label),
         // A bare halt has no prior events to fall back to, unlike a
         // `Partial`'s trailing control below — falling into
-        // `result.collect_owned()` would silently treat it as "zero events"
+        // `result.collect_owned::<S>()` would silently treat it as "zero events"
         // instead of halting (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
@@ -44573,7 +44688,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // needed -- its own `Error`/`Break`/`Halt`/`Partial` arms are simply
         // unreachable here, since this match's own arms above already
         // intercept those variants before `result` can carry one.
-        result => stream_outputs(result),
+        result => stream_outputs::<_, S>(result),
     };
 
     let mut outputs = Vec::new();
@@ -44642,7 +44757,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // a decode nothing here needs -- like `eval_not`, it wrongly raises
     // for a *container* `depth` that merely contains an undecodable
     // string, where jq would just proceed unaffected.
-    let depth = to_owned_lossy(&value);
+    let depth = to_owned_lossy::<S, _>(&value);
 
     // A `Partial`'s trailing control is not intercepted here (#694): its
     // prefix of events is processed below like any other, and the control
@@ -44670,7 +44785,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // document-backed (as opposed to literal/computed) content to draw
         // an undecodable value from, so this holds for any `stream_expr`,
         // not just one that reads `value` directly.
-        result => (result.collect_owned(), None),
+        result => (result.collect_owned::<S>(), None),
     };
 
     let mut outputs = Vec::new();
@@ -44717,11 +44832,11 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// down through `eval_single` already -- so a wrapping `paths?` suppresses
 /// a catchable result here without this function needing to consult it
 /// itself, and `is_decode_failure()` errors stay uncatchable regardless.
-fn builtin_paths<W: Clone + AsRef<[u64]>>(
+fn builtin_paths<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
@@ -44809,7 +44924,7 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // "eager and unconditional" placement as the root node_filter pre-check
     // just below: nothing has been pushed to `sink` yet, so this is always
     // a bare `Error`, never a `Partial`.
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(owned) => owned,
         // #2334: `suppresses`, not a bare escape. Nothing has been pushed to
         // `sink` yet, so the suppressed form is a clean `Exhausted` -- the
@@ -44857,7 +44972,7 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut paths = Vec::new();
     let flow = each_paths_filter::<W, S>(filter, value, optional, &mut |item| {
-        paths.push(item.into_owned_from_owned_producer());
+        paths.push(item.into_owned_from_owned_producer::<S>());
         Demand::Continue
     });
     match flow {
@@ -44995,11 +45110,11 @@ fn collect_leaf_paths(
 /// #1829: `to_owned`, not `to_owned_lossy` -- shares `builtin_paths`'s own
 /// fix and its reasoning for leaving `_optional` unused (see that function's
 /// doc comment).
-fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
+fn builtin_leaf_paths<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
@@ -45411,7 +45526,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             // #1953: a non-decode-failure to_owned error respects
             // `optional`, the same as every other builtin refusal here.
-            let owned = match to_owned(&value) {
+            let owned = match to_owned::<S, _>(&value) {
                 Ok(owned) => owned,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -48858,7 +48973,7 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
     let mut docs: Vec<OwnedValue> = Vec::new();
     match each_inputs::<W, S>(&mut |item| {
-        docs.push(item.into_owned_from_owned_producer());
+        docs.push(item.into_owned_from_owned_producer::<S>());
         Demand::Continue
     }) {
         // A `Continue`-only sink never stops, but the arm costs nothing and
@@ -48897,11 +49012,11 @@ fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() ->
 
 /// Builtin: gmtime - convert Unix timestamp to broken-down UTC time
 /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
-fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
+fn builtin_gmtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+    let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
         EvalError::datetime_requires_number("gmtime")
     }) {
         Ok(f) => f,
@@ -49031,13 +49146,13 @@ fn ok_or_result<'a, W: Clone + AsRef<[u64]>, T>(
 
 /// Builtin: localtime - convert Unix timestamp to broken-down local time
 /// Returns [year, month(0-11), day(1-31), hour, minute, second, weekday(0-6, Sunday=0), yearday(0-365)]
-fn builtin_localtime<W: Clone + AsRef<[u64]>>(
+fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     #[cfg(feature = "std")]
     {
-        let timestamp = match get_float_value_with::<W>(&value, optional, || {
+        let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
             EvalError::datetime_requires_number("localtime")
         }) {
             Ok(f) => f,
@@ -49108,7 +49223,7 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>>(
     #[cfg(not(feature = "std"))]
     {
         // In no_std, fall back to gmtime (UTC)
-        builtin_gmtime::<W>(value, optional)
+        builtin_gmtime::<W, S>(value, optional)
     }
 }
 
@@ -49183,7 +49298,7 @@ fn checked_month_index(month: i64) -> Result<i64, EvalError> {
 }
 
 /// Builtin: mktime - convert broken-down time to Unix timestamp
-fn builtin_mktime<W: Clone + AsRef<[u64]>>(
+fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -49200,7 +49315,7 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     if let Some(e) = scalar_decode_failure(&value) {
         return QueryResult::Error(e);
     }
-    let arr = match to_owned_lossy(&value) {
+    let arr = match to_owned_lossy::<S, _>(&value) {
         OwnedValue::Array(a) => a,
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::mktime_requires_array()),
@@ -49464,7 +49579,7 @@ fn local_zone() -> LocalZone {
 /// (`None`/`Error`) should return -- each caller's own `match .. { Ok(t) =>
 /// .., Err(r) => return r }` reads as a single step rather than the large
 /// inline match this replaced.
-fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
+fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
     zone: &Option<LocalZone>,
@@ -49483,7 +49598,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
                 } else {
                     f64::INFINITY
                 }
-            } else if let Ok(f) = n.as_f64() {
+            } else if let Ok(f) = json_number_f64::<S>(n) {
                 f
             // Defensive: a `Number` whose bytes are neither the NaN/infinity
             // sentinel nor a valid `f64` is not producible by ordinary JSON
@@ -49522,7 +49637,7 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>>(
             if let Some(e) = scalar_decode_failure(value) {
                 return Err(QueryResult::Error(e));
             }
-            match to_owned_lossy(value) {
+            match to_owned_lossy::<S, _>(value) {
                 OwnedValue::Array(arr) => {
                     // Real jq requires the full 8-element array — weekday and
                     // yearday included — not just the 6 fields mktime needs.
@@ -49613,7 +49728,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             };
 
-            let t = match broken_down_time_fields::<W>(&value, optional, &zone, name) {
+            let t = match broken_down_time_fields::<W, S>(&value, optional, &zone, name) {
                 Ok(t) => t,
                 Err(r) => return r,
             };
@@ -50279,7 +50394,7 @@ fn parse_digits(
 }
 
 /// Builtin: todate - convert Unix timestamp to ISO 8601 date string
-fn builtin_todate<W: Clone + AsRef<[u64]>>(
+fn builtin_todate<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -50290,7 +50405,7 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
     // `<name>/1 requires parsed datetime inputs` error on anything else --
     // `broken_down_time_fields` is the one shared implementation of that,
     // also used by `strftime_in_zone`.
-    let t = match broken_down_time_fields::<W>(&value, optional, &None, "strftime") {
+    let t = match broken_down_time_fields::<W, S>(&value, optional, &None, "strftime") {
         Ok(t) => t,
         Err(r) => return r,
     };
@@ -50454,11 +50569,11 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 /// own pre-existing wording (not real yq's -- that gap is pre-existing and
 /// separate, filed as its own issue) rather than reusing
 /// `broken_down_time_fields`.
-fn builtin_from_unix<W: Clone + AsRef<[u64]>>(
+fn builtin_from_unix<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+    let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
         EvalError::new("math function requires number")
     }) {
         Ok(f) => f,
@@ -50770,7 +50885,7 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Get the timestamp from input (wording kept as it was; see `todate`)
-    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+    let timestamp = match get_float_value_with::<W, S>(&value, optional, || {
         EvalError::new("math function requires number")
     }) {
         Ok(f) => f,
@@ -50867,7 +50982,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // value in the loaded file must raise, not silently
                 // become "".
-                match to_owned(&cursor.value()) {
+                match to_owned::<S, _>(&cursor.value()) {
                     Ok(v) => QueryResult::Owned(v),
                     Err(e) => suppress_or_raise(e, optional),
                 }
@@ -51063,7 +51178,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: combinations - generate all combinations from array of arrays
 /// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
-fn builtin_combinations<W: Clone + AsRef<[u64]>>(
+fn builtin_combinations<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -51153,7 +51268,8 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // it used to be silently lossy-substituted and only then reach
     // `range_num`'s ordinary, `optional`-suppressible type error. Pinned by
     // `test_builtin_combinations_n_raises_on_undecodable_n_expr_2196`.
-    let (n_values, trailing) = stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
+    let (n_values, trailing) =
+        stream_outputs::<_, S>(eval_single::<W, S>(n_expr, value.clone(), optional));
 
     // Array construction drops its prefix when its generator escapes, so a
     // trailing break/error aborts the whole call with no output -- verified
@@ -51608,9 +51724,11 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 }
 
 /// Builtin: normals - select only normal numbers (not zero, infinite, NaN, or subnormal)
-fn builtin_normals<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
+fn builtin_normals<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+) -> QueryResult<'_, W> {
     if let StandardJson::Number(n) = &value {
-        if let Ok(f) = n.as_f64() {
+        if let Ok(f) = json_number_f64::<S>(n) {
             if f.is_normal() {
                 return QueryResult::One(value);
             }
@@ -51620,9 +51738,11 @@ fn builtin_normals<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> Query
 }
 
 /// Builtin: finites - select only finite numbers (not infinite or NaN)
-fn builtin_finites<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
+fn builtin_finites<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+) -> QueryResult<'_, W> {
     if let StandardJson::Number(n) = &value {
-        if let Ok(f) = n.as_f64() {
+        if let Ok(f) = json_number_f64::<S>(n) {
             if f.is_finite() {
                 return QueryResult::One(value);
             }
@@ -51692,7 +51812,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // control against this same `values` accumulator).
             let mut values: Vec<OwnedValue> = vec_with_capacity(taken.len());
             for item in taken {
-                match item.into_owned() {
+                match item.into_owned::<S>() {
                     Ok(v) => values.push(v),
                     Err(e) => return partial(values, Control::Error(e)),
                 }
@@ -51724,7 +51844,7 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let (items, flow) = each_take_first::<W, S>(expr, value, optional);
-    match take_stopping_items_to_result(items, flow) {
+    match take_stopping_items_to_result::<_, S>(items, flow) {
         // This builtin has always materialized, unlike `eval_first_expr`.
         // #1989: checked conversion -- this value is the query's own output,
         // so an undecodable string must raise rather than be emitted as `""`
@@ -51832,7 +51952,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // decode is checked here rather than deferred.
             let mut owned = vec_with_capacity(items.len());
             for item in items {
-                match item.into_owned() {
+                match item.into_owned::<S>() {
                     Ok(v) => owned.push(v),
                     // #1519: a decode failure past an already-kept prefix is
                     // reached by jq the same way any other later-alternative
@@ -51983,10 +52103,10 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1351: a path descending through an alias position deletes from the
     // shared node. The extra `to_owned` runs only while a table is installed.
     // STYLE-0012: a probe, not the materialization -- a failure here just
-    // skips the redirect, and the `to_owned(value)` in `result` below (the
+    // skips the redirect, and the `to_owned::<S, _>(value)` in `result` below (the
     // site that decides) re-raises it exactly as before.
     let delpaths_pre = if alias_identity::active() {
-        to_owned(value).ok() // STYLE-0012: probe only; the site below decides.
+        to_owned::<S, _>(value).ok() // STYLE-0012: probe only; the site below decides.
     } else {
         None
     };
@@ -52137,7 +52257,7 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut root_deleted = false;
     let result = if S::TAG == EvalTag::Yq {
         // STYLE-0012: see the note above `root_deleted`.
-        to_owned(value).and_then(|mut v| {
+        to_owned::<S, _>(value).and_then(|mut v| {
             for &path in &paths {
                 v = if path.is_empty() {
                     root_deleted = true;
@@ -52154,10 +52274,10 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `delpaths([[],[0]])` and `delpaths([[0],[]])` are both `null`.
         match paths.first() {
             // STYLE-0012: see the note above `root_deleted`.
-            None => to_owned(value),
+            None => to_owned::<S, _>(value),
             Some([]) => Ok(OwnedValue::Null),
             // STYLE-0012: see the note above `root_deleted`.
-            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted::<S>(v, &paths, 0)),
+            Some(_) => to_owned::<S, _>(value).and_then(|v| delete_paths_sorted::<S>(v, &paths, 0)),
         }
     };
     match result {
@@ -52185,25 +52305,35 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// [`document_number_f64`] for a `JsonNumber`: its source bytes under `S`'s
+/// number model, `JsonNumber::as_f64` (the plain parse, plus the bridge
+/// tokens and decNumber words) for everything that is not a literal.
+fn json_number_f64<S: EvalSemantics>(
+    n: &crate::json::light::JsonNumber<'_>,
+) -> Result<f64, crate::json::light::JsonError> {
+    document_number_f64::<S>(n.raw_bytes(), || n.as_f64().ok())
+        .ok_or(crate::json::light::JsonError::InvalidNumber)
+}
+
 // Phase 10: Math Functions
 
 /// Helper to get float value from input
-fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
+fn get_float_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
 ) -> Result<f64, QueryResult<'a, W>> {
     // jq's `LIBM_DD` wording, shared by every libm builtin from `floor`
     // to `cbrt` (#3042): `string ("x") number required`. The value is only
     // materialized on the error path.
-    get_float_value_with(value, optional, || {
-        EvalError::number_required(&to_owned_lossy(value))
+    get_float_value_with::<W, S>(value, optional, || {
+        EvalError::number_required(&to_owned_lossy::<S, _>(value))
     })
 }
 
 /// Like [`get_float_value`], but with a caller-supplied error for the
 /// non-number case — used by `gmtime`/`localtime` to raise jq's own wording
 /// instead of the generic math-function message.
-fn get_float_value_with<'a, W: Clone + AsRef<[u64]>>(
+fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
     not_a_number: impl FnOnce() -> EvalError,
@@ -52218,7 +52348,7 @@ fn get_float_value_with<'a, W: Clone + AsRef<[u64]>>(
                 } else {
                     f64::INFINITY
                 })
-            } else if let Ok(f) = n.as_f64() {
+            } else if let Ok(f) = json_number_f64::<S>(n) {
                 Ok(f)
             } else if optional {
                 Err(QueryResult::None)
@@ -52261,11 +52391,11 @@ fn round_f64(x: f64) -> f64 {
 }
 
 /// Builtin: floor
-fn builtin_floor<W: Clone + AsRef<[u64]>>(
+fn builtin_floor<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(floor_f64(n) as i64)),
         Err(r) => r,
@@ -52273,11 +52403,11 @@ fn builtin_floor<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: ceil
-fn builtin_ceil<W: Clone + AsRef<[u64]>>(
+fn builtin_ceil<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(ceil_f64(n) as i64)),
         Err(r) => r,
@@ -52285,11 +52415,11 @@ fn builtin_ceil<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: round
-fn builtin_round<W: Clone + AsRef<[u64]>>(
+fn builtin_round<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(round_f64(n) as i64)),
         Err(r) => r,
@@ -52297,11 +52427,11 @@ fn builtin_round<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: trunc - truncate toward zero
-fn builtin_trunc<W: Clone + AsRef<[u64]>>(
+fn builtin_trunc<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) if n.is_nan() => QueryResult::Owned(OwnedValue::Float(f64::NAN)),
         Ok(n) => QueryResult::Owned(OwnedValue::Int(math::trunc(n) as i64)),
         Err(r) => r,
@@ -52309,88 +52439,88 @@ fn builtin_trunc<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: sqrt
-fn builtin_sqrt<W: Clone + AsRef<[u64]>>(
+fn builtin_sqrt<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sqrt(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: fabs (absolute value)
-fn builtin_fabs<W: Clone + AsRef<[u64]>>(
+fn builtin_fabs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::fabs(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: log (natural logarithm)
-fn builtin_log<W: Clone + AsRef<[u64]>>(
+fn builtin_log<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: log10
-fn builtin_log10<W: Clone + AsRef<[u64]>>(
+fn builtin_log10<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log10(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: log2
-fn builtin_log2<W: Clone + AsRef<[u64]>>(
+fn builtin_log2<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::log2(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: exp (e^x)
-fn builtin_exp<W: Clone + AsRef<[u64]>>(
+fn builtin_exp<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: exp10 (10^x)
-fn builtin_exp10<W: Clone + AsRef<[u64]>>(
+fn builtin_exp10<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp10(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: exp2 (2^x)
-fn builtin_exp2<W: Clone + AsRef<[u64]>>(
+fn builtin_exp2<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::exp2(n))),
         Err(r) => r,
     }
@@ -52459,66 +52589,66 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Trigonometric functions
 
 /// Builtin: sin
-fn builtin_sin<W: Clone + AsRef<[u64]>>(
+fn builtin_sin<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sin(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: cos
-fn builtin_cos<W: Clone + AsRef<[u64]>>(
+fn builtin_cos<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::cos(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: tan
-fn builtin_tan<W: Clone + AsRef<[u64]>>(
+fn builtin_tan<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::tan(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: asin
-fn builtin_asin<W: Clone + AsRef<[u64]>>(
+fn builtin_asin<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::asin(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: acos
-fn builtin_acos<W: Clone + AsRef<[u64]>>(
+fn builtin_acos<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::acos(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: atan
-fn builtin_atan<W: Clone + AsRef<[u64]>>(
+fn builtin_atan<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::atan(n))),
         Err(r) => r,
     }
@@ -52562,66 +52692,66 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // Hyperbolic functions
 
 /// Builtin: sinh
-fn builtin_sinh<W: Clone + AsRef<[u64]>>(
+fn builtin_sinh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::sinh(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: cosh
-fn builtin_cosh<W: Clone + AsRef<[u64]>>(
+fn builtin_cosh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::cosh(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: tanh
-fn builtin_tanh<W: Clone + AsRef<[u64]>>(
+fn builtin_tanh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::tanh(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: asinh
-fn builtin_asinh<W: Clone + AsRef<[u64]>>(
+fn builtin_asinh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::asinh(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: acosh
-fn builtin_acosh<W: Clone + AsRef<[u64]>>(
+fn builtin_acosh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::acosh(n))),
         Err(r) => r,
     }
 }
 
 /// Builtin: atanh
-fn builtin_atanh<W: Clone + AsRef<[u64]>>(
+fn builtin_atanh<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    match get_float_value::<W, S>(&value, optional) {
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::atanh(n))),
         Err(r) => r,
     }
@@ -52632,7 +52762,7 @@ fn builtin_atanh<W: Clone + AsRef<[u64]>>(
 /// out-parameter functions (`frexp`, `modf`, `lgamma_r`) answer the
 /// two-element array jq builds from the C call -- with the exponent/sign
 /// as an `Int`, which prints the same digits as jq's `jv_number(int)`.
-fn builtin_libm1<W: Clone + AsRef<[u64]>>(
+fn builtin_libm1<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: Libm1,
     value: StandardJson<'_, W>,
     optional: bool,
@@ -52646,7 +52776,7 @@ fn builtin_libm1<W: Clone + AsRef<[u64]>>(
     if f == Libm1::Pow10 {
         return QueryResult::Error(EvalError::new("Error: pow10/0 not found at build time"));
     }
-    let x = match get_float_value::<W>(&value, optional) {
+    let x = match get_float_value::<W, S>(&value, optional) {
         Ok(n) => n,
         Err(r) => return r,
     };
@@ -52809,7 +52939,7 @@ fn builtin_libm3<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// share it: the former treats the unparseable token as `false` (jq says an
 /// infinity is not normal), and the latter routes through
 /// `get_float_value_with`, which already decodes both sentinels (#2932).
-fn builtin_isinfinite<W: Clone + AsRef<[u64]>>(
+fn builtin_isinfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
@@ -52819,7 +52949,7 @@ fn builtin_isinfinite<W: Clone + AsRef<[u64]>>(
                 QueryResult::Owned(OwnedValue::Bool(false))
             } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
                 QueryResult::Owned(OwnedValue::Bool(true))
-            } else if let Ok(f) = n.as_f64() {
+            } else if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(OwnedValue::Bool(f.is_infinite()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -52830,7 +52960,7 @@ fn builtin_isinfinite<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isnan
-fn builtin_isnan<W: Clone + AsRef<[u64]>>(
+fn builtin_isnan<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
@@ -52838,7 +52968,7 @@ fn builtin_isnan<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => {
             if is_nan_sentinel(n.raw_bytes()) {
                 QueryResult::Owned(OwnedValue::Bool(true))
-            } else if let Ok(f) = n.as_f64() {
+            } else if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(OwnedValue::Bool(f.is_nan()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -52849,13 +52979,13 @@ fn builtin_isnan<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isnormal
-fn builtin_isnormal<W: Clone + AsRef<[u64]>>(
+fn builtin_isnormal<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if let Ok(f) = n.as_f64() {
+            if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(OwnedValue::Bool(f.is_normal()))
             } else {
                 QueryResult::Owned(OwnedValue::Bool(false))
@@ -52866,13 +52996,13 @@ fn builtin_isnormal<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: isfinite
-fn builtin_isfinite<W: Clone + AsRef<[u64]>>(
+fn builtin_isfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
     // The error is discarded, so don't let `get_float_value` build its
     // `number required` preview (a deep copy of the value, #3042 review).
-    match get_float_value_with::<W>(&value, optional, || EvalError::new("")) {
+    match get_float_value_with::<W, S>(&value, optional, || EvalError::new("")) {
         Ok(n) => QueryResult::Owned(OwnedValue::Bool(n.is_finite())),
         Err(_) => QueryResult::Owned(OwnedValue::Bool(false)),
     }
@@ -53073,7 +53203,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let code = match code_expr {
         Some(expr) => {
-            // #820: `result_to_owned(eval_single(..))` ran the whole argument
+            // #820: `result_to_owned::<_, S>(eval_single(..))` ran the whole argument
             // first, so `halt_error(1, ("inner"|halt_error(2)))` fired the
             // inner halt -- printing its message and winning the exit code --
             // where real jq prints only `outer` and exits 1.
@@ -53098,7 +53228,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => Ok(items.into_iter().next()),
             };
             let n_result: Result<OwnedValue, EvalEscape> = match first {
-                Ok(Some(item)) => Ok(item.into_owned_lossy()),
+                Ok(Some(item)) => Ok(item.into_owned_lossy::<S>()),
                 // #1408: a zero-output code expression (`halt_error(empty)`)
                 // must make the whole call produce zero output -- matching
                 // real jq's own `x as $x | ...` desugaring, the same fix
@@ -53149,7 +53279,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // asymmetry #2280 fixed for Format/Path/GetPath. Defensive today: this
     // materialization's only error path is `is_decode_failure()`-tagged,
     // which is never suppressed regardless of `optional` either way.
-    let owned = match to_owned(&value) {
+    let owned = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -53238,7 +53368,7 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::new("env variable name must be a string")),
     };
 
-    finish_result(
+    finish_result::<_, S>(
         match std::env::var(&var_name) {
             Ok(val) => QueryResult::Owned(OwnedValue::String(val)),
             Err(_) if optional => QueryResult::None,
@@ -53367,7 +53497,7 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
 // Array functions
 
 /// Builtin: transpose - transpose array of arrays
-fn builtin_transpose<W: Clone + AsRef<[u64]>>(
+fn builtin_transpose<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -53388,12 +53518,12 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
     for item in elements {
         match item {
-            StandardJson::Array(inner) => match inner.map(|v| to_owned(&v)).collect() {
+            StandardJson::Array(inner) => match inner.map(|v| to_owned::<S, _>(&v)).collect() {
                 Ok(row) => inner_arrays.push(row),
                 Err(e) => return suppress_or_raise(e, optional),
             },
             // Non-array elements are treated as single-element arrays
-            _ => match to_owned(&item) {
+            _ => match to_owned::<S, _>(&item) {
                 Ok(owned) => inner_arrays.push(vec![owned]),
                 Err(e) => return suppress_or_raise(e, optional),
             },
@@ -53475,7 +53605,7 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755: to_owned, not to_owned_lossy -- an undecodable element
     // must raise, not silently compare as "" against the search target.
     let elements: Result<Vec<OwnedValue>, EvalError> =
-        elements_iter.map(|v| to_owned(&v)).collect();
+        elements_iter.map(|v| to_owned::<S, _>(&v)).collect();
     let elements = match elements {
         Ok(elements) => elements,
         Err(e) => return suppress_or_raise(e, optional),
@@ -53879,7 +54009,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !omit_indices.contains(i))
-                .map(|(_, v)| to_owned(v))
+                .map(|(_, v)| to_owned::<S, _>(v))
                 .collect::<Result<Vec<OwnedValue>, EvalError>>()
             {
                 Ok(result) => QueryResult::Owned(OwnedValue::array_from(result)),
@@ -54011,7 +54141,7 @@ fn builtin_line_comment<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// `shuffle` - randomly shuffle array elements (yq)
 /// Uses non-cryptographic RNG for performance.
 #[cfg(feature = "cli")]
-fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
+fn builtin_shuffle<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -54024,7 +54154,8 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently become "" and get shuffled
             // in as if it were the real value.
-            let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
+            let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned::<S, _>(&e)).collect()
+            {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -54060,7 +54191,7 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
 ///   → {name: ["Alice", "Bob"], age: [30, 25]}
 ///
 /// Handles missing keys with null padding.
-fn builtin_pivot<W: Clone + AsRef<[u64]>>(
+fn builtin_pivot<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -54069,7 +54200,7 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>>(
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently become "" and get pivoted
             // in as if it were the real value.
-            let items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
+            let items: Vec<OwnedValue> = match elements.map(|e| to_owned::<S, _>(&e)).collect() {
                 Ok(v) => v,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -54199,7 +54330,7 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // ...`/`. as {k: $a} | ...`, not just `. as $a | ...`). A
     // checked-conversion failure folds into `bound_control` exactly like an
     // ordinary `Partial`'s control.
-    let (bound_values, bound_control) = stream_outputs(bound_result.materialize_cursor());
+    let (bound_values, bound_control) = stream_outputs::<_, S>(bound_result.materialize_cursor());
 
     // Every variable name any alternative might bind -- a var referenced in
     // the body but bound only by an alternative that didn't end up matching
@@ -54357,12 +54488,12 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // elsewhere.
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => {
-                carried.push(to_owned_lossy(&v));
+                carried.push(to_owned_lossy::<S, _>(&v));
                 return Ok((carried, None));
             }
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => {
-                carried.extend(vs.iter().map(to_owned_lossy));
+                carried.extend(vs.iter().map(to_owned_lossy::<S, _>));
                 return Ok((carried, None));
             }
             QueryResult::Owned(v) => {
@@ -55331,7 +55462,7 @@ fn eval_shared_chain_link<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(cached);
     }
     let result = eval_single::<W, S>(inner, value, optional);
-    if let Some(owned) = cacheable_owned(&result) {
+    if let Some(owned) = cacheable_owned::<_, S>(&result) {
         ambient_frame_depth::cache_shared_value(key, owned);
     }
     result
@@ -55340,10 +55471,12 @@ fn eval_shared_chain_link<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// The owned value to cache for a [`QueryResult`], or `None` for any shape
 /// [`eval_shared_chain_link`] must not memoize (#3012) -- see that
 /// function's own doc comment.
-fn cacheable_owned<W: Clone + AsRef<[u64]>>(result: &QueryResult<'_, W>) -> Option<OwnedValue> {
+fn cacheable_owned<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    result: &QueryResult<'_, W>,
+) -> Option<OwnedValue> {
     match result {
-        QueryResult::One(v) => Some(to_owned_lossy(v)),
-        QueryResult::OneCursor(c) => Some(to_owned_lossy(&c.value())),
+        QueryResult::One(v) => Some(to_owned_lossy::<S, _>(v)),
+        QueryResult::OneCursor(c) => Some(to_owned_lossy::<S, _>(&c.value())),
         QueryResult::Owned(v) => Some(v.clone()),
         _ => None,
     }
@@ -56887,12 +57020,12 @@ mod tests {
             items.push(item);
             Demand::Continue
         });
-        let result = items_to_result_checked(items);
+        let result = items_to_result_checked::<_, JqSemantics>(items);
         match flow {
             Flow::Exhausted | Flow::Stopped { .. } => result,
             Flow::Escaped(control) => {
                 let mut prefix = Vec::new();
-                push_owned_values_lossy(result, &mut prefix);
+                push_owned_values_lossy::<_, JqSemantics>(result, &mut prefix);
                 partial(prefix, control)
             }
         }
@@ -56902,7 +57035,7 @@ mod tests {
     /// carries, plus a tag for however it terminated.
     fn normalize<W: Clone + AsRef<[u64]>>(r: QueryResult<'_, W>) -> (Vec<OwnedValue>, String) {
         let mut out = Vec::new();
-        let control = push_owned_values_lossy(r, &mut out);
+        let control = push_owned_values_lossy::<_, JqSemantics>(r, &mut out);
         let tag = match control {
             None => "ok".to_string(),
             Some(Control::Error(e)) => format!("error:{}", e.message),
@@ -59323,7 +59456,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         for optional in [true, false] {
-            match builtin_combinations::<Vec<u64>>(cursor.value(), optional) {
+            match builtin_combinations::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
                 QueryResult::Error(e) => {
                     assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
                 }
@@ -60211,7 +60344,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         for optional in [true, false] {
-            match builtin_tojsonstream::<Vec<u64>>(cursor.value(), optional) {
+            match builtin_tojsonstream::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
                 QueryResult::Error(e) => {
                     assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
                 }
@@ -60229,7 +60362,7 @@ mod tests {
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
         let index = JsonIndex::build(decode_failure_bytes);
         let cursor = index.root(decode_failure_bytes);
-        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), true) {
+        match builtin_tojsonstream::<Vec<u64>, JqSemantics>(cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
@@ -60244,7 +60377,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         for optional in [true, false] {
-            match builtin_tostream::<Vec<u64>>(cursor.value(), optional) {
+            match builtin_tostream::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
                 QueryResult::Error(e) => {
                     assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
                 }
@@ -60262,7 +60395,7 @@ mod tests {
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
         let index = JsonIndex::build(decode_failure_bytes);
         let cursor = index.root(decode_failure_bytes);
-        match builtin_tostream::<Vec<u64>>(cursor.value(), true) {
+        match builtin_tostream::<Vec<u64>, JqSemantics>(cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
@@ -60712,7 +60845,7 @@ mod tests {
         query!(
             br#"{"a":"k","k":7}"#,
             "first(.[(.a)])",
-            QueryResult::One(v) => assert_eq!(to_owned(&v).unwrap(), OwnedValue::Int(7))
+            QueryResult::One(v) => assert_eq!(to_owned::<JqSemantics, _>(&v).unwrap(), OwnedValue::Int(7))
         );
     }
 
@@ -61580,7 +61713,7 @@ mod tests {
             QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(1)); }
         );
         query!(br#"{"a":1,"k":"a"}"#, ".[.k]",
-            QueryResult::One(v) => { assert_eq!(to_owned_lossy(&v), OwnedValue::Int(1)); }
+            QueryResult::One(v) => { assert_eq!(to_owned_lossy::<JqSemantics, _>(&v), OwnedValue::Int(1)); }
         );
         query!(br#"{"a":[1,2,3],"n":1}"#, ".a[(.n):]",
             QueryResult::Owned(OwnedValue::Array(v)) => {
@@ -61592,7 +61725,7 @@ mod tests {
         );
         query!(br#"{"a":1,"b":2,"keys":["a","b"]}"#, ".[(.keys[])]",
             QueryResult::Many(vs) => {
-                assert_eq!(vs.iter().map(to_owned_lossy).collect::<Vec<_>>(), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+                assert_eq!(vs.iter().map(to_owned_lossy::<JqSemantics, _>).collect::<Vec<_>>(), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
         );
     }
@@ -63244,7 +63377,7 @@ mod tests {
     /// private function rather than through `+=`/etc, since both real
     /// callers (`eval_compound_assign`/`eval_alternative_assign`)
     /// immediately re-materialize the whole document via
-    /// `eval_update_multi`'s own `to_owned(&input)` right after,
+    /// `eval_update_multi`'s own `to_owned::<S, _>(&input)` right after,
     /// masking this fix at the integration level whenever the RHS value
     /// comes from the same document (the only way it *can* come from a
     /// `StandardJson` cursor at all -- `to_owned` fails fast on
@@ -63882,7 +64015,7 @@ mod tests {
         let cursor = index.root(json_bytes);
         let expr = parse("1 as $x ?// $y | 5, 6").unwrap();
         let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
-            .collect_owned()
+            .collect_owned::<JqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect::<Vec<_>>();
@@ -63891,7 +64024,7 @@ mod tests {
         // The single-alternative case still answers exactly once.
         let expr = parse("1 as $x | 5, 6").unwrap();
         let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
-            .collect_owned()
+            .collect_owned::<JqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect::<Vec<_>>();
@@ -63905,7 +64038,7 @@ mod tests {
         let cursor = index.root(doc);
         let expr = parse(".a").unwrap();
         let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
-            .collect_owned()
+            .collect_owned::<JqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect::<Vec<_>>();
@@ -64024,7 +64157,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
         eval::<Vec<u64>, JqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect()
@@ -64040,7 +64173,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse(filter).unwrap();
         eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect()
@@ -64185,7 +64318,7 @@ mod tests {
             other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
         };
         match result {
-            QueryResult::One(v) => Ok(Some(to_owned_lossy(&v))),
+            QueryResult::One(v) => Ok(Some(to_owned_lossy::<JqSemantics, _>(&v))),
             QueryResult::None => Ok(None),
             QueryResult::Error(e) => Err(e),
             other => panic!("unexpected result from via_cursor: {other:?}"),
@@ -64415,9 +64548,9 @@ mod tests {
             OwnedValue::Float(f64::NAN),
             OwnedValue::Float(f64::INFINITY),
             OwnedValue::Float(f64::NEG_INFINITY),
-            OwnedValue::from_number_literal("1"),
-            OwnedValue::from_number_literal("1.0"),
-            OwnedValue::from_number_literal("1e10"),
+            OwnedValue::from_number_literal::<JqSemantics>("1"),
+            OwnedValue::from_number_literal::<JqSemantics>("1.0"),
+            OwnedValue::from_number_literal::<JqSemantics>("1e10"),
             OwnedValue::String(String::new()),
             OwnedValue::String("number".to_string()),
             OwnedValue::String("x".to_string()),
@@ -64899,8 +65032,8 @@ mod tests {
                 let bytes = doc.as_bytes();
                 let index = JsonIndex::build(bytes);
                 let root = index.root(bytes);
-                let input =
-                    to_owned(&root.value()).unwrap_or_else(|e| panic!("to_owned {doc}: {e:?}"));
+                let input = to_owned::<JqSemantics, _>(&root.value())
+                    .unwrap_or_else(|e| panic!("to_owned {doc}: {e:?}"));
                 if let Ok(paths) = resolve_dynamic_indexes::<JqSemantics>(&expr, &input, false) {
                     assert!(
                         paths.len() <= 1,
@@ -65241,12 +65374,12 @@ mod tests {
     #[test]
     fn test_numeric_key_to_index_number_literal_387() {
         assert_eq!(
-            numeric_key_to_index(&OwnedValue::from_number_literal("2")),
+            numeric_key_to_index(&OwnedValue::from_number_literal::<JqSemantics>("2")),
             Some(2)
         );
         // Truncates toward zero, same as plain Float.
         assert_eq!(
-            numeric_key_to_index(&OwnedValue::from_number_literal("1.7")),
+            numeric_key_to_index(&OwnedValue::from_number_literal::<JqSemantics>("1.7")),
             Some(1)
         );
     }
@@ -65264,14 +65397,14 @@ mod tests {
         // back to Rust's `f64`/`i64` Display.
         let expr = parse("$n").unwrap();
 
-        let int_lit = OwnedValue::from_number_literal("42");
+        let int_lit = OwnedValue::from_number_literal::<JqSemantics>("42");
         let substituted = substitute_vars(&expr, [("n", &int_lit)]);
         assert_eq!(
             substituted,
             Expr::Literal(Literal::number_literal("42".to_string()))
         );
 
-        let float_lit = OwnedValue::from_number_literal("1e100");
+        let float_lit = OwnedValue::from_number_literal::<JqSemantics>("1e100");
         let substituted = substitute_vars(&expr, [("n", &float_lit)]);
         assert_eq!(
             substituted,
@@ -65282,7 +65415,7 @@ mod tests {
         let cursor = index.root(b"null");
         assert_eq!(
             eval::<Vec<u64>, JqSemantics>(&substituted, cursor)
-                .collect_owned()
+                .collect_owned::<JqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect::<Vec<_>>(),
@@ -65502,7 +65635,7 @@ mod tests {
         // the borrowed fast path is taken.
         query!(br#"{"a": 1, "b": 2}"#, ".a, .b",
             QueryResult::Many(values) => {
-                let rendered: Vec<String> = values.iter().map(|v| to_owned_lossy(v).to_json()).collect();
+                let rendered: Vec<String> = values.iter().map(|v| to_owned_lossy::<JqSemantics, _>(v).to_json()).collect();
                 assert_eq!(rendered, ["1", "2"]);
             }
         );
@@ -66212,7 +66345,7 @@ mod tests {
     fn test_computed_index_ordinary_cross_product_unaffected_1634() {
         query!(br#"{"a":1,"b":2}"#, r#".[("a","b")]"#,
             QueryResult::Many(vs) => {
-                let values: Vec<OwnedValue> = vs.iter().map(to_owned_lossy).collect();
+                let values: Vec<OwnedValue> = vs.iter().map(to_owned_lossy::<JqSemantics, _>).collect();
                 assert_eq!(values, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
         );
@@ -69239,7 +69372,7 @@ mod tests {
         // `One` arm.
         let expr = parse(".a").unwrap();
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
-        match prepend(vec![OwnedValue::Int(1)], result) {
+        match prepend::<_, JqSemantics>(vec![OwnedValue::Int(1)], result) {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![OwnedValue::Int(1)]);
                 assert!(e.is_decode_failure());
@@ -69250,7 +69383,7 @@ mod tests {
         // `Many` arm: a decodable value ahead of the undecodable one.
         let expr = parse(".b, .a").unwrap();
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
-        match prepend(vec![OwnedValue::Int(1)], result) {
+        match prepend::<_, JqSemantics>(vec![OwnedValue::Int(1)], result) {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(
                     vs,
@@ -69265,7 +69398,7 @@ mod tests {
         // normally.
         let expr = parse(".b").unwrap();
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
-        match prepend(vec![OwnedValue::Int(1)], result) {
+        match prepend::<_, JqSemantics>(vec![OwnedValue::Int(1)], result) {
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(
                     vs,
@@ -69324,7 +69457,7 @@ mod tests {
             Control::Error(EvalError::new("x")),
         );
         assert!(err.is_error());
-        assert_eq!(err.collect_owned(), vec![OwnedValue::Int(1)]);
+        assert_eq!(err.collect_owned::<JqSemantics>(), vec![OwnedValue::Int(1)]);
 
         let brk: QueryResult<Vec<u64>> = QueryResult::Partial(
             vec![OwnedValue::Int(1), OwnedValue::Int(2)],
@@ -69332,7 +69465,7 @@ mod tests {
         );
         assert!(!brk.is_error());
         assert_eq!(
-            brk.collect_owned(),
+            brk.collect_owned::<JqSemantics>(),
             vec![OwnedValue::Int(1), OwnedValue::Int(2)]
         );
     }
@@ -70194,7 +70327,7 @@ mod tests {
         for json in [b"[1 2, 3]".as_slice(), br#"{"a" 1, "b": 2}"#.as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = match to_owned(&cursor.value()) {
+            let err = match to_owned::<JqSemantics, _>(&cursor.value()) {
                 Err(e) => e,
                 Ok(v) => panic!("{json:?}: a malformed delimiter is not JSON, got {v:?}"),
             };
@@ -70209,7 +70342,7 @@ mod tests {
     /// #2262: same function, #2243's trailing-stray-`,`-after-a-real-last-
     /// child check (`[1,]`, `{"a":1,}`) -- also entirely missing before
     /// this fix. Confirmed live before the fix (matching the issue's own
-    /// repro): `to_owned(&cursor.value())` on `[1,]` returned
+    /// repro): `to_owned::<S, _>(&cursor.value())` on `[1,]` returned
     /// `Ok(Array([Int(1)]))` at no error, where real jq 1.7.1 rejects the
     /// document outright.
     #[test]
@@ -70217,7 +70350,7 @@ mod tests {
         for json in [b"[1,]".as_slice(), br#"{"a":1,}"#.as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = match to_owned(&cursor.value()) {
+            let err = match to_owned::<JqSemantics, _>(&cursor.value()) {
                 Err(e) => e,
                 Ok(v) => panic!(
                     "{json:?}: a trailing comma after a real last child is not JSON, got {v:?}"
@@ -70247,7 +70380,7 @@ mod tests {
         for json in [b"[,]".as_slice(), b"{,}".as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            if let Err(e) = to_owned(&cursor.value()) {
+            if let Err(e) = to_owned::<JqSemantics, _>(&cursor.value()) {
                 panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
             }
         }
@@ -70268,7 +70401,7 @@ mod tests {
         for json in [br#"{"a": {,}}"#.as_slice(), br#"{"a": [,]}"#.as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = to_owned(&cursor.value())
+            let err = to_owned::<JqSemantics, _>(&cursor.value())
                 .expect_err("a stray comma in a nested empty container is not JSON");
             assert!(
                 err.message.contains("Invalid JSON text"),
@@ -70291,7 +70424,7 @@ mod tests {
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let err = to_owned(&cursor.value())
+            let err = to_owned::<JqSemantics, _>(&cursor.value())
                 .expect_err("a stray trailing comma after a real nested child is not JSON");
             assert!(
                 err.message.contains("Invalid JSON text"),
@@ -70315,12 +70448,12 @@ mod tests {
                     "a".to_string(),
                     OwnedValue::Array(
                         vec![
-                            OwnedValue::from_number_literal("1"),
-                            OwnedValue::from_number_literal("2"),
+                            OwnedValue::from_number_literal::<JqSemantics>("1"),
+                            OwnedValue::from_number_literal::<JqSemantics>("2"),
                             OwnedValue::Object(
                                 IndexMap::from([(
                                     "b".to_string(),
-                                    OwnedValue::from_number_literal("3"),
+                                    OwnedValue::from_number_literal::<JqSemantics>("3"),
                                 )])
                                 .into(),
                             ),
@@ -70333,7 +70466,10 @@ mod tests {
             ])
             .into(),
         );
-        assert_eq!(to_owned(&cursor.value()).unwrap(), expected);
+        assert_eq!(
+            to_owned::<JqSemantics, _>(&cursor.value()).unwrap(),
+            expected
+        );
     }
 
     /// #2262: well-formed arrays/objects (including a multi-element array
@@ -70348,9 +70484,9 @@ mod tests {
                 b"[1,2,3]".as_slice(),
                 OwnedValue::Array(
                     vec![
-                        OwnedValue::from_number_literal("1"),
-                        OwnedValue::from_number_literal("2"),
-                        OwnedValue::from_number_literal("3"),
+                        OwnedValue::from_number_literal::<JqSemantics>("1"),
+                        OwnedValue::from_number_literal::<JqSemantics>("2"),
+                        OwnedValue::from_number_literal::<JqSemantics>("3"),
                     ]
                     .into(),
                 ),
@@ -70359,8 +70495,14 @@ mod tests {
                 br#"{"a":1,"b":2}"#.as_slice(),
                 OwnedValue::Object(
                     IndexMap::from([
-                        ("a".to_string(), OwnedValue::from_number_literal("1")),
-                        ("b".to_string(), OwnedValue::from_number_literal("2")),
+                        (
+                            "a".to_string(),
+                            OwnedValue::from_number_literal::<JqSemantics>("1"),
+                        ),
+                        (
+                            "b".to_string(),
+                            OwnedValue::from_number_literal::<JqSemantics>("2"),
+                        ),
                     ])
                     .into(),
                 ),
@@ -70369,7 +70511,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             assert_eq!(
-                to_owned(&cursor.value()).unwrap(),
+                to_owned::<JqSemantics, _>(&cursor.value()).unwrap(),
                 expected,
                 "{json:?}: to_owned"
             );
@@ -70641,7 +70783,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse("(.a[] | select((true,true))) |= . + 10").unwrap();
         let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect();
@@ -78649,7 +78791,7 @@ mod tests {
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => Err(e.message),
             other => Ok(other
-                .collect_owned()
+                .collect_owned::<JqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect::<Vec<_>>()
@@ -81619,22 +81761,25 @@ mod tests {
         // Covers the None / Error / Break / Owned / ManyOwned arms and is_error,
         // which the integration parity tests do not exercise.
         let none: QueryResult<Vec<u64>> = QueryResult::None;
-        assert!(none.collect_owned().is_empty());
+        assert!(none.collect_owned::<JqSemantics>().is_empty());
         assert!(!QueryResult::<Vec<u64>>::None.is_error());
 
         let err: QueryResult<Vec<u64>> = QueryResult::Error(EvalError::new("boom"));
         assert!(err.is_error());
-        assert!(err.collect_owned().is_empty());
+        assert!(err.collect_owned::<JqSemantics>().is_empty());
 
         let brk: QueryResult<Vec<u64>> = QueryResult::Break("lbl".into());
-        assert!(brk.collect_owned().is_empty());
+        assert!(brk.collect_owned::<JqSemantics>().is_empty());
 
         let owned: QueryResult<Vec<u64>> = QueryResult::Owned(OwnedValue::Int(7));
-        assert_eq!(owned.collect_owned(), vec![OwnedValue::Int(7)]);
+        assert_eq!(
+            owned.collect_owned::<JqSemantics>(),
+            vec![OwnedValue::Int(7)]
+        );
 
         let many: QueryResult<Vec<u64>> =
             QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        assert_eq!(many.collect_owned().len(), 2);
+        assert_eq!(many.collect_owned::<JqSemantics>().len(), 2);
     }
 
     #[test]
@@ -81644,7 +81789,7 @@ mod tests {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
             let expr = parse(filter).expect("parse failed");
-            eval::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned()
+            eval::<Vec<u64>, JqSemantics>(&expr, cursor).collect_owned::<JqSemantics>()
         }
         // OneCursor: identity passes a container through unchanged.
         assert_eq!(owned(br#"{"a":1}"#, ".").len(), 1);
@@ -81708,15 +81853,15 @@ mod tests {
         let cursor = index.root(json);
 
         assert!(matches!(
-            builtin_gmtime::<Vec<u64>>(cursor.value(), true),
+            builtin_gmtime::<Vec<u64>, JqSemantics>(cursor.value(), true),
             QueryResult::None
         ));
         assert!(matches!(
-            builtin_localtime::<Vec<u64>>(cursor.value(), true),
+            builtin_localtime::<Vec<u64>, JqSemantics>(cursor.value(), true),
             QueryResult::None
         ));
         assert!(matches!(
-            builtin_todate::<Vec<u64>>(cursor.value(), true),
+            builtin_todate::<Vec<u64>, JqSemantics>(cursor.value(), true),
             QueryResult::None
         ));
 
@@ -83635,7 +83780,7 @@ mod tests {
             let cursor = index.root(json);
             let expr = parse(filter).unwrap();
             let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-                .collect_owned()
+                .collect_owned::<YqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect();
@@ -83661,7 +83806,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse("del(.a[].x[1:3])").unwrap();
         let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect();
@@ -86103,7 +86248,7 @@ mod tests {
                 assert_eq!(results.len(), 3);
                 // Check that all results are string keys
                 let keys: Vec<String> = results.iter().filter_map(|v| {
-                    match to_owned_lossy(v) {
+                    match to_owned_lossy::<JqSemantics, _>(v) {
                         OwnedValue::String(s) => Some(s),
                         _ => None,
                     }
@@ -86154,7 +86299,7 @@ mod tests {
         query!(br#"{"outer": {"inner": 42}}"#, ".outer | .[] | key",
             QueryResult::OneCursor(c) => {
                 assert_eq!(
-                    crate::jq::eval_generic::to_owned_cursor(&c).expect("decodes"),
+                    crate::jq::eval_generic::to_owned_cursor::<JqSemantics, _>(&c).expect("decodes"),
                     OwnedValue::String("inner".to_string())
                 );
             }
@@ -86330,7 +86475,7 @@ mod tests {
     ) -> QueryResult<'a, Vec<u64>> {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let input = to_owned_lossy(&cursor.value());
+        let input = to_owned_lossy::<JqSemantics, _>(&cursor.value());
         let expr = parse(filter).unwrap();
         eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, file_origin)
     }
@@ -86408,7 +86553,7 @@ mod tests {
                 let expr = parse(filter).unwrap();
                 let rendered =
                     eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, &[])
-                        .collect_owned()
+                        .collect_owned::<JqSemantics>()
                         .iter()
                         .map(OwnedValue::to_json)
                         .collect::<Vec<_>>()
@@ -86422,7 +86567,7 @@ mod tests {
             let expr = parse(".[] | key").unwrap();
             assert_eq!(
                 eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, &[])
-                    .collect_owned()
+                    .collect_owned::<JqSemantics>()
                     .iter()
                     .map(OwnedValue::to_json)
                     .collect::<Vec<_>>(),
@@ -87302,7 +87447,7 @@ mod tests {
         let cursor = index.root(b"[10,20]");
         let expr = parse(".[] | key | tostring").unwrap();
         let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect();
@@ -87649,8 +87794,8 @@ mod tests {
     fn test_nth_stream_number_literal_n_387() {
         // A bare `.n` field access stays a lazy StandardJson::Number cursor
         // (QueryResult::One), which already worked fine -- it never goes
-        // through to_owned_lossy()'s NumberLiteral conversion. getpath(["n"])
-        // forces materialization through to_owned_lossy(), so `n` arrives as
+        // through to_owned_lossy::<S, _>()'s NumberLiteral conversion. getpath(["n"])
+        // forces materialization through to_owned_lossy::<S, _>(), so `n` arrives as
         // QueryResult::Owned(OwnedValue::NumberLiteral(..)), which is the
         // arm that was actually broken. The n-arm match in
         // builtin_nth_stream must treat that the same as a plain Int/Float,
@@ -89664,7 +89809,7 @@ mod tests {
             _ => String::new(),
         };
         let values = result
-            .collect_owned()
+            .collect_owned::<JqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect();
@@ -90421,12 +90566,12 @@ mod tests {
         // `QueryResult::collect_owned`'s `Halt` arm (#791). Every internal
         // caller of `collect_owned()` in this file already intercepts
         // `QueryResult::Halt` explicitly *before* falling into the generic
-        // `other => other.collect_owned()` branch -- see `stream_outputs_lossy`
+        // `other => other.collect_owned::<S>()` branch -- see `stream_outputs_lossy`
         // (matches `Halt` itself before its `other` fallback),
         // `eval_owned_multi`/`eval_owned_multi_first` (both match `Halt`
-        // before their `other => Ok(other.collect_owned())` arm), and
+        // before their `other => Ok(other.collect_owned::<S>())` arm), and
         // `builtin_fromstream`/`builtin_truncate_stream` (both `return
-        // QueryResult::Halt(code)` before their `result => (result.collect_owned(), None)`
+        // QueryResult::Halt(code)` before their `result => (result.collect_owned::<S>(), None)`
         // arm) -- and the CLI never calls `collect_owned()` at all (only
         // `eval.rs`/`eval_generic.rs` do). So this arm is reachable only by
         // constructing a `Halt` directly, the same way
@@ -90434,7 +90579,7 @@ mod tests {
         // sibling `Break` arm right next to it. Mirrors `Break`'s "no
         // outputs" answer: a halt carries no output value of its own either.
         let halt: QueryResult<Vec<u64>> = QueryResult::Halt(0);
-        assert!(halt.collect_owned().is_empty());
+        assert!(halt.collect_owned::<JqSemantics>().is_empty());
     }
 
     #[test]
@@ -90556,7 +90701,7 @@ mod tests {
         let n_expr = parse(".n").unwrap();
         let expr = parse(".xs[]").unwrap();
         match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
-            QueryResult::One(v) => assert_eq!(to_owned_lossy(&v).to_json(), "20"),
+            QueryResult::One(v) => assert_eq!(to_owned_lossy::<JqSemantics, _>(&v).to_json(), "20"),
             QueryResult::Owned(v) => assert_eq!(v.to_json(), "20"),
             other => panic!("expected the element at index 1, got {other:?}"),
         }
@@ -90731,7 +90876,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse("del(.[.a:1], .[.a:2])").unwrap();
         let rendered: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
-            .collect_owned()
+            .collect_owned::<YqSemantics>()
             .iter()
             .map(OwnedValue::to_json)
             .collect();
@@ -91116,7 +91261,7 @@ mod tests {
     fn finish_result_many_and_many_owned_splice_trailing_control_1164() {
         let many: QueryResult<'_, Vec<u64>> =
             QueryResult::Many(vec![StandardJson::Bool(true), StandardJson::Bool(false)]);
-        match finish_result(many, Some(Control::Break("out".to_string()))) {
+        match finish_result::<_, JqSemantics>(many, Some(Control::Break("out".to_string()))) {
             QueryResult::Partial(vs, Control::Break(label)) => {
                 assert_eq!(label, "out");
                 assert_eq!(vs, vec![OwnedValue::Bool(true), OwnedValue::Bool(false)]);
@@ -91126,7 +91271,7 @@ mod tests {
 
         let many_owned: QueryResult<'_, Vec<u64>> =
             QueryResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        match finish_result(many_owned, Some(Control::Break("out".to_string()))) {
+        match finish_result::<_, JqSemantics>(many_owned, Some(Control::Break("out".to_string()))) {
             QueryResult::Partial(vs, Control::Break(label)) => {
                 assert_eq!(label, "out");
                 assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
@@ -91139,15 +91284,21 @@ mod tests {
     fn finish_result_none_collapses_to_each_bare_control_variant_1164() {
         let none_result = || QueryResult::<'_, Vec<u64>>::None;
 
-        match finish_result(none_result(), Some(Control::Error(EvalError::new("boom")))) {
+        match finish_result::<_, JqSemantics>(
+            none_result(),
+            Some(Control::Error(EvalError::new("boom"))),
+        ) {
             QueryResult::Error(e) => assert_eq!(e.message, "boom"),
             other => panic!("unexpected result: {other:?}"),
         }
-        match finish_result(none_result(), Some(Control::Break("out".to_string()))) {
+        match finish_result::<_, JqSemantics>(
+            none_result(),
+            Some(Control::Break("out".to_string())),
+        ) {
             QueryResult::Break(label) => assert_eq!(label, "out"),
             other => panic!("unexpected result: {other:?}"),
         }
-        match finish_result(none_result(), Some(Control::Halt(3))) {
+        match finish_result::<_, JqSemantics>(none_result(), Some(Control::Halt(3))) {
             QueryResult::Halt(3) => {}
             other => panic!("unexpected result: {other:?}"),
         }
@@ -91164,7 +91315,7 @@ mod tests {
             vec![OwnedValue::Int(1)],
             Control::Error(EvalError::new("x")),
         );
-        match finish_result(delegated, Some(Control::Break("out".to_string()))) {
+        match finish_result::<_, JqSemantics>(delegated, Some(Control::Break("out".to_string()))) {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![OwnedValue::Int(1)]);
                 assert_eq!(e.message, "x");
@@ -91415,7 +91566,7 @@ mod tests {
         let cursor = index.root(json);
         let expr = parse(".a, .b").unwrap();
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
-        match result_to_owned_ctrl(result) {
+        match result_to_owned_ctrl::<_, JqSemantics>(result) {
             Ok((OwnedValue::String(s), None)) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
@@ -91738,15 +91889,16 @@ mod tests {
         let json = linear_nest(MAX_VALUE_TREE_DEPTH - 1);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = to_owned_lossy(&cursor.value());
+        let owned = to_owned_lossy::<JqSemantics, _>(&cursor.value());
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_nest(MAX_VALUE_TREE_DEPTH);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let value = cursor.value();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned_lossy(&value)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            to_owned_lossy::<JqSemantics, _>(&value)
+        }));
         assert!(
             result.is_err(),
             "to_owned_lossy should panic at MAX_VALUE_TREE_DEPTH"
@@ -92006,7 +92158,7 @@ mod tests {
     /// either of its two callers (`eval_compound_assign`/
     /// `eval_alternative_assign`): both always call `eval_update_multi`
     /// immediately afterward on the *same, unmodified* input, and that
-    /// function's own `to_owned(&input)` re-materializes and
+    /// function's own `to_owned::<S, _>(&input)` re-materializes and
     /// decode-checks the whole document before any RHS value is ever
     /// used. This pins that masking -- no jq-constructible input can make
     /// a hypothetical RHS-side bug independently observable here, since
@@ -92178,7 +92330,7 @@ mod tests {
                     OwnedValue::Object(map) => {
                         assert_eq!(
                             map.get("\u{FFFD}\u{FFFD}"),
-                            Some(&OwnedValue::from_number_literal("1")),
+                            Some(&OwnedValue::from_number_literal::<JqSemantics>("1")),
                             "expected the undecodable key preserved as its lossy-decoded \
                              source span, matching eval_generic.rs's own #1642 convention, \
                              got: {map:?}"
@@ -96737,7 +96889,7 @@ mod tests {
         let array_index = JsonIndex::build(array_bytes);
         let array_cursor = array_index.root(array_bytes);
         for optional in [true, false] {
-            match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), optional) {
+            match builtin_fromjsonstream::<Vec<u64>, JqSemantics>(array_cursor.value(), optional) {
                 QueryResult::Error(e) => {
                     assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
                 }
@@ -96774,7 +96926,7 @@ mod tests {
         let array_bytes: &[u8] = &b"[\"\xff\xfe\"]"[..];
         let array_index = JsonIndex::build(array_bytes);
         let array_cursor = array_index.root(array_bytes);
-        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), true) {
+        match builtin_fromjsonstream::<Vec<u64>, JqSemantics>(array_cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
@@ -97702,7 +97854,7 @@ mod touched_edge_cases_2999 {
         let cursor = index.root(json);
         match eval::<Vec<u64>, S>(expr, cursor) {
             QueryResult::Owned(v) => v.to_json(),
-            QueryResult::One(v) => to_owned(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
+            QueryResult::One(v) => to_owned::<S, _>(&v).unwrap().to_json(), // omni-dev: coverage tolerate-line reason="every pinned filter below yields an owned value; kept so a cursor answer still renders rather than panics (#2999)"
             other => panic!("unexpected result: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertions this helper serves (#2999)"
         }
     }

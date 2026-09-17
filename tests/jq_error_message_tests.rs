@@ -140,12 +140,15 @@ fn outcome(evaluator: Evaluator, probe: &Probe) -> Result<String, String> {
             let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
             match result {
                 QueryResult::Error(e) => (Some(e.message), Vec::new()),
-                other => (None, render(other.collect_owned())),
+                other => (None, render(other.collect_owned::<JqSemantics>())),
             }
         }
         Evaluator::Generic => match eval_generic::eval_with_cursor(&expr, cursor) {
             eval_generic::GenericResult::Error(e) => (Some(e.message), Vec::new()),
-            other => (None, render(other.collect_owned().expect("materializes"))),
+            other => (
+                None,
+                render(other.collect_owned::<JqSemantics>().expect("materializes")),
+            ),
         },
     };
 

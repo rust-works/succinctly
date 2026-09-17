@@ -25,9 +25,7 @@ use indexmap::IndexMap;
 
 use super::error::EvalError;
 use super::escape::{escape_json_body, write_json_body_jq};
-use super::eval::{EvalSemantics, EvalTag};
-#[cfg(test)]
-use super::eval::{JqSemantics, YqSemantics};
+use super::eval::{EvalSemantics, EvalTag, JqSemantics, YqSemantics};
 use super::expr::Literal;
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
@@ -184,6 +182,42 @@ pub(crate) fn parse_i64_or_f64_in<S: EvalSemantics>(s: &str) -> Option<NumberRep
         s.parse::<f64>().ok()?
     };
     Some(NumberRepr::Float(f))
+}
+
+/// A document number's double under `S`'s number model, read straight from
+/// its source bytes without materializing an `OwnedValue` (#2936).
+///
+/// The cursor-level builtins (`length`, `isnan`/`isinfinite`/`isnormal`,
+/// `normals`/`finites`, `strftime`'s timestamp, `implode`'s codepoints and
+/// every libm function through `get_float_value`) read a number's value
+/// without ever building an `OwnedValue`, so
+/// [`OwnedValue::from_number_bytes`]'s mode-aware parse never runs for them.
+/// This is their one accessor: when `bytes` spell a literal (valid RFC 8259
+/// or one of the lenient spellings the funnels preserve, a leading `+`
+/// peeled), jq mode rounds it to 17 significant digits like every other
+/// entry point; anything else -- a bridge token, a decNumber word, a
+/// malformed span -- falls through to `fallback`, the caller's own
+/// mode-less read (`JsonNumber::as_f64`, `V::as_f64`). yq mode always
+/// takes the fallback, which is Go's correctly-rounded parse already.
+///
+/// #2937 needs the same site set for its `Int` widening; add that arm here
+/// rather than at each caller.
+pub(crate) fn document_number_f64<S: EvalSemantics>(
+    bytes: &[u8],
+    fallback: impl FnOnce() -> Option<f64>,
+) -> Option<f64> {
+    if S::DECNUMBER_LITERALS {
+        let literal = crate::json::validate::strip_leading_plus(bytes).unwrap_or(bytes);
+        if crate::json::validate::is_preservable_number_literal(literal) {
+            if let Some(f) = core::str::from_utf8(literal)
+                .ok()
+                .and_then(jq_literal_text_to_f64)
+            {
+                return Some(f);
+            }
+        }
+    }
+    fallback()
 }
 
 /// The number of significant decimal digits in a number literal's text
@@ -2600,10 +2634,21 @@ impl OwnedValue {
     /// baking a literal there would leak into the string builtins that read
     /// it (`!!float 2 | tostring` must stay `2`, #1090/#1176). Non-finite
     /// floats have no decimal spelling at all and stay bare.
+    ///
+    /// Mode-less on purpose (#2936): the spelling baked here is a double's
+    /// own exact decimal expansion, and rounding that to 17 significant
+    /// digits parses back to the same double (17 digits round-trip every
+    /// `f64`), so jq's literal model and the plain parse agree on it. The
+    /// plain `parse_i64_or_f64` states that directly rather than picking a
+    /// mode that cannot matter.
     #[must_use]
     pub fn from_document_float(f: f64) -> Self {
         if f.is_finite() && crate::yaml::yq_float_is_scientific(f) {
-            Self::from_number_literal(&crate::yaml::format_float_with_fraction(f))
+            let text = crate::yaml::format_float_with_fraction(f);
+            match parse_i64_or_f64(&text) {
+                Some(repr) => Self::NumberLiteral(repr, text.into()),
+                None => Self::Float(f),
+            }
         } else {
             Self::Float(f)
         }
@@ -2617,8 +2662,15 @@ impl OwnedValue {
     /// neither (should not happen for a valid document number token, but
     /// matches how every other decode-failure path in this codebase
     /// represents "not actually a number" — #966).
-    pub(crate) fn from_number_literal(literal: &str) -> Self {
-        Self::from_number_literal_boxed(literal.into())
+    ///
+    /// `S` decides the double a non-`i64` literal carries (#2936): jq's
+    /// 17-digit-rounded one under `DECNUMBER_LITERALS`, the plain parse for
+    /// yq -- see [`parse_i64_or_f64_in`]. There is deliberately no
+    /// mode-less form: a funnel left without a mode would keep the plain
+    /// parse in jq mode and nothing would fail, which is how #2906 left the
+    /// float half of this behind.
+    pub(crate) fn from_number_literal<S: EvalSemantics>(literal: &str) -> Self {
+        Self::from_number_literal_boxed::<S>(literal.into())
     }
 
     /// Like `from_number_literal` (private, this file only), but parses
@@ -2672,11 +2724,32 @@ impl OwnedValue {
     /// Like [`from_number_literal`](Self::from_number_literal), but takes an
     /// already-owned `Box<str>` (e.g. from `JqValue::NumberLiteral`) instead
     /// of allocating a fresh one.
-    pub(crate) fn from_number_literal_boxed(literal: Box<str>) -> Self {
-        let Some(repr) = parse_i64_or_f64(&literal) else {
+    pub(crate) fn from_number_literal_boxed<S: EvalSemantics>(literal: Box<str>) -> Self {
+        let Some(repr) = parse_i64_or_f64_in::<S>(&literal) else {
             return Self::Null;
         };
         Self::NumberLiteral(repr, literal)
+    }
+
+    /// The reindex bridge's NaN/infinity tokens (#472/#1083), decoded to
+    /// the bare `f64` they stand for; `None` for anything else. The first
+    /// check [`from_number_bytes`](Self::from_number_bytes) makes, split
+    /// out so `JsonNumber::as_f64` (`src/json/light.rs`) can decode the
+    /// same tokens without choosing a number model: no spelling this
+    /// accepts is a literal, so jq's 17-digit rule (#2936) has nothing to
+    /// say about it.
+    #[must_use]
+    pub fn bridge_nonfinite_from_bytes(bytes: &[u8]) -> Option<f64> {
+        if is_nan_sentinel(bytes) {
+            return Some(f64::NAN);
+        }
+        is_infinity_sentinel(bytes).map(|negative| {
+            if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        })
     }
 
     /// Materialize raw JSON number-token bytes into the correctly-gated
@@ -2701,19 +2774,15 @@ impl OwnedValue {
     /// [`to_json`](Self::to_json)/[`number_str`](Self::number_str) echo it
     /// back out verbatim, since both always reproduce a `NumberLiteral`'s
     /// stored text unchanged.
-    pub fn from_number_bytes(bytes: &[u8]) -> Self {
-        if is_nan_sentinel(bytes) {
-            return Self::Float(f64::NAN);
-        }
-        if let Some(negative) = is_infinity_sentinel(bytes) {
-            return Self::Float(if negative {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            });
+    ///
+    /// `S` is the number model the literal's double is read under (#2936);
+    /// see [`from_number_literal`](Self::from_number_literal).
+    pub fn from_number_bytes<S: EvalSemantics>(bytes: &[u8]) -> Self {
+        if let Some(f) = Self::bridge_nonfinite_from_bytes(bytes) {
+            return Self::Float(f);
         }
         if crate::json::validate::is_valid_number(bytes) {
-            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal::<S>);
         }
         // The reindex bridge's computed-float token (#2902): a bare `Float`
         // going in must be a bare `Float` coming out, never a
@@ -2745,7 +2814,7 @@ impl OwnedValue {
         // `DocumentValue::number_literal` implementation, which needs the
         // identical escape (#2240 code review).
         if crate::json::validate::has_leading_dot(bytes) {
-            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal::<S>);
         }
         // Real jq's own number reader also tolerates a redundant leading
         // zero in the integer part (`007` -> `7`, `007e5` -> `7E+5`,
@@ -2780,7 +2849,8 @@ impl OwnedValue {
         let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
         if let Some(stripped) = &zero_stripped {
             if crate::json::validate::is_valid_number(stripped) {
-                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+                return core::str::from_utf8(bytes)
+                    .map_or(Self::Null, Self::from_number_literal::<S>);
             }
         }
         // Real jq's own number reader also tolerates a trailing `.`
@@ -2811,7 +2881,7 @@ impl OwnedValue {
         // only resolves its own half.
         let base = zero_stripped.as_deref().unwrap_or(bytes);
         if crate::json::validate::has_trailing_dot_before_exponent(base) {
-            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal::<S>);
         }
         // decNumber's special values (#2877): `nan`, `sNaN12`, `-Infinity`,
         // `+inf`, ... are real `f64` values in jq 1.7.1 -- `type` is
@@ -2847,13 +2917,13 @@ impl OwnedValue {
         if let Some(unsigned) = crate::json::validate::strip_leading_plus(bytes) {
             if crate::json::validate::is_preservable_number_literal(unsigned) {
                 return core::str::from_utf8(unsigned)
-                    .map_or(Self::Null, Self::from_number_literal);
+                    .map_or(Self::Null, Self::from_number_literal::<S>);
             }
         }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };
-        Self::plain_number_from_repr(parse_i64_or_f64(s))
+        Self::plain_number_from_repr(parse_i64_or_f64_in::<S>(s))
     }
 
     /// Collapse a [`NumberLiteral`](Self::NumberLiteral) into a plain
@@ -3901,13 +3971,19 @@ fn decompose_decimal_literal(text: &str) -> (bool, Vec<u8>, i128) {
 ///
 /// A `NumberLiteral` (either repr) and a bare `Int` are literals (the
 /// invariant [`jq_literal_int_to_f64`] documents); a bare `Float` is
-/// computed. Two literals are ordered by their correctly-rounded doubles
-/// first -- rounding is monotonic, so a strict double order *is* the exact
-/// order -- and only a double tie falls through to the digit comparison,
-/// so sorting document floats pays for text only when two values' doubles
-/// coincide (byte-equal spellings short-circuit). A `Float` literal with
-/// more than 17 significant digits is still widened by its parsed double
-/// rather than jq's rounded one (#2936).
+/// computed. Two literals are ordered by their doubles first and only a
+/// double tie falls through to the digit comparison, so sorting document
+/// floats pays for text only when two values' doubles coincide (byte-equal
+/// spellings short-circuit). That shortcut is sound only because **both
+/// doubles come from the same monotone rounding** -- jq's 17-digit one
+/// (#2906/#2936): a `Float` literal's stored double is already that
+/// ([`parse_i64_or_f64_in`]), and an `Int` literal's is widened here
+/// through [`jq_literal_int_to_f64`], never a plain `as f64`. Mixing the
+/// two orders wrongly: `869389897822472001` plain-rounds to `…472064`
+/// while `869389897822472004.9` 17-digit-rounds to `…471936`, so the
+/// doubles would say `>` where the exact decimals say `<`; with both on
+/// the 17-digit rounding they tie at `…471936` and the digit comparison
+/// decides correctly.
 pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<core::cmp::Ordering> {
     use core::cmp::Ordering;
 
@@ -3942,12 +4018,12 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
     fn side(value: &OwnedValue) -> Option<Side<'_>> {
         Some(match value {
             OwnedValue::Int(n) => Side::Literal(Literal {
-                double: *n as f64,
+                double: jq_literal_int_to_f64(*n),
                 int: Some(*n),
                 text: None,
             }),
             OwnedValue::NumberLiteral(NumberRepr::Int(n), text) => Side::Literal(Literal {
-                double: *n as f64,
+                double: jq_literal_int_to_f64(*n),
                 int: Some(*n),
                 text: Some(text),
             }),
@@ -3961,10 +4037,7 @@ pub(crate) fn jq_numeric_cmp(left: &OwnedValue, right: &OwnedValue) -> Option<co
         })
     }
     fn to_double(literal: &Literal<'_>) -> f64 {
-        match literal.int {
-            Some(n) => jq_literal_int_to_f64(n),
-            None => literal.double,
-        }
+        literal.double
     }
     fn text<'a>(literal: &'a Literal<'a>) -> Cow<'a, str> {
         match (literal.text, literal.int) {
@@ -4168,10 +4241,13 @@ impl From<Literal> for OwnedValue {
             // do, restoring some of what `from_number_literal_boxed`'s
             // unconditional re-parse used to guarantee for free.
             Literal::NumberLiteral(repr, text) => {
-                debug_assert_eq!(
-                    Some(repr),
-                    parse_i64_or_f64(&text),
-                    "Literal::NumberLiteral's repr {repr:?} doesn't match a fresh parse of its own text {text:?}"
+                // #2936: a `Literal` carries no mode, and the two modes read
+                // a >17-significant-digit float differently, so either
+                // mode's parse is a match.
+                debug_assert!(
+                    Some(repr) == parse_i64_or_f64_in::<JqSemantics>(&text)
+                        || Some(repr) == parse_i64_or_f64_in::<YqSemantics>(&text),
+                    "Literal::NumberLiteral's repr {repr:?} doesn't match a fresh parse of its own text {text:?} under either mode"
                 );
                 Self::NumberLiteral(repr, text.into())
             }
@@ -4641,19 +4717,25 @@ mod tests {
     #[test]
     fn test_from_number_bytes_preserves_leading_dot_spelling() {
         assert_eq!(
-            OwnedValue::from_number_bytes(b".500"),
+            OwnedValue::from_number_bytes::<JqSemantics>(b".500"),
             OwnedValue::NumberLiteral(NumberRepr::Float(0.5), ".500".into())
         );
         assert_eq!(
-            OwnedValue::from_number_bytes(b"-.500"),
+            OwnedValue::from_number_bytes::<JqSemantics>(b"-.500"),
             OwnedValue::NumberLiteral(NumberRepr::Float(-0.5), "-.500".into())
         );
         // A bare `.` (no digit at all) still degrades to Null:
         // `has_leading_dot` returns `false` for it -- prefixing a `0`
         // doesn't make it strictly valid either, since there's still no
         // digit anywhere in the token.
-        assert_eq!(OwnedValue::from_number_bytes(b"."), OwnedValue::Null);
-        assert_eq!(OwnedValue::from_number_bytes(b"-."), OwnedValue::Null);
+        assert_eq!(
+            OwnedValue::from_number_bytes::<JqSemantics>(b"."),
+            OwnedValue::Null
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes::<JqSemantics>(b"-."),
+            OwnedValue::Null
+        );
     }
 
     /// #2220: a trailing-dot mantissa immediately before an exponent marker
@@ -4698,7 +4780,7 @@ mod tests {
                 "-007.e999",
             ),
         ] {
-            match OwnedValue::from_number_bytes(bytes) {
+            match OwnedValue::from_number_bytes::<JqSemantics>(bytes) {
                 OwnedValue::NumberLiteral(repr, literal) => {
                     assert_eq!(repr, expected_repr, "input {bytes:?}");
                     assert_eq!(&*literal, expected_literal, "input {bytes:?}");
@@ -4710,10 +4792,16 @@ mod tests {
         // escape -- real jq doesn't preserve that spelling either (`[1.]`
         // -> `[1]`), so it still degrades to a plain `Float` via the
         // pre-existing fallback below, not a `NumberLiteral`.
-        assert_eq!(OwnedValue::from_number_bytes(b"1."), OwnedValue::Float(1.0));
+        assert_eq!(
+            OwnedValue::from_number_bytes::<JqSemantics>(b"1."),
+            OwnedValue::Float(1.0)
+        );
         // Genuinely malformed shapes (two dots) stay untouched by this
         // escape too: the inserted `0` can't make `1.5.3` valid either way.
-        assert_eq!(OwnedValue::from_number_bytes(b"1.5.3"), OwnedValue::Null);
+        assert_eq!(
+            OwnedValue::from_number_bytes::<JqSemantics>(b"1.5.3"),
+            OwnedValue::Null
+        );
     }
 
     #[test]
@@ -5077,15 +5165,15 @@ mod tests {
     #[test]
     fn test_from_number_literal_picks_int_or_float() {
         assert_eq!(
-            OwnedValue::from_number_literal("42"),
+            OwnedValue::from_number_literal::<JqSemantics>("42"),
             OwnedValue::NumberLiteral(NumberRepr::Int(42), "42".into())
         );
         assert_eq!(
-            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::from_number_literal::<JqSemantics>("1.0"),
             OwnedValue::NumberLiteral(NumberRepr::Float(1.0), "1.0".into())
         );
         assert_eq!(
-            OwnedValue::from_number_literal("1e100"),
+            OwnedValue::from_number_literal::<JqSemantics>("1e100"),
             OwnedValue::NumberLiteral(NumberRepr::Float(1e100), "1e100".into())
         );
     }
@@ -5095,18 +5183,30 @@ mod tests {
         // A NumberLiteral is numerically equal to the plain variant it parses
         // to, and to the other representation of the same number -- equality
         // never looks at the source text (#387).
-        assert_eq!(OwnedValue::from_number_literal("42"), OwnedValue::Int(42));
-        assert_eq!(OwnedValue::Int(42), OwnedValue::from_number_literal("42"));
         assert_eq!(
-            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::from_number_literal::<JqSemantics>("42"),
+            OwnedValue::Int(42)
+        );
+        assert_eq!(
+            OwnedValue::Int(42),
+            OwnedValue::from_number_literal::<JqSemantics>("42")
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("1.0"),
             OwnedValue::Float(1.0)
         );
-        assert_eq!(OwnedValue::from_number_literal("1.0"), OwnedValue::Int(1));
         assert_eq!(
-            OwnedValue::from_number_literal("1e0"),
-            OwnedValue::from_number_literal("1")
+            OwnedValue::from_number_literal::<JqSemantics>("1.0"),
+            OwnedValue::Int(1)
         );
-        assert_ne!(OwnedValue::from_number_literal("1.5"), OwnedValue::Int(1));
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("1e0"),
+            OwnedValue::from_number_literal::<JqSemantics>("1")
+        );
+        assert_ne!(
+            OwnedValue::from_number_literal::<JqSemantics>("1.5"),
+            OwnedValue::Int(1)
+        );
     }
 
     #[test]
@@ -5120,20 +5220,23 @@ mod tests {
         // `NumberLiteral` operand above 2^53, before `compare_values` was
         // rewritten to share this exact dispatch with equality).
         let pairs = [
-            (OwnedValue::Int(42), OwnedValue::from_number_literal("42")),
             (
-                OwnedValue::Float(1.5),
-                OwnedValue::from_number_literal("1.5"),
+                OwnedValue::Int(42),
+                OwnedValue::from_number_literal::<JqSemantics>("42"),
             ),
             (
-                OwnedValue::from_number_literal("1.0"),
-                OwnedValue::from_number_literal("1e0"),
+                OwnedValue::Float(1.5),
+                OwnedValue::from_number_literal::<JqSemantics>("1.5"),
+            ),
+            (
+                OwnedValue::from_number_literal::<JqSemantics>("1.0"),
+                OwnedValue::from_number_literal::<JqSemantics>("1e0"),
             ),
             // The precision-boundary case #387 regressed: a `NumberLiteral`
             // `Int` above 2^53 against a `Float` that collapses to the same
             // `f64` value on widening.
             (
-                OwnedValue::from_number_literal("9007199254740993"),
+                OwnedValue::from_number_literal::<JqSemantics>("9007199254740993"),
                 OwnedValue::Float(9007199254740992.0),
             ),
             // An 18-digit `Int` literal against the double jq's own literal
@@ -5142,7 +5245,7 @@ mod tests {
             // both must agree on; jq-mode `==` answers separately through
             // `jq_numeric_cmp` (#2906, tested below).
             (
-                OwnedValue::from_number_literal("869389897822472004"),
+                OwnedValue::from_number_literal::<JqSemantics>("869389897822472004"),
                 OwnedValue::Float(869389897822471936.0),
             ),
         ];
@@ -5222,7 +5325,7 @@ mod tests {
     #[test]
     fn test_jq_numeric_cmp_literal_pairs_exact_and_computed_pairs_rounded_2906() {
         use core::cmp::Ordering::{Equal, Greater, Less};
-        let lit = OwnedValue::from_number_literal;
+        let lit = OwnedValue::from_number_literal::<JqSemantics>;
         let computed = |f: f64| OwnedValue::Float(f);
         // `869389897822472004 + 0` in jq: the literal rounds to ...000, whose
         // nearest double is ...1936.
@@ -5566,18 +5669,18 @@ mod tests {
 
     #[test]
     fn test_number_literal_type_name_and_conversions() {
-        let lit = OwnedValue::from_number_literal("1e100");
+        let lit = OwnedValue::from_number_literal::<JqSemantics>("1e100");
         assert_eq!(lit.type_name(), "number");
         assert_eq!(lit.as_f64(), Some(1e100));
         assert_eq!(lit.as_i64(), None); // not integral
 
-        let int_lit = OwnedValue::from_number_literal("42");
+        let int_lit = OwnedValue::from_number_literal::<JqSemantics>("42");
         assert_eq!(int_lit.as_i64(), Some(42));
         assert_eq!(int_lit.as_f64(), Some(42.0));
 
         // A NumberLiteral backed by an integral Float representation also
         // converts to i64, just like plain OwnedValue::Float does.
-        let float_int_lit = OwnedValue::from_number_literal("2.0");
+        let float_int_lit = OwnedValue::from_number_literal::<JqSemantics>("2.0");
         assert_eq!(float_int_lit.as_i64(), Some(2));
     }
 
@@ -5585,13 +5688,28 @@ mod tests {
     fn test_number_literal_to_json_preserves_source_spelling() {
         // Preserved verbatim where jq's own canonical formatting agrees with
         // the source text...
-        assert_eq!(OwnedValue::from_number_literal("42").to_json(), "42");
-        assert_eq!(OwnedValue::from_number_literal("1.0").to_json(), "1.0");
-        assert_eq!(OwnedValue::from_number_literal("-0.0").to_json(), "-0.0");
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("42").to_json(),
+            "42"
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("1.0").to_json(),
+            "1.0"
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("-0.0").to_json(),
+            "-0.0"
+        );
         // ...and reformatted into jq's canonical spelling where it doesn't --
         // this is the exact repro from #387, pinned against jq-1.7.1.
-        assert_eq!(OwnedValue::from_number_literal("1e100").to_json(), "1E+100");
-        assert_eq!(OwnedValue::from_number_literal("1e-7").to_json(), "1E-7");
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("1e100").to_json(),
+            "1E+100"
+        );
+        assert_eq!(
+            OwnedValue::from_number_literal::<JqSemantics>("1e-7").to_json(),
+            "1E-7"
+        );
     }
 
     #[test]
@@ -5603,7 +5721,7 @@ mod tests {
         // back to -- confirmed live against jq 1.7.1, `1e400 | .` (identity)
         // echoes `1E+400`, not `null` (#1087; this test's own name/premise
         // predates that finding).
-        let lit = OwnedValue::from_number_literal("1e400");
+        let lit = OwnedValue::from_number_literal::<JqSemantics>("1e400");
         assert!(matches!(
             lit,
             OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_infinite()
@@ -5668,7 +5786,7 @@ mod tests {
     fn test_from_number_bytes_decodes_the_computed_float_token_2902() {
         for f in [1.0, -0.0, 0.5, 2e16, 5e-6] {
             let token = crate::json::validate::computed_float_token(f);
-            let got = OwnedValue::from_number_bytes(token.as_bytes());
+            let got = OwnedValue::from_number_bytes::<JqSemantics>(token.as_bytes());
             assert!(
                 matches!(got, OwnedValue::Float(back) if back.to_bits() == f.to_bits()),
                 "{token} materialized as {got:?}"
@@ -5676,11 +5794,11 @@ mod tests {
         }
         // A genuine literal that merely ends in `e0` is still a literal.
         assert_eq!(
-            OwnedValue::from_number_bytes(b"1e0"),
-            OwnedValue::from_number_literal("1e0")
+            OwnedValue::from_number_bytes::<JqSemantics>(b"1e0"),
+            OwnedValue::from_number_literal::<JqSemantics>("1e0")
         );
         assert!(matches!(
-            OwnedValue::from_number_bytes(b"1e0"),
+            OwnedValue::from_number_bytes::<JqSemantics>(b"1e0"),
             OwnedValue::NumberLiteral(_, _)
         ));
     }
@@ -5696,7 +5814,7 @@ mod tests {
             "nan", "NaN", "-nan", "+nan", "nan1", "sNaN", "SNAN12", "-sNaN",
         ] {
             assert!(
-                matches!(OwnedValue::from_number_bytes(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
+                matches!(OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
                 "{word}"
             );
         }
@@ -5709,7 +5827,7 @@ mod tests {
             ("-Infinity", f64::NEG_INFINITY),
         ] {
             assert_eq!(
-                OwnedValue::from_number_bytes(word.as_bytes()),
+                OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()),
                 OwnedValue::Float(f),
                 "{word}"
             );
@@ -5728,12 +5846,16 @@ mod tests {
             ("+.5e3", ".5e3"),
             ("+007.e5", "007.e5"),
         ] {
-            let got = OwnedValue::from_number_bytes(signed.as_bytes());
-            assert_eq!(got, OwnedValue::from_number_literal(unsigned), "{signed}");
+            let got = OwnedValue::from_number_bytes::<JqSemantics>(signed.as_bytes());
+            assert_eq!(
+                got,
+                OwnedValue::from_number_literal::<JqSemantics>(unsigned),
+                "{signed}"
+            );
             assert!(matches!(got, OwnedValue::NumberLiteral(..)), "{signed}");
             assert_eq!(
                 got.to_json(),
-                OwnedValue::from_number_bytes(unsigned.as_bytes()).to_json(),
+                OwnedValue::from_number_bytes::<JqSemantics>(unsigned.as_bytes()).to_json(),
                 "`+X` must print as `X`: {signed}"
             );
         }
@@ -5742,7 +5864,7 @@ mod tests {
         // (#966's `null`), never to a NaN, an infinity or a computed float.
         for text in ["+9e999e999", "+8e999e999", "+1e0e0", "+1.2.3"] {
             assert_eq!(
-                OwnedValue::from_number_bytes(text.as_bytes()),
+                OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes()),
                 OwnedValue::Null,
                 "{text}"
             );
@@ -5750,14 +5872,17 @@ mod tests {
         // A bare trailing dot is the lossy fallback in both spellings (jq
         // prints `5` for `[5.]` and `[+5.]` alike).
         assert_eq!(
-            OwnedValue::from_number_bytes(b"+5."),
-            OwnedValue::from_number_bytes(b"5.")
+            OwnedValue::from_number_bytes::<JqSemantics>(b"+5."),
+            OwnedValue::from_number_bytes::<JqSemantics>(b"5.")
         );
-        assert_eq!(OwnedValue::from_number_bytes(b"+5.").to_json(), "5");
+        assert_eq!(
+            OwnedValue::from_number_bytes::<JqSemantics>(b"+5.").to_json(),
+            "5"
+        );
         // Not decNumber's words: the lossy fallback, as before.
         for text in ["nanx", "inf1", "infinity1", "+", "+-1", "nope"] {
             assert_eq!(
-                OwnedValue::from_number_bytes(text.as_bytes()),
+                OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes()),
                 OwnedValue::Null,
                 "{text}"
             );
@@ -5777,7 +5902,7 @@ mod tests {
         assert_eq!(inf, INFINITY_SENTINEL);
         assert_eq!(neg, NEG_INFINITY_SENTINEL);
         for token in [&nan, &inf, &neg] {
-            let back = OwnedValue::from_number_bytes(token.as_bytes());
+            let back = OwnedValue::from_number_bytes::<JqSemantics>(token.as_bytes());
             assert!(
                 matches!(back, OwnedValue::Float(_)),
                 "{token} must read back as a bare Float, got {back:?}"
@@ -5793,8 +5918,8 @@ mod tests {
         // survives where `to_json_for_reindex` would have re-rendered it.
         let long = format!("1{}", "0".repeat(300));
         let value = OwnedValue::array_from(vec![
-            OwnedValue::from_number_literal(&long),
-            OwnedValue::from_number_literal("1.500"),
+            OwnedValue::from_number_literal::<JqSemantics>(&long),
+            OwnedValue::from_number_literal::<JqSemantics>("1.500"),
             OwnedValue::Int(7),
             OwnedValue::Float(0.5),
             OwnedValue::Null,
@@ -5816,11 +5941,11 @@ mod tests {
     fn test_from_document_float_records_provenance_only_past_the_threshold() {
         assert_eq!(
             OwnedValue::from_document_float(1e20),
-            OwnedValue::from_number_literal("100000000000000000000.0")
+            OwnedValue::from_number_literal::<JqSemantics>("100000000000000000000.0")
         );
         assert_eq!(
             OwnedValue::from_document_float(1e-5),
-            OwnedValue::from_number_literal("0.00001")
+            OwnedValue::from_number_literal::<JqSemantics>("0.00001")
         );
         // Everyday magnitudes, and non-finite values (which have no decimal
         // spelling at all), stay bare.
@@ -5870,13 +5995,13 @@ mod tests {
         let cases: &[(OwnedValue, &str)] = &[
             (OwnedValue::Float(1.0), "Float(1.0)"),
             (
-                OwnedValue::from_number_literal("1.0"),
+                OwnedValue::from_number_literal::<YqSemantics>("1.0"),
                 "NumberLiteral(Float(1.0), \"1.0\")",
             ),
             (OwnedValue::Int(1), "NumberLiteral(Int(1), \"1\")"),
             (OwnedValue::Float(2e16), "Float(2e16)"),
             (
-                OwnedValue::from_number_literal("2e16"),
+                OwnedValue::from_number_literal::<YqSemantics>("2e16"),
                 "NumberLiteral(Float(2e16), \"2e16\")",
             ),
             (OwnedValue::Float(-0.0), "Float(-0.0)"),
@@ -5886,7 +6011,7 @@ mod tests {
                 value.to_json_for_reindex::<YqSemantics>(),
                 value.to_json_for_reindex::<JqSemantics>(),
             ] {
-                let round_tripped = OwnedValue::from_number_bytes(json.as_bytes());
+                let round_tripped = OwnedValue::from_number_bytes::<YqSemantics>(json.as_bytes());
                 assert_eq!(format!("{round_tripped:?}"), *want, "{value:?} -> {json}");
             }
         }
@@ -6131,11 +6256,11 @@ mod tests {
         // Round-trips correctly through the same public entry point real
         // document numbers go through.
         assert_eq!(
-            OwnedValue::from_number_bytes(INFINITY_SENTINEL.as_bytes()),
+            OwnedValue::from_number_bytes::<JqSemantics>(INFINITY_SENTINEL.as_bytes()),
             OwnedValue::Float(f64::INFINITY)
         );
         assert_eq!(
-            OwnedValue::from_number_bytes(NEG_INFINITY_SENTINEL.as_bytes()),
+            OwnedValue::from_number_bytes::<JqSemantics>(NEG_INFINITY_SENTINEL.as_bytes()),
             OwnedValue::Float(f64::NEG_INFINITY)
         );
 
@@ -6143,7 +6268,7 @@ mod tests {
         // (pre-#1083/#1087) sentinel no longer collides with anything --
         // it round-trips as an ordinary overflow literal now.
         assert_eq!(
-            OwnedValue::from_number_bytes(b"1e999"),
+            OwnedValue::from_number_bytes::<JqSemantics>(b"1e999"),
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e999".into())
         );
     }
@@ -6216,7 +6341,7 @@ mod tests {
 
     #[test]
     fn test_number_literal_number_str_matches_to_json() {
-        let lit = OwnedValue::from_number_literal("1e100");
+        let lit = OwnedValue::from_number_literal::<JqSemantics>("1e100");
         assert_eq!(lit.number_str().as_deref(), Some("1E+100"));
         assert_eq!(OwnedValue::Null.number_str(), None);
 
@@ -6233,7 +6358,7 @@ mod tests {
         // to `Null` (matching every other decode-failure path in this
         // codebase) rather than panicking or silently producing `0`.
         assert_eq!(
-            OwnedValue::from_number_literal("not-a-number"),
+            OwnedValue::from_number_literal::<JqSemantics>("not-a-number"),
             OwnedValue::Null
         );
     }
@@ -6245,11 +6370,11 @@ mod tests {
         // formatting falls back to plain Int/Float Display -- matching jq,
         // where only untouched values keep their original spelling.
         assert_eq!(
-            OwnedValue::from_number_literal("1e100").into_plain_number(),
+            OwnedValue::from_number_literal::<JqSemantics>("1e100").into_plain_number(),
             OwnedValue::Float(1e100)
         );
         assert_eq!(
-            OwnedValue::from_number_literal("42").into_plain_number(),
+            OwnedValue::from_number_literal::<JqSemantics>("42").into_plain_number(),
             OwnedValue::Int(42)
         );
         // No-op for every other variant.

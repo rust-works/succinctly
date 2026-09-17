@@ -1768,16 +1768,21 @@ fn query_result_to_owned_values(
     // surfaces as a normal `EvalError` instead of a panic.
     match result {
         QueryResult::One(v) => {
-            let Some(v) = sink.materialize(DiagStyle::Yq, generic_to_owned(&v), &no_location())
-            else {
+            let Some(v) = sink.materialize(
+                DiagStyle::Yq,
+                generic_to_owned::<YqSemantics, _>(&v),
+                &no_location(),
+            ) else {
                 return Vec::new();
             };
             vec![v]
         }
         QueryResult::OneCursor(c) => {
-            let Some(v) =
-                sink.materialize(DiagStyle::Yq, generic_to_owned(&c.value()), &no_location())
-            else {
+            let Some(v) = sink.materialize(
+                DiagStyle::Yq,
+                generic_to_owned::<YqSemantics, _>(&c.value()),
+                &no_location(),
+            ) else {
                 return Vec::new();
             };
             vec![v]
@@ -1786,7 +1791,7 @@ fn query_result_to_owned_values(
             let Some(vs) = sink.materialize(
                 DiagStyle::Yq,
                 vs.iter()
-                    .map(generic_to_owned)
+                    .map(generic_to_owned::<YqSemantics, _>)
                     .collect::<core::result::Result<Vec<_>, _>>(),
                 &no_location(),
             ) else {
@@ -3370,11 +3375,13 @@ fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<Owned
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
     match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
-        QueryResult::One(v) => generic_to_owned(&v).ok().map(|v| vec![v]),
-        QueryResult::OneCursor(c) => generic_to_owned(&c.value()).ok().map(|v| vec![v]),
+        QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
+        QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())
+            .ok()
+            .map(|v| vec![v]),
         QueryResult::Many(vs) => vs
             .iter()
-            .map(generic_to_owned)
+            .map(generic_to_owned::<YqSemantics, _>)
             .collect::<Result<_, _>>()
             .ok(),
         QueryResult::None => Some(Vec::new()),
@@ -3744,7 +3751,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // any other (#1247): report it and yield no documents, exactly as the
     // `GenericResult::Error` arm below does.
     let has_aliases = cursor.index().has_aliases();
-    // #1982 (code review): cursor-aware, not `generic_to_owned(&cursor.value())`
+    // #1982 (code review): cursor-aware, not `generic_to_owned::<YqSemantics, _>(&cursor.value())`
     // -- the same "real cursor in scope but discarded" shape as the two sites
     // this PR fixed, so a tag-forced value's own pristine snapshot doesn't
     // silently resolve to the untagged type. Verified inert in practice today
@@ -3753,7 +3760,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // correct value before this snapshot's own comparison runs) -- fixed
     // anyway since it costs nothing and closes the same gap defensively.
     let alias_sync_ctx = match (is_alias_sensitive_assign(expr) && has_aliases)
-        .then(|| generic_to_owned_cursor(&cursor))
+        .then(|| generic_to_owned_cursor::<YqSemantics, _>(&cursor))
     {
         Some(pristine) => {
             let Some(pristine) = sink.materialize(DiagStyle::Yq, pristine, &no_location()) else {
@@ -3772,7 +3779,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // `no_comments` below reconciles this against each result document once
     // evaluation finishes.
     let presentation_sync_ctx = match (need_comments && is_alias_sensitive_assign(expr))
-        .then(|| to_owned_with_comments(&cursor.value(), Some(&cursor)))
+        .then(|| to_owned_with_comments::<_, YqSemantics>(&cursor.value(), Some(&cursor)))
     {
         Some(snapshot) => {
             let Some(snapshot) = sink.materialize(DiagStyle::Yq, snapshot, &no_location()) else {
@@ -3841,7 +3848,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     //
     // #1982: the `need_comments == false` arm must still resolve through
     // the *cursor* (`generic_to_owned_cursor`, #747's tag-aware
-    // materializer), not `generic_to_owned(&c.value())` -- the latter
+    // materializer), not `generic_to_owned::<YqSemantics, _>(&c.value())` -- the latter
     // takes a bare value with no cursor attached, so an explicit tag
     // (`!!str 5`, `!!int "5"`, ...) has nowhere to be read from and
     // silently stops applying the moment `-o json` sets `need_comments`
@@ -3855,9 +3862,9 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             // `to_owned_with_comments` itself (#2795 PR B review), since
             // the write path's pristine snapshot (`presentation_sync_ctx`
             // above) needs the exact same rule and was missing it.
-            to_owned_with_comments(&c.value(), Some(c))
+            to_owned_with_comments::<_, YqSemantics>(&c.value(), Some(c))
         } else {
-            generic_to_owned_cursor(c).map(&no_comments)
+            generic_to_owned_cursor::<YqSemantics, _>(c).map(&no_comments)
         }
     };
 
@@ -3872,8 +3879,11 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // over the shared `GenericResult` enum.
     let mut docs = match result {
         GenericResult::One(v) => {
-            let Some(v) = sink.materialize(DiagStyle::Yq, generic_to_owned(&v), &no_location())
-            else {
+            let Some(v) = sink.materialize(
+                DiagStyle::Yq,
+                generic_to_owned::<YqSemantics, _>(&v),
+                &no_location(),
+            ) else {
                 return Ok(Vec::new());
             };
             Ok(vec![no_comments(v)])
@@ -3889,7 +3899,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             let Some(vs) = sink.materialize(
                 DiagStyle::Yq,
                 vs.iter()
-                    .map(generic_to_owned)
+                    .map(generic_to_owned::<YqSemantics, _>)
                     .collect::<core::result::Result<Vec<_>, _>>(),
                 &no_location(),
             ) else {
@@ -3953,7 +3963,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
         // composed `map` chain (#724, #725) that never resolved into a
         // narrower shape before reaching this materializing DOM boundary.
-        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic::<YqSemantics>() {
             Ok(v) => Ok(vec![no_comments(v)]),
             Err(jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Yq, &e, &no_location());
@@ -6423,7 +6433,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
                             result
-                                .stream_yaml(out, yaml_indent, sort_keys, |w| {
+                                .stream_yaml::<_, YqSemantics>(out, yaml_indent, sort_keys, |w| {
                                     w.write_result_terminator(terminator)
                                 })
                                 .map_err(StreamFailure::from)
@@ -6471,7 +6481,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
                                 // Explicit `DocumentCursor::stream_json(...)`
-                                // (not `$cursor.stream_json(...)`): this
+                                // (not `$cursor.stream_json::<_, YqSemantics>(...)`): this
                                 // macro body is shared by both `YamlCursor`
                                 // and `JsonCursor` call sites, and only
                                 // `YamlCursor` has an *inherent* method of
@@ -6480,7 +6490,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // #1576's `JsonConvention` parameter) --
                                 // inherent methods win method-call-syntax
                                 // resolution over the trait unconditionally,
-                                // so `$cursor.stream_json(...)` would silently
+                                // so `$cursor.stream_json::<_, YqSemantics>(...)` would silently
                                 // pick a different, 3-argument method there.
                                 // The explicit trait call always reaches
                                 // `DocumentCursor::stream_json` for both
@@ -6526,7 +6536,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
                                 result
-                                    .stream_json(
+                                    .stream_json::<_, YqSemantics>(
                                         out,
                                         json_indent,
                                         sort_keys,

@@ -67,7 +67,7 @@ fn bench_recurse_depth(c: &mut Criterion) {
         let probe: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
         assert!(!probe.is_error(), "depth {depth} fixture must not error");
         assert!(
-            probe.collect_owned().is_empty(),
+            probe.collect_owned::<JqSemantics>().is_empty(),
             "depth {depth} fixture must produce no output"
         );
 
@@ -76,7 +76,7 @@ fn bench_recurse_depth(c: &mut Criterion) {
             b.iter(|| {
                 let cursor = index.root(black_box(json));
                 let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
-                black_box(result.collect_owned().len())
+                black_box(result.collect_owned::<JqSemantics>().len())
             });
         });
     }

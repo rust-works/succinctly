@@ -2346,12 +2346,21 @@ impl<'a> JsonNumber<'a> {
     /// rather than restating its arms keeps the two from drifting. Only
     /// consulted once the ordinary parse has already failed, so a genuine
     /// number pays nothing for it.
+    ///
+    /// The value is the **plain** correctly-rounded parse, the JSON
+    /// library's own answer. jq mode's 17-digit literal model (#2936) is
+    /// applied by the evaluators' number funnels
+    /// (`OwnedValue::from_number_bytes::<S>`, `document_number_f64::<S>`),
+    /// not here: this type has no mode, and every spelling below the
+    /// fallback is a non-literal (a bridge token or a decNumber word) whose
+    /// value the model cannot change.
     pub fn as_f64(&self) -> Result<f64, JsonError> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
-            crate::jq::OwnedValue::from_number_bytes(bytes)
-                .as_f64()
+            crate::jq::OwnedValue::bridge_nonfinite_from_bytes(bytes)
+                .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
+                .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
     }
@@ -3716,7 +3725,11 @@ fn write_json_number<Out: core::fmt::Write>(
             // a malformed trailing shape like `1.2.3`). Sanitize via the
             // same fallback every other "raw bytes -> number" conversion
             // in this crate uses, instead of reformatting invalid text.
-            match OwnedValue::from_number_bytes(raw) {
+            // `JqCompat` is jq's own output convention, so the literal
+            // model is jq's too (#2936) -- only the sanitized value of a
+            // lenient span is printed from the double here, never a
+            // preserved literal's.
+            match OwnedValue::from_number_bytes::<JqSemantics>(raw) {
                 OwnedValue::Int(i) => write!(out, "{i}"),
                 OwnedValue::Float(f) => {
                     if f.is_finite() {
