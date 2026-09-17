@@ -98035,6 +98035,35 @@ mod tests {
         assert_eq!(math_operand::<JqSemantics>(&float_literal, false), Ok(2.5));
         assert_eq!(math_operand::<YqSemantics>(&float_literal, false), Ok(2.5));
     }
+
+    /// #2937: `get_float_value_with`'s outer `_ if optional => ...` arm
+    /// (non-`Number`, suppressed) mirrors #2730's `builtin_reverse` finding
+    /// -- no real jq syntax reaches a math builtin with `optional = true`.
+    /// `floor?` parses to `Expr::Optional(Expr::Builtin(Floor))`, whose
+    /// catch evaluates the inner builtin at the *ambient* `optional`
+    /// (see the comment on `Expr::Optional` in `eval_single`), so
+    /// `"a" | floor?` does produce the correct external behaviour (empty,
+    /// suppressed) but via `eval_try` catching the *unsuppressed* error
+    /// this arm returns for `optional = false`, never via this arm itself.
+    /// Pin it the same way #2730 did: call the dispatcher directly with
+    /// `optional` forced to `true`.
+    #[test]
+    fn test_builtin_floor_suppresses_non_number_when_optional_2937() {
+        let json_bytes: &[u8] = br#""a""#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = Expr::Builtin(Builtin::Floor);
+        assert!(matches!(
+            eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), true),
+            QueryResult::None
+        ));
+        // Positive control: same input, ambient `optional = false`, raises
+        // the real "number required" error instead.
+        match eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.message.contains("number required")),
+            other => panic!("expected number-required error, got: {other:?}"),
+        }
+    }
 }
 
 /// #2999: the copies structural sharing removes from the write routes,

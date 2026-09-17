@@ -11,6 +11,5 @@
   "float_literal_operand": [(2.50 | pow(.;1)), (2.50 | atan2(1;.))],
   "computed_int_operand": [((1+1) | pow(.;1)), ((1+1) | atan2(1;.))],
   "neg_zero_int_literal": (.negzero | [floor, ceil, round]),
-  "all_digit_i64_overflow": (99999999999999999999999999 | floor),
-  "non_number_optional_suppressed": ["a" | floor?]
+  "all_digit_i64_overflow": (99999999999999999999999999 | floor)
 }
