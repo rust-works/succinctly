@@ -2050,11 +2050,15 @@ fn test_del_static_comma_type_error_reports_the_first_sibling() {
 ///    reproducing that needs an explicit `field_groups`/`index_groups` list;
 ///    ordering the recursion by the child map instead silently rewrites which
 ///    error jq reports.
-/// 2. **A terminal node is not consulted on the way in.** `del(.a, .a[0])`
-///    reaches `.a` as both a doomed key and a prefix, and jq still walks
-///    *into* it — the walk raises even though the key is about to be deleted
-///    wholesale. Short-circuiting a terminal node on entry would swallow
-///    that.
+/// 2. **A terminal node's error, when there is one, comes from path
+///    resolution, not the trie walk.** `del(.a, .a[0])` reaches `.a` as both
+///    a doomed key and a prefix, and still raises — but
+///    `resolve_del_path_branches` already validates `.a[0]` before the trie
+///    is ever built, so the error fires regardless of whether the walk
+///    itself later recurses into a doomed key or skips it (#2929: jq mode
+///    now skips it, matching jq's own `delpaths_sorted`, which never
+///    recurses into a key whose shortest path ends there — see
+///    `DeleteTrieNode::terminal`'s doc comment).
 #[test]
 fn test_del_trie_preserves_group_order_and_terminal_recursion_1690() {
     // (1) `.a` first appears terminal, `.b` first appears as a prefix, so the
@@ -2110,6 +2114,26 @@ fn test_del_trie_preserves_group_order_and_terminal_recursion_1690() {
         r#"{"a":{"b":1,"c":2}}"#,
         "del(.a.b, .a)",
         Outcome::values(&["{}"]),
+    );
+
+    // #2929's K3/K5/K6: must-not-change rows alongside A1-A13/B1-B6 below --
+    // an optional continuation into a doomed key still no-ops rather than
+    // erroring (K3), and a plain index/slice mix with no slice-through-
+    // slice or doomed-key interaction is untouched by either fix (K5/K6).
+    check(
+        r#"{"a":"s"}"#,
+        "del(.a, (.a[0])?)",
+        Outcome::values(&["{}"]),
+    );
+    check(
+        "[1,2,3,4]",
+        "del(.[0:2], .[1:3][0])",
+        Outcome::values(&["[4]"]),
+    );
+    check(
+        "[1,2,3,4]",
+        "del(.[0], .[0:2][1])",
+        Outcome::values(&["[3,4]"]),
     );
 }
 
@@ -2413,5 +2437,165 @@ fn test_cursor_target_is_indexed_in_place() {
     assert_eq!(
         full(doc.as_bytes(), r#"at_offset(0)[("a","b")]"#),
         Outcome::error("at_offset requires document cursor context")
+    );
+}
+
+// =============================================================================
+// #2929: DeleteTrie fix A (doomed-key subsumption) and fix B (jq key order)
+// =============================================================================
+
+/// #2929 fix A: jq's `delpaths_sorted` never recurses into a key whose
+/// shortest path ends at this node — it goes wholly into `delkeys` instead.
+/// The pre-fix trie walked into every continuation child regardless,
+/// including one that was *also* terminal, which spliced a shrunk
+/// sub-array/sub-object back before the terminal batch ever ran (A1-A9), or
+/// raised through a scalar the terminal delete was about to remove outright
+/// (A10-A13) — jq itself does neither. Every row here was captured from jq
+/// 1.7.1 first; every mirror argument order is included because the trie's
+/// child map is order-independent by construction, so a fix that only
+/// worked for one ordering would be masking a real bug, not fixing it.
+#[test]
+fn test_del_trie_terminal_subsumes_continuations_2929() {
+    // A1-A2: `del(.[0:1] | ..)`'s recursive descent revisits the same
+    // sliced-through prefix, but the doomed key is still subsumed once.
+    check("[1,2,3]", "del(.[0:1] | ..)", Outcome::values(&["[2,3]"]));
+    check(
+        "[1,2,3]",
+        "del(.[0:1] | .. | ..)",
+        Outcome::values(&["[2,3]"]),
+    );
+    check(
+        "[true,false]",
+        "del(.[0:1] | .. | ..)",
+        Outcome::values(&["[false]"]),
+    );
+    check(
+        "[[1,2],[3]]",
+        "del(.[0:1] | .. | ..)",
+        Outcome::values(&["[[3]]"]),
+    );
+    check(
+        r#"{"a":[1,2,3]}"#,
+        "del(.a[0:1] | .. | ..)",
+        Outcome::values(&[r#"{"a":[2,3]}"#]),
+    );
+    // A6-A9: the same shape spelled as an explicit comma group, both
+    // argument orders.
+    check(
+        "[1,2,3]",
+        "del(.[0:1], .[0:1][0])",
+        Outcome::values(&["[2,3]"]),
+    );
+    check(
+        "[1,2,3]",
+        "del(.[0:1][0], .[0:1])",
+        Outcome::values(&["[2,3]"]),
+    );
+    check(
+        "[1,2,3,4]",
+        "del(.[0:2], .[0:2][0])",
+        Outcome::values(&["[3,4]"]),
+    );
+    check(
+        "[[1,2,3]]",
+        "del(.[0][0:1], .[0][0:1][0])",
+        Outcome::values(&["[[2,3]]"]),
+    );
+    // A10-A13: not only slices -- a whole-key delete through a field or an
+    // index also subsumes a continuation that would otherwise index into a
+    // scalar and raise.
+    check(
+        r#"["ab",2]"#,
+        "del(.[0:1], .[0:1][0][0:1])",
+        Outcome::values(&["[2]"]),
+    );
+    check(
+        r#"{"a":"ab"}"#,
+        "del(.a, .a[0:1])",
+        Outcome::values(&["{}"]),
+    );
+    check(
+        r#"["ab"]"#,
+        "del(.[0], .[0][0:1])",
+        Outcome::values(&["[]"]),
+    );
+    check(
+        r#"{"a":{"b":"ab"}}"#,
+        "del(.a, .a.b[0:1])",
+        Outcome::values(&["{}"]),
+    );
+}
+
+/// #2929 fix B: jq's `delpaths_sorted` visits array continuations in
+/// `jv_sort` key order (numbers ascending, then slice descriptors comparing
+/// `end` then `start`), not first-resolved order. Only observable when a
+/// slice continuation is present, since deleting inside one splices a
+/// shorter sub-array back and shifts every later position -- an index-only
+/// continuation's order stays insertion order (that's jq's own #1301 error
+/// priority, pinned by `test_del_trie_preserves_group_order_and_terminal_recursion_1690`
+/// above) since a bare index delete never shifts anything before it runs.
+/// Every row's mirror argument order is included: both already agree, so a
+/// regression to first-seen order would only show up in one direction.
+#[test]
+fn test_del_trie_array_groups_follow_jq_key_order_2929() {
+    check(
+        "[1,2,3,4,5]",
+        "del(.[3:5][0], .[0:2][0])",
+        Outcome::values(&["[2,3,4]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[0:2][0], .[3:5][0])",
+        Outcome::values(&["[2,3,4]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[1:3][0], .[0:3][0])",
+        Outcome::values(&["[2,4,5]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[0:3][0], .[1:3][0])",
+        Outcome::values(&["[2,4,5]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[0:2][0], .[1:][0])",
+        Outcome::values(&["[3,4,5]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[1:][0], .[0:2][0])",
+        Outcome::values(&["[3,4,5]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[:2][0], .[3:][0])",
+        Outcome::values(&["[2,3,5]"]),
+    );
+    check(
+        "[1,2,3,4,5]",
+        "del(.[3:][0], .[:2][0])",
+        Outcome::values(&["[2,3,5]"]),
+    );
+    check(
+        r#"[1,{"x":1},3]"#,
+        "del(.[0:2][0], .[1].x)",
+        Outcome::values(&[r"[{},3]"]),
+    );
+    check(
+        r#"[1,{"x":1},3]"#,
+        "del(.[1].x, .[0:2][0])",
+        Outcome::values(&[r"[{},3]"]),
+    );
+    check(
+        r#"[{"x":1},2,{"x":3}]"#,
+        "del(.[0:2][1], .[2].x)",
+        Outcome::values(&[r#"[{"x":1},{}]"#]),
+    );
+    check(
+        r#"[{"x":1},2,{"x":3}]"#,
+        "del(.[2].x, .[0:2][1])",
+        Outcome::values(&[r#"[{"x":1},{}]"#]),
     );
 }
