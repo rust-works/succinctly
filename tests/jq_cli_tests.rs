@@ -47301,6 +47301,16 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         // error -- and index/last `1` in each case is `.d`, never `.a`.
         ("[.[]] | .[1]", "5"),
         ("[.[]] | last", "5"),
+        // #2658: `any(cond)`/`all(cond)`, `isvalid` and the loops read their
+        // input through a cursor now, so only what `cond`/`f`/`update`
+        // decode is validated -- `any(true)` decodes nothing, `isvalid(.d)`
+        // and `until(true; .) | .d` never touch `.a`. Each raised before,
+        // for the bridge's whole-document copy.
+        ("any(true)", "true"),
+        ("all(false)", "false"),
+        ("isvalid(.d)", "true"),
+        ("until(true; .) | .d", "5"),
+        ("[while(false; .)] | length", "0"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -60310,6 +60320,320 @@ fn test_try_handler_reads_path_context_from_the_failing_stage_2829() -> Result<(
         "the pre-error output must still be delivered, and the handler must \
          still run with the failing stage's path"
     );
+
+    Ok(())
+}
+
+/// #2658: `any(cond)`/`all(cond)`, `isvalid(f)` and `until`/`while` answer
+/// identically on the cursor route (document on stdin) and the owned route
+/// (`-n`, the value spelled as a literal), and both match jq 1.7.1.
+///
+/// These five constructs were the remaining spellings of #2476/#2968's
+/// class: each still reached the wildcard bridge, whose first act is a
+/// `to_owned` of the whole ambient input. They now have native,
+/// cursor-threaded arms in the generic evaluator (`any_all_f_generic`,
+/// `isvalid_generic`, `each_loop_generic`), so this table is the fidelity
+/// pin for what those arms reproduce from the eager route: jq's
+/// backtracking loop definitions (a multi-output `cond` forks the rest of
+/// the loop per output, a multi-output `update` runs each branch to its end
+/// before the next, #534), `first`/`limit` stopping an infinite loop, `label`/
+/// `break` unwinding through a loop and through `any`'s probe, `?`/`try`
+/// silencing a trailing error and keeping the outputs before it, `any`'s
+/// first-decisive-output rule (`any(true, error("x"))` never reaches the
+/// error, #2968), an object's *values* under the last-occurrence duplicate
+/// rule (`{"a":true,"a":false} | any(.)` is `false`, #422/#1385), the number
+/// spelling `cond` sees (`[1.0, 1e2] | any(tostring == "1.0")`, the row the
+/// old `any_all_gen_cond` comment feared -- both routes agree with jq), and
+/// the scalar error text in both modes. Every `want` is jq 1.7.1's own
+/// output, captured live.
+///
+/// `isvalid` has no jq oracle (`isvalid/1 is not defined` in 1.7.1); its rows
+/// are the eager arm's own pinned rules (#881/#791/#867), see
+/// `test_isvalid_native_arm_matches_eager_rules_2658`.
+#[test]
+fn test_any_all_cond_while_until_native_arms_match_jq_2658() -> Result<()> {
+    for (input, filter, want) in [
+        // The jq loop definitions, forking included.
+        ("null", "[until(.>3; .+1,.+2)]", "[4,5,4,4,5,4,5,4]"),
+        ("null", "[while(.<3; .+1,.+2)]", "[null,1,2,2]"),
+        ("0", "until(.>3; .+1)", "4"),
+        ("0", "[while(.<3; .+1)]", "[0,1,2]"),
+        ("7", "[until(true; .)]", "[7]"),
+        ("7", "[while(false; .)]", "[]"),
+        (
+            "0",
+            "[until((.>1, .>3); .+1)]",
+            "[2,3,4,4,2,3,4,4,2,3,4,4,2,3,4,4]",
+        ),
+        ("0", "[while((.<2, .<1); .+1)]", "[0,1,0,1]"),
+        ("0", "[while(.<2; (.+1, .+2))]", "[0,1]"),
+        ("0", "[until(.>=2; (.+1, .+2))]", "[2,3,2]"),
+        // A downstream stop ends an infinite loop; the eager arm has no
+        // early exit, so this row only ever passed on the streaming route
+        // before -- now it passes on both because `-n` takes the same arm.
+        ("0", "first(while(true; .+1))", "0"),
+        ("0", "[limit(3; while(true; .+1))]", "[0,1,2]"),
+        ("0", "first(until(.>100; .+1))", "101"),
+        ("7", "[limit(2; until(true; .))]", "[7]"),
+        ("3", "[limit(5; while(true; .))] | length", "5"),
+        // Escapes through the loop.
+        (
+            "0",
+            "[label $out | while(true; if .>1 then break $out else .+1 end)]",
+            "[0,1,2]",
+        ),
+        ("0", "try until(true; error(\"e\")) catch \"caught\"", "0"),
+        ("0", "try until(false; error(\"e\")) catch .", "\"e\""),
+        ("0", "[until(error(\"c\"); .)?]", "[]"),
+        ("0", "[until(.>2; .+1)?]", "[3]"),
+        ("0", "until(true; error(\"u\"))", "0"),
+        // Loops that navigate the document (a cursor state at every step).
+        ("[1,2,3]", "[while(type==\"array\"; .[0])]", "[[1,2,3]]"),
+        ("[[1],[2,3]]", "until(type==\"number\"; .[0])", "1"),
+        ("[1,2,3]", "until(length==0; .[1:]) | length", "0"),
+        (
+            "{\"a\":{\"a\":{\"a\":1}}}",
+            "until(type!=\"object\"; .a)",
+            "1",
+        ),
+        (
+            "[1,[2],[[3]]]",
+            "[.[] | until(type!=\"array\"; .[0])]",
+            "[1,2,3]",
+        ),
+        ("[1,2,3]", "[.[] | until(.>2; .+1)]", "[3,3,3]"),
+        // Loops as an operand of another construct.
+        ("0", "[foreach until(.>2;.+1) as $v (0; .+$v)]", "[3]"),
+        ("null", "reduce while(.<3;.+1) as $v (0; .+$v)", "3"),
+        ("0", "{a: until(.>2;.+1)}", "{\"a\":3}"),
+        ("0", "[until(.>1; .+1), while(.<2;.+1)]", "[2,0,1]"),
+        ("0", "[range(3) | while(.<2; .+1)]", "[0,1,1]"),
+        ("0", "until(.>=5000; .+1)", "5000"),
+        // `any(cond)`/`all(cond)`.
+        ("[1,2,3]", "any(.==2)", "true"),
+        ("[1,2,3]", "all(.>0)", "true"),
+        ("[1,2,3]", "all(.>1)", "false"),
+        ("[]", "any(true)", "false"),
+        ("[]", "all(false)", "true"),
+        ("{\"a\":true,\"a\":false}", "any(.)", "false"),
+        ("{\"a\":false,\"a\":true}", "all(.)", "true"),
+        ("{\"a\":1,\"b\":2}", "any(.==2)", "true"),
+        ("{\"a\":1,\"b\":2}", "all(.<2)", "false"),
+        ("[1,2,3]", "any(empty)", "false"),
+        ("[1,2,3]", "all(empty)", "true"),
+        ("[1,2]", "any((false,true))", "true"),
+        ("[1,2]", "all((true,false))", "false"),
+        ("[1,2]", "any(true, error(\"x\"))", "true"),
+        ("[1,2]", "all(false, error(\"x\"))", "false"),
+        ("[1,2]", "try any(error(\"e\")) catch .", "\"e\""),
+        ("[1,2]", "[any(error(\"e\"))?]", "[]"),
+        ("[1,[2,3]]", "any(.[]?==3)", "true"),
+        ("[[1],[2,3]]", "all(length>0)", "true"),
+        (
+            "5",
+            "try any(.==1) catch .",
+            "\"Cannot iterate over number (5)\"",
+        ),
+        (
+            "\"s\"",
+            "try all(.==1) catch .",
+            "\"Cannot iterate over string (\\\"s\\\")\"",
+        ),
+        (
+            "null",
+            "try any(true) catch .",
+            "\"Cannot iterate over null (null)\"",
+        ),
+        ("5", "[any(.==1)?]", "[]"),
+        ("[1.0, 1e2]", "any(tostring==\"1.0\")", "true"),
+        ("[1.0, 1e2]", "any(tostring==\"100\")", "false"),
+        ("[1,2,3]", "[.[] | any(.==1)?]", "[]"),
+        ("[[1],[2]]", "map(any(.==1))", "[true,false]"),
+        ("[1,2]", "any(.==1) and all(.>0)", "true"),
+        ("[1,2]", "if any(.==3) then \"y\" else \"n\" end", "\"n\""),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "cursor route `{filter}` on {input}: {stderr}");
+        assert_eq!(stdout.trim(), want, "cursor route `{filter}` on {input}");
+
+        let owned = format!("{input} | {filter}");
+        let (stdout, stderr, code) = run_jq_stdin_streams(&owned, "", &["-nc"])?;
+        assert_eq!(code, 0, "owned route `{owned}`: {stderr}");
+        assert_eq!(stdout.trim(), want, "owned route `{owned}`");
+    }
+
+    // A `break` that unwinds *through* the construct to an outer label yields
+    // nothing at all, on both routes -- neither the loop nor `any` digests it
+    // into a verdict (#867's rule for `isvalid`, shared here).
+    for (input, filter) in [
+        (
+            "0",
+            "label $out | until(.>1; if .>0 then break $out else .+1 end)",
+        ),
+        (
+            "[1,2,3]",
+            "label $out | any(if .==2 then break $out else false end)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            ("", 0),
+            "cursor route `{filter}`: {stderr}"
+        );
+        let owned = format!("{input} | {filter}");
+        let (stdout, stderr, code) = run_jq_stdin_streams(&owned, "", &["-nc"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            ("", 0),
+            "owned route `{owned}`: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2658: `isvalid(f)`'s native arm reproduces the eager arm's pinned rules
+/// (#881: at least one output and no error; #791: `halt` passes through;
+/// #867: an unresolved `break` passes through), on both routes.
+///
+/// One row is a fix to the eager arm rather than a mirror of it:
+/// `isvalid(.[])` on an empty container answered `true` there, because
+/// `.[]` over `[]` comes back as an empty `Many` rather than `None`, while
+/// `isvalid(empty)` answered `false` -- the #881 review's own rule. The
+/// generic arm counts outputs and never had that gap; `builtin_isvalid` now
+/// treats an empty `Many`/`ManyOwned` as `None`, so both routes answer
+/// `false` and the two spellings of "no output" agree.
+#[test]
+fn test_isvalid_native_arm_matches_eager_rules_2658() -> Result<()> {
+    for (input, filter, want) in [
+        ("{\"a\":1}", "isvalid(.a)", "true"),
+        ("{\"a\":1}", "isvalid(.b)", "true"),
+        ("{\"a\":1}", "isvalid(.[])", "true"),
+        ("{\"a\":[1,2]}", "isvalid(.a[])", "true"),
+        ("123", "isvalid(.foo)", "false"),
+        ("null", "isvalid(empty)", "false"),
+        ("[]", "isvalid(.[])", "false"),
+        ("{}", "isvalid(.[])", "false"),
+        ("[]", "isvalid(.[] | error)", "false"),
+        ("null", "isvalid(error(\"x\"))", "false"),
+        ("null", "isvalid(1, error(\"x\"))", "false"),
+        ("[1,2]", "isvalid(.[] | tonumber)", "true"),
+        ("[\"a\"]", "isvalid(.[] | tonumber)", "false"),
+        ("[1,\"a\"]", "isvalid(.[] | tonumber)", "false"),
+        ("0", "isvalid(until(.>2; .+1))", "true"),
+        ("[1,2]", "isvalid(any(.==1))", "true"),
+        ("5", "isvalid(any(.==1))", "false"),
+        ("null", "[isvalid(.), isvalid(error)]", "[true,false]"),
+        ("[1,2]", "isvalid(limit(1; .[]))", "true"),
+        ("[1,2]", "isvalid(first(.[] | error))", "false"),
+        // #867: a `break` unwinds through `isvalid` to its label -- no
+        // verdict, no output, exit 0.
+        ("null", "[label $out | isvalid((1, break $out))]", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "cursor route `{filter}` on {input}: {stderr}");
+        assert_eq!(stdout.trim(), want, "cursor route `{filter}` on {input}");
+
+        let owned = format!("{input} | {filter}");
+        let (stdout, stderr, code) = run_jq_stdin_streams(&owned, "", &["-nc"])?;
+        assert_eq!(code, 0, "owned route `{owned}`: {stderr}");
+        assert_eq!(stdout.trim(), want, "owned route `{owned}`");
+    }
+
+    // #791: `halt` inside `isvalid` exits the process, it is never `true`.
+    for (filter, args) in [
+        ("isvalid(halt)", &["-c"][..]),
+        ("null | isvalid(halt)", &["-nc"][..]),
+    ] {
+        let (stdout, _, code) = run_jq_stdin_streams(filter, "null", args)?;
+        assert_eq!((stdout.trim(), code), ("", 0), "`{filter}`");
+    }
+    for (filter, args) in [
+        ("isvalid(\"boom\" | halt_error)", &["-c"][..]),
+        ("null | isvalid(\"boom\" | halt_error)", &["-nc"][..]),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "null", args)?;
+        assert_eq!((stdout.trim(), code), ("", 5), "`{filter}`");
+        assert!(stderr.contains("boom"), "`{filter}`: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2658: what the five constructs validate follows the #2103 rule now --
+/// a filter validates exactly what it materializes -- because their inputs
+/// are cursors instead of a copy of the whole document.
+///
+/// On `{"a":"\ud800","d":5}` every one of these used to exit 5 with the
+/// decode failure, not because it read `.a` but because the wildcard
+/// bridge's `to_owned` of the ambient input did. Now `any(true)` and
+/// `all(false)` decide from the first element's `cond` without decoding it,
+/// `isvalid(.d)` navigates to `.d` and never touches `.a`, and the loops
+/// read only what `cond`/`update` read: `until(true; .) | .d` is `.d`.
+/// `[5, "\ud800"] | any(. == 5)` regains #1755's short-circuit (the eager
+/// arm has it, the bridge lost it), and everything that genuinely reads the
+/// bad string still raises. Real jq rejects the document at parse time in
+/// every row; recorded in `docs/compliance/jq/limitations.md` under the
+/// #2103 entry.
+#[test]
+fn test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658() -> Result<()> {
+    let doc = r#"{"a":"\ud800","d":5}"#;
+    for (filter, want) in [
+        ("any(true)", "true"),
+        ("all(false)", "false"),
+        ("any(type == \"number\")", "true"),
+        ("all(type == \"string\")", "false"),
+        ("isvalid(.d)", "true"),
+        ("isvalid(.[])", "true"),
+        // Navigating to `.a` does not decode it (#2168); only reading does.
+        ("isvalid(.a)", "true"),
+        ("until(true; .) | .d", "5"),
+        ("[while(false; .)] | length", "0"),
+        ("until(type == \"number\"; .d)", "5"),
+        ("[while(type == \"object\"; .d)] | length", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    // #1755's short-circuit: the deciding element comes first, the bad one
+    // is never reached.
+    let (stdout, stderr, code) = run_jq_stdin_streams("any(. == 5)", r#"[5, "\ud800"]"#, &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("true", 0), "{stderr}");
+    let (stdout, stderr, code) = run_jq_stdin_streams("all(. != 5)", r#"[5, "\ud800"]"#, &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("false", 0), "{stderr}");
+
+    // Reading the bad string still raises, on every construct.
+    for (filter, input) in [
+        ("any(. == \"x\")", doc),
+        // `.a` is the object's first value, so `. == 5` reaches it first.
+        ("any(. == 5)", doc),
+        ("all(. == 5)", doc),
+        ("all(. == 5)", r#"["\ud800", 5]"#),
+        ("any(. == 5)", r#"["\ud800", 5]"#),
+        // A decode failure is uncatchable (#1620): `isvalid` raises it
+        // rather than answering `false`, exactly as `try` lets it through.
+        ("isvalid(.a | length)", doc),
+        ("[.[] | isvalid(tostring)]", doc),
+        ("until(.a == \"x\"; .)", doc),
+        ("[while(.a != \"x\"; .)]", doc),
+        ("until(true; .) | .a | length", doc),
+        // A write in `update` rebuilds the object, which materializes it.
+        ("until(.d > 6; .d += 1) | .d", doc),
+        ("[while(.d < 7; .d += 1)] | length", doc),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` on {input}: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{filter}` on {input}: {stderr:?}"
+        );
+    }
 
     Ok(())
 }
