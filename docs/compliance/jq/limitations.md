@@ -4547,6 +4547,35 @@ a whole-array copy on a filter that reads nothing it did not already need to. Pi
 `test_lazy_validation_boundary_2168`'s and
 `test_select_passes_through_corruption_it_only_tests_1645_2692`'s own rows.
 
+[#2658](https://github.com/rust-works/succinctly/issues/2658) applied the rule to the last
+five spellings of #2476's class: `any(cond)`/`all(cond)`, `isvalid(f)`, `until` and `while`.
+Each had no native arm in the generic evaluator and fell to the wildcard bridge, whose first
+act is a `to_owned` of the whole ambient input — `O(2^N)` on an alias fan-out, and a
+whole-document validation for filters that read almost none of it. Their inputs are cursors
+now: `any(cond)` probes `cond` at each element's own position and stops at the first
+decisive one, `isvalid` runs `f` to exhaustion without reading its outputs, and the loops
+carry a document state as a cursor for as long as `update` stays in the document. On
+`{"a":"\ud800","d":5}`:
+
+| filter                                                       | jq 1.7.1 | before #2658           | now                       |
+|--------------------------------------------------------------|----------|------------------------|---------------------------|
+| `any(true)`, `all(false)`                                    | error    | error — **matched jq** | `true`/`false` — **diverges** |
+| `isvalid(.d)`, `isvalid(.a)` (navigates, never decodes)      | error    | error — **matched jq** | `true` — **diverges**     |
+| `until(true; .) \| .d`, `[while(false; .)] \| length`        | error    | error — **matched jq** | `5`/`0` — **diverges**    |
+| `[5, "\ud800"] \| any(. == 5)`                               | error    | error                  | `true` (#1755's short-circuit, as the eager arm always answered) |
+| `any(. == "x")`, `isvalid(.a \| length)`, `until(.a == "x"; .)` | error | error — **matched jq** | error — **matched jq** (the read decodes `.a`) |
+
+The eager arms these mirror already followed the rule as far as they could: `any_all_f`
+converts each element right before its own probe (#1755), so an element the short-circuit
+never reaches was never read — but one it does reach is converted whole even when `cond`
+would not look at it, and the loops' `to_owned` of the starting value read everything. What
+changed is only that the bridge's copy in front of them is gone. `isvalid` is a succinctly
+extension (neither jq 1.7.1 nor yq defines it), so its rows have no reference either way;
+its one rule change under this issue is that a decode failure now passes through it
+uncaught, as it does through `try` (#1620), instead of being digested into `false`. Pinned
+in `test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658` and
+`test_lazy_validation_boundary_2168`'s answering column.
+
 Step 2 of ADR-0018's decision order therefore separates the two options and favours the
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
 corrupted or discarded, and neither choice takes the process down. **This is a deliberate

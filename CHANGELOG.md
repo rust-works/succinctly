@@ -214,6 +214,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`isvalid(f)` answers `false` for a generator that produced nothing, and lets an
+  uncatchable error through** (#2658). `isvalid(.[])` on `[]`/`{}` answered `true`
+  because an empty `.[]` came back as an empty multi-output rather than `None`,
+  while `isvalid(empty)` answered `false` (the #881 rule); both are `false` now, on
+  both evaluator routes. And an error `try` itself cannot catch -- a decode
+  failure (#1620), a resource-limit raise (#2132), yq's negative-index raise
+  (#2254) -- now passes through `isvalid` instead of being digested into `false`,
+  the rule `try`/`?`/`//` already apply: `isvalid(.a | length)` on a document
+  whose `.a` is undecodable raises, `isvalid(.a)` (which never decodes it) is
+  `true`. Before this issue the cursor route never reached either arm, because the
+  bridge's whole-input copy raised first.
+- **The eager evaluator's `any`/`all`/`any(cond)`/`all(cond)` walk an object's
+  effective values, not every raw member** (#2658). `{"a":true,"a":false} | any(.)`
+  answered `true` through the library's eager entry point where jq 1.7.1 answers
+  `false` (last occurrence wins, #1385); the CLI never saw it because the bridge
+  collapsed the keys into an `OwnedValue` on the way in, and the generic
+  evaluator's own arms always collapsed. Pinned across both evaluators in
+  `tests/jq_evaluator_parity_tests.rs`.
 - **`succinctly jq` rounds every number literal to 17 significant digits before
   the double conversion, as jq does** (#2936). #2906 modelled
   `jvp_literal_number_to_double` for `i64` literals only; a fraction, an
@@ -1037,6 +1055,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each other, not just with the oracle). yq mode is unaffected.
 
 ### Performance
+
+- **`any(cond)`/`all(cond)`, `isvalid(f)` and `until`/`while` no longer copy the
+  whole input before running** (#2658, the remaining spellings of #2476/#2968's
+  class). Each still reached the generic evaluator's wildcard bridge, whose first
+  act is a `to_owned` of the ambient value -- `O(2^N)` on an alias fan-out
+  (`aN: &aN [*a(N-1), *a(N-1)]`, `succinctly yq --jq-extensions`): at N=22,
+  `.a22 | any(length == 2)` took 3.46 s / 2.4 GB, `isvalid(.[0])` 2.50 s / 1.6 GB,
+  `until(true; .) | length` 4.43 s / 3.1 GB and `until(length == 1; .[0])`
+  5.60 s / 3.2 GB (Apple M-series, release build, indicative). All five now have
+  native, cursor-threaded arms: `any(cond)`/`all(cond)` probe `cond` at each
+  element's own position and stop at the first decisive one, `isvalid` drives `f`
+  to exhaustion without reading its outputs, and the two loops carry a document
+  state as a cursor for as long as `update` stays in the document, so a
+  navigating loop (`until(length == 1; .[0])`) steps one node at a time and an
+  emitted state is the node itself. Every row above is 0.00 s / 9 MB at N=18..24.
+  `any(. == 1)` on the same document keeps its remaining term (the compare
+  materializes the aliased element), tracked separately.
+
+  Two consequences beyond speed. **The loops are demand-driven now**:
+  `first(while(true; .+1))` stops after one output on the cursor route, where the
+  eager arm ran the loop to its `WHILE_UNTIL_MAX_STEPS` cap first (jq's own
+  definition is lazy). **What the five constructs validate follows the #2103
+  rule** -- a filter validates exactly what it materializes -- because their input
+  is a cursor rather than a copy: on `{"a":"\ud800","d":5}`, `any(true)`,
+  `all(false)`, `isvalid(.d)`, `until(true; .) | .d` and `[while(false; .)]` now
+  answer where the bridge's whole-document copy raised, and `[5, "\ud800"] |
+  any(. == 5)` regains #1755's short-circuit. Anything that reads the bad string
+  still raises. Recorded in `docs/compliance/jq/limitations.md` under the #2103
+  entry; real jq rejects the document at parse time in every row.
 
 - **The path-context walk no longer clones its position per step** (#2572).
   `key`/`path`/`parent` over a fan-out (`[.[] | .k.x | parent]`) kept each
