@@ -87545,6 +87545,14 @@ mod tests {
         query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!((n - 7.25).abs() < f64::EPSILON);
         });
+        // A *computed* negative Int (not a NumberLiteral, which is what
+        // every literal in filter source or document data produces, #1035)
+        // still classifies correctly -- reachable via arithmetic, unlike
+        // the literal-input cases above.
+        query!(b"null", "(0-5) | abs", QueryResult::Owned(OwnedValue::Int(5)) => {});
+        // `?` suppresses the "cannot be negated" error the same way jq's
+        // own unary minus does.
+        query!(b"null", "null | abs?", QueryResult::None => {});
         // Non-numbers pass straight through -- jq's total ordering puts
         // strings/arrays/objects above every number, so `. < 0` is false.
         query!(br#""a""#, "abs", QueryResult::Owned(OwnedValue::String(s)) => {
