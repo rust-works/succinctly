@@ -378,8 +378,8 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
-    FuncDefData, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param,
-    Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
+    FuncDefData, Libm1, Libm2, Libm3, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry,
+    ObjectKey, Origin, Param, Pattern, PatternEntry, SliceBoundKey, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, int_to_f64,
@@ -10558,6 +10558,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Asinh => builtin_asinh::<W>(value, optional),
         Builtin::Acosh => builtin_acosh::<W>(value, optional),
         Builtin::Atanh => builtin_atanh::<W>(value, optional),
+        Builtin::Libm1(f) => builtin_libm1::<W>(*f, value, optional),
+        Builtin::Libm2(f, a, b) => builtin_libm2::<W, S>(*f, a, b, value, optional),
+        Builtin::Libm3(f, a, b, c) => builtin_libm3::<W, S>(*f, a, b, c, value, optional),
 
         // Phase 10: Number Classification & Constants
         Builtin::Infinite => QueryResult::Owned(OwnedValue::Float(f64::INFINITY)),
@@ -50127,7 +50130,12 @@ fn builtin_todate<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let timestamp = match get_float_value::<W>(&value, optional) {
+    // Not jq's wording either way (jq says `strftime/1 requires parsed
+    // datetime inputs`, since `todate` is `strftime` there); kept as it was
+    // when #3042 moved the libm family onto `number required`.
+    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+        EvalError::new("math function requires number")
+    }) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -50583,8 +50591,10 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the timestamp from input
-    let timestamp = match get_float_value::<W>(&value, optional) {
+    // Get the timestamp from input (wording kept as it was; see `todate`)
+    let timestamp = match get_float_value_with::<W>(&value, optional, || {
+        EvalError::new("math function requires number")
+    }) {
         Ok(f) => f,
         Err(r) => return r,
     };
@@ -52004,8 +52014,11 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
     optional: bool,
 ) -> Result<f64, QueryResult<'a, W>> {
+    // jq's `LIBM_DD` wording, shared by every libm builtin from `floor`
+    // to `cbrt` (#3042): `string ("x") number required`. The value is only
+    // materialized on the error path.
     get_float_value_with(value, optional, || {
-        EvalError::new("math function requires number")
+        EvalError::number_required(&to_owned_lossy(value))
     })
 }
 
@@ -52224,7 +52237,10 @@ fn math_operand(value: &OwnedValue, optional: bool) -> Result<f64, Option<EvalEr
             .as_f64()
             .ok_or_else(|| Some(EvalError::new("invalid number"))),
         _ if optional => Err(None),
-        _ => Err(Some(EvalError::new("expected number"))),
+        // jq's `LIBM_DDD` wording (`pow("a"; 1)` is `string ("a") number
+        // required`, captured live against 1.7.1), shared with the unary
+        // family's `get_float_value` (#3042).
+        _ => Err(Some(EvalError::number_required(value))),
     }
 }
 
@@ -52431,6 +52447,170 @@ fn builtin_atanh<W: Clone + AsRef<[u64]>>(
         Ok(n) => QueryResult::Owned(OwnedValue::Float(math::atanh(n))),
         Err(r) => r,
     }
+}
+
+/// The rest of jq's unary libm surface (#3042). `.` is the operand; every
+/// result is the platform libm's own (`src/jq/math.rs`), and the three
+/// out-parameter functions (`frexp`, `modf`, `lgamma_r`) answer the
+/// two-element array jq builds from the C call -- with the exponent/sign
+/// as an `Int`, which prints the same digits as jq's `jv_number(int)`.
+fn builtin_libm1<W: Clone + AsRef<[u64]>>(
+    f: Libm1,
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    let x = match get_float_value::<W>(&value, optional) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let float = |v: f64| QueryResult::Owned(OwnedValue::Float(v));
+    match f {
+        Libm1::Cbrt => float(math::cbrt(x)),
+        Libm1::Erf => float(math::erf(x)),
+        Libm1::Erfc => float(math::erfc(x)),
+        Libm1::Expm1 => float(math::expm1(x)),
+        Libm1::Gamma => float(math::gamma(x)),
+        Libm1::J0 => float(math::j0(x)),
+        Libm1::J1 => float(math::j1(x)),
+        Libm1::Lgamma => float(math::lgamma(x)),
+        Libm1::Log1p => float(math::log1p(x)),
+        Libm1::Logb => float(math::logb(x)),
+        Libm1::Nearbyint => float(math::nearbyint(x)),
+        Libm1::Rint => float(math::rint(x)),
+        Libm1::Significand => float(math::significand(x)),
+        Libm1::Tgamma => float(math::tgamma(x)),
+        Libm1::Y0 => float(math::y0(x)),
+        Libm1::Y1 => float(math::y1(x)),
+        Libm1::Frexp => {
+            let (m, e) = math::frexp(x);
+            QueryResult::Owned(OwnedValue::Array(vec![
+                OwnedValue::Float(m),
+                OwnedValue::Int(i64::from(e)),
+            ]))
+        }
+        Libm1::Modf => {
+            let (frac, int) = math::modf(x);
+            QueryResult::Owned(OwnedValue::Array(vec![
+                OwnedValue::Float(frac),
+                OwnedValue::Float(int),
+            ]))
+        }
+        Libm1::LgammaR => {
+            let (v, sign) = math::lgamma_r(x);
+            QueryResult::Owned(OwnedValue::Array(vec![
+                OwnedValue::Float(v),
+                OwnedValue::Int(i64::from(sign)),
+            ]))
+        }
+        // No platform libm still exports `pow10` (glibc dropped it in
+        // 2.27, Apple never had it), so every jq 1.7.1 build defines
+        // `pow10/0` as this runtime error -- `1 | pow10` prints it from
+        // both `/usr/bin/jq` and `jq-linux-amd64`. Reached only when
+        // evaluated, exactly like jq's own stub.
+        Libm1::Pow10 => {
+            QueryResult::Error(EvalError::new("Error: pow10/0 not found at build time"))
+        }
+    }
+}
+
+/// The two-argument libm surface (#3042), through the same fan-out as
+/// `pow`/`atan2`: both arguments are generators, the *second* is outermost
+/// (`[ldexp((1,2);(3,4))]` is `[8,16,16,32]`, captured live), and `.` is
+/// ignored. Integer-taking C signatures (`ldexp`, `scalbln`, `jn`, `yn`)
+/// convert their exponent/order the way the platform's jq does -- see
+/// `math::c_int`.
+fn builtin_libm2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: Libm2,
+    a_expr: &Expr,
+    b_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    fanout_two_args::<W, S>(
+        b_expr,
+        a_expr,
+        value.clone(),
+        optional,
+        // Real yq has none of these builtins (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |b, a| {
+            let a = match math_operand(&a, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            let b = match math_operand(&b, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            QueryResult::Owned(OwnedValue::Float(match f {
+                Libm2::Copysign => math::copysign(a, b),
+                // `drem` is `remainder` under its BSD name (an alias in
+                // glibc, a `#define` in jq's own `builtin.c` on Apple).
+                Libm2::Drem | Libm2::Remainder => math::remainder(a, b),
+                Libm2::Fdim => math::fdim(a, b),
+                Libm2::Fmax => math::fmax(a, b),
+                Libm2::Fmin => math::fmin(a, b),
+                Libm2::Fmod => math::fmod(a, b),
+                Libm2::Hypot => math::hypot(a, b),
+                Libm2::Jn => math::jn(a, b),
+                Libm2::Ldexp => math::ldexp(a, b),
+                // `nexttoward` takes a `long double` target; jq hands it a
+                // double, and no double lies strictly between two adjacent
+                // doubles, so the answer is `nextafter`'s.
+                Libm2::Nextafter | Libm2::Nexttoward => math::nextafter(a, b),
+                Libm2::Scalb => math::scalb(a, b),
+                Libm2::Scalbln => math::scalbln(a, b),
+                Libm2::Yn => math::yn(a, b),
+            }))
+        },
+    )
+}
+
+/// `fma(a; b; c)` (#3042): three generator arguments, nested rightmost-
+/// outermost like every C builtin -- `c` outer, `b` middle, `a` innermost
+/// (`[fma((1,2);(3,4);(5,6))]` is `[8,11,9,13,9,12,10,14]`, captured live).
+/// Composed from the two-argument fan-out: the inner `fanout_arg` over `a`
+/// is re-evaluated once per `(c, b)` pair, which is exactly the nesting jq's
+/// own `c as $c | b as $b | a as $a` desugaring produces.
+fn builtin_libm3<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: Libm3,
+    a_expr: &Expr,
+    b_expr: &Expr,
+    c_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    fanout_two_args::<W, S>(
+        c_expr,
+        b_expr,
+        value.clone(),
+        optional,
+        ArgFanout::All,
+        |c, b| {
+            let c = match math_operand(&c, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            let b = match math_operand(&b, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            fanout_arg::<W, S, _>(a_expr, value.clone(), optional, ArgFanout::All, |a| {
+                let a = match math_operand(&a, optional) {
+                    Ok(n) => n,
+                    Err(None) => return QueryResult::None,
+                    Err(Some(e)) => return QueryResult::Error(e),
+                };
+                QueryResult::Owned(OwnedValue::Float(match f {
+                    Libm3::Fma => math::fma(a, b, c),
+                }))
+            })
+        },
+    )
 }
 
 // Number Classification

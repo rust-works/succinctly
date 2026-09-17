@@ -1190,6 +1190,147 @@ pub enum FormatType {
     Props,
 }
 
+/// The unary libm builtins jq exposes beyond the trigonometric/exponential
+/// core (#3042). One `Builtin::Libm1` variant carries the whole family so
+/// that adding a function is a row here and a match arm in the evaluator,
+/// not a new variant threaded through the parser, three walker lists, the
+/// path-rule table and the dispatcher.
+///
+/// `.` is the operand; every function is `number -> number` except
+/// `frexp`/`modf`/`lgamma_r`, which answer a two-element array, and `pow10`,
+/// which is a runtime error in every jq 1.7.1 build (`pow10/0 not found at
+/// build time`) because no platform libm still exports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Libm1 {
+    Cbrt,
+    Erf,
+    Erfc,
+    Expm1,
+    Frexp,
+    Gamma,
+    J0,
+    J1,
+    Lgamma,
+    LgammaR,
+    Log1p,
+    Logb,
+    Modf,
+    Nearbyint,
+    Pow10,
+    Rint,
+    Significand,
+    Tgamma,
+    Y0,
+    Y1,
+}
+
+impl Libm1 {
+    /// Every member with its jq name, in roster order.
+    pub const ALL: [(&'static str, Self); 20] = [
+        ("cbrt", Self::Cbrt),
+        ("erf", Self::Erf),
+        ("erfc", Self::Erfc),
+        ("expm1", Self::Expm1),
+        ("frexp", Self::Frexp),
+        ("gamma", Self::Gamma),
+        ("j0", Self::J0),
+        ("j1", Self::J1),
+        ("lgamma", Self::Lgamma),
+        ("lgamma_r", Self::LgammaR),
+        ("log1p", Self::Log1p),
+        ("logb", Self::Logb),
+        ("modf", Self::Modf),
+        ("nearbyint", Self::Nearbyint),
+        ("pow10", Self::Pow10),
+        ("rint", Self::Rint),
+        ("significand", Self::Significand),
+        ("tgamma", Self::Tgamma),
+        ("y0", Self::Y0),
+        ("y1", Self::Y1),
+    ];
+
+    /// The jq name.
+    pub fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, f)| *f == self)
+            .map_or("", |(n, _)| n)
+    }
+}
+
+/// The two-argument libm builtins (#3042): `f(a; b)`, where `.` is ignored
+/// and both arguments are generator arguments nested rightmost-outermost, as
+/// for every C-implemented jq builtin (`[ldexp((1,2);(3,4))]` is
+/// `[8,16,16,32]`, captured live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Libm2 {
+    Copysign,
+    Drem,
+    Fdim,
+    Fmax,
+    Fmin,
+    Fmod,
+    Hypot,
+    Jn,
+    Ldexp,
+    Nextafter,
+    Nexttoward,
+    Remainder,
+    Scalb,
+    Scalbln,
+    Yn,
+}
+
+impl Libm2 {
+    /// Every member with its jq name, in roster order.
+    pub const ALL: [(&'static str, Self); 15] = [
+        ("copysign", Self::Copysign),
+        ("drem", Self::Drem),
+        ("fdim", Self::Fdim),
+        ("fmax", Self::Fmax),
+        ("fmin", Self::Fmin),
+        ("fmod", Self::Fmod),
+        ("hypot", Self::Hypot),
+        ("jn", Self::Jn),
+        ("ldexp", Self::Ldexp),
+        ("nextafter", Self::Nextafter),
+        ("nexttoward", Self::Nexttoward),
+        ("remainder", Self::Remainder),
+        ("scalb", Self::Scalb),
+        ("scalbln", Self::Scalbln),
+        ("yn", Self::Yn),
+    ];
+
+    /// The jq name.
+    pub fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, f)| *f == self)
+            .map_or("", |(n, _)| n)
+    }
+}
+
+/// The three-argument libm builtins (#3042): only `fma(a; b; c)`, the third
+/// argument outermost and the first innermost (`[fma((1,2);(3,4);(5,6))]`
+/// is `[8,11,9,13,9,12,10,14]`, captured live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Libm3 {
+    Fma,
+}
+
+impl Libm3 {
+    /// Every member with its jq name.
+    pub const ALL: [(&'static str, Self); 1] = [("fma", Self::Fma)];
+
+    /// The jq name.
+    pub fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(_, f)| *f == self)
+            .map_or("", |(n, _)| n)
+    }
+}
+
 /// Builtin functions supported by jq.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Builtin {
@@ -1462,6 +1603,13 @@ pub enum Builtin {
     Acosh,
     /// `atanh` - inverse hyperbolic tangent
     Atanh,
+    /// The rest of jq's unary libm surface (`cbrt`, `frexp`, `tgamma`, ...),
+    /// one variant for the family (#3042).
+    Libm1(Libm1),
+    /// `f(a; b)` for the two-argument libm surface (`ldexp`, `fmax`, ...).
+    Libm2(Libm2, Box<Expr>, Box<Expr>),
+    /// `fma(a; b; c)`.
+    Libm3(Libm3, Box<Expr>, Box<Expr>, Box<Expr>),
 
     // Phase 10: Number Classification & Constants
     /// `infinite` - positive infinity constant

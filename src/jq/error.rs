@@ -1425,6 +1425,15 @@ impl EvalError {
         Self::subject(value, "cannot be negated")
     }
 
+    /// `<v> number required` — a libm builtin (`sin`, `floor`, `cbrt`,
+    /// `ldexp`, ...) on a non-number operand or argument. jq's `LIBM_DD`/
+    /// `LIBM_DDD`/`LIBM_DDDD` macros all raise this one `type_error`;
+    /// confirmed live against jq 1.7.1 (`"x" | sin`, `null | floor`,
+    /// `ldexp(1; "a")` all print `<type> (<value>) number required`).
+    pub fn number_required(value: &OwnedValue) -> Self {
+        Self::subject(value, "number required")
+    }
+
     /// `<v> has no length`.
     pub fn has_no_length(value: &OwnedValue) -> Self {
         Self::subject(value, "has no length")

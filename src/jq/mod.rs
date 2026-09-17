@@ -111,8 +111,8 @@ pub use eval::input_queue_is_active;
 pub use eval::cli_context;
 pub use expr::{
     ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound, FuncDefData,
-    Import, Include, Literal, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey,
-    Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
+    Import, Include, Libm1, Libm2, Libm3, Literal, MetaSlot, MetaValue, ModuleMeta, NumberKey,
+    ObjectEntry, ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
 pub use lazy::JqValue;
 pub use parser::{
