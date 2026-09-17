@@ -45874,6 +45874,74 @@ fn test_unresolved_call_line_distinguishes_same_scope_shape_2635() -> Result<()>
     Ok(())
 }
 
+/// #2635 review: `occurrences` (the per-`(name, arity)` counter behind
+/// `occurrence_index`) is one shared map across the whole merged tree --
+/// main filter plus every inlined module -- but each origin's own
+/// `call_sites` table is independently re-parsed from that origin's own
+/// text alone. An earlier draft keyed `occurrences` by `(name, arity)`
+/// only, so a module's own occurrence of a name inflated the main filter's
+/// count for the same name+arity, landing `.nth(occurrence_index)` on the
+/// wrong table (or missing entirely). Keying by `(origin, name, arity)`
+/// instead keeps the two scopes' counts independent, matching how their
+/// `call_sites` tables already are. Confirmed live against jq 1.7.1: only
+/// the main filter's own `nosuch` (line 4) is reported this way (jq
+/// suppresses the module's own `def helper: nosuch;` diagnostic here, a
+/// separate, pre-existing, already-documented divergence -- see the
+/// `test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085`
+/// module row above), but what this pins is that whichever citation *is*
+/// reported still lands on its own correct line.
+#[test]
+fn test_unresolved_call_occurrence_index_is_scoped_per_module_2635() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(dir.path().join("m.jq"), "def helper: nosuch;\n")?;
+    let lib = dir.path().to_string_lossy().to_string();
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "-L",
+            &lib,
+            "include \"m\";\n(def nosuch: 1; nosuch)\n| helper\n| nosuch",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("nosuch/0 is not defined at <top-level>, line 4:"),
+        "the main filter's own failing nosuch must cite its own line (4), \
+         not be thrown off by the module's separate nosuch/0 -- stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2635 review: `check`'s `Expr::Reduce`/`Expr::Foreach` arms used to visit
+/// `init` before the destructuring `patterns`, but `patterns` (with its own
+/// computed keys, `{(EXPR): P}`) comes first in the source text --
+/// `SOURCE as PATTERN (INIT; UPDATE)`. Since `occurrence_index` must agree
+/// with `collect_call_sites`' offset-sorted table, a name repeated across
+/// these positions needs them visited in the same relative order. Every
+/// citation below confirmed against a live jq 1.7.1 run of the same filter
+/// (jq's own multi-error *reporting* order differs here -- an existing,
+/// orthogonal divergence unrelated to any single citation's correctness,
+/// noted on the `Expr::Reduce` arm's own comment -- but each individual
+/// line jq cites matches exactly).
+#[test]
+fn test_unresolved_call_line_in_reduce_pattern_vs_init_2635() -> Result<()> {
+    let filter = "h\n| reduce empty as\n{(h): $x}\n(h;\nh)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    for want_line in [1, 3, 4, 5] {
+        assert!(
+            stderr.contains(&format!(
+                "h/0 is not defined at <top-level>, line {want_line}:"
+            )),
+            "should cite line {want_line} -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// An unresolvable call in a branch that is never taken still fails, and fails
 /// before any input is read. jq: `f/3 is not defined`, exit 3.
 #[test]
