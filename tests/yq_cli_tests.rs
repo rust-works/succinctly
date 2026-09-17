@@ -10128,12 +10128,31 @@ fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
         "1 2",
         "0x10",
         "1.2.3",
-        "+1",
+        // #2877: jq's non-finite spellings are admitted by the shared
+        // lenient validator now, and refused here by the materializer --
+        // this mode has nowhere to put a NaN or an infinity.
         "nan",
+        "NaN5",
+        "sNaN",
+        "-nan",
+        "Infinity",
+        "-inf",
+        "[+1,Infinity]",
+        r#"{"a":nan}"#,
     ] {
         let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", value, "-o=json"])?;
         assert_ne!(code, 0, "--argjson {value} must be rejected: {output:?}");
         assert_eq!(output, "", "--argjson {value}");
+    }
+
+    // #2877: a leading `+` is finite and admitted, spelling dropped, exactly
+    // as the `007`/`.5` this flag already takes under #2052's `-p json`
+    // mirroring convention (real yq has no `--argjson`; no oracle).
+    for (value, expected) in [("+1", "1"), ("+.5", "0.5"), ("[+1.500,+007]", "[1.5,7]")] {
+        let (output, code) =
+            run_yq_stdin("$x", "a: 1", &["--argjson", "x", value, "-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "--argjson {value}: {output:?}");
+        assert_eq!(output.trim(), expected, "--argjson {value}");
     }
 
     for value in [
@@ -10158,6 +10177,59 @@ fn test_argjson_reject_set_and_overflow_after_2052() -> Result<()> {
     let (output, code) = run_yq_stdin("$x", "a: 1", &["--argjson", "x", "1e308", "-o=json"])?;
     assert_eq!(code, 0, "{output:?}");
     assert_eq!(output.trim(), "1e+308");
+    Ok(())
+}
+
+/// #2877 widened `succinctly jq`'s JSON input to jq's decNumber spellings;
+/// yq mode must not move. `-p json` goes through the YAML parser and never
+/// saw the JSON dispatchers, so it rejects every row as it did (real yq
+/// v4.53.3 does too: `json: invalid character a as null`, `invalid
+/// character '+' looking for beginning of value`). The `--slurp`/
+/// `--eval-all` DOM route does use those dispatchers: it refuses the
+/// non-finite words at its materializer, and admits a leading `+` with the
+/// spelling dropped -- the same shape as the `007`/`.5` it already admits
+/// under #2052's mirroring convention (`{"a":007}` is `{"a":7}` there), so
+/// `+1` follows `007`, not `nan`.
+#[test]
+fn test_p_json_input_is_unmoved_by_2877() -> Result<()> {
+    for input in [
+        r#"{"a":nan}"#,
+        r#"{"a":+1}"#,
+        r#"{"a":Infinity}"#,
+        "[sNaN]",
+        "[-inf]",
+    ] {
+        let (output, code) = run_yq_stdin(".", input, &["-p", "json", "-o=json"])?;
+        assert_ne!(code, 0, "-p json must reject {input}: {output:?}");
+        assert_eq!(output, "", "{input}");
+    }
+    for input in [
+        r#"{"a":nan}"#,
+        r#"{"a":Infinity}"#,
+        "[sNaN]",
+        "[-inf]",
+        "[+1,nan]",
+    ] {
+        let (output, code) = run_yq_stdin(".", input, &["-p", "json", "--slurp", "-o=json"])?;
+        assert_ne!(code, 0, "-p json --slurp must reject {input}: {output:?}");
+        assert_eq!(output, "", "{input}");
+    }
+    for (input, expected) in [
+        (r#"{"a":+1}"#, r#"[{"a":1}]"#),
+        ("[+1.500,007]", "[[1.5,7]]"),
+    ] {
+        let (output, code) =
+            run_yq_stdin(".", input, &["-p", "json", "--slurp", "-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "{input}: {output:?}");
+        assert_eq!(output.trim(), expected, "{input}");
+    }
+    // `tonumber` in yq mode is byte-for-byte what it was: Rust's word set,
+    // not decNumber's.
+    let (output, code) = run_yq_stdin("tonumber", r#""sNaN""#, &[])?;
+    assert_ne!(code, 0, "{output:?}");
+    let (output, code) = run_yq_stdin("tonumber", r#""nan""#, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), ".nan");
     Ok(())
 }
 
