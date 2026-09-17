@@ -543,7 +543,7 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-19 | Added quoted field access `."key"` and bracket notation `.["key"]` (✅ complete)|
 | 2026-01-19 | Added `#` comments in jq expressions (✅ complete)|
 | 2026-01-19 | Added `now` builtin for current Unix timestamp (✅ complete)|
-| 2026-01-19 | Added `abs` builtin as alias for fabs (✅ complete)|
+| 2026-01-19 | Added `abs` builtin as alias for fabs (✅ complete; corrected to jq's own `if . < 0 then -. else . end` semantics, #3041)|
 | 2026-01-19 | Added `builtins` builtin to list all builtin function names (✅ complete)|
 | 2026-01-19 | Added `normals` and `finites` type filters for numeric selection (✅ complete)|
 | 2026-01-19 | Added `@urid` format for URI/percent decoding (✅ complete)|

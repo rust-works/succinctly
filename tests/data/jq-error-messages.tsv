@@ -239,3 +239,6 @@ libm_fma_checks_a_before_c	fma("x"; 1; "z")	null	string ("x") number required
 todate_string	todate	"x"	strftime/1 requires parsed datetime inputs
 todate_null	todate	null	strftime/1 requires parsed datetime inputs
 todateiso8601_string	todateiso8601	"x"	strftime/1 requires parsed datetime inputs
+abs_null	abs	null	null (null) cannot be negated
+abs_false	abs	false	boolean (false) cannot be negated
+abs_true	abs	true	boolean (true) cannot be negated

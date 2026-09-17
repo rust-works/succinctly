@@ -10803,7 +10803,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::GetSearchList => QueryResult::Owned(cli_context::search_list()),
         Builtin::GetJqOrigin => QueryResult::Owned(cli_context::jq_origin()),
         Builtin::GetProgOrigin => QueryResult::Owned(cli_context::prog_origin()),
-        Builtin::Abs => builtin_fabs::<W, S>(value, optional), // abs is an alias for fabs
+        Builtin::Abs => builtin_abs::<W, S>(value, optional), // #3041: not an fabs alias
         Builtin::Builtins => builtin_builtins::<W>(),
         Builtin::Normals => builtin_normals::<W, S>(value),
         Builtin::Finites => builtin_finites::<W, S>(value),
@@ -52466,6 +52466,42 @@ fn builtin_fabs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Builtin: abs (#3041) -- real jq defines this as
+/// `def abs: if . < 0 then -. else . end;`, not a libm `fabs` call. Unlike
+/// every other math builtin, it is not restricted to numbers: jq's total
+/// ordering places `null`/`false`/`true` below every number and
+/// strings/arrays/objects above every number, so only a `null`/`false`/
+/// `true` or an actually-negative number takes the `-.` branch (through
+/// `arith_negate`, which is also where jq's own "cannot be negated" error
+/// on `null`/`false`/`true` comes from); everything else is jq's `else .
+/// end` -- a pure identity that must not collapse a positive number
+/// literal's own spelling (`1.50 | abs` stays `"1.50"`, where `fabs` would
+/// give `1.5`) or reject a string/array/object. Confirmed live against jq
+/// 1.7.1.
+fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    let owned = to_owned_lossy(&value);
+    let sorts_below_zero = match &owned {
+        OwnedValue::Null | OwnedValue::Bool(_) => true,
+        OwnedValue::Int(n) => *n < 0,
+        OwnedValue::Float(f) => *f < 0.0,
+        OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => *n < 0,
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f < 0.0,
+        _ => false,
+    };
+    if sorts_below_zero {
+        match arith_negate::<S>(owned) {
+            Ok(v) => QueryResult::Owned(v),
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(e),
+        }
+    } else {
+        QueryResult::Owned(owned)
+    }
+}
+
 /// Builtin: log (natural logarithm)
 fn builtin_log<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -87492,17 +87528,48 @@ mod tests {
         );
     }
 
+    /// #3041: real jq's `abs` is `def abs: if . < 0 then -. else . end;`, not
+    /// `fabs` -- a negative `Int` negates to an exact `Int` (not `fabs`'s
+    /// always-`Float` answer), and a non-negative number keeps its own
+    /// literal spelling (`.i | abs` on `1.500` stays `1.500`) rather than
+    /// being recomputed through `f64`.
     #[test]
     fn test_abs() {
-        // abs is an alias for fabs
-        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
-            assert!((n - 5.0).abs() < f64::EPSILON);
-        });
-        query!(b"5", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
-            assert!((n - 5.0).abs() < f64::EPSILON);
+        query!(b"-5", "abs", QueryResult::Owned(OwnedValue::Int(5)) => {});
+        // Positive: passed through unchanged, keeping its literal wrapper
+        // (as every non-negated number literal does in this codebase),
+        // not collapsed to a bare `Int` the way the negated case is.
+        query!(b"5", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), text)) => {
+            assert_eq!(text.as_ref(), "5");
         });
         query!(b"-7.25", "abs", QueryResult::Owned(OwnedValue::Float(n)) => {
             assert!((n - 7.25).abs() < f64::EPSILON);
+        });
+        // Non-numbers pass straight through -- jq's total ordering puts
+        // strings/arrays/objects above every number, so `. < 0` is false.
+        query!(br#""a""#, "abs", QueryResult::Owned(OwnedValue::String(s)) => {
+            assert_eq!(s, "a");
+        });
+        query!(b"[1,2]", "abs", QueryResult::Owned(OwnedValue::Array(a)) => {
+            assert_eq!(a.len(), 2);
+        });
+        // null/false/true sort *below* every number, so they take the `-.`
+        // branch -- which is also where jq's "cannot be negated" error on
+        // them comes from.
+        for (filter_input, want) in [
+            ("null", "null (null) cannot be negated"),
+            ("false", "boolean (false) cannot be negated"),
+            ("true", "boolean (true) cannot be negated"),
+        ] {
+            query!(filter_input.as_bytes(), "abs", QueryResult::Error(e) => {
+                assert_eq!(e.message, want, "`{filter_input} | abs`");
+            });
+        }
+        // A non-negative literal keeps its own spelling rather than being
+        // recomputed -- `1.50` stays `1.50` (fabs would give `1.5`).
+        query!(b"1.50", "abs", QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), text)) => {
+            assert_eq!(f, 1.5);
+            assert_eq!(text.as_ref(), "1.50");
         });
     }
 

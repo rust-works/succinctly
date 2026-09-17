@@ -1753,7 +1753,8 @@ pub enum Builtin {
     /// `get_prog_origin` - the directory of the `-f` program, or the current
     /// directory (#3046)
     GetProgOrigin,
-    /// `abs` - absolute value (alias for fabs)
+    /// `abs` - absolute value (#3041: `if . < 0 then -. else . end` in real
+    /// jq, not an alias for `fabs`)
     Abs,
     /// `builtins` - list all builtin function names
     Builtins,
