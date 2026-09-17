@@ -367,3 +367,14 @@ arithmetic_overflow_preview	scan(1e300*1e300)	"x"
 # ── modulemeta always errors: type-check or module-not-found (#2111) ───────
 modulemeta_non_string	modulemeta	null
 modulemeta_not_found	modulemeta	"foo"
+
+# ── <v> number required: the libm builtins on a non-number (#3042) ─────────
+libm_sin_string	sin	"x"
+libm_floor_null	floor	null
+libm_cbrt_array	cbrt	[0,1,2,3,4,5,6,7,8,9,10]
+libm_frexp_object	frexp	{"a":1}
+libm_ldexp_arg2_string	ldexp(1; "a")	null
+libm_ldexp_arg1_bool	ldexp(true; 1)	null
+libm_pow_arg_string	pow("a"; 1)	null
+libm_fma_arg3_string	fma(1; 2; "z")	null
+libm_significand_long_string	significand	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

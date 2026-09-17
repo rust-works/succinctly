@@ -1647,6 +1647,14 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "isnormal",
         "isfinite",
         "nan",
+        // #3042: the rest of jq's libm family, one per arity plus the
+        // array-valued and always-erroring members.
+        "cbrt",
+        "frexp",
+        "pow10",
+        "ldexp(1; 2)",
+        "fmax(1; 2)",
+        "fma(1; 2; 3)",
         // #2462: real yq's lexer rejects these outright ("invalid input
         // text"); real yq spells the same operation `downcase`/`upcase`,
         // which are always on (not gated -- see
@@ -1863,6 +1871,11 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "1 | isnormal",
         "1 | isfinite",
         "nan",
+        "8 | cbrt",
+        "8 | frexp",
+        "ldexp(1; 2)",
+        "fmax(1; 2)",
+        "fma(1; 2; 3)",
         "\"ABC\" | ascii_downcase",
         "\"abc\" | ascii_upcase",
         "path(.a)",

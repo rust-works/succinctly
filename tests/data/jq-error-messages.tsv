@@ -225,3 +225,12 @@ nan_preview	scan(nan)	"x"	number (null) is not a string
 arithmetic_overflow_preview	scan(1e300*1e300)	"x"	number (1.797693134...) is not a string
 modulemeta_non_string	modulemeta	null	modulemeta input module name must be a string
 modulemeta_not_found	modulemeta	"foo"	module not found: foo
+libm_sin_string	sin	"x"	string ("x") number required
+libm_floor_null	floor	null	null (null) number required
+libm_cbrt_array	cbrt	[0,1,2,3,4,5,6,7,8,9,10]	array ([0,1,2,3,4,...) number required
+libm_frexp_object	frexp	{"a":1}	object ({"a":1}) number required
+libm_ldexp_arg2_string	ldexp(1; "a")	null	string ("a") number required
+libm_ldexp_arg1_bool	ldexp(true; 1)	null	boolean (true) number required
+libm_pow_arg_string	pow("a"; 1)	null	string ("a") number required
+libm_fma_arg3_string	fma(1; 2; "z")	null	string ("z") number required
+libm_significand_long_string	significand	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"	string ("xxxxxxxxxx...) number required

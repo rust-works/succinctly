@@ -44632,48 +44632,147 @@ fn cli_context_builtins_match_jq_3046() -> Result<()> {
     Ok(())
 }
 
-/// A jq builtin succinctly does not implement must still *compile* when it is
-/// mentioned somewhere evaluation never reaches -- real jq compiles it, so
-/// rejecting it would be a regression #1473's resolution pass introduced.
-///
-/// The roster in `src/jq/resolve.rs` is what makes this hold, and
-/// `jq_builtin_roster_matches_the_pinned_capture` (that module's own tests)
-/// checks the roster against `tests/data/jq-builtin-names.txt` entry by entry.
-/// This test covers the other half -- that the roster is actually consulted --
-/// on a representative sample rather than all 218 names: a whole-roster sweep
-/// through the CLI also exercises the *parser*, which is a separate concern
-/// from resolution (`modulemeta` used to diverge there -- #2035 -- until its
-/// parser arity was fixed to match jq's actual `modulemeta/0`).
+/// Every builtin the pinned jq (1.7.1) defines is implemented: with #3042
+/// (the libm family) and #3046 (`JOIN`, `format`, `input_filename`, ...) the
+/// last two groups landed, so `tests/data/jq-builtin-names.txt` -- the
+/// captured roster `src/jq/resolve.rs` is checked against entry by entry --
+/// is now also the list of what *evaluates*. Two programs sweep it in two
+/// spawns: one mentions every name, at its captured arity, in an unreached
+/// branch (jq compiles it, so a compile error here is the regression #1473's
+/// pass could introduce); the other *reaches* every name under `try`, so an
+/// unimplemented one -- a compile error since #1473 -- fails the whole run,
+/// while a type error or a real answer both prove the name has an
+/// implementation. Before #3042, `cbrt`, `hypot(.; .)`, `fma(.; .; .)`,
+/// `frexp`, `significand`, `gamma`, `nearbyint` and `logb` were the sampled
+/// "still unimplemented" names here.
 #[test]
-fn test_unimplemented_jq_builtins_still_compile_when_unreached_1473() -> Result<()> {
-    for call in [
-        "cbrt",
-        "hypot(.; .)",
-        "fma(.; .; .)",
-        "frexp",
-        "significand",
-        "gamma",
-        "nearbyint",
-        "logb",
-        // `JOIN`, `format`, `input_filename`, `get_search_list` and
-        // `strflocaltime` used to be sampled here; #3046 implemented them.
+fn test_every_pinned_jq_builtin_is_implemented_1473() -> Result<()> {
+    let roster = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/jq-builtin-names.txt"
+    ))?;
+    let mut calls = Vec::new();
+    for line in roster.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, arity) = line.rsplit_once('/').expect("<name>/<arity>");
+        let arity: usize = arity.parse()?;
+        calls.push(if arity == 0 {
+            name.to_string()
+        } else {
+            format!("{name}({})", vec!["1"; arity].join("; "))
+        });
+    }
+    assert!(
+        calls.len() >= 218,
+        "roster unexpectedly short: {}",
+        calls.len()
+    );
+
+    let unreached = calls
+        .iter()
+        .map(|call| format!("(if false then {call} else 1 end)"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &unreached], Some("1"))?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (calls.len().to_string().as_str(), 0),
+        "unreached sweep: stderr {stderr:?}"
+    );
+
+    // `input`/`inputs` consume the stream, `halt`/`halt_error` exit,
+    // `debug`/`stderr` write to stderr, and `repeat(1)`/`while(1; 1)`/
+    // `recurse(1)` never terminate (their step cap is uncatchable, #2132) --
+    // none can be "undefined", and each would perturb the one-spawn shape;
+    // the unreached form above covers them.
+    let reached = calls
+        .iter()
+        .filter(|call| {
+            !matches!(
+                call.split('(').next().unwrap_or(""),
+                "input"
+                    | "inputs"
+                    | "halt"
+                    | "halt_error"
+                    | "debug"
+                    | "stderr"
+                    | "repeat"
+                    | "while"
+                    | "recurse"
+            )
+        })
+        .map(|call| format!("(try ({call}) catch \"caught\")"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &format!("[{reached}] | length")], Some("1"))?;
+    assert_eq!(code, 0, "reached sweep: stderr {stderr:?}");
+    assert!(
+        !stderr.contains("is not defined") && !stderr.contains("undefined function"),
+        "a pinned builtin is still unimplemented: {stderr:?}"
+    );
+    assert!(
+        stdout.trim_end().parse::<usize>().is_ok_and(|n| n >= 190),
+        "reached sweep produced {stdout:?}"
+    );
+    Ok(())
+}
+
+/// #3042: the libm family goes through the same parser machinery as `pow`
+/// and `asin`, so a wrong arity is jq's compile error, a `def` shadows the
+/// name at any arity, `?` swallows the type error, and `try` sees jq's own
+/// `number required` wording. Every expectation captured live from
+/// `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
+    for (filter, want) in [
+        (r#"def cbrt: "mine"; 8 | cbrt"#, r#""mine""#),
+        (r#"def ldexp(a; b): "mine"; ldexp(1; 2)"#, r#""mine""#),
+        (r#"def ldexp(a): "one"; ldexp(1)"#, r#""one""#),
+        ("if false then fma(1; 2; 3) else (8 | cbrt) end", "2"),
+        (r#"["x" | cbrt?]"#, "[]"),
+        (r#"[ldexp("x"; 1)?]"#, "[]"),
+        (
+            r#"[try ("x" | frexp) catch .]"#,
+            r#"["string (\"x\") number required"]"#,
+        ),
+        (
+            r#"[try fma(1; 2; "z") catch .]"#,
+            r#"["string (\"z\") number required"]"#,
+        ),
+        (
+            r#"[try (1 | pow10) catch .]"#,
+            r#"["Error: pow10/0 not found at build time"]"#,
+        ),
     ] {
-        let filter = format!("if false then {call} else 1 end");
-        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
-        assert_eq!(code, 0, "{call}: stderr {stderr:?}");
-        assert_eq!(stdout.trim_end(), "1", "{call}: stderr {stderr:?}");
+        let (output, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), want, "`{filter}`");
+    }
+    for (filter, want_err) in [
+        ("ldexp(1)", "ldexp/1 is not defined"),
+        ("ldexp", "ldexp/0 is not defined"),
+        ("cbrt(1)", "cbrt/1 is not defined"),
+        ("fma(1; 2)", "fma/2 is not defined"),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 3, "`{filter}`: stderr {stderr:?}");
+        assert!(stderr.contains(want_err), "`{filter}`: stderr {stderr:?}");
     }
     Ok(())
 }
 
-/// A jq builtin succinctly does not implement stays a *runtime* error when the
-/// call is actually reached -- the roster defers it, it does not silence it.
+/// A name the pinned jq does *not* define is still an error when reached
+/// (#1473 deferred unresolved calls to runtime; #3042 removed the last real
+/// builtins from that set, so a made-up name is what exercises it now).
 #[test]
-fn test_unimplemented_jq_builtin_still_errors_when_reached_1473() -> Result<()> {
-    let (_stdout, stderr, code) = run_jq_full(&["-c", "cbrt"], Some("8"))?;
-    assert_eq!(code, 5, "stderr: {stderr:?}");
+fn test_unknown_function_still_errors_when_reached_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "cbrt_no_such_builtin"], Some("8"))?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("undefined function: cbrt/0"),
+        stderr.contains("cbrt_no_such_builtin/0 is not defined"),
         "stderr: {stderr:?}"
     );
     Ok(())
