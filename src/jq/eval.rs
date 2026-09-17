@@ -3198,7 +3198,7 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// compares with [`compare_key_arrays`] instead of wrapping each key in an
 /// `OwnedValue::Array` (#2999): since the wrapper's storage is refcounted,
 /// that wrapping would cost a second allocation per key and a pointer chase
-/// per comparison -- measured at +6% to +20% on `sort_by(.)` before this
+/// per comparison -- measured at +6% to +27% on `sort_by(.)` before this
 /// split, and nothing under B's inline `Vec` -- for an array no one ever
 /// shares.
 fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(

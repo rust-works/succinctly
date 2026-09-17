@@ -86,13 +86,13 @@ pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 /// of this exact check. Both are now thin wrappers around this one,
 /// parameterized by `max` instead of re-deriving the assertion.
 ///
-/// `#[cfg_attr(any(test, feature = "share-stats"), track_caller)]` (and on both wrappers below) so a panic reports the
+/// `#[track_caller]` (and on both wrappers below) so a panic reports the
 /// call site inside the actual `_at_depth` recursive function that
 /// overflowed, not this shared body's own line -- otherwise every one of
 /// the ~15 guarded call sites collapses to the same file:line, making a
 /// crash report impossible to attribute without a full backtrace (#1020
 /// code review).
-#[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+#[track_caller]
 pub fn assert_depth(depth: usize, max: usize) {
     assert!(depth < max, "{}", nesting_depth_exceeded_message(max));
 }
@@ -113,7 +113,7 @@ pub fn nesting_depth_exceeded_message(max: usize) -> String {
 /// See that constant's own doc comment for why this exists as a second,
 /// independently-tuned ceiling alongside
 /// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
-#[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+#[track_caller]
 pub fn assert_value_tree_depth(depth: usize) {
     assert_depth(depth, MAX_VALUE_TREE_DEPTH);
 }
@@ -1806,8 +1806,8 @@ macro_rules! note_forced_copy {
 /// the same for any wrapped container -- `Default`, `Clone` (a refcount
 /// bump), `PartialEq`, a transparent `Debug`, `Deref`, `DerefMut` (the
 /// copy-on-write point, `Rc::make_mut`) and `From<target>`. Everything whose
-/// shape depends on the container -- iteration, `Extend`, `FromIterator`,
-/// `take_entry`/`take_element` -- stays written out per wrapper below.
+/// shape depends on the container -- iteration, `Extend`, `FromIterator` --
+/// stays written out per wrapper below.
 ///
 /// `unshared_from`/`unshared_into` say how the `unshared-containers` holdout
 /// wraps and unwraps its inner type (a `Box` for the map, nothing for the
@@ -1991,8 +1991,8 @@ macro_rules! shared_container {
 ///
 /// `DerefMut` and the by-value conversions (`into_index_map`, the owned
 /// `IntoIterator`) are where a shared map is copied; both are
-/// `#[cfg_attr(any(test, feature = "share-stats"), track_caller)]` so [`share_stats`](super::share_stats) can name the
-/// line that forced it.
+/// `#[track_caller]` in the builds that read it (`test`, `share-stats`) so
+/// [`share_stats`](super::share_stats) can name the line that forced it.
 ///
 /// Note for downstream users: the shape of the `OwnedValue::Object` variant
 /// changed in #3000 (boxed) and again in #2999 (refcounted). Construct with
@@ -2035,16 +2035,26 @@ impl<V: Clone> Extend<(String, V)> for ObjectMapOf<V> {
     }
 }
 
-/// By-value iteration over an [`ObjectMapOf`]: the map's own iterator when
-/// this handle was the last one, otherwise one pass over the shared map
-/// cloning each entry as it goes -- never a copy of the whole map first and
-/// a second pass to consume it (#2999 review).
+/// By-value iteration over an [`ObjectMapOf`].
+///
+/// The map's own iterator when this handle was the last one, otherwise one
+/// pass over the shared map cloning each entry as it goes -- never a copy of
+/// the whole map first and a second pass to consume it (#2999 review).
 pub enum ObjectMapIntoIter<V> {
     /// This handle owned the map outright.
     Owned(indexmap::map::IntoIter<String, V>),
-    /// Another handle still shares the map; entries are cloned out in order.
+    /// Another handle still shares the map; the entries in `next..end` are
+    /// cloned out, from either end (`DoubleEndedIterator`, like the owned
+    /// form).
     #[cfg(not(feature = "unshared-containers"))]
-    Shared(Rc<IndexMap<String, V>>, usize),
+    Shared {
+        /// The map every remaining entry is cloned from.
+        map: Rc<IndexMap<String, V>>,
+        /// Index of the next entry from the front.
+        next: usize,
+        /// One past the next entry from the back.
+        end: usize,
+    },
 }
 
 impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
@@ -2055,7 +2065,10 @@ impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.next(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared(map, next) => {
+            Self::Shared { map, next, end } => {
+                if next >= end {
+                    return None;
+                }
                 let (k, v) = map.get_index(*next)?;
                 *next += 1;
                 Some((k.clone(), v.clone()))
@@ -2068,9 +2081,27 @@ impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.size_hint(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared(map, next) => {
-                let n = map.len() - *next;
+            Self::Shared { next, end, .. } => {
+                let n = end - next;
                 (n, Some(n))
+            }
+        }
+    }
+}
+
+impl<V: Clone> DoubleEndedIterator for ObjectMapIntoIter<V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(iter) => iter.next_back(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared { map, next, end } => {
+                if next >= end {
+                    return None;
+                }
+                *end -= 1;
+                let (k, v) = map.get_index(*end)?;
+                Some((k.clone(), v.clone()))
             }
         }
     }
@@ -2089,7 +2120,12 @@ impl<V: Clone> IntoIterator for ObjectMapOf<V> {
                 Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
                 Err(shared) => {
                     note_forced_copy!(ObjectUnwrap);
-                    ObjectMapIntoIter::Shared(shared, 0)
+                    let end = shared.len();
+                    ObjectMapIntoIter::Shared {
+                        map: shared,
+                        next: 0,
+                        end,
+                    }
                 }
             }
         }
@@ -2204,9 +2240,17 @@ impl<V: Clone> Extend<V> for ArrayOf<V> {
 pub enum ArrayIntoIter<V> {
     /// This handle owned the array outright.
     Owned(alloc::vec::IntoIter<V>),
-    /// Another handle still shares the array; elements are cloned out in order.
+    /// Another handle still shares the array; the elements in `next..end`
+    /// are cloned out, from either end.
     #[cfg(not(feature = "unshared-containers"))]
-    Shared(Rc<Vec<V>>, usize),
+    Shared {
+        /// The array every remaining element is cloned from.
+        vec: Rc<Vec<V>>,
+        /// Index of the next element from the front.
+        next: usize,
+        /// One past the next element from the back.
+        end: usize,
+    },
 }
 
 impl<V: Clone> Iterator for ArrayIntoIter<V> {
@@ -2217,7 +2261,10 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.next(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared(vec, next) => {
+            Self::Shared { vec, next, end } => {
+                if next >= end {
+                    return None;
+                }
                 let v = vec.get(*next)?;
                 *next += 1;
                 Some(v.clone())
@@ -2230,9 +2277,26 @@ impl<V: Clone> Iterator for ArrayIntoIter<V> {
         match self {
             Self::Owned(iter) => iter.size_hint(),
             #[cfg(not(feature = "unshared-containers"))]
-            Self::Shared(vec, next) => {
-                let n = vec.len() - *next;
+            Self::Shared { next, end, .. } => {
+                let n = end - next;
                 (n, Some(n))
+            }
+        }
+    }
+}
+
+impl<V: Clone> DoubleEndedIterator for ArrayIntoIter<V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<V> {
+        match self {
+            Self::Owned(iter) => iter.next_back(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared { vec, next, end } => {
+                if next >= end {
+                    return None;
+                }
+                *end -= 1;
+                vec.get(*end).cloned()
             }
         }
     }
@@ -2254,7 +2318,12 @@ impl<V: Clone> IntoIterator for ArrayOf<V> {
                 Ok(vec) => ArrayIntoIter::Owned(vec.into_iter()),
                 Err(shared) => {
                     note_forced_copy!(ArrayUnwrap);
-                    ArrayIntoIter::Shared(shared, 0)
+                    let end = shared.len();
+                    ArrayIntoIter::Shared {
+                        vec: shared,
+                        next: 0,
+                        end,
+                    }
                 }
             }
         }
@@ -4266,6 +4335,32 @@ mod tests {
         assert_eq!(recorded[0].0.kind, Kind::ArrayUnwrap);
         assert_eq!(keep.len(), 1, "the surviving handle still reads");
 
+        // The shared iterator walks from either end and the two ends meet
+        // exactly once, the same contract `vec::IntoIter` gives the owned
+        // arm -- `.into_iter().rev()` over an array payload compiled before
+        // #2999 and must keep doing so.
+        let shared = ArrayVec::from((1..=4).map(OwnedValue::Int).collect::<Vec<_>>());
+        let _keep = shared.clone();
+        let mut both_ends = shared.clone().into_iter();
+        assert_eq!(both_ends.len(), 4);
+        assert_eq!(both_ends.next(), Some(OwnedValue::Int(1)));
+        assert_eq!(both_ends.next_back(), Some(OwnedValue::Int(4)));
+        assert_eq!(both_ends.len(), 2);
+        assert_eq!(both_ends.next_back(), Some(OwnedValue::Int(3)));
+        assert_eq!(both_ends.next(), Some(OwnedValue::Int(2)));
+        assert_eq!(both_ends.next(), None);
+        assert_eq!(both_ends.next_back(), None);
+        assert_eq!(both_ends.len(), 0);
+        let reversed: Vec<OwnedValue> = shared.into_iter().rev().collect();
+        assert_eq!(
+            reversed,
+            (1..=4).rev().map(OwnedValue::Int).collect::<Vec<_>>()
+        );
+        // And the owned arm, for the same `.rev()`.
+        let unique = ArrayVec::from((1..=2).map(OwnedValue::Int).collect::<Vec<_>>());
+        let reversed: Vec<OwnedValue> = unique.into_iter().rev().collect();
+        assert_eq!(reversed, vec![OwnedValue::Int(2), OwnedValue::Int(1)]);
+
         let map = ObjectMap::from(IndexMap::from([("a".to_string(), OwnedValue::Int(1))]));
         let keep = map.clone();
         let (m, recorded) = share_stats::measure(|| map.into_index_map());
@@ -4273,6 +4368,30 @@ mod tests {
         assert_eq!(recorded.len(), 1, "{recorded:?}");
         assert_eq!(recorded[0].0.kind, Kind::ObjectUnwrap);
         assert_eq!(keep.len(), 1);
+
+        // Same both-ends contract for a shared map.
+        let map = ObjectMap::from(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+            ("c".to_string(), OwnedValue::Int(3)),
+        ]));
+        let _keep = map.clone();
+        let mut both_ends = map.clone().into_iter();
+        assert_eq!(both_ends.len(), 3);
+        assert_eq!(both_ends.next_back().map(|(k, _)| k).as_deref(), Some("c"));
+        assert_eq!(both_ends.next().map(|(k, _)| k).as_deref(), Some("a"));
+        assert_eq!(both_ends.next().map(|(k, _)| k).as_deref(), Some("b"));
+        assert_eq!(both_ends.len(), 0);
+        assert!(both_ends.next().is_none());
+        assert!(both_ends.next_back().is_none());
+        let keys: Vec<String> = map.into_iter().rev().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["c", "b", "a"]);
+        let unique = ObjectMap::from(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        let keys: Vec<String> = unique.into_iter().rev().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["b", "a"]);
     }
 
     /// A write copies the *spine* it goes through, not the tree: writing one
