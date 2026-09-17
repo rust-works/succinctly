@@ -76,7 +76,7 @@ use super::eval::{
     yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
     yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
     EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics,
+    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8130,6 +8130,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // eager path and the lazy one).
         Expr::Shared(_) => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2658: `until`/`while` natively via `eval_each_generic`'s own
+        // `each_loop_generic` arm, so the loop's `cond`/`update` read the
+        // input at its cursor instead of a whole-document copy.
+        Expr::Until { .. } | Expr::While { .. } => {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -8901,6 +8908,40 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Builtin(Builtin::Skip(n, inner)) => {
             each_skip_generic::<S, V>(n, inner, value, optional, cursor, sink)
+        }
+        // #2658: the remaining spellings of #2476/#2968's class -- `any(cond)`/
+        // `all(cond)`, `isvalid(f)` and the two jq loops -- native and
+        // cursor-threaded here too, instead of `bridge_to_each_owned_flow`/
+        // `bridge_to_full_evaluator_flow`'s `O(2^N)` ambient copy on an
+        // alias fan-out. The `any`/`all`/`isvalid` verdicts are one item, so
+        // they answer through the collecting arm and push it; the loops
+        // stream. Same live-input-queue deferral as the arms above (#1309).
+        Expr::Builtin(Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_))
+            if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
+        {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_result_generic::<V>(
+            any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true),
+            sink,
+        ),
+        Expr::Builtin(Builtin::AllF(cond)) if cursor.is_some() => drain_result_generic::<V>(
+            any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), false),
+            sink,
+        ),
+        Expr::Builtin(Builtin::IsValid(f)) => {
+            drain_result_generic::<V>(isvalid_generic::<S, V>(f, value, cursor), sink)
+        }
+        Expr::Until { cond, update } | Expr::While { cond, update }
+            if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
+        {
+            bridge_to_full_evaluator_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        Expr::Until { cond, update } => {
+            each_loop_generic::<S, V>(LoopKind::Until, cond, update, value, optional, cursor, sink)
+        }
+        Expr::While { cond, update } => {
+            each_loop_generic::<S, V>(LoopKind::While, cond, update, value, optional, cursor, sink)
         }
 
         // #2180 WP2a introduced this pair for `and`/`or` with a path-context
@@ -10693,6 +10734,413 @@ fn each_skip_generic<S: EvalSemantics, V: DocumentValue>(
         });
         resume_from_escape(escape, flow)
     })
+}
+
+/// `any(cond)`/`all(cond)` over the cursor, instead of through the wildcard
+/// bridge's ambient materialization (#2658).
+///
+/// Generic twin of `eval::any_all_f`: the container's own elements (array
+/// items, or an object's *values* under the mode's duplicate-key rule --
+/// jq iterates `{"a":true,"a":false}` as one `false`, #422/#1385) are each
+/// probed with `cond` at their own position through
+/// [`any_all_probe_item_generic`], the same probe `any(gen; cond)` uses
+/// (#2968), stopping at the first decisive element. Neither builtin had an
+/// arm in [`eval_builtin`], so both fell to its `_` wildcard, whose first act
+/// is `to_owned_with_cursor` on the whole input: `O(2^N)` on an alias
+/// fan-out (`aN: &aN [*a(N-1), *a(N-1)]`), where `.a20 | any(length == 2)`
+/// took 0.85 s / 585 MB for an answer the first element decides.
+///
+/// **Not spelled as `any(.[]; cond)`**, although jq defines it so: in yq mode
+/// `.[]` on a scalar yields nothing, so that spelling answers `false` where
+/// the eager arm raises `Cannot iterate over number (5)`, and it is the eager
+/// arm both routes have always agreed on. The scalar arm therefore mirrors
+/// `any_all_f`'s own -- `cannot_iterate_with` behind the decode-failure
+/// precedence (#1620/#1989), in both modes; unlike bare `any`/`all`, the
+/// `cond` forms have no yq-only "only supports arrays" rule on the eager
+/// route either, and real yq rejects every spelling of `any(cond)` outright
+/// (`bad expression`, v4.53.3), so there is nothing to match there.
+///
+/// **What this validates changes** (#2103 rule: a filter validates what it
+/// materializes, and nothing else). The eager arm `to_owned`-converts each
+/// element right before its own probe (#1755), so an undecodable element the
+/// short-circuit never reaches is never read, but one it does reach raises
+/// even when `cond` would not have looked at it. Here an element is a cursor
+/// and only `cond`'s own reads decode it: `[5, "\ud800"] | any(true)`
+/// answers `true`, and so does `all(false)` answer `false`, where the bridge
+/// raised for the whole document. `[5, "\ud800"] | any(. == 5)` keeps
+/// #1755's `true` -- the short-circuit still stops before the bad element
+/// -- and `["\ud800", 5] | any(. == 5)` still raises, because comparing the
+/// string decodes it. Recorded in `docs/compliance/jq/limitations.md`.
+fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    value: &V,
+    optional: bool,
+    cursor: V::Cursor,
+    target_truthy: bool,
+) -> GenericResult<V> {
+    let answer = |b: bool| GenericResult::Owned(OwnedValue::Bool(b));
+    // One probe for both container arms: decisive -> the answer, undecided
+    // -> keep walking, an escape before any decision -> propagate it.
+    let probe = |elem_cursor: V::Cursor| {
+        any_all_probe_item_generic::<S, V>(cond, GenericItem::OneCursor(elem_cursor), target_truthy)
+    };
+    if let Some(elements) = value.as_array() {
+        // #2594: the zero-element `[,]` the walk below cannot see -- the
+        // `.[]` arm's own check, since these are `.[]`'s elements.
+        if let Err(err) = empty_elements_tail_gap_ok(&elements, Some(&cursor)) {
+            return GenericResult::Error(err);
+        }
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            match probe(elem_cursor) {
+                Ok(true) => return answer(target_truthy),
+                Ok(false) => {}
+                Err(control) => return partial_generic(Vec::new(), control),
+            }
+            elems = rest;
+        }
+        answer(!target_truthy)
+    } else if let Some(fields) = value.as_object() {
+        if let Err(err) = empty_fields_tail_gap_ok(&fields, Some(&cursor)) {
+            return GenericResult::Error(err);
+        }
+        // `true`, not `S::COLLAPSE_DUPLICATE_KEYS`: these are `.[]`'s values,
+        // and `.[]`'s own object arm collapses a repeated key onto its last
+        // occurrence in both modes -- `{a: true, a: false} | [.[]]` is
+        // `[false]` under yq too, and so is the eager `any_all_f`'s walk.
+        // The mode constant governs the *keys* builtins, where yq keeps every
+        // occurrence; here it would have answered `any(.)` `true`.
+        match effective_fields_checked(&fields, true) {
+            Ok(fields) => {
+                for field in fields {
+                    match probe(field.value_cursor) {
+                        Ok(true) => return answer(target_truthy),
+                        Ok(false) => {}
+                        Err(control) => return partial_generic(Vec::new(), control),
+                    }
+                }
+                answer(!target_truthy)
+            }
+            Err(err) => GenericResult::Error(err),
+        }
+    } else {
+        decode_failure_or(value, optional, || {
+            GenericResult::Error(EvalError::cannot_iterate_with(
+                S::TAG,
+                &to_owned_for_diagnostic::<_, S>(value, Some(cursor)),
+            ))
+        })
+    }
+}
+
+/// `isvalid(f)` over the cursor, instead of through the wildcard bridge
+/// (#2658). A succinctly extension in both modes (neither jq 1.7.1 nor yq
+/// v4.53.3 defines it, ADR-0018 rule 5), so the spec is
+/// `eval::builtin_isvalid`'s own pinned rules, reproduced over the streaming
+/// route: `f` is driven to exhaustion -- never stopped early, since a later
+/// error flips the verdict (`isvalid(1, error("x"))` is `false`, #881) --
+/// and answers `true` when it produced at least one output and no error,
+/// `false` when it produced none or ended in an error, while a `halt` (#791)
+/// or an unresolved `break` (#867) passes through unconverted, prefix or no
+/// prefix, exactly as the eager arm's `Partial(_, Halt | Break)` arms do, and
+/// so does an error `try` itself cannot catch (#1620's decode failure and
+/// its two siblings) -- `isvalid(.a | length)` on a document whose `.a` is
+/// undecodable raises like `try (.a | length) catch "c"` does, rather than
+/// digesting the corruption into `false`.
+///
+/// An output's *value* is never read, so it is run through
+/// [`discard_generic_item`] for the errors it still owes (a buffered
+/// `LazySeq`) and otherwise left undecoded, the #2692 rule: `isvalid(.d)` on a
+/// document with a malformed `.a` answers `true` where the bridge raised for
+/// the whole document, and `.a20 | isvalid(.[0])` on the alias fan-out is one
+/// child step instead of a `2^19`-node copy.
+fn isvalid_generic<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut produced = false;
+    let mut escape: Option<Control> = None;
+    // `optional` hardcoded `false`: the eager arm evaluates `f` with its own
+    // ambient `false` too (#881's "ambient, not broadcast"), and the verdict
+    // is a `Bool` that no `?` has anything to suppress on.
+    let flow = eval_each_generic::<S, V>(f, value, false, cursor, &mut |item| {
+        produced = true;
+        discard_generic_item::<_, S>(item, &mut escape)
+    });
+    let control = match (escape, flow) {
+        (Some(control), _) | (None, Flow::Escaped(control)) => Some(control),
+        (None, Flow::Exhausted | Flow::Stopped { .. }) => None,
+    };
+    match control {
+        None => GenericResult::Owned(OwnedValue::Bool(produced)),
+        // A decode failure (#1620), a resource-limit raise (#2132) or a yq
+        // negative-index raise (#2254) is uncatchable at a value position:
+        // `try`, `?` and `//` all let it through, and so does this verdict,
+        // the same rule `eval::builtin_isvalid` applies (#2658).
+        Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => GenericResult::Error(e),
+        Some(Control::Error(_)) => GenericResult::Owned(OwnedValue::Bool(false)),
+        Some(Control::Halt(code)) => GenericResult::Halt(code),
+        Some(Control::Break(label)) => GenericResult::Break(label),
+    }
+}
+
+/// One state of a `while`/`until` loop on the streaming route (#2658): a
+/// document node, kept as the value and the cursor it came from, or a
+/// computed value once `update` has left the document.
+///
+/// The loop reads `cond` and `update` at the state's own position while it
+/// still has one, so `.a20 | until(true; .) | length` and `while(false; .)`
+/// never copy the input, and `until(length == 1; .[0])` steps down the
+/// document one cursor at a time. A lazy item (`LazyKeys`/`LazyIndexRange`/
+/// `LazySeq`) is materialized on arrival, exactly as
+/// [`any_all_probe_item_generic`] does for its own item.
+enum LoopState<V: DocumentValue> {
+    Document(V, Option<V::Cursor>),
+    Owned(OwnedValue),
+}
+
+impl<V: DocumentValue> LoopState<V> {
+    fn from_item<S: EvalSemantics>(item: GenericItem<V>) -> Result<Self, Control> {
+        Ok(match item {
+            GenericItem::One(v) => LoopState::Document(v, None),
+            GenericItem::OneCursor(c) => LoopState::Document(c.value(), Some(c)),
+            GenericItem::OneCursorValue(c, v) => LoopState::Document(v, Some(c)),
+            GenericItem::Owned(o) => LoopState::Owned(o),
+            item @ (GenericItem::LazyKeys { .. }
+            | GenericItem::LazyIndexRange(_)
+            | GenericItem::LazySeq(_)) => LoopState::Owned(generic_item_into_owned::<_, S>(item)?),
+        })
+    }
+
+    /// The item this state is emitted as: the node itself while it has a
+    /// cursor (so a downstream `length`/`key` reads it in place), else a copy
+    /// of the computed value, as `until_step`'s `outputs.push(state.clone())`.
+    fn emit(&self) -> GenericItem<V> {
+        match self {
+            LoopState::Document(_, Some(c)) => GenericItem::OneCursor(*c),
+            LoopState::Document(v, None) => GenericItem::One(v.clone()),
+            LoopState::Owned(o) => GenericItem::Owned(o.clone()),
+        }
+    }
+
+    /// Drive `expr` over this state into `sink`: at the node's position for a
+    /// document state, through `eval.rs` for a computed one -- the same split
+    /// [`any_all_probe_item_generic`] makes per item.
+    fn each<S: EvalSemantics>(&self, expr: &Expr, optional: bool, sink: &mut dyn Sink<V>) -> Flow {
+        match self {
+            LoopState::Document(v, cursor) => {
+                eval_each_generic::<S, V>(expr, v.clone(), optional, *cursor, sink)
+            }
+            LoopState::Owned(o) => {
+                eval_each_owned::<S>(expr, o, optional, &mut |o| sink.push(GenericItem::Owned(o)))
+            }
+        }
+    }
+
+    /// Every output of `expr` over this state as a new state, with the
+    /// escape (if any) that ended the generator -- `eval_owned_expr_fork`'s
+    /// `(Vec<OwnedValue>, Option<Control>)` shape, over items.
+    fn fork<S: EvalSemantics>(&self, expr: &Expr, optional: bool) -> (Vec<Self>, Option<Control>) {
+        let mut states = Vec::new();
+        let mut escape: Option<Control> = None;
+        let flow = self.each::<S>(
+            expr,
+            optional,
+            &mut |item| match Self::from_item::<S>(item) {
+                Ok(state) => {
+                    states.push(state);
+                    Demand::Continue
+                }
+                Err(control) => stop_with_escape(&mut escape, control),
+            },
+        );
+        let control = match resume_from_escape(escape, flow) {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        };
+        (states, control)
+    }
+
+    /// The truthiness of every output of `cond` over this state, with the
+    /// escape that ended it -- the values themselves are never kept, only
+    /// the bit each `if` reads (#2692: testing a value decodes nothing).
+    fn cond_bits<S: EvalSemantics>(
+        &self,
+        cond: &Expr,
+        optional: bool,
+    ) -> (Vec<bool>, Option<Control>) {
+        let mut bits = Vec::new();
+        let mut escape: Option<Control> = None;
+        let flow = self.each::<S>(
+            cond,
+            optional,
+            &mut |item| match generic_item_truthiness::<_, S>(item) {
+                Ok(bit) => {
+                    bits.push(bit);
+                    Demand::Continue
+                }
+                Err(control) => stop_with_escape(&mut escape, control),
+            },
+        );
+        let control = match resume_from_escape(escape, flow) {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        };
+        (bits, control)
+    }
+}
+
+/// Which of the two jq loops [`each_loop_generic`] is running: `until`
+/// stops a branch on a truthy `cond` and emits the state there; `while`
+/// emits the state on a truthy `cond` and keeps stepping, and stops on a
+/// falsy one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoopKind {
+    Until,
+    While,
+}
+
+impl LoopKind {
+    fn name(self) -> &'static str {
+        match self {
+            LoopKind::Until => "until",
+            LoopKind::While => "while",
+        }
+    }
+}
+
+/// `until(cond; update)`/`while(cond; update)` over the cursor, instead of
+/// through [`bridge_to_full_evaluator_flow`]'s ambient materialization
+/// (#2658). Generic twin of `eval::eval_until`/`eval_while`, whose
+/// `until_step`/`while_step` recursion this reproduces state for state --
+/// jq's backtracking definitions (`def _until: if cond then . else (update
+/// | _until) end;`, `def _while: if cond then ., (update | _while) else
+/// empty end;`), so a multi-output `cond` forks the rest of the loop per
+/// output (#534), each branch of a multi-output `update` runs to its own end
+/// before the next starts, the single-output step loops in place so an
+/// ordinary loop costs no stack depth, and one [`WHILE_UNTIL_MAX_STEPS`]
+/// budget is shared across the whole tree (#2087). Outputs stream to `sink`
+/// as each branch decides them rather than collecting into a `Vec`, which
+/// is the same order the eager `outputs.push` produces; a downstream
+/// `Demand::Stop` (`first(while(true; . + 1))`) unwinds the tree at once,
+/// where the eager arm has no early exit at all.
+///
+/// The bridge's materialization was two costs on the alias fan-out: the
+/// `to_owned` of the whole input (`.a20 | while(false; .)` took 0.84 s /
+/// 762 MB to emit nothing), and the copy of every state a branch emits. Here
+/// a state that is still a document node is emitted *as* that node
+/// ([`LoopState::emit`]), so `.a20 | until(true; .) | length` reads the
+/// length in place. What this validates changes accordingly (#2103): the
+/// eager arm's `to_owned` of the starting value raised on an undecodable
+/// member anywhere in it (#1755); here only what `cond`/`update` read is
+/// decoded, so `until(true; .) | .d` on a document with a malformed `.a`
+/// answers `.d`, exactly as `.d` alone does. Recorded in
+/// `docs/compliance/jq/limitations.md`.
+///
+/// A trailing error is silenced under an ambient `optional` and the outputs
+/// already streamed stand, the `finish_fork` rule (#1902: never a decode
+/// failure, a resource-limit raise or a yq negative-index raise --
+/// [`suppresses`]); a `break`/`halt` always propagates.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors until_step's own six, plus the loop kind and the sink it streams to.
+fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
+    kind: LoopKind,
+    cond: &Expr,
+    update: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let mut budget = WHILE_UNTIL_MAX_STEPS;
+    let state = LoopState::Document(value, cursor);
+    match loop_step_generic::<S, V>(kind, cond, update, state, optional, &mut budget, sink) {
+        Ok(Demand::Continue) => Flow::Exhausted,
+        Ok(Demand::Stop) => Flow::Stopped { pending: None },
+        Err(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
+        Err(control) => Flow::Escaped(control),
+    }
+}
+
+/// One branch of [`each_loop_generic`]'s tree -- `until_step`/`while_step`
+/// over a [`LoopState`], with the two loops' one difference expressed as
+/// which `cond` bit continues the branch (`until` continues on `false`,
+/// `while` on `true`) and whether the state is emitted before continuing
+/// (`while`) or instead of it (`until`). `Ok(Demand::Stop)` is the sink's
+/// own stop, unwinding every level.
+fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
+    kind: LoopKind,
+    cond: &Expr,
+    update: &Expr,
+    mut state: LoopState<V>,
+    optional: bool,
+    budget: &mut usize,
+    sink: &mut dyn Sink<V>,
+) -> Result<Demand, Control> {
+    // `until` steps on a falsy `cond`; `while` on a truthy one.
+    let continues_on = kind == LoopKind::While;
+    loop {
+        if *budget == 0 {
+            // #2132: uncatchable -- see `EvalError::resource_limit`.
+            return Err(Control::Error(EvalError::resource_limit(&format!(
+                "{}: maximum iterations exceeded",
+                kind.name()
+            ))));
+        }
+        *budget -= 1;
+
+        let (bits, cond_control) = state.cond_bits::<S>(cond, optional);
+
+        // Fast path: exactly one continuing `cond` output and exactly one
+        // `update` output -- continue in place rather than recursing, so this
+        // step costs no stack depth (`until_step`'s own rationale).
+        if cond_control.is_none() && bits.len() == 1 && bits[0] == continues_on {
+            if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+                return Ok(Demand::Stop);
+            }
+            let (mut next, update_control) = state.fork::<S>(update, optional);
+            if update_control.is_none() && next.len() == 1 {
+                state = next.pop().expect("one update output");
+                continue;
+            }
+            for next_state in next {
+                if loop_step_generic::<S, V>(
+                    kind, cond, update, next_state, optional, budget, sink,
+                )? == Demand::Stop
+                {
+                    return Ok(Demand::Stop);
+                }
+            }
+            return update_control.map_or(Ok(Demand::Continue), Err);
+        }
+
+        for bit in bits {
+            if bit != continues_on {
+                // `until`'s truthy branch emits the state and stops there;
+                // `while`'s falsy branch is `empty`.
+                if kind == LoopKind::Until && sink.push(state.emit()) == Demand::Stop {
+                    return Ok(Demand::Stop);
+                }
+                continue;
+            }
+            if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
+                return Ok(Demand::Stop);
+            }
+            let (next, update_control) = state.fork::<S>(update, optional);
+            for next_state in next {
+                if loop_step_generic::<S, V>(
+                    kind, cond, update, next_state, optional, budget, sink,
+                )? == Demand::Stop
+                {
+                    return Ok(Demand::Stop);
+                }
+            }
+            if let Some(control) = update_control {
+                return Err(control);
+            }
+        }
+        return cond_control.map_or(Ok(Demand::Continue), Err);
+    }
 }
 
 /// Demand-forwarding twin of `eval_builtin`'s own native `Builtin::Select`
@@ -22068,6 +22516,29 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::All if cursor.is_some() => {
             any_all_generic::<S, V>(&value, optional, cursor.expect("guarded"), "all", false)
         }
+
+        // #2658: the `cond` forms, gated the same way and for the same reason
+        // as `Any`/`All` above -- without a cursor the wildcard already runs
+        // `eval.rs`'s `any_all_f` on an owned value it does not have to copy.
+        // Same live-input-queue deferral as the #2968 arms above (#1309).
+        Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_)
+            if crate::jq::input_queue_is_active()
+                && crate::jq::walk::uses_input_builtins(&Expr::Builtin(builtin.clone())) =>
+        {
+            bridge_to_full_evaluator::<S, _>(
+                &Expr::Builtin(builtin.clone()),
+                value,
+                cursor,
+                optional,
+            )
+        }
+        Builtin::AnyF(cond) if cursor.is_some() => {
+            any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true)
+        }
+        Builtin::AllF(cond) if cursor.is_some() => {
+            any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), false)
+        }
+        Builtin::IsValid(f) => isvalid_generic::<S, V>(f, value, cursor),
 
         _ => {
             // #2231: `owned_or_suppress!`, not `owned_or_err!` -- this

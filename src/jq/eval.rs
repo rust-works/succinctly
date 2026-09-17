@@ -11814,9 +11814,14 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match value {
         StandardJson::Array(elements) => owned_bool(any_all_over::<_, S>(elements, true)),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        StandardJson::Object(fields) => {
-            owned_bool(any_all_over::<_, S>(fields.map(|f| f.value()), true))
-        }
+        // #2658: effective values under the mode's duplicate-key rule, as
+        // `any_all_f`'s object arm -- see its comment.
+        StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
+            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                .into_iter()
+                .map(|f| f.value),
+            true,
+        )),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: `scalar_fallback`, not a bare `_ if optional` + type error.
         // jq mode's wildcard also catches `String`, so an undecodable string
@@ -11855,9 +11860,14 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match value {
         StandardJson::Array(elements) => owned_bool(any_all_over::<_, S>(elements, false)),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        StandardJson::Object(fields) => {
-            owned_bool(any_all_over::<_, S>(fields.map(|f| f.value()), false))
-        }
+        // #2658: effective values under the mode's duplicate-key rule, as
+        // `any_all_f`'s object arm -- see its comment.
+        StandardJson::Object(fields) => owned_bool(any_all_over::<_, S>(
+            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                .into_iter()
+                .map(|f| f.value),
+            false,
+        )),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1989: same `scalar_fallback` conversion as `builtin_any` above --
         // see its comment for why the jq-mode wildcard needed one too.
@@ -11920,9 +11930,21 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Array(elements) => any_all_f_over::<W, S>(cond, elements, target_truthy),
-        StandardJson::Object(fields) => {
-            any_all_f_over::<W, S>(cond, fields.map(|f| f.value()), target_truthy)
-        }
+        // #2658: the object's *effective* values, under the mode's
+        // duplicate-key rule, exactly as this file's own `Expr::Iterate` arm
+        // walks them (#1385) -- a raw `fields.map(|f| f.value())` probed
+        // both members of `{"a":true,"a":false}`, so `any(.)` answered
+        // `true` where jq 1.7.1 answers `false`. Unreachable from the CLI
+        // until the generic evaluator gained its own `any_all_f_generic`
+        // arm (the bridge's `to_owned` collapsed the keys on the way in);
+        // the library's eager entry point always had it.
+        StandardJson::Object(fields) => any_all_f_over::<W, S>(
+            cond,
+            effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                .into_iter()
+                .map(|f| f.value),
+            target_truthy,
+        ),
         // #1989: `scalar_fallback`, for the same reason as bare
         // `any`/`all` above -- `any(cond)`/`all(cond)` on an undecodable
         // string input reported `Cannot iterate over string ("")` (or
@@ -42894,7 +42916,7 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// superlinear-cost cond/update body kept in the single-digit seconds,
 /// measured rather than assumed). Full rationale:
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
-const WHILE_UNTIL_MAX_STEPS: usize = 100_000;
+pub(crate) const WHILE_UNTIL_MAX_STEPS: usize = 100_000;
 
 /// Evaluate `until(cond; update)` - apply update until cond is true.
 ///
@@ -43888,11 +43910,38 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `QueryResult::is_error` rather than re-spelling the same two-variant
     // match by hand, so this can't drift from that helper's own definition
     // of "ended in an error" the way a second inline copy could.
+    // #2658: an error `try` itself cannot catch -- a decode failure (#1620),
+    // a resource-limit raise (#2132), a yq negative-index raise (#2254) --
+    // passes through this verdict too, the rule `Expr::Try`/`?`/`//` all
+    // apply (`is_uncatchable_at_value_position`). Before the generic route
+    // gained its own arm this was unreachable here: the bridge's whole-input
+    // `to_owned` raised the decode failure first.
+    if let QueryResult::Error(ref e) | QueryResult::Partial(_, Control::Error(ref e)) = result {
+        if e.is_uncatchable_at_value_position() {
+            return match result {
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    QueryResult::Error(e)
+                }
+                _ => unreachable!("matched an error shape just above"),
+            };
+        }
+    }
     if result.is_error() {
         return QueryResult::Owned(OwnedValue::Bool(false));
     }
     match result {
+        // #2658: an empty `Many`/`ManyOwned` is the same "zero outputs, no
+        // error" verdict `None` is -- `isvalid(.[])` on `[]` used to answer
+        // `true` here while `isvalid(empty)` answered `false` (the #881
+        // review's own rule), because `.[]` over an empty container comes
+        // back as an empty vector rather than `None`. The generic route's
+        // `isvalid_generic` counts outputs and so never had the gap; this
+        // closes it on the eager route too.
         QueryResult::None => QueryResult::Owned(OwnedValue::Bool(false)),
+        QueryResult::Many(ref vs) if vs.is_empty() => QueryResult::Owned(OwnedValue::Bool(false)),
+        QueryResult::ManyOwned(ref vs) if vs.is_empty() => {
+            QueryResult::Owned(OwnedValue::Bool(false))
+        }
         // A halt is never a validity verdict: it must exit the process, not
         // report `true`/`false` and let evaluation continue (#791) — same
         // shape as the `Error`/`None` cases above never being swallowed by
