@@ -52496,7 +52496,7 @@ fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned_lossy(&value);
+    let owned = to_owned_lossy::<S, W>(&value);
     let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &OwnedValue::Int(0));
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
