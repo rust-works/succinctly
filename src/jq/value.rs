@@ -269,13 +269,23 @@ fn significant_digit_count(text: &str) -> usize {
 ///
 /// A literal with at most 17 significant digits is unchanged by the
 /// intermediate rounding, so it takes the plain parse straight away --
-/// which is nearly every document number. `Emax`/`Emin` of the DECIMAL64
-/// context (`384`/`-383`) are not modelled: every finite double lies inside
-/// that range, and a literal outside it is infinite or zero after the
-/// final parse either way (`1.00000000000000000001e400` and `e-390` are
-/// pinned). Accepts every spelling the literal funnels store, the lenient
-/// ones included (`.5`, `007.5`, `1.e5`, a leading `-`); `None` only when
-/// the text is not a number at all, which no funnel hands it.
+/// which is nearly every document number. That gate is two-tiered because
+/// this sits on the per-number hot path of every materialization: a text of
+/// at most 17 *bytes* cannot hold 18 significant digits and skips even the
+/// digit count (an interleaved A/B read +5-8% on a 4 MB array of
+/// 8-digit floats with the count alone, neutral with the length check in
+/// front of it); only a longer text is counted. The slow path runs on a
+/// stack buffer -- the first 18 significant digits, a "nonzero digits
+/// beyond" flag, and the spelled `d.ddd…e±x` -- with no allocation, since a
+/// document of 18-22-digit literals materializes every one of them through
+/// here (measured: a `Vec`+`String` version cost +37-60% on such a document,
+/// this one is what the A/B on the PR records). `Emax`/`Emin` of the
+/// DECIMAL64 context (`384`/`-383`) are not modelled: every finite double
+/// lies inside that range, and a literal outside it is infinite or zero
+/// after the final parse either way (`1.00000000000000000001e400` and
+/// `e-390` are pinned). Accepts every spelling the literal funnels store,
+/// the lenient ones included (`.5`, `007.5`, `1.e5`, a leading `-`); `None`
+/// only when the text is not a number at all, which no funnel hands it.
 ///
 /// Sign-symmetric by construction (the sign is peeled first and re-applied
 /// last), which is what lets the parser's unary-minus fold negate a
@@ -285,62 +295,154 @@ fn significant_digit_count(text: &str) -> usize {
 /// `ParseFloat`, which the plain parse already is.
 pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
     const DOUBLE_PRECISION_DIGITS: usize = 17;
-    if significant_digit_count(text) <= DOUBLE_PRECISION_DIGITS {
+    // A text of at most 17 bytes cannot carry 18 significant digits; a
+    // longer one might (`0.0000000000000001` is 18 bytes and one digit), so
+    // it is counted before the slow path is committed to.
+    if text.len() <= DOUBLE_PRECISION_DIGITS
+        || significant_digit_count(text) <= DOUBLE_PRECISION_DIGITS
+    {
         return text.parse::<f64>().ok();
     }
-    let (negative, mut digits, mut exponent) = decompose_decimal_literal(text);
-    if digits.len() > DOUBLE_PRECISION_DIGITS {
-        // Round half-even on the 18th digit and everything after it. The
-        // digits carry no trailing zeros (`decompose_decimal_literal`
-        // strips them), so an exact tie is a tail of exactly `5`.
-        let tail = digits.split_off(DOUBLE_PRECISION_DIGITS);
-        exponent += tail.len() as i128;
-        let round_up = match tail[0] {
+    let bytes = text.as_bytes();
+    let (negative, mut i) = match bytes.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        _ => (false, 0),
+    };
+    // Walk the mantissa once, keeping the first 18 significant digits (17
+    // to keep, one to round on) and whether anything nonzero follows them.
+    // `exponent10` is the power of ten the *last kept digit* sits at once
+    // the fraction and the exponent part are accounted for.
+    let mut kept = [0u8; DOUBLE_PRECISION_DIGITS + 1];
+    let mut kept_len = 0usize;
+    let mut tail_nonzero = false;
+    let mut seen_nonzero = false;
+    let mut exponent10: i64 = 0;
+    let mut in_fraction = false;
+    let mut any_digit = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' if !in_fraction => in_fraction = true,
+            d @ b'0'..=b'9' => {
+                any_digit = true;
+                if !seen_nonzero && d == b'0' {
+                    // A leading zero contributes nothing to the digits and
+                    // only moves the point when it is in the fraction.
+                    if in_fraction {
+                        exponent10 -= 1;
+                    }
+                } else {
+                    seen_nonzero = true;
+                    if kept_len < kept.len() {
+                        kept[kept_len] = d;
+                        kept_len += 1;
+                        if in_fraction {
+                            exponent10 -= 1;
+                        }
+                    } else {
+                        // Past the 18th digit: an integer-part digit scales
+                        // the kept digits up by ten, a fraction digit does
+                        // not move them at all.
+                        if !in_fraction {
+                            exponent10 += 1;
+                        }
+                        tail_nonzero |= d != b'0';
+                    }
+                }
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if !any_digit {
+        return None;
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        // `parse_literal_exponent` saturates an absurd exponent; clamp far
+        // beyond any double's range so the arithmetic below cannot overflow.
+        exponent10 += parse_literal_exponent(&text[i + 1..])
+            .value()
+            .clamp(-(1 << 40), 1 << 40) as i64;
+    }
+    if kept_len == 0 {
+        return Some(if negative { -0.0 } else { 0.0 });
+    }
+    // Round half-even on the 18th digit and everything after it.
+    if kept_len > DOUBLE_PRECISION_DIGITS {
+        let round_digit = kept[DOUBLE_PRECISION_DIGITS];
+        kept_len = DOUBLE_PRECISION_DIGITS;
+        exponent10 += 1;
+        let round_up = match round_digit {
             b'6'..=b'9' => true,
-            b'5' => tail.len() > 1 || (digits[DOUBLE_PRECISION_DIGITS - 1] - b'0') % 2 == 1,
+            b'5' => tail_nonzero || (kept[DOUBLE_PRECISION_DIGITS - 1] - b'0') % 2 == 1,
             _ => false,
         };
         if round_up {
-            // Propagate the carry; `999…9` becomes `1000…0`, i.e. a single
-            // `1` one place higher.
-            let mut i = digits.len();
+            let mut j = kept_len;
             loop {
-                if i == 0 {
-                    digits.clear();
-                    digits.push(b'1');
-                    exponent += DOUBLE_PRECISION_DIGITS as i128;
+                if j == 0 {
+                    // `999…9` carried all the way out: a single `1`, one
+                    // place higher.
+                    kept[0] = b'1';
+                    kept_len = 1;
+                    exponent10 += DOUBLE_PRECISION_DIGITS as i64;
                     break;
                 }
-                i -= 1;
-                if digits[i] == b'9' {
-                    digits[i] = b'0';
+                j -= 1;
+                if kept[j] == b'9' {
+                    kept[j] = b'0';
                 } else {
-                    digits[i] += 1;
+                    kept[j] += 1;
                     break;
                 }
             }
         }
     }
-    if digits.is_empty() {
-        return Some(if negative { -0.0 } else { 0.0 });
-    }
-    // `d.ddd…e<exp>`: the exponent of the leading digit is
-    // `exponent + digits.len() - 1`. Clamped far outside any double's
-    // range so the formatting can never fail and the parse saturates to
-    // infinity or zero exactly as `strtod` would.
-    let leading_exponent = (exponent + digits.len() as i128 - 1).clamp(-100_000, 100_000);
-    let mut spelled = String::with_capacity(digits.len() + 12);
+    // Spell `d.ddd…e<exp>` into a stack buffer: the exponent of the leading
+    // digit is `exponent10 + kept_len - 1`. Clamped so the buffer fits and
+    // the parse saturates to infinity or zero exactly as `strtod` would.
+    let leading_exponent = (exponent10 + kept_len as i64 - 1).clamp(-99_999, 99_999);
+    let mut spelled = [0u8; 32];
+    let mut n = 0usize;
     if negative {
-        spelled.push('-');
+        spelled[n] = b'-';
+        n += 1;
     }
-    spelled.push(digits[0] as char);
-    if digits.len() > 1 {
-        spelled.push('.');
-        spelled.extend(digits[1..].iter().map(|&d| d as char));
+    spelled[n] = kept[0];
+    n += 1;
+    if kept_len > 1 {
+        spelled[n] = b'.';
+        n += 1;
+        spelled[n..n + kept_len - 1].copy_from_slice(&kept[1..kept_len]);
+        n += kept_len - 1;
     }
-    spelled.push('e');
-    spelled.push_str(&leading_exponent.to_string());
-    spelled.parse::<f64>().ok()
+    spelled[n] = b'e';
+    n += 1;
+    let mut exp = leading_exponent;
+    if exp < 0 {
+        spelled[n] = b'-';
+        n += 1;
+        exp = -exp;
+    }
+    let mut digits = [0u8; 6];
+    let mut d = 0usize;
+    loop {
+        digits[d] = b'0' + (exp % 10) as u8;
+        d += 1;
+        exp /= 10;
+        if exp == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        spelled[n] = digits[d];
+        n += 1;
+    }
+    core::str::from_utf8(&spelled[..n])
+        .ok()?
+        .parse::<f64>()
+        .ok()
 }
 
 /// Convert an integer *literal* to `f64` the way real jq 1.7.1 does (#2906);
@@ -2778,7 +2880,7 @@ impl OwnedValue {
     /// stored text unchanged.
     ///
     /// `S` is the number model the literal's double is read under (#2936);
-    /// see [`from_number_literal`](Self::from_number_literal).
+    /// see `from_number_literal` and `parse_i64_or_f64_in` (both private).
     pub fn from_number_bytes<S: EvalSemantics>(bytes: &[u8]) -> Self {
         if let Some(f) = Self::bridge_nonfinite_from_bytes(bytes) {
             return Self::Float(f);
