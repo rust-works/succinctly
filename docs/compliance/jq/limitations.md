@@ -7054,24 +7054,50 @@ def errors entirely.
 A bad `--slurpfile`/`--rawfile`/`--argjson` argument now exits 2 (jq's usage-error code) with
 a single `jq: ...` line instead of routing through `anyhow`'s generic exit-1 `Error: .../Caused
 by:` block ([#3051](https://github.com/rust-works/succinctly/issues/3051)). The wrapper
-wording matches jq 1.7.1 byte-for-byte, confirmed live, for every case but one:
+wording matches jq 1.7.1 byte-for-byte, confirmed live, for a missing file on either flag and
+for a malformed `--argjson` value:
 
-| filter                                    | jq 1.7.1                                                                                         | succinctly                                                       |
-|--------------------------------------------|---------------------------------------------------------------------------------------------------|--------------------------------------------------------------------|
-| `--slurpfile x <missing>`                  | `jq: Bad JSON in --slurpfile x <missing>: Could not open <missing>: No such file or directory`    | byte-identical                                                      |
-| `--rawfile x <missing>`                     | `jq: Bad JSON in --rawfile x <missing>: Could not open <missing>: No such file or directory`      | byte-identical                                                      |
-| `--argjson x '[1,'`                        | `jq: invalid JSON text passed to --argjson` + usage-hint trailer                                  | byte-identical                                                      |
-| `--slurpfile x <truncated JSON>`           | `jq: Bad JSON in --slurpfile x <file>: Unfinished JSON term at EOF at line 2, column 5`            | `jq: Bad JSON in --slurpfile x <file>: Invalid JSON in stream`      |
+```console
+$ jq  -nc 1 --slurpfile x /nonexistent    # jq: Bad JSON in --slurpfile x /nonexistent: Could not open /nonexistent: No such file or directory
+$ sjq -nc 1 --slurpfile x /nonexistent    # byte-identical
+$ jq  -nc 1 --rawfile x /nonexistent      # jq: Bad JSON in --rawfile x /nonexistent: Could not open /nonexistent: No such file or directory
+$ sjq -nc 1 --rawfile x /nonexistent      # byte-identical
+$ jq  -nc 1 --argjson x '[1,'             # jq: invalid JSON text passed to --argjson  (+ usage-hint trailer)
+$ sjq -nc 1 --argjson x '[1,'             # byte-identical
+```
 
-Only the last row's *inner* detail (after the second `: `) diverges: jq's own line/column
-diagnostic comes from its own hand-written JSON reader, where succinctly's comes from
-`serde_json`'s `Display` for the same failure class. Reproducing jq's exact wording there
-would mean re-deriving its parser's own error-position/message rules for this one CLI-arg
-error path — out of proportion to this issue's own "Low severity" scope, which was the exit
-code and the reporting channel, not this detail text. `--jsonargs` has the identical exit-1
-bug (confirmed live: jq exits 2 for a bad `--jsonargs` value too) but is left unfixed here,
-filed as [#3096](https://github.com/rust-works/succinctly/issues/3096) instead of folded into
-this issue's own narrower scope.
+Only `--slurpfile`'s own malformed-JSON *inner* detail (after the wrapper's second `: `)
+diverges:
+
+```console
+$ jq  -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Unfinished JSON term at EOF at line 2, column 5
+$ sjq -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Invalid JSON in stream: EOF while parsing a value at line 2 column 5
+```
+
+jq's own line/column diagnostic comes from its own hand-written JSON reader; succinctly's
+`Invalid JSON in stream: <serde_json detail>` comes from `anyhow`'s context chain over
+`serde_json`'s own `Display` for the same failure (`parse_json_stream`'s
+`.context("Invalid JSON in stream")` — the chain is preserved via `anyhow::Error`'s alternate
+`{:#}` Display, not dropped). Reproducing jq's exact wording there would mean re-deriving its
+parser's own error-position/message rules for this one CLI-arg error path — out of proportion
+to this issue's own "Low severity" scope, which was the exit code and the reporting channel,
+not this detail text.
+
+`--rawfile`'s "Could not open" wrapper also covers invalid-UTF-8 file content (`std::io::Error`'s
+`ErrorKind::InvalidData`, since this crate reads the argument as a Rust `String`) — unverifiable
+against jq, which reads raw bytes and never rejects invalid UTF-8 there at all (confirmed live:
+`jq -nc 1 --rawfile x <file with invalid UTF-8>` exits 0, the content silently unused by a filter
+that never reads `$x`). Not the scope of this issue either: it is a pre-existing limitation of
+this crate's whole `--rawfile`/`--slurpfile` pipeline being built on `String`, not something
+#3051 introduces or narrows.
+
+`--jsonargs` has the identical exit-1 bug (confirmed live: jq exits 2 for a bad `--jsonargs`
+value too) but is left unfixed here, filed as
+[#3096](https://github.com/rust-works/succinctly/issues/3096) instead of folded into this
+issue's own narrower scope. `-f`/`--from-file` and the main input file have the same bug too,
+filed as [#3098](https://github.com/rust-works/succinctly/issues/3098) — jq's own wording
+differs between those two and from `--slurpfile`/`--rawfile`'s wrapper here, so neither reuses
+this fix's message shape directly.
 
 ## Provenance
 

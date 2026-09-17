@@ -266,17 +266,45 @@ impl From<anyhow::Error> for BuildContextError {
     }
 }
 
+/// Print a [`BuildContextError::Usage`] message the way `run_jq`'s call
+/// site needs to (mirrors [`report_module_load_error`]'s own one-line-vs-
+/// scattered-`eprintln!` reasoning): a bare `jq:` prefix, no `error:`
+/// (unlike [`report_module_load_error`]'s own compile-error shape) --
+/// jq's own usage-error wording never includes it.
+fn report_usage_error(message: &str) {
+    eprintln!("jq: {message}");
+}
+
 /// Strip Rust's `std::io::Error` Display's own `" (os error N)"` suffix,
 /// which has no jq equivalent -- jq's C `strerror()` call never appends an
-/// errno number. Leaves any other message untouched (that suffix is a fixed
-/// tail `io::Error::fmt` always appends after `strerror`'s own text, not a
-/// pattern that occurs elsewhere in it).
+/// errno number. Leaves any other message untouched: the one `std::io::Error`
+/// shape with no such suffix to strip is `ErrorKind::InvalidData` (invalid
+/// UTF-8 in a `--slurpfile`/`--rawfile` argument, constructed from a plain
+/// string rather than an OS errno) -- an unverified-against-jq wording for a
+/// failure class real jq's own byte-oriented reader never hits at all (it
+/// accepts arbitrary bytes in `--rawfile`; confirmed live), so there is
+/// nothing to match there, only to not silently corrupt.
 fn strerror_only(e: &std::io::Error) -> String {
     let full = e.to_string();
     match full.rsplit_once(" (os error ") {
         Some((message, _)) => message.to_string(),
         None => full,
     }
+}
+
+/// Read `--slurpfile`/`--rawfile`'s file argument, wrapped in jq's own
+/// `Bad JSON in --<flag> <name> <file>: Could not open <file>: <detail>`
+/// shape on a read failure (#3051, confirmed live for both flags) -- one
+/// place so a future wording tweak can't land on one flag and not the
+/// other the way the two near-identical inline blocks it replaces could
+/// have drifted.
+fn read_arg_file(flag: &str, name: &str, file: &str) -> Result<String, BuildContextError> {
+    std::fs::read_to_string(file).map_err(|e| {
+        BuildContextError::Usage(format!(
+            "Bad JSON in --{flag} {name} {file}: Could not open {file}: {}",
+            strerror_only(&e)
+        ))
+    })
 }
 
 /// Resolve a module path to a file path within `search_path`.
@@ -2601,7 +2629,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let context = match build_context(&args) {
         Ok(context) => context,
         Err(BuildContextError::Usage(message)) => {
-            eprintln!("jq: {message}");
+            report_usage_error(&message);
             return Ok(exit_codes::USAGE_ERROR);
         }
         Err(BuildContextError::Other(e)) => return Err(e),
@@ -3612,17 +3640,18 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     // and malformed JSON in it under the identical "Bad JSON in --slurpfile
     // ..." wording (#3051, confirmed live) -- succinctly's own detail text
     // after the colon is not jq's (see `docs/compliance/jq/limitations.md`),
-    // but the flag, exit code (2) and single-line shape now match.
+    // but the flag, exit code (2) and single-line shape now match. `{e:#}`,
+    // not `{e}`: `parse_json_stream`'s own `.context("Invalid JSON in
+    // stream")` call replaces (not chains onto) the wrapped `serde_json`
+    // error's own Display, so a bare `{e}` here would silently drop its
+    // line/column detail entirely rather than merely wording it differently
+    // from jq's own diagnostic -- `anyhow::Error`'s alternate Display joins
+    // the whole context chain instead.
     for chunk in args.slurpfile.chunks(2) {
         if let [name, file] = chunk {
-            let contents = std::fs::read_to_string(file).map_err(|e| {
-                BuildContextError::Usage(format!(
-                    "Bad JSON in --slurpfile {name} {file}: Could not open {file}: {}",
-                    strerror_only(&e)
-                ))
-            })?;
+            let contents = read_arg_file("slurpfile", name, file)?;
             let values = parse_json_stream(&contents).map_err(|e| {
-                BuildContextError::Usage(format!("Bad JSON in --slurpfile {name} {file}: {e}"))
+                BuildContextError::Usage(format!("Bad JSON in --slurpfile {name} {file}: {e:#}"))
             })?;
             context
                 .named
@@ -3636,12 +3665,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     // unconditionally (#3051, confirmed live).
     for chunk in args.rawfile.chunks(2) {
         if let [name, file] = chunk {
-            let contents = std::fs::read_to_string(file).map_err(|e| {
-                BuildContextError::Usage(format!(
-                    "Bad JSON in --rawfile {name} {file}: Could not open {file}: {}",
-                    strerror_only(&e)
-                ))
-            })?;
+            let contents = read_arg_file("rawfile", name, file)?;
             context
                 .named
                 .insert(name.clone(), OwnedValue::String(contents));
