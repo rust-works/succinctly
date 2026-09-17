@@ -3142,6 +3142,30 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    match collect_array_items::<W, S>(inner, value, optional) {
+        Ok(items) => QueryResult::Owned(OwnedValue::Array(items.into())),
+        Err(escape) => escape,
+    }
+}
+
+/// [`eval_array_construction`] without the `OwnedValue::Array` wrapper: the
+/// constructed elements as a bare `Vec`, or the `QueryResult` that ends the
+/// construction (`Error`/`Break`/`Halt`).
+///
+/// The sort family's key computation (`sort_by`/`group_by`/`unique_by`/
+/// `min_by`/`max_by`, which key by jq's own `[f]`) holds one key per element
+/// only to compare and then discard it, so it takes the `Vec` here and
+/// compares with [`compare_key_arrays`] instead of wrapping each key in an
+/// `OwnedValue::Array` (#2999): since the wrapper's storage is refcounted,
+/// that wrapping would cost a second allocation per key and a pointer chase
+/// per comparison -- measured at +6% to +20% on `sort_by(.)` before this
+/// split, and nothing under B's inline `Vec` -- for an array no one ever
+/// shares.
+fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    inner: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
     // Collect all outputs from the inner expression into an array
     let result = eval_single::<W, S>(inner, value, optional);
 
@@ -3164,28 +3188,28 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // comment just above.
         QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => vec![v],
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return Err(QueryResult::Error(e)),
         },
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => match vs.iter().map(to_owned).collect::<Result<_, _>>() {
             Ok(items) => items,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return Err(QueryResult::Error(e)),
         },
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => vec![],
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Error(e) => return Err(QueryResult::Error(e)),
+        QueryResult::Break(label) => return Err(QueryResult::Break(label)),
+        QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
         // Array construction is atomic in jq (verified: `[1,error("x"),3]`
         // produces no output at all, not a partial array) — a `Partial`
         // inner stream just surfaces its control, same as a bare one.
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Error(e)) => return Err(QueryResult::Error(e)),
+        QueryResult::Partial(_, Control::Break(label)) => return Err(QueryResult::Break(label)),
+        QueryResult::Partial(_, Control::Halt(code)) => return Err(QueryResult::Halt(code)),
     };
 
-    QueryResult::Owned(OwnedValue::Array(items.into()))
+    Ok(items)
 }
 
 /// The `QueryResult` variants [`eval_array_construction`] never returns,
@@ -9835,6 +9859,40 @@ pub(crate) fn compare_values<S: EvalSemantics>(
 /// `repeat` build up at query-evaluation time bypasses #998's
 /// document-input guards entirely: no adversarial document is involved,
 /// only enough loop iterations to grow the accumulator past the limit.
+/// jq's array ordering over two element slices: lexicographic by
+/// [`compare_values_at_depth`] on the elements, then by length -- the
+/// `Array` arm of `compare_values`, factored so the sort family can order
+/// bare `Vec` keys without wrapping them (see [`collect_array_items`]).
+fn compare_slices_at_depth<S: EvalSemantics>(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    depth: usize,
+) -> core::cmp::Ordering {
+    for (av, bv) in a.iter().zip(b.iter()) {
+        match compare_values_at_depth::<S>(av, bv, depth) {
+            core::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Order two `[f]` keys exactly as `compare_values` orders the
+/// `OwnedValue::Array`s they would have been wrapped in.
+fn compare_key_arrays<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> core::cmp::Ordering {
+    compare_slices_at_depth::<S>(a, b, 1)
+}
+
+/// jq equality of two `[f]` keys, as `owned_value_eq` would answer for the
+/// `OwnedValue::Array`s they would have been wrapped in: same length and
+/// element-wise `==` under `S`'s number rules.
+fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| owned_value_eq::<S>(x, y))
+}
+
 fn compare_values_at_depth<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
@@ -9879,13 +9937,7 @@ fn compare_values_at_depth<S: EvalSemantics>(
         }
         (OwnedValue::String(a), OwnedValue::String(b)) => a.cmp(b),
         (OwnedValue::Array(a), OwnedValue::Array(b)) => {
-            for (av, bv) in a.iter().zip(b.iter()) {
-                match compare_values_at_depth::<S>(av, bv, depth + 1) {
-                    Ordering::Equal => continue,
-                    other => return other,
-                }
-            }
-            a.len().cmp(&b.len())
+            compare_slices_at_depth::<S>(a, b, depth + 1)
         }
         (OwnedValue::Object(a), OwnedValue::Object(b)) => {
             // jq compares the sorted key arrays first, then values in
@@ -12132,20 +12184,14 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Compute keys for each item. jq keys by `[f]` — the array of
             // *all* outputs of the key filter, not just its first output
             // (#155).
-            let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
+            let mut keyed: Vec<(Vec<OwnedValue>, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_array_construction::<W, S>(f, item.clone(), optional) {
-                    QueryResult::Owned(v) => keyed.push((v, item)),
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // #2182: was a wildcard `_ =>` -- see
-                    // `eval_array_construction_impossible_variants!`'s own
-                    // doc comment for the verification and why this is
-                    // shared.
-                    eval_array_construction_impossible_variants!() => {
-                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
-                    }
+                // A bare `Vec`, compared with `compare_key_arrays`, rather
+                // than an `OwnedValue::Array` (#2999; see
+                // `collect_array_items`).
+                match collect_array_items::<W, S>(f, item.clone(), optional) {
+                    Ok(key) => keyed.push((key, item)),
+                    Err(escape) => return escape,
                 }
             }
 
@@ -12155,7 +12201,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_del`'s doc comment for the shared reasoning.
             let (_, v) = keyed
                 .into_iter()
-                .min_by(|(a, _), (b, _)| compare_values::<S>(a, b))
+                .min_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
                 .unwrap();
             let min = match to_owned(&v) {
                 Ok(v) => v,
@@ -12200,20 +12246,14 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Compute keys for each item. jq keys by `[f]` — the array of
             // *all* outputs of the key filter, not just its first output
             // (#155).
-            let mut keyed: Vec<(OwnedValue, StandardJson<'a, W>)> = Vec::new();
+            let mut keyed: Vec<(Vec<OwnedValue>, StandardJson<'a, W>)> = Vec::new();
             for item in items {
-                match eval_array_construction::<W, S>(f, item.clone(), optional) {
-                    QueryResult::Owned(v) => keyed.push((v, item)),
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // #2182: was a wildcard `_ =>` -- see
-                    // `eval_array_construction_impossible_variants!`'s own
-                    // doc comment for the verification and why this is
-                    // shared.
-                    eval_array_construction_impossible_variants!() => {
-                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
-                    }
+                // A bare `Vec`, compared with `compare_key_arrays`, rather
+                // than an `OwnedValue::Array` (#2999; see
+                // `collect_array_items`).
+                match collect_array_items::<W, S>(f, item.clone(), optional) {
+                    Ok(key) => keyed.push((key, item)),
+                    Err(escape) => return escape,
                 }
             }
 
@@ -12223,7 +12263,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_min_by`'s sibling comment above.
             let (_, v) = keyed
                 .into_iter()
-                .max_by(|(a, _), (b, _)| compare_values::<S>(a, b))
+                .max_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b))
                 .unwrap();
             let max = match to_owned(&v) {
                 Ok(v) => v,
@@ -13498,23 +13538,17 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let items: Vec<StandardJson<'a, W>> = elements.collect();
 
             // Compute keys for each item
-            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            let mut keyed: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
             for item in items {
                 // jq keys by `[f]` — the array of *all* outputs of the key
                 // filter — not just its first output, so `sort_by(.a,.b)`
                 // is a genuine multi-key sort (#155).
-                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
-                    QueryResult::Owned(v) => v,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // #2182: was a wildcard `_ =>` -- see
-                    // `eval_array_construction_impossible_variants!`'s own
-                    // doc comment for the verification and why this is
-                    // shared.
-                    eval_array_construction_impossible_variants!() => {
-                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
-                    }
+                // A bare `Vec`, compared with `compare_key_arrays`, rather
+                // than an `OwnedValue::Array` (#2999; see
+                // `collect_array_items`).
+                let key = match collect_array_items::<W, S>(f, item.clone(), optional) {
+                    Ok(items) => items,
+                    Err(escape) => return escape,
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
@@ -13535,12 +13569,12 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
 
             // Group consecutive items with same key
             let mut groups: Vec<OwnedValue> = Vec::new();
             let mut current_group: Vec<OwnedValue> = Vec::new();
-            let mut current_key: Option<OwnedValue> = None;
+            let mut current_key: Option<Vec<OwnedValue>> = None;
 
             for (key, item) in keyed {
                 match &current_key {
@@ -13551,7 +13585,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // must agree with `==`'s own yq-mode strict Int/Float
                     // distinction (#950 review) -- `[2, 2.0]` groups as one
                     // in jq, two in yq.
-                    Some(k) if owned_value_eq::<S>(k, &key) => {
+                    Some(k) if key_arrays_eq::<S>(k, &key) => {
                         current_group.push(item);
                     }
                     _ => {
@@ -13672,23 +13706,17 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let items: Vec<StandardJson<'a, W>> = elements.collect();
 
             // Compute keys for each item
-            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            let mut keyed: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
             for item in items {
                 // jq keys by `[f]` — the array of *all* outputs of the key
                 // filter — not just its first output, so `sort_by(.a,.b)`
                 // is a genuine multi-key sort (#155).
-                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
-                    QueryResult::Owned(v) => v,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // #2182: was a wildcard `_ =>` -- see
-                    // `eval_array_construction_impossible_variants!`'s own
-                    // doc comment for the verification and why this is
-                    // shared.
-                    eval_array_construction_impossible_variants!() => {
-                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
-                    }
+                // A bare `Vec`, compared with `compare_key_arrays`, rather
+                // than an `OwnedValue::Array` (#2999; see
+                // `collect_array_items`).
+                let key = match collect_array_items::<W, S>(f, item.clone(), optional) {
+                    Ok(items) => items,
+                    Err(escape) => return escape,
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
@@ -13709,12 +13737,12 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
 
             // Remove consecutive duplicates by key. `owned_value_eq::<S>`,
             // not `compare_values(..) == Equal` (#950 review, same
             // reasoning as `unique`/`group_by`).
-            keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
+            keyed.dedup_by(|(a, _), (b, _)| key_arrays_eq::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result.into()))
@@ -13777,23 +13805,17 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let items: Vec<StandardJson<'a, W>> = elements.collect();
 
             // Compute keys for each item
-            let mut keyed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+            let mut keyed: Vec<(Vec<OwnedValue>, OwnedValue)> = Vec::new();
             for item in items {
                 // jq keys by `[f]` — the array of *all* outputs of the key
                 // filter — not just its first output, so `sort_by(.a,.b)`
                 // is a genuine multi-key sort (#155).
-                let key = match eval_array_construction::<W, S>(f, item.clone(), optional) {
-                    QueryResult::Owned(v) => v,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // #2182: was a wildcard `_ =>` -- see
-                    // `eval_array_construction_impossible_variants!`'s own
-                    // doc comment for the verification and why this is
-                    // shared.
-                    eval_array_construction_impossible_variants!() => {
-                        unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
-                    }
+                // A bare `Vec`, compared with `compare_key_arrays`, rather
+                // than an `OwnedValue::Array` (#2999; see
+                // `collect_array_items`).
+                let key = match collect_array_items::<W, S>(f, item.clone(), optional) {
+                    Ok(items) => items,
+                    Err(escape) => return escape,
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
@@ -13814,7 +13836,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
 
             // Sort by key
-            keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
+            keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result.into()))
@@ -97565,17 +97587,13 @@ mod share_audit_2999 {
             *by_kind.entry(site.kind).or_insert(0) += n;
         }
         let expected: BTreeMap<Kind, u64> = expected.iter().copied().collect();
+        let sites: String = recorded
+            .iter()
+            .map(|(s, n)| format!("{n:>8}  {:<16} {}:{}\n", s.kind.label(), s.file, s.line))
+            .collect();
         assert_eq!(
-            by_kind,
-            expected,
-            "{filter}: forced copies by site:\n{}",
-            share_stats::report()
-                .is_empty()
-                .then(|| recorded
-                    .iter()
-                    .map(|(s, n)| format!("{n:>8}  {:<16} {}:{}\n", s.kind.label(), s.file, s.line))
-                    .collect::<String>())
-                .unwrap_or_default()
+            by_kind, expected,
+            "{filter}: forced copies by site:\n{sites}"
         );
     }
 

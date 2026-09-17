@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
+#[cfg(not(feature = "unshared-containers"))]
 use alloc::rc::Rc;
 use core::ops::{Deref, DerefMut};
 
@@ -1777,11 +1778,13 @@ fn try_positive_shifted_plain(
 // on `wide_10mb | to_entries` -- ~290 bytes of allocator hole per entry
 // object. Both enums use `ObjectMapOf`, so a change here moves both at once.
 //
-// The `unshared-containers` cargo feature swaps the `Rc` for a `Box` in both
-// wrappers. That is functionally the #3000 layout built from this source
-// shape: the never-triggering holdout an A/B of the sharing subtracts as
-// code-layout bias (see `docs/guides/benchmarking.md`). Measurement only;
-// never enable it in a shipped build.
+// The `unshared-containers` cargo feature restores the #3000 layout from
+// this source shape -- the object map behind a plain `Box`, the array's
+// `Vec` inline -- so a clone deep-copies again and every container costs
+// exactly the allocations it did before #2999 (an inline `Vec` is 24 bytes,
+// so the value stays 32). That is the never-triggering holdout an A/B of the
+// sharing subtracts as code-layout bias (see `docs/guides/benchmarking.md`).
+// Measurement only; never enable it in a shipped build.
 
 /// The backing store for an object-valued enum arm: an
 /// `IndexMap<String, V>` held behind a single pointer (#3000), refcounted so
@@ -1820,7 +1823,7 @@ pub type ObjectMap = ObjectMapOf<OwnedValue>;
 type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
 
 /// See [`ObjectMapInnerOf`]'s shared twin -- the `unshared-containers`
-/// measurement holdout, functionally the #3000 layout.
+/// measurement holdout, the #3000 layout: boxed, not shared.
 #[cfg(feature = "unshared-containers")]
 type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
 
@@ -2067,9 +2070,11 @@ pub type ArrayVec = ArrayOf<OwnedValue>;
 type ArrayInnerOf<V> = Rc<Vec<V>>;
 
 /// See [`ArrayInnerOf`]'s shared twin -- the `unshared-containers`
-/// measurement holdout.
+/// measurement holdout: the `Vec` inline, exactly as `OwnedValue::Array`
+/// held it before #2999 (24 bytes, so the value stays 32 and no array costs
+/// an allocation it did not cost then).
 #[cfg(feature = "unshared-containers")]
-type ArrayInnerOf<V> = Box<Vec<V>>;
+type ArrayInnerOf<V> = Vec<V>;
 
 impl<V> ArrayOf<V> {
     /// An empty array.
@@ -2138,7 +2143,7 @@ impl<V: Clone> ArrayOf<V> {
         }
         #[cfg(feature = "unshared-containers")]
         {
-            *self.0
+            self.0
         }
     }
 }
@@ -2225,9 +2230,16 @@ impl<V: Clone> DerefMut for ArrayOf<V> {
 }
 
 impl<V> From<Vec<V>> for ArrayOf<V> {
+    #[cfg(not(feature = "unshared-containers"))]
     #[inline]
     fn from(vec: Vec<V>) -> Self {
-        Self(ArrayInnerOf::new(vec))
+        Self(Rc::new(vec))
+    }
+
+    #[cfg(feature = "unshared-containers")]
+    #[inline]
+    fn from(vec: Vec<V>) -> Self {
+        Self(vec)
     }
 }
 
@@ -4012,9 +4024,11 @@ mod tests {
     /// map behind a pointer is what demotes `Object` from widest arm to 8
     /// bytes. #2999 put `Array` behind a pointer as well (24 -> 8), which
     /// changes nothing here -- `NumberLiteral` was already the widest arm --
-    /// and is asserted so the shape stays documented. Both wrappers are one
-    /// pointer in every build: `Rc` shipped, `Box` under the
-    /// `unshared-containers` holdout, so this pin has no feature exemption.
+    /// and is asserted so the shape stays documented. 32 holds in every build
+    /// -- under the `unshared-containers` holdout the array's `Vec` is inline
+    /// again (24 bytes, still under `NumberLiteral`'s 32) -- so this pin has
+    /// no feature exemption; only the one-pointer assertion on `ArrayVec` is
+    /// the shipped shape's.
     /// Same 64-bit gate as the crate's other exact-size pins (`EvalError`,
     /// `Expr`): 32-bit targets shrink the pointer-sized fields.
     #[test]
@@ -4032,6 +4046,7 @@ mod tests {
             "ObjectMap must stay one pointer wide -- that is what keeps Object from \
              being OwnedValue's widest arm again"
         );
+        #[cfg(not(feature = "unshared-containers"))]
         assert_eq!(
             core::mem::size_of::<ArrayVec>(),
             core::mem::size_of::<usize>(),
@@ -4197,7 +4212,7 @@ mod tests {
         };
         assert!(items.is_shared());
 
-        let (_, recorded) = share_stats::measure(|| {
+        let ((), recorded) = share_stats::measure(|| {
             copy.as_array_mut().unwrap().push(OwnedValue::Int(3));
         });
         assert_eq!(recorded.len(), 1, "{recorded:?}");
@@ -4219,7 +4234,7 @@ mod tests {
         assert!(!items.is_shared(), "the write left both handles unique");
 
         // A second write through the now-unique handle copies nothing.
-        let (_, recorded) = share_stats::measure(|| {
+        let ((), recorded) = share_stats::measure(|| {
             copy.as_array_mut().unwrap().push(OwnedValue::Int(4));
         });
         assert!(recorded.is_empty(), "{recorded:?}");
@@ -4227,7 +4242,7 @@ mod tests {
         // Same contract for objects.
         let original = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         let mut copy = original.clone();
-        let (_, recorded) = share_stats::measure(|| {
+        let ((), recorded) = share_stats::measure(|| {
             copy.as_object_mut()
                 .unwrap()
                 .insert("b".to_string(), OwnedValue::Int(2));
@@ -4311,7 +4326,7 @@ mod tests {
                 .collect(),
         );
         let mut written = doc.clone();
-        let (_, recorded) = share_stats::measure(|| {
+        let ((), recorded) = share_stats::measure(|| {
             let items = written.as_array_mut().unwrap();
             let first = items[0].as_object_mut().unwrap();
             first.insert("a".to_string(), OwnedValue::Int(-1));
@@ -4341,13 +4356,21 @@ mod tests {
         }
     }
 
-    /// The holdout's own pin: `unshared-containers` must copy eagerly, or the
-    /// A/B it exists for is measuring two sharing binaries against each other
-    /// and reporting the difference as code-layout bias.
+    /// The holdout's own pin: `unshared-containers` must copy eagerly and
+    /// hold the array's `Vec` inline (24 bytes, as before #2999 -- an extra
+    /// allocation per array would make it a third layout, not #3000's), or
+    /// the A/B it exists for is measuring two sharing binaries against each
+    /// other and reporting the difference as code-layout bias.
     #[test]
     #[cfg(feature = "unshared-containers")]
     fn unshared_containers_holdout_copies_eagerly_2999() {
         use crate::jq::share_stats;
+
+        assert_eq!(
+            core::mem::size_of::<ArrayVec>(),
+            core::mem::size_of::<Vec<OwnedValue>>()
+        );
+        assert_eq!(core::mem::size_of::<OwnedValue>(), 32);
 
         let original = OwnedValue::array_from(vec![OwnedValue::object_from([(
             "a".to_string(),
@@ -4359,7 +4382,7 @@ mod tests {
             unreachable!()
         };
         assert!(!items.is_shared());
-        let (_, recorded) = share_stats::measure(|| {
+        let ((), recorded) = share_stats::measure(|| {
             copy.as_array_mut().unwrap()[0]
                 .as_object_mut()
                 .unwrap()

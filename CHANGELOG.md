@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared. `size_of::<OwnedValue>()` stays 32 and `JqValue` stays 40. Measured
   numbers are in the PR and in ADR-0024.
 
+  The cost is one more allocation per *array* (the refcount box) on top of
+  #3000's one per object. The first A/B found where that shows: the sort family
+  (`sort_by`/`group_by`/`unique_by`/`min_by`/`max_by`) built one `[f]` key array
+  per element as an `OwnedValue::Array` only to compare and discard it, which
+  read +6% to +27% on `sort_by(.)`. Those keys are now bare `Vec`s compared with
+  the same array ordering, so that path allocates exactly what it did before.
+
   **Breaking** for anything that pattern-matches the variant: `OwnedValue::Array`
   now carries a `succinctly::jq::ArrayVec` (an alias for `ArrayOf<OwnedValue>`), not
   a `Vec<OwnedValue>`, and `OwnedValue::Object`'s `ObjectMap` is refcounted rather
@@ -35,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   crossed a thread in this crate; nothing in `src/jq` carries either bound).
 
   Two measurement features come with it, neither for a shipped build:
-  `unshared-containers` swaps the `Rc` for a `Box` in both wrappers (functionally the
-  #3000 layout, the A/B's never-triggering holdout), and `share-stats` records every
+  `unshared-containers` restores the #3000 layout (boxed object map, inline array `Vec`;
+  the A/B's never-triggering holdout), and `share-stats` records every
   copy-on-write that actually copied, with the `file:line` that forced it
   (`SUCCINCTLY_SHARE_STATS=1` on a `--features cli,share-stats` binary prints the
   list at exit). Every `cfg(test)` build carries the same counters, and

@@ -125,9 +125,11 @@ pub fn record(site: Site) {
 }
 
 /// Build the [`Site`] for the caller of the wrapper method that observed a
-/// shared container. `#[track_caller]` here means the location reported is
-/// the wrapper's *own* caller, i.e. the `&mut`/by-value site in `eval.rs`
-/// or wherever, provided the wrapper method is itself `#[track_caller]`.
+/// shared container.
+///
+/// `#[track_caller]` here means the location reported is the wrapper's *own*
+/// caller -- the `&mut`/by-value site in `eval.rs` or wherever -- provided
+/// the wrapper method is itself `#[track_caller]`.
 #[inline]
 #[track_caller]
 pub fn site(kind: Kind) -> Site {
@@ -203,7 +205,7 @@ mod tests {
 
     #[test]
     fn records_count_and_report_per_site() {
-        let (_, recorded) = measure(|| {
+        let ((), recorded) = measure(|| {
             record(site(Kind::ArrayMakeMut));
             record(site(Kind::ArrayMakeMut));
             record(site(Kind::ObjectUnwrap));
