@@ -2946,6 +2946,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    fn number_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            StandardJson::Number(n) => core::str::from_utf8(n.raw_bytes()).ok().map(Cow::Borrowed),
+            _ => None,
+        }
+    }
+
     fn number_literal(&self) -> Option<Cow<'_, str>> {
         match self {
             StandardJson::Number(n) => {

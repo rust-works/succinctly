@@ -989,6 +989,21 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// The raw source text of this value if it is a number token, whatever
+    /// its spelling -- [`number_literal`](Self::number_literal) minus the
+    /// "preservable" gate (#2936). A lenient span this crate does not keep
+    /// as a literal (a bare trailing dot, `14455058590201385605.`, is the
+    /// rule-4c case) is still a decimal jq reads through its 17-digit
+    /// rounding, so the mode-aware number readers
+    /// (`eval_generic::document_number_f64_generic`) need the text, not the
+    /// double `as_f64` already rounded once. Not a display contract: nothing
+    /// echoes this text. Defaults to [`number_literal`](Self::number_literal),
+    /// which is exactly right for YAML (its scalar text is what that
+    /// override returns); JSON overrides it with the token's raw span.
+    fn number_text(&self) -> Option<Cow<'_, str>> {
+        self.number_literal()
+    }
+
     /// The value this number token carries if it is the reindex bridge's
     /// computed-float token (`crate::json::validate::computed_float_token`,
     /// #2902), `None` for every other value.

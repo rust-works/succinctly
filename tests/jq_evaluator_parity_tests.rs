@@ -2561,7 +2561,7 @@ fn test_eval_pipe_path_context_redirect_does_not_recurse_2416() {
 /// each row differed on `main` at `00e907ab3`.
 #[test]
 fn test_float_literal_rounding_agrees_across_evaluators_2936() {
-    const DOC: &[u8] = br#"{"a":2.7293109604053567083,"b":[9377102121403479046,2.4703282292062327209e-324],"c":1.797693134862315808e308}"#;
+    const DOC: &[u8] = br#"{"a":2.7293109604053567083,"b":[9377102121403479046,2.4703282292062327209e-324],"c":1.797693134862315808e308,"d":[14455058590201385605.,014455058590201385605]}"#;
     for (filter, expected) in [
         (".a + 0", "2.7293109604053565"),
         (".a * 1", "2.7293109604053565"),
@@ -2581,6 +2581,15 @@ fn test_float_literal_rounding_agrees_across_evaluators_2936() {
         ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
         (".a | tostring | tonumber + 0", "2.7293109604053565"),
         (".a | tojson | fromjson + 0", "2.7293109604053565"),
+        // a lenient span the funnels do not keep as a literal (rule 4c's bare
+        // trailing dot, a redundant leading zero) is still jq's decimal, and
+        // both routes must round it the same way (second /code-review round)
+        (".d[0] + 0", "14455058590201387000"),
+        (".d[1] + 0", "14455058590201387000"),
+        (
+            ".d | map(. + 0)",
+            "[14455058590201387000,14455058590201387000]",
+        ),
         // unchanged: display keeps the spelling, two literals compare exactly
         (".a", "2.7293109604053567083"),
         (".a | tojson", "\"2.7293109604053567083\""),
