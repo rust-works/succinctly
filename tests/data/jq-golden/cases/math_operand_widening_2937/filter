@@ -9,5 +9,7 @@
   "must_not_change": [(9007199254740993|floor), (123456789012345675|trunc), (2.7293109604053567083|floor), (nan|floor)],
   "neg_zero_downstream": [[(-0.5|ceil)], [limit((-0.5|ceil); 1,2)]],
   "float_literal_operand": [(2.50 | pow(.;1)), (2.50 | atan2(1;.))],
-  "computed_int_operand": [((1+1) | pow(.;1)), ((1+1) | atan2(1;.))]
+  "computed_int_operand": [((1+1) | pow(.;1)), ((1+1) | atan2(1;.))],
+  "neg_zero_int_literal": (.negzero | [floor, ceil, round]),
+  "all_digit_i64_overflow": (99999999999999999999999999 | floor)
 }

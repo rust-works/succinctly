@@ -14725,11 +14725,12 @@ pub(crate) fn numeric_length_owned<S: EvalSemantics>(value: OwnedValue) -> Owned
             // jq computes `fabs(jv_number_value(x))` -- a double, not an
             // exact integer (#2937). `Int` here is the same display
             // optimization `integral_f64_result` uses: exact only up to
-            // `2^53`, past which (including `i64::MIN`, whose magnitude is
-            // `2^63`) the result is the `Float` jq would actually print.
-            OwnedValue::Int(i) if i.unsigned_abs() <= EXACT_F64_INT_BOUND as u64 => {
-                OwnedValue::Int(i.abs())
-            }
+            // `2^53` (`jq_int_within_exact_f64_range`, shared rather than
+            // re-derived here so the two "same bound" call sites can't
+            // silently drift apart), past which (including `i64::MIN`,
+            // whose magnitude is `2^63`) the result is the `Float` jq would
+            // actually print.
+            OwnedValue::Int(i) if jq_int_within_exact_f64_range(i) => OwnedValue::Int(i.abs()),
             OwnedValue::Int(i) => OwnedValue::Float(jq_literal_int_to_f64(i).abs()),
             OwnedValue::Float(f) => OwnedValue::Float(f.abs()),
             other => other,
@@ -52357,7 +52358,11 @@ fn get_float_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// rounding, not just the integer-shaped subset #2937 originally covered
 /// with a bespoke `as_i64`/`int_to_f64` fast path (dropped here in favor of
 /// this one shared accessor, per its own doc comment's "add that arm here
-/// rather than at each caller").
+/// rather than at each caller"). This also sidesteps the `-0` sign-loss bug
+/// that fast path had to special-case: `n.as_i64()` on a bare `-0` literal
+/// throws the sign away before `int_to_f64` ever sees it (`i64` has no
+/// negative zero), where `json_number_f64`'s own text-based parse -- and its
+/// `n.as_f64()` fallback -- keep it, matching jq's `-0` print (#2937 review).
 fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     optional: bool,
@@ -52390,16 +52395,31 @@ fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// magnitude, adjacent integers stop having distinct `f64` representations
 /// (the same `2^53` bound [`jq_int_within_exact_f64_range`] and
 /// [`jq_f64_backed_int`] use for a jq-mode arithmetic *result*, reused here
-/// for a math-builtin result under the identical reasoning).
-const EXACT_F64_INT_BOUND: f64 = 9_007_199_254_740_992.0; // 2^53
+/// for a math-builtin result under the identical reasoning). Derived from
+/// the identical `1u64 << 53` shift `jq_int_within_exact_f64_range` uses,
+/// rather than a bare decimal literal, so the two can't silently drift to
+/// different bounds -- `jq_int_within_exact_f64_range` itself isn't called
+/// here because it takes an already-widened `i64`, not the raw `f64` this
+/// bound gates.
+const EXACT_F64_INT_BOUND: f64 = (1u64 << 53) as f64; // 2^53
 
 /// yq mode's `Int` boundary in [`integral_f64_result`]: an `int64`'s own
-/// range, `[i64::MIN, i64::MAX]` widened to the half-open `f64` interval
-/// `[-2^63, 2^63)` -- `i64::MAX as f64` itself rounds *up* to `2^63` (`f64`
-/// has no exact representation of `2^63 - 1`), so the exclusive upper bound
-/// is what actually excludes it.
+/// range, `[i64::MIN, i64::MAX]` widened to `f64`. `i64::MAX as f64` itself
+/// rounds *up* to `2^63` (`f64` has no exact representation of `2^63 - 1`,
+/// the closest representable values on either side being `2^63` and
+/// `2^63 - 1024`) -- so the upper bound this compares against is
+/// **inclusive** of `2^63`, not exclusive: a computed `f` landing exactly
+/// on `2^63` is exactly what `i64::MAX` itself widens to, and `f as i64`'s
+/// saturating cast already maps it back to `i64::MAX` correctly (#2937
+/// review -- an earlier exclusive-upper-bound version wrongly reclassified
+/// `9223372036854775807 | floor` as `Float(9223372036854776000.0)` instead
+/// of leaving the already-integral value as the identity). A value that
+/// only *rounds* to `2^63` because it's genuinely larger than `i64::MAX`
+/// gets the same saturating clamp the pre-#2937 code already gave it at
+/// this exact boundary -- unchanged, not a new imprecision this fix
+/// introduces.
 const I64_RANGE_LOWER_BOUND_AS_F64: f64 = -9_223_372_036_854_775_808.0; // i64::MIN, exact
-const I64_RANGE_UPPER_BOUND_AS_F64: f64 = 9_223_372_036_854_775_808.0; // 2^63
+const I64_RANGE_UPPER_BOUND_AS_F64: f64 = 9_223_372_036_854_775_808.0; // 2^63, inclusive
 
 /// Build the `Int`/`Float` result of `floor`/`ceil`/`round`/`trunc` from
 /// their computed `f64` (#2937).
@@ -52429,7 +52449,7 @@ fn integral_f64_result<S: EvalSemantics>(f: f64) -> OwnedValue {
         } else {
             OwnedValue::Int(f as i64)
         }
-    } else if (I64_RANGE_LOWER_BOUND_AS_F64..I64_RANGE_UPPER_BOUND_AS_F64).contains(&f) {
+    } else if (I64_RANGE_LOWER_BOUND_AS_F64..=I64_RANGE_UPPER_BOUND_AS_F64).contains(&f) {
         OwnedValue::Int(f as i64)
     } else {
         OwnedValue::Float(f)
@@ -97917,13 +97937,20 @@ mod tests {
             &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64 - 1024.0),
             (I64_RANGE_UPPER_BOUND_AS_F64 - 1024.0) as i64
         ));
-        assert!(
-            is_float_bits(
-                &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64),
-                I64_RANGE_UPPER_BOUND_AS_F64
-            ),
-            "i64::MAX as f64 (2^63) itself must not saturate to an Int"
-        );
+        // 2^63 itself is what i64::MAX widens to (f64 has no exact 2^63-1),
+        // so it must stay the identity -- Int(i64::MAX), not a corrupted
+        // Float -- rather than being excluded as "out of range" (#2937
+        // review: an earlier exclusive-upper-bound version got this wrong).
+        assert!(is_int(
+            &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64),
+            i64::MAX
+        ));
+        // Genuinely past i64::MAX (not just its own rounded widening)
+        // still falls back to Float rather than saturating silently.
+        assert!(is_float_bits(
+            &integral_f64_result::<YqSemantics>(I64_RANGE_UPPER_BOUND_AS_F64 + 1e6),
+            I64_RANGE_UPPER_BOUND_AS_F64 + 1e6
+        ));
         assert!(is_float_bits(
             &integral_f64_result::<YqSemantics>(I64_RANGE_LOWER_BOUND_AS_F64 - 1e6),
             I64_RANGE_LOWER_BOUND_AS_F64 - 1e6

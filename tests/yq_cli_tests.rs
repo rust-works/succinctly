@@ -47950,5 +47950,21 @@ fn test_yq_floor_keeps_int64_cast_and_stops_saturating_2937() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "18");
+
+    // i64::MAX itself is the boundary an earlier version of this fix got
+    // wrong: i64::MAX widens to exactly 2^63 as an f64 (f64 has no exact
+    // 2^63 - 1), so an exclusive upper-bound check reclassified the
+    // already-integral value as "out of range" and corrupted it to a
+    // Float instead of leaving it alone (#2937 review). floor/ceil/round/
+    // trunc of an already-integral i64::MAX must all be the identity.
+    for filter in [".a | floor", ".a | ceil", ".a | round", ".a | trunc"] {
+        let (output, code) = run_yq_stdin(
+            filter,
+            "a: 9223372036854775807\n",
+            &["-o=json", "-I=0", "--jq-extensions"],
+        )?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(output.trim(), "9223372036854775807", "`{filter}`");
+    }
     Ok(())
 }
