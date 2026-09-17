@@ -90,9 +90,17 @@ jobs:
   test-x86:
     name: Test (x86_64)
     needs: test-x86-matrix
+    # `if: always()` + an explicit result check, not the bare `needs:` this replaced:
+    # GitHub skips (not fails) a job whose `needs:` target failed, and a `skipped`
+    # conclusion's branch-protection semantics vary -- so a broken leg wasn't
+    # reliably blocking merge (#3084). `needs.test-x86-matrix.result` is `success`
+    # only when every matrix leg succeeded.
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: echo "All Test (x86_64) matrix legs passed"
+      - run: |
+          test "${{ needs.test-x86-matrix.result }}" = "success" \
+            || { echo "::error::a Test (x86_64) matrix leg did not succeed (${{ needs.test-x86-matrix.result }})"; exit 1; }
 
   test-x86-matrix:
     name: Test (x86_64) (${{ matrix.name }})
@@ -246,9 +254,14 @@ jobs:
   test-arm:
     name: Test (ARM64)
     needs: test-arm-matrix
+    # See test-x86 above for why this is `if: always()` + a result check rather
+    # than a bare `needs:` (#3084).
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: echo "All Test (ARM64) matrix legs passed"
+      - run: |
+          test "${{ needs.test-arm-matrix.result }}" = "success" \
+            || { echo "::error::a Test (ARM64) matrix leg did not succeed (${{ needs.test-arm-matrix.result }})"; exit 1; }
 
   test-arm-matrix:
     name: Test (ARM64) (${{ matrix.name }})
@@ -404,9 +417,14 @@ jobs:
   test-macos-arm:
     name: Test (macOS ARM64)
     needs: test-macos-arm-matrix
+    # See test-x86 above for why this is `if: always()` + a result check rather
+    # than a bare `needs:` (#3084).
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: echo "All Test (macOS ARM64) matrix legs passed"
+      - run: |
+          test "${{ needs.test-macos-arm-matrix.result }}" = "success" \
+            || { echo "::error::a Test (macOS ARM64) matrix leg did not succeed (${{ needs.test-macos-arm-matrix.result }})"; exit 1; }
 
   test-macos-arm-matrix:
     name: Test (macOS ARM64) (${{ matrix.name }})
