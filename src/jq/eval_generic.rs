@@ -15338,7 +15338,7 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // that entry check, so it needs its own (#2058 code review).
     assert_nesting_depth(path.depth());
     let Some((first, rest)) = exprs.split_first() else {
-        out.push(OwnedValue::Array(path.to_vec().into()));
+        out.push(OwnedValue::Array(path.to_vec().into())); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         return Ok(());
     };
     if rest.is_empty() {
@@ -20196,7 +20196,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 let items: Vec<OwnedValue> =
                     owned_or_suppress!(to_owned_all_cursors(&cursors), optional);
                 if items.is_empty() {
-                    return GenericResult::Owned(OwnedValue::array());
+                    return GenericResult::Owned(OwnedValue::array()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
                 }
 
                 let all_arrays = items.iter().all(|v| matches!(v, OwnedValue::Array(_)));
@@ -20217,7 +20217,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         .unwrap_or(0);
 
                     if max_len == 0 {
-                        return GenericResult::Owned(OwnedValue::array());
+                        return GenericResult::Owned(OwnedValue::array()); // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
                     }
 
                     let mut result = vec_with_capacity(max_len);
