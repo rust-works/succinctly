@@ -74,7 +74,7 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `iterables` - Select arrays and objects
 - [x] `scalars` - Select non-iterables (null, bool, number, string)
 - [x] `normals` - Select only normal numbers (not 0, infinite, NaN, or subnormal)
-- [x] `finites` - Select only finite numbers (not infinite or NaN)
+- [x] `finites` - Select only non-infinite numbers (NaN passes through, matching jq's own `select(isinfinite | not)` definition -- #3071)
 
 ### Selection & Filtering
 - [x] `select(cond)` - Filter by condition
