@@ -15128,19 +15128,21 @@ fn format_csv_row_element<S: EvalSemantics>(
         // already correct and has no jq oracle to override it with --
         // `test_yq_at_csv_special_floats_use_yaml_spelling_1060` caught an
         // earlier, unconditional version of this arm regressing it.
-        OwnedValue::Float(f) if S::TAG != EvalTag::Yq && f.is_nan() => Ok(String::new()),
-        // Defensive: `OwnedValue::from_number_bytes`'s `bridge_nonfinite_from_bytes`
-        // check intercepts every NaN/infinity sentinel spelling and returns
-        // a bare `Float` before the `NumberLiteral`-producing branch is
-        // ever reached, so a NaN wrapped in `NumberLiteral` has no known
-        // producer through ordinary parsing -- confirmed live (a
-        // document-sourced `NaN` decodes as the bare `Float` arm above,
-        // not this one). Kept for defense in depth: this arm's own
-        // behavior is correct if a future code path ever does construct one.
-        OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
+        //
+        // Combined with the `NumberLiteral` spelling (the idiom used
+        // elsewhere in this file, e.g. `owned_to_string` a few lines below)
+        // rather than a second, identical arm: `from_number_bytes`'s
+        // `bridge_nonfinite_from_bytes` check intercepts every NaN
+        // sentinel into a bare `Float` before the `NumberLiteral`-producing
+        // branch is ever reached, so the `NumberLiteral` half has no known
+        // producer through ordinary parsing today -- but a combined arm
+        // costs nothing to keep for defense in depth, and (unlike a second
+        // arm) needs no separate coverage-tolerate marker, since the
+        // already-common `Float` case covers the whole pattern.
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
             if S::TAG != EvalTag::Yq && f.is_nan() =>
         {
-            Ok(String::new()) // omni-dev: coverage tolerate-line reason="no known producer of NumberLiteral(Float(NaN)) through ordinary parsing -- see the arm's own doc comment (#3070)"
+            Ok(String::new())
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::not_valid_in_csv_row(v)),
         other => Ok(owned_to_string::<S>(other)),
