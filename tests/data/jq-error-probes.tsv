@@ -378,3 +378,5 @@ libm_ldexp_arg1_bool	ldexp(true; 1)	null
 libm_pow_arg_string	pow("a"; 1)	null
 libm_fma_arg3_string	fma(1; 2; "z")	null
 libm_significand_long_string	significand	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+libm_pow10_string_is_the_stub	pow10	"x"
+libm_fma_checks_a_before_c	fma("x"; 1; "z")	null

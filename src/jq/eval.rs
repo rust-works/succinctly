@@ -52459,12 +52459,22 @@ fn builtin_libm1<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    // No platform libm still exports `pow10` (glibc dropped it in 2.27,
+    // Apple never had it), so every jq 1.7.1 build defines `pow10/0` as a
+    // jq-level stub that raises this without ever looking at `.` --
+    // `"x" | pow10` prints it, not a type error (captured live from both
+    // `/usr/bin/jq` and `jq-linux-amd64`; PR #3067 review). Reached only
+    // when evaluated, exactly like the stub.
+    if f == Libm1::Pow10 {
+        return QueryResult::Error(EvalError::new("Error: pow10/0 not found at build time"));
+    }
     let x = match get_float_value::<W>(&value, optional) {
         Ok(n) => n,
         Err(r) => return r,
     };
     let float = |v: f64| QueryResult::Owned(OwnedValue::Float(v));
     match f {
+        Libm1::Pow10 => unreachable!("handled above"),
         Libm1::Cbrt => float(math::cbrt(x)),
         Libm1::Erf => float(math::erf(x)),
         Libm1::Erfc => float(math::erfc(x)),
@@ -52501,14 +52511,6 @@ fn builtin_libm1<W: Clone + AsRef<[u64]>>(
                 OwnedValue::Float(v),
                 OwnedValue::Int(i64::from(sign)),
             ]))
-        }
-        // No platform libm still exports `pow10` (glibc dropped it in
-        // 2.27, Apple never had it), so every jq 1.7.1 build defines
-        // `pow10/0` as this runtime error -- `1 | pow10` prints it from
-        // both `/usr/bin/jq` and `jq-linux-amd64`. Reached only when
-        // evaluated, exactly like jq's own stub.
-        Libm1::Pow10 => {
-            QueryResult::Error(EvalError::new("Error: pow10/0 not found at build time"))
         }
     }
 }
@@ -52589,21 +52591,24 @@ fn builtin_libm3<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         ArgFanout::All,
         |c, b| {
-            let c = match math_operand(&c, optional) {
-                Ok(n) => n,
-                Err(None) => return QueryResult::None,
-                Err(Some(e)) => return QueryResult::Error(e),
-            };
-            let b = match math_operand(&b, optional) {
-                Ok(n) => n,
-                Err(None) => return QueryResult::None,
-                Err(Some(e)) => return QueryResult::Error(e),
-            };
+            // The type checks run only once all three operands exist, in
+            // a, b, c order -- jq's `LIBM_DDDD` reads its three `jv`s
+            // first, so `fma("x"; 1; "z")` names `"x"`, `[fma(empty; 1;
+            // "z")]` is `[]`, and `fma(error("boom"); 1; "z")` raises
+            // `boom` (all captured live; PR #3067 review).
             fanout_arg::<W, S, _>(a_expr, value.clone(), optional, ArgFanout::All, |a| {
-                let a = match math_operand(&a, optional) {
-                    Ok(n) => n,
-                    Err(None) => return QueryResult::None,
-                    Err(Some(e)) => return QueryResult::Error(e),
+                let (a, b, c) = match (
+                    math_operand(&a, optional),
+                    math_operand(&b, optional),
+                    math_operand(&c, optional),
+                ) {
+                    (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                        return match e {
+                            None => QueryResult::None,
+                            Some(e) => QueryResult::Error(e),
+                        }
+                    }
                 };
                 QueryResult::Owned(OwnedValue::Float(match f {
                     Libm3::Fma => math::fma(a, b, c),
@@ -52687,7 +52692,9 @@ fn builtin_isfinite<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match get_float_value::<W>(&value, optional) {
+    // The error is discarded, so don't let `get_float_value` build its
+    // `number required` preview (a deep copy of the value, #3042 review).
+    match get_float_value_with::<W>(&value, optional, || EvalError::new("")) {
         Ok(n) => QueryResult::Owned(OwnedValue::Bool(n.is_finite())),
         Err(_) => QueryResult::Owned(OwnedValue::Bool(false)),
     }

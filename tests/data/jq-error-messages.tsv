@@ -234,3 +234,5 @@ libm_ldexp_arg1_bool	ldexp(true; 1)	null	boolean (true) number required
 libm_pow_arg_string	pow("a"; 1)	null	string ("a") number required
 libm_fma_arg3_string	fma(1; 2; "z")	null	string ("z") number required
 libm_significand_long_string	significand	"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"	string ("xxxxxxxxxx...) number required
+libm_pow10_string_is_the_stub	pow10	"x"	Error: pow10/0 not found at build time
+libm_fma_checks_a_before_c	fma("x"; 1; "z")	null	string ("x") number required
