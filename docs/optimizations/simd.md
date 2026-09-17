@@ -152,6 +152,25 @@ unsafe fn neon_movemask(mask: uint8x16_t) -> u16 {
 
 **Result**: 10-18% improvement over variable shifts.
 
+**When only "any match" and "first match" are needed, use the `shrn` nibble mask
+instead** (`neon_nibble_mask` in `util/simd/escape.rs`, #2963): one narrowing shift
+packs every lane's top nibble into a `u64`, so `mask != 0` is the any-match test and
+`mask.trailing_zeros() / 4` is the first lane, after a single vector-to-GPR transfer.
+
+```rust
+unsafe fn neon_nibble_mask(v: uint8x16_t) -> u64 {
+    // nibble i of the result is 0xF iff lane i of `v` is 0xFF
+    let nibbles = vshrn_n_u16::<4>(vreinterpretq_u16_u8(v));
+    vget_lane_u64::<0>(vreinterpret_u64_u8(nibbles))
+}
+```
+
+The multiply form costs two lane extracts, two 64-bit multiplies and a shift-and-or on
+the critical path of every chunk; that latency is what made a per-string 16-byte chunk
+lose to a scalar loop on an M4 Pro (see [the #2963 section](#instruction-counts-vs-wall-clock-the-document-splitter-string-scan-2878--2963)).
+Keep the multiply form where a *dense* 16-bit mask is consumed (bit iteration,
+`popcount`, concatenation with a neighbouring chunk).
+
 ### NEON Table Lookup (vqtbl1q_u8)
 
 16 parallel lookups from a 16-entry table:
@@ -698,6 +717,143 @@ isolation but cause regression when integrated due to real-world data characteri
 
 ---
 
+## Instruction counts vs wall-clock: the document-splitter string scan (#2878 / #2963)
+
+#2878 routed the CLI's JSON document splitter (`string_literal_end`, reached from
+`jq_runner.rs`'s `scan_one_json_token` / `find_matching_close` on every JSON input the
+CLI reads) through `find_json_escape`, replacing a byte-at-a-time loop. CI's perf guard
+(cachegrind instruction counts against the PR's merge-base) read the change as
+**-8.2% on ARM64-Linux and +2.2% on x86_64** for `users_keys_unsorted`, and #2963 was
+filed to attribute and, if warranted, tune away the x86_64 cost.
+
+Wall-clock told a different story on *both* architectures, and the sign of the
+instruction count was wrong on both.
+
+### Attribution (x86_64, cachegrind on the guard's own `users` 2 MB fixture)
+
+The fixture has 111,849 strings, 6.7 content bytes on average, every one shorter than 32
+bytes, and no escapes. The whole +2.18% (66,354,221 -> 67,800,879 Ir) is in the scan:
+
+| Function (self Ir)                          | pre-#2878    | post-#2878  | per string |
+|---------------------------------------------|--------------|-------------|------------|
+| `scan_one_json_token` (inlined scalar loop) | 15,216,621   | 8,160,432   | ~63 -> ~6  |
+| `string_literal_end` (not inlined)          | --           | 5,033,209   | 45.0       |
+| `json_escape::avx2` (`#[target_feature]`)   | --           | 3,467,379   | 31.0       |
+
+Two facts fall out of the disassembly:
+
+1. **The scanner never sees a short input.** `find_json_escape(bytes, i)` is handed the
+   rest of the *document*, so O3's "scalar below 16 bytes" threshold (which compares
+   against the buffer remainder) is always false from inside a string, and the first
+   32-byte AVX2 chunk resolves every string in one iteration. The cost per string is
+   flat, ~76 Ir, regardless of its length. The issue body's proposal of "a length
+   threshold at the call site" cannot be applied as written -- the length is what the
+   scan is looking for.
+2. **The cost is dispatch, not bytes.** ~45 of those 76 Ir are `string_literal_end`'s
+   own prologue/epilogue, the `avx2_enabled` `OnceLock` read, the call to the
+   non-inlinable `#[target_feature(enable = "avx2")]` kernel and unpacking its `Option`;
+   the kernel's 31 include three constant broadcasts and a `vzeroupper` per call. None of
+   that is the `< 0x20` comparison the correctness rule added.
+
+### Wall-clock, both machines (interleaved `scripts/ab-cli.py`, 9 reps, `min` column)
+
+| `jq keys_unsorted` on 10 MB | 7950X pre -> post | M4 Pro pre -> post |
+|-----------------------------|-------------------|--------------------|
+| `users` (6.7-byte strings)  | **-6.5%**         | **+10.7%**         |
+| `wide` (6-7-byte keys)      | -0.4%             | +1.1%              |
+| `unicode` (~21-byte)        | -12.5%            | +4.9%              |
+| `strings` (120-byte)        | -14.9%            | -19.7%             |
+
+Control runs (a binary against a copy of itself) read within -2.4%..+1.2% at 10 MB on
+both machines. So on the 7950X the +2.2% instruction count is a **wall-clock win on every
+shape** -- a 32-byte compare-and-movemask retires faster than a 12-instruction-per-byte
+branchy loop even at 7 bytes -- and the x86_64 tuning the issue asked for was declined.
+On the M4 Pro the -8.2% instruction count (measured on ARM64-*Linux*) is a **wall-clock
+regression on every shape shorter than ~24 bytes**. The NEON path is latency-bound:
+compare, or, the multiply-based movemask (two lane extracts, two 64-bit multiplies, a
+shift-and-or) and a vector-to-GPR transfer sit on the critical path of every chunk, and
+the next string cannot start until the index comes back. A scalar loop over 7 bytes with
+well-predicted branches is simply shorter.
+
+### What shipped (aarch64 only; x86_64 measured identical to the instruction)
+
+- **`shrn` nibble mask** for the escape scanner's NEON movemask (`neon_nibble_mask` in
+  `util/simd/escape.rs`): one narrowing shift and one transfer replace the multiply
+  emulation. Every consumer of the scanner benefits; on the M4 Pro against `main`, 7 of 8
+  rows moved negative (`users keys_unsorted` -3.3%, `unicode` -2.3%, jq identity rows
+  -1.3%).
+- **An 8-byte word probe** in `string_literal_end` (`STRING_SCALAR_PREFIX`, aarch64
+  only, zero elsewhere): the first 8 bytes of every string are checked with one 64-bit
+  load and the `haszero`/`hasless` word tricks (`word_special_mask`), and the SIMD
+  scanner takes over from byte 8. 84% of the `users` shape's strings never reach the
+  chunk. Measured on the M4 Pro against the `shrn` build alone (10 MB, `jq
+  keys_unsorted`, `min` column): `users` **-5.1%**, `wide` -1.0%, `unicode` -0.5%,
+  `strings` -0.0%. Against pre-#2878: `users` +0.1%, `unicode` -2.1%, `strings` -17.9%:
+  the regression is gone and the long-string win is kept.
+
+  Two probe shapes were measured first and rejected:
+
+  | 10 MB, `jq keys_unsorted`, vs `shrn` build | byte loop K=8 | byte loop K=16 | word K=8 |
+  |--------------------------------------------|---------------|----------------|----------|
+  | `users`                                    | **-9.1%**     | -6.3%          | -5.1%    |
+  | `wide`                                     | +1.2%         | +0.0%          | -1.0%    |
+  | `unicode`                                  | +0.4%         | **+2.7%**      | -0.5%    |
+  | `strings`                                  | -0.1%         | +1.0%          | -0.0%    |
+  | ARM64-Linux guard, `users_keys_unsorted`   | **+8.8%** Ir  | --             | +6.2% out of line, **+1.1%** inlined |
+
+  The byte loop's K=16 loses on `unicode` (p50 = 21 bytes: 16 scalar iterations *and* the
+  chunk), the risk the triage plan named. Its K=8 is the fastest on the M4 Pro but costs
+  ~33 instructions per string on the guard's ARM64-Linux leg (+8.8%, over the 5% gate) --
+  a byte loop retires ~6 instructions per byte, and the guard cannot see the wall-clock
+  win it buys. The word probe is a flat ~14 instructions for 8 bytes.
+
+  The word probe's first push still read **+6.2%** on that leg. The disassembly showed
+  why: with the probe added, fat LTO stopped inlining `string_literal_end` into the
+  splitter's loops, so every string paid a call, a prologue/epilogue and ~16
+  instructions rebuilding the probe's *and* the NEON chunk's constants. `inline(always)`
+  on `string_literal_end` (the same load-bearing attribute `find_json_escape` carries
+  from O3) hoists the constants back out of the per-string path. Inlined, the M4 Pro
+  reads `users` **-6.1%** against the `shrn` build and -0.0% against pre-#2878, and the
+  ARM64-Linux guard reads `users_keys_unsorted` +1.1%. On the
+  7950X the same inlining reads `users_keys_unsorted` -2.7% on the guard (prologue and
+  epilogue gone), every other row inside ±0.6% except `arrays_first_map_iterate` +3.5% --
+  a shape with no strings, the codegen-layout class #2603/#2655 documented -- and times
+  neutral against its true baseline (`min` column within ±2% on every row).
+
+  That last measurement was first read as **+9% to +19%** and the attribute was nearly
+  gated to aarch64 on the strength of it. The "before" binary on the x86 box was a
+  `main` checkout from the start of the issue, and `main` had moved: the two mains time
+  +17% apart on `users keys_unsorted` on the 7950X with instruction counts identical to
+  the guard's 0.0% (filed as a follow-up). The A/B rule "the baseline must predate your
+  first commit" has a companion: it must also be the base your branch is actually on.
+- On x86_64 the probe compiles out (`PREFIX = 0`); before the inlining change the guard
+  read every row at ±0.0% against `main` on the 7950X. A build with the word probe enabled on x86_64 too
+  was measured and not shipped: the guard read `users_keys_unsorted` +1.2% and the 7950X
+  timed it neutral (every row within ±1.2%, inside the control range) -- the AVX2 path is
+  already the fastest shape there.
+
+### What to take from it
+
+- **The perf guard measures instructions, and instructions and time can disagree in
+  sign -- per architecture.** A guard row moving negative is not evidence of a win, and a
+  row moving positive is not evidence of a loss; either one is a prompt to time it. The
+  same change was +Ir/-time on x86_64 and -Ir/+time on Apple Silicon.
+- **A buffer-relative SIMD threshold never fires on a whole-document scan.** If the thing
+  being found is the length, the threshold has to be a prefix probe at the call site, and
+  its K is a per-shape trade (8 bytes here; 16 lost on 21-byte strings).
+- **Latency, not instruction count, decides a per-item SIMD path.** Count the cycles on
+  the critical path from load to the branch that consumes the index; on NEON the
+  movemask emulation and the vector-to-GPR transfer dominate a 16-byte chunk, and the
+  `shrn` trick is the cheapest known form of it.
+- **Shape the probe for the metric that gates it as well as the one that matters.** The
+  byte loop and the word probe resolve the same 8 bytes; one costs ~33 instructions per
+  string on the ARM64-Linux guard and the other ~18, for a 4-point difference in
+  wall-clock on the M4 Pro. ARM64-Linux (CI's runner) has no wall-clock measurement in
+  this repo, so the guard's instruction count is the only ARM-Linux number, and a probe
+  that fails it does not ship however it times elsewhere.
+
+---
+
 ## Popcount Strategies: Explicit SIMD vs Auto-Vectorized `count_ones()`
 
 *Measured for [issue #45](https://github.com/rust-works/succinctly/issues/45), raised on
@@ -865,6 +1021,7 @@ Full data and methodology:
 7. **Isolation benchmarks can mislead**: A function can be 5x faster in isolation but cause regression when integrated (colon-space detection won for 46+ byte scans, but real YAML keys are 5-15 bytes)
 8. **Know your data characteristics**: Benchmark with realistic data sizes, not arbitrary test cases
 9. **Specialized instructions win**: SVE2 inline assembly for general ops is 50% slower than NEON, but BDEP (SVE2-BITPERM) provides 5-17x speedup for select_in_word
+10. **Instruction counts and wall-clock can disagree in sign, per architecture**: the document-splitter scan was +2.2% Ir / -6.5% time on a 7950X and -8.2% Ir / +10.7% time on an M4 Pro (#2963). A per-item NEON path is decided by the latency from load to the consuming branch, not by how many instructions it retires
 
 ---
 
