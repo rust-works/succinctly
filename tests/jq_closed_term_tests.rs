@@ -28,7 +28,7 @@
 //! them here would only freeze a limitation in place.
 
 use succinctly::jq::walk::reads_ambient_value;
-use succinctly::jq::{eval_generic, parse, parse_with_mode, ParserMode};
+use succinctly::jq::{eval_generic, parse, parse_with_mode, JqSemantics, ParserMode};
 use succinctly::json::JsonIndex;
 
 /// Structurally unrelated, all well-formed: an object, an array, a scalar,
@@ -287,7 +287,7 @@ fn outputs(doc: &str, filter: &str) -> Result<Vec<String>, String> {
     let cursor = index.root(bytes);
     let expr = parse(filter).map_err(|e| format!("parse {filter:?}: {e:?}"))?;
     let values = eval_generic::eval_with_cursor(&expr, cursor)
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .map_err(|e| format!("eval {filter:?}: {e:?}"))?;
     Ok(values
         .iter()

@@ -39,7 +39,7 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
     result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)
         .collect()

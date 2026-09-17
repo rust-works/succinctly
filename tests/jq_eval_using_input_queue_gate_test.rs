@@ -30,7 +30,7 @@ fn test_eval_using_interleaves_input_with_top_level_comma_1504() {
     let expr = parse("(., input)").expect("parse failed");
     let result = eval_using::<JqSemantics, _>(&expr, value);
     let outputs: Vec<String> = result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .unwrap()
         .iter()
         .map(OwnedValue::to_json)

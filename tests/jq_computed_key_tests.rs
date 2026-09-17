@@ -48,7 +48,7 @@ fn full(json: &[u8], filter: &str) -> Outcome {
         QueryResult::Error(e) => Outcome::Error(e.message),
         other => Outcome::Values(
             other
-                .collect_owned()
+                .collect_owned::<JqSemantics>()
                 .iter()
                 .map(OwnedValue::to_json)
                 .collect(),
@@ -65,7 +65,7 @@ fn generic(json: &[u8], filter: &str) -> Outcome {
         eval_generic::GenericResult::Error(e) => Outcome::Error(e.message),
         other => Outcome::Values(
             other
-                .collect_owned()
+                .collect_owned::<JqSemantics>()
                 .expect("materializes")
                 .iter()
                 .map(OwnedValue::to_json)

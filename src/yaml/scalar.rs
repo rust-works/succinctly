@@ -36,6 +36,13 @@ use alloc::{borrow::Cow, format, string::String, string::ToString};
 use std::borrow::Cow;
 
 use crate::jq::OwnedValue;
+// A YAML scalar is real yq's number, and yq's number model is Go's
+// correctly-rounded `ParseFloat` -- the plain parse `YqSemantics` selects
+// (#2936). Today this cannot be observed either way (a preservable YAML
+// float literal is capped at 17 significant digits, where jq's rounding is
+// the identity), but #3040 may lift that cap, and the mode must already be
+// right when it does.
+use crate::jq::YqSemantics;
 
 /// The resolved type (and parsed value) of a plain YAML scalar.
 ///
@@ -172,10 +179,10 @@ impl ResolvedScalar {
             Self::Bool(b) => OwnedValue::Bool(b),
             Self::Int(n) => OwnedValue::Int(n),
             Self::Float(_) if is_preservable_float_literal(&text) => {
-                OwnedValue::from_number_literal(&text)
+                OwnedValue::from_number_literal::<YqSemantics>(&text)
             }
             Self::Float(f) => match preservable_float_literal_text(&text) {
-                Some(normalized) => OwnedValue::from_number_literal(&normalized),
+                Some(normalized) => OwnedValue::from_number_literal::<YqSemantics>(&normalized),
                 // The tag-forced-float re-spelling (#1176) -- gated to
                 // `to_owned_value_for_json_bridge`'s single caller, whose
                 // doc comment carries the full reasoning and the cost of
@@ -184,7 +191,9 @@ impl ResolvedScalar {
                     && f.is_finite()
                     && needs_explicit_float_tag(&text) =>
                 {
-                    OwnedValue::from_number_literal(&super::format_float_with_fraction(f))
+                    OwnedValue::from_number_literal::<YqSemantics>(
+                        &super::format_float_with_fraction(f),
+                    )
                 }
                 // #2438: same document boundary as `to_owned_at_depth`'s own
                 // bare-float arm (`src/jq/eval_generic.rs`) -- an explicitly

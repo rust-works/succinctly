@@ -33,12 +33,13 @@ use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::eval::{JqSemantics, YqSemantics};
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include, Libm1,
     Libm2, Libm3, Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry,
     ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
-use super::value::{parse_i64_or_f64, NumberRepr};
+use super::value::{parse_i64_or_f64_in, NumberRepr};
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1067,7 +1068,20 @@ impl<'a> Parser<'a> {
         }
 
         let num_str = &self.input[start..self.pos];
-        let Some(repr) = parse_i64_or_f64(num_str) else {
+        // #2936: the literal's double follows the mode. jq reads a program
+        // literal through the same 17-digit decNumber rounding it applies to
+        // a document number (`2.7293109604053567083 + 0` is
+        // `2.7293109604053565` there, the plain parse's `…357`), and real yq
+        // parses with Go's correctly-rounded `ParseFloat`, which the plain
+        // parse already is. `fold_index_key` and the unary-minus fold below
+        // both read this `repr` rather than re-parsing, so this is the one
+        // site the parser decides it at; the negation the fold applies is
+        // exact, and the rounding is sign-symmetric, so `-X` stays right.
+        let parsed = match self.mode {
+            ParserMode::Jq => parse_i64_or_f64_in::<JqSemantics>(num_str),
+            ParserMode::Yq => parse_i64_or_f64_in::<YqSemantics>(num_str),
+        };
+        let Some(repr) = parsed else {
             return Err(ParseError::new("invalid number", start));
         };
         // #1035: keep the literal's own source spelling (e.g. `1.500`,

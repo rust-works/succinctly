@@ -24,7 +24,7 @@ fn full_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let expr = parse(filter).expect("parse failed");
     let result: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
     result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)
         .collect()
@@ -37,7 +37,7 @@ fn generic_outputs(json: &[u8], filter: &str) -> Vec<String> {
     let expr = parse(filter).expect("parse failed");
     let result = eval_generic::eval_with_cursor(&expr, cursor);
     result
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .expect("materializes")
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)
@@ -653,7 +653,7 @@ fn assert_optional_parity_suppressed(json: &[u8], expr: &Expr) {
         "full evaluator: {expr:?} should be suppressed"
     );
     assert!(
-        full.collect_owned().is_empty(),
+        full.collect_owned::<JqSemantics>().is_empty(),
         "full evaluator: {expr:?} should yield nothing"
     );
 
@@ -663,7 +663,10 @@ fn assert_optional_parity_suppressed(json: &[u8], expr: &Expr) {
         "generic evaluator: {expr:?} should be suppressed"
     );
     assert!(
-        generic.collect_owned().expect("materializes").is_empty(),
+        generic
+            .collect_owned::<JqSemantics>()
+            .expect("materializes")
+            .is_empty(),
         "generic evaluator: {expr:?} should yield nothing"
     );
 }
@@ -1256,7 +1259,7 @@ fn assert_error_parity(json: &[u8], filter: &str) {
         other => panic!(
             "full evaluator did not raise for `{filter}` on `{}`: {:?}",
             String::from_utf8_lossy(json),
-            other.collect_owned()
+            other.collect_owned::<JqSemantics>()
         ),
     };
 
@@ -1559,7 +1562,10 @@ fn test_parity_fold_init_evaluated_before_source_2440() {
             eval::<Vec<u64>, JqSemantics>(&expr, index.root(br#"{"a":1}"#));
         match full {
             QueryResult::Error(e) => assert_eq!(e.message, "init", "`{filter}`"),
-            other => panic!("`{filter}` did not raise: {:?}", other.collect_owned()),
+            other => panic!(
+                "`{filter}` did not raise: {:?}",
+                other.collect_owned::<JqSemantics>()
+            ),
         }
     }
     // A zero-output INIT never pulls SOURCE at all, in either front end:
@@ -1614,7 +1620,7 @@ fn route_outputs<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    match eval_generic::eval_with_cursor_using::<S, _>(&expr, cursor).collect_owned() {
+    match eval_generic::eval_with_cursor_using::<S, _>(&expr, cursor).collect_owned::<S>() {
         Ok(values) => {
             let rendered: Vec<String> = values
                 .iter()
@@ -1949,13 +1955,13 @@ fn both_evaluator_outputs<S: EvalSemantics>(
 
     let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, S>(&expr, index.root(json));
     let full = full
-        .collect_owned()
+        .collect_owned::<S>()
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)
         .collect();
 
     let generic = eval_generic::eval_with_cursor_using::<S, _>(&expr, index.root(json))
-        .collect_owned()
+        .collect_owned::<S>()
         .expect("materializes")
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)

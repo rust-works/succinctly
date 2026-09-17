@@ -8921,7 +8921,7 @@ mod tests {
 
                 // Now test to_owned conversion
                 eprintln!("\n=== Testing to_owned conversion ===");
-                let owned = to_owned(&doc_cursor.value());
+                let owned = to_owned::<crate::jq::YqSemantics, _>(&doc_cursor.value());
                 eprintln!("to_owned result: {owned:?}");
             }
             other => panic!("expected mapping, got {other:?}"),

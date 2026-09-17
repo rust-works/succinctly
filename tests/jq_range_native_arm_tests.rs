@@ -6,7 +6,7 @@
 //! one directly -- which is what these tests do, rather than marking the arm
 //! tolerated and leaving its behaviour unasserted.
 
-use succinctly::jq::{eval_generic, Expr, Literal};
+use succinctly::jq::{eval_generic, Expr, JqSemantics, Literal};
 use succinctly::json::JsonIndex;
 
 fn run(expr: &Expr, doc: &str) -> Vec<String> {
@@ -14,7 +14,7 @@ fn run(expr: &Expr, doc: &str) -> Vec<String> {
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
     eval_generic::eval_with_cursor(expr, cursor)
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .expect("evaluates")
         .iter()
         .map(succinctly::jq::OwnedValue::to_json)

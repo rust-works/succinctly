@@ -27,6 +27,11 @@ use indexmap::IndexMap;
 use std::borrow::Cow;
 
 use crate::json::light::{JsonCursor, StandardJson};
+// `JqValue` is the representation `succinctly jq` prints through -- the yq
+// runner never constructs one -- so every number literal it materializes is
+// read under jq's number model (#2936). Stated once here rather than at each
+// of the sites below.
+use super::eval::JqSemantics;
 
 use super::document::{
     effective_len, effective_len_checked, key_display_string, DistinctKeyCursors, DocumentFields,
@@ -373,7 +378,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n),
             JqValue::Float(f) if (*f - (*f as i64 as f64)).abs() < f64::EPSILON => Some(*f as i64),
-            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_i64(),
+            JqValue::NumberLiteral(literal) => {
+                OwnedValue::from_number_literal::<JqSemantics>(literal).as_i64()
+            }
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -390,7 +397,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         match self {
             JqValue::Int(n) => Some(*n as f64),
             JqValue::Float(f) => Some(*f),
-            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal).as_f64(),
+            JqValue::NumberLiteral(literal) => {
+                OwnedValue::from_number_literal::<JqSemantics>(literal).as_f64()
+            }
             JqValue::RawNumber(bytes) => core::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse().ok()),
@@ -526,8 +535,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(b) => OwnedValue::Bool(*b),
             JqValue::Int(n) => OwnedValue::Int(*n),
             JqValue::Float(f) => OwnedValue::Float(*f),
-            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
-            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal),
+            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes::<JqSemantics>(bytes),
+            JqValue::NumberLiteral(literal) => {
+                OwnedValue::from_number_literal::<JqSemantics>(literal)
+            }
             JqValue::String(s) => OwnedValue::String(s.clone()),
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.iter()
@@ -587,8 +598,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(b) => OwnedValue::Bool(*b),
             JqValue::Int(n) => OwnedValue::Int(*n),
             JqValue::Float(f) => OwnedValue::Float(*f),
-            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
-            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal(literal),
+            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes::<JqSemantics>(bytes),
+            JqValue::NumberLiteral(literal) => {
+                OwnedValue::from_number_literal::<JqSemantics>(literal)
+            }
             JqValue::String(s) => OwnedValue::String(s.clone()),
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.iter()
@@ -625,8 +638,10 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::Bool(b) => OwnedValue::Bool(b),
             JqValue::Int(n) => OwnedValue::Int(n),
             JqValue::Float(f) => OwnedValue::Float(f),
-            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes(bytes),
-            JqValue::NumberLiteral(literal) => OwnedValue::from_number_literal_boxed(literal),
+            JqValue::RawNumber(bytes) => OwnedValue::from_number_bytes::<JqSemantics>(bytes),
+            JqValue::NumberLiteral(literal) => {
+                OwnedValue::from_number_literal_boxed::<JqSemantics>(literal)
+            }
             JqValue::String(s) => OwnedValue::String(s),
             JqValue::Array(arr) => OwnedValue::Array(
                 arr.into_iter()
@@ -894,7 +909,7 @@ fn lazy_index_range_to_owned(len: usize) -> OwnedValue {
 fn cursor_to_owned<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    super::eval_generic::to_owned_cursor_with(
+    super::eval_generic::to_owned_cursor_with::<_, JqSemantics>(
         cursor,
         |depth| {
             super::eval_generic::assert_nesting_depth(depth);
@@ -909,7 +924,7 @@ fn cursor_to_owned<W: Clone + AsRef<[u64]>>(
 fn try_cursor_to_owned<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
-    super::eval_generic::to_owned_cursor_with(
+    super::eval_generic::to_owned_cursor_with::<_, JqSemantics>(
         cursor,
         super::eval_generic::check_nesting_depth,
         cursor_number_to_owned,
@@ -924,7 +939,9 @@ fn cursor_number_to_owned<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Option<OwnedValue> {
     match value {
-        StandardJson::Number(number) => Some(OwnedValue::from_number_bytes(number.raw_bytes())),
+        StandardJson::Number(number) => Some(OwnedValue::from_number_bytes::<JqSemantics>(
+            number.raw_bytes(),
+        )),
         _ => None,
     }
 }
@@ -1067,7 +1084,7 @@ mod tests {
             for owned in [
                 cursor_to_owned(&cursor).unwrap(),
                 try_cursor_to_owned(&cursor).unwrap(),
-                super::super::eval_generic::to_owned_cursor(&cursor).unwrap(),
+                super::super::eval_generic::to_owned_cursor::<JqSemantics, _>(&cursor).unwrap(),
             ] {
                 let OwnedValue::NumberLiteral(_, spelling) = owned else {
                     panic!("{literal}: expected a source-backed number, got {owned:?}");
@@ -1096,7 +1113,7 @@ mod tests {
             let expected = try_cursor_to_owned(&cursor).unwrap();
             assert_eq!(cursor_to_owned(&cursor).unwrap(), expected, "{json:?}");
             assert_eq!(
-                super::super::eval_generic::to_owned_cursor(&cursor).unwrap(),
+                super::super::eval_generic::to_owned_cursor::<JqSemantics, _>(&cursor).unwrap(),
                 expected,
                 "{json:?}"
             );
@@ -1121,7 +1138,7 @@ mod tests {
             assert!(expected.is_decode_failure(), "{json:?}: {expected:?}");
             for actual in [
                 cursor_to_owned(&cursor).unwrap_err(),
-                super::super::eval_generic::to_owned_cursor(&cursor).unwrap_err(),
+                super::super::eval_generic::to_owned_cursor::<JqSemantics, _>(&cursor).unwrap_err(),
             ] {
                 assert_eq!(actual.message, expected.message, "{json:?}");
                 assert_eq!(actual.is_decode_failure(), expected.is_decode_failure());
@@ -1205,10 +1222,15 @@ mod tests {
             if depth < MAX_NESTING_DEPTH {
                 assert_eq!(try_cursor_to_owned(&cursor).unwrap().to_json(), json);
                 assert_eq!(cursor_to_owned(&cursor).unwrap().to_json(), json);
-                assert_eq!(to_owned_cursor(&cursor).unwrap().to_json(), json);
+                assert_eq!(
+                    to_owned_cursor::<JqSemantics, _>(&cursor)
+                        .unwrap()
+                        .to_json(),
+                    json
+                );
             } else {
                 let checked = try_cursor_to_owned(&cursor).unwrap_err();
-                let generic = to_owned_cursor(&cursor).unwrap_err();
+                let generic = to_owned_cursor::<JqSemantics, _>(&cursor).unwrap_err();
                 assert_eq!(checked.message, generic.message);
                 assert!(!checked.is_decode_failure());
                 assert!(generic.is_decode_failure());
@@ -1495,9 +1517,9 @@ mod tests {
                 b"[1,2,3]".as_slice(),
                 OwnedValue::Array(
                     vec![
-                        OwnedValue::from_number_literal("1"),
-                        OwnedValue::from_number_literal("2"),
-                        OwnedValue::from_number_literal("3"),
+                        OwnedValue::from_number_literal::<JqSemantics>("1"),
+                        OwnedValue::from_number_literal::<JqSemantics>("2"),
+                        OwnedValue::from_number_literal::<JqSemantics>("3"),
                     ]
                     .into(),
                 ),
@@ -1538,7 +1560,7 @@ mod tests {
             OwnedValue::Object(
                 IndexMap::from([(
                     "\u{FFFD}\u{FFFD}".to_string(),
-                    OwnedValue::from_number_literal("1")
+                    OwnedValue::from_number_literal::<JqSemantics>("1")
                 )])
                 .into()
             )
@@ -1639,7 +1661,7 @@ mod tests {
         // `JqValue::NumberLiteral` is `OwnedValue::NumberLiteral`'s lazy-side
         // counterpart (built by `from_owned`, e.g. by the CLI's output
         // formatter).
-        let owned = OwnedValue::from_number_literal("1e100");
+        let owned = OwnedValue::from_number_literal::<JqSemantics>("1e100");
 
         // `materialize`/`into_owned` round-trip through `OwnedValue`, whose
         // own `to_json` reformats through jq's canonical algorithm (see
@@ -1668,19 +1690,19 @@ mod tests {
         // document number flows through) must resolve the same as a plain
         // Int/Float, not silently read as "not a number".
         let int_lit: JqValue<'_, Vec<u64>> =
-            JqValue::from_owned(OwnedValue::from_number_literal("2"));
+            JqValue::from_owned(OwnedValue::from_number_literal::<JqSemantics>("2"));
         assert_eq!(int_lit.as_i64(), Some(2));
         assert_eq!(int_lit.as_f64(), Some(2.0));
 
         let float_lit: JqValue<'_, Vec<u64>> =
-            JqValue::from_owned(OwnedValue::from_number_literal("1.5"));
+            JqValue::from_owned(OwnedValue::from_number_literal::<JqSemantics>("1.5"));
         assert_eq!(float_lit.as_i64(), None);
         assert_eq!(float_lit.as_f64(), Some(1.5));
 
         // An integral-valued Float repr (e.g. from "2.0") still converts to
         // i64, same as JqValue::Float's own integral-value branch above.
         let integral_float_lit: JqValue<'_, Vec<u64>> =
-            JqValue::from_owned(OwnedValue::from_number_literal("2.0"));
+            JqValue::from_owned(OwnedValue::from_number_literal::<JqSemantics>("2.0"));
         assert_eq!(integral_float_lit.as_i64(), Some(2));
     }
 

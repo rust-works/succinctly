@@ -33,7 +33,7 @@ fn eval_to_json(json: &[u8], filter: &str) -> Vec<String> {
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
     eval::<_, JqSemantics>(&expr, cursor)
-        .collect_owned()
+        .collect_owned::<JqSemantics>()
         .iter()
         .map(OwnedValue::to_json)
         .collect()

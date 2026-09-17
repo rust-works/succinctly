@@ -27,6 +27,11 @@ use super::document::{DistinctKeyCursors, DocumentFields, IndentSpec, JsonConven
 use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::eval_generic::key_owned_value;
+// Key retyping (`1: x` is an `!!int` key, #2785) is real yq's rule and
+// `key_owned_value` already spells the check under `YqSemantics`; a jq key is
+// always a string and returns before the number model is consulted, so the
+// mode passed at the three `keys` writers below is yq's (#2936).
+use super::eval::YqSemantics;
 use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
     jq_bare_float_display, NumberRepr, OwnedValue,
@@ -743,7 +748,7 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
         // (`1: x`) is an `!!int` node in real yq's `keys`, and this writer
         // is the M2 fast path `keys` takes under default flags, so it has
         // to agree with the materializing routes.
-        let key = match key_owned_value(&key, &cursor)
+        let key = match key_owned_value::<_, _, YqSemantics>(&key, &cursor)
             .transpose()
             .unwrap_or_else(|| Err(fields.malformed_member_error()))
         {
@@ -1107,7 +1112,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             // non-stringifiable key (#1194) stops the walk and reports via
             // `error` instead of silently skipping it. A typed key is
             // written as its node (#2785), as in `stream_lazy_keys_json`.
-            let key = match key_owned_value(&key, &cursor)
+            let key = match key_owned_value::<_, _, YqSemantics>(&key, &cursor)
                 .transpose()
                 .unwrap_or_else(|| Err(fields.malformed_member_error()))
             {
@@ -1132,7 +1137,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         // Block style
         let mut cursors = DistinctKeyCursors::new(fields, collapse);
         for (i, (key, cursor)) in cursors.by_ref().enumerate() {
-            let key = match key_owned_value(&key, &cursor)
+            let key = match key_owned_value::<_, _, YqSemantics>(&key, &cursor)
                 .transpose()
                 .unwrap_or_else(|| Err(fields.malformed_member_error()))
             {
