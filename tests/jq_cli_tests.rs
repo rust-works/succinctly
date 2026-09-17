@@ -60514,6 +60514,17 @@ fn test_any_all_cond_while_until_native_arms_match_jq_2658() -> Result<()> {
             "[.nope | until(true; .) | key]",
             "[\"nope\"]",
         ),
+        // As a top-level pipe stage (`path_context_stage_native` is asked).
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            ".[] | until(key == \"c\"; .c) | key",
+            "\"c\"\n\"c\"",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            ".[] | [while(key != \"c\"; .c)] | length",
+            "1\n1",
+        ),
         (
             "{\"b\":{\"c\":1}}",
             "[.[] | until(true; .) | key]",

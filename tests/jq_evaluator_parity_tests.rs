@@ -2770,6 +2770,10 @@ fn test_loops_over_a_cursorless_value_2658() {
         (".arr | until(length == 1; .[1:]) | .[0][0]", "2"),
         (".arr | [.[] | any(. > 1)]", "[false,true]"),
         (".arr | isvalid(.[0])", "true"),
+        // A state emitted while still cursorless, and an `update` whose
+        // output stays cursorless (`select` forwards the value as it stood).
+        (".arr | first(while(true; .[1:])) | length", "2"),
+        (".arr | [limit(3; while(true; select(true)))] | length", "3"),
     ] {
         let expr = parse(filter).expect("parse failed");
         let cursorless: Vec<String> =
@@ -2785,5 +2789,39 @@ fn test_loops_over_a_cursorless_value_2658() {
             generic_outputs(json, filter),
             "cursorless vs cursor: `{filter}`"
         );
+    }
+}
+
+/// #2658: the eager `builtin_isvalid`'s two fixed arms, reached through the
+/// library's eager entry point (the CLI routes every program through the
+/// generic evaluator, whose `isvalid_generic` has the same two rules):
+/// an error `try` cannot catch passes through (`until`'s step cap is a
+/// resource-limit raise, #2132), and an empty multi-output is "no output".
+#[test]
+fn test_eager_isvalid_uncatchable_and_empty_generator_2658() {
+    let json = br#"{"n":0,"empty":[]}"#;
+    let index = JsonIndex::build(json);
+    let expr = parse(".n | isvalid(until(false; . + 1))").expect("parse failed");
+    match eval::<Vec<u64>, JqSemantics>(&expr, index.root(json)) {
+        QueryResult::Error(e) => {
+            assert!(e.is_uncatchable_at_value_position(), "{e}");
+            assert!(e.to_string().contains("maximum iterations exceeded"), "{e}");
+        }
+        other => panic!("expected the step-cap raise to pass through isvalid, got {other:?}"),
+    }
+    match eval_generic::eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(json)) {
+        eval_generic::GenericResult::Error(e) => {
+            assert!(e.to_string().contains("maximum iterations exceeded"), "{e}");
+        }
+        _ => panic!("expected the step-cap raise to pass through isvalid on the generic route"),
+    }
+    for filter in [
+        ".empty | isvalid(.[])",
+        ".empty | isvalid(map(.)[])",
+        ".empty | isvalid(.[] | . + 1)",
+    ] {
+        let (full, generic) = both_evaluator_outputs::<JqSemantics>(json, filter);
+        assert_eq!(as_strs(&full), ["false"], "full evaluator: `{filter}`");
+        assert_eq!(full, generic, "evaluators disagree on `{filter}`");
     }
 }
