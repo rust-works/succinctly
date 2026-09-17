@@ -47244,6 +47244,43 @@ fn consumer_argument_positional_read_resolves_on_every_route_2968() -> Result<()
             "absent walk isempty",
         ),
         (format!(".zz | [skip(1; {g})]"), "[1]", "absent walk skip"),
+        // the path-context walk steps `skip` like `limit`: a read *after*
+        // it stands on the forwarded node, and the count fans out
+        (
+            ".aa | [skip(1; .[]) | key]".to_string(),
+            r#"["c"]"#,
+            "walk skip then key",
+        ),
+        (
+            "[.aa | skip(1; .[]) | path]".to_string(),
+            r#"[["aa","c"]]"#,
+            "walk skip then path",
+        ),
+        (
+            ".aa | [skip((0,1); .[]) | key]".to_string(),
+            r#"["bbb","c","c"]"#,
+            "walk skip count fan-out",
+        ),
+        (
+            ".aa | [skip(1; .[]) | parent | key]".to_string(),
+            r#"["aa"]"#,
+            "walk skip then parent",
+        ),
+        (
+            ".aa | [skip(0; .) | key]".to_string(),
+            r#"["aa"]"#,
+            "walk skip keeps the node",
+        ),
+        (
+            ".zz | [skip(0; .) | key]".to_string(),
+            r#"["zz"]"#,
+            "walk skip keeps an absent position",
+        ),
+        (
+            r#".aa.bbb | "\(IN(range(0;(key|length)+1)))""#.to_string(),
+            r#""true""#,
+            "interpolation IN(s) rewrite",
+        ),
     ];
     for (filter, want, route) in &rows {
         let (out, code) = run_yq_stdin(filter, doc, &args)?;
@@ -47254,6 +47291,16 @@ fn consumer_argument_positional_read_resolves_on_every_route_2968() -> Result<()
              `key` were absent"
         );
     }
+    // The walk's `skip` step reports a bad or escaping count the way
+    // `limit`'s does.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(r#".aa | [skip("x"; .[]) | key]"#, doc, &args)?;
+    assert_ne!(code, 0);
+    assert!(err.contains("expected number"), "stderr {err:?}");
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(r#".aa | [skip((1, error("boom")); .[]) | key]"#, doc, &args)?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "stderr {err:?}");
     Ok(())
 }
 

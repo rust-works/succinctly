@@ -54406,6 +54406,55 @@ fn isempty_any_in_retry_terminal_rule_on_native_route_2968() -> Result<()> {
     Ok(())
 }
 
+/// #2968: the sink twins' remaining arms -- a lazy `map(..) | .[]` item
+/// (`LazySeq`) is run for the error it owes when `isempty`/`skip` discard
+/// it and when `IN` materializes it, `keys_unsorted[]` items reach the
+/// `any` probe with their pre-decoded value, and an argument that reads
+/// `input`/`inputs` still defers to `eval.rs` under a live input queue on
+/// both routes (bare and wrapped). Captured from jq 1.7.1 where it has the
+/// spelling (`skip/2` is jq 1.8's).
+#[test]
+fn consumers_lazy_items_and_input_deferral_2968() -> Result<()> {
+    let doc = r#"{"a":1,"b":2}"#;
+    for (filter, want) in [
+        (
+            "try isempty(map(1/0) | .[]) catch .",
+            r#""number (1) and number (0) cannot be divided because the divisor is zero""#,
+        ),
+        (
+            "try IN(map(1/0) | .[]) catch .",
+            r#""number (1) and number (0) cannot be divided because the divisor is zero""#,
+        ),
+        ("[skip(1; map(.) | .[])]", "[2]"),
+        (
+            "[try skip(1; map(1/0) | .[]) catch .]",
+            r#"["number (1) and number (0) cannot be divided because the divisor is zero"]"#,
+        ),
+        (r#"[any(keys_unsorted[]; . == "b")]"#, "[true]"),
+        ("isempty(map(.) | .[])", "false"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+    }
+    for (filter, input, want) in [
+        ("isempty(input)", "1\n2\n", "false"),
+        ("[isempty(input)]", "1\n2\n", "[false]"),
+        ("any(inputs; . == 3)", "1\n2\n3\n", "true"),
+        // doc 1 consumes 2 (decisive); doc 3 has no inputs left: `[false]`
+        (
+            "[first(any(inputs; . == 2))]",
+            "1\n2\n3\n",
+            "[true]\n[false]",
+        ),
+        ("IN(inputs)", "1\n2\n3\n", "false"),
+        ("[skip(1; inputs)]", "1\n2\n3\n", "[3]"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2968: leaving `bridge_to_each_owned_flow` stops the whole-document
 /// materialization the bridge performed, so a consumer whose argument reads
 /// `.b` no longer raises for a fault in `.a` (the #2103/#2173 class -- jq
