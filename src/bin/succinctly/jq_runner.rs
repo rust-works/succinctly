@@ -1675,18 +1675,16 @@ impl OutputConfig {
         // - No seq mode (would need to add RS characters)
         // - Source-preserving convention (jq's own would need to reformat
         //   numbers like 4e4 → 4E+4)
-        // - Never a jq-escape-table convention (#2985): this path writes
-        //   `json_bytes` verbatim with no per-byte inspection at all, so it
-        //   cannot re-encode a raw DEL byte (`0x7f`) the way jq's own
-        //   escape table does -- unlike the two other #2591/#2592 call
-        //   sites this issue also fixed, there is no per-field `has_del`
-        //   flag here to gate on; the whole-document echo has to be
-        //   disabled for any convention that would need it instead. Only
-        //   `Preserve` (yq's own) satisfies both this and
-        //   `preserves_source_values()` today -- `JqPreserveInput`
-        //   preserves source *values* but still uses jq's table (#2209),
-        //   so it now falls through to the slower per-field path below,
-        //   which already escapes DEL correctly.
+        //
+        // This only decides whether the *raw-echo path itself* is taken at
+        // all -- DEL-escaping (#2985) is handled separately, inside
+        // `write_identity_bytes`, once a document's actual bytes are known.
+        // An earlier draft folded `&& !uses_jq_escape_table()` into this
+        // function instead, which disabled the fast path for *every*
+        // jq-mode document (not just DEL-bearing ones), since
+        // `JqCompat`/`JqPreserveInput` are the only two conventions this
+        // binary ever constructs -- caught by review as a 2.7x-4.8x
+        // slowdown on ordinary input with no DEL at all.
         self.compact
             && !self.color_output
             && !self.sort_keys
@@ -1694,7 +1692,31 @@ impl OutputConfig {
             && !self.raw_output
             && !self.seq
             && self.convention.preserves_source_values()
-            && !self.convention.uses_jq_escape_table()
+    }
+
+    /// Writes `json_bytes` on `can_use_raw_identity`'s fast path, escaping
+    /// any raw DEL byte (`0x7f`) a jq-escape-table convention requires
+    /// (#2985). `Preserve` (yq's own) never re-encodes DEL, so its
+    /// documents always take the plain byte-for-byte write.
+    ///
+    /// This substitutes in place rather than falling back to the
+    /// slower, validating write path when DEL is found: this whole path
+    /// exists specifically for `--preserve-input`'s lenient, non-validating
+    /// echo (e.g. a trailing comma still round-trips), and falling back to
+    /// a real parse-and-reencode would make that leniency depend on
+    /// whether an unrelated DEL byte happens to also be in the document --
+    /// caught by review on the first draft, which did exactly that.
+    fn write_identity_bytes(&self, out: &mut impl Write, json_bytes: &[u8]) -> std::io::Result<()> {
+        if !self.convention.del_needs_escaping(json_bytes) {
+            return out.write_all(json_bytes);
+        }
+        let mut rest = json_bytes;
+        while let Some(pos) = rest.iter().position(|&b| b == 0x7f) {
+            out.write_all(&rest[..pos])?;
+            out.write_all(b"\\u007f")?;
+            rest = &rest[pos + 1..];
+        }
+        out.write_all(rest)
     }
 }
 
@@ -3151,7 +3173,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     if args.exit_status {
                         last_output = Some(identity_exit_status_value(json_bytes));
                     }
-                    out.write_all(json_bytes)?;
+                    output_config.write_identity_bytes(&mut out, json_bytes)?;
                     out.write_all(b"\n")?;
                     continue;
                 }

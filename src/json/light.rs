@@ -2899,30 +2899,53 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
                 return Err(StreamFailure::Fmt);
             };
             // #2985: a jq-escape-table convention (`JqPreserveInput`) can't
-            // take this fast path when the span contains a raw DEL byte
-            // (`0x7f`) -- jq's own escape table re-encodes it, and this
-            // path writes the *entire* raw span verbatim with no per-byte
-            // inspection otherwise. `Preserve` (yq's own, never a
-            // jq-escape-table convention) is unaffected and skips the scan
-            // entirely. Every *other* byte legal unescaped in JSON source
-            // is shared between both escape tables (confirmed by
-            // #2591/#2592's own scope), so DEL is the only reason a
-            // jq-escape-table convention can't take this branch
-            // unconditionally the way `Preserve` always could -- and this
-            // has to be a real scan, not a blanket exclusion: gating on
-            // `uses_jq_escape_table()` alone (an earlier draft) also
-            // disabled the fast path for a `JqPreserveInput` span with no
-            // DEL at all, silently canonicalizing an already-escaped
-            // `` to jq's own `\b` short form and breaking
+            // let a raw DEL byte (`0x7f`) through unescaped -- jq's own
+            // escape table re-encodes it, and this path otherwise writes
+            // the *entire* raw span verbatim with no per-byte inspection at
+            // all. `Preserve` (yq's own, never a jq-escape-table
+            // convention) is unaffected and skips the scan entirely. Every
+            // *other* byte legal unescaped in JSON source is shared between
+            // both escape tables (confirmed by #2591/#2592's own scope), so
+            // DEL is the only reason a jq-escape-table convention can't
+            // otherwise take this branch unconditionally the way `Preserve`
+            // always could.
+            //
+            // A DEL hit substitutes its escape in place and keeps writing
+            // the surrounding bytes verbatim, rather than falling through
+            // to the validating writer below: this fast path exists for
+            // `--preserve-input`'s *lenient*, non-validating echo (a stray
+            // trailing comma still round-trips), and falling back to a real
+            // parse would make that leniency depend on whether an unrelated
+            // DEL byte happens to also be in the document. Caught by review
+            // on the first draft, which did exactly that.
+            //
+            // Gating on `uses_jq_escape_table()` alone with no byte scan at
+            // all (an even earlier draft) has its own failure mode:
+            // disabling this fast path for a `JqPreserveInput` span with no
+            // DEL at all silently canonicalizes an already-escaped six
+            // character source spelling to jq's own two-character short
+            // form, breaking
             // `test_preserve_input_keeps_jq_escape_table_2209`'s pinned
             // "verbatim spelling survives" behavior, which predates #2209
             // and has nothing to do with DEL.
-            let del_unsafe = numbers.uses_jq_escape_table() && bytes.contains(&0x7f);
-            if !del_unsafe {
-                // SAFETY: JSON input is valid UTF-8 (checked during indexing)
-                let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
-                return Ok(out.write_str(s)?);
+            if numbers.del_needs_escaping(bytes) {
+                let mut rest = bytes;
+                while let Some(pos) = rest.iter().position(|&b| b == 0x7f) {
+                    // SAFETY: JSON input is valid UTF-8 (checked during
+                    // indexing); DEL (`0x7f`) can never appear as a
+                    // continuation byte of a multi-byte sequence, so
+                    // splitting here can't cut one in half.
+                    let chunk = core::str::from_utf8(&rest[..pos]).map_err(|_| core::fmt::Error)?;
+                    out.write_str(chunk)?;
+                    out.write_str("\\u007f")?;
+                    rest = &rest[pos + 1..];
+                }
+                let chunk = core::str::from_utf8(rest).map_err(|_| core::fmt::Error)?;
+                return Ok(out.write_str(chunk)?);
             }
+            // SAFETY: JSON input is valid UTF-8 (checked during indexing)
+            let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+            return Ok(out.write_str(s)?);
         }
         // #1676/#1576 review: a stray `,` in an *apparently* empty
         // container (`{,}`, `[,]`) has no child cursor for
@@ -3738,20 +3761,20 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 ///
 /// Zero-copy fast path: a span with no `\` escape needs no re-encoding
 /// under yq's own convention (`Preserve`), which agrees with source on
-/// every byte legal unescaped in JSON -- but jq's convention (`JqCompat`)
-/// diverges from that at exactly one such byte, DEL (`0x7f`, #2591:
-/// `jq::escape`'s own `conventions_differ_at_exactly_five_code_points`
-/// names all five differences (three within the control-character range
-/// this comment's own claim is scoped to, plus two multi-byte separators,
-/// #1982, that are out of scope for a single-*byte* fast path like this
-/// one); the other two control-range differences, backspace/form-feed, always
-/// arrive pre-escaped with a `\` and so never reach this fast path at all).
-/// `del_unsafe` below is what keeps a `JqCompat` span containing a raw DEL
-/// byte off this path. **Three call sites in
-/// `src/bin/succinctly/jq_runner.rs`'s own `print_json` (`.[]`-streamed
-/// values, and both `keys_unsorted` key-printing loops) share this exact
-/// bug shape today, deliberately left unfixed by #2591 to keep it narrowly
-/// scoped -- tracked in #2592.**
+/// every byte legal unescaped in JSON -- but a jq-escape-table convention
+/// (`JqCompat`/`JqPreserveInput`) diverges from that at exactly one such
+/// byte, DEL (`0x7f`, #2591: `jq::escape`'s own
+/// `conventions_differ_at_exactly_five_code_points` names all five
+/// differences -- three within the control-character range this comment's
+/// own claim is scoped to, plus two multi-byte separators, #1982, that are
+/// out of scope for a single-*byte* fast path like this one; the other two
+/// control-range differences, backspace/form-feed, always arrive
+/// pre-escaped with a `\` and so never reach this fast path at all).
+/// `del_unsafe` below is what keeps such a span containing a raw DEL byte
+/// off this path (#2591/#2985 -- the three sibling call sites in
+/// `src/bin/succinctly/jq_runner.rs`'s own `print_json`, tracked in #2592,
+/// and this function's own `JqPreserveInput` gap, tracked in #2985, are
+/// both fixed now too).
 fn write_json_string_pretty<Out: core::fmt::Write>(
     out: &mut Out,
     s: JsonString<'_>,
