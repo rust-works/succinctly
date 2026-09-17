@@ -55,16 +55,16 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, cache_shared_chain_value, cached_shared_chain_value,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
-    clear_nonretryable_stop, collapse_vec, collect_pattern_var_names, compare_key_arrays,
-    compare_values, debug_assert_materialization_error, demote_rebuilt_markers, each_path_on_owned,
-    each_recurse_walk, enter_def_call_frame, entries_to_object, eval_each_owned,
-    eval_full as full_eval, extract_pattern_bindings, extract_single_pattern_binding,
-    finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
-    foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
-    index_in_array_bounds, index_one_owned as index_owned_by_key, is_dollar_safe_chain_key,
-    is_pure_chain_link, is_retryable_stop, key_arrays_eq, literal_to_owned,
-    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
+    classify_skip_n, clear_nonretryable_stop, collapse_vec, collect_pattern_var_names,
+    compare_key_arrays, compare_values, debug_assert_materialization_error, demote_rebuilt_markers,
+    each_path_on_owned, each_recurse_walk, enter_def_call_frame, entries_to_object,
+    eval_each_owned, eval_full as full_eval, extract_pattern_bindings,
+    extract_single_pattern_binding, finish_fork_flow, finish_fork_from_flow, finish_short_circuit,
+    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
+    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
+    is_dollar_safe_chain_key, is_pure_chain_link, is_retryable_stop, key_arrays_eq,
+    literal_to_owned, mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index,
+    numeric_key_to_index, numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
     pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
     range_values_f64, range_values_int, recurse_walk_flow, reduce_forks,
     resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
@@ -2829,13 +2829,15 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
 /// carries the native lazy `Builtin::Inputs` arm the eager path does not --
 /// so this direction can only improve input interleaving, never regress it.
 ///
-/// Used for the three consumers this module has no native arm for at all
-/// (`isempty`, `any`/`all(gen; cond)`, `IN`), which already bridged
-/// wholesale to `eval.rs` before #2180 -- writing generic twins for them
-/// would have duplicated `eval.rs`'s five sinks for no cursor to preserve:
-/// all three answer with a computed `OwnedValue::Bool`, never a document
-/// node. `first`/`nth` are the opposite case and keep their native,
-/// cursor-preserving arms ([`each_first_generic`], [`each_nth_generic`]).
+/// Used for the live-input-queue deferrals only (#1309): `first`/`nth`
+/// ([`each_first_generic`], [`each_nth_generic`]) and, since #2968,
+/// `isempty`/`any`/`all(gen; cond)`/`IN`/`skip`, whenever the argument
+/// reads `input`/`inputs` -- `eval.rs`'s `eval_each` has the native
+/// `Builtin::Inputs` arm this module lacks. Every one of those consumers is
+/// otherwise native here now; the reasoning that once kept the last five on
+/// this bridge ("a computed boolean has no cursor to preserve") was true of
+/// their *output* and said nothing about their arguments, which need the
+/// cursor to evaluate a positional read (#2968).
 fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -8778,26 +8780,28 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #2180 WP1: the nested short-circuiting consumers, mirroring
         // `eval.rs`'s own new arm set. Route matters here and always has --
         // a bare `first(...)` at the CLI is intercepted by this module's
-        // native `Expr::FirstExpr` arm and drives `eval_each_generic`, while
-        // `isempty(...)` has no native arm at all and bridges wholesale to
-        // `eval.rs` -- so a fix landing in one file is not evidence it
-        // landed in the other, and every row was confirmed under both
-        // wrappers (`scripts/jq-alt-retry-oracle-sweep.sh` crosses all six
-        // consumers with all six wrappers).
-        //
-        // `first`/`nth` get native, cursor-preserving arms; `isempty`,
-        // `any`/`all(gen; cond)` and `IN` take the demand-forwarding owned
-        // bridge, since all three answer with a computed boolean and have no
-        // cursor to preserve -- see [`bridge_to_each_owned_flow`]'s own doc
-        // comment for why that crossing loses nothing the eager bridge they
-        // already took did not.
+        // native `Expr::FirstExpr` arm and drives `eval_each_generic`, and
+        // until #2968 `isempty(...)` had no native arm at all and bridged
+        // wholesale to `eval.rs` -- so a fix landing in one file is not
+        // evidence it landed in the other, and every row was confirmed
+        // under both wrappers (`scripts/jq-alt-retry-oracle-sweep.sh`
+        // crosses all six consumers with all six wrappers). All six are
+        // native here now, so the two evaluators' copies of each rule are
+        // what has to be kept in step.
         Expr::FirstExpr(inner) => each_first_generic::<S, V>(inner, value, optional, cursor, sink),
         Expr::NthExpr { n, expr: inner } | Expr::Builtin(Builtin::NthStream(n, inner)) => {
             each_nth_generic::<S, V>(n, inner, value, optional, cursor, sink)
         }
-        // `skip` already materializes through the owned bridge in the eager
-        // evaluator; use its streaming twin so downstream stops reach both
-        // the count and body generators (#2934).
+        // #2968: native, cursor-threaded twins of `eval.rs`'s five sinks
+        // (plus `skip`, #2934) -- these used to take
+        // `bridge_to_each_owned_flow` on the reasoning that a computed
+        // boolean has no cursor to preserve on the way *out*, which said
+        // nothing about the way *in*: a positional read inside the
+        // argument (`isempty(range(0; (key|length)))`) was evaluated with
+        // no cursor at all. The one deferral kept is `each_first_generic`'s
+        // own: with a live input queue, an argument that reads `input`/
+        // `inputs` still crosses to `eval.rs`, whose `Builtin::Inputs` arm
+        // this module lacks (#1309).
         Expr::Builtin(
             Builtin::Skip(..)
             | Builtin::IsEmpty(_)
@@ -8805,7 +8809,27 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             | Builtin::AllCond(..)
             | Builtin::UpperIn(_)
             | Builtin::UpperInSrc(..),
-        ) => bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink),
+        ) if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        Expr::Builtin(Builtin::IsEmpty(inner)) => {
+            each_isempty_generic::<S, V>(inner, value, optional, cursor, sink)
+        }
+        Expr::Builtin(Builtin::AnyCond(gen, cond)) => {
+            each_any_all_gen_cond_generic::<S, V>(gen, cond, value, optional, cursor, true, sink)
+        }
+        Expr::Builtin(Builtin::AllCond(gen, cond)) => {
+            each_any_all_gen_cond_generic::<S, V>(gen, cond, value, optional, cursor, false, sink)
+        }
+        Expr::Builtin(Builtin::UpperIn(s)) => {
+            each_upper_in_generic::<S, V>(s, value, optional, cursor, sink)
+        }
+        Expr::Builtin(Builtin::UpperInSrc(src, s)) => {
+            each_upper_in_src_generic::<S, V>(src, s, value, optional, cursor, sink)
+        }
+        Expr::Builtin(Builtin::Skip(n, inner)) => {
+            each_skip_generic::<S, V>(n, inner, value, optional, cursor, sink)
+        }
 
         // #2180 WP2a introduced this pair for `and`/`or` with a path-context
         // operand, gated exactly as `eval_single`'s own `Expr::And`/`Expr::Or`
@@ -9120,8 +9144,9 @@ fn each_reduce_generic<S: EvalSemantics, V: DocumentValue>(
 ///
 /// Both routes need the arm and both are exercised by every row: a bare
 /// `first(...)` is intercepted by this file's own native `FirstExpr` arm and
-/// drives `eval_each_generic`, while `isempty(...)` has no native arm here
-/// and reaches `eval.rs`'s `eval_each` instead.
+/// drives `eval_each_generic`; `isempty(...)` used to reach `eval.rs`'s
+/// `eval_each` instead and is native here too since #2968, so the rows now
+/// pin the two evaluators' copies of the rule against each other.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: `foreach`'s own INIT/source/EXTRACT list
 fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     input: &Expr,
@@ -10296,6 +10321,305 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
         take_at_index_generic::<S, V>(expr, value.clone(), optional, cursor, n, sink)
+    })
+}
+
+/// Generic twin of `eval::counted_bool_flow_to_flow` (#2968): the terminal
+/// rule shared by [`each_isempty_generic`], [`each_any_all_gen_cond_generic`]
+/// and [`each_upper_in_generic`], transcribed verbatim -- including the one
+/// place it deliberately differs from [`finish_short_circuit`]: the
+/// identity (`isempty`'s trailing `, true`, `any`/`all`/`IN`'s own identity
+/// element) fires on [`Flow::Exhausted`] **even when the outer sink already
+/// stopped**, because that exhaustion belongs to whichever `?//`
+/// alternative the outer stop's unwind retried. `[first(isempty([1] as [$x]
+/// ?// $x | if ($x|type)=="number" then 9 else empty end))]` is
+/// `[false,true]` in jq 1.7.1, and this arm is what makes the native route
+/// answer it too rather than `[false]`.
+fn counted_bool_flow_to_flow_generic<V: DocumentValue>(
+    identity: bool,
+    outer_stopped: bool,
+    flow: Flow,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    match flow {
+        Flow::Exhausted => match sink.push(GenericItem::Owned(OwnedValue::Bool(identity))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        },
+        stopped @ Flow::Stopped { .. } if outer_stopped => stopped,
+        Flow::Stopped { .. } => Flow::Exhausted,
+        Flow::Escaped(control) => Flow::Escaped(control),
+    }
+}
+
+/// Run a generator output whose *value* is never read (`isempty`'s
+/// `g|false`, `skip`'s dropped prefix) for the errors it still owes (#2968).
+///
+/// A `LazySeq` is a buffered computation (`map(1/0)`, #724/#725) that jq
+/// would have evaluated on the way to discarding it, so it is forced and
+/// its escape reported. A document node (`One`/`OneCursor`) is left
+/// undecoded on purpose: nothing reads it, and the #2692 rule is that a
+/// value is validated exactly when something decodes it -- `isempty(.b)` on
+/// a document with a malformed `.a` answers, as recorded in
+/// `docs/compliance/jq/limitations.md`. `LazyKeys`/`LazyIndexRange` carry
+/// no computation that can fail short of that same decode.
+fn discard_generic_item<V: DocumentValue>(
+    item: GenericItem<V>,
+    escape: &mut Option<Control>,
+) -> Demand {
+    match item {
+        GenericItem::LazySeq(_) => match generic_item_into_owned(item) {
+            Ok(_) => Demand::Continue,
+            Err(control) => stop_with_escape(escape, control),
+        },
+        _ => Demand::Continue,
+    }
+}
+
+/// Generic twin of `eval::each_isempty` (#2968): jq's `def isempty(g): label
+/// $out | (g|false, break $out), true;` driven through
+/// [`eval_each_generic`] with the cursor, so a positional read inside `g`
+/// (`isempty(range(0; (key|length)))`) resolves at the stage's own position
+/// instead of the owned bridge's no-cursor default. `false` is pushed once
+/// per output `g` hands over and `true` once on exhaustion, through the
+/// shared terminal rule.
+fn each_isempty_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        if discard_generic_item(item, &mut escape) == Demand::Stop {
+            return Demand::Stop;
+        }
+        if sink.push(GenericItem::Owned(OwnedValue::Bool(false))) == Demand::Stop {
+            outer_stopped = true;
+        }
+        Demand::Stop
+    });
+    if escape.is_some() {
+        return resume_from_escape(escape, flow);
+    }
+    counted_bool_flow_to_flow_generic(true, outer_stopped, flow, sink)
+}
+
+/// Probe one `gen` output's `cond` at that output's own position (#2968):
+/// `cond` is evaluated against the item's value *with the item's cursor*,
+/// so `key`/`parent` inside `cond` see the element, not the stage input.
+/// The probe stops at the first *decisive* output (`truthy == target`),
+/// which is jq's own `first((g|c and empty), true)`-shaped definition: a
+/// later output of the same `cond` application is never evaluated once one
+/// has decided, so `[any(1; (true, ("C"|stderr)))]` writes nothing, as in
+/// jq 1.7.1.
+///
+/// Evaluated directly, not as a pipe continuation of the item
+/// (`continue_pipe_element_generic`): in yq mode a stage after `.[]`
+/// applies the discard-the-prefix rule to a generator that fails part-way
+/// (#2326), which would turn `any(.[]; (true, error("late")))` from the
+/// `true` the owned route always answered into that error -- real yq has
+/// no `any(gen; cond)` at all, so the owned route's answer is the baseline
+/// to keep. `eval_each_generic`'s own `Comma` arm is lazy in both modes.
+/// An item with no cursor to offer (`Owned`, a lazy chain) takes the owned
+/// evaluator exactly as before, materialized first.
+///
+/// `Ok(true)`: decisive. `Ok(false)`: `cond` ran dry undecided. `Err`: an
+/// escape before any decision -- an error after a decisive output is never
+/// reached, which is the "prefix wins over trailing control" rule
+/// `eval::any_all_probe_element` states, arrived at by stopping early
+/// instead of by collecting and then discarding.
+fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    item: GenericItem<V>,
+    target_truthy: bool,
+) -> Result<bool, Control> {
+    let mut decided = false;
+    let mut escape: Option<Control> = None;
+    let mut probe = |out: GenericItem<V>| match generic_item_truthiness(out) {
+        Ok(truthy) if truthy == target_truthy => {
+            decided = true;
+            Demand::Stop
+        }
+        Ok(_) => Demand::Continue,
+        Err(control) => stop_with_escape(&mut escape, control),
+    };
+    let flow = match item {
+        GenericItem::One(v) => eval_each_generic::<S, V>(cond, v, false, None, &mut probe),
+        GenericItem::OneCursor(c) => {
+            eval_each_generic::<S, V>(cond, c.value(), false, Some(c), &mut probe)
+        }
+        GenericItem::OneCursorValue(c, v) => {
+            eval_each_generic::<S, V>(cond, v, false, Some(c), &mut probe)
+        }
+        item @ (GenericItem::Owned(_)
+        | GenericItem::LazyKeys { .. }
+        | GenericItem::LazyIndexRange(_)
+        | GenericItem::LazySeq(_)) => {
+            let elem = generic_item_into_owned(item)?;
+            eval_each_owned::<S>(cond, &elem, false, &mut |o| probe(GenericItem::Owned(o)))
+        }
+    };
+    if let Some(control) = escape {
+        return Err(control);
+    }
+    if decided {
+        return Ok(true);
+    }
+    match flow {
+        Flow::Escaped(control) => Err(control),
+        Flow::Exhausted | Flow::Stopped { .. } => Ok(false),
+    }
+}
+
+/// Generic twin of `eval::each_any_all_gen_cond` (#2968) -- `any(gen;
+/// cond)`/`all(gen; cond)` with `gen` driven through [`eval_each_generic`]
+/// at the stage's cursor and `cond` probed at each output's own position
+/// ([`any_all_probe_item_generic`]).
+///
+/// Every `?//` rule the eager twin documents is reproduced verbatim: a
+/// decisive element short-circuits `gen`; `probe_escape` is a per-attempt
+/// channel cleared on every genuine match, so an already-retried-past
+/// alternative's `cond` error cannot outrank a later alternative's real
+/// verdict (#1519); and it is folded into the flow exactly once, at the
+/// end, so the shared terminal rule reasons about one escape channel
+/// (#2204). Equality for `IN` stays `owned_value_eq::<S>` in
+/// [`each_upper_in_generic`]; nothing here compares values.
+fn each_any_all_gen_cond_generic<S: EvalSemantics, V: DocumentValue>(
+    gen: &Expr,
+    cond: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    target_truthy: bool,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut probe_escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(gen, value, optional, cursor, &mut |item| {
+        match any_all_probe_item_generic::<S, V>(cond, item, target_truthy) {
+            Ok(true) => {
+                probe_escape = None;
+                if sink.push(GenericItem::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
+                    outer_stopped = true;
+                }
+                Demand::Stop
+            }
+            Ok(false) => Demand::Continue,
+            Err(control) => stop_with_escape(&mut probe_escape, control),
+        }
+    });
+
+    let effective_flow = if matches!(flow, Flow::Stopped { .. }) && probe_escape.is_some() {
+        resume_from_escape(probe_escape, flow)
+    } else {
+        flow
+    };
+    counted_bool_flow_to_flow_generic(!target_truthy, outer_stopped, effective_flow, sink)
+}
+
+/// Generic twin of `eval::each_upper_in` (#2968) -- `IN(s)`, jq's `any(s ==
+/// .; .)`, with `s` driven at the stage's cursor. The current input is
+/// materialized once (it is the stage's own value, not the document) and
+/// each candidate as it arrives, and the comparison is
+/// `owned_value_eq::<S>` so yq mode's strict Int/Float distinction is
+/// honoured exactly as on the eager route.
+fn each_upper_in_generic<S: EvalSemantics, V: DocumentValue>(
+    s: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let current = match to_owned(&value) {
+        Ok(v) => v,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(s, value, optional, cursor, &mut |item| {
+        let candidate = match generic_item_into_owned(item) {
+            Ok(v) => v,
+            Err(control) => return stop_with_escape(&mut escape, control),
+        };
+        if owned_value_eq::<S>(&candidate, &current) {
+            if sink.push(GenericItem::Owned(OwnedValue::Bool(true))) == Demand::Stop {
+                outer_stopped = true;
+            }
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    if escape.is_some() {
+        return resume_from_escape(escape, flow);
+    }
+    counted_bool_flow_to_flow_generic(false, outer_stopped, flow, sink)
+}
+
+/// Generic twin of `eval::each_upper_in_src` (#2968) -- `IN(src; s)` is
+/// `any(src == s; .)`, so it synthesizes the identical `Expr::Compare` its
+/// eager sibling does and hands it to [`each_any_all_gen_cond_generic`];
+/// `eval_each_generic`'s own `Compare` arm keeps the nest lazy and at the
+/// cursor. Built directly as a `Compare`, never as a `Pipe` (#3031).
+fn each_upper_in_src_generic<S: EvalSemantics, V: DocumentValue>(
+    src: &Expr,
+    s: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let gen = Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(src.clone()),
+        right: Box::new(s.clone()),
+    };
+    each_any_all_gen_cond_generic::<S, V>(
+        &gen,
+        &Expr::Identity,
+        value,
+        optional,
+        cursor,
+        true,
+        sink,
+    )
+}
+
+/// Generic twin of `eval::each_skip` (#2968): `n` is the outer fan-out
+/// ([`fanout_arg_each_generic`], as `nth`'s is), and each count's walk of
+/// `expr` drops its first `n` outputs and passes the rest through **with
+/// their cursors**, so a downstream positional read still sees the element
+/// -- the point of leaving the bridge, which had no cursor to hand on. A
+/// dropped output is run for the errors it owes ([`discard_generic_item`])
+/// but not decoded. #2952's retry boundary is kept as `eval::each_skip` has
+/// it: `remaining` is per count and never resets across a `?//` retry.
+fn each_skip_generic<S: EvalSemantics, V: DocumentValue>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    fanout_arg_each_generic::<S, V, _>(n_expr, value.clone(), optional, cursor, |count| {
+        let mut remaining = match classify_skip_n(count) {
+            Ok(n) => n,
+            Err(error) => return Flow::Escaped(Control::Error(error)),
+        };
+        let mut escape: Option<Control> = None;
+        let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
+            if remaining > 0 {
+                remaining -= 1;
+                return discard_generic_item(item, &mut escape);
+            }
+            sink.push(item)
+        });
+        resume_from_escape(escape, flow)
     })
 }
 
@@ -15943,6 +16267,9 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => nav(inner),
         Expr::Shared(inner) => nav(inner),
         Expr::Limit { n, expr } => path_context_component_walkable(n) && nav(expr),
+        // #2968: `skip(n; body)` steps its body and drops the first `n`
+        // positions -- `limit`'s twin, with the count read the same way.
+        Expr::Builtin(Builtin::Skip(n, expr)) => path_context_component_walkable(n) && nav(expr),
         Expr::FuncDef {
             name,
             params,
@@ -16477,6 +16804,29 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     Err(e) => return Err(Control::Error(e)),
                 };
                 path_context_step_bounded::<S, V>(expr, take, pos, out)?;
+            }
+            control.map_or(Ok(()), |c| {
+                Err(path_context_component_escape::<S, V>(out, produced_from, c))
+            })
+        }
+        // #2968: `skip(n; body)` -- `limit`'s twin in the walk. The body is
+        // stepped in full (there is no bound to stop it at; every dropped
+        // position still had to be produced) and the first `n` positions
+        // are dropped, once per count value, with the count's own escape
+        // reported after the positions already produced exactly as `limit`
+        // reports its count's.
+        Expr::Builtin(Builtin::Skip(n, expr)) => {
+            let produced_from = out.len();
+            let (counts, control) = path_context_component_values::<S, V>(n, pos);
+            for n_value in counts {
+                let drop = match classify_skip_n(n_value) {
+                    Ok(n) => n,
+                    Err(e) => return Err(Control::Error(e)),
+                };
+                let mut branch = Vec::new();
+                let stepped = path_context_step_generic::<S, V>(expr, pos, &mut branch);
+                out.extend(branch.into_iter().skip(drop));
+                stepped?;
             }
             control.map_or(Ok(()), |c| {
                 Err(path_context_component_escape::<S, V>(out, produced_from, c))
@@ -18149,6 +18499,16 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner) => step_can_yield_absent(inner, incoming),
         Expr::Limit { expr, .. } => step_can_yield_absent(expr, incoming),
+        // #2968: `skip` yields what its body yields; the boolean consumers
+        // yield a computed value, never a position.
+        Expr::Builtin(Builtin::Skip(_, inner)) => step_can_yield_absent(inner, incoming),
+        Expr::Builtin(
+            Builtin::IsEmpty(_)
+            | Builtin::AnyCond(..)
+            | Builtin::AllCond(..)
+            | Builtin::UpperIn(_)
+            | Builtin::UpperInSrc(..),
+        ) => false,
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             step_can_yield_absent(inner, incoming)
         }
@@ -18236,6 +18596,9 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
         Expr::Paren(inner) | Expr::Optional(inner) => path_context_stage_preserves_node(inner),
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_stage_preserves_node(inner),
         Expr::Limit { expr, .. } => path_context_stage_preserves_node(expr),
+        // #2968: `skip` forwards its body's outputs, cursors intact; the
+        // boolean-answering consumers emit a computed value (`_` below).
+        Expr::Builtin(Builtin::Skip(_, inner)) => path_context_stage_preserves_node(inner),
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             path_context_stage_preserves_node(inner)
         }
@@ -18425,6 +18788,16 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::Limit { n, expr } => {
             matches!(**n, Expr::Literal(_)) && path_context_single_native(expr)
         }
+        // #2968: native on both routes (`eval_each_generic`'s sink twins,
+        // collected by `eval_builtin`), every argument evaluated with the
+        // cursor -- `cond` at each `gen` output's own cursor.
+        Expr::Builtin(Builtin::IsEmpty(f) | Builtin::UpperIn(f)) => path_context_single_native(f),
+        Expr::Builtin(
+            Builtin::AnyCond(a, b)
+            | Builtin::AllCond(a, b)
+            | Builtin::UpperInSrc(a, b)
+            | Builtin::Skip(a, b),
+        ) => path_context_single_native(a) && path_context_single_native(b),
         // Native since #2416 phase 3 (`build_object_entries_generic`): every
         // key and value expression is evaluated with the cursor.
         Expr::Object(entries) => entries.iter().all(|entry| {
@@ -18801,6 +19174,18 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         }
         Expr::Builtin(Builtin::Select(cond)) => sub(cond),
         Expr::Limit { n, expr } => sub(n) && sub(expr),
+        // #2968: the consumers' arguments are evaluated at this stage's own
+        // position (`gen`, `s`, `src`, the `skip` count and body), so a read
+        // in them resolves like `limit`'s. `cond` is not: it stands at each
+        // `gen` output's position, which the rewrite cannot spell as this
+        // stage's constants, so a read there is refused (the pipe keeps the
+        // native streaming route, which evaluates `cond` at the element).
+        Expr::Builtin(Builtin::IsEmpty(f) | Builtin::UpperIn(f)) => sub(f),
+        Expr::Builtin(Builtin::UpperInSrc(src, s)) => sub(src) && sub(s),
+        Expr::Builtin(Builtin::Skip(n, f)) => sub(n) && sub(f),
+        Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond)) => {
+            sub(gen) && !needs_path_context(cond)
+        }
         Expr::Try { expr, catch } => sub(expr) && catch.as_deref().map_or(true, sub),
         Expr::If {
             cond,
@@ -18952,6 +19337,8 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
             path_context_absent_keeps_position(inner)
         }
         Expr::Limit { expr, .. } => path_context_absent_keeps_position(expr),
+        // #2968: `skip` keeps whatever position its body keeps.
+        Expr::Builtin(Builtin::Skip(_, inner)) => path_context_absent_keeps_position(inner),
         Expr::Try { expr, catch } => {
             path_context_absent_keeps_position(expr)
                 && catch
@@ -19397,6 +19784,22 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             n: boxed(n)?,
             expr: boxed(expr)?,
         },
+        // #2968: the rewriter's half of `path_context_resolvable`'s arms for
+        // the consumers -- every argument evaluated at this position is
+        // rewritten; `cond` is left as written, the gate having refused any
+        // read inside it.
+        Expr::Builtin(Builtin::IsEmpty(f)) => Expr::Builtin(Builtin::IsEmpty(boxed(f)?)),
+        Expr::Builtin(Builtin::UpperIn(s)) => Expr::Builtin(Builtin::UpperIn(boxed(s)?)),
+        Expr::Builtin(Builtin::UpperInSrc(src, s)) => {
+            Expr::Builtin(Builtin::UpperInSrc(boxed(src)?, boxed(s)?))
+        }
+        Expr::Builtin(Builtin::Skip(n, f)) => Expr::Builtin(Builtin::Skip(boxed(n)?, boxed(f)?)),
+        Expr::Builtin(Builtin::AnyCond(gen, cond)) => {
+            Expr::Builtin(Builtin::AnyCond(boxed(gen)?, cond.clone()))
+        }
+        Expr::Builtin(Builtin::AllCond(gen, cond)) => {
+            Expr::Builtin(Builtin::AllCond(boxed(gen)?, cond.clone()))
+        }
         Expr::Try { expr, catch } => Expr::Try {
             expr: boxed(expr)?,
             catch: catch.as_deref().map(boxed).transpose()?,
@@ -20819,6 +21222,25 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
         Builtin::LastStream(inner) => {
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
+        }
+
+        // #2968: native on this route too, by collecting the sink twins
+        // `eval_each_generic` runs for these six -- a builtin that is native
+        // only on the streaming route must not be admitted by
+        // `path_context_stage_native`, and these are admitted there now.
+        // Same live-input-queue deferral as the streaming arm (#1309).
+        Builtin::IsEmpty(_)
+        | Builtin::AnyCond(..)
+        | Builtin::AllCond(..)
+        | Builtin::UpperIn(_)
+        | Builtin::UpperInSrc(..)
+        | Builtin::Skip(..) => {
+            let expr = Expr::Builtin(builtin.clone());
+            if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(&expr) {
+                bridge_to_full_evaluator::<S, _>(&expr, value, cursor, optional)
+            } else {
+                collect_each_generic::<S, V>(&expr, value, optional, cursor)
+            }
         }
 
         // `nth(n; expr)` (arity 2) parses straight to this `Builtin`
