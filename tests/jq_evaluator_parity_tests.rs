@@ -2752,3 +2752,38 @@ fn test_position_reads_inside_any_cond_isvalid_loops_agree_2658() {
         }
     }
 }
+
+/// #2658: the loops' native arm over a value that carries no cursor -- the
+/// library's cursorless entry point (`eval_generic::eval_using`), where every
+/// state is a `LoopState::Document(v, None)` and the states it emits are
+/// `GenericItem::One`. The CLI never builds this shape (every document value
+/// it evaluates has a cursor), so it is reached here directly, and answers
+/// exactly as the cursor-bearing route does.
+#[test]
+fn test_loops_over_a_cursorless_value_2658() {
+    let json = br#"{"n":0,"arr":[[1],[2,3]]}"#;
+    let index = JsonIndex::build(json);
+    for (filter, expected) in [
+        (".n | [until(.>3; .+1,.+2)]", "[4,5,4,4,5,4,5,4]"),
+        (".n | [while(.<3; .+1)]", "[0,1,2]"),
+        (".arr | [.[] | until(type != \"array\"; .[0])]", "[1,2]"),
+        (".arr | until(length == 1; .[1:]) | .[0][0]", "2"),
+        (".arr | [.[] | any(. > 1)]", "[false,true]"),
+        (".arr | isvalid(.[0])", "true"),
+    ] {
+        let expr = parse(filter).expect("parse failed");
+        let cursorless: Vec<String> =
+            eval_generic::eval_using::<JqSemantics, _>(&expr, index.root(json).value())
+                .collect_owned::<JqSemantics>()
+                .expect("materializes")
+                .iter()
+                .map(succinctly::jq::OwnedValue::to_json)
+                .collect();
+        assert_eq!(as_strs(&cursorless), [expected], "cursorless: `{filter}`");
+        assert_eq!(
+            cursorless,
+            generic_outputs(json, filter),
+            "cursorless vs cursor: `{filter}`"
+        );
+    }
+}
