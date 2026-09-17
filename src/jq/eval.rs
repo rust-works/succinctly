@@ -82246,6 +82246,29 @@ mod tests {
                 }
             );
         }
+
+        // `?` suppresses every early-exit `broken_down_time_fields` has,
+        // shared with `strftime`'s own identical suppression: a too-short
+        // array, a non-array/non-number value, and a month value that
+        // overflows `checked_month_index` (#893's class).
+        for filter in [
+            "[1,2,3] | todate?",
+            "null | todate?",
+            "[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
+        ] {
+            query!(b"null", filter, QueryResult::None => {});
+        }
+
+        // An array element that is a *computed* `Int` (not a `NumberLiteral`,
+        // which is what every array literal written directly in filter
+        // source produces, #1035) still resolves through `get_int`'s
+        // `Some(OwnedValue::Int(n))` arm -- reachable via arithmetic on an
+        // array element, unlike the literal-array cases above.
+        query!(b"null", "[1970,(0+0),1,0,0,0,4,0] | todate",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1970-01-01T00:00:00Z");
+            }
+        );
     }
 
     #[test]
