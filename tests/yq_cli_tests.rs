@@ -27352,17 +27352,31 @@ fn test_yq_del_slice_outcome_iterate_prefix_scalar_and_null_1432() -> Result<()>
 /// #2929's Y1-Y3: the `DeleteTrie` doomed-key subsumption (fix A) and jq
 /// key-order sort (fix B) are both gated `!yq_mode` -- these pin that real
 /// yq's own, pre-existing behaviour for the same shapes stays untouched.
+///
+/// Only Y2 actually *discriminates* fix A's gate (verified by temporarily
+/// dropping the `!yq_mode` guard and rebuilding): a doomed index's negative
+/// out-of-range bound can only be checked once the array's real runtime
+/// length is known, so it isn't caught by `resolve_del_path_branches`
+/// ahead of the trie the way a static type mismatch is, and skipping the
+/// continuation (as fix A would) silently turns the raise into `[]`
+/// instead. Y1's own expected shape does *not* depend on whether the
+/// continuation walks or is skipped -- `delete_keys`'s single-key
+/// positive-out-of-range padding produces `[null,null,null]` either way,
+/// confirmed by the same drop-the-guard experiment -- so it is kept purely
+/// as a regression pin on that shape's overall output, not as evidence for
+/// fix A specifically.
 #[test]
 fn test_yq_del_trie_untouched_by_2929() -> Result<()> {
-    // Y1: yq pads a doomed-and-continued index with `null` rather than
-    // subsuming the continuation the way jq mode's fix A now does.
+    // Y1: unaffected by fix A (see above) -- kept as a plain
+    // must-not-regress pin on this shape's output.
     let (out, code) = run_yq_stdin("del(.[3], .[3].a)", "[]\n", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[null,null,null]");
 
     // Y2: yq raises from inside a doomed key that jq mode's fix A would now
     // skip -- the walk-through-a-doomed-key behaviour fix A removes in jq
-    // mode is exactly what yq mode still needs to raise this.
+    // mode is exactly what yq mode still needs to raise this. The only Y
+    // row that actually exercises the `!yq_mode` gate (see doc comment).
     let (out, stderr, code) = run_yq_stdin_with_stderr("del(.[0], .[0][-5])", "[[1, 2]]\n", &[])?;
     assert_ne!(code, 0);
     assert!(out.is_empty());

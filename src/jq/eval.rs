@@ -46011,6 +46011,15 @@ impl DeleteTrie {
     fn root_is_terminal(&self) -> bool {
         self.node(DELETE_TRIE_ROOT).terminal
     }
+
+    /// jq mode only (#2929): whether `delete_trie_object`/`delete_trie_array`
+    /// should skip walking into `child` because it is a doomed key jq's own
+    /// `delpaths_sorted` never recurses into — see `DeleteTrieNode::terminal`'s
+    /// doc comment. One shared check for both loops so the rule can't drift
+    /// between the two container kinds.
+    fn skips_doomed_continuation(&self, child: u32, yq_mode: bool) -> bool {
+        !yq_mode && self.node(child).terminal
+    }
 }
 
 /// Builds a [`DeleteTrie`] from resolved [`PathBranch`]es, interning each
@@ -46469,7 +46478,7 @@ fn delete_trie_object(
         // this walk, so skipping the continuation here doesn't lose it
         // (#2929). yq mode keeps walking: real yq raises from inside a
         // doomed key that jq wouldn't even reach (confirmed live).
-        if !yq_mode && trie.node(child).terminal {
+        if trie.skips_doomed_continuation(child, yq_mode) {
             continue;
         }
         match entries.get_mut(name.as_str()) {
@@ -46505,6 +46514,15 @@ fn delete_trie_object(
 /// with `None` sorting before `Some(n)` — exactly `Option<i64>`'s derived
 /// `Ord`, which the `(Option<i64>, Option<i64>)` tail of the returned tuple
 /// relies on directly rather than re-implementing the `None`-first rule.
+///
+/// This is the same ordering `delete_paths_sorted` gets from
+/// `compare_values::<S>` over the `OwnedValue` form of a path component
+/// (`slice::literal_component`'s `{"start":s,"end":e}` object, whose key
+/// order gives the `end`-then-`start` rule for free) — encoded again here,
+/// rather than reused, because `ArrayStep` is a lighter-weight type than
+/// `OwnedValue` and this is a hot sort key, not a one-off comparison. If
+/// jq's own slice-descriptor ordering ever changes, both sites need the
+/// same update.
 fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, Option<i64>, Option<i64>) {
     match *step {
         ArrayStep::Index(idx) => (0, idx, None, None),
@@ -46649,7 +46667,13 @@ fn delete_trie_array(
                 )
             }) {
             let mut sorted = node.index_groups.clone();
-            sorted.sort_by_key(|&slot| {
+            // `sort_by_cached_key`, not `sort_by_key`: the latter has no
+            // decorate-sort-undecorate step, so its key closure -- an
+            // `IndexMap` lookup plus a match -- would run up to O(n log n)
+            // times instead of once per element. `index_groups` can run to
+            // a few thousand entries for a filtered recursive descent
+            // (#1690); this keeps the lookup itself linear regardless.
+            sorted.sort_by_cached_key(|&slot| {
                 let (step, _) = node
                     .indices
                     .get_index(slot)
@@ -46666,10 +46690,7 @@ fn delete_trie_array(
                 .indices
                 .get_index(slot)
                 .expect("index_groups holds live indices indices");
-            // Same jq-only doomed-key skip as `delete_trie_object`'s
-            // `field_groups` loop above — see `DeleteTrieNode::terminal`'s
-            // doc comment.
-            if !yq_mode && trie.node(child).terminal {
+            if trie.skips_doomed_continuation(child, yq_mode) {
                 continue;
             }
             match step {
