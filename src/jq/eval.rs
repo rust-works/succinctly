@@ -8011,7 +8011,7 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
-    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+    let expr = demote_for_owned_reentry(expr);
     eval_each_owned_reindexed::<S>(&expr, input, optional, sink)
 }
 
@@ -14345,7 +14345,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // into its own throwaway document, so no `Snapshot` marker in `f` can
     // name a node of it -- see `eval_each_owned`. Demoted once, not per
     // entry.
-    let f = demote_rebuilt_markers(f, &RootWitness::Owned);
+    let f = demote_for_owned_reentry(f);
     let f: &Expr = &f;
     let mut transformed: Vec<OwnedValue> = Vec::new();
     for entry in entries {
@@ -28864,6 +28864,11 @@ impl Frame {
 pub(crate) enum RootWitness {
     /// The reindex bridge's root is this document node.
     Node { node: usize, document: usize },
+    /// The value about to be bridged is an owned root the identity pipe
+    /// tracks under this token (#3036, `OwnedIdentity::root`): no document
+    /// node backs it, but a marker bound *at* that root, with nothing
+    /// rebuilt since, names it exactly.
+    OwnedRoot(u64),
     /// No document node backs the value about to be bridged (an
     /// accumulator, a synthesized array, a slice, ...).
     Owned,
@@ -28955,6 +28960,14 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
                 document: root_document,
             },
         ) if chain.is_empty() => node != root_node || document != root_document,
+        // #3036: a binding made at an owned root the identity pipe tracks
+        // (`input`, a literal, a rebuilt value) names that root by its own
+        // token; a stage that rebuilds the value gets a fresh one.
+        (Some(BindOrigin::Owned { chain, root, .. }), RootWitness::OwnedRoot(witness))
+            if chain.is_empty() =>
+        {
+            root != witness
+        }
         // No recorded node (a binding made before #2072's cursor-tracking
         // reached that site), an `Owned`-provenance binding, or an `Owned`
         // root: none of these can prove the marker *is* this root, so the
@@ -29021,6 +29034,53 @@ fn has_demotable_marker(expr: &Expr, root: &RootWitness) -> bool {
         expr,
         &mut |e| matches!(e, Expr::TrackedVar(marker) if marker_needs_demotion(marker, root)),
     )
+}
+
+/// [`demote_rebuilt_markers`] against [`RootWitness::Owned`] for an
+/// owned-value re-entry into this evaluator (#3036), skipping the rebuild
+/// when nothing in `expr` could observe it.
+///
+/// A demotion is read in exactly one place, `Frame::certifies`, and a
+/// `Frame` exists only inside a resolver invocation -- which starts from an
+/// assignment (`Expr::Assign`/`Update`/`CompoundAssign`/`AlternativeAssign`/
+/// `MetaAssign`), a builtin (`del`, `path`, `sort_keys`, `pick`, every
+/// jq-defined write that desugars into one of those; kept as *any*
+/// `Expr::Builtin`, so a builtin routed through the resolver later needs no
+/// edit here), or a call whose body may hold one (`FuncCall`/
+/// `NamespacedCall`/`DefCall`/`FuncDef`/`Shared`). An expression with none
+/// of those -- the `{s: .score} | $x.id` shape a per-record `as` body takes
+/// through this bridge -- evaluates its markers as plain values, so
+/// rebuilding it would cost a clone of every bound value per re-entry
+/// (measured +5% on that shape, both architectures) for no observable
+/// change.
+fn demote_for_owned_reentry(expr: &Expr) -> Cow<'_, Expr> {
+    if !has_demotable_marker(expr, &RootWitness::Owned) || !may_enter_resolver(expr) {
+        return Cow::Borrowed(expr);
+    }
+    demote_rebuilt_markers(expr, &RootWitness::Owned)
+}
+
+/// Whether evaluating `expr` can start a resolver invocation -- see
+/// [`demote_for_owned_reentry`]. Conservative: every builtin and every call
+/// counts, and [`any_subexpr`] descends into `def` bodies, resolved
+/// `DefCall`s and `Shared` arguments.
+fn may_enter_resolver(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::Assign { .. }
+                | Expr::Update { .. }
+                | Expr::CompoundAssign { .. }
+                | Expr::AlternativeAssign { .. }
+                | Expr::MetaAssign { .. }
+                | Expr::Builtin(_)
+                | Expr::FuncCall { .. }
+                | Expr::NamespacedCall { .. }
+                | Expr::DefCall { .. }
+                | Expr::FuncDef { .. }
+                | Expr::Shared(_)
+        )
+    })
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -41442,7 +41502,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     // `Snapshot` marker can name -- see `eval_each_owned`. After the fast
     // path on purpose: it never reaches a resolver, and demoting is a
     // rebuild of `expr` whenever a marker is present.
-    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+    let expr = demote_for_owned_reentry(expr);
 
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
@@ -41626,7 +41686,7 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // #3036: an owned value re-indexed here is a fresh document no
     // `Snapshot` marker can name -- see `eval_each_owned`.
-    let expr = demote_rebuilt_markers(expr, &RootWitness::Owned);
+    let expr = demote_for_owned_reentry(expr);
 
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
@@ -44460,7 +44520,7 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .then(|| {
             exprs
                 .iter()
-                .map(|e| demote_rebuilt_markers(e, &RootWitness::Owned).into_owned())
+                .map(|e| demote_for_owned_reentry(e).into_owned())
                 .collect()
         });
     let exprs: &[Expr] = demoted.as_deref().unwrap_or(exprs);
@@ -95972,6 +96032,7 @@ mod tests {
                 chain,
                 key_node: false,
                 exact,
+                root: 11,
             }),
         };
         let root = RootWitness::Node {

@@ -230,8 +230,8 @@ Three findings, in order of what they cost:
   bridge, a fold's UPDATE, a `|=` right-hand side, `with_entries`, a `catch` handler) — no
   funnel ran there. Closed at every owned→document re-entry in `eval.rs` (`eval_each_owned`
   and its siblings demote every `Snapshot` marker; the generic funnels take the
-  non-demoting `eval_each_owned_bridged`), plus `OwnedIdentity::exact`/`root_witness` for the
-  owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
+  non-demoting `eval_each_owned_bridged`), plus `OwnedIdentity::exact`/`root`/`root_witness`
+  for the owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
   paragraph for the refuse-only flips.
 - **Value-mode bindings.** `eval_as` (the non-path-tracked evaluator) still binds with no
   path at all, so `.a as $y | path(.a | $y)` — jq `["a"]` — stays refuse-only. Closing it

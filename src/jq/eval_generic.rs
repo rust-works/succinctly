@@ -9803,6 +9803,7 @@ fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>) -> BindOrigi
         chain: id.ancestors.clone(),
         key_node: id.key_node,
         exact: id.exact,
+        root: id.root,
     }
 }
 
@@ -9838,17 +9839,20 @@ fn identity_from_origin<V: DocumentValue>(
             chain,
             key_node,
             exact,
+            root,
         } => Some(OwnedIdentity {
             base: None,
             ancestors: chain.clone(),
             key_node: *key_node,
             exact: *exact,
+            root: *root,
         }),
         BindOrigin::Owned {
             base: Some((node, document)),
             chain,
             key_node,
             exact,
+            root,
         } => {
             let anchor = anchor?;
             if anchor.document_token() != *document {
@@ -9859,6 +9863,7 @@ fn identity_from_origin<V: DocumentValue>(
                 ancestors: chain.clone(),
                 key_node: *key_node,
                 exact: *exact,
+                root: *root,
             })
         }
     }
@@ -22685,6 +22690,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 /// path so that a stage rebuilding the value at a position (`to_entries`
 /// twice over) never has to patch a shared root: `parent` is simply the
 /// last link.
+/// A fresh [`OwnedIdentity::root`] token. Per thread, since an `Expr` never
+/// crosses threads and two evaluations on different threads never meet.
+fn fresh_owned_root() -> u64 {
+    thread_local! {
+        static NEXT: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
+    }
+    NEXT.with(|next| {
+        let token = next.get();
+        next.set(token + 1);
+        token
+    })
+}
+
 struct OwnedIdentity<V: DocumentValue> {
     base: Option<V::Cursor>,
     ancestors: Vec<(Rc<OwnedValue>, OwnedValue)>,
@@ -22693,10 +22711,20 @@ struct OwnedIdentity<V: DocumentValue> {
     /// a new value at the same position (`sort`, `to_entries`, a write, a
     /// `catch` payload). `base`/`ancestors` model yq *position*, which a
     /// rebuilt value keeps; this models jq *node identity*, which it does
-    /// not -- the difference is what [`owned_identity_root`] needs, and
-    /// keying on `ancestors.is_empty()` alone would certify `sort`'s new
-    /// array as the node it stands on.
+    /// not -- the difference is what [`OwnedIdentity::root_witness`] needs,
+    /// and keying on `ancestors.is_empty()` alone would certify `sort`'s
+    /// new array as the node it stands on.
     exact: bool,
+    /// This owned root's own identity (#3036): a token fresh for every root
+    /// the pipe starts ([`OwnedIdentity::kept`]/[`OwnedIdentity::detached`])
+    /// and every value a stage rebuilds at a position
+    /// ([`OwnedIdentity::rebuilt`]), shared by every child position under
+    /// it. It is what a marker bound at a *detached* root (`input`, a
+    /// literal, `map`'s output) is certified against -- there is no `base`
+    /// node to name, yet `input | . as $x | ($x.a = 9)` is a write through
+    /// the very value that was bound, and `input | . as $x | {a:1} |
+    /// ($x.a = 9)` is not.
+    root: u64,
     /// This value *is* the key `key` emitted (#2471). It stands at the same
     /// position -- `path`/`parent` answer exactly as they did for the node
     /// `key` was asked of -- but a key has no key of its own, so a second
@@ -22713,6 +22741,7 @@ impl<V: DocumentValue> Clone for OwnedIdentity<V> {
             ancestors: self.ancestors.clone(),
             key_node: self.key_node,
             exact: self.exact,
+            root: self.root,
         }
     }
 }
@@ -22732,6 +22761,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             ancestors: Vec::new(),
             key_node: false,
             exact: true,
+            root: fresh_owned_root(),
         }
     }
 
@@ -22742,13 +22772,16 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             ancestors: Vec::new(),
             key_node: false,
             exact: false,
+            root: fresh_owned_root(),
         }
     }
 
     /// The same position, holding a value that is no longer `base`'s own
-    /// (#3036) -- see [`OwnedIdentity::exact`].
+    /// (#3036) -- see [`OwnedIdentity::exact`] and [`OwnedIdentity::root`]:
+    /// a new value is a new root, whatever position it stands at.
     fn rebuilt(mut self) -> Self {
         self.exact = false;
+        self.root = fresh_owned_root();
         self
     }
 
@@ -22756,16 +22789,20 @@ impl<V: DocumentValue> OwnedIdentity<V> {
     /// is checked against before it crosses into `eval.rs` (#3036, closing
     /// #2642's owned-identity residual): the base node itself when the
     /// value *is* that node's own, unrebuilt value, and `Owned` -- which
-    /// demotes every `Snapshot` marker -- for a rebuilt value, a detached
-    /// one, or a position inside an owned tree. Never `ancestors.is_empty()`
+    /// demotes every `Snapshot` marker -- for a position inside an owned
+    /// tree; and this root's own token for anything else (a detached root,
+    /// or a value rebuilt at a position). Never `ancestors.is_empty()`
     /// alone: the `Keeps` rule leaves `sort`'s new array with an empty chain
-    /// at the input's position, and certifying a marker against it would
-    /// write through a copy.
+    /// at the input's position, and certifying a marker against the *node*
+    /// there would write through a copy -- which is why a rebuilt value
+    /// answers with a fresh token instead.
     fn root_witness(&self) -> RootWitness {
-        if self.exact && self.ancestors.is_empty() {
+        if !self.ancestors.is_empty() {
+            RootWitness::Owned
+        } else if self.exact {
             RootWitness::of(self.base.as_ref())
         } else {
-            RootWitness::Owned
+            RootWitness::OwnedRoot(self.root)
         }
     }
 
@@ -22786,6 +22823,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             // A child of a key node is an ordinary node again.
             key_node: false,
             exact: self.exact,
+            root: self.root,
         }
     }
 
