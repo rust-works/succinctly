@@ -54425,6 +54425,25 @@ fn any_all_cond_read_resolves_on_rewritten_routes_jq_3079() -> Result<()> {
         let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
         assert_eq!((out.trim(), code), (want, 0), "#3079: `{filter}`");
     }
+    // the identity pipe's native arm, on container members
+    let doc = r#"{"aa":{"bbb":{"x":1},"c":{"y":2}}}"#;
+    for (filter, want) in [
+        (
+            r#".aa | map_values(any(.[]; key == "y"))"#,
+            r#"{"bbb":false,"c":true}"#,
+        ),
+        (
+            r#".aa | map_values(all(.[]; key == "y") | key)"#,
+            r#"{"bbb":"bbb","c":"c"}"#,
+        ),
+        (
+            r#". as $x | .aa[] |= any($x; key == "bbb")"#,
+            r#"{"aa":{"bbb":false,"c":false}}"#,
+        ),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!((out.trim(), code), (want, 0), "#3079: `{filter}`");
+    }
     Ok(())
 }
 

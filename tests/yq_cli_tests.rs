@@ -47563,6 +47563,69 @@ fn any_all_cond_read_resolves_on_rewritten_routes_3079() -> Result<()> {
              answers `key` as absent"
         );
     }
+
+    // The identity pipe's own native arm (`eval_owned_identity_any_all`):
+    // a navigating `gen` under `map_values`, on members that are containers
+    // so `.[]` has children with keys of their own -- `bbb`'s child is `x`,
+    // `c`'s is `y`. The rewrite cannot express this shape (review of PR
+    // #3087), so these rows are the arm's, not the prefetch hook's.
+    let doc = "aa: {bbb: {x: 1}, c: {y: 2}}\n";
+    for (filter, want) in [
+        (
+            r#".aa | map_values(any(.[]; key == "y"))"#,
+            r#"{"bbb":false,"c":true}"#,
+        ),
+        (
+            r#".aa | map_values(all(.[]; key == "y"))"#,
+            r#"{"bbb":false,"c":true}"#,
+        ),
+        (
+            r#".aa | map_values(any(.[]; key == "y") | key)"#,
+            r#"{"bbb":"bbb","c":"c"}"#,
+        ),
+        (
+            r#".aa | map_values(any(.[]; (parent|keys) == ["y"]))"#,
+            r#"{"bbb":false,"c":true}"#,
+        ),
+        (
+            r#".aa | map_values([any(.[]; key == "y")])"#,
+            r#"{"bbb":[false],"c":[true]}"#,
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#3079 [identity arm]: `{filter}`"
+        );
+    }
+
+    // Shapes the rewrite must *not* treat as "cond stands at the stage"
+    // (PR #3087 review): a `$x` frozen at the binding stage, and `A // B`,
+    // whose right side stands elsewhere. Both answer the read as absent,
+    // which is what the same expression answers without the consumer.
+    for (filter, want) in [
+        (
+            r#". as $x | .aa[] |= any($x; key == "bbb")"#,
+            r#"{"aa":{"bbb":false,"c":false}}"#,
+        ),
+        (
+            r#".aa[] |= any(. // .x; key == "bbb")"#,
+            r#"{"aa":{"bbb":false,"c":false}}"#,
+        ),
+        (r#".aa.zz | any(. // 5; key == "zz")"#, "false"),
+        (
+            r#".aa[] |= any((try . catch 1); key == "c")"#,
+            r#"{"aa":{"bbb":false,"c":true}}"#,
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "aa: {bbb: 1, c: 2}\n", &args)?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#3079 [not a passthrough]: `{filter}`"
+        );
+    }
     Ok(())
 }
 
