@@ -55,28 +55,28 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, cache_shared_chain_value, cached_shared_chain_value,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
-    clear_nonretryable_stop, collapse_vec, collect_pattern_var_names, compare_values,
-    debug_assert_materialization_error, demote_rebuilt_markers, each_path_on_owned,
+    clear_nonretryable_stop, collapse_vec, collect_pattern_var_names, compare_key_arrays,
+    compare_values, debug_assert_materialization_error, demote_rebuilt_markers, each_path_on_owned,
     each_recurse_walk, enter_def_call_frame, entries_to_object, eval_each_owned,
     eval_full as full_eval, extract_pattern_bindings, extract_single_pattern_binding,
     finish_fork_flow, finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix,
     foreach_forks, format_owned, has_type_mismatch_is_permissive, index_component_value,
     index_in_array_bounds, index_one_owned as index_owned_by_key, is_dollar_safe_chain_key,
-    is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_expr, owned_to_string, pattern_alternatives_var_names,
-    prefer_pending_control, range_max_exceeded_error, range_num, range_values_f64,
-    range_values_int, recurse_walk_flow, reduce_forks, resolve_computed_slice_bounds,
-    resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
-    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    RootWitness, SliceTargetKind, YqSemantics,
+    is_pure_chain_link, is_retryable_stop, key_arrays_eq, literal_to_owned,
+    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
+    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
+    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
+    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, RangeNum, RootWitness, SliceTargetKind, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -14781,12 +14781,52 @@ fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
     f: &Expr,
     elem: &V::Cursor,
     optional: bool,
-) -> Result<OwnedValue, Control> {
+) -> Result<Vec<OwnedValue>, Control> {
     let mut out: Vec<OwnedValue> = Vec::new();
     let result = eval_single::<S, V>(f, elem.value(), optional, Some(*elem));
     match push_generic_owned_values(result, &mut out) {
         Some(control) => Err(control),
-        None => Ok(OwnedValue::Array(out.into())),
+        None => Ok(out),
+    }
+}
+
+/// One element's comparison key in the sort family.
+///
+/// The `_by` forms key by jq's `[f]`, held as the bare `Vec` rather than
+/// wrapped in an `OwnedValue::Array` (#2999): the wrapper's storage is
+/// refcounted, so wrapping would cost one more allocation per element for an
+/// array that is compared and dropped, never shared -- measured at +13% to
+/// +31% peak RSS on `sort_by(.)` before this split. The bare forms compare
+/// elements by their own value, which for a scalar allocates nothing, so
+/// they keep the `OwnedValue`.
+enum SortKey {
+    /// `sort`/`unique`/`min`/`max`: the element's own decoded value.
+    Own(OwnedValue),
+    /// `sort_by(f)`/`unique_by(f)`/`min_by(f)`/`max_by(f)`: `[f]`.
+    By(Vec<OwnedValue>),
+}
+
+impl SortKey {
+    /// jq's ordering, as `compare_values` would order the two keys.
+    fn cmp<S: EvalSemantics>(&self, other: &Self) -> core::cmp::Ordering {
+        match (self, other) {
+            (Self::Own(a), Self::Own(b)) => compare_values::<S>(a, b),
+            (Self::By(a), Self::By(b)) => compare_key_arrays::<S>(a, b),
+            // One `key_elements_generic` call builds every key of one run
+            // from the same `key: Option<&Expr>`, so the two shapes never
+            // meet.
+            _ => unreachable!("one sort-family call keys every element the same way"), // omni-dev: coverage tolerate-line reason="unreachable by construction: key_elements_generic builds every key of a run from the same Option<&Expr> (#2999)"
+        }
+    }
+
+    /// jq's `==`, under `S`'s number rules, as `owned_value_eq` would answer
+    /// for the two keys.
+    fn eq<S: EvalSemantics>(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Own(a), Self::Own(b)) => owned_value_eq::<S>(a, b),
+            (Self::By(a), Self::By(b)) => key_arrays_eq::<S>(a, b),
+            _ => unreachable!("one sort-family call keys every element the same way"), // omni-dev: coverage tolerate-line reason="unreachable by construction: key_elements_generic builds every key of a run from the same Option<&Expr> (#2999)"
+        }
     }
 }
 
@@ -14799,11 +14839,11 @@ fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
 /// stays a `V::Cursor` -- that is the whole point of #1687's fix for this
 /// family, since only a cursor can still name a duplicate mapping key.
 ///
-/// The key is an `OwnedValue` in both cases and unavoidably so: `compare_values`
-/// has no cursor-domain equivalent, and a `_by` key is a computed value with no
-/// document position at all. So a duplicate key *inside a comparison key* is
-/// still collapsed -- exactly as it is in `eval.rs` today. Only the emitted
-/// element is lossless.
+/// The key is an owned value in both cases ([`SortKey`]) and unavoidably so:
+/// `compare_values` has no cursor-domain equivalent, and a `_by` key is a
+/// computed value with no document position at all. So a duplicate key
+/// *inside a comparison key* is still collapsed -- exactly as it is in
+/// `eval.rs` today. Only the emitted element is lossless.
 ///
 /// **Both arms carry `eval.rs`'s #1755 rule**, by different means: the `None`
 /// arm's own conversion is already the checked one, and the `Some(f)` arm
@@ -14818,7 +14858,7 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     cursors: Vec<V::Cursor>,
     key: Option<&Expr>,
     optional: bool,
-) -> Result<Vec<(OwnedValue, V::Cursor)>, Control> {
+) -> Result<Vec<(SortKey, V::Cursor)>, Control> {
     let mut keyed = vec_with_capacity(cursors.len());
     for cursor in cursors {
         let k = match key {
@@ -14846,7 +14886,7 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
                 if let Some(control) = push_generic_document_validation_error(&cursor, 0) {
                     return Err(control);
                 }
-                sort_key_generic::<S, V>(f, &cursor, optional)?
+                SortKey::By(sort_key_generic::<S, V>(f, &cursor, optional)?)
             }
             // The bare forms compare elements by their own decoded value, so
             // the conversion below *is* the check -- `to_owned_cursor` is
@@ -14862,7 +14902,7 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
             // (`sort_by(error("x"))`). Suppressing there would swallow those
             // instead, which is not what `optional` means. See
             // `sort_family_control`'s own doc comment (#2334 review).
-            None => to_owned_cursor(&cursor).map_err(Control::Error)?,
+            None => SortKey::Own(to_owned_cursor(&cursor).map_err(Control::Error)?),
         };
         keyed.push((k, cursor));
     }
@@ -14941,7 +14981,7 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
     cursors: Vec<V::Cursor>,
     key: Option<&Expr>,
     optional: bool,
-    reorder: impl FnOnce(Vec<(OwnedValue, V::Cursor)>) -> Vec<V::Cursor>,
+    reorder: impl FnOnce(Vec<(SortKey, V::Cursor)>) -> Vec<V::Cursor>,
 ) -> GenericResult<V> {
     let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
         Ok(keyed) => keyed,
@@ -14959,8 +14999,8 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 /// been flattened to equal `OwnedValue`s, whereas the cursors this returns
 /// still point at distinct document positions that can print differently
 /// (two mappings with the same collapsed form but different duplicate keys).
-fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(OwnedValue, V::Cursor)]) {
-    keyed.sort_by(|(a, _), (b, _)| compare_values::<S>(a, b));
+fn sort_keyed_elements<S: EvalSemantics, V: DocumentValue>(keyed: &mut [(SortKey, V::Cursor)]) {
+    keyed.sort_by(|(a, _), (b, _)| a.cmp::<S>(b));
 }
 
 /// Whether `path(expr)` can be resolved by walking cursors instead of
@@ -20941,7 +20981,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // yq-mode strict Int/Float distinction (#950). Same
                     // choice `eval::builtin_unique` makes, reused rather
                     // than re-derived.
-                    keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
+                    keyed.dedup_by(|(a, _), (b, _)| a.eq::<S>(b));
                 }
                 keyed.into_iter().map(|(_, cursor)| cursor).collect()
             })
@@ -21000,13 +21040,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // hand-rolling the comparison keeps that asymmetry from being
             // re-derived and getting it backwards.
             let winner = if matches!(builtin, Builtin::Min | Builtin::MinBy(_)) {
-                keyed
-                    .into_iter()
-                    .min_by(|(a, _), (b, _)| compare_values::<S>(a, b))
+                keyed.into_iter().min_by(|(a, _), (b, _)| a.cmp::<S>(b))
             } else {
-                keyed
-                    .into_iter()
-                    .max_by(|(a, _), (b, _)| compare_values::<S>(a, b))
+                keyed.into_iter().max_by(|(a, _), (b, _)| a.cmp::<S>(b))
             };
             match winner {
                 Some((_, cursor)) => GenericResult::OneCursor(cursor),

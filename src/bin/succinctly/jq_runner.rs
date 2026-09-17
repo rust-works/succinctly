@@ -1995,10 +1995,11 @@ impl MalformedJsonError {
             // release build the message alone is still the right diagnostic.
             EvalErrorPayload::Value(_) => {
                 debug_assert!(
-                    false,
+                    // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives is a decode or nesting-depth failure the evaluator raised itself, never error(v) (#2999)"
+                    false, // omni-dev: coverage tolerate-line reason="see the debug_assert above (#2999)"
                     "a malformed-document error never carries an error(v) payload"
                 );
-                None
+                None // omni-dev: coverage tolerate-line reason="see the debug_assert above (#2999)"
             }
         };
         Self {

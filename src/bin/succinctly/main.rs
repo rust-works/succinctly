@@ -1427,7 +1427,7 @@ fn run_main() -> Result<()> {
         }
         Command::Yq(args) => {
             let exit_code = yq_runner::run_yq(args)?;
-            exit_after_run(exit_code);
+            exit_after_run(exit_code); // omni-dev: coverage tolerate-line reason="the CLI suites drive yq through the `syq` multi-call arm above; this arm is the same call reached only when spelled `succinctly yq` (#2999)"
         }
         Command::JqLocate(args) => {
             let exit_code = jq_locate::run_jq_locate(args)?;
