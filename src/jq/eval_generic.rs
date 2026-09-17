@@ -10435,12 +10435,12 @@ fn counted_bool_flow_to_flow_generic<V: DocumentValue>(
 /// a document with a malformed `.a` answers, as recorded in
 /// `docs/compliance/jq/limitations.md`. `LazyKeys`/`LazyIndexRange` carry
 /// no computation that can fail short of that same decode.
-fn discard_generic_item<V: DocumentValue>(
+fn discard_generic_item<V: DocumentValue, S: EvalSemantics>(
     item: GenericItem<V>,
     escape: &mut Option<Control>,
 ) -> Demand {
     match item {
-        GenericItem::LazySeq(_) => match generic_item_into_owned(item) {
+        GenericItem::LazySeq(_) => match generic_item_into_owned::<_, S>(item) {
             Ok(_) => Demand::Continue,
             Err(control) => stop_with_escape(escape, control),
         },
@@ -10465,7 +10465,7 @@ fn each_isempty_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        if discard_generic_item(item, &mut escape) == Demand::Stop {
+        if discard_generic_item::<_, S>(item, &mut escape) == Demand::Stop {
             return Demand::Stop;
         }
         if sink.push(GenericItem::Owned(OwnedValue::Bool(false))) == Demand::Stop {
@@ -10510,7 +10510,7 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<bool, Control> {
     let mut decided = false;
     let mut escape: Option<Control> = None;
-    let mut probe = |out: GenericItem<V>| match generic_item_truthiness(out) {
+    let mut probe = |out: GenericItem<V>| match generic_item_truthiness::<_, S>(out) {
         Ok(truthy) if truthy == target_truthy => {
             decided = true;
             Demand::Stop
@@ -10530,7 +10530,7 @@ fn any_all_probe_item_generic<S: EvalSemantics, V: DocumentValue>(
         | GenericItem::LazyKeys { .. }
         | GenericItem::LazyIndexRange(_)
         | GenericItem::LazySeq(_)) => {
-            let elem = generic_item_into_owned(item)?;
+            let elem = generic_item_into_owned::<_, S>(item)?;
             eval_each_owned::<S>(cond, &elem, false, &mut |o| probe(GenericItem::Owned(o)))
         }
     };
@@ -10605,7 +10605,7 @@ fn each_upper_in_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    let current = match to_owned(&value) {
+    let current = match to_owned::<S, _>(&value) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -10614,7 +10614,7 @@ fn each_upper_in_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(s, value, optional, cursor, &mut |item| {
-        let candidate = match generic_item_into_owned(item) {
+        let candidate = match generic_item_into_owned::<_, S>(item) {
             Ok(v) => v,
             Err(control) => return stop_with_escape(&mut escape, control),
         };
@@ -10687,7 +10687,7 @@ fn each_skip_generic<S: EvalSemantics, V: DocumentValue>(
         let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
             if remaining > 0 {
                 remaining -= 1;
-                return discard_generic_item(item, &mut escape);
+                return discard_generic_item::<_, S>(item, &mut escape);
             }
             sink.push(item)
         });
