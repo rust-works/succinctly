@@ -10930,6 +10930,14 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::Int(0))
             }
         }
+        // #3093: real yq's `length` answers a boolean's text width
+        // (`false` => 5, `true` => 4) on every route, not just the cursor
+        // one that resolves through `StandardJson::String` above when a
+        // YAML scalar's own source spelling is available. jq mode falls
+        // through to the error arm below, unchanged.
+        StandardJson::Bool(b) if S::TAG == EvalTag::Yq => {
+            QueryResult::Owned(OwnedValue::Int(if *b { 4 } else { 5 }))
+        }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy::<S, _>(&value))),
     }
