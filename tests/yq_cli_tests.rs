@@ -47331,3 +47331,19 @@ fn jq_only_builtins_3046_are_gated_in_yq_mode() -> Result<()> {
     assert_eq!((output.trim(), code), ("\"[1]\"", 0));
     Ok(())
 }
+
+/// `tz` (a yq-mode extension) on a non-number keeps its pre-#3042 wording;
+/// real yq answers a Go layout-parse error (`could not parse datetime of
+/// [a] ...`) there, so neither is oracle-backed -- pinned only so #3042's
+/// move of the libm family onto jq's `number required` provably did not
+/// reach it (see #3068 for the jq-side sibling).
+#[test]
+fn test_tz_non_number_wording_unchanged_by_3042() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(r#".a | tz("UTC")"#, "a: x\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("math function requires number"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}

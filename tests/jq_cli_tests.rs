@@ -45153,6 +45153,9 @@ fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
         ("if false then fma(1; 2; 3) else (8 | cbrt) end", "2"),
         (r#"["x" | cbrt?]"#, "[]"),
         (r#"[ldexp("x"; 1)?]"#, "[]"),
+        (r#"[ldexp(1; "x")?]"#, "[]"),
+        (r#"[fma(1; "x"; 2)?]"#, "[]"),
+        (r#"[fma(1; 2; "x")?]"#, "[]"),
         (
             r#"[try ("x" | frexp) catch .]"#,
             r#"["string (\"x\") number required"]"#,
@@ -45185,13 +45188,34 @@ fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
     }
     for (filter, want_err) in [
         ("ldexp(1)", "ldexp/1 is not defined"),
+        ("ldexp(1; 2; 3)", "ldexp/3 is not defined"),
         ("ldexp", "ldexp/0 is not defined"),
         ("cbrt(1)", "cbrt/1 is not defined"),
+        ("fma", "fma/0 is not defined"),
+        ("fma(1)", "fma/1 is not defined"),
         ("fma(1; 2)", "fma/2 is not defined"),
+        ("fma(1; 2; 3; 4)", "fma/4 is not defined"),
     ] {
         let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 3, "`{filter}`: stderr {stderr:?}");
         assert!(stderr.contains(want_err), "`{filter}`: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
+/// `todate`/`todateiso8601` on a non-number keep their pre-#3042 wording
+/// (jq's is `strftime/1 requires parsed datetime inputs`, tracked as
+/// #3068); pinned so #3042's move of the libm family onto `number required`
+/// provably did not reach them, and so the eventual fix has a row to flip.
+#[test]
+fn test_todate_non_number_wording_unchanged_by_3042() -> Result<()> {
+    for filter in [r#""x" | todate"#, r#""x" | todateiso8601"#] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 5, "`{filter}`: stderr {stderr:?}");
+        assert!(
+            stderr.contains("math function requires number"),
+            "`{filter}` moved -- if it now prints jq's `strftime/1 requires parsed datetime inputs`, close #3068: {stderr:?}"
+        );
     }
     Ok(())
 }
