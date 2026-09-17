@@ -8072,6 +8072,30 @@ pub(crate) fn eval_each_owned_bridged<S: EvalSemantics>(
     eval_each_owned_reindexed::<S>(expr, input, optional, sink)
 }
 
+/// [`eval_each_owned`] or [`eval_each_owned_bridged`], chosen by whether
+/// `value` is a node the resolver is *tracking* (#3036): inside a resolver
+/// invocation, `trackable` means the ambient is the register -- a node
+/// reached from the invocation's input by navigation alone -- so a marker
+/// proven against that input is proven against this node too, and the
+/// leaf, condition, computed key or bind source evaluated here must not
+/// demote it (`path(select(($x.a = 9) | true))`, `.[($x.a = 9 | "a")] =
+/// 5`). Once the register has moved off a node (a literal, a constructed
+/// value), the ambient is a value that may be a rebuilt copy, and the
+/// demoting entry applies.
+fn eval_each_owned_at<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if trackable {
+        eval_each_owned_bridged::<S>(expr, value, optional, sink)
+    } else {
+        eval_each_owned::<S>(expr, value, optional, sink)
+    }
+}
+
 /// [`eval_owned_fast_path`] delivered through `sink`: `Some` when the fast
 /// path answered, `None` when the caller has to reindex.
 fn eval_each_owned_fast_path<S: EvalSemantics>(
@@ -10284,7 +10308,11 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // with the *raised value* as its input, not the original input, so
         // `try error("boom") catch .` yields "boom".
         QueryResult::Error(e) => match catch {
-            Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
+            // #3036: see `try_payload_root`.
+            Some(catch_expr) => {
+                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                eval_owned_input_bridged::<W, S>(&catch_expr, &e.payload(), optional)
+            }
             None => QueryResult::None,
         },
         // jq's `catch` catches a `break` the same way it catches a raised
@@ -10308,7 +10336,11 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `Partial` if the handler errors too — in after them.
         QueryResult::Partial(prefix, Control::Error(e)) => {
             let handled = match catch {
-                Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &e.payload(), optional),
+                // #3036: see `try_payload_root`.
+                Some(catch_expr) => {
+                    let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                    eval_owned_input_bridged::<W, S>(&catch_expr, &e.payload(), optional)
+                }
                 None => QueryResult::None,
             };
             prepend::<_, S>(prefix, handled)
@@ -24352,6 +24384,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Vec::new()
         };
         let pristine = result.clone();
+        let mut untouched = true;
         let outcome = stream_path_writes::<S>(
             path_expr,
             &pristine,
@@ -24363,6 +24396,13 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     base_len: base.len(),
                     pre: None,
                 });
+                // #3036: a root path before any write updates the document
+                // `|=` was called on, untouched -- see the eager loop below.
+                let ambient = core::mem::replace(&mut untouched, false) && is_root_path(path);
+                if ambient {
+                    return update_root_with_filter::<S>(result, filter_expr, pos.as_ref(), true)
+                        .map(|_wrote| ());
+                }
                 // `false` for `scalar_noop`, as the eager route computes it in jq
                 // mode.
                 update_path::<S>(result, path, filter_expr, false, false, pos.as_ref())
@@ -24499,7 +24539,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #3036: the first path, when it is the root itself, updates the
         // very document `|=` was called on, untouched -- jq's filter then
         // sees `$x`'s own node.
-        let outcome = if i == 0 && matches!(path, Expr::Identity) {
+        let outcome = if i == 0 && is_root_path(path) {
             update_root_with_filter::<S>(&mut result, filter_expr, pos.as_ref(), true)
         } else {
             update_path::<S>(
@@ -27298,6 +27338,17 @@ fn position_update_filter<S: EvalSemantics>(
 /// key/element outright on `false` instead of leaving it `null`. yq mode
 /// keeps its pre-#1916 behavior at those three arms unchanged; see the
 /// `Field` arm's own comment for why.
+/// Whether a resolved update path names the document itself (#3036): `.`,
+/// `(.)`, and what `getpath([])`/`first(., .a)` resolve to.
+fn is_root_path(path: &Expr) -> bool {
+    match path {
+        Expr::Identity => true,
+        Expr::Paren(inner) => is_root_path(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_root_path),
+        _ => false,
+    }
+}
+
 /// `|=`'s own leaf: run `filter_expr` on `root` and write its first output
 /// back -- [`update_path`]'s `Expr::Identity` arm, shared with
 /// [`eval_update_impl`]'s lone-root-path case.
@@ -29090,14 +29141,11 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
                 document: root_document,
             },
         ) if chain.is_empty() => node != root_node || document != root_document,
-        // #3036: a binding made at an owned root the identity pipe tracks
-        // (`input`, a literal, a rebuilt value) names that root by its own
-        // token; a stage that rebuilds the value gets a fresh one.
-        (Some(BindOrigin::Owned { chain, root, .. }), RootWitness::OwnedRoot(witness))
-            if chain.is_empty() =>
-        {
-            root != witness
-        }
+        // #3036: a binding made at an owned position the identity pipe
+        // tracks (`input`, a literal, a rebuilt value, a child inside one)
+        // names it by its own token; a stage that rebuilds the value gets a
+        // fresh one, and a child position derives its own from its parent's.
+        (Some(BindOrigin::Owned { root, .. }), RootWitness::OwnedRoot(witness)) => root != witness,
         // No recorded node (a binding made before #2072's cursor-tracking
         // reached that site), an `Owned`-provenance binding, or an `Owned`
         // root: none of these can prove the marker *is* this root, so the
@@ -30072,10 +30120,13 @@ fn emit_passthrough<'a>(
 fn resolve_cond_fork_stream<S: EvalSemantics>(
     cond: &Expr,
     value: &OwnedValue,
+    trackable: bool,
     mut dispatch: impl FnMut(bool) -> ResolveFlow,
 ) -> ResolveFlow {
     let mut dispatched: Option<ResolveFlow> = None;
-    let flow = eval_each_owned::<S>(cond, value, false, &mut |c| match dispatch(c.is_truthy()) {
+    let flow = eval_each_owned_at::<S>(cond, value, trackable, false, &mut |c| match dispatch(
+        c.is_truthy(),
+    ) {
         ResolveFlow::Exhausted => Demand::Continue,
         other => {
             dispatched = Some(other);
@@ -30622,7 +30673,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let mut already_emitted = false;
-            resolve_cond_fork_stream::<S>(cond, value, |truthy| {
+            resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
                 if select_emits::<S>(truthy, &mut already_emitted) {
                     emit_passthrough(value, trackable, snapshot, sink)
                 } else {
@@ -30668,7 +30719,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             cond,
             then_branch,
             else_branch,
-        } => resolve_cond_fork_stream::<S>(cond, value, |truthy| {
+        } => resolve_cond_fork_stream::<S>(cond, value, trackable, |truthy| {
             let branch = if truthy { then_branch } else { else_branch };
             resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
         }),
@@ -30913,7 +30964,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // keep" reasoning `resolve_index_expr`'s own key/target evaluation
         // escapes already document).
         Expr::Builtin(Builtin::DebugMsg(msg)) => {
-            let flow = eval_each_owned::<S>(msg, value, false, &mut |msg_value| {
+            let flow = eval_each_owned_at::<S>(msg, value, trackable, false, &mut |msg_value| {
                 write_debug_line::<S>(&msg_value);
                 Demand::Continue
             });
@@ -32009,7 +32060,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
 
     let mut delivered = 0usize;
     let mut stopped_by_sink = false;
-    let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+    let flow = eval_each_owned_at::<S>(expr, value, trackable, false, &mut |v| {
         delivered += 1;
         let branch = PathBranch::untracked(Cow::Owned(v))
             .with_register(trackable.then(|| Cow::Borrowed(value)));
@@ -32139,7 +32190,7 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         // answers `Stop` (`drain_result`'s own doc comment states that
         // invariant).
         let mut values = Vec::new();
-        let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+        let flow = eval_each_owned_at::<S>(expr, value, trackable, false, &mut |v| {
             values.push(v);
             Demand::Continue
         });
@@ -32280,7 +32331,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // generator for every value — see [`drive_fold_source`].
     let limit = keep.limit();
     let mut values: Vec<OwnedValue> = Vec::new();
-    let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+    let flow = eval_each_owned_at::<S>(expr, value, trackable, false, &mut |v| {
         values.push(v);
         if values.len() >= limit {
             Demand::Stop
@@ -33670,7 +33721,7 @@ fn drive_fold_source<S: EvalSemantics>(
         )
     });
     if !has_navigation {
-        return drive_fold_source_by_value::<S>(source, ambient.value, step);
+        return drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step);
     }
     if S::TAG != EvalTag::Jq {
         // Yq: branches discarded, only the fatal escape kept (#1467's
@@ -33687,7 +33738,7 @@ fn drive_fold_source<S: EvalSemantics>(
             Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
                 Some(Control::Error(e))
             }
-            _ => drive_fold_source_by_value::<S>(source, ambient.value, step),
+            _ => drive_fold_source_by_value::<S>(source, ambient.value, ambient.trackable, step),
         };
     }
     let flow = resolve_node_sink::<S>(
@@ -33725,9 +33776,10 @@ fn drive_fold_source<S: EvalSemantics>(
 fn drive_fold_source_by_value<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
+    trackable: bool,
     step: &mut dyn FnMut(FoldSourceValue) -> Demand,
 ) -> Option<Control> {
-    match eval_each_owned::<S>(source, value, false, &mut |value| {
+    match eval_each_owned_at::<S>(source, value, trackable, false, &mut |value| {
         step(FoldSourceValue {
             value,
             register_path: None,
@@ -33944,7 +33996,9 @@ fn resolve_bind_source_sink<S: EvalSemantics>(
     }
 
     let mut stashed: Option<ResolveFlow> = None;
-    let flow = eval_each_owned::<S>(source, value, false, &mut |bound| match bind(bound, None) {
+    let flow = eval_each_owned_at::<S>(source, value, trackable, false, &mut |bound| match bind(
+        bound, None,
+    ) {
         ResolveFlow::Exhausted => Demand::Continue,
         other => {
             stashed = Some(other);
@@ -37408,9 +37462,10 @@ fn resolve_target_for_pair<'a, S: EvalSemantics>(
 fn drive_index_key<S: EvalSemantics>(
     key: &Expr,
     value: &OwnedValue,
+    trackable: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<EvalEscape> {
-    match eval_each_owned::<S>(key, value, false, sink) {
+    match eval_each_owned_at::<S>(key, value, trackable, false, sink) {
         Flow::Exhausted => None,
         // `pending` is dropped, with every other Stage-2 consumer (see
         // [`Flow::Stopped`]): the caller stops only because `target` already
@@ -37555,7 +37610,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     // used to be stated twice here and there. The per-pair reservation
     // that used to sit alongside it is gone; nothing accumulates in
     // either resolver any more.
-    let key_escape = drive_index_key::<S>(key, value, &mut |k| {
+    let key_escape = drive_index_key::<S>(key, value, trackable, &mut |k| {
         // The shared exit every escape arm below funnels through, so parking
         // the escape and stopping the driver can't drift between arms.
         // Nothing is folded in as a prefix any more: every branch produced
@@ -38099,7 +38154,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
     // at a time so each `s` reaches its own pairs before the next `s` is
     // asked for. Its own trailing escape is the one this function reports
     // last (#1528, below), after `E`'s and `T`'s.
-    let driven = drive_slice_bound::<S>(start, value, f64::floor, &mut |s| {
+    let driven = drive_slice_bound::<S>(start, value, trackable, f64::floor, &mut |s| {
         // `T` (`end`) evaluated fresh for this `s`, not once overall
         // (#2245). An empty `T` for this `s` contributes nothing and moves
         // on to the next `s` (verified live: a `T` that's empty only for
@@ -38112,19 +38167,24 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
         // even though `target`, `(1,2)`, is untrackable and would
         // otherwise have raised its own "Invalid path expression" error
         // first -- `T`'s own escape wins before `target` is ever reached).
-        let ends = drive_slice_bound::<S>(end, value, f64::ceil, &mut |e| match resolve_pair(
-            &s, &e, sink,
-        ) {
-            Ok(Demand::Continue) => Demand::Continue,
-            Ok(Demand::Stop) => {
-                stopped = true;
-                Demand::Stop
-            }
-            Err(control) => {
-                inner_escape = Some(control);
-                Demand::Stop
-            }
-        });
+        let ends =
+            drive_slice_bound::<S>(
+                end,
+                value,
+                trackable,
+                f64::ceil,
+                &mut |e| match resolve_pair(&s, &e, sink) {
+                    Ok(Demand::Continue) => Demand::Continue,
+                    Ok(Demand::Stop) => {
+                        stopped = true;
+                        Demand::Stop
+                    }
+                    Err(control) => {
+                        inner_escape = Some(control);
+                        Demand::Stop
+                    }
+                },
+            );
         let ends_escape = match ends {
             Ok(escape) => escape,
             Err(control) => {
@@ -38293,6 +38353,7 @@ impl PathSliceBound {
 fn drive_slice_bound<S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
+    trackable: bool,
     round: fn(f64) -> f64,
     sink: &mut dyn FnMut(PathSliceBound) -> Demand,
 ) -> Result<Option<EvalEscape>, EvalEscape> {
@@ -38344,7 +38405,7 @@ fn drive_slice_bound<S: EvalSemantics>(
     // same lossy materialization -- and falls back to the eager evaluator
     // for any `Expr` with no native lazy arm, which simply reproduces the
     // old ordering for that shape rather than changing anything.
-    let flow = eval_each_owned::<S>(expr, value, false, &mut |raw| {
+    let flow = eval_each_owned_at::<S>(expr, value, trackable, false, &mut |raw| {
         sink(PathSliceBound::classify(raw, round))
     });
     match flow {

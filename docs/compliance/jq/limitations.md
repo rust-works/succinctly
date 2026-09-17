@@ -931,9 +931,10 @@ is the revert that established what the other one costs.
    route (`eval_owned_identity_stages`/`owned_identity_values`, the `OwnedIdentity`/#2072
    machinery a `key`/`parent`/`path` sibling routes through) now checks against
    `OwnedIdentity::root_witness` — the base node itself while the value is that node's own,
-   unrebuilt value (`OwnedIdentity::exact`), and otherwise the owned root's own token
+   unrebuilt value (`OwnedIdentity::exact`), and otherwise the owned position's own token
    (`OwnedIdentity::root`, fresh for every root the pipe starts and every value a stage
-   rebuilds at a position: `sort`, `to_entries`, a write), never `ancestors.is_empty()` alone,
+   rebuilds at a position — `sort`, `to_entries`, a write, but not `select`/`objects`/`debug`,
+   which hand their input on — and derived per child position), never `ancestors.is_empty()` alone,
    which would certify `sort`'s new array; `.foo | . as $x | (parent, ($x.a = 9))` still
    writes, `input | . as $x | ((path | empty), ($x.a = 9))` (a bind at a detached root, nothing
    rebuilt since) still writes, and `.foo | . as $x | sort | (parent, ($x[0] = 9))` now
@@ -946,8 +947,11 @@ is the revert that established what the other one costs.
    raise sites naming different values no longer certifies. `eval.rs`'s own consumers that
    hand their *unrebuilt ambient input* to the owned bridge — `any`/`all`/`IN`'s generator,
    `until`/`while`/`repeat`'s first round, `recurse(f)`'s level 0, `debug(msg)`, `|=` on a
-   lone root path — take the non-demoting bridge, so `. as $x | any(($x.a = 9); true)`,
-   `. as $x | . |= ($x.a = 9)` and `. as $x | until(($x.a = 9) | true; .)` keep answering;
+   first root path (`.`, `(.)`, `getpath([])`), and every leaf, condition, computed key or bind
+   source a resolver evaluates while its ambient is still the register (`trackable`) — take
+   the non-demoting bridge, so `. as $x | any(($x.a = 9); true)`, `. as $x | . |= ($x.a =
+   9)`, `. as $x | until(($x.a = 9) | true; .)` and `. as $x | path(select(($x.a = 9) |
+   true))` keep answering;
    a later round, a sub-path, or a second path of the same `|=` (whose root jq's `setpath`
    has already copied: `. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else .
    end)` wrote `{"a":9,"b":2}` before this, jq refuses) demotes. The refuse-only flips this
