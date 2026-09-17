@@ -94,7 +94,6 @@ pub mod exit_codes {
     /// for an unrelated reason: mikefarah/yq exits 1 for *any* failure, where
     /// jq reserves distinct codes per failure kind (#355).
     pub const YQ_FAILURE: i32 = 1;
-    #[allow(dead_code)] // STYLE-0005: complete jq exit-code set; not all emitted yet
     pub const USAGE_ERROR: i32 = 2; // Usage problem or system error
     pub const COMPILE_ERROR: i32 = 3; // jq program compile error
     pub const NO_OUTPUT: i32 = 4; // With -e, no valid result produced (jq-only; yq folds into 1)

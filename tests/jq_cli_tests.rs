@@ -661,6 +661,70 @@ fn test_argjson_preserves_number_literal_fidelity_1058() -> Result<()> {
     Ok(())
 }
 
+/// #3051: a bad `--argjson`/`--slurpfile`/`--rawfile` argument is jq's own
+/// *usage* error (exit 2, a single `jq: ...` line), not the generic
+/// `anyhow`-routed exit 1 (`Error: .../Caused by:`) it used to fall through
+/// to. Wrapper wording pinned against the live pinned jq 1.7.1 -- exactly,
+/// for the file-not-found and `--argjson` rows; the `--slurpfile` malformed-
+/// JSON row's own inner detail text is a recorded divergence (see
+/// `docs/compliance/jq/limitations.md`), so only its wrapper/exit code is
+/// checked there.
+#[test]
+fn test_bad_argjson_slurpfile_rawfile_exit_2_not_1_3051() -> Result<()> {
+    // --argjson: malformed JSON, exit 2, jq's own wording plus usage hint.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--argjson", "x", "[1,"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: invalid JSON text passed to --argjson\n\
+         Use jq --help for help with command-line options,\n\
+         or see the jq manpage, or online docs  at https://jqlang.github.io/jq\n"
+    );
+
+    // --slurpfile: missing file, exit 2, byte-identical to jq's own wording.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "1", "--slurpfile", "x", "/nonexistent"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: Bad JSON in --slurpfile x /nonexistent: Could not open /nonexistent: \
+         No such file or directory\n"
+    );
+
+    // --rawfile: missing file, exit 2, byte-identical to jq's own wording
+    // even though a raw file is never actually parsed as JSON -- jq's own
+    // generic arg-file reader uses the "Bad JSON in --rawfile" wrapper
+    // unconditionally, confirmed live.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "1", "--rawfile", "x", "/nonexistent"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: Bad JSON in --rawfile x /nonexistent: Could not open /nonexistent: \
+         No such file or directory\n"
+    );
+
+    // --slurpfile: malformed JSON in an existing file, exit 2. Only the
+    // wrapper is pinned here (`docs/compliance/jq/limitations.md` records
+    // why the inner detail after the second `: ` is succinctly's own).
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, "{{\"ok\":1}}")?;
+    write!(file, "[1,2,")?;
+    let path = file.path().to_str().unwrap().to_string();
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--slurpfile", "x", &path], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with(&format!("jq: Bad JSON in --slurpfile x {path}: ")),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 // =============================================================================
 // #2052: `--argjson`/`--jsonargs` validate through the crate's own RFC 8259
 // validator in jq's accept-set (`json::validate::validate_jq_lenient`),
@@ -41938,12 +42002,17 @@ fn test_argjson_low_surrogate_substitutes_replacement_character_2012() {
     // Control: a lone *high* surrogate stays rejected (#2013's own,
     // unrelated scope) -- asserting on the message content, not just
     // non-empty stderr, so a regression that broke `--argjson` parsing
-    // for an unrelated reason wouldn't pass this check too.
+    // for an unrelated reason wouldn't pass this check too. jq's own
+    // wording (#3051) since this crate stopped routing the rejection
+    // through `anyhow`'s generic "Invalid JSON for --argjson x" text.
     let (_stdout, stderr, code) =
         run_jq_full(&["-n", "--argjson", "x", r#""\ud800""#, "$x"], None).unwrap();
-    assert_ne!(code, 0, "lone high surrogate should still be rejected");
+    assert_eq!(
+        code, 2,
+        "lone high surrogate should still be rejected: {stderr}"
+    );
     assert!(
-        stderr.contains("Invalid JSON for --argjson"),
+        stderr.contains("invalid JSON text passed to --argjson"),
         "stderr: {stderr}"
     );
 
