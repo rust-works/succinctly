@@ -46824,6 +46824,19 @@ fn test_break_in_included_module_names_its_own_file_2964() -> Result<()> {
 /// `break $x` each index into their own site table rather than one
 /// stealing the other's slot (which, keyed by name alone, would have
 /// misattributed at least one of the two positions).
+///
+/// The `jq: 2 compile errors` this pins is itself a *known, pre-existing*
+/// divergence from the oracle, not something #2964 verifies or introduces:
+/// confirmed live, `/usr/bin/jq` reports only **1** compile error for this
+/// exact program -- a main-body compile error suppresses a def-body one
+/// entirely, a gap already recorded (generically, for Call/Var too) in
+/// `docs/compliance/jq/limitations.md`'s "Module-scope gaps that are
+/// genuinely open" section ("a main-*body* error suppresses def errors
+/// entirely"). This test's own job is the occurrence-counter/module-
+/// attribution claim above, not the error *count* -- the count is pinned
+/// as-is (2, matching succinctly's honest behavior) so a future change
+/// can't silently regress the counter claim without this test noticing,
+/// not because 2 is the oracle-correct answer.
 #[test]
 fn test_break_occurrence_counters_do_not_cross_module_boundaries_2964() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
@@ -46924,6 +46937,40 @@ fn test_break_reduce_pattern_key_and_init_caret_positions_are_swapped_2964() -> 
              jq: 2 compile errors\n",
             " ".repeat(18),
             " ".repeat(34)
+        )
+    );
+    Ok(())
+}
+
+/// #2964 review finding: `foreach`'s doc comment in `resolve.rs` claims the
+/// same `init`-before-pattern visit-order rationale as `Expr::Reduce` above,
+/// but until now that claimed parity had no test of its own -- confirmed
+/// live this is exactly the same swapped-caret residual, one construct over.
+#[test]
+fn test_break_foreach_pattern_key_and_init_caret_positions_are_swapped_2964() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "foreach (1,2) as {(break $x): $v} (break $x; .+1)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    // The pinned oracle reports the same two messages in the same order, but
+    // with the two caret paddings swapped (35 then 19, `init`'s own break
+    // first) -- see limitations.md.
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             foreach (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
+             jq: error: $*label-x is not defined at <top-level>, line 1:\n\
+             foreach (1,2) as {{(break $x): $v}} (break $x; .+1){}\n\
+             jq: 2 compile errors\n",
+            " ".repeat(19),
+            " ".repeat(35)
         )
     );
     Ok(())
