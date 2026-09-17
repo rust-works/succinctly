@@ -5496,7 +5496,7 @@ mod tests {
         // Everything finite is `to_json`, uncapped: a 300-digit literal
         // survives where `to_json_for_reindex` would have re-rendered it.
         let long = format!("1{}", "0".repeat(300));
-        let value = OwnedValue::Array(vec![
+        let value = OwnedValue::array_from(vec![
             OwnedValue::from_number_literal(&long),
             OwnedValue::from_number_literal("1.500"),
             OwnedValue::Int(7),
