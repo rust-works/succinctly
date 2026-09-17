@@ -1257,11 +1257,14 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
 /// (not the "restore the original parse and re-dispatch" arm, which revisits
 /// the same position rather than a new one).
 fn next_call_occurrence(
-    occurrences: &mut BTreeMap<(String, usize), usize>,
+    occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
+    origin: Option<u32>,
     name: &str,
     arity: usize,
 ) -> usize {
-    let count = occurrences.entry((name.to_string(), arity)).or_insert(0);
+    let count = occurrences
+        .entry((origin, name.to_string(), arity))
+        .or_insert(0);
     let index = *count;
     *count += 1;
     index
@@ -1323,7 +1326,7 @@ fn check_pattern_keys(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
-    occurrences: &mut BTreeMap<(String, usize), usize>,
+    occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
 ) {
     match pattern {
         Pattern::Var(_) => {}
@@ -1363,7 +1366,7 @@ fn bind_patterns(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
-    occurrences: &mut BTreeMap<(String, usize), usize>,
+    occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
 ) -> Vec<String> {
     for pattern in patterns.iter_mut() {
         check_pattern_keys(pattern, scope, var_scope, errors, reachable, occurrences);
@@ -1519,7 +1522,7 @@ fn check(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
-    occurrences: &mut BTreeMap<(String, usize), usize>,
+    occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
 ) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
@@ -1833,17 +1836,42 @@ fn check(
             init,
             update,
         } => {
+            // #2635 review: `patterns` (its own computed keys) is checked
+            // before `init`, matching source-*text* order -- `SOURCE as
+            // PATTERN (INIT; UPDATE)` writes the pattern before the
+            // parenthesized part, and `collect_call_sites`' table is sorted
+            // by byte offset, purely textual. `occurrence_index` needs this
+            // order specifically for a name repeated across these
+            // positions to land on the right table entry -- it does not
+            // change which var_scope `init` sees (`bind_patterns` only
+            // *checks* `patterns`'s own computed keys here; the names it
+            // returns are not folded into `var_scope` until the explicit
+            // `extend` below).
+            //
+            // Confirmed live this does not make multi-error *reporting*
+            // order match jq exactly: real jq 1.7.1 prints a bare `init`
+            // error before a `patterns` one (`h | reduce empty as {(h): $x}
+            // (h; h)` split across lines reports line 4 before line 3),
+            // its own compile-order artifact unrelated to text position --
+            // an existing, orthogonal divergence class (`resolve_all`'s own
+            // doc comment already notes reporting order is source-order-ish,
+            // not full jq-compile-order fidelity) this reordering does not
+            // newly introduce, since #2635's own scope is per-occurrence
+            // line *correctness*, not inter-error print order. Every
+            // individual citation still lands on its own correct line
+            // either way (confirmed against the same live example).
             check(input, scope, var_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, errors, reachable, occurrences);
             let outer = var_scope.len();
             let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
+            check(init, scope, var_scope, errors, reachable, occurrences);
             var_scope.extend(bound);
             check(update, scope, var_scope, errors, reachable, occurrences);
             var_scope.truncate(outer);
         }
 
         // #2734: same rule as `Expr::Reduce` above -- `init` sees no bound
-        // vars, `update`/`extract` both do.
+        // vars, `update`/`extract` both do. #2635 review: same patterns-
+        // before-init reordering, same reasoning.
         Expr::Foreach {
             input,
             patterns,
@@ -1852,9 +1880,9 @@ fn check(
             extract,
         } => {
             check(input, scope, var_scope, errors, reachable, occurrences);
-            check(init, scope, var_scope, errors, reachable, occurrences);
             let outer = var_scope.len();
             let bound = bind_patterns(patterns, scope, var_scope, errors, reachable, occurrences);
+            check(init, scope, var_scope, errors, reachable, occurrences);
             var_scope.extend(bound);
             check(update, scope, var_scope, errors, reachable, occurrences);
             check_opt(extract.as_deref_mut(), scope, var_scope, errors, reachable, occurrences);
@@ -1934,13 +1962,24 @@ fn check(
             if let Some(qualified) = aliased {
                 *name = qualified;
             }
+            // #2635 review: keyed by `origin` too, not just `(name, arity)`
+            // -- `occurrences` is one shared map across the whole merged
+            // tree (main filter plus every inlined module), but each
+            // origin's own `call_sites` table is independently re-parsed
+            // from that origin's own text alone (`jq_runner.rs`). Without
+            // this, a module's own earlier occurrence of `(name, arity)`
+            // inflated the main filter's own count for the same pair (or
+            // vice versa), landing `.nth(occurrence_index)` on the wrong
+            // table entirely.
+            let origin = scan.run.map(|(id, _)| id);
             if resolved {
-                // #2635: counts this call towards `occurrences` (a resolved
-                // one still needs to, so a *later* same-name-same-arity call
-                // that fails knows how many earlier occurrences -- resolved
-                // or not -- came before it in the source; see
-                // `UnresolvedCall::occurrence_index`'s own doc comment).
-                next_call_occurrence(occurrences, name, arity);
+                // Counts this call towards `occurrences` (a resolved one
+                // still needs to, so a *later* same-name-same-arity call in
+                // the same origin that fails knows how many earlier
+                // occurrences -- resolved or not -- came before it in the
+                // source; see `UnresolvedCall::occurrence_index`'s own doc
+                // comment).
+                next_call_occurrence(occurrences, origin, name, arity);
                 // #2971: of `builtin_fallback_into_args`'s arms only the
                 // `Builtin` one clones -- the rest move their operands, which
                 // keeps every `def` body where `build_call_graph` found it.
@@ -1970,16 +2009,16 @@ fn check(
                 *expr = *fallback;
                 check(expr, scope, var_scope, errors, reachable, occurrences);
             } else if is_jq_builtin(name, arity) {
-                next_call_occurrence(occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
+                next_call_occurrence(occurrences, origin, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
                     check(a, scope, var_scope, errors, reachable, occurrences); // omni-dev: coverage tolerate-line reason="same unreachable arm as the line above"
                 }
             } else {
-                let occurrence_index = next_call_occurrence(occurrences, name, arity);
+                let occurrence_index = next_call_occurrence(occurrences, origin, name, arity);
                 errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,
-                    origin: scan.run.map(|(id, _)| id),
+                    origin,
                     occurrence_index,
                 }));
             }
@@ -2160,7 +2199,7 @@ fn check_opt(
     var_scope: &mut VarScope,
     errors: &mut Vec<ResolveError>,
     reachable: &BTreeSet<usize>,
-    occurrences: &mut BTreeMap<(String, usize), usize>,
+    occurrences: &mut BTreeMap<(Option<u32>, String, usize), usize>,
 ) {
     if let Some(e) = expr {
         check(e, scope, var_scope, errors, reachable, occurrences);
