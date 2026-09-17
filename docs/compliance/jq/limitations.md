@@ -1061,7 +1061,7 @@ is the revert that established what the other one costs.
    output it emits, so `path(foreach .a as {a:$v} ?// $v (.c; .; empty))` exited 0 where jq
    refuses partway through the construct, and `del`/`=`/`\|=` wrote through it.
 
-   Two refusals remain where jq might answer, both deliberate: the resolver's *own* refusals
+   Three refusals remain where jq might answer, all deliberate: the resolver's *own* refusals
    never retry (a nested pipe carries no register, so `$q[0]` inside an `if` refuses here
    where jq navigates, and retrying on that artefact would bind a different alternative than
    jq and write through it), and a walk refusal retries only when it is jq's own verdict.
@@ -1070,6 +1070,18 @@ is the revert that established what the other one costs.
    `null`/boolean, or the register is lost, the refusal is a guess and propagates instead:
    `path(foreach .a as {a:$v} ?// $v (.c; .; $v))` on `{"a":2,"c":2}` refuses on both, jq at
    the pattern step and succinctly without retrying `$v`.
+
+   The third is the same "resolver's own refusal never retries" rule landing on a bare
+   `$var` alternative instead of a destructuring one: `path(foreach (1) as $x ?// [$z]
+   (null; .; $x))` refuses here on `$x`'s own untrackable-navigation error (`$x` is bound to
+   a SOURCE value that is not itself register-derived — here a literal, not navigation), where
+   live jq 1.7.1 retries into `[$z]`'s own destructuring failure against the same value
+   ("near attempt to access element 0 of 1"). Confirmed narrow: with a realistic
+   `.`-navigated source both agree (`path(foreach .a as $x ?// [$z] (null; .; $x))` on
+   `{"a":1}` is `["a"]` in both) — the divergence needs a SOURCE that is genuinely not
+   navigation-derived at all. Loosening `is_resolver_refusal`'s retry-suppression to special
+   case this one shape would risk the already-verified `$q[0]`-inside-`if` case above
+   regressing, since both are the same rule; not planned for closure on that basis.
 
    A `?//` chain of a plain `as` bind on an *untracked* stage no longer falls to the
    by-value catch-all either: `path(5 \| . as {a:$v} ?// $v \| .b?)` refuses on both (it

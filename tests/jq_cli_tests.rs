@@ -27296,6 +27296,22 @@ fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
             "",
             0,
         ),
+        // review: not a `?//` row -- a plain (single-pattern) `foreach`'s
+        // UPDATE still delivers its own generator's outputs before an
+        // escape, exactly as #2979's rule 3 doc comment states
+        // (`resolve_reduce`'s identical charge) and jq's own generator
+        // semantics require. Pinned here because #2979 is what put this
+        // exact code path (UPDATE resolved via the `(update_branches,
+        // update_escape)` split, run through EXTRACT before the escape is
+        // reported) in reach for every `foreach`, not just an alternated
+        // one, and it had no regression coverage of its own.
+        (
+            "{\"a\":1}",
+            "path(foreach (1) as $x (.; (.a, error(\"x\"))))",
+            "[\"a\"]\n",
+            "jq: error (at <stdin>:1): x\n",
+            5,
+        ),
     ];
     for (doc, filter, want_stdout, want_stderr, want_code) in rows {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&format!("{doc}\n")))?;
