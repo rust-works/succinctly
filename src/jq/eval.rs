@@ -7572,6 +7572,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `first(range(1e18))` still returns `0` instantly, no error, while
     // `[range(1e18)]`/`reduce range(1e18) as $x (0;.+$x)` now raise instead
     // of silently returning a 100000-element/-sum prefix.
+    //
+    // `step.is_none()` marks the 1-arg/2-arg call shapes (no explicit step
+    // expression) -- see `range_values_f64`'s doc comment (#3071) for why
+    // that arity, not the runtime step value, decides the float path's
+    // NaN-bound behavior.
+    let implicit_step = step.is_none();
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
         let (one, truncated) = match (from_val, to_val, step_val) {
             // `eval_range_values` never falls back to `eval_range_values_f64`
@@ -7583,7 +7589,9 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
                 eval_range_values::<W>(f, t, st)
             }
-            (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
+            (f, t, st) => {
+                eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64(), implicit_step)
+            }
         };
         match drain_result(one, sink) {
             Flow::Exhausted if truncated => {
@@ -43837,14 +43845,40 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
     from: f64,
     to: f64,
     step: f64,
+    implicit_step: bool,
 ) -> (QueryResult<'a, W>, bool) {
-    let (values, truncated) = range_values_f64(from, to, step);
+    let (values, truncated) = range_values_f64(from, to, step, implicit_step);
     (owned_vec_to_result(values), truncated)
 }
 
 /// [`eval_range_values_f64`]'s body, stopping at the `Vec` -- the float twin
 /// of [`range_values_int`], same reasoning (#2698).
-pub(crate) fn range_values_f64(from: f64, to: f64, step: f64) -> (Vec<OwnedValue>, bool) {
+///
+/// `implicit_step` is true for the 1-arg (`range(n)`) and 2-arg
+/// (`range(from; to)`) call shapes, false for the 3-arg
+/// (`range(from; to; step)`) shape -- confirmed against `/usr/bin/jq` 1.7.1
+/// to select genuinely different behavior when `to` is NaN, not just an
+/// implementation-detail flag: `[limit(3; range(nan))]` is `[0,1,2]`
+/// (loops), but `[limit(3; range(0; nan; 1))]` is `[]` (stops immediately)
+/// -- identical `(from, to, step)` operands, different arity, different
+/// answer (#3071). The ascending branch below reproduces this by testing
+/// `!(i >= to)` instead of `i < to` when `implicit_step` is set: the two
+/// agree for every non-NaN `i`/`to` (De Morgan's law), so this changes
+/// nothing for any range that doesn't involve NaN, but a NaN `to` (or a NaN
+/// running `i`, from a NaN `from`) makes `i >= to` false unconditionally,
+/// so the negation never stops the loop -- matching jq's native fast path
+/// for these two arities. The descending branch is untouched: `from`/`to`/
+/// `step` are always `RangeNum::Int(1)`-shaped positive steps at the two
+/// `implicit_step` call sites, so it's unreachable under `implicit_step`
+/// today; jq's 3-arg range has its own further NaN divergence on a
+/// *negative* step that this issue doesn't cover, filed separately as
+/// [#3102](https://github.com/rust-works/succinctly/issues/3102).
+pub(crate) fn range_values_f64(
+    from: f64,
+    to: f64,
+    step: f64,
+    implicit_step: bool,
+) -> (Vec<OwnedValue>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
@@ -43853,13 +43887,22 @@ pub(crate) fn range_values_f64(from: f64, to: f64, step: f64) -> (Vec<OwnedValue
     // `while` condition (`while_float` fires on that shape specifically,
     // not on one ANDed with another term) -- matching how the pre-#2089
     // version of this loop already avoided the lint by coincidence.
+    //
+    // The negation in the `implicit_step` arm is the entire point, not an
+    // oversight `partial_cmp` should replace: `!(i >= to)` and `i < to`
+    // agree for every comparable `f64` pair, and deliberately disagree
+    // when `to` (or `i`, from a NaN `from`) is NaN -- exactly the case this
+    // function exists to reproduce (#3071).
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let continue_ascending = |i: f64| if implicit_step { !(i >= to) } else { i < to };
+
     if step > 0.0 {
         let mut i = from;
-        while i < to && values.len() < MAX_RANGE {
+        while continue_ascending(i) && values.len() < MAX_RANGE {
             values.push(OwnedValue::Float(i));
             i += step;
         }
-        truncated = i < to;
+        truncated = continue_ascending(i);
     } else if step < 0.0 {
         let mut i = from;
         while i > to && values.len() < MAX_RANGE {
@@ -49318,12 +49361,29 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         OwnedValue::Int(t.day),
         OwnedValue::Int(t.hour),
         OwnedValue::Int(t.minute),
-        OwnedValue::Int(t.second),
+        OwnedValue::Float(broken_down_seconds(t.second, timestamp)),
         OwnedValue::Int(t.weekday),
         OwnedValue::Int(t.yearday),
     ];
 
     QueryResult::Owned(OwnedValue::array_from(result))
+}
+
+/// jq's `tm2jv` writes the seconds slot as `tm_sec + (t - floor(t))`, not the
+/// truncated `tm_sec` alone -- so `gmtime`/`localtime` keep a NaN or a
+/// fractional part that a plain integer seconds field would drop (#3071).
+/// The date/time breakdown itself still comes from `t.trunc()` (matching
+/// this file's existing `broken_down_time_from_unix_secs` callers); only the
+/// output seconds slot needs the un-truncated fraction added back, using
+/// `floor` rather than `trunc` for that remainder -- confirmed against
+/// `/usr/bin/jq` across a spread of negative fractional inputs, where the
+/// two disagree (e.g. `-1.5 | gmtime` keeps the date at `23:59:59`, from
+/// `trunc(-1.5) == -1`, but reports seconds `59.5`, which only `floor`'s
+/// `0.5` remainder produces -- `trunc`'s `-0.5` would give `58.5`). A NaN
+/// `raw` timestamp makes `raw - raw.floor()` itself NaN, which serializes to
+/// `null`, matching `nan | gmtime`.
+fn broken_down_seconds(second: i64, raw: f64) -> f64 {
+    second as f64 + (raw - raw.floor())
 }
 
 /// Convert a Unix timestamp (whole seconds, UTC) to broken-down time using
@@ -49494,7 +49554,7 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             OwnedValue::Int(t.day),
             OwnedValue::Int(t.hour),
             OwnedValue::Int(t.minute),
-            OwnedValue::Int(t.second),
+            OwnedValue::Float(broken_down_seconds(t.second, timestamp)),
             OwnedValue::Int(t.weekday),
             OwnedValue::Int(t.yearday),
         ];
@@ -52023,13 +52083,18 @@ fn builtin_normals<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::None
 }
 
-/// Builtin: finites - select only finite numbers (not infinite or NaN)
+/// Builtin: finites - select only non-infinite numbers. Confirmed against
+/// `/usr/bin/jq` 1.7.1: `finites` passes a NaN through (`[nan, 1, infinite]
+/// | map(finites)` is `[null, 1]`, keeping the NaN slot as `null`) -- only
+/// `isinfinite` excludes, not `isnan`. This is *not* symmetric with
+/// `normals` just below, which does exclude NaN (also confirmed live) -- so
+/// don't fold the two predicates together (#3071).
 fn builtin_finites<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
 ) -> QueryResult<'_, W> {
     if let StandardJson::Number(n) = &value {
         if let Ok(f) = json_number_f64::<S>(n) {
-            if f.is_finite() {
+            if !f.is_infinite() {
                 return QueryResult::One(value);
             }
         }
@@ -76862,6 +76927,58 @@ mod tests {
     }
 
     #[test]
+    fn test_range_nan_bound_never_stops_the_implicit_step_forms_3071() {
+        // jq's native fast path for range/1 and range/2 (no explicit step)
+        // never stops on a NaN bound or a NaN running value -- confirmed
+        // against `/usr/bin/jq` 1.7.1. range/3 (explicit step) is a
+        // different implementation and keeps the straightforward reading
+        // for these same operands (`[limit(3; range(0; nan; 1))]` is `[]`,
+        // covered by `test_range`'s sibling below) -- so arity, not the
+        // runtime step value, decides this.
+        query!(br"null", r"[limit(3; range(nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Float(0.0),
+                    OwnedValue::Float(1.0),
+                    OwnedValue::Float(2.0),
+                ]);
+            }
+        );
+        query!(br"null", r"[limit(3; range(0; nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Float(0.0),
+                    OwnedValue::Float(1.0),
+                    OwnedValue::Float(2.0),
+                ]);
+            }
+        );
+        query!(br"null", r"[limit(3; range(nan; 3))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                for v in &arr {
+                    match v {
+                        OwnedValue::Float(f) => assert!(f.is_nan()),
+                        other => panic!("expected a NaN float, got {other:?}"),
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_3_arg_nan_bound_keeps_the_straightforward_reading_3071() {
+        // Same operands as the implicit-step test above, but spelled with
+        // an explicit step -- confirmed against `/usr/bin/jq` 1.7.1 that
+        // this arity really does answer differently for a NaN bound.
+        query!(br"null", r"[limit(3; range(0; nan; 1))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+    }
+
+    #[test]
     fn test_limit() {
         // limit(n; expr) - take first n outputs
         query!(br"null", r"[limit(3; range(10))]",
@@ -82251,6 +82368,63 @@ mod tests {
                 assert_eq!(arr[5], OwnedValue::Int(0));    // second
                 assert_eq!(arr[6], OwnedValue::Int(4));    // weekday (Thursday)
                 assert_eq!(arr[7], OwnedValue::Int(0));    // yearday
+            }
+        );
+    }
+
+    #[test]
+    fn test_gmtime_keeps_nan_and_fraction_in_seconds_slot_3071() {
+        // jq's `tm2jv` writes the seconds slot as `tm_sec + (t - floor(t))`,
+        // not a truncated integer -- confirmed against `/usr/bin/jq` 1.7.1
+        // for every case below, including the negative-fraction ones where
+        // `floor`'s remainder and `trunc`'s disagree (`-1.5 | gmtime` keeps
+        // the date at 23:59:59, from `trunc(-1.5) == -1`, but reports
+        // seconds `59.5`, not `58.5`).
+        query!(b"null", "nan | gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[0], OwnedValue::Int(1970));
+                assert_eq!(arr[1], OwnedValue::Int(0));
+                assert_eq!(arr[2], OwnedValue::Int(1));
+                assert_eq!(arr[3], OwnedValue::Int(0));
+                assert_eq!(arr[4], OwnedValue::Int(0));
+                match &arr[5] {
+                    OwnedValue::Float(f) => assert!(f.is_nan()),
+                    other => panic!("expected a NaN float, got {other:?}"),
+                }
+                assert_eq!(arr[6], OwnedValue::Int(4));
+                assert_eq!(arr[7], OwnedValue::Int(0));
+            }
+        );
+        query!(b"1.5", "gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[5], OwnedValue::Float(1.5));
+            }
+        );
+        query!(b"-1.5", "gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[2], OwnedValue::Int(31)); // 1969-12-31
+                assert_eq!(arr[3], OwnedValue::Int(23));
+                assert_eq!(arr[4], OwnedValue::Int(59));
+                assert_eq!(arr[5], OwnedValue::Float(59.5));
+            }
+        );
+        query!(b"-0.1", "gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                // Still epoch day (trunc(-0.1) == 0), fraction from floor: 0.9.
+                assert_eq!(arr[2], OwnedValue::Int(1));
+                assert_eq!(arr[3], OwnedValue::Int(0));
+                assert_eq!(arr[4], OwnedValue::Int(0));
+                assert_eq!(arr[5], OwnedValue::Float(0.9));
+            }
+        );
+        // Integer input still reports a whole-number seconds slot -- the
+        // fraction added back is exactly 0.0, so this doesn't regress
+        // `test_gmtime`'s own `OwnedValue::Int(0)` comparison above
+        // (`OwnedValue`'s `PartialEq` treats `Int`/`Float` as equal by
+        // numeric value).
+        query!(b"1435677542", "gmtime",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr[5], OwnedValue::Int(2));
             }
         );
     }
@@ -87998,12 +88172,33 @@ mod tests {
 
     #[test]
     fn test_finites() {
-        // finites selects only finite numbers (not inf or nan)
+        // finites selects only non-infinite numbers -- NaN passes (#3071),
+        // unlike normals just above, which does exclude it.
         query!(b"5", "finites", QueryResult::One(_) => {});
         query!(b"-3.14", "finites", QueryResult::One(_) => {});
         query!(b"0", "finites", QueryResult::One(_) => {}); // 0 is finite
         query!(b"null", "finites", QueryResult::None => {}); // null is not a number
         query!(br#""string""#, "finites", QueryResult::None => {}); // string is not a number
+    }
+
+    #[test]
+    fn test_finites_passes_nan_through_3071() {
+        // Confirmed against `/usr/bin/jq` 1.7.1: `[nan, 1, infinite] |
+        // map(finites)` is `[null, 1]` -- `finites` filters `isinfinite`,
+        // not `isnan`, so a NaN element survives (and serializes as `null`,
+        // like every other NaN this evaluator ever computes).
+        query!(b"null", "[nan, 1, infinite] | map(finites)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                match &arr[0] {
+                    OwnedValue::Float(f) => assert!(f.is_nan()),
+                    other => panic!("expected a NaN float, got {other:?}"),
+                }
+                assert_eq!(arr[1], OwnedValue::Int(1));
+            }
+        );
+        query!(b"null", "infinite | finites", QueryResult::None => {});
+        query!(b"null", "(-infinite) | finites", QueryResult::None => {});
     }
 
     #[test]

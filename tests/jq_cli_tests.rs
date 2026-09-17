@@ -45479,6 +45479,49 @@ fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
     Ok(())
 }
 
+/// #3071: three separate NaN-handling mechanisms found by a NaN sweep over
+/// every builtin, each confirmed live against jq 1.7.1.
+#[test]
+fn test_nan_handling_in_gmtime_finites_range_3071() -> Result<()> {
+    // `gmtime`/`localtime` write the seconds slot as `tm_sec + (t -
+    // floor(t))`, a double, not a truncated integer -- so a NaN or
+    // fractional input timestamp keeps it (jq's `tm2jv`).
+    for (filter, want) in [
+        ("nan | gmtime", "[1970,0,1,0,0,null,4,0]"),
+        ("1.5 | gmtime", "[1970,0,1,0,0,1.5,4,0]"),
+        ("(-1.5) | gmtime", "[1969,11,31,23,59,59.5,3,364]"),
+        ("(-0.1) | gmtime", "[1970,0,1,0,0,0.9,4,0]"),
+        ("1.5 | gmtime | todate", r#""1970-01-01T00:00:01Z""#),
+        ("1.5 | gmtime | mktime", "1"),
+    ] {
+        let (stdout, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    // `finites` filters `isinfinite`, not `isnan` -- jq 1.7.1's own def is
+    // `select(isinfinite | not)`, so a NaN element passes through.
+    let (stdout, code) = run_jq_null("[nan, 1, infinite] | map(finites)", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[null,1]");
+
+    // `range`'s native fast path for the 1-arg/2-arg (implicit step) forms
+    // never stops on a NaN bound or a NaN running value; the 3-arg
+    // (explicit step) form keeps the straightforward reading for the same
+    // operands -- arity, not the runtime step value, decides this.
+    for (filter, want) in [
+        ("[limit(3; range(nan))]", "[0,1,2]"),
+        ("[limit(3; range(0; nan))]", "[0,1,2]"),
+        ("[limit(3; range(nan; 3))]", "[null,null,null]"),
+        ("[limit(3; range(0; nan; 1))]", "[]"),
+    ] {
+        let (stdout, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: stdout {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// A name the pinned jq does *not* define is still an error when reached
 /// (#1473 deferred unresolved calls to runtime; #3042 removed the last real
 /// builtins from that set, so a made-up name is what exercises it now).

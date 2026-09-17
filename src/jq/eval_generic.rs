@@ -13083,10 +13083,14 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
     let mut sink_stopped = false;
 
+    // See `each_range`'s own note (#3071): the 1-arg/2-arg call shapes (no
+    // explicit step expression) select the float path's NaN-tolerant loop
+    // condition in `range_values_f64`, not the runtime step value.
+    let implicit_step = step.is_none();
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
         let (values, truncated) = match (from_val, to_val, step_val) {
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => range_values_int(f, t, st),
-            (f, t, st) => range_values_f64(f.as_f64(), t.as_f64(), st.as_f64()),
+            (f, t, st) => range_values_f64(f.as_f64(), t.as_f64(), st.as_f64(), implicit_step),
         };
         for v in values {
             if sink.push(GenericItem::Owned(v)) == Demand::Stop {
