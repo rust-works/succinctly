@@ -458,7 +458,13 @@ What remains, recorded here:
   glibc-2.35 jq *and* Ubuntu 24.04's glibc-2.39 jq, compared as text (a JSON-level
   compare is blind to `-0`), and only the rows all three agree on stayed; the
   platform-dependent digits (`cbrt(27)`, `lgamma(5)`, `erf(1)`, ...) are pinned per
-  platform by `math.rs`'s gated unit test instead.
+  platform by `math.rs`'s gated unit test instead. glibc on **AArch64** is a fourth libm
+  again — the same C sources compiled with fused multiply-adds — and PR #3067's first CI
+  run on `ubuntu-24.04-arm` found it one ulp from x86-64 glibc on `cbrt(3)` and `y0(10)`
+  while agreeing on every other row; those two inputs left the golden, and the `jn`/`yn`
+  rows (a multiply-add recurrence over `j0`/`j1`) were reduced to their `n = 0, ±1`
+  cases plus the order rules as equalities, since no AArch64 Linux host was available to
+  measure them on.
 
 ## Behaviour and parser gaps
 
