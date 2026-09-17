@@ -277,7 +277,7 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
             is_first = false;
         }
         child_tail_gap_ok(last_elem.as_ref(), b']')?;
-        Ok(OwnedValue::Array(items.into()))
+        Ok(OwnedValue::array_from(items))
     } else if value.is_null() {
         Ok(OwnedValue::Null)
     } else if let Some(b) = value.as_bool() {
@@ -525,7 +525,7 @@ fn to_owned_at_depth<V: DocumentValue>(
         }
         // #2358: same reasoning as the object arm's own check above.
         tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-        Ok(OwnedValue::Array(items.into()))
+        Ok(OwnedValue::array_from(items))
     // Then check scalars in order of specificity
     } else if value.is_null() {
         Ok(OwnedValue::Null)
@@ -849,7 +849,7 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         // #2211/#2243: same reasoning as the object arm's own check just
         // above, and now literally the same call (#1803).
         container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-        Ok(OwnedValue::Array(items.into()))
+        Ok(OwnedValue::array_from(items))
     } else {
         if let Some(owned) = scalar_override(&value) {
             return Ok(owned);
@@ -1745,7 +1745,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         // #2405: same reasoning as the object arm's own check above.
         tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok((
-            OwnedValue::Array(items.into()),
+            OwnedValue::array_from(items),
             CommentTree::Array(own_meta, comment_items),
         ))
     } else {
@@ -1780,7 +1780,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
 /// ever be rejected on type (#669).
 fn to_owned_key_shape<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     if value.is_array() {
-        Ok(OwnedValue::Array(Vec::new().into()))
+        Ok(OwnedValue::array())
     } else if value.is_object() {
         Ok(OwnedValue::Object(IndexMap::new().into()))
     } else {
@@ -1796,7 +1796,7 @@ fn to_owned_key_shape<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalErr
 fn to_owned_key_shape_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
     let value = cursor.value();
     if value.is_array() {
-        Ok(OwnedValue::Array(Vec::new().into()))
+        Ok(OwnedValue::array())
     } else if value.is_object() {
         Ok(OwnedValue::Object(IndexMap::new().into()))
     } else {
@@ -1836,7 +1836,7 @@ fn materialize_lazy_keys<V: DocumentValue>(
         // for an invariant already enforced one layer up, at compile time.
         keys.sort_by(compare_values::<JqSemantics>);
     }
-    Ok(OwnedValue::Array(keys.into()))
+    Ok(OwnedValue::array_from(keys))
 }
 
 /// The value a mapping key materializes as (#2785): its display string for
@@ -2417,7 +2417,7 @@ impl<V: DocumentValue> LazySeq<V> {
         for item in &items {
             out.push(lazy_elem_to_owned(item).map_err(Control::Error)?);
         }
-        Ok(OwnedValue::Array(out.into()))
+        Ok(OwnedValue::array_from(out))
     }
 }
 
@@ -2603,7 +2603,7 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
             for e in *elements {
                 items.push(owned_from_standard_json_at_depth(&e, depth + 1)?);
             }
-            OwnedValue::Array(items.into())
+            OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
@@ -4047,7 +4047,7 @@ impl<V: DocumentValue> GenericResult<V> {
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
-            Self::ManyOwned(os) => Some(OwnedValue::Array(os.into())),
+            Self::ManyOwned(os) => Some(OwnedValue::array_from(os)),
             Self::Break(_) => None,
             Self::Halt(_) => None,
             // A `Partial` prefix is not representable as a single value —
@@ -4278,7 +4278,7 @@ impl<V: DocumentValue> GenericResult<V> {
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(items) => {
-                                OwnedValue::Array(items.into())
+                                OwnedValue::array_from(items)
                                     .stream_json(out, indent, sort_keys, numbers)?;
                                 true
                             }
@@ -4527,7 +4527,7 @@ impl<V: DocumentValue> GenericResult<V> {
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(items) => {
-                                OwnedValue::Array(items.into())
+                                OwnedValue::array_from(items)
                                     .stream_yaml(out, indent, sort_keys)?;
                                 true
                             }
@@ -7950,7 +7950,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // #2902 made the bridge an identity on a bare `Float`, the round
             // trip could no longer change anything it was meant to, and was
             // removed.
-            GenericResult::Owned(OwnedValue::Array(items.into()))
+            GenericResult::Owned(OwnedValue::array_from(items))
         }
 
         // Comma: evaluate each operand in source order against the ambient
@@ -11318,7 +11318,7 @@ fn collect_together<S: EvalSemantics, V: DocumentValue>(
         }
     }
     Ok(YqContextItem::new(
-        YqContextNode::Owned(OwnedValue::Array(merged.into())),
+        YqContextNode::Owned(OwnedValue::array_from(merged)),
         YqContextTag::default(),
     ))
 }
@@ -14385,7 +14385,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         // `suppresses`'s own doc comment records happening twice already,
         // #1902 and #1934).
         return match to_owned_all(items[range].iter()) {
-            Ok(v) => GenericResult::Owned(OwnedValue::Array(v.into())),
+            Ok(v) => GenericResult::Owned(OwnedValue::array_from(v)),
             Err(e) if suppresses(&e, optional) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
         };
@@ -14425,7 +14425,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     // `resolve_plain` re-derivations of the same scalar into the one
     // `type_name()` already performs.
     if S::TAG == EvalTag::Yq && matches!(target.type_name(), "null" | "boolean" | "number") {
-        return GenericResult::Owned(OwnedValue::Array(Vec::new().into()));
+        return GenericResult::Owned(OwnedValue::array());
     }
     if target.is_null() {
         return GenericResult::Owned(OwnedValue::Null);
@@ -16868,7 +16868,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                             Err(e) => return GenericResult::Error(e),
                         }
                     }
-                    let sliced = OwnedValue::Array(items.into());
+                    let sliced = OwnedValue::array_from(items);
                     return if let Some(rest) = segments.get(i + 1..).filter(|r| !r.is_empty()) {
                         query_result_to_generic::<V>(
                             crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(
@@ -16959,7 +16959,7 @@ fn path_context_getpath_walk_one<S: EvalSemantics, V: DocumentValue>(
                         PathNode::Owned(v) => Rc::clone(v),
                     };
                     let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::tracked_value(
-                        OwnedValue::Array(vec![component.clone()].into()),
+                        OwnedValue::array_from(vec![component.clone()]),
                     ))));
                     let (values, control) = owned_identity_values::<S>(&segment, &value, false);
                     path_context_push_owned_children(
@@ -17509,7 +17509,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 return Err(Control::Error(e));
             }
             walked?;
-            Ok(sink.push(GenericItem::Owned(OwnedValue::Array(items.into()))))
+            Ok(sink.push(GenericItem::Owned(OwnedValue::array_from(items))))
         }
         // `key` at the document root emits nothing: real yq prints nothing
         // there (#2421, captured live from v4.53.3), and jq has no `key` at
@@ -20136,7 +20136,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // passthrough (matches the `*=` merge rule documented in
                 // CLAUDE.md: "null acts as an empty container on either
                 // side of a yq-mode merge").
-                GenericResult::Owned(OwnedValue::Array(Vec::new().into()))
+                GenericResult::Owned(OwnedValue::array())
             } else if S::TAG == EvalTag::Yq {
                 // Every other scalar passes through byte-for-byte
                 // unchanged -- no decode-check needed, nothing ever reads
@@ -20171,7 +20171,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         owned_or_suppress!(to_owned_all_cursors(&cursors), optional);
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
-                    GenericResult::Owned(OwnedValue::Array(values.into()))
+                    GenericResult::Owned(OwnedValue::array_from(values))
                 } else {
                     GenericResult::Error(EvalError::new(format!(
                         "shuffle requires array, got {}",
@@ -20196,7 +20196,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 let items: Vec<OwnedValue> =
                     owned_or_suppress!(to_owned_all_cursors(&cursors), optional);
                 if items.is_empty() {
-                    return GenericResult::Owned(OwnedValue::Array(vec![].into()));
+                    return GenericResult::Owned(OwnedValue::array());
                 }
 
                 let all_arrays = items.iter().all(|v| matches!(v, OwnedValue::Array(_)));
@@ -20217,7 +20217,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         .unwrap_or(0);
 
                     if max_len == 0 {
-                        return GenericResult::Owned(OwnedValue::Array(vec![].into()));
+                        return GenericResult::Owned(OwnedValue::array());
                     }
 
                     let mut result = vec_with_capacity(max_len);
@@ -20230,9 +20230,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                                 column.push(OwnedValue::Null);
                             }
                         }
-                        result.push(OwnedValue::Array(column.into()));
+                        result.push(OwnedValue::array_from(column));
                     }
-                    GenericResult::Owned(OwnedValue::Array(result.into()))
+                    GenericResult::Owned(OwnedValue::array_from(result))
                 } else if all_objects {
                     // Transpose array of objects: [{a: 1}, {a: 2, b: 3}] → {a: [1, 2], b: [null, 3]}
                     let mut all_keys: Vec<String> = Vec::new();
@@ -20256,7 +20256,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                                 values.push(OwnedValue::Null);
                             }
                         }
-                        result_obj.insert(key.clone(), OwnedValue::Array(values.into()));
+                        result_obj.insert(key.clone(), OwnedValue::array_from(values));
                     }
                     GenericResult::Owned(OwnedValue::Object(result_obj.into()))
                 } else if optional {
@@ -20508,7 +20508,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     );
                     entries.push(OwnedValue::Object(entry.into()));
                 }
-                GenericResult::Owned(OwnedValue::Array(entries.into()))
+                GenericResult::Owned(OwnedValue::array_from(entries))
             } else if let Some(fields) = value.as_object() {
                 // Up front, because `effective_fields` reports an unpaired
                 // trailing child as plain exhaustion -- the loop below would
@@ -20594,7 +20594,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         return GenericResult::Error(fields.malformed_member_error());
                     }
                 }
-                GenericResult::Owned(OwnedValue::Array(entries.into()))
+                GenericResult::Owned(OwnedValue::array_from(entries))
             } else {
                 // `optional: false` unconditionally: `Builtin::ToEntries`
                 // isn't `IndexExpr`/`SliceExpr`, so #693's dispatch never
@@ -20901,7 +20901,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 };
                 match length {
                     GenericResult::Owned(len) if reverse_length_is_empty(&len) => {
-                        GenericResult::Owned(OwnedValue::Array(Vec::new().into()))
+                        GenericResult::Owned(OwnedValue::array())
                     }
                     GenericResult::Error(e) => GenericResult::Error(e),
                     // `length` only answers `None` under `optional = true`,
@@ -21414,7 +21414,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         },
         Builtin::PathNoArg if cursor.is_some() => {
             match cursor_path_and_ancestors(&cursor.expect("guarded")) {
-                Ok((path, _, _)) => GenericResult::Owned(OwnedValue::Array(path.into())),
+                Ok((path, _, _)) => GenericResult::Owned(OwnedValue::array_from(path)),
                 Err(e) => GenericResult::Error(e),
             }
         }
@@ -23890,9 +23890,9 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         }
     }
     let result = match family {
-        MapFamily::Map => OwnedValue::Array(array.into()),
+        MapFamily::Map => OwnedValue::array_from(array),
         MapFamily::MapValues => match container {
-            OwnedValue::Array(_) => OwnedValue::Array(array.into()),
+            OwnedValue::Array(_) => OwnedValue::array_from(array),
             _ => OwnedValue::Object(object.into()),
         },
         MapFamily::WithEntries => match entries_to_object::<S, _>(array) {
@@ -24535,7 +24535,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
             Ok(path) => eval_owned_identity_stages::<S, V>(
                 rest,
-                Cow::Owned(OwnedValue::Array(path.into())),
+                Cow::Owned(OwnedValue::array_from(path)),
                 id,
                 optional,
                 tail,
@@ -25311,7 +25311,7 @@ mod tests {
             OwnedValue::Float(3.5),
             OwnedValue::Float(1e19),
             OwnedValue::Float(f64::NAN),
-            OwnedValue::Array(Vec::new().into()),
+            OwnedValue::array(),
             OwnedValue::Object(IndexMap::new().into()),
             OwnedValue::Array(
                 vec![
@@ -26253,7 +26253,7 @@ mod tests {
         let empty_result = eval(&Expr::Builtin(Builtin::KeysUnsorted), empty_cursor.value());
         assert_eq!(
             empty_result.collect_owned().unwrap(),
-            vec![OwnedValue::Array(vec![].into())]
+            vec![OwnedValue::array()]
         );
     }
 
@@ -26590,8 +26590,8 @@ mod tests {
         assert_eq!(
             result.collect_owned().unwrap(),
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)].into()),
-                OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
+                OwnedValue::array_from(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
             ]
         );
     }
@@ -27350,7 +27350,7 @@ mod tests {
         let expr = crate::jq::parse("map(.)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![].into())
+            OwnedValue::array()
         );
 
         let json = br"{}";
@@ -27360,7 +27360,7 @@ mod tests {
         let expr = crate::jq::parse("map(.)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![].into())
+            OwnedValue::array()
         );
     }
 
@@ -27996,7 +27996,7 @@ mod tests {
         };
         assert_eq!(
             owned,
-            OwnedValue::Array(vec![expected_entry(1), expected_entry(2)].into())
+            OwnedValue::array_from(vec![expected_entry(1), expected_entry(2)])
         );
     }
 
@@ -28031,7 +28031,7 @@ mod tests {
         entry.insert("value".to_string(), OwnedValue::Int(2));
         assert_eq!(
             owned,
-            OwnedValue::Array(vec![OwnedValue::Object(entry.into())].into())
+            OwnedValue::array_from(vec![OwnedValue::Object(entry.into())])
         );
     }
 
@@ -28111,7 +28111,7 @@ mod tests {
             entry.insert("value".to_string(), OwnedValue::Int(v));
             OwnedValue::Object(entry.into())
         };
-        let expected_array = OwnedValue::Array(vec![expected_entry(1), expected_entry(2)].into());
+        let expected_array = OwnedValue::array_from(vec![expected_entry(1), expected_entry(2)]);
         assert_eq!(owned, vec![expected_array.clone(), expected_array]);
     }
 
@@ -28138,7 +28138,7 @@ mod tests {
         };
         assert_eq!(
             owned,
-            OwnedValue::Array(vec![entry("a", 3), entry("b", 2)].into())
+            OwnedValue::array_from(vec![entry("a", 3), entry("b", 2)])
         );
     }
 
@@ -28169,7 +28169,7 @@ mod tests {
         };
         assert_eq!(
             owned,
-            OwnedValue::Array(vec![expected_entry(0, "a"), expected_entry(1, "b")].into())
+            OwnedValue::array_from(vec![expected_entry(0, "a"), expected_entry(1, "b")])
         );
     }
 
@@ -28729,10 +28729,10 @@ mod tests {
                 IndexMap::from([
                     (
                         "a".to_string(),
-                        OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+                        OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
                     ),
                     ("b".to_string(), OwnedValue::Object(IndexMap::new().into())),
-                    ("c".to_string(), OwnedValue::Array(Vec::new().into())),
+                    ("c".to_string(), OwnedValue::array()),
                 ])
                 .into()
             )
@@ -29212,7 +29212,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
     }
 
@@ -29236,7 +29236,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
     }
 
@@ -30113,10 +30113,7 @@ mod tests {
         let expr = crate::jq::parse(".[(1-1):(1+0)]").unwrap();
 
         let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
-        assert_eq!(
-            result.into_owned().unwrap(),
-            Some(OwnedValue::Array(Vec::new().into()))
-        );
+        assert_eq!(result.into_owned().unwrap(), Some(OwnedValue::array()));
     }
 
     // Coverage follow-ups for #532: the tests above exercise the common
@@ -30844,8 +30841,8 @@ mod tests {
         assert_eq!(
             many.collect_owned().unwrap(),
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
-                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
             ]
         );
     }
@@ -30909,8 +30906,8 @@ mod tests {
         assert_eq!(
             result.collect_owned().unwrap(),
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
-                OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::array_from(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
             ]
         );
     }
@@ -31199,8 +31196,8 @@ mod tests {
         assert_eq!(
             result.collect_owned().unwrap(),
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
-                OwnedValue::Array(vec![OwnedValue::Int(4), OwnedValue::Int(5)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                OwnedValue::array_from(vec![OwnedValue::Int(4), OwnedValue::Int(5)]),
             ]
         );
     }
@@ -32212,8 +32209,8 @@ mod tests {
         assert_eq!(
             eval(&expr, value).collect_owned().unwrap(),
             vec![
-                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)].into()),
-                OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
+                OwnedValue::array_from(vec![OwnedValue::Int(10), OwnedValue::Int(20)]),
             ]
         );
     }
@@ -32237,7 +32234,7 @@ mod tests {
                 OwnedValue::Array(
                     vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into()
                 ),
-                OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into()),
+                OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
             ]
         );
     }
@@ -32346,7 +32343,7 @@ mod tests {
         assert_eq!(
             result.into_owned().unwrap().unwrap(),
             // yq keeps float modulo (1.5), unlike jq's truncating modulo (1).
-            OwnedValue::Array(vec![OwnedValue::Float(1.5)].into())
+            OwnedValue::array_from(vec![OwnedValue::Float(1.5)])
         );
     }
 
@@ -32386,7 +32383,7 @@ mod tests {
             eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::Array(vec![OwnedValue::String("a".to_string())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".to_string())]),
                     OwnedValue::Array(
                         vec![
                             OwnedValue::String("bb".to_string()),
@@ -32408,7 +32405,7 @@ mod tests {
             eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(0), OwnedValue::Int(1)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(0), OwnedValue::Int(1)]),
                     OwnedValue::Array(
                         vec![OwnedValue::Int(0), OwnedValue::Int(1), OwnedValue::Int(2)].into()
                     ),
@@ -32424,7 +32421,7 @@ mod tests {
         let expr = crate::jq::parse("map(select(. > 1))").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)])
         );
 
         // A comma of literals -> `GenericResult::ManyOwned`, fanning one
@@ -32435,7 +32432,7 @@ mod tests {
         let expr = crate::jq::parse("map(1, 2)").unwrap();
         assert_eq!(
             eval(&expr, value).into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
 
         // `.[]` on an array-valued element -> `GenericResult::ManyCursor`
@@ -32465,7 +32462,7 @@ mod tests {
             eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::Array(vec![OwnedValue::String("A".to_string())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::String("A".to_string())]),
                     OwnedValue::Array(
                         vec![
                             OwnedValue::String("BB".to_string()),
@@ -32525,7 +32522,7 @@ mod tests {
         let expr = crate::jq::parse("select(map(. + 1))").unwrap();
         assert_eq!(
             eval(&expr, value.clone()).into_owned().unwrap().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
 
         let expr = crate::jq::parse(r#"select(map(error("boom")))"#).unwrap();
@@ -34275,7 +34272,7 @@ mod tests {
     #[test]
     fn test_to_owned_wellformed_containers_unaffected_by_trailing_comma_check_2262() {
         for (json, expected) in [
-            (b"[]".as_slice(), OwnedValue::Array(vec![].into())),
+            (b"[]".as_slice(), OwnedValue::array()),
             (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
@@ -34389,7 +34386,7 @@ mod tests {
                     ),
                 ),
                 ("c".to_string(), OwnedValue::Object(IndexMap::new().into())),
-                ("d".to_string(), OwnedValue::Array(vec![].into())),
+                ("d".to_string(), OwnedValue::array()),
             ])
             .into(),
         );
@@ -36456,10 +36453,7 @@ mod tests {
         // position at all -- real yq gives nothing for all three.
         for (filter, expected) in [
             (r#".a | ("x" | .[0:1]) | key"#, vec![]),
-            (
-                r#".a | ("x" | .[0:1]) | path"#,
-                vec![OwnedValue::Array(vec![].into())],
-            ),
+            (r#".a | ("x" | .[0:1]) | path"#, vec![OwnedValue::array()]),
             (r#".a | ("x" | .[0:1]) | parent"#, vec![]),
         ] {
             let (out, control) = drive_each_sink::<JqSemantics>(json, filter);
@@ -36495,7 +36489,7 @@ mod tests {
         let (out, control) = drive_each_sink::<JqSemantics>(json, ".a | (null | .[0:1]) | path");
         assert_eq!(
             out,
-            vec![OwnedValue::Array(vec![slice_component(0, 1)].into())]
+            vec![OwnedValue::array_from(vec![slice_component(0, 1)])]
         );
         assert!(control.is_none(), "control: {control:?}");
 
@@ -36518,7 +36512,7 @@ mod tests {
         // (`OwnedIdentityRule::Slice`'s own `S::TAG == Yq` branch) -- this
         // fix's jq-only condition must leave it unaffected.
         let (out, control) = drive_each_sink::<YqSemantics>(json, r#".a | ("x" | .[0:1]) | path"#);
-        assert_eq!(out, vec![OwnedValue::Array(vec![].into())]);
+        assert_eq!(out, vec![OwnedValue::array()]);
         assert!(control.is_none(), "control: {control:?}");
 
         // A *dynamic*-bound slice (`.[$s:$e]`, `Expr::SliceExpr`, handled by
@@ -36537,11 +36531,7 @@ mod tests {
             json,
             r#".a | (0 as $s | 1 as $e | "x" | .[$s:$e]) | path"#,
         );
-        assert_eq!(
-            out,
-            vec![OwnedValue::Array(vec![].into())],
-            "dynamic-bound slice path"
-        );
+        assert_eq!(out, vec![OwnedValue::array()], "dynamic-bound slice path");
         assert!(control.is_none(), "control: {control:?}");
 
         // The dynamic-bound arm's own attached and null carve-outs stay

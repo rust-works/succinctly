@@ -86,13 +86,13 @@ pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 /// of this exact check. Both are now thin wrappers around this one,
 /// parameterized by `max` instead of re-deriving the assertion.
 ///
-/// `#[track_caller]` (and on both wrappers below) so a panic reports the
+/// `#[cfg_attr(any(test, feature = "share-stats"), track_caller)]` (and on both wrappers below) so a panic reports the
 /// call site inside the actual `_at_depth` recursive function that
 /// overflowed, not this shared body's own line -- otherwise every one of
 /// the ~15 guarded call sites collapses to the same file:line, making a
 /// crash report impossible to attribute without a full backtrace (#1020
 /// code review).
-#[track_caller]
+#[cfg_attr(any(test, feature = "share-stats"), track_caller)]
 pub fn assert_depth(depth: usize, max: usize) {
     assert!(depth < max, "{}", nesting_depth_exceeded_message(max));
 }
@@ -113,7 +113,7 @@ pub fn nesting_depth_exceeded_message(max: usize) -> String {
 /// See that constant's own doc comment for why this exists as a second,
 /// independently-tuned ceiling alongside
 /// [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth).
-#[track_caller]
+#[cfg_attr(any(test, feature = "share-stats"), track_caller)]
 pub fn assert_value_tree_depth(depth: usize) {
     assert_depth(depth, MAX_VALUE_TREE_DEPTH);
 }
@@ -1786,6 +1786,192 @@ fn try_positive_shifted_plain(
 // sharing subtracts as code-layout bias (see `docs/guides/benchmarking.md`).
 // Measurement only; never enable it in a shipped build.
 
+/// Report a forced copy-on-write to [`share_stats`](super::share_stats),
+/// attributed to the wrapper method's caller. One spelling for every
+/// instrumented path, so the `cfg` gate cannot drift between them; expands
+/// to nothing in the shipped build, and is not defined at all under the
+/// `unshared-containers` holdout, where nothing is ever shared.
+#[cfg(not(feature = "unshared-containers"))]
+macro_rules! note_forced_copy {
+    ($kind:ident) => {
+        #[cfg(any(test, feature = "share-stats"))]
+        super::share_stats::forced(super::share_stats::Kind::$kind);
+    };
+}
+
+/// The copy-on-write bookkeeping [`ObjectMapOf`] and [`ArrayOf`] share,
+/// generated once so the two wrappers cannot drift apart in the part that
+/// matters: `new`/`with_capacity`, `is_shared`, the by-value unwrap (move
+/// when unique, clone-and-record when shared), and the traits whose body is
+/// the same for any wrapped container -- `Default`, `Clone` (a refcount
+/// bump), `PartialEq`, a transparent `Debug`, `Deref`, `DerefMut` (the
+/// copy-on-write point, `Rc::make_mut`) and `From<target>`. Everything whose
+/// shape depends on the container -- iteration, `Extend`, `FromIterator`,
+/// `take_entry`/`take_element` -- stays written out per wrapper below.
+///
+/// `unshared_from`/`unshared_into` say how the `unshared-containers` holdout
+/// wraps and unwraps its inner type (a `Box` for the map, nothing for the
+/// `Vec`, both exactly the #3000 layout).
+macro_rules! shared_container {
+    (
+        $wrapper:ident, $inner:ident, target = $target:ty,
+        into = $into:ident, on_write = $on_write:ident, on_unwrap = $on_unwrap:ident,
+        unshared_from = |$from_arg:ident| $unshared_from:expr,
+        unshared_into = |$into_arg:ident| $unshared_into:expr,
+    ) => {
+        impl<V> $wrapper<V> {
+            /// An empty container.
+            #[inline]
+            pub fn new() -> Self {
+                Self::from(<$target>::new())
+            }
+
+            /// An empty container with room for `capacity` entries.
+            #[inline]
+            pub fn with_capacity(capacity: usize) -> Self {
+                Self::from(<$target>::with_capacity(capacity))
+            }
+
+            /// Whether another handle currently shares this storage, i.e.
+            /// whether the next write through this handle will copy it.
+            ///
+            /// Always `false` under `unshared-containers`, where every clone
+            /// already copied eagerly.
+            #[inline]
+            pub fn is_shared(&self) -> bool {
+                #[cfg(not(feature = "unshared-containers"))]
+                {
+                    Rc::strong_count(&self.0) > 1
+                }
+                #[cfg(feature = "unshared-containers")]
+                {
+                    false
+                }
+            }
+        }
+
+        impl<V: Clone> $wrapper<V> {
+            /// Consume the wrapper, yielding the container it wraps -- by move
+            /// when this handle was the last one, by copy otherwise.
+            #[inline]
+            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+            pub fn $into(self) -> $target {
+                #[cfg(not(feature = "unshared-containers"))]
+                {
+                    match Rc::try_unwrap(self.0) {
+                        Ok(inner) => inner,
+                        Err(shared) => {
+                            note_forced_copy!($on_unwrap);
+                            (*shared).clone()
+                        }
+                    }
+                }
+                #[cfg(feature = "unshared-containers")]
+                {
+                    let $into_arg = self.0;
+                    $unshared_into
+                }
+            }
+        }
+
+        // Hand-written rather than derived: a derive would put a `V: Default`
+        // / `V: Clone` bound on the *container*, but an empty or cloned one
+        // needs nothing of its value type beyond what the clone itself needs.
+        // `OwnedValue` has no `Default` at all, so `#[derive(Default)]` would
+        // not even compile here.
+        impl<V> Default for $wrapper<V> {
+            #[inline]
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        /// A refcount bump in the shipped shape (the copy is deferred to the
+        /// first write through either handle); a deep copy under
+        /// `unshared-containers`.
+        impl<V: Clone> Clone for $wrapper<V> {
+            #[inline]
+            fn clone(&self) -> Self {
+                Self(self.0.clone())
+            }
+        }
+
+        impl<V: PartialEq> PartialEq for $wrapper<V> {
+            #[inline]
+            fn eq(&self, other: &Self) -> bool {
+                // Through `Deref`, not the field: the field is an `Rc` in the
+                // shipped shape and something else under `unshared-containers`.
+                **self == **other
+            }
+        }
+
+        /// Transparent, so `{:?}` on an `OwnedValue` prints the bare
+        /// container exactly as it did before the wrapper existed. A derived
+        /// `Debug` would print the wrapper's name -- a cosmetic but real
+        /// change to what a downstream `println!("{:?}", value)` shows, for a
+        /// type whose whole purpose is to be invisible.
+        impl<V: core::fmt::Debug> core::fmt::Debug for $wrapper<V> {
+            #[inline]
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                core::fmt::Debug::fmt(&**self, f)
+            }
+        }
+
+        impl<V> Deref for $wrapper<V> {
+            type Target = $target;
+
+            #[inline]
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        /// The copy-on-write point: a shared container is cloned here, once,
+        /// before the caller's write reaches it. `V: Clone` is what
+        /// `Rc::make_mut` needs and is the only bound the sharing adds
+        /// anywhere.
+        impl<V: Clone> DerefMut for $wrapper<V> {
+            #[inline]
+            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                #[cfg(not(feature = "unshared-containers"))]
+                {
+                    if Rc::strong_count(&self.0) > 1 {
+                        note_forced_copy!($on_write);
+                    }
+                    Rc::make_mut(&mut self.0)
+                }
+                #[cfg(feature = "unshared-containers")]
+                {
+                    &mut self.0
+                }
+            }
+        }
+
+        impl<V> From<$target> for $wrapper<V> {
+            #[cfg(not(feature = "unshared-containers"))]
+            #[inline]
+            fn from(inner: $target) -> Self {
+                Self(Rc::new(inner))
+            }
+
+            #[cfg(feature = "unshared-containers")]
+            #[inline]
+            fn from($from_arg: $target) -> Self {
+                Self($unshared_from)
+            }
+        }
+
+        impl<V: Clone> From<$wrapper<V>> for $target {
+            #[inline]
+            #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+            fn from(wrapper: $wrapper<V>) -> Self {
+                wrapper.$into()
+            }
+        }
+    };
+}
+
 /// The backing store for an object-valued enum arm: an
 /// `IndexMap<String, V>` held behind a single pointer (#3000), refcounted so
 /// that clones share it until one side writes (#2999).
@@ -1805,7 +1991,7 @@ fn try_positive_shifted_plain(
 ///
 /// `DerefMut` and the by-value conversions (`into_index_map`, the owned
 /// `IntoIterator`) are where a shared map is copied; both are
-/// `#[track_caller]` so [`share_stats`](super::share_stats) can name the
+/// `#[cfg_attr(any(test, feature = "share-stats"), track_caller)]` so [`share_stats`](super::share_stats) can name the
 /// line that forced it.
 ///
 /// Note for downstream users: the shape of the `OwnedValue::Object` variant
@@ -1827,167 +2013,11 @@ type ObjectMapInnerOf<V> = Rc<IndexMap<String, V>>;
 #[cfg(feature = "unshared-containers")]
 type ObjectMapInnerOf<V> = Box<IndexMap<String, V>>;
 
-impl<V> ObjectMapOf<V> {
-    /// An empty object map.
-    #[inline]
-    pub fn new() -> Self {
-        Self::from(IndexMap::new())
-    }
-
-    /// An empty object map with room for `capacity` entries.
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::from(IndexMap::with_capacity(capacity))
-    }
-
-    /// Whether another handle currently shares this map's storage, i.e.
-    /// whether the next write through this handle will copy it.
-    ///
-    /// Always `false` under `unshared-containers`, where every clone already
-    /// copied eagerly.
-    #[inline]
-    pub fn is_shared(&self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            Rc::strong_count(&self.0) > 1
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            false
-        }
-    }
-}
-
-impl<V: Clone> ObjectMapOf<V> {
-    /// Consume this map, yielding only the value at `key`: moved out when
-    /// this handle is the last one, cloned (a refcount bump for a container,
-    /// a copy for a scalar) when another handle shares the map -- never a
-    /// copy of the whole map to extract one entry (#2999).
-    ///
-    /// The unique case swap-removes, which is O(1) and safe because the map
-    /// is consumed here: nothing observes the order its siblings are left in.
-    #[inline]
-    #[track_caller]
-    pub fn take_entry(mut self, key: &str) -> Option<V> {
-        if self.is_shared() {
-            self.get(key).cloned()
-        } else {
-            self.swap_remove(key)
-        }
-    }
-
-    /// Consume this map, yielding the `IndexMap` it wraps -- by move when
-    /// this handle was the last one, by copy otherwise.
-    #[inline]
-    #[track_caller]
-    pub fn into_index_map(self) -> IndexMap<String, V> {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.0) {
-                Ok(map) => map,
-                Err(shared) => {
-                    #[cfg(any(test, feature = "share-stats"))]
-                    super::share_stats::record(super::share_stats::site(
-                        super::share_stats::Kind::ObjectUnwrap,
-                    ));
-                    (*shared).clone()
-                }
-            }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            *self.0
-        }
-    }
-}
-
-// Hand-written rather than derived: a derive would put a `V: Default` /
-// `V: Clone` bound on the *map*, but an empty or cloned map needs nothing of
-// its value type beyond what the clone itself needs. `OwnedValue` has no
-// `Default` at all, so `#[derive(Default)]` would not even compile here.
-impl<V> Default for ObjectMapOf<V> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A refcount bump in the shipped shape (the copy is deferred to the first
-/// write through either handle); a deep copy under `unshared-containers`.
-impl<V: Clone> Clone for ObjectMapOf<V> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<V: PartialEq> PartialEq for ObjectMapOf<V> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        // Through `Deref`, not the field: the field is an `Rc` in the
-        // shipped shape and a `Box` under `unshared-containers`.
-        **self == **other
-    }
-}
-
-/// Transparent, so `{:?}` on an `OwnedValue` prints `Object({...})` exactly as
-/// it did before #3000 wrapped the map. A derived `Debug` would have printed
-/// `Object(ObjectMap({...}))` -- a cosmetic but real change to what a
-/// downstream `println!("{:?}", value)` shows, for a wrapper whose whole
-/// purpose is to be invisible.
-impl<V: core::fmt::Debug> core::fmt::Debug for ObjectMapOf<V> {
-    #[inline]
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<V> Deref for ObjectMapOf<V> {
-    type Target = IndexMap<String, V>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// The copy-on-write point: a shared map is cloned here, once, before the
-/// caller's write reaches it. `V: Clone` is what `Rc::make_mut` needs and is
-/// the only bound the sharing adds anywhere.
-impl<V: Clone> DerefMut for ObjectMapOf<V> {
-    #[inline]
-    #[track_caller]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            #[cfg(any(test, feature = "share-stats"))]
-            if Rc::strong_count(&self.0) > 1 {
-                super::share_stats::record(super::share_stats::site(
-                    super::share_stats::Kind::ObjectMakeMut,
-                ));
-            }
-            Rc::make_mut(&mut self.0)
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            &mut self.0
-        }
-    }
-}
-
-impl<V> From<IndexMap<String, V>> for ObjectMapOf<V> {
-    #[inline]
-    fn from(map: IndexMap<String, V>) -> Self {
-        Self(ObjectMapInnerOf::new(map))
-    }
-}
-
-impl<V: Clone> From<ObjectMapOf<V>> for IndexMap<String, V> {
-    #[inline]
-    #[track_caller]
-    fn from(map: ObjectMapOf<V>) -> Self {
-        map.into_index_map()
-    }
+shared_container! {
+    ObjectMapOf, ObjectMapInnerOf, target = IndexMap<String, V>,
+    into = into_index_map, on_write = ObjectMakeMut, on_unwrap = ObjectUnwrap,
+    unshared_from = |map| Box::new(map),
+    unshared_into = |inner| *inner,
 }
 
 impl<V> FromIterator<(String, V)> for ObjectMapOf<V> {
@@ -1999,20 +2029,74 @@ impl<V> FromIterator<(String, V)> for ObjectMapOf<V> {
 
 impl<V: Clone> Extend<(String, V)> for ObjectMapOf<V> {
     #[inline]
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn extend<I: IntoIterator<Item = (String, V)>>(&mut self, iter: I) {
         (**self).extend(iter);
     }
 }
 
-impl<V: Clone> IntoIterator for ObjectMapOf<V> {
+/// By-value iteration over an [`ObjectMapOf`]: the map's own iterator when
+/// this handle was the last one, otherwise one pass over the shared map
+/// cloning each entry as it goes -- never a copy of the whole map first and
+/// a second pass to consume it (#2999 review).
+pub enum ObjectMapIntoIter<V> {
+    /// This handle owned the map outright.
+    Owned(indexmap::map::IntoIter<String, V>),
+    /// Another handle still shares the map; entries are cloned out in order.
+    #[cfg(not(feature = "unshared-containers"))]
+    Shared(Rc<IndexMap<String, V>>, usize),
+}
+
+impl<V: Clone> Iterator for ObjectMapIntoIter<V> {
     type Item = (String, V);
-    type IntoIter = indexmap::map::IntoIter<String, V>;
 
     #[inline]
-    #[track_caller]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(iter) => iter.next(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared(map, next) => {
+                let (k, v) = map.get_index(*next)?;
+                *next += 1;
+                Some((k.clone(), v.clone()))
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Owned(iter) => iter.size_hint(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared(map, next) => {
+                let n = map.len() - *next;
+                (n, Some(n))
+            }
+        }
+    }
+}
+
+impl<V: Clone> IntoIterator for ObjectMapOf<V> {
+    type Item = (String, V);
+    type IntoIter = ObjectMapIntoIter<V>;
+
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        self.into_index_map().into_iter()
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            match Rc::try_unwrap(self.0) {
+                Ok(map) => ObjectMapIntoIter::Owned(map.into_iter()),
+                Err(shared) => {
+                    note_forced_copy!(ObjectUnwrap);
+                    ObjectMapIntoIter::Shared(shared, 0)
+                }
+            }
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            ObjectMapIntoIter::Owned((*self.0).into_iter())
+        }
     }
 }
 
@@ -2031,7 +2115,7 @@ impl<'a, V: Clone> IntoIterator for &'a mut ObjectMapOf<V> {
     type IntoIter = indexmap::map::IterMut<'a, String, V>;
 
     #[inline]
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
         (**self).iter_mut()
     }
@@ -2076,99 +2160,11 @@ type ArrayInnerOf<V> = Rc<Vec<V>>;
 #[cfg(feature = "unshared-containers")]
 type ArrayInnerOf<V> = Vec<V>;
 
-impl<V> ArrayOf<V> {
-    /// An empty array.
-    #[inline]
-    pub fn new() -> Self {
-        Self::from(Vec::new())
-    }
-
-    /// An empty array with room for `capacity` elements.
-    #[inline]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self::from(Vec::with_capacity(capacity))
-    }
-
-    /// Whether another handle currently shares this array's storage, i.e.
-    /// whether the next write through this handle will copy it.
-    ///
-    /// Always `false` under `unshared-containers`.
-    #[inline]
-    pub fn is_shared(&self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            Rc::strong_count(&self.0) > 1
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            false
-        }
-    }
-}
-
-impl<V: Clone> ArrayOf<V> {
-    /// Consume this array, yielding only the element at `index` (`None` when
-    /// out of range): moved out when this handle is the last one, cloned when
-    /// another handle shares the array -- never a copy of the whole array to
-    /// extract one element (#2999). See [`ObjectMapOf::take_entry`].
-    #[inline]
-    #[track_caller]
-    pub fn take_element(mut self, index: usize) -> Option<V> {
-        if index >= self.len() {
-            None
-        } else if self.is_shared() {
-            Some(self[index].clone())
-        } else {
-            Some(self.swap_remove(index))
-        }
-    }
-
-    /// Consume this array, yielding the `Vec` it wraps -- by move when this
-    /// handle was the last one, by copy otherwise.
-    #[inline]
-    #[track_caller]
-    pub fn into_vec(self) -> Vec<V> {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            match Rc::try_unwrap(self.0) {
-                Ok(vec) => vec,
-                Err(shared) => {
-                    #[cfg(any(test, feature = "share-stats"))]
-                    super::share_stats::record(super::share_stats::site(
-                        super::share_stats::Kind::ArrayUnwrap,
-                    ));
-                    (*shared).clone()
-                }
-            }
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            self.0
-        }
-    }
-}
-
-impl<V> Default for ArrayOf<V> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A refcount bump in the shipped shape; a deep copy under
-/// `unshared-containers`.
-impl<V: Clone> Clone for ArrayOf<V> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<V: PartialEq> PartialEq for ArrayOf<V> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
+shared_container! {
+    ArrayOf, ArrayInnerOf, target = Vec<V>,
+    into = into_vec, on_write = ArrayMakeMut, on_unwrap = ArrayUnwrap,
+    unshared_from = |vec| vec,
+    unshared_into = |inner| inner,
 }
 
 /// An array compares equal to the bare `Vec` it wraps, in both directions,
@@ -2189,68 +2185,6 @@ impl<V: PartialEq> PartialEq<ArrayOf<V>> for Vec<V> {
     }
 }
 
-/// Transparent: `{:?}` on an `OwnedValue` prints `Array([...])`, as it always
-/// has.
-impl<V: core::fmt::Debug> core::fmt::Debug for ArrayOf<V> {
-    #[inline]
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<V> Deref for ArrayOf<V> {
-    type Target = Vec<V>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// The copy-on-write point for arrays; see [`ObjectMapOf`]'s `DerefMut`.
-impl<V: Clone> DerefMut for ArrayOf<V> {
-    #[inline]
-    #[track_caller]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        #[cfg(not(feature = "unshared-containers"))]
-        {
-            #[cfg(any(test, feature = "share-stats"))]
-            if Rc::strong_count(&self.0) > 1 {
-                super::share_stats::record(super::share_stats::site(
-                    super::share_stats::Kind::ArrayMakeMut,
-                ));
-            }
-            Rc::make_mut(&mut self.0)
-        }
-        #[cfg(feature = "unshared-containers")]
-        {
-            &mut self.0
-        }
-    }
-}
-
-impl<V> From<Vec<V>> for ArrayOf<V> {
-    #[cfg(not(feature = "unshared-containers"))]
-    #[inline]
-    fn from(vec: Vec<V>) -> Self {
-        Self(Rc::new(vec))
-    }
-
-    #[cfg(feature = "unshared-containers")]
-    #[inline]
-    fn from(vec: Vec<V>) -> Self {
-        Self(vec)
-    }
-}
-
-impl<V: Clone> From<ArrayOf<V>> for Vec<V> {
-    #[inline]
-    #[track_caller]
-    fn from(array: ArrayOf<V>) -> Self {
-        array.into_vec()
-    }
-}
-
 impl<V> FromIterator<V> for ArrayOf<V> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
@@ -2260,20 +2194,74 @@ impl<V> FromIterator<V> for ArrayOf<V> {
 
 impl<V: Clone> Extend<V> for ArrayOf<V> {
     #[inline]
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn extend<I: IntoIterator<Item = V>>(&mut self, iter: I) {
         (**self).extend(iter);
     }
 }
 
-impl<V: Clone> IntoIterator for ArrayOf<V> {
+/// By-value iteration over an [`ArrayOf`]; see [`ObjectMapIntoIter`].
+pub enum ArrayIntoIter<V> {
+    /// This handle owned the array outright.
+    Owned(alloc::vec::IntoIter<V>),
+    /// Another handle still shares the array; elements are cloned out in order.
+    #[cfg(not(feature = "unshared-containers"))]
+    Shared(Rc<Vec<V>>, usize),
+}
+
+impl<V: Clone> Iterator for ArrayIntoIter<V> {
     type Item = V;
-    type IntoIter = alloc::vec::IntoIter<V>;
 
     #[inline]
-    #[track_caller]
+    fn next(&mut self) -> Option<V> {
+        match self {
+            Self::Owned(iter) => iter.next(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared(vec, next) => {
+                let v = vec.get(*next)?;
+                *next += 1;
+                Some(v.clone())
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Owned(iter) => iter.size_hint(),
+            #[cfg(not(feature = "unshared-containers"))]
+            Self::Shared(vec, next) => {
+                let n = vec.len() - *next;
+                (n, Some(n))
+            }
+        }
+    }
+}
+
+impl<V: Clone> ExactSizeIterator for ArrayIntoIter<V> {}
+impl<V: Clone> ExactSizeIterator for ObjectMapIntoIter<V> {}
+
+impl<V: Clone> IntoIterator for ArrayOf<V> {
+    type Item = V;
+    type IntoIter = ArrayIntoIter<V>;
+
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
-        self.into_vec().into_iter()
+        #[cfg(not(feature = "unshared-containers"))]
+        {
+            match Rc::try_unwrap(self.0) {
+                Ok(vec) => ArrayIntoIter::Owned(vec.into_iter()),
+                Err(shared) => {
+                    note_forced_copy!(ArrayUnwrap);
+                    ArrayIntoIter::Shared(shared, 0)
+                }
+            }
+        }
+        #[cfg(feature = "unshared-containers")]
+        {
+            ArrayIntoIter::Owned(self.0.into_iter())
+        }
     }
 }
 
@@ -2292,7 +2280,7 @@ impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
     type IntoIter = core::slice::IterMut<'a, V>;
 
     #[inline]
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn into_iter(self) -> Self::IntoIter {
         (**self).iter_mut()
     }
@@ -2834,7 +2822,7 @@ impl OwnedValue {
     ///
     /// A copy-on-write point (#2999): on a shared array this is where the
     /// copy happens, attributed to this method's caller.
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
             Self::Array(arr) => Some(&mut **arr),
@@ -2854,7 +2842,7 @@ impl OwnedValue {
     ///
     /// A copy-on-write point (#2999): on a shared map this is where the
     /// copy happens, attributed to this method's caller.
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn as_object_mut(&mut self) -> Option<&mut IndexMap<String, Self>> {
         match self {
             Self::Object(obj) => Some(obj),
@@ -3473,7 +3461,7 @@ pub(crate) fn owned_value_eq<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -
     owned_value_eq_at_depth_generic::<S>(a, b, 0)
 }
 
-fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
+pub(crate) fn owned_value_eq_at_depth_generic<S: EvalSemantics>(
     a: &OwnedValue,
     b: &OwnedValue,
     depth: usize,
@@ -4127,6 +4115,15 @@ mod tests {
         assert!(OwnedValue::Int(1).as_object_mut().is_none());
     }
 
+    /// The array handle inside a value this test built as an array, to read
+    /// its sharing state.
+    fn as_array_vec(value: &OwnedValue) -> &ArrayVec {
+        match value {
+            OwnedValue::Array(items) => items,
+            other => panic!("built as an array: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every caller built the value as an array (#2999)"
+        }
+    }
+
     /// [`ArrayVec`] exists to be invisible in the same way (#2999): one
     /// assertion per conversion/iteration impl, since each is the only thing
     /// standing between a call site and a compile error.
@@ -4207,9 +4204,7 @@ mod tests {
         let original = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
         let (mut copy, recorded) = share_stats::measure(|| original.clone());
         assert!(recorded.is_empty(), "a clone copies nothing: {recorded:?}");
-        let OwnedValue::Array(items) = &copy else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
-        };
+        let items = as_array_vec(&copy);
         assert!(items.is_shared());
 
         let ((), recorded) = share_stats::measure(|| {
@@ -4228,9 +4223,7 @@ mod tests {
             "the other handle is untouched"
         );
         assert_eq!(copy.as_array().unwrap().len(), 3);
-        let OwnedValue::Array(items) = &copy else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
-        };
+        let items = as_array_vec(&copy);
         assert!(!items.is_shared(), "the write left both handles unique");
 
         // A second write through the now-unique handle copies nothing.
@@ -4280,35 +4273,6 @@ mod tests {
         assert_eq!(recorded.len(), 1, "{recorded:?}");
         assert_eq!(recorded[0].0.kind, Kind::ObjectUnwrap);
         assert_eq!(keep.len(), 1);
-
-        // Taking one child out of a consumed container never copies the
-        // container, shared or not -- the shared case clones the child only.
-        let nested = OwnedValue::array_from(vec![OwnedValue::Int(7), OwnedValue::Int(8)]);
-        let items = ArrayVec::from(vec![nested.clone(), OwnedValue::Int(1)]);
-        let keep = items.clone();
-        let (taken, recorded) = share_stats::measure(|| items.take_element(0));
-        assert!(recorded.is_empty(), "{recorded:?}");
-        assert_eq!(taken.as_ref(), Some(&nested));
-        let OwnedValue::Array(inner) = taken.unwrap() else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
-        };
-        assert!(inner.is_shared(), "the child is shared, not copied");
-        assert_eq!(keep.len(), 2, "the other handle still has both elements");
-        assert_eq!(keep.take_element(5), None);
-        let unique = ArrayVec::from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        assert_eq!(unique.take_element(1), Some(OwnedValue::Int(2)));
-
-        let map = ObjectMap::from(IndexMap::from([
-            ("a".to_string(), nested.clone()),
-            ("b".to_string(), OwnedValue::Int(2)),
-        ]));
-        let keep = map.clone();
-        let (taken, recorded) = share_stats::measure(|| map.take_entry("a"));
-        assert!(recorded.is_empty(), "{recorded:?}");
-        assert_eq!(taken.as_ref(), Some(&nested));
-        assert_eq!(keep.len(), 2);
-        assert_eq!(keep.clone().take_entry("zzz"), None);
-        assert_eq!(keep.take_entry("b"), Some(OwnedValue::Int(2)));
     }
 
     /// A write copies the *spine* it goes through, not the tree: writing one
@@ -4378,9 +4342,7 @@ mod tests {
         )])]);
         let (mut copy, recorded) = share_stats::measure(|| original.clone());
         assert!(recorded.is_empty());
-        let OwnedValue::Array(items) = &copy else {
-            unreachable!() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the value was built as this container a few lines above (#2999)"
-        };
+        let items = as_array_vec(&copy);
         assert!(!items.is_shared());
         let ((), recorded) = share_stats::measure(|| {
             copy.as_array_mut().unwrap()[0]
@@ -4502,7 +4464,7 @@ mod tests {
         assert!(OwnedValue::Bool(true).is_truthy());
         assert!(OwnedValue::Int(0).is_truthy()); // 0 is truthy in jq!
         assert!(OwnedValue::String(String::new()).is_truthy()); // "" is truthy in jq!
-        assert!(OwnedValue::Array(vec![].into()).is_truthy()); // [] is truthy in jq!
+        assert!(OwnedValue::array().is_truthy()); // [] is truthy in jq!
     }
 
     #[test]
@@ -4512,7 +4474,7 @@ mod tests {
         assert_eq!(OwnedValue::Int(42).type_name(), "number");
         assert_eq!(OwnedValue::Float(2.5).type_name(), "number");
         assert_eq!(OwnedValue::String(String::new()).type_name(), "string");
-        assert_eq!(OwnedValue::Array(vec![].into()).type_name(), "array");
+        assert_eq!(OwnedValue::array().type_name(), "array");
         assert_eq!(
             OwnedValue::Object(IndexMap::new().into()).type_name(),
             "object"
@@ -4525,7 +4487,7 @@ mod tests {
         assert_eq!(OwnedValue::String("hello".into()).length(), Some(5));
         assert_eq!(OwnedValue::String("héllo".into()).length(), Some(5)); // Unicode
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()).length(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]).length(),
             Some(2)
         );
         assert_eq!(OwnedValue::Bool(true).length(), None);
@@ -4545,7 +4507,7 @@ mod tests {
             "\"hello\\nworld\""
         );
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()).to_json(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]).to_json(),
             "[1,2]"
         );
     }
@@ -4632,10 +4594,10 @@ mod tests {
 
     #[test]
     fn test_collection_constructors() {
-        assert_eq!(OwnedValue::array(), OwnedValue::Array(vec![].into()));
+        assert_eq!(OwnedValue::array(), OwnedValue::array());
         assert_eq!(
             OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
         assert_eq!(
             OwnedValue::object(),
@@ -4660,7 +4622,7 @@ mod tests {
         assert!(!OwnedValue::String("1".into()).is_number());
         assert!(!OwnedValue::Bool(true).is_number());
         assert!(!OwnedValue::Null.is_number());
-        assert!(!OwnedValue::Array(vec![].into()).is_number());
+        assert!(!OwnedValue::array().is_number());
     }
 
     #[test]
@@ -4696,12 +4658,12 @@ mod tests {
 
     #[test]
     fn test_as_array_and_mut() {
-        let mut v = OwnedValue::Array(vec![OwnedValue::Int(1)].into());
+        let mut v = OwnedValue::array_from(vec![OwnedValue::Int(1)]);
         assert_eq!(v.as_array(), Some(&vec![OwnedValue::Int(1)]));
         v.as_array_mut().unwrap().push(OwnedValue::Int(2));
         assert_eq!(
             v,
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
         assert_eq!(OwnedValue::Null.as_array(), None);
         assert_eq!(OwnedValue::Null.as_array_mut(), None);
@@ -4788,12 +4750,12 @@ mod tests {
     fn test_eq_recurses_through_containers() {
         // `Vec`/`IndexMap` inherit element equality, so containers are numeric-aware too.
         assert_eq!(
-            OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
-            OwnedValue::Array(vec![OwnedValue::Float(1.0)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::array_from(vec![OwnedValue::Float(1.0)])
         );
         assert_ne!(
-            OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
-            OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+            OwnedValue::array_from(vec![OwnedValue::Float(1.0), OwnedValue::Int(2)])
         );
         assert_eq!(
             OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]),
@@ -4821,7 +4783,7 @@ mod tests {
         assert_ne!(OwnedValue::Int(0), OwnedValue::Null);
         assert_ne!(OwnedValue::Float(0.0), OwnedValue::Null);
         assert_ne!(
-            OwnedValue::Array(vec![].into()),
+            OwnedValue::array(),
             OwnedValue::Object(IndexMap::new().into())
         );
     }
@@ -6879,7 +6841,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v].into());
+            v = OwnedValue::array_from(vec![v]);
         }
         v
     }
@@ -7099,7 +7061,7 @@ mod tests {
     /// even though jq considers them equal.
     #[test]
     fn identical_recurses_and_respects_key_order_1360() {
-        let nan_arr = || OwnedValue::Array(vec![OwnedValue::Float(f64::NAN)].into());
+        let nan_arr = || OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN)]);
         assert!(nan_arr().identical(&nan_arr()));
         assert_ne!(nan_arr(), nan_arr(), "jq equality still says otherwise");
 
@@ -7138,7 +7100,7 @@ mod tests {
             OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".nan".into()),
             OwnedValue::String(String::new()),
             OwnedValue::String("s".into()),
-            OwnedValue::Array(Vec::new().into()),
+            OwnedValue::array(),
             OwnedValue::Object(indexmap::IndexMap::new().into()),
         ] {
             assert!(v.identical(&v), "not reflexive: {v:?}");

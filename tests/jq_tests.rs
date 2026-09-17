@@ -397,11 +397,11 @@ fn test_slice_array_construction_nests() {
         QueryResult::Owned(OwnedValue::Array(outer)) => {
             assert_eq!(
                 outer,
-                vec![OwnedValue::Array(vec![
+                vec![OwnedValue::array_from(vec![
                     OwnedValue::Int(1),
                     OwnedValue::Int(2),
                     OwnedValue::Int(3),
-                ].into())]
+                ])]
             );
         }
     );

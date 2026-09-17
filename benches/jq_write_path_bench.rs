@@ -196,7 +196,7 @@ fn bench_del_array(c: &mut Criterion) {
         };
         assert_eq!(
             doc.get("foo"),
-            Some(&OwnedValue::Array(Vec::new().into())),
+            Some(&OwnedValue::array()),
             "n={n}: del(.foo[]) must empty the array"
         );
 
@@ -434,7 +434,7 @@ fn bench_del_computed_key_with_trailing_iterate(c: &mut Criterion) {
             };
             assert_eq!(
                 item.get("foo"),
-                Some(&OwnedValue::Array(Vec::new().into())),
+                Some(&OwnedValue::array()),
                 "n={n}: `.items[{i}].foo` must be emptied"
             );
         }
@@ -939,7 +939,7 @@ fn expected_comma_path(i: usize, j: usize, depth: usize) -> OwnedValue {
         OwnedValue::String(format!("b{j}")),
     ];
     p.extend(core::iter::repeat(OwnedValue::String("d".into())).take(depth));
-    OwnedValue::Array(p.into())
+    OwnedValue::array_from(p)
 }
 
 /// Assert `comma_query`'s full output, then time it. Shared by the two comma
@@ -1052,7 +1052,7 @@ fn bench_path_paren_chain_ast(c: &mut Criterion) {
             expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(k));
             assert_eq!(
                 *p,
-                OwnedValue::Array(expected.into()),
+                OwnedValue::array_from(expected),
                 "k={k}: path {i} mismatch"
             );
         }
@@ -1118,7 +1118,7 @@ fn bench_path_if_fanout_ast(c: &mut Criterion) {
             let mut expected = vec![OwnedValue::String("foo".into()), OwnedValue::Int(i as i64)];
             expected.push(OwnedValue::String("b".into()));
             expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(DEPTH));
-            let expected = OwnedValue::Array(expected.into());
+            let expected = OwnedValue::array_from(expected);
             for j in 0..width {
                 assert_eq!(
                     paths[i * width + j],
@@ -1179,7 +1179,7 @@ fn bench_path_recursive_def_ast(c: &mut Criterion) {
             expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(k));
             assert_eq!(
                 *p,
-                OwnedValue::Array(expected.into()),
+                OwnedValue::array_from(expected),
                 "k={k}: path {i} mismatch"
             );
         }
@@ -1328,7 +1328,7 @@ fn bench_recurse_family_bounded(c: &mut Criterion) {
             // otherwise look identical to a correct, lazy one here.
             assert_eq!(
                 eval_one(&expr, &json),
-                OwnedValue::Array(Vec::new().into()),
+                OwnedValue::array(),
                 "{label} n={n}: path(limit(1; ...)) must answer the root path []"
             );
 

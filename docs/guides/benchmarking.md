@@ -803,6 +803,39 @@ O5 and O6) carries the full numbers.
 `scripts/ab-cli.py` implements rules 1, 2, 4 and 6 for CLI-level A/B work:
 
 ```bash
+### The never-triggering holdout build
+
+A layout or representation change moves code around, and on this codebase code
+layout alone reads ±5% on some rows (#2603, #595, #1587, #2655). An A/B of BASE
+against HEAD therefore cannot tell the change's own effect from that bias. The
+method that separates them is a third binary, the **holdout**: HEAD's own source
+with the mechanism switched off by a cargo feature, so it is functionally BASE
+but built from HEAD's code shape. Measure BASE vs HEAD and BASE vs HOLDOUT the
+same interleaved way; what the holdout reads is the bias, and the change's own
+effect is `HEAD − HOLDOUT`.
+
+Three rules make the holdout trustworthy, each learned the hard way (#3000,
+#2999):
+
+1. **Functionally BASE means every allocation BASE made and no other.** #2999's
+   first holdout held arrays behind a `Box` where BASE held an inline `Vec` --
+   one allocation more per array, a third layout, not BASE's -- and it showed
+   the regression it was supposed to isolate. Pin the holdout's shape in a test
+   (`size_of`, allocation-visible behaviour) as carefully as the shipped one.
+2. **The switch is a measurement feature, never a shipped configuration**, and
+   it is non-additive: `--all-features` builds the holdout shape. Tests that
+   prove the mechanism are gated on the shipped shape and run on CI's explicit
+   feature legs, not under `--all-features`; the second clippy leg lints the
+   shipped shape for the same reason.
+3. **Retire the switch when its measurement is recorded.** `unboxed-object-map`
+   (#3000) was replaced by `unshared-containers` (#2999) once B's numbers were in
+   the ADR; a holdout that outlives its experiment is a permanent second layout
+   for no measurement.
+
+Current switch: `unshared-containers` (the #3000 layout for `OwnedValue`'s
+containers). The `share-stats` feature is its companion for the copy audit
+(`SUCCINCTLY_SHARE_STATS=1`).
+
 # what the harness reports for a change that does not exist — run this first, once per machine
 scripts/ab-cli.py --before ./succ-base --control --corpus ~/wrk/bench-scratch/mycorpus
 

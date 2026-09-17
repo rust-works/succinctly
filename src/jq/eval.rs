@@ -384,7 +384,7 @@ use super::expr::{
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, int_to_f64,
     is_infinity_sentinel, is_nan_sentinel, jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp,
-    owned_value_eq, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -1890,6 +1890,46 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
 /// that is a lie at a third of its sites is worse than one that simply
 /// names the hazard.
 ///
+/// jq's array ordering over two element slices: lexicographic by
+/// [`compare_values_at_depth`] on the elements, then by length -- the
+/// `Array` arm of `compare_values`, factored so the sort family can order
+/// bare `Vec` keys without wrapping them (see [`collect_array_items`]).
+fn compare_slices_at_depth<S: EvalSemantics>(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+    depth: usize,
+) -> core::cmp::Ordering {
+    for (av, bv) in a.iter().zip(b.iter()) {
+        match compare_values_at_depth::<S>(av, bv, depth) {
+            core::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Order two `[f]` keys exactly as `compare_values` orders the
+/// `OwnedValue::Array`s they would have been wrapped in.
+pub(crate) fn compare_key_arrays<S: EvalSemantics>(
+    a: &[OwnedValue],
+    b: &[OwnedValue],
+) -> core::cmp::Ordering {
+    compare_slices_at_depth::<S>(a, b, 1)
+}
+
+/// jq equality of two `[f]` keys, as `owned_value_eq` would answer for the
+/// `OwnedValue::Array`s they would have been wrapped in: same length and
+/// element-wise `==` under `S`'s number rules.
+pub(crate) fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
+    // Depth 1, like `compare_key_arrays`: the elements sit where they would
+    // inside the `OwnedValue::Array` the key used to be, so both halves of
+    // the sort family count nesting against `MAX_VALUE_TREE_DEPTH` the same.
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| owned_value_eq_at_depth_generic::<S>(x, y, 1))
+}
+
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1005) — see that constant's own doc comment for why
 /// this uses a different ceiling than `eval_generic::to_owned`'s own guard
@@ -1927,7 +1967,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
             let items: Vec<OwnedValue> = (*elements)
                 .map(|e| to_owned_lossy_at_depth(&e, depth + 1))
                 .collect();
-            OwnedValue::Array(items.into())
+            OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
@@ -2065,7 +2105,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // can't, for the reason this function's own doc comment above
             // explains.
             tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
-            OwnedValue::Array(items.into())
+            OwnedValue::array_from(items)
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
@@ -2190,7 +2230,7 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
     match value {
-        StandardJson::Array(_) => Ok(OwnedValue::Array(Vec::new().into())),
+        StandardJson::Array(_) => Ok(OwnedValue::array()),
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new().into())),
         other => to_owned(other),
     }
@@ -2598,7 +2638,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StandardJson::Null | StandardJson::Number(_) | StandardJson::Bool(_)
                 if S::TAG == EvalTag::Yq =>
             {
-                QueryResult::Owned(OwnedValue::Array(Vec::new().into()))
+                QueryResult::Owned(OwnedValue::array())
             }
             // jq returns null for slice on null
             StandardJson::Null => QueryResult::One(StandardJson::Null),
@@ -3001,7 +3041,7 @@ pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<Own
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
         // Regardless of `body`: the collected array is emitted once even
         // when its own body loops zero times over the empty context.
-        Expr::Array(_) => Some(OwnedValue::Array(Vec::new().into())),
+        Expr::Array(_) => Some(OwnedValue::array()),
         Expr::Object(entries) => {
             let mut map = IndexMap::new();
             for entry in entries {
@@ -3143,7 +3183,7 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match collect_array_items::<W, S>(inner, value, optional) {
-        Ok(items) => QueryResult::Owned(OwnedValue::Array(items.into())),
+        Ok(items) => QueryResult::Owned(OwnedValue::array_from(items)),
         Err(escape) => escape,
     }
 }
@@ -3216,7 +3256,9 @@ fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// for a catch-all match arm at one of its call sites.
 ///
 /// #2182 (review): 6 call sites each spelled out this identical variant
-/// list by hand after the fix that added it, one per site -- a future
+/// list by hand after the fix that added it, one per site (down to one,
+/// `map_bracketed_over_object_fields`, since #2999 routed the sort family
+/// through `collect_array_items`) -- a future
 /// correction to the list (e.g. if `eval_array_construction` ever starts
 /// returning a variant it doesn't today) needed all 6 kept in lockstep by
 /// hand. Sharing the pattern here means there is exactly one place to
@@ -9121,7 +9163,7 @@ fn arith_sub<S: EvalSemantics>(
                 .into_iter()
                 .filter(|x| !b.iter().any(|y| owned_value_eq::<S>(x, y)))
                 .collect();
-            Ok(OwnedValue::Array(result.into()))
+            Ok(OwnedValue::array_from(result))
         }
         // Numeric subtraction -- only once both operands are confirmed
         // numeric (via the non-consuming `is_number()` peek) does this arm
@@ -9261,7 +9303,7 @@ fn arith_mul<S: EvalSemantics>(
             merge_values(OwnedValue::Object(IndexMap::new().into()), b, flags),
         ),
         (OwnedValue::Null, b @ OwnedValue::Array(_)) if S::NULL_MERGES_AS_EMPTY => {
-            Ok(merge_values(OwnedValue::Array(Vec::new().into()), b, flags))
+            Ok(merge_values(OwnedValue::array(), b, flags))
         }
         // Every other `Null`-involving pairing falls through to the
         // generic numeric/string match below, where `Null` matches none
@@ -9665,7 +9707,7 @@ fn arith_div<S: EvalSemantics>(
                     .split(&sep)
                     .map(|p| OwnedValue::String(p.to_string()))
                     .collect();
-                Ok(OwnedValue::Array(parts.into()))
+                Ok(OwnedValue::array_from(parts))
             }
             (left, right) => Err(EvalError::binary_op(&left, &right, BinOp::Divide)),
         },
@@ -9859,43 +9901,6 @@ pub(crate) fn compare_values<S: EvalSemantics>(
 /// `repeat` build up at query-evaluation time bypasses #998's
 /// document-input guards entirely: no adversarial document is involved,
 /// only enough loop iterations to grow the accumulator past the limit.
-/// jq's array ordering over two element slices: lexicographic by
-/// [`compare_values_at_depth`] on the elements, then by length -- the
-/// `Array` arm of `compare_values`, factored so the sort family can order
-/// bare `Vec` keys without wrapping them (see [`collect_array_items`]).
-fn compare_slices_at_depth<S: EvalSemantics>(
-    a: &[OwnedValue],
-    b: &[OwnedValue],
-    depth: usize,
-) -> core::cmp::Ordering {
-    for (av, bv) in a.iter().zip(b.iter()) {
-        match compare_values_at_depth::<S>(av, bv, depth) {
-            core::cmp::Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    a.len().cmp(&b.len())
-}
-
-/// Order two `[f]` keys exactly as `compare_values` orders the
-/// `OwnedValue::Array`s they would have been wrapped in.
-pub(crate) fn compare_key_arrays<S: EvalSemantics>(
-    a: &[OwnedValue],
-    b: &[OwnedValue],
-) -> core::cmp::Ordering {
-    compare_slices_at_depth::<S>(a, b, 1)
-}
-
-/// jq equality of two `[f]` keys, as `owned_value_eq` would answer for the
-/// `OwnedValue::Array`s they would have been wrapped in: same length and
-/// element-wise `==` under `S`'s number rules.
-pub(crate) fn key_arrays_eq<S: EvalSemantics>(a: &[OwnedValue], b: &[OwnedValue]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| owned_value_eq::<S>(x, y))
-}
-
 fn compare_values_at_depth<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
@@ -10590,7 +10595,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::PathNoArg => {
             // PathNoArg requires path context which is handled in eval_pipe_with_context
             // When called without context, return empty path (root position)
-            QueryResult::Owned(OwnedValue::Array(vec![].into())) // omni-dev: coverage tolerate-line reason="unreachable: every entry point supplies path context, so `path` never evaluates without one; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+            QueryResult::Owned(OwnedValue::array()) // omni-dev: coverage tolerate-line reason="unreachable: every entry point supplies path context, so `path` never evaluates without one; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
         }
         // `parent`/`parent(n)` with no path context at all is the root
         // position: there is no ancestor to return. Same #2460 rule, and the
@@ -10942,7 +10947,7 @@ fn builtin_keys<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 keys.sort();
             }
             let arr: Vec<OwnedValue> = keys.into_iter().map(OwnedValue::String).collect();
-            QueryResult::Owned(OwnedValue::Array(arr.into()))
+            QueryResult::Owned(OwnedValue::array_from(arr))
         }
         StandardJson::Array(elements) => {
             // For arrays, keys returns indices [0, 1, 2, ...]
@@ -10954,7 +10959,7 @@ fn builtin_keys<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(e) => return QueryResult::Error(e),
             };
             let arr: Vec<OwnedValue> = (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
-            QueryResult::Owned(OwnedValue::Array(arr.into()))
+            QueryResult::Owned(OwnedValue::array_from(arr))
         }
         _ => {
             // #1820: scalar_decode_failure before the optional/type-error
@@ -11436,7 +11441,7 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         }
     }
-    QueryResult::Owned(OwnedValue::Array(results.into()))
+    QueryResult::Owned(OwnedValue::array_from(results))
 }
 
 fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -11461,9 +11466,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unchanged, so no decode-check is needed here at all -- nothing
         // ever reads its content (the "uniform fix regressed content-
         // independent ops" lesson, #1820's own review).
-        StandardJson::Null if S::TAG == EvalTag::Yq => {
-            QueryResult::Owned(OwnedValue::Array(Vec::new().into()))
-        }
+        StandardJson::Null if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::array()),
         _ if S::TAG == EvalTag::Yq => QueryResult::One(value),
         _ => {
             // #1820: sibling `map_over`'s own per-element path is already
@@ -11636,7 +11639,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
             }
-            QueryResult::Owned(OwnedValue::Array(results.into()))
+            QueryResult::Owned(OwnedValue::array_from(results))
         }
         // #929: real jq defines map_values(f) via `.[] |= f`'s own `.[]`,
         // so a non-object/array input fails the same way any other bare
@@ -11647,9 +11650,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // see `builtin_map`'s identical arm above for the full rationale
         // (confirmed live for `map_values` too, v4.53.3: `5 |
         // map_values(error("boom"))` succeeds silently, `5`).
-        StandardJson::Null if S::TAG == EvalTag::Yq => {
-            QueryResult::Owned(OwnedValue::Array(Vec::new().into()))
-        }
+        StandardJson::Null if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::array()),
         _ if S::TAG == EvalTag::Yq => QueryResult::One(value),
         // #1820: scalar_decode_failure first -- same gap as builtin_map's
         // sibling fallback above.
@@ -12168,7 +12169,7 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
-        QueryResult::Error(error_ctor(&original, &OwnedValue::Array(computed.into())))
+        QueryResult::Error(error_ctor(&original, &OwnedValue::array_from(computed)))
     }
 }
 
@@ -12550,7 +12551,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             .map(|p| OwnedValue::String(p.to_string()))
                             .collect()
                     };
-                    QueryResult::Owned(OwnedValue::Array(parts.into()))
+                    QueryResult::Owned(OwnedValue::array_from(parts))
                 }
                 _ if optional => QueryResult::None,
                 _ => {
@@ -13278,11 +13279,11 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => {
             let mut items = to_owned_vec_or_suppress!(elements, optional);
             items.reverse();
-            QueryResult::Owned(OwnedValue::Array(items.into()))
+            QueryResult::Owned(OwnedValue::array_from(items))
         }
         _ if S::TAG == EvalTag::Jq => match builtin_length::<W, S>(value.clone(), optional) {
             QueryResult::Owned(len) if reverse_length_is_empty(&len) => {
-                QueryResult::Owned(OwnedValue::Array(Vec::new().into()))
+                QueryResult::Owned(OwnedValue::array())
             }
             QueryResult::Error(e) => QueryResult::Error(e),
             // `optional` already suppressed `length`'s own error.
@@ -13357,7 +13358,7 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return suppress_or_raise(e, optional),
     };
     match flatten_owned::<S>(items, depth) {
-        Ok(flattened) => QueryResult::Owned(OwnedValue::Array(flattened.into())),
+        Ok(flattened) => QueryResult::Owned(OwnedValue::array_from(flattened)),
         Err(e) => suppress_or_raise(e, optional),
     }
 }
@@ -13593,7 +13594,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                     _ => {
                         if !current_group.is_empty() {
-                            groups.push(OwnedValue::Array(current_group.into()));
+                            groups.push(OwnedValue::array_from(current_group));
                         }
                         current_group = vec![item];
                         current_key = Some(key);
@@ -13601,10 +13602,10 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
             if !current_group.is_empty() {
-                groups.push(OwnedValue::Array(current_group.into()));
+                groups.push(OwnedValue::array_from(current_group));
             }
 
-            QueryResult::Owned(OwnedValue::Array(groups.into()))
+            QueryResult::Owned(OwnedValue::array_from(groups))
         }
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #995: group_by shares min_by/max_by/unique_by's `map([f])`-pairing
@@ -13663,7 +13664,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `==`'s own yq-mode strict Int/Float distinction.
             items.dedup_by(|a, b| owned_value_eq::<S>(a, b));
 
-            QueryResult::Owned(OwnedValue::Array(items.into()))
+            QueryResult::Owned(OwnedValue::array_from(items))
         }
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #995: real jq defines `unique` as `unique_by(.)`, so it shares the
@@ -13748,7 +13749,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             keyed.dedup_by(|(a, _), (b, _)| key_arrays_eq::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
-            QueryResult::Owned(OwnedValue::Array(result.into()))
+            QueryResult::Owned(OwnedValue::array_from(result))
         }
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #929: unique_by shares min_by/max_by's `map([f])`-pairing
@@ -13786,7 +13787,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `builtin_del`'s doc comment for the shared reasoning.
             let mut items = to_owned_vec_or_suppress!(elements, optional);
             items.sort_by(compare_values::<S>);
-            QueryResult::Owned(OwnedValue::Array(items.into()))
+            QueryResult::Owned(OwnedValue::array_from(items))
         }
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
@@ -13842,7 +13843,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             keyed.sort_by(|(a, _), (b, _)| compare_key_arrays::<S>(a, b));
 
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
-            QueryResult::Owned(OwnedValue::Array(result.into()))
+            QueryResult::Owned(OwnedValue::array_from(result))
         }
         // #995: sort_by shares min_by/max_by/unique_by/group_by's
         // `map([f])`-pairing computation (see
@@ -13919,7 +13920,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 entry.insert("value".to_string(), val);
                 entries.push(OwnedValue::Object(entry.into()));
             }
-            QueryResult::Owned(OwnedValue::Array(entries.into()))
+            QueryResult::Owned(OwnedValue::array_from(entries))
         }
         StandardJson::Object(fields) => {
             // #1829: `effective_fields_checked` (`document.rs`) raises on a
@@ -13962,7 +13963,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 entry.insert("value".to_string(), val);
                 entries.push(OwnedValue::Object(entry.into()));
             }
-            QueryResult::Owned(OwnedValue::Array(entries.into()))
+            QueryResult::Owned(OwnedValue::array_from(entries))
         }
         _ => {
             // #1820: the Array/Object arms are already checked (this is
@@ -16674,7 +16675,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
     // Check for empty array
     if *pos < bytes.len() && bytes[*pos] == b']' {
         *pos += 1;
-        return Ok(OwnedValue::Array(elements.into()));
+        return Ok(OwnedValue::array_from(elements));
     }
 
     loop {
@@ -16693,7 +16694,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
         match bytes[*pos] {
             b']' => {
                 *pos += 1;
-                return Ok(OwnedValue::Array(elements.into()));
+                return Ok(OwnedValue::array_from(elements));
             }
             b',' => {
                 *pos += 1;
@@ -16859,7 +16860,7 @@ fn builtin_explode<W: Clone + AsRef<[u64]>>(
                     .chars()
                     .map(|c| OwnedValue::Int(c as u32 as i64))
                     .collect();
-                QueryResult::Owned(OwnedValue::Array(codepoints.into()))
+                QueryResult::Owned(OwnedValue::array_from(codepoints))
             }
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
@@ -17216,7 +17217,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 break;
                             }
                         }
-                        QueryResult::Owned(OwnedValue::Array(indices.into()))
+                        QueryResult::Owned(OwnedValue::array_from(indices))
                     }
                     SearchOccurrence::First => match cow.find(pattern_str.as_str()) {
                         Some(pos) => QueryResult::Owned(OwnedValue::Int(pos as i64)),
@@ -17248,7 +17249,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         indices.push(OwnedValue::Int(i as i64));
                     }
                 }
-                QueryResult::Owned(OwnedValue::Array(indices.into()))
+                QueryResult::Owned(OwnedValue::array_from(indices))
             }
             SearchOccurrence::First => {
                 for (i, elem) in (*elements).enumerate() {
@@ -17459,7 +17460,7 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
 
     let mut results = Vec::new();
     collect_stream(&owned, &mut Vec::new(), &mut results);
-    QueryResult::Owned(OwnedValue::Array(results.into()))
+    QueryResult::Owned(OwnedValue::array_from(results))
 }
 
 /// Builtin: fromjsonstream - convert from JSON text stream format (simplified)
@@ -18702,7 +18703,7 @@ fn build_match_object(
         );
         captures.push(OwnedValue::Object(cap_obj.into()));
     }
-    obj.insert("captures".to_string(), OwnedValue::Array(captures.into()));
+    obj.insert("captures".to_string(), OwnedValue::array_from(captures));
 
     OwnedValue::Object(obj.into())
 }
@@ -19903,7 +19904,7 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
                     captured.push(OwnedValue::String(m.as_str().to_string()));
                 }
             }
-            results.push(OwnedValue::Array(captured.into()));
+            results.push(OwnedValue::array_from(captured));
         } else {
             // No capture groups - return the matched string
             if let Some(m) = caps.get(0) {
@@ -20041,7 +20042,7 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
         .map(OwnedValue::String)
         .collect();
 
-    QueryResult::Owned(OwnedValue::Array(parts.into()))
+    QueryResult::Owned(OwnedValue::array_from(parts))
 }
 
 /// Builtin: splits(re; flags) - split by regex with flags as stream
@@ -22484,9 +22485,8 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
             // resolution; `.a.b[].z = error("boom")` used to still
             // evaluate the RHS either way, where real yq needs it for
             // neither).
-            const NULL: &OwnedValue = &OwnedValue::Null;
             let child = match current {
-                OwnedValue::Object(map) => Some(map.get(name).unwrap_or(NULL)),
+                OwnedValue::Object(map) => Some(map.get(name).unwrap_or(NULL_VALUE)),
                 OwnedValue::Null => Some(current),
                 _ => None,
             };
@@ -22899,7 +22899,7 @@ fn yq_del_slice_field_error(steps: &[DeleteStep], root: &OwnedValue) -> Option<E
     // established no-op precedent) and anything else fall through
     // unchanged, before ever applying a slice or walking the suffix.
     let mut sliced = match pre_slice_value {
-        OwnedValue::Null => OwnedValue::Array(Vec::new().into()),
+        OwnedValue::Null => OwnedValue::array(),
         OwnedValue::Array(_) => pre_slice_value.clone(),
         _ => return None,
     };
@@ -23056,7 +23056,7 @@ pub(crate) fn slice_owned_value_read<S: EvalSemantics>(
     optional: bool,
 ) -> Result<Option<OwnedValue>, EvalError> {
     if S::TAG == EvalTag::Yq && is_yq_slice_empty_container_scalar(target) {
-        return Ok(Some(OwnedValue::Array(Vec::new().into())));
+        return Ok(Some(OwnedValue::array()));
     }
     if let (EvalTag::Yq, OwnedValue::Object(map)) = (S::TAG, target) {
         return Ok(Some(slice_object_as_yq_children(map, start, end)));
@@ -23112,7 +23112,7 @@ fn slice_object_children_at(
             }
         })
         .collect();
-    OwnedValue::Array(children.into())
+    OwnedValue::array_from(children)
 }
 
 /// Get element at index (supports negative indexing).
@@ -25460,7 +25460,7 @@ fn autovivify_object(root: &mut OwnedValue) {
 /// Sibling of [`autovivify_object`] for an `Index` step.
 fn autovivify_array(root: &mut OwnedValue) {
     if matches!(root, OwnedValue::Null) {
-        *root = OwnedValue::Array(Vec::new().into());
+        *root = OwnedValue::array();
     }
 }
 
@@ -26640,7 +26640,7 @@ fn through_slice<E: From<EvalError>>(
         // identical mechanism accidentally correct. Left as a known,
         // unfixed gap -- see #1340's own follow-up).
         _ if scalar_noop && is_yq_slice_empty_container_scalar(root) => {
-            let mut throwaway = OwnedValue::Array(Vec::new().into());
+            let mut throwaway = OwnedValue::array();
             edit(&mut throwaway)?;
             // Always `true`: this is yq's own unconditional slice no-op
             // (unrelated to #1877/#1894's jq-only `|= empty` mechanism --
@@ -27251,7 +27251,8 @@ fn update_path<S: EvalSemantics>(
                         // in place, since a `Vec::remove` per dropped
                         // element would be quadratic.
                         let mut retained = vec_with_capacity(arr.len());
-                        for (index, mut elem) in core::mem::take(arr).into_iter().enumerate() {
+                        for (index, mut elem) in core::mem::take(&mut **arr).into_iter().enumerate()
+                        {
                             let child = pos.map(|pos| pos.child(OwnedValue::Int(index as i64)));
                             if update_path::<S>(
                                 &mut elem,
@@ -27264,7 +27265,7 @@ fn update_path<S: EvalSemantics>(
                                 retained.push(elem);
                             }
                         }
-                        *arr = retained.into();
+                        **arr = retained;
                     }
                     Ok(true)
                 }
@@ -27800,7 +27801,7 @@ fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError
             Expr::Index { idx, .. } => {
                 let mut arr = Vec::new();
                 *write_index(&mut arr, *idx)? = value;
-                OwnedValue::Array(arr.into())
+                OwnedValue::array_from(arr)
             }
             // `fresh_run_len` only ever collects `Field`/`Index` components.
             // #2549: closed by construction, not by a predicate -- the caller
@@ -37657,29 +37658,22 @@ fn drive_slice_bound<S: EvalSemantics>(
 /// key kind that can index anything at all, so a later key still resolves
 /// instead of erroring against a container it never actually saw.
 ///
-/// **Takes `value` by value, and that is load-bearing (#2058).** Each step
-/// below navigates *destructively* -- swapping the matched child out of its
-/// parent container and letting the untouched remainder drop -- rather than
-/// cloning the parent's whole remaining subtree just to read one field out of
-/// it. `OwnedValue`'s derived `Clone` is a deep clone, so the old
-/// `value.clone()`-per-step version cost, for a `d`-deep chain, O(d) at step
-/// 1, O(d-1) at step 2, ... summing to O(d^2) -- exactly the shape #1690's own
-/// depth-scaled acceptance benchmark kept reading an exponent near 2 under,
-/// even after #1690 itself removed a *different* O(d^2) one level up (see
-/// docs/optimizations/del-path-trie.md and this function's issue, #2058).
-/// Every container `current` holds at each step is exclusively owned by this
-/// call -- `resolve_static_tail`, the only caller, always hands in a fresh
-/// `.clone()` of its own borrowed input (see its call site) -- so nothing
-/// else can observe a container after this function has navigated past it,
-/// and consuming it here is safe. See [`navigate_static_component`] for the
-/// per-step logic.
+/// **Borrows `value` and walks it as [`WalkNode`]s, cloning only the value it
+/// returns.** #2058 made this walk destructive -- each step swap-removed the
+/// matched child out of a container this call owned -- because
+/// `OwnedValue::clone()` was a deep copy then, and the caller's per-step
+/// `.clone()` cost O(d^2) over a `d`-deep chain. Since #2999 a clone is a
+/// refcount bump per container, so the borrowing walk `path()` already used
+/// ([`navigate_static_component_ref`]) is the cheaper one here too: no
+/// ownership to establish, no sibling reordering to reason about, and the
+/// one clone at the end copies a scalar or bumps a container's count.
 fn value_after_components<S: EvalSemantics>(
     components: &[Expr],
-    value: OwnedValue,
+    value: &OwnedValue,
 ) -> Result<Option<OwnedValue>, EvalEscape> {
-    let mut current = value;
+    let mut current = WalkNode::Doc(value);
     for component in components {
-        current = match navigate_static_component::<S>(component, current)? {
+        current = match navigate_static_component_ref::<S>(component, &current)? {
             Some(next) => next,
             // Zero outputs here can only come from a `?`-suppressed step
             // that failed to navigate (#2124): every component reaching
@@ -37701,26 +37695,26 @@ fn value_after_components<S: EvalSemantics>(
             None => return Ok(None),
         };
     }
-    Ok(Some(current))
+    Ok(Some(current.value().clone()))
 }
 
 /// Where a bare static [`Expr::Field`]/[`Expr::Index`] component lands, as a
 /// position in the container it was resolved against (#2190).
 ///
-/// [`navigate_static_component`] (destructive, for `=`/`|=`/`del()`) and
-/// [`navigate_static_component_ref`] (borrowing, for `path()`) differ only in
-/// how they take that position *out* -- `swap_remove_index` versus
-/// `get_index`. Everything that could otherwise drift between them is decided
-/// once, in [`classify_static_component`]: the missing-key and out-of-bounds
-/// rules, the negative-index resolution, the step-through-`null` rule, and
-/// which error a container that cannot be indexed at all raises.
+/// [`navigate_static_component_ref`] is the one step function for both the
+/// `path()` walk and `value_after_components` (`=`/`|=`/`del()`; a
+/// destructive twin existed until #2999 made a clone cheap). Everything that
+/// could drift between callers is decided once, in
+/// [`classify_static_component`]: the missing-key and out-of-bounds rules,
+/// the negative-index resolution, the step-through-`null` rule, and which
+/// error a container that cannot be indexed at all raises.
 ///
 /// That is this repo's own "one definition, plus a test that the call sites
 /// agree" rule applied where a second navigator would otherwise have meant a
 /// *fourth* independent copy of jq's indexing rules -- the reason #2190's own
 /// fix-direction note called the borrowing walker blocked. The agreement
 /// test is
-/// `navigate_static_component_agrees_with_eval_owned_fast_path`.
+/// `value_after_components_agrees_with_eval_owned_fast_path_2190`.
 enum StaticAccess<'e> {
     /// The child is this key of the object `current`, if the object has it --
     /// "if" being the *extraction's* business, because that is the one place
@@ -37814,65 +37808,12 @@ fn eval_static_component_fallback<S: EvalSemantics>(
     })
 }
 
-/// One step of [`value_after_components`]'s walk (#2058), taking its value by
-/// move -- the `=`/`|=`/`del()` side.
-///
-/// A bare [`Expr::Field`]/[`Expr::Index`] -- the overwhelmingly common shape
-/// in a static tail (`.c.c.c...c[0]`) -- is navigated destructively here,
-/// through [`ObjectMapOf::take_entry`]/[`ArrayOf::take_element`]: a
-/// swap-removal (O(1), not the order-preserving `shift_remove`/`Vec::remove`)
-/// when this walk holds the container's only handle, since the container is
-/// *never read again* -- every sibling still inside it is simply dropped, in
-/// whatever order swap-removal leaves them, the moment this function returns
-/// -- and a clone of just the child when the container is shared with a
-/// document still live elsewhere (#2999). The second case is what the sharing
-/// makes necessary: the pre-#2999 form swap-removed unconditionally, which on
-/// a shared container would first copy the whole container to remove one
-/// child from it. (The borrowing twin, [`navigate_static_component_ref`],
-/// removes nothing at all and so carries no such requirement.)
-///
-/// Anything else -- [`Expr::Slice`] (jq's own array slice keeps the sliced
-/// sub-range regardless, so there is no equivalent "don't clone the sibling"
-/// move available, and it was never on [`eval_owned_fast_path`]'s fast path to
-/// begin with -- every static-tail `Slice` step already paid a full
-/// `to_json_for_reindex` + reparse round trip before this change and still
-/// does, a separate, pre-existing cost this fix does not touch),
-/// [`Expr::Optional`] (ditto: [`eval_owned_multi_keep_partial`], the only
-/// caller feeding this loop, always evaluates with `optional: false`
-/// regardless of whether `component` is `Optional`-wrapped, so a wrapped
-/// component was already falling through [`eval_owned_fast_path`]'s `_ =>
-/// None` arm to the reindex bridge before this change too), or anything
-/// unforeseen -- falls back to the pre-#2058 clone-and-reevaluate path
-/// unchanged, at the cost of one clone for that single step only.
-fn navigate_static_component<S: EvalSemantics>(
-    component: &Expr,
-    current: OwnedValue,
-) -> Result<Option<OwnedValue>, EvalEscape> {
-    Ok(Some(
-        match classify_static_component(component, &current)? {
-            // A missing key is `null`, not an error, exactly as
-            // `eval_owned_fast_path`'s own `Field` arm has it.
-            StaticAccess::Field(name) => match current {
-                OwnedValue::Object(map) => map.take_entry(name).unwrap_or(OwnedValue::Null),
-                // Unreachable: `classify_static_component` answers `Field`
-                // only for an object. `null` is what it would answer for a
-                // key that is not there anyway, so this needs no panic.
-                _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Field only for OwnedValue::Object, and it was handed this very value (#2190)"
-            },
-            StaticAccess::Index(i) => match current {
-                // `classify_static_component` answers `Index` only for an
-                // in-range index, so the `None` here is unreachable too.
-                OwnedValue::Array(items) => items.take_element(i).unwrap_or(OwnedValue::Null),
-                // Unreachable, and `null`, for the same reasons.
-                _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Index only for OwnedValue::Array, and it was handed this very value (#2190)"
-            },
-            StaticAccess::Null => OwnedValue::Null,
-            StaticAccess::Fallback => {
-                return eval_static_component_fallback::<S>(component, &current)
-            }
-        },
-    ))
-}
+/// The one `null` handed out by reference wherever a lookup misses and the
+/// caller wants a `&OwnedValue` without owning one. A `const` reference,
+/// not a `static`: since #2999 `OwnedValue` holds `Rc`s and is not `Sync`,
+/// so a `static` of it no longer compiles -- and a unit variant promotes to
+/// `'static` regardless of the type's drop glue, so no exemption is needed.
+const NULL_VALUE: &OwnedValue = &OwnedValue::Null;
 
 /// A node the `path()` walk stands on (#2190).
 ///
@@ -37909,13 +37850,6 @@ enum WalkNode<'v> {
     Null,
 }
 
-/// The `null` every [`WalkNode::Null`] hands out. A `const` reference, not a
-/// `static`: since #2999 `OwnedValue` holds `Rc`s and is not `Sync`, so a
-/// `static` of it no longer compiles -- and a unit variant needs no
-/// promotion exemption anyway, because the value itself owns nothing, only
-/// the type has drop glue.
-const WALK_NODE_NULL: &OwnedValue = &OwnedValue::Null;
-
 impl WalkNode<'_> {
     /// A value the walk built, wrapped for buffering.
     fn made(value: OwnedValue) -> Self {
@@ -37929,7 +37863,7 @@ impl WalkNode<'_> {
         match self {
             Self::Doc(value) => value,
             Self::Made(value) => value,
-            Self::Null => WALK_NODE_NULL,
+            Self::Null => NULL_VALUE,
         }
     }
 
@@ -37991,10 +37925,11 @@ fn slot_of(value: &OwnedValue, slot: usize) -> Option<&OwnedValue> {
     }
 }
 
-/// [`navigate_static_component`]'s borrowing twin -- the `path()` side (#2190).
+/// One static step of a path walk -- `path()`'s side since #2190, and
+/// `=`/`|=`/`del()`'s too since #2999 retired the destructive twin.
 ///
-/// Same rules, via the same [`classify_static_component`]; the only difference
-/// is that this one *reads* the resolved slot instead of removing it, so the
+/// Same rules, via the same [`classify_static_component`]; this one *reads*
+/// the resolved slot rather than removing it, so the
 /// document it walks is never consumed and never has to be cloned to be walked
 /// again by the next resolved branch.
 fn navigate_static_component_ref<'v, S: EvalSemantics>(
@@ -38053,7 +37988,7 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     // identical (`value` is always borrowed here, from a caller that cannot
     // hand ownership over) while removing the O(d^2) that used to live
     // inside the loop.
-    value_after_components::<S>(components, value.clone()).map_err(|e| (Vec::new(), e))
+    value_after_components::<S>(components, value).map_err(|e| (Vec::new(), e))
 }
 
 /// Apply a purely-static path tail to one branch, extending its path with
@@ -40253,13 +40188,13 @@ fn literal_shaped_expr_to_owned(expr: &Expr, depth: usize) -> Option<OwnedValue>
     match expr {
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
         Expr::Array(inner) => match inner.as_ref() {
-            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::Array(Vec::new().into())), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::array()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
             Expr::Comma(items) => {
                 let mut out = vec_with_capacity(items.len());
                 for item in items {
                     out.push(literal_shaped_expr_to_owned(item, depth + 1)?);
                 }
-                Some(OwnedValue::Array(out.into()))
+                Some(OwnedValue::array_from(out))
             }
             single => Some(OwnedValue::Array(
                 vec![literal_shaped_expr_to_owned(single, depth + 1)?].into(),
@@ -41043,7 +40978,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         QueryResult::ManyOwned(vs) => match vs.len() {
             0 => Ok(None),
             1 => Ok(Some((vs.into_iter().next().unwrap(), None))),
-            _ => Ok(Some((OwnedValue::Array(vs.into()), None))),
+            _ => Ok(Some((OwnedValue::array_from(vs), None))),
         },
         // The one behavior change from `eval_owned_expr_ctrl_full`'s own
         // slow path (#1280): `None`, not `Ok(Some((Null, None)))`.
@@ -41068,7 +41003,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
             if vs.len() == 1 {
                 Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
             } else {
-                Ok(Some((OwnedValue::Array(vs.into()), Some(control))))
+                Ok(Some((OwnedValue::array_from(vs), Some(control))))
             }
         }
     }
@@ -43736,7 +43671,7 @@ fn walk_impl_at_depth<S: EvalSemantics>(
                     return (Vec::new(), Some(control));
                 }
             }
-            OwnedValue::Array(new_arr.into())
+            OwnedValue::array_from(new_arr)
         }
         OwnedValue::Object(obj) => {
             let mut new_obj = IndexMap::with_capacity(obj.len());
@@ -44428,10 +44363,9 @@ fn walk_pipe<'v, S: EvalSemantics>(
 ///
 /// Delegates the actual navigation to [`navigate_static_component_ref`],
 /// which decides the step through the very same
-/// [`classify_static_component`] that `=`/`|=`/`del()`'s destructive
-/// [`navigate_static_component`] uses -- one definition of jq's indexing
-/// rules, two extractions (#2058, #2190), rather than a second copy of them
-/// here. `Err` is suppressed into no output under `?`, which is all `?` means
+/// [`classify_static_component`] that `=`/`|=`/`del()`'s
+/// [`value_after_components`] uses -- one definition of jq's indexing
+/// rules (#2058, #2190), rather than a second copy of them here. `Err` is suppressed into no output under `?`, which is all `?` means
 /// on a path step.
 fn step_into<'v, S: EvalSemantics>(
     step: &Expr,
@@ -44736,7 +44670,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // integer depth in practice).
             let offset = depth.as_f64().map_or(0, |f| f.max(0.0) as usize);
             let truncated = path[offset.min(path.len())..].to_vec();
-            parts[0] = OwnedValue::Array(truncated.into());
+            parts[0] = OwnedValue::array_from(truncated);
             outputs.push(OwnedValue::Array(parts));
         }
     }
@@ -46561,7 +46495,7 @@ fn delete_trie_array(
     // `null`-tolerant walk-through-absent behavior below, unchanged.
     let terminal_index_count = node.indices.len() - node.index_groups.len();
     if yq_mode && terminal_index_count <= 1 && matches!(value, OwnedValue::Null) {
-        value = OwnedValue::Array(Vec::new().into());
+        value = OwnedValue::array();
     } else if matches!(value, OwnedValue::Null) {
         // Same per-step `null` exemption as `delete_trie_object` — applies
         // to a bare index and a slice component alike (#476), and likewise
@@ -46814,10 +46748,9 @@ fn rewrite_yq_del_comma_branches(
 /// Read-only static walk through a `Field`/`Index`-only prefix (#2324's own
 /// pre-pass detection below), answering exactly what an ordinary read would:
 /// `Null` for a missing object key or an out-of-range array index, matching
-/// `navigate_static_component`'s own read semantics (that function is not
-/// reused directly because it *consumes* its input to avoid a clone on the
-/// hot `=`/`|=` path -- this caller only ever needs to peek, on the rare
-/// error-recovery path below, so borrowing is both simpler and cheaper
+/// `navigate_static_component_ref`'s own read semantics (this caller only
+/// ever needs to peek, on the rare error-recovery path below, so a bare
+/// borrow is both simpler and cheaper
 /// here). Returns `Err(())` on a genuine type mismatch -- indexing a
 /// non-container, non-null value -- so the caller can leave that case for
 /// the ordinary `resolve_del_path_branches` path to raise its own
@@ -46826,11 +46759,10 @@ fn peek_static_prefix<'a>(
     mut current: &'a OwnedValue,
     prefix: &[Expr],
 ) -> Result<&'a OwnedValue, ()> {
-    const NULL: OwnedValue = OwnedValue::Null;
     for component in prefix {
         current = match (component, current) {
-            (Expr::Field(name), OwnedValue::Object(map)) => map.get(name).unwrap_or(&NULL),
-            (Expr::Field(_), OwnedValue::Null) => &NULL,
+            (Expr::Field(name), OwnedValue::Object(map)) => map.get(name).unwrap_or(NULL_VALUE),
+            (Expr::Field(_), OwnedValue::Null) => NULL_VALUE,
             (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
@@ -46840,9 +46772,9 @@ fn peek_static_prefix<'a>(
                 usize::try_from(resolved)
                     .ok()
                     .filter(|&i| i < items.len())
-                    .map_or(&NULL, |i| &items[i])
+                    .map_or(NULL_VALUE, |i| &items[i])
             }
-            (Expr::Index { .. }, OwnedValue::Null) => &NULL,
+            (Expr::Index { .. }, OwnedValue::Null) => NULL_VALUE,
             // Anything else (a `Field`/`Index` against a scalar) is a
             // genuine type mismatch -- the caller's own prefix filter
             // (`trailing_bare_iterate_prefix`) only ever hands this
@@ -47513,7 +47445,7 @@ fn delete_at_path(
             // array to resolve the index against. Gated on `real_slot` too
             // -- see this function's own doc comment.
             if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
-                *root = OwnedValue::Array(Vec::new().into());
+                *root = OwnedValue::array();
             }
             match root {
                 OwnedValue::Array(arr) => {
@@ -47580,7 +47512,7 @@ fn delete_at_path(
             // `Array` arm below (clearing an already-empty array is itself
             // a no-op) produces exactly that. Gated on `real_slot` too.
             if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
-                *root = OwnedValue::Array(Vec::new().into());
+                *root = OwnedValue::array();
             }
             match root {
                 OwnedValue::Array(arr) => {
@@ -47985,7 +47917,7 @@ fn delete_path_steps(
                 // vivify here even though `real_slot` was true one step
                 // earlier for `.[5]` itself.
                 OwnedValue::Null if yq_mode && real_slot => {
-                    *root = OwnedValue::Array(Vec::new().into());
+                    *root = OwnedValue::array();
                     continue;
                 }
                 // Same per-step `null` exemption as the `Field` case above —
@@ -48027,7 +47959,7 @@ fn delete_path_steps(
                 // than through it. Gated on `real_slot` too -- see this
                 // function's own doc comment.
                 if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
-                    *root = OwnedValue::Array(Vec::new().into());
+                    *root = OwnedValue::array();
                 }
                 // `rest` is turned into an `Expr::Pipe` at most once here
                 // (only in yq mode, only per `Iterate` occurrence, not per
@@ -48876,7 +48808,7 @@ fn builtin_gmtime<W: Clone + AsRef<[u64]>>(
         OwnedValue::Int(t.yearday),
     ];
 
-    QueryResult::Owned(OwnedValue::Array(result.into()))
+    QueryResult::Owned(OwnedValue::array_from(result))
 }
 
 /// Convert a Unix timestamp (whole seconds, UTC) to broken-down time using
@@ -49052,7 +48984,7 @@ fn builtin_localtime<W: Clone + AsRef<[u64]>>(
             OwnedValue::Int(t.yearday),
         ];
 
-        QueryResult::Owned(OwnedValue::Array(result.into()))
+        QueryResult::Owned(OwnedValue::array_from(result))
     }
     #[cfg(not(feature = "std"))]
     {
@@ -49835,7 +49767,7 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         OwnedValue::Int(t.weekday),
                         OwnedValue::Int(t.yearday),
                     ];
-                    QueryResult::Owned(OwnedValue::Array(result.into()))
+                    QueryResult::Owned(OwnedValue::array_from(result))
                 }
                 Err(_) if optional => QueryResult::None,
                 Err(_) => QueryResult::Error(EvalError::strptime_no_match(&input, &fmt)),
@@ -50801,7 +50733,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 if doc_values.len() == 1 {
                                     QueryResult::Owned(doc_values.into_iter().next().unwrap())
                                 } else {
-                                    QueryResult::Owned(OwnedValue::Array(doc_values.into()))
+                                    QueryResult::Owned(OwnedValue::array_from(doc_values))
                                 }
                             }
                             // Documents are always wrapped in a virtual root sequence,
@@ -50894,7 +50826,7 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
                 items.push(yaml_value_to_owned_checked(elem_cursor)?);
                 elements = rest;
             }
-            OwnedValue::Array(items.into())
+            OwnedValue::array_from(items)
         }
         YamlValue::Mapping(fields) => {
             let mut map = indexmap::IndexMap::new();
@@ -51003,7 +50935,7 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
 
     // If no arrays, return empty array
     if arrays.is_empty() {
-        return QueryResult::Owned(OwnedValue::Array(Vec::new().into()));
+        return QueryResult::Owned(OwnedValue::array());
     }
 
     // Generate Cartesian product
@@ -51113,7 +51045,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // n=0 returns single empty array
     if n == 0 {
-        return QueryResult::Owned(OwnedValue::Array(Vec::new().into()));
+        return QueryResult::Owned(OwnedValue::array());
     }
 
     // If base array is empty and n > 0, return no results
@@ -51201,7 +51133,7 @@ fn mixed_radix_combinations(
 
     loop {
         let combination: Vec<OwnedValue> = (0..width).map(|i| value_at(i, indices[i])).collect();
-        results.push(OwnedValue::Array(combination.into()));
+        results.push(OwnedValue::array_from(combination));
 
         // Increment indices (like counting in mixed radix).
         let mut carry = true;
@@ -51233,7 +51165,7 @@ fn mixed_radix_combinations(
 /// generator-controlled cross products (#1669).
 fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
-        return Ok(vec![OwnedValue::Array(Vec::new().into())]); // omni-dev: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
+        return Ok(vec![OwnedValue::array()]); // omni-dev: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
     }
 
     // Guard the row width (arrays.len()) against the heaviest type that
@@ -51504,7 +51436,7 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         .map(|s| OwnedValue::String((*s).to_string()))
         .collect();
 
-    QueryResult::Owned(OwnedValue::Array(arr.into()))
+    QueryResult::Owned(OwnedValue::array_from(arr))
 }
 
 /// Builtin: normals - select only normal numbers (not zero, infinite, NaN, or subnormal)
@@ -53301,7 +53233,7 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     }
 
     if inner_arrays.is_empty() {
-        return QueryResult::Owned(OwnedValue::Array(vec![].into()));
+        return QueryResult::Owned(OwnedValue::array());
     }
 
     // Find max length
@@ -53320,10 +53252,10 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
                 row.push(val.clone());
             }
         }
-        result.push(OwnedValue::Array(row.into()));
+        result.push(OwnedValue::array_from(row));
     }
 
-    QueryResult::Owned(OwnedValue::Array(result.into()))
+    QueryResult::Owned(OwnedValue::array_from(result))
 }
 
 /// Builtin: bsearch(x) - binary search for x in sorted array
@@ -53633,7 +53565,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 // If index out of bounds, yq silently skips it
             }
-            QueryResult::Owned(OwnedValue::Array(result.into()))
+            QueryResult::Owned(OwnedValue::array_from(result))
         }
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
@@ -53782,7 +53714,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .map(|(_, v)| to_owned(v))
                 .collect::<Result<Vec<OwnedValue>, EvalError>>()
             {
-                Ok(result) => QueryResult::Owned(OwnedValue::Array(result.into())),
+                Ok(result) => QueryResult::Owned(OwnedValue::array_from(result)),
                 Err(e) => suppress_or_raise(e, optional),
             }
         }
@@ -53932,7 +53864,7 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
             // but seed from system entropy for actual randomness
             let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
             items.shuffle(&mut rng);
-            QueryResult::Owned(OwnedValue::Array(items.into()))
+            QueryResult::Owned(OwnedValue::array_from(items))
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
@@ -53976,7 +53908,7 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>>(
 
             if items.is_empty() {
                 // Empty array pivots to empty array
-                return QueryResult::Owned(OwnedValue::Array(vec![].into()));
+                return QueryResult::Owned(OwnedValue::array());
             }
 
             // Check if all elements are arrays (array-of-arrays case)
@@ -54022,7 +53954,7 @@ fn pivot_arrays<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResul
         .unwrap_or(0);
 
     if max_len == 0 {
-        return QueryResult::Owned(OwnedValue::Array(vec![].into()));
+        return QueryResult::Owned(OwnedValue::array());
     }
 
     // Build transposed array
@@ -54037,10 +53969,10 @@ fn pivot_arrays<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResul
                 column.push(OwnedValue::Null);
             }
         }
-        result.push(OwnedValue::Array(column.into()));
+        result.push(OwnedValue::array_from(column));
     }
 
-    QueryResult::Owned(OwnedValue::Array(result.into()))
+    QueryResult::Owned(OwnedValue::array_from(result))
 }
 
 /// Transpose array of objects: [{a: 1}, {a: 2, b: 3}] → {a: [1, 2], b: [null, 3]}
@@ -54068,7 +54000,7 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
                 values.push(OwnedValue::Null);
             }
         }
-        result.insert(key.clone(), OwnedValue::Array(values.into()));
+        result.insert(key.clone(), OwnedValue::array_from(values));
     }
 
     QueryResult::Owned(OwnedValue::Object(result.into()))
@@ -62049,7 +61981,7 @@ mod tests {
         );
         query!(br"[1,2]", "[recurse(.[]?; . < 2)]",
             QueryResult::Owned(OwnedValue::Array(v)) => {
-                assert_eq!(v[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()));
+                assert_eq!(v[0], OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]));
             }
         );
         query!(br"[1,2]", "walk(if type == \"number\" then .+1 else . end)",
@@ -64155,7 +64087,7 @@ mod tests {
         }
     }
 
-    /// [`navigate_static_component`]'s `Field`/`Index` arms are a *third*
+    /// [`navigate_static_component_ref`]'s `Field`/`Index` arms are a *third*
     /// independent copy of the missing-key/out-of-bounds/error-type indexing
     /// rules, alongside [`eval_owned_fast_path`]'s own arms (kept aligned only
     /// by a doc comment cross-reference, #2058 code review) and the general
@@ -64167,7 +64099,7 @@ mod tests {
     /// documented lesson ("duplicated predicates diverge silently -- one
     /// definition, plus a test that the call sites agree").
     ///
-    /// `navigate_static_component` has no `optional` parameter of its own --
+    /// `value_after_components` has no `optional` parameter of its own --
     /// every one of its callers reaches it only for a bare (non-`Optional`-
     /// wrapped) `Field`/`Index` component, so it always behaves as
     /// `eval_owned_fast_path::<S>(expr, input, false)` does. The comparison
@@ -64217,90 +64149,11 @@ mod tests {
             let fast = eval_owned_fast_path::<JqSemantics>(&expr, &input, false)
                 .expect("Field/Index are always Some from eval_owned_fast_path")
                 .map_err(EvalEscape::from);
-            let destructive = navigate_static_component::<JqSemantics>(&expr, input.clone());
+            let walked =
+                value_after_components::<JqSemantics>(core::slice::from_ref(&expr), &input);
             assert_eq!(
-                fast, destructive,
-                "navigate_static_component disagrees with eval_owned_fast_path \
-                 for {expr:?} on {input:?}"
-            );
-        }
-    }
-
-    /// #2190 pins the *other* half of the same drift risk. The two navigators
-    /// share [`classify_static_component`], so every rule they could disagree
-    /// on -- missing key, out of bounds either sign, negative-index
-    /// resolution, step through `null`, which `EvalError` a non-indexable
-    /// container raises -- has one definition and cannot drift by
-    /// construction. What is *not* shared is the extraction: `swap_remove_
-    /// index`/`Vec::swap_remove` against `get_index`/`<[_]>::get`, plus the
-    /// fallback's owned result being rewrapped as [`WalkNode::Made`]. This
-    /// pins those.
-    ///
-    /// The matrix is the sibling test's, plus the [`Expr::Slice`] rows it has
-    /// no reason to carry: `Slice` is the shape that reaches
-    /// [`eval_static_component_fallback`], and so the one case where the
-    /// borrowing navigator has to *build* its answer rather than borrow it.
-    #[test]
-    fn navigate_static_component_ref_agrees_with_navigate_static_component() {
-        let obj = || {
-            let mut m = indexmap::IndexMap::new();
-            m.insert("a".to_string(), OwnedValue::Int(1));
-            m.insert("b".to_string(), OwnedValue::Int(2));
-            OwnedValue::Object(m.into())
-        };
-        let arr = || {
-            OwnedValue::Array(
-                vec![
-                    OwnedValue::Int(10),
-                    OwnedValue::Int(20),
-                    OwnedValue::Int(30),
-                ]
-                .into(),
-            )
-        };
-        let slice = |start: Option<i64>, end: Option<i64>| Expr::Slice {
-            start,
-            end,
-            start_key: None,
-            end_key: None,
-        };
-
-        let cases: Vec<(Expr, OwnedValue)> = vec![
-            // Field: present key, missing key, on null, on a type that
-            // cannot be field-indexed at all.
-            (Expr::Field("a".to_string()), obj()),
-            (Expr::Field("missing".to_string()), obj()),
-            (Expr::Field("a".to_string()), OwnedValue::Null),
-            (Expr::Field("a".to_string()), OwnedValue::Int(5)),
-            (Expr::Field("a".to_string()), arr()),
-            // Index: in bounds, negative-from-end, out of bounds (positive
-            // and negative), on null, on a type that cannot be
-            // position-indexed at all.
-            (Expr::index(1), arr()),
-            (Expr::index(-1), arr()),
-            (Expr::index(10), arr()),
-            (Expr::index(-10), arr()),
-            (Expr::index(0), OwnedValue::Null),
-            (Expr::index(0), OwnedValue::String("x".to_string())),
-            (Expr::index(0), obj()),
-            // Slice: the `eval_static_component_fallback` rows -- a sub-range,
-            // an open bound, a clamped one, and the two non-array inputs.
-            (slice(Some(0), Some(2)), arr()),
-            (slice(Some(1), None), arr()),
-            (slice(None, Some(1)), arr()),
-            (slice(Some(0), Some(99)), arr()),
-            (slice(Some(0), Some(2)), OwnedValue::Null),
-            (slice(Some(0), Some(2)), obj()),
-        ];
-
-        for (expr, input) in cases {
-            let destructive = navigate_static_component::<JqSemantics>(&expr, input.clone());
-            let borrowing =
-                navigate_static_component_ref::<JqSemantics>(&expr, &WalkNode::Doc(&input))
-                    .map(|reached| reached.map(|node| node.value().clone()));
-            assert_eq!(
-                destructive, borrowing,
-                "navigate_static_component_ref disagrees with navigate_static_component \
+                fast, walked,
+                "value_after_components disagrees with eval_owned_fast_path \
                  for {expr:?} on {input:?}"
             );
         }
@@ -64314,7 +64167,7 @@ mod tests {
     /// slice's fabricated array is the residue the rest of the pipe walks.
     #[test]
     fn walk_node_child_borrows_the_document_and_copies_residue() {
-        let doc = OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)].into());
+        let doc = OwnedValue::array_from(vec![OwnedValue::Int(10), OwnedValue::Int(20)]);
 
         let from_doc = WalkNode::Doc(&doc).child_at(1);
         let WalkNode::Doc(child) = from_doc else {
@@ -64364,7 +64217,7 @@ mod tests {
             let mut wrapper = indexmap::IndexMap::new();
             wrapper.insert("a".to_string(), OwnedValue::Object(inner.into()));
             out.push(OwnedValue::Object(wrapper.into()));
-            out.push(OwnedValue::Array(vec![v].into()));
+            out.push(OwnedValue::array_from(vec![v]));
         }
         out
     }
@@ -64400,8 +64253,8 @@ mod tests {
             OwnedValue::String(String::new()),
             OwnedValue::String("number".to_string()),
             OwnedValue::String("x".to_string()),
-            OwnedValue::Array(Vec::new().into()),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
+            OwnedValue::array(),
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
             OwnedValue::Object(indexmap::IndexMap::new().into()),
             OwnedValue::Object(flat.into()),
             OwnedValue::Object(nested.into()),
@@ -66217,10 +66070,10 @@ mod tests {
         query!(br"[1,2,3,4,5]", r".[(0,1):(3,4)]",
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)]),
                 ]);
             }
         );
@@ -66279,8 +66132,8 @@ mod tests {
         query!(b"null", r#"([1,2],[3,4],error("x"))[(0+0):(1+0)]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(3)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(3)]),
                 ]);
                 assert_eq!(e.message, "x");
             }
@@ -66298,7 +66151,7 @@ mod tests {
     fn test_slice_expr_target_own_partial_prefix_ok_none_suppressed_by_optional_2226() {
         query!(b"null", r#"(1, [7], error("x"))[(0+0):(1+0)]?"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(vs, vec![OwnedValue::Array(vec![OwnedValue::Int(7)].into())]);
+                assert_eq!(vs, vec![OwnedValue::array_from(vec![OwnedValue::Int(7)])]);
                 assert_eq!(e.message, "x");
             }
         );
@@ -66489,7 +66342,7 @@ mod tests {
         query!(b"[10,20,30]", r#".[(1,"x",error("y")):3]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
                 ]);
                 assert!(e.message.contains("integers"), "{}", e.message);
             }
@@ -66581,7 +66434,7 @@ mod tests {
         query!(b"[10,20,30]", r#".[(1,"x",halt):3]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
                 ]);
                 assert!(e.message.contains("integers"), "{}", e.message);
             }
@@ -66602,7 +66455,7 @@ mod tests {
         query!(b"[10,20,30]", r#".[(1,"x",break $out):3]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
                 ]);
                 assert!(e.message.contains("integers"), "{}", e.message);
             }
@@ -66644,8 +66497,8 @@ mod tests {
         query!(b"[1,2,3]", r#".[(0,1,error("x")):3]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
                 ]);
                 assert_eq!(e.message, "x");
             }
@@ -66692,8 +66545,8 @@ mod tests {
         query!(b"[1,2,3]", r#".[0:(1,2,error("x"))]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(1)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
                 ]);
                 assert_eq!(e.message, "x");
             }
@@ -66884,7 +66737,7 @@ mod tests {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(
                     vs,
-                    vec![OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)].into())]
+                    vec![OwnedValue::array_from(vec![OwnedValue::Int(20), OwnedValue::Int(30)])]
                 );
                 assert!(e.message.contains("integers"), "{}", e.message);
             }
@@ -67334,7 +67187,7 @@ mod tests {
         );
         yq_query!(br#"{"a": [1, 2], "b": [3, 4]}"#, ".a *= .b",
             QueryResult::Owned(OwnedValue::Object(o)) => {
-                assert_eq!(o.get("a"), Some(&OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(4)].into())));
+                assert_eq!(o.get("a"), Some(&OwnedValue::array_from(vec![OwnedValue::Int(3), OwnedValue::Int(4)])));
             }
         );
 
@@ -67343,9 +67196,9 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(
                     o.get("a"),
-                    Some(&OwnedValue::Array(vec![
+                    Some(&OwnedValue::array_from(vec![
                         OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4),
-                    ].into()))
+                    ]))
                 );
             }
         );
@@ -67394,8 +67247,8 @@ mod tests {
             ".a *=n+ .b",
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 let OwnedValue::Object(a) = o.get("a").unwrap() else { panic!("expected object") };
-                assert_eq!(a.get("thing"), Some(&OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())));
-                assert_eq!(a.get("another"), Some(&OwnedValue::Array(vec![OwnedValue::Int(1)].into())));
+                assert_eq!(a.get("thing"), Some(&OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])));
+                assert_eq!(a.get("another"), Some(&OwnedValue::array_from(vec![OwnedValue::Int(1)])));
             }
         );
 
@@ -67405,7 +67258,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(
                     o.get("a"),
-                    Some(&OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(3)].into()))
+                    Some(&OwnedValue::array_from(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(3)]))
                 );
             }
         );
@@ -67413,7 +67266,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(
                     o.get("a"),
-                    Some(&OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(30)].into()))
+                    Some(&OwnedValue::array_from(vec![OwnedValue::Int(10), OwnedValue::Int(20), OwnedValue::Int(30)]))
                 );
             }
         );
@@ -67527,7 +67380,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(
                     o.get("a"),
-                    Some(&OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()))
+                    Some(&OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]))
                 );
             }
         );
@@ -70308,7 +70161,7 @@ mod tests {
                     ),
                 ),
                 ("c".to_string(), OwnedValue::Object(IndexMap::new().into())),
-                ("d".to_string(), OwnedValue::Array(vec![].into())),
+                ("d".to_string(), OwnedValue::array()),
             ])
             .into(),
         );
@@ -70321,7 +70174,7 @@ mod tests {
     #[test]
     fn test_to_owned_wellformed_containers_unaffected_2262() {
         for (json, expected) in [
-            (b"[]".as_slice(), OwnedValue::Array(vec![].into())),
+            (b"[]".as_slice(), OwnedValue::array()),
             (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
@@ -71757,7 +71610,7 @@ mod tests {
             OwnedValue::Int(1),
             OwnedValue::Float(1.5),
             OwnedValue::String("s".to_string()),
-            OwnedValue::Array(vec![].into()),
+            OwnedValue::array(),
             OwnedValue::Object(IndexMap::new().into()),
         ]
     }
@@ -72021,7 +71874,7 @@ mod tests {
                 assert_eq!(arr.len(), 3);
                 assert_eq!(arr[0], OwnedValue::Int(1));
                 assert_eq!(arr[1], OwnedValue::Int(2));
-                assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3)].into()));
+                assert_eq!(arr[2], OwnedValue::array_from(vec![OwnedValue::Int(3)]));
             }
         );
 
@@ -74595,10 +74448,10 @@ mod tests {
                 assert_eq!(matches.len(), 1);
                 assert_eq!(
                     matches[0],
-                    OwnedValue::Array(vec![
+                    OwnedValue::array_from(vec![
                         OwnedValue::String("a".to_string()),
                         OwnedValue::String("b".to_string()),
-                    ].into())
+                    ])
                 );
             }
         );
@@ -74609,17 +74462,17 @@ mod tests {
                 assert_eq!(matches.len(), 2);
                 assert_eq!(
                     matches[0],
-                    OwnedValue::Array(vec![
+                    OwnedValue::array_from(vec![
                         OwnedValue::String("a".to_string()),
                         OwnedValue::String("1".to_string()),
-                    ].into())
+                    ])
                 );
                 assert_eq!(
                     matches[1],
-                    OwnedValue::Array(vec![
+                    OwnedValue::array_from(vec![
                         OwnedValue::String("b".to_string()),
                         OwnedValue::String("2".to_string()),
-                    ].into())
+                    ])
                 );
             }
         );
@@ -75723,7 +75576,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(
                     vs,
-                    vec![OwnedValue::Array(vec![OwnedValue::String("xaab".to_string())].into())],
+                    vec![OwnedValue::array_from(vec![OwnedValue::String("xaab".to_string())])],
                     "jq returns [[\"x\",\"\",\"b\"]] — known gap, #922"
                 );
             }
@@ -76832,7 +76685,7 @@ mod tests {
         let bare = Expr::Array(Box::new(Expr::Literal(Literal::Int(1))));
         assert_eq!(
             literal_shaped_expr_to_owned(&bare, 0),
-            Some(OwnedValue::Array(vec![OwnedValue::Int(1)].into()))
+            Some(OwnedValue::array_from(vec![OwnedValue::Int(1)]))
         );
         let comma = Expr::Array(Box::new(Expr::Comma(vec![
             Expr::Literal(Literal::Int(1)),
@@ -78484,12 +78337,12 @@ mod tests {
             QueryResult::ManyOwned(paths) => {
                 // Should have paths: ["a"], ["b"], ["b", "c"]
                 assert_eq!(paths.len(), 3);
-                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())].into()));
-                assert_eq!(paths[1], OwnedValue::Array(vec![OwnedValue::String("b".into())].into()));
-                assert_eq!(paths[2], OwnedValue::Array(vec![
+                assert_eq!(paths[0], OwnedValue::array_from(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::array_from(vec![OwnedValue::String("b".into())]));
+                assert_eq!(paths[2], OwnedValue::array_from(vec![
                     OwnedValue::String("b".into()),
                     OwnedValue::String("c".into())
-                ].into()));
+                ]));
             }
         );
     }
@@ -78521,11 +78374,11 @@ mod tests {
             QueryResult::ManyOwned(paths) => {
                 // Should have paths: ["a"], ["b", "c"]
                 assert_eq!(paths.len(), 2);
-                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())].into()));
-                assert_eq!(paths[1], OwnedValue::Array(vec![
+                assert_eq!(paths[0], OwnedValue::array_from(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::array_from(vec![
                     OwnedValue::String("b".into()),
                     OwnedValue::String("c".into())
-                ].into()));
+                ]));
             }
         );
     }
@@ -78580,10 +78433,10 @@ mod tests {
         query!(br#"{"a":[{"b":1},{"c":[2,3]}],"d":null}"#, "[leaf_paths]",
             QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths, vec![
-                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(0), OwnedValue::String("b".into())].into()),
-                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(0)].into()),
-                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(1)].into()),
-                    OwnedValue::Array(vec![OwnedValue::String("d".into())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".into()), OwnedValue::Int(0), OwnedValue::String("b".into())]),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(0)]),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".into()), OwnedValue::Int(1), OwnedValue::String("c".into()), OwnedValue::Int(1)]),
+                    OwnedValue::array_from(vec![OwnedValue::String("d".into())]),
                 ]);
             }
         );
@@ -78598,9 +78451,9 @@ mod tests {
         query!(br#"[1,[[],{"a":2}]]"#, "[leaf_paths]",
             QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(0)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(0)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(0)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(0)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
                 ]);
             }
         );
@@ -80900,15 +80753,15 @@ mod tests {
                 assert_eq!(
                     paths,
                     vec![
-                        OwnedValue::Array(vec![
+                        OwnedValue::array_from(vec![
                             OwnedValue::String("a".into()),
                             OwnedValue::String("b".into()),
-                        ].into()),
-                        OwnedValue::Array(vec![
+                        ]),
+                        OwnedValue::array_from(vec![
                             OwnedValue::String("a".into()),
                             OwnedValue::String("c".into()),
                             OwnedValue::Int(1),
-                        ].into()),
+                        ]),
                     ]
                 );
             }
@@ -81326,8 +81179,8 @@ mod tests {
             QueryResult::ManyOwned(paths) => {
                 // Should have paths to "a" and "c" (both numbers)
                 assert_eq!(paths.len(), 2);
-                assert_eq!(paths[0], OwnedValue::Array(vec![OwnedValue::String("a".into())].into()));
-                assert_eq!(paths[1], OwnedValue::Array(vec![OwnedValue::String("c".into())].into()));
+                assert_eq!(paths[0], OwnedValue::array_from(vec![OwnedValue::String("a".into())]));
+                assert_eq!(paths[1], OwnedValue::array_from(vec![OwnedValue::String("c".into())]));
             }
         );
     }
@@ -81370,8 +81223,8 @@ mod tests {
         query!(br#"[1,[[],{"a":2}]]"#, "[paths(scalars)]",
             QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths, vec![
-                    OwnedValue::Array(vec![OwnedValue::Int(0)].into()),
-                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::Int(0)]),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(1), OwnedValue::String("a".into())]),
                 ]);
             }
         );
@@ -81384,8 +81237,8 @@ mod tests {
         query!(br#"{"a": 1, "b": "x", "c": 2.5}"#, "[paths(numbers)]",
             QueryResult::Owned(OwnedValue::Array(paths)) => {
                 assert_eq!(paths, vec![
-                    OwnedValue::Array(vec![OwnedValue::String("a".into())].into()),
-                    OwnedValue::Array(vec![OwnedValue::String("c".into())].into()),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".into())]),
+                    OwnedValue::array_from(vec![OwnedValue::String("c".into())]),
                 ]);
             }
         );
@@ -82868,11 +82721,11 @@ mod tests {
         query!(br#"{"a": [1, 2, 3]}"#, r".a[] += .a[0]",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 let arr = obj.get("a").unwrap();
-                assert_eq!(*arr, OwnedValue::Array(vec![
+                assert_eq!(*arr, OwnedValue::array_from(vec![
                     OwnedValue::Int(2),
                     OwnedValue::Int(3),
                     OwnedValue::Int(4),
-                ].into()));
+                ]));
             }
         );
     }
@@ -84241,9 +84094,9 @@ mod tests {
         let mut root = OwnedValue::Null;
         set_path::<JqSemantics>(&mut root, &Expr::index(0), OwnedValue::Int(1), false, false)
             .unwrap();
-        assert_eq!(root, OwnedValue::Array(vec![OwnedValue::Int(1)].into()));
+        assert_eq!(root, OwnedValue::array_from(vec![OwnedValue::Int(1)]));
 
-        let mut root = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into());
+        let mut root = OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
         set_path::<JqSemantics>(&mut root, &Expr::index(4), OwnedValue::Int(9), false, false)
             .unwrap();
         assert_eq!(
@@ -84502,7 +84355,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(
                     obj.get("a"),
-                    Some(&OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)].into()))
+                    Some(&OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(3)]))
                 );
             }
         );
@@ -84747,7 +84600,7 @@ mod tests {
                     vec![
                         OwnedValue::Int(1), OwnedValue::Int(2),
                         OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
-                        OwnedValue::Array(vec![].into()),
+                        OwnedValue::array(),
                     ]
                 );
             }
@@ -84891,7 +84744,7 @@ mod tests {
                     vec![
                         OwnedValue::Int(1), OwnedValue::Int(2),
                         OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
-                        OwnedValue::Array(vec![].into()),
+                        OwnedValue::array(),
                     ]
                 );
             }
@@ -88265,8 +88118,8 @@ mod tests {
         query!(br"[[1, 2], [3, 4]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)].into()));
-                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(4)].into()));
+                assert_eq!(arr[0], OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
+                assert_eq!(arr[1], OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(4)]));
             }
         );
     }
@@ -88277,9 +88130,9 @@ mod tests {
         query!(br"[[1, 2, 3], [4, 5, 6], [7, 8, 9]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 3);
-                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(4), OwnedValue::Int(7)].into()));
-                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(5), OwnedValue::Int(8)].into()));
-                assert_eq!(arr[2], OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(6), OwnedValue::Int(9)].into()));
+                assert_eq!(arr[0], OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(4), OwnedValue::Int(7)]));
+                assert_eq!(arr[1], OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Int(5), OwnedValue::Int(8)]));
+                assert_eq!(arr[2], OwnedValue::array_from(vec![OwnedValue::Int(3), OwnedValue::Int(6), OwnedValue::Int(9)]));
             }
         );
     }
@@ -88290,8 +88143,8 @@ mod tests {
         query!(br"[[1, 2], [3]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(3)].into()));
-                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Null].into()));
+                assert_eq!(arr[0], OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(3)]));
+                assert_eq!(arr[1], OwnedValue::array_from(vec![OwnedValue::Int(2), OwnedValue::Null]));
             }
         );
     }
@@ -88302,14 +88155,14 @@ mod tests {
         query!(br#"[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]"#, "pivot",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 2);
-                assert_eq!(obj.get("name"), Some(&OwnedValue::Array(vec![
+                assert_eq!(obj.get("name"), Some(&OwnedValue::array_from(vec![
                     OwnedValue::String("Alice".to_string()),
                     OwnedValue::String("Bob".to_string())
-                ].into())));
-                assert_eq!(obj.get("age"), Some(&OwnedValue::Array(vec![
+                ])));
+                assert_eq!(obj.get("age"), Some(&OwnedValue::array_from(vec![
                     OwnedValue::Int(30),
                     OwnedValue::Int(25)
-                ].into())));
+                ])));
             }
         );
     }
@@ -88320,14 +88173,14 @@ mod tests {
         query!(br#"[{"a": 1}, {"a": 2, "b": 3}]"#, "pivot",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 2);
-                assert_eq!(obj.get("a"), Some(&OwnedValue::Array(vec![
+                assert_eq!(obj.get("a"), Some(&OwnedValue::array_from(vec![
                     OwnedValue::Int(1),
                     OwnedValue::Int(2)
-                ].into())));
-                assert_eq!(obj.get("b"), Some(&OwnedValue::Array(vec![
+                ])));
+                assert_eq!(obj.get("b"), Some(&OwnedValue::array_from(vec![
                     OwnedValue::Null,
                     OwnedValue::Int(3)
-                ].into())));
+                ])));
             }
         );
     }
@@ -88411,8 +88264,8 @@ mod tests {
         query!(br"[[1, 2], [3, 4]]", "pivot | pivot",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
-                assert_eq!(arr[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()));
-                assert_eq!(arr[1], OwnedValue::Array(vec![OwnedValue::Int(3), OwnedValue::Int(4)].into()));
+                assert_eq!(arr[0], OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]));
+                assert_eq!(arr[1], OwnedValue::array_from(vec![OwnedValue::Int(3), OwnedValue::Int(4)]));
             }
         );
     }
@@ -91583,7 +91436,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v].into());
+            v = OwnedValue::array_from(vec![v]);
         }
         v
     }
@@ -92629,7 +92482,7 @@ mod tests {
         assert_tag_agrees!(b"1", OwnedValue::Int(1));
         assert_tag_agrees!(b"1.5", OwnedValue::Float(1.5));
         assert_tag_agrees!(b"\"a\"", OwnedValue::String("a".to_string()));
-        assert_tag_agrees!(b"[1]", OwnedValue::Array(vec![OwnedValue::Int(1)].into()));
+        assert_tag_agrees!(b"[1]", OwnedValue::array_from(vec![OwnedValue::Int(1)]));
         assert_tag_agrees!(b"{}", OwnedValue::Object(IndexMap::new().into()));
     }
 
@@ -97520,6 +97373,25 @@ mod share_audit_2999 {
     #[test]
     fn streaming_multi_path_write_copies_the_spine_once() {
         assert_forced(&ints(1000), ".[(0,1)] = 0", &[(Kind::ArrayMakeMut, 1)]);
+        // The attribution pin: `#[track_caller]` must reach through the
+        // wrapper and the accessor to the write site in *this* file, or the
+        // audit collapses to one useless `value.rs` row.
+        let json = ints(10);
+        let index = JsonIndex::build(&json);
+        let cursor = index.root(&json);
+        let expr = parse(".[(0,1)] = 0").unwrap();
+        let ((), recorded) = share_stats::measure(|| {
+            drop(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+        });
+        assert!(!recorded.is_empty());
+        for (site, _) in &recorded {
+            assert!(
+                site.file.ends_with("src/jq/eval.rs"),
+                "forced copy attributed to {}:{} rather than the write site in eval.rs",
+                site.file,
+                site.line
+            );
+        }
     }
 
     /// Nested: the array copy is 1,000 *handles* (a refcount bump each), and

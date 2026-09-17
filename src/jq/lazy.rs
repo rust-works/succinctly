@@ -875,7 +875,7 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
-    Ok(OwnedValue::Array(keys.into()))
+    Ok(OwnedValue::array_from(keys))
 }
 
 /// Materialize a `JqValue::LazyIndexRange` into the `[0, 1, ..., len-1]`
@@ -1489,7 +1489,7 @@ mod tests {
         use crate::json::JsonIndex;
 
         for (json, expected) in [
-            (b"[]".as_slice(), OwnedValue::Array(vec![].into())),
+            (b"[]".as_slice(), OwnedValue::array()),
             (b"{}".as_slice(), OwnedValue::Object(IndexMap::new().into())),
             (
                 b"[1,2,3]".as_slice(),
@@ -1624,7 +1624,7 @@ mod tests {
         let arr: JqValue<'_, Vec<u64>> = JqValue::Array(vec![JqValue::Int(1), JqValue::Int(2)]);
         assert_eq!(
             arr.into_owned().unwrap(),
-            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)].into())
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
         );
     }
 
@@ -1710,10 +1710,7 @@ mod tests {
     #[test]
     fn test_jqvalue_lazy_index_range_materialize_and_into_owned() {
         let empty: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(0);
-        assert_eq!(
-            empty.materialize().unwrap(),
-            OwnedValue::Array(vec![].into())
-        );
+        assert_eq!(empty.materialize().unwrap(), OwnedValue::array());
 
         let three: JqValue<'_, Vec<u64>> = JqValue::LazyIndexRange(3);
         assert_eq!(
@@ -2002,7 +1999,7 @@ mod tests {
     fn linear_owned_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v].into());
+            v = OwnedValue::array_from(vec![v]);
         }
         v
     }
@@ -2140,7 +2137,7 @@ mod tests {
         };
         assert_eq!(
             lazy_keys_array_to_owned(&fields, true).expect("preserved, not raised (#1642)"),
-            OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())].into())
+            OwnedValue::array_from(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
         );
     }
 
