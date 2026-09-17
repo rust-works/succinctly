@@ -50923,23 +50923,33 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
 /// #2219 retargeted this test's expectation: two `i64` literals only 50
 /// apart at `~2^63` magnitude round to the *same* `f64` once real jq parses
 /// them (its own unary minus collapses a literal this large to a `double`
-/// before `range` ever sees it -- an unrelated, already-documented
-/// divergence, `docs/compliance/jq/limitations.md`'s #2357 section), so
-/// real jq's `while(. > $upto; . + $by)` never even emits its own starting
+/// before `range` ever sees it -- an unrelated divergence, tracked at the
+/// time in `docs/compliance/jq/limitations.md`'s #2357 section), so real
+/// jq's `while(. > $upto; . + $by)` never even emits its own starting
 /// value -- confirmed live against the pinned jq 1.7.1 oracle (empty
-/// output, exit 0). succinctly no longer matches that by coincidence: since
-/// #2219, an overflowing `checked_add` ends the loop and keeps whatever was
-/// already pushed (here, the exact `from` value) instead of discarding it
-/// for an `f64` recomputation, so succinctly's own answer is the one exact
-/// value real jq's literal-collapse quirk prevents it from ever seeing.
+/// output, exit 0). succinctly no longer matched that by coincidence:
+/// since #2219, an overflowing `checked_add` ends the loop and keeps
+/// whatever was already pushed (here, the exact `from` value) instead of
+/// discarding it for an `f64` recomputation.
+///
+/// #3044 closed that #2357 divergence: a bare negative literal this large
+/// is now *also* a computed double in succinctly's own filter text, same
+/// as real jq, so `range(-9223372036854775758; ...)` written directly no
+/// longer reaches this fast path at all -- both tools now agree on empty
+/// output for that exact spelling (pinned in
+/// `test_unary_minus_matches_jq_past_2_53_3044`). This test still needs to
+/// exercise `eval_range_values`'s own overflow-safety fix, so it sources
+/// the same magnitudes from **data** instead (`.[0]`/`.[1]`/`.[2]`, which
+/// both tools keep exact, unaffected by #3044) to still reach `range` with
+/// exact `Int` bounds.
 #[test]
-fn test_range_i64_overflow_keeps_exact_prefix_diverging_from_jq_2219() -> Result<()> {
+fn test_range_i64_overflow_keeps_exact_prefix_2219() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
-            "-nc",
-            "range(-9223372036854775758; -9223372036854775808; -100)",
+            "-c",
+            ".[0] as $from | .[1] as $to | .[2] as $step | range($from; $to; $step)",
         ],
-        None,
+        Some("[-9223372036854775758, -9223372036854775808, -100]"),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(
@@ -50949,26 +50959,44 @@ fn test_range_i64_overflow_keeps_exact_prefix_diverging_from_jq_2219() -> Result
     Ok(())
 }
 
-/// #2357: real jq's unary minus destroys literal preservation above `2^53`
-/// (the operand becomes a computed `double`, not a preserved literal),
-/// where succinctly keeps the exact value -- accepted as a deliberate
-/// divergence (ADR-0018 rule 4c, `docs/compliance/jq/limitations.md`'s
-/// "Unary minus in filter text destroys literal preservation" section), for
-/// the same reason succinctly stays exact everywhere else above `2^53`
-/// rather than matching jq's `double`/`decNumber` model one operator at a
-/// time. `-1.10` is the magnitude-specific control: below `2^53`, `double`
-/// holds the value exactly either way, so the two tools still agree.
+/// #2357/#3044: real jq's unary minus destroys literal preservation above
+/// `2^53` (the operand becomes a computed `double`, not a preserved
+/// literal) -- previously accepted as a deliberate divergence (ADR-0018
+/// rule 4c) on the premise that matching would "reintroduce... silently
+/// degrading large-but-safe integers to `f64`" for this operator alone,
+/// when every other operator kept the exact value. #3044 found that
+/// premise false: binary `-`/`+`/`*` have rounded past `2^53` since
+/// #2631/#2906, so unary minus was the one remaining holdout, not a
+/// consistent exception. Fixed by routing a literal-adjacent `-` through
+/// the same `-1 * <literal>` split the float/exponent case already used
+/// (`parser.rs`) and closing the same gap in `arith_negate` for the
+/// parenthesized/piped spellings (`eval.rs`). `-1.10` is the
+/// magnitude-specific control: below `2^53`, `double` holds the value
+/// exactly either way, so this was never observable there.
 #[test]
-fn test_unary_minus_destroys_literal_preservation_2357() -> Result<()> {
+fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
     for (filter, want) in [
-        ("-9223372036854775758", "-9223372036854775758"),
-        ("-9007199254740993", "-9007199254740993"),
+        ("-9223372036854775758", "-9223372036854776000"),
+        ("-9007199254740993", "-9007199254740992"),
+        ("-(9223372036854775758)", "-9223372036854776000"),
+        ("9223372036854775758 | -.", "-9223372036854776000"),
+        ("-9223372036854775808", "-9223372036854776000"), // i64::MIN
         ("-1.10", "-1.1"),
+        ("-123", "-123"), // below 2^53: unaffected, still exact
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
         assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), want, "for filter {filter:?}");
     }
+
+    // The identical magnitude arriving as *data* keeps its exact spelling
+    // in both tools -- unaffected by this fix, and the reason the fix
+    // above is scoped to the parser's literal-negation fold rather than
+    // the data-decoding path.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "--", ".[0]"], Some("[-9223372036854775758]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "-9223372036854775758");
     Ok(())
 }
 
@@ -58432,8 +58460,9 @@ fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()>
 
 /// #2906: document input, `--argjson`, and the generic (stdin) evaluator
 /// reach the same arithmetic as `-n` program literals, including a
-/// negative literal arriving as data (unaffected by the separate #2357
-/// unary-minus divergence). Captured live against `/usr/bin/jq` 1.7.1.
+/// negative literal arriving as data (unaffected by the separate, now-fixed
+/// #2357/#3044 filter-text unary-minus question). Captured live against
+/// `/usr/bin/jq` 1.7.1.
 #[test]
 fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Result<()> {
     let (output, code) = run_jq_stdin(". + 944331", "869389897822472004", &["-c"])?;
@@ -58471,9 +58500,10 @@ fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Resul
 /// #2906 must-not-regress companion: a literal that is only *displayed*
 /// keeps its exact spelling, 17-or-fewer-digit literals are unchanged (the
 /// rounding is the identity below 10^17), genuine `i64` overflow still goes
-/// through the pre-existing float path, and the #2357 unary-minus
-/// divergence (succinctly keeps the exact value) is untouched. jq's answers
-/// captured live against `/usr/bin/jq` 1.7.1 except where noted.
+/// through the pre-existing float path, and (#3044, superseding the former
+/// #2357 divergence this row used to pin the opposite way) a negative
+/// literal past `2^53` now rounds the same as every other operator. jq's
+/// answers captured live against `/usr/bin/jq` 1.7.1 except where noted.
 #[test]
 fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() -> Result<()> {
     for (filter, want) in [
@@ -58488,10 +58518,7 @@ fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() ->
             "9223372036854775807 + 9223372036854775807",
             "18446744073709552000",
         ),
-        // #2357: real jq prints -869389897822472000 here; succinctly's
-        // documented divergence keeps the exact literal, and this fix must
-        // not change that (see `docs/compliance/jq/limitations.md`).
-        ("0 | -869389897822472004", "-869389897822472004"),
+        ("0 | -869389897822472004", "-869389897822472000"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
