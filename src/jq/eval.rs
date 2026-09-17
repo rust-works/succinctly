@@ -15129,10 +15129,18 @@ fn format_csv_row_element<S: EvalSemantics>(
         // `test_yq_at_csv_special_floats_use_yaml_spelling_1060` caught an
         // earlier, unconditional version of this arm regressing it.
         OwnedValue::Float(f) if S::TAG != EvalTag::Yq && f.is_nan() => Ok(String::new()),
+        // Defensive: `OwnedValue::from_number_bytes`'s `bridge_nonfinite_from_bytes`
+        // check intercepts every NaN/infinity sentinel spelling and returns
+        // a bare `Float` before the `NumberLiteral`-producing branch is
+        // ever reached, so a NaN wrapped in `NumberLiteral` has no known
+        // producer through ordinary parsing -- confirmed live (a
+        // document-sourced `NaN` decodes as the bare `Float` arm above,
+        // not this one). Kept for defense in depth: this arm's own
+        // behavior is correct if a future code path ever does construct one.
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _)
             if S::TAG != EvalTag::Yq && f.is_nan() =>
         {
-            Ok(String::new())
+            Ok(String::new()) // omni-dev: coverage tolerate-line reason="no known producer of NumberLiteral(Float(NaN)) through ordinary parsing -- see the arm's own doc comment (#3070)"
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => Err(EvalError::not_valid_in_csv_row(v)),
         other => Ok(owned_to_string::<S>(other)),
@@ -72900,8 +72908,9 @@ mod tests {
             }
         );
         // A document-sourced NaN (succinctly's own lenient JSON `NaN`
-        // spelling, #2877) decodes as a NumberLiteral, not the nan
-        // builtin's bare Float above -- both arms must catch it.
+        // spelling, #2877) works too -- confirmed it decodes as the same
+        // bare `Float` the `nan` builtin produces, not a `NumberLiteral`
+        // (see that arm's own doc comment on `format_csv_row_element`).
         query!(b"[NaN,1]", "@csv",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, ",1");
