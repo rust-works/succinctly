@@ -1276,6 +1276,20 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // could still reach it.
         OwnedValue::Int(i)
     } else if let Some(f) = value.as_f64() {
+        // #2877: a lenient span with no preservable literal that still
+        // reads as a *non-finite* number is one of jq's decNumber words
+        // (`nan`, `NaN5`, `Infinity`, `-inf`), which `succinctly jq` now
+        // admits and real yq's JSON decoder does not (`json: invalid
+        // character a as null`, v4.53.3) -- and this materializer has
+        // nowhere to put one anyway (a YAML `.nan`/`.inf` real yq then
+        // cannot read back). Refused here, at the arm the words reach,
+        // rather than by widening the JSON dispatchers' own mode-less
+        // decision. A finite one (`+1`, `+.5`) is admitted, like the `007`
+        // and `.5` this path already takes. An overflowing *literal*
+        // (`1e400`) is the `number_literal` arm above and unchanged.
+        if !f.is_finite() {
+            return Err(EvalError::decode_failure("not a JSON number"));
+        }
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned())
@@ -5562,11 +5576,17 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 ///
 /// The acceptance half of `parse_json_value`'s overflow rule above: an
 /// `f64` that came from a literal is non-finite only if that literal
-/// overflowed, since the validator has already refused the `Infinity`
-/// spelling itself (#2877). Checked over the materialized value rather than
-/// the source text because the overflow is a property of the conversion,
-/// not of the spelling -- `1e400`, `-1e400` and `1e400000000000` are all
-/// different texts and one outcome.
+/// overflowed. jq's own non-finite spellings (`nan`, `NaN5`, `Infinity`,
+/// `-inf`), which the shared lenient validator admits since #2877, never
+/// get this far -- `to_owned_canonicalizing_numbers_at_depth` refuses them
+/// at the arm they reach, so this stays the overflow check it was. A
+/// leading `+` (`+1`) is finite and *is* admitted, consistent with the
+/// `007`/`.5` this flag already takes under #2052's `-p json` mirroring
+/// convention; real yq has no `--argjson` at all, so there is no oracle
+/// either way. Checked over the materialized value rather than the source
+/// text because the overflow is a property of the conversion, not of the
+/// spelling -- `1e400`, `-1e400` and `1e400000000000` are all different
+/// texts and one outcome.
 fn has_non_finite_number(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Float(f) => !f.is_finite(),

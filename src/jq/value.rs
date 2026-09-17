@@ -2250,6 +2250,43 @@ impl OwnedValue {
         if crate::json::validate::has_trailing_dot_before_exponent(base) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
+        // decNumber's special values (#2877): `nan`, `sNaN12`, `-Infinity`,
+        // `+inf`, ... are real `f64` values in jq 1.7.1 -- `type` is
+        // `"number"`, `isnan`/`isinfinite` answer `true`, and only the
+        // *printer* renders them as `null`/the `DBL_MAX` text -- which is
+        // exactly what a bare `Float` already is here (`nan`/`infinite`, the
+        // builtins, produce the same values and print identically). A
+        // `NumberLiteral` carrying the word would instead make
+        // `format_number_jq_compat` echo a bare `nan`, which is not a
+        // number in either output language.
+        //
+        // After the bridge-token checks above, never before them: those
+        // tokens are drawn from `[0-9.eE+-]` and this grammar is letters,
+        // so the two can't collide, but the ordering rule is what every
+        // future interception in this function inherits (#1083/#2902).
+        if let Some(f) = crate::json::validate::jq_special_number(bytes) {
+            return Self::Float(f);
+        }
+        // A leading `+` (#2877): `+X` behaves exactly like `X` in jq, and
+        // the stored literal is the *unsigned* text (`+1.500` -> `1.500`,
+        // see `strip_leading_plus`). The peel re-runs the strict grammar
+        // and the three lenient escapes above on the unsigned text -- and
+        // *only* those. It deliberately does not recurse through this
+        // function's own entry, so the bridge-token checks at the top are
+        // never reached with a peeled token: `+9e999e999` and `+1e0e0` are
+        // user text, and must fall through to the lossy fallback below
+        // (`Null`, as `[+1.2.3]` does) rather than decode as NaN or a
+        // computed float. `strip_leading_plus` only peels before a digit
+        // or `.`, so a `+nan` was already `jq_special_number`'s above and
+        // a doubled sign (`+-1`) stays out. `is_preservable_number_literal`
+        // names the four gates above exactly, so the two spellings cannot
+        // drift.
+        if let Some(unsigned) = crate::json::validate::strip_leading_plus(bytes) {
+            if crate::json::validate::is_preservable_number_literal(unsigned) {
+                return core::str::from_utf8(unsigned)
+                    .map_or(Self::Null, Self::from_number_literal);
+            }
+        }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };
@@ -2493,6 +2530,50 @@ impl OwnedValue {
             format_number_jq_compat,
             jq_bare_float_display,
             infinite_float_preview_text,
+            "null",
+        )
+    }
+
+    /// [`to_json`](Self::to_json) for a value that is about to be **re-read
+    /// as a document** rather than printed: identical, except a bare
+    /// non-finite `Float` is written as the reindex bridge's own tokens
+    /// (`NAN_SENTINEL`, [`overflow_literal`]) instead of the `null`/`DBL_MAX`
+    /// text jq's printer substitutes (#2877).
+    ///
+    /// Used by the materializing input path (`jq_runner.rs`'s
+    /// `evaluate_input_streaming`, behind `--slurp` and `--seq`), which
+    /// serializes each already-decoded input value and indexes the text
+    /// again for the cursor evaluator. Until #2877 no JSON input could put
+    /// a bare NaN or infinity into that value -- every document number was
+    /// a `NumberLiteral` or degraded to `null` -- so `to_json`'s printer
+    /// substitutions were never a round-trip concern there. A document
+    /// `nan` is a real number in jq (`type` is `"number"`, `isnan` is
+    /// `true`), and through `to_json` it came back as an actual `null`;
+    /// `Infinity` came back as the *literal* `1.7976931348623157e+308`,
+    /// which the final formatter then spelled `…E+308` where jq, printing
+    /// a computed infinity, writes `…e+308`. `from_number_bytes` and
+    /// `JsonNumber::as_f64` already decode both tokens back to the bare
+    /// `Float`, so every reader downstream sees what `input`/`inputs` (which
+    /// never round-trip) already saw.
+    ///
+    /// Not [`to_json_for_reindex`](Self::to_json_for_reindex): that one
+    /// caps a preserved literal at 256 bytes and falls back to a bounded
+    /// rendering, a trade made for `reduce`/`foreach`'s per-iteration reuse
+    /// that would silently drop the spelling of a long `--slurp`ed literal.
+    /// This path serializes once per input and keeps `to_json`'s
+    /// unbounded literal rendering.
+    ///
+    /// `--preserve-input`'s sibling [`to_json_jq_preserve`](Self::to_json_jq_preserve)
+    /// deliberately keeps the printer's `null`: under that convention the
+    /// final printer echoes a number's raw bytes verbatim, and a sentinel
+    /// would come out as `9e999e999`.
+    pub fn to_json_input_bridge(&self) -> String {
+        self.to_json_at_depth(
+            0,
+            format_number_jq_compat,
+            jq_bare_float_display,
+            overflow_literal_text,
+            NAN_SENTINEL,
         )
     }
 
@@ -2516,6 +2597,7 @@ impl OwnedValue {
             crate::jq::stream::real_output_finite_literal,
             jq_bare_float_display,
             infinite_float_preview_text,
+            "null",
         )
     }
 
@@ -2565,6 +2647,7 @@ impl OwnedValue {
             crate::jq::stream::real_output_finite_literal,
             crate::yaml::format_float_yq,
             yq_infinite_float_json_text,
+            "null",
         )
     }
 
@@ -2593,6 +2676,7 @@ impl OwnedValue {
         finite_literal: fn(&[u8]) -> String,
         float_fmt: fn(f64) -> String,
         infinite_fmt: fn(bool) -> &'static str,
+        nan_text: &'static str,
     ) -> String {
         assert_value_tree_depth(depth);
         match self {
@@ -2602,7 +2686,9 @@ impl OwnedValue {
             Self::Int(n) => format!("{n}"),
             Self::Float(f) => {
                 if f.is_nan() {
-                    "null".into() // JSON doesn't support NaN
+                    // JSON doesn't support NaN: `"null"` for output, the
+                    // bridge token for `to_json_input_bridge` (#2877).
+                    nan_text.into()
                 } else if f.is_infinite() {
                     infinite_fmt(f.is_sign_negative()).into()
                 } else {
@@ -2631,7 +2717,15 @@ impl OwnedValue {
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
-                    .map(|v| v.to_json_at_depth(depth + 1, finite_literal, float_fmt, infinite_fmt))
+                    .map(|v| {
+                        v.to_json_at_depth(
+                            depth + 1,
+                            finite_literal,
+                            float_fmt,
+                            infinite_fmt,
+                            nan_text,
+                        )
+                    })
                     .collect();
                 format!("[{}]", elements.join(","))
             }
@@ -2642,7 +2736,13 @@ impl OwnedValue {
                         format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_at_depth(depth + 1, finite_literal, float_fmt, infinite_fmt)
+                            v.to_json_at_depth(
+                                depth + 1,
+                                finite_literal,
+                                float_fmt,
+                                infinite_fmt,
+                                nan_text
+                            )
                         )
                     })
                     .collect();
@@ -2796,14 +2896,16 @@ impl OwnedValue {
             // display spelling -- see that function's doc for why the token
             // is unparseable as an ordinary number. Same in both modes; the
             // spelling is re-derived from the `f64` downstream, per mode.
-            // `infinite_fmt` is unreachable from here -- every NaN/infinite
-            // case is already handled by the arms above, before this
-            // fallback -- so which one is passed only matters for reading.
+            // `infinite_fmt` and `nan_text` are unreachable from here --
+            // every NaN/infinite case is already handled by the arms above,
+            // before this fallback -- so which are passed only matters for
+            // reading.
             other => other.to_json_at_depth(
                 depth,
                 format_number_jq_compat,
                 crate::json::validate::computed_float_token,
                 infinite_float_preview_text,
+                "null",
             ),
         }
     }
@@ -2851,7 +2953,14 @@ pub(crate) fn is_infinity_sentinel(bytes: &[u8]) -> Option<bool> {
 /// why a guaranteed-unparseable (rather than naturally-overflowing)
 /// spelling is what makes this safe.
 fn overflow_literal(f: f64) -> &'static str {
-    if f.is_sign_negative() {
+    overflow_literal_text(f.is_sign_negative())
+}
+
+/// [`overflow_literal`] by sign, in the `fn(bool) -> &'static str` shape
+/// `to_json_at_depth`'s `infinite_fmt` slot takes (#2877,
+/// [`OwnedValue::to_json_input_bridge`]).
+fn overflow_literal_text(negative: bool) -> &'static str {
+    if negative {
         NEG_INFINITY_SENTINEL
     } else {
         INFINITY_SENTINEL
@@ -4570,6 +4679,130 @@ mod tests {
             OwnedValue::from_number_bytes(b"1e0"),
             OwnedValue::NumberLiteral(_, _)
         ));
+    }
+
+    /// #2877: decNumber's special values materialize as the same bare
+    /// `Float` the `nan`/`infinite` builtins produce -- never a
+    /// `NumberLiteral` carrying the word -- and a leading `+` stores the
+    /// *unsigned* text, composing with every lenient escape. Rows captured
+    /// from jq 1.7.1 (`printf '[%s]' | jq -c '.[0] | [., type, isnan]'`).
+    #[test]
+    fn test_from_number_bytes_reads_decnumber_specials_and_leading_plus_2877() {
+        for word in [
+            "nan", "NaN", "-nan", "+nan", "nan1", "sNaN", "SNAN12", "-sNaN",
+        ] {
+            assert!(
+                matches!(OwnedValue::from_number_bytes(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
+                "{word}"
+            );
+        }
+        for (word, f) in [
+            ("inf", f64::INFINITY),
+            ("Infinity", f64::INFINITY),
+            ("iNfInItY", f64::INFINITY),
+            ("+inf", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                OwnedValue::from_number_bytes(word.as_bytes()),
+                OwnedValue::Float(f),
+                "{word}"
+            );
+        }
+        // `+X` is `X`, stored unsigned: the strict grammar and the three
+        // lenient escapes (leading dot, leading zero, trailing dot before
+        // an exponent) each hold through the peel, and compose.
+        for (signed, unsigned) in [
+            ("+1", "1"),
+            ("+0", "0"),
+            ("+01", "01"),
+            ("+.5", ".5"),
+            ("+1.500", "1.500"),
+            ("+1e400", "1e400"),
+            ("+1.e5", "1.e5"),
+            ("+.5e3", ".5e3"),
+            ("+007.e5", "007.e5"),
+        ] {
+            let got = OwnedValue::from_number_bytes(signed.as_bytes());
+            assert_eq!(got, OwnedValue::from_number_literal(unsigned), "{signed}");
+            assert!(matches!(got, OwnedValue::NumberLiteral(..)), "{signed}");
+            assert_eq!(
+                got.to_json(),
+                OwnedValue::from_number_bytes(unsigned.as_bytes()).to_json(),
+                "`+X` must print as `X`: {signed}"
+            );
+        }
+        // The peel never reaches the bridge-token checks: user text spelling
+        // a token with a `+` in front degrades exactly as `+1.2.3` does
+        // (#966's `null`), never to a NaN, an infinity or a computed float.
+        for text in ["+9e999e999", "+8e999e999", "+1e0e0", "+1.2.3"] {
+            assert_eq!(
+                OwnedValue::from_number_bytes(text.as_bytes()),
+                OwnedValue::Null,
+                "{text}"
+            );
+        }
+        // A bare trailing dot is the lossy fallback in both spellings (jq
+        // prints `5` for `[5.]` and `[+5.]` alike).
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"+5."),
+            OwnedValue::from_number_bytes(b"5.")
+        );
+        assert_eq!(OwnedValue::from_number_bytes(b"+5.").to_json(), "5");
+        // Not decNumber's words: the lossy fallback, as before.
+        for text in ["nanx", "inf1", "infinity1", "+", "+-1", "nope"] {
+            assert_eq!(
+                OwnedValue::from_number_bytes(text.as_bytes()),
+                OwnedValue::Null,
+                "{text}"
+            );
+        }
+    }
+
+    /// #2877: the input bridge writes a bare non-finite `Float` as the
+    /// reindex tokens (the same ones `to_json_for_reindex` uses) and is
+    /// otherwise `to_json`: a preserved literal keeps its full spelling with
+    /// no length cap, and a finite float takes jq's display form.
+    #[test]
+    fn test_to_json_input_bridge_keeps_nonfinite_floats_readable_2877() {
+        let nan = OwnedValue::Float(f64::NAN).to_json_input_bridge();
+        let inf = OwnedValue::Float(f64::INFINITY).to_json_input_bridge();
+        let neg = OwnedValue::Float(f64::NEG_INFINITY).to_json_input_bridge();
+        assert_eq!(nan, NAN_SENTINEL);
+        assert_eq!(inf, INFINITY_SENTINEL);
+        assert_eq!(neg, NEG_INFINITY_SENTINEL);
+        for token in [&nan, &inf, &neg] {
+            assert!(
+                matches!(
+                    OwnedValue::from_number_bytes(token.as_bytes()),
+                    OwnedValue::Float(_)
+                ),
+                "{token} must read back as a bare Float"
+            );
+        }
+        // `to_json` still substitutes for output.
+        assert_eq!(OwnedValue::Float(f64::NAN).to_json(), "null");
+        assert_eq!(
+            OwnedValue::Float(f64::INFINITY).to_json(),
+            "1.7976931348623157e+308"
+        );
+        // Everything finite is `to_json`, uncapped: a 300-digit literal
+        // survives where `to_json_for_reindex` would have re-rendered it.
+        let long = format!("1{}", "0".repeat(300));
+        let value = OwnedValue::Array(vec![
+            OwnedValue::from_number_literal(&long),
+            OwnedValue::from_number_literal("1.500"),
+            OwnedValue::Int(7),
+            OwnedValue::Float(0.5),
+            OwnedValue::Null,
+        ]);
+        assert_eq!(value.to_json_input_bridge(), value.to_json());
+        assert!(value.to_json_input_bridge().contains(&long));
+        assert_ne!(
+            value.to_json_for_reindex::<JqSemantics>(),
+            value.to_json_input_bridge()
+        );
     }
 
     /// #2438: the document boundary bakes yq's own decimal spelling into a

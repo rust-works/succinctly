@@ -831,26 +831,18 @@ fn unhex4(bytes: &[u8]) -> Option<u32> {
 /// where jq says "Potentially truncated top-level numeric value", or vice
 /// versa.
 fn number_is_valid(token: &[u8]) -> bool {
+    // The special-value words (`nan`, `sNaN12`, `-Infinity`, `+inf`) are
+    // one shared definition since #2877 -- the document dispatchers and
+    // the lenient validator read the same grammar from the same function.
+    if succinctly::json::validate::jq_special_number(token).is_some() {
+        return true;
+    }
     let body = match token.first() {
         Some(b'+' | b'-') => &token[1..],
         _ => token,
     };
     if body.is_empty() {
         return false;
-    }
-
-    // Longest first: stripping `inf` from `infinity` would leave `inity`.
-    for form in [b"infinity".as_slice(), b"inf".as_slice()] {
-        if let Some(rest) = strip_prefix_ignore_ascii_case(body, form) {
-            return rest.is_empty();
-        }
-    }
-    let nan_body = match body.first() {
-        Some(b's' | b'S') => &body[1..],
-        _ => body,
-    };
-    if let Some(payload) = strip_prefix_ignore_ascii_case(nan_body, b"nan") {
-        return payload.iter().all(u8::is_ascii_digit);
     }
 
     let (mantissa, exponent) = match body.iter().position(|&b| b == b'e' || b == b'E') {
@@ -882,12 +874,6 @@ fn number_is_valid(token: &[u8]) -> bool {
         }
     }
     true
-}
-
-fn strip_prefix_ignore_ascii_case<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
-    let head = bytes.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then(|| &bytes[prefix.len()..])
 }
 
 #[cfg(test)]

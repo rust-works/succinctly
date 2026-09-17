@@ -225,6 +225,19 @@ impl<'a> Validator<'a> {
 
     /// Validate a JSON value (object, array, string, number, or keyword).
     fn validate_value(&mut self) -> Result<(), ValidationError> {
+        // #2877: decNumber's special values (`nan`, `sNaN12`, `-Infinity`,
+        // `+inf`) are numbers in jq's accept-set. Decided ahead of the
+        // dispatch below because they share first bytes with other arms --
+        // `nan` with `null`, `-inf` with a negative number -- and only in
+        // lenient mode, so strict mode's grammar is untouched.
+        if self.jq_lenient {
+            if let Some(len) = self.special_number_len() {
+                for _ in 0..len {
+                    self.advance();
+                }
+                return Ok(());
+            }
+        }
         match self.peek() {
             Some(b'{') => self.validate_object(),
             Some(b'[') => self.validate_array(),
@@ -234,6 +247,10 @@ impl<'a> Validator<'a> {
             // jq's accept-set; RFC 8259 has no value starting with `.`, so
             // strict mode keeps falling through to the error arm below.
             Some(b'.') if self.jq_lenient => self.validate_number(),
+            // #2877: a leading `+` likewise -- `validate_number` peels it
+            // exactly as it peels `-`, so `+X` is accepted iff `X` is,
+            // rule 4c's refusal of a bare trailing dot included (`+5.`).
+            Some(b'+') if self.jq_lenient => self.validate_number(),
             Some(b't' | b'f' | b'n') => self.validate_keyword(),
             Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
             Some(_) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
@@ -593,10 +610,39 @@ impl<'a> Validator<'a> {
         n
     }
 
+    /// Length of the decNumber special value (`nan`, `NaN5`, `sNaN`, `inf`,
+    /// `Infinity`, optionally signed -- [`jq_special_number`], #2877) at the
+    /// current offset, or `None` if the token there is not one. The token
+    /// is the maximal run of bytes a JSON scalar can be made of (ASCII
+    /// alphanumerics, `.`, `-`, `+`), and the whole run has to validate, so
+    /// `nan1.5`, `nanx` and `infinity1` all fall through to the ordinary
+    /// dispatch and its errors, as jq rejects them.
+    ///
+    /// Cheap to ask on every value: it looks past the first byte only when
+    /// that byte can start such a word, and past a sign only when a letter
+    /// follows it, so an ordinary number or keyword costs one comparison.
+    fn special_number_len(&self) -> Option<usize> {
+        let rest = &self.input[self.offset..];
+        match rest.first()? {
+            b'n' | b'N' | b'i' | b'I' | b's' | b'S' => {}
+            b'+' | b'-' if rest.get(1).is_some_and(u8::is_ascii_alphabetic) => {}
+            _ => return None,
+        }
+        let len = rest
+            .iter()
+            .position(|&b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')))
+            .unwrap_or(rest.len());
+        jq_special_number(&rest[..len]).map(|_| len)
+    }
+
     /// Validate a JSON number.
     fn validate_number(&mut self) -> Result<(), ValidationError> {
-        // Optional minus sign
-        if self.peek() == Some(b'-') {
+        // Optional sign. `+` reaches here only from lenient mode's own
+        // dispatch arm (#2877) -- strict mode rejects it as `LeadingPlus`
+        // before ever calling this -- and is peeled exactly like `-`, so
+        // the grammar below is the same for `+X` and `X`.
+        let sign = self.peek().filter(|b| matches!(b, b'-' | b'+'));
+        if sign.is_some() {
             self.advance();
         }
 
@@ -626,7 +672,11 @@ impl<'a> Validator<'a> {
             Some(b'.') if self.jq_lenient => 0,
             Some(_) | None => {
                 return Err(self.error(ValidationErrorKind::InvalidNumber {
-                    reason: "expected digit after minus sign",
+                    reason: if sign == Some(b'+') {
+                        "expected digit after plus sign"
+                    } else {
+                        "expected digit after minus sign"
+                    },
                 }));
             }
         };
@@ -794,7 +844,7 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 /// argument (`--argjson`/`--jsonargs`, and a `--seq` record) rather than
 /// RFC 8259's (#2052).
 ///
-/// Four spellings jq accepts and RFC 8259 does not, each captured live from
+/// Six spellings jq accepts and RFC 8259 does not, each captured live from
 /// jq 1.7.1 via `jq -nc --argjson x <value> '$x'`:
 ///
 /// | spelling | jq 1.7.1 | rule |
@@ -803,15 +853,14 @@ pub fn validate(input: &[u8]) -> Result<(), ValidationError> {
 /// | `.5`, `-.5`, `.05` | `0.5`, `-0.5`, `0.05` | elided integer part (#2240) |
 /// | `1.e5`, `1.E5` | `1E+5` | fraction elided before an exponent (#2240) |
 /// | `"\udc00"` (escaped) | U+FFFD | lone *low* surrogate escape (#2012) |
+/// | `+1`, `+.5`, `+1.500`, `+007.e5` | `1`, `0.5`, `1.500`, `7E+5` | leading `+`, composing with all of the above (#2877, [`strip_leading_plus`]) |
+/// | `nan`, `NaN5`, `sNaN`, `-nan`, `inf`, `Infinity`, `-Infinity`, `+inf` | `null`, `null`, `null`, `null`, `1.7976931348623157e+308`, ... | decNumber's special values, as real NaN/infinity numbers (#2877, [`jq_special_number`]) |
 ///
 /// Nothing else moves. A lone *high* surrogate, a control character in a
-/// string, trailing content, `0x10`, `1_000` and `1.2.3` stay rejected, as
-/// they are in jq. Three spellings jq *does* accept stay rejected here
-/// because the decoder behind this validator cannot materialize them yet --
-/// a leading `+` (`+1` is `1` there), `nan`/`NaN` (`null`) and
-/// `Infinity`/`-Infinity` (the `f64` extremes); they are tracked separately
-/// as #2877 rather than opened here, since admitting a spelling this
-/// module's own decoder refuses is the #1247 failure shape.
+/// string, trailing content, `0x10`, `1_000`, `1.2.3`, a doubled sign
+/// (`+-1`), a word that is not one of decNumber's (`nanx`, `inf1`,
+/// `infinity1`) and a NaN with anything but digits after it (`nan1.5`,
+/// `nan(1)`) stay rejected, as they are in jq.
 ///
 /// **A bare trailing dot (`5.`, `007.`, `0.`) is rejected on purpose**,
 /// even though jq answers `5`: see `Validator::validate_number`'s own
@@ -1053,6 +1102,158 @@ pub fn has_leading_dot(bytes: &[u8]) -> bool {
     is_valid_number(&fixed)
 }
 
+/// decNumber's special values, as jq 1.7.1 reads them (#2877).
+///
+/// The grammar is an optional `+`/`-`, then a case-insensitive `inf` |
+/// `infinity` | `nan[0-9]*` | `snan[0-9]*`; the whole slice must match.
+/// Returns the value -- NaN for either NaN spelling (the sign and the payload
+/// digits are not observable through jq's printer, which renders every NaN
+/// as `null`), `f64::INFINITY` or `f64::NEG_INFINITY` for the infinities.
+///
+/// jq 1.7.1 builds with decNumber: `check_literal` (`src/jv_parse.c`) sends
+/// any token that is not `t…`/`f…`/`nu…` to `jv_number_with_literal`, which
+/// calls `decNumberFromString`, so the grammar of a number *word* is
+/// decNumber's -- a NaN takes an optional digit payload and a signalling
+/// NaN is accepted too. Captured live from `/usr/bin/jq` 1.7.1, nested and
+/// top-level alike: `nan`, `NaN`, `-nan`, `+nan`, `nan1`, `nan0012`,
+/// `sNaN`, `SNAN12`, `inf`, `INF`, `Infinity`, `iNfInItY`, `+inf`,
+/// `-Infinity` are all numbers; `nana`, `nanx`, `nan.`, `nan1.5`, `nan1e3`,
+/// `nan-1`, `nan(1)`, `qnan`, `ssnan`, `nA`, `infin`, `Infinite`,
+/// `infinity1`, `inf1`, `sinf`, `infx` and `1nan` are all `Invalid numeric
+/// literal`. Rust's own `f64: FromStr` covers most of the accepting rows
+/// but rejects `sNaN` and `nan12`, which is why this exists rather than a
+/// bare `parse::<f64>()`.
+///
+/// The one definition of that grammar (CLAUDE.md's #106 rule): the `--seq`
+/// reader's `number_is_valid` (`src/bin/succinctly/jq_seq_reader.rs`, #1723)
+/// implemented it first and now calls this; the document dispatchers in
+/// [`crate::json::light`], [`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes),
+/// the lenient [`Validator`] and jq-mode `tonumber` all ask the same
+/// question here.
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::jq_special_number;
+///
+/// assert!(jq_special_number(b"NaN").is_some_and(f64::is_nan));
+/// assert!(jq_special_number(b"sNaN12").is_some_and(f64::is_nan));
+/// assert_eq!(jq_special_number(b"-Infinity"), Some(f64::NEG_INFINITY));
+/// assert_eq!(jq_special_number(b"+inf"), Some(f64::INFINITY));
+/// assert_eq!(jq_special_number(b"nanx"), None);
+/// assert_eq!(jq_special_number(b"inf1"), None);
+/// assert_eq!(jq_special_number(b"1"), None);
+/// ```
+#[must_use]
+pub fn jq_special_number(bytes: &[u8]) -> Option<f64> {
+    let (negative, body) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if body.eq_ignore_ascii_case(b"inf") || body.eq_ignore_ascii_case(b"infinity") {
+        return Some(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    let nan_body = match body.first() {
+        Some(b's' | b'S') => &body[1..],
+        _ => body,
+    };
+    let payload = nan_body.get(..3)?;
+    if !payload.eq_ignore_ascii_case(b"nan") {
+        return None;
+    }
+    nan_body[3..]
+        .iter()
+        .all(u8::is_ascii_digit)
+        .then_some(f64::NAN)
+}
+
+/// `bytes` without its leading `+`, when a digit or `.` follows it (#2877).
+///
+/// `None` otherwise -- including for a bare `+`, a doubled sign (`+-1`,
+/// `++1`) and a `+` before a word (`+nan` is [`jq_special_number`]'s to
+/// read, sign included).
+///
+/// jq 1.7.1 accepts a leading `+` on every decimal spelling it accepts
+/// without one, and prints the same text either way: `+1` -> `1`, `+01` ->
+/// `1`, `+.5` -> `0.5`, `+1.500` -> `1.500`, `+1e400` -> `1E+400`,
+/// `+007.e5` -> `7E+5` (captured live). So the rule every caller applies is
+/// "`+X` behaves exactly like `X`": peel the sign here, then run the
+/// unsigned text through whatever the caller already does for `X` -- the
+/// strict grammar, the leading-dot/leading-zero/trailing-dot escapes, the
+/// rule-4c refusal of a bare trailing dot -- so the two spellings cannot
+/// drift apart. The literal a caller stores is the *unsigned* text, because
+/// a `NumberLiteral`'s text is re-read as JSON by the reindex bridge and
+/// storing `+…` would make that reparse depend on this leniency.
+///
+/// The digit-or-dot check is load-bearing, not defensive: `is_valid_number`
+/// accepts a leading `-` of its own, so a doubled sign would otherwise peel
+/// to a perfectly valid `-1` and succeed where jq errors (`Invalid numeric
+/// literal`, both `+-1` and `++1`).
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::strip_leading_plus;
+///
+/// assert_eq!(strip_leading_plus(b"+1.500"), Some(&b"1.500"[..]));
+/// assert_eq!(strip_leading_plus(b"+.5"), Some(&b".5"[..]));
+/// assert_eq!(strip_leading_plus(b"+-1"), None);
+/// assert_eq!(strip_leading_plus(b"+"), None);
+/// assert_eq!(strip_leading_plus(b"1"), None);
+/// ```
+#[must_use]
+pub fn strip_leading_plus(bytes: &[u8]) -> Option<&[u8]> {
+    let unsigned = bytes.strip_prefix(b"+")?;
+    matches!(unsigned.first(), Some(b'0'..=b'9' | b'.')).then_some(unsigned)
+}
+
+/// Whether `bytes`, as written, is number text this crate preserves as a
+/// literal spelling.
+///
+/// That is valid RFC 8259 number syntax, or one of the three jq leniencies
+/// stored verbatim -- a leading `.` ([`has_leading_dot`], #1171), a
+/// redundant leading zero ([`strip_redundant_leading_zeros`] then
+/// [`is_valid_number`], #1149) or a fraction elided before an exponent
+/// ([`has_trailing_dot_before_exponent`], #2220), the last two composing.
+///
+/// These are the same four gates, in the same order,
+/// [`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes)
+/// and [`crate::json::light`]'s `DocumentValue::number_literal` each apply
+/// inline to a token; this names them once so the leading-`+` peel both
+/// make (#2877, [`strip_leading_plus`]) can re-run exactly that set on the
+/// unsigned text -- and nothing else, in particular none of the reindex
+/// bridge's token checks that sit between those gates in
+/// `from_number_bytes`.
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::is_preservable_number_literal;
+///
+/// assert!(is_preservable_number_literal(b"1.500"));
+/// assert!(is_preservable_number_literal(b"007.e5"));
+/// assert!(is_preservable_number_literal(b".5"));
+/// assert!(!is_preservable_number_literal(b"1.2.3"));
+/// assert!(!is_preservable_number_literal(b"nan"));
+/// assert!(!is_preservable_number_literal(b"+1"));
+/// ```
+#[must_use]
+pub fn is_preservable_number_literal(bytes: &[u8]) -> bool {
+    if is_valid_number(bytes) || has_leading_dot(bytes) {
+        return true;
+    }
+    let zero_stripped = strip_redundant_leading_zeros(bytes);
+    if zero_stripped.as_deref().is_some_and(is_valid_number) {
+        return true;
+    }
+    has_trailing_dot_before_exponent(zero_stripped.as_deref().unwrap_or(bytes))
+}
+
 /// The suffix [`computed_float_token`] appends to Rust's `{:e}` rendering,
 /// giving the token its second exponent marker.
 const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";
@@ -1070,10 +1271,12 @@ const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";
 /// literal -- and none of the jq-lenient spellings this crate preserves as
 /// literals either (a leading `.`, a redundant leading zero, a trailing `.`
 /// before the exponent) -- can ever spell the same bytes; it starts with a
-/// digit or `-digit`, so the semi-index scanner classifies it as a number
-/// (a `+`-prefixed token does not survive `JsonIndex::build` at all,
-/// probed); and it is drawn from `[0-9.eE+-]`, so `nested_number_span`
-/// (`src/json/light.rs`) captures it whole.
+/// digit or `-digit`, so the semi-index scanner classifies it as a number;
+/// and it is drawn from `[0-9.eE+-]`, so `nested_number_span`
+/// (`src/json/light.rs`) captures it whole. A `+`-prefixed spelling of it
+/// (`+1e0e0`) is a number token since #2877, but user text: the leading-`+`
+/// peel in `from_number_bytes` re-runs only the lenient escapes, never this
+/// decode, so it degrades to `null` like any malformed span.
 ///
 /// This is *not* a display formatter: the value's spelling is re-derived
 /// from the `f64` by whichever mode's computed-float rule applies once it
@@ -1264,6 +1467,36 @@ mod tests {
             // and all of them at once, the composition #2012's own retry got
             // wrong before it was fixed
             r#"[007,"\udc00",.5,1.e5]"#,
+            // leading `+` (#2877), composing with every escape above
+            "+1",
+            "+0",
+            "+01",
+            "+.5",
+            "+1.500",
+            "+1e400",
+            "+1.e5",
+            "+.5e3",
+            "+007.e5",
+            r#"[+007,"\udc00",+.5,+1.e5]"#,
+            // decNumber's special values (#2877)
+            "nan",
+            "NaN",
+            "nAn",
+            "-nan",
+            "+nan",
+            "nan1",
+            "nan0012",
+            "sNaN",
+            "SNAN12",
+            "-sNaN",
+            "inf",
+            "INF",
+            "Infinity",
+            "iNfInItY",
+            "-Infinity",
+            "+inf",
+            "[nan,+1]",
+            r#"{"a":Infinity,"b":[sNaN,-inf]}"#,
         ] {
             assert!(
                 validate(s.as_bytes()).is_err(),
@@ -1279,9 +1512,10 @@ mod tests {
     /// Lenient mode moves nothing else. The first group is rejected by jq
     /// too; the second is the deliberate rule-4c divergence (jq accepts a
     /// bare trailing dot, this validator must not -- see
-    /// `Validator::validate_number`); the third is #2877's trio, which jq
-    /// accepts and the decoder behind this validator cannot yet
-    /// materialize, so admitting them here would be the #1247 shape.
+    /// `Validator::validate_number`), which a leading `+` must not route
+    /// around (#2877); the third is every way the #2877 word and sign
+    /// gates can fail to fire -- each row captured as `Invalid numeric
+    /// literal` (or `Invalid literal`) from jq 1.7.1.
     #[test]
     fn jq_lenient_rejects_everything_outside_the_four_leniencies_2052() {
         for s in [
@@ -1314,12 +1548,45 @@ mod tests {
             "1.",
             "0.",
             "007.",
-            // #2877: jq accepts, the decoder cannot represent them yet
-            "+1",
-            "nan",
-            "NaN",
-            "Infinity",
-            "-Infinity",
+            "+5.",
+            "+1.",
+            "+007.",
+            // #2877: not decNumber's words, not a peelable `+`
+            "nana",
+            "nanx",
+            "nan.",
+            "nan1.5",
+            "nan1e3",
+            "nan-1",
+            "nan(1)",
+            "qnan",
+            "ssnan",
+            "nA",
+            "infin",
+            "infinit",
+            "Infinite",
+            "infinity1",
+            "inf1",
+            "sinf",
+            "infx",
+            "infinityx",
+            "1nan",
+            "+0x10",
+            "+",
+            "++1",
+            "+-1",
+            "-+1",
+            "+ 1",
+            "+e5",
+            "-nope",
+            "-snan.",
+            "[nanx]",
+            "[+]",
+            "{nan:1}",
+            "[nan1.5,2]",
+            // the reindex bridge's own tokens are never user-writable
+            "+9e999e999",
+            "+1e0e0",
         ] {
             assert!(
                 validate_jq_lenient(s.as_bytes()).is_err(),
@@ -1392,6 +1659,22 @@ mod tests {
             "42",
             "-1.5e-3",
             "1e400",
+            // #2877
+            "+1",
+            "+01",
+            "+.5",
+            "+1.500",
+            "+1e400",
+            "+007.e5",
+            "nan",
+            "-nan",
+            "NaN5",
+            "sNaN",
+            "SNAN12",
+            "inf",
+            "Infinity",
+            "-Infinity",
+            "+inf",
         ] {
             assert!(
                 validate_jq_lenient(s.as_bytes()).is_ok(),
@@ -1404,6 +1687,177 @@ mod tests {
                 ),
                 "validator admits a number the decoder does not read as one: {s:?}"
             );
+        }
+    }
+
+    // ========================================================================
+    // jq_special_number / strip_leading_plus / is_preservable_number_literal
+    // tests (#2877)
+    // ========================================================================
+
+    /// The decNumber word grammar, both columns captured from `/usr/bin/jq`
+    /// 1.7.1 (`printf '[%s]' <tok> | jq -c .` and the bare top-level form
+    /// agree on every row).
+    #[test]
+    fn jq_special_number_is_decnumbers_grammar_2877() {
+        for s in [
+            "nan", "NaN", "nAn", "NAN", "-nan", "+nan", "nan1", "nan0012", "sNaN", "snan", "SNAN",
+            "-sNaN", "+sNaN", "sNaN12",
+        ] {
+            assert!(
+                jq_special_number(s.as_bytes()).is_some_and(f64::is_nan),
+                "expected NaN: {s:?}"
+            );
+        }
+        for s in [
+            "inf",
+            "Inf",
+            "INF",
+            "infinity",
+            "INFINITY",
+            "iNfInItY",
+            "+inf",
+            "+Infinity",
+        ] {
+            assert_eq!(
+                jq_special_number(s.as_bytes()),
+                Some(f64::INFINITY),
+                "{s:?}"
+            );
+        }
+        for s in ["-inf", "-Infinity", "-INF"] {
+            assert_eq!(
+                jq_special_number(s.as_bytes()),
+                Some(f64::NEG_INFINITY),
+                "{s:?}"
+            );
+        }
+        for s in [
+            "",
+            "+",
+            "-",
+            "s",
+            "n",
+            "na",
+            "nA",
+            "nana",
+            "nanx",
+            "nan.",
+            "nan1.5",
+            "nan1e3",
+            "nan-1",
+            "nan(1)",
+            "nan()",
+            "qnan",
+            "ssnan",
+            "infin",
+            "infinit",
+            "Infinite",
+            "infinity1",
+            "inf1",
+            "sinf",
+            "infx",
+            "infinityx",
+            "1nan",
+            "1",
+            "-1",
+            "+1",
+            "1e5",
+            "9e999e999",
+            "8e999e999",
+            "1e0e0",
+            "null",
+            "true",
+            "nul",
+            "nan 1",
+            " nan",
+            "nan ",
+        ] {
+            assert_eq!(jq_special_number(s.as_bytes()), None, "must reject: {s:?}");
+        }
+    }
+
+    #[test]
+    fn strip_leading_plus_peels_only_before_a_digit_or_dot_2877() {
+        for (s, unsigned) in [
+            ("+1", "1"),
+            ("+0", "0"),
+            ("+01", "01"),
+            ("+.5", ".5"),
+            ("+1.500", "1.500"),
+            ("+1e400", "1e400"),
+            ("+007.e5", "007.e5"),
+            ("+5.", "5."),
+            ("+1.2.3", "1.2.3"),
+            ("+9e999e999", "9e999e999"),
+        ] {
+            assert_eq!(
+                strip_leading_plus(s.as_bytes()),
+                Some(unsigned.as_bytes()),
+                "{s:?}"
+            );
+        }
+        for s in [
+            "+",
+            "++1",
+            "+-1",
+            "-+1",
+            "-1",
+            "1",
+            "+nan",
+            "+inf",
+            "+Infinity",
+            "+e5",
+            "+x",
+            "+ 1",
+            "",
+        ] {
+            assert_eq!(
+                strip_leading_plus(s.as_bytes()),
+                None,
+                "must not peel: {s:?}"
+            );
+        }
+    }
+
+    /// `+X` is preservable exactly when `X` is: the peel and the four gates
+    /// compose, and the bare-trailing-dot refusal (rule 4c) rides along.
+    #[test]
+    fn is_preservable_number_literal_names_the_four_gates_2877() {
+        for s in [
+            "0", "42", "-1.5e-3", "1.500", "1e400", "007", "-007e5", "007.500", ".5", "-.5", ".05",
+            "1.e5", "1.E5", "007.e5", "007.e999",
+        ] {
+            assert!(is_preservable_number_literal(s.as_bytes()), "{s:?}");
+            let plus = format!("+{s}");
+            assert_eq!(
+                strip_leading_plus(plus.as_bytes()).is_some_and(is_preservable_number_literal),
+                !s.starts_with('-'),
+                "`+X` must follow `X`: {plus:?}"
+            );
+        }
+        for s in [
+            "",
+            "+1",
+            "-",
+            ".",
+            "-.",
+            "1.",
+            "5.",
+            "007.",
+            "1.2.3",
+            "1e",
+            "1e0e0",
+            "9e999e999",
+            "nan",
+            "inf",
+            "Infinity",
+            "0x10",
+            "1_000",
+            "e5",
+            ".e5",
+        ] {
+            assert!(!is_preservable_number_literal(s.as_bytes()), "{s:?}");
         }
     }
 

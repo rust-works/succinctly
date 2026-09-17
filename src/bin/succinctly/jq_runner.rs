@@ -4597,18 +4597,27 @@ fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
         // matching real jq on every input path, while still accepting
         // `0x7F` the way jq's own signed-char check does (#2878).
         b'"' => succinctly::json::light::string_literal_end(bytes, pos),
-        // true, false, null
-        b't' | b'f' | b'n' => find_literal_end(bytes, pos),
-        // Number. `number_literal_end` (shared with `light.rs`'s own
+        // true, false, null. Only `t…`, `f…` and `nu…` take the keyword
+        // path -- jq's own `check_literal` (`jv_parse.c`) reads exactly
+        // that, and sends a bare `n` to its number parser, which is how
+        // `nan` and `nan12` are numbers there (#2877; `jq_seq_reader.rs`
+        // models the same split for `--seq`).
+        b't' | b'f' => find_literal_end(bytes, pos),
+        b'n' if bytes.get(pos + 1) == Some(&b'u') => find_literal_end(bytes, pos),
+        // Number. `jq_number_token_end` (shared with `light.rs`'s own
         // materializer, #1171 review -- one validated implementation
         // instead of independently-maintained copies) both finds the
         // end of and validates the token: a `.` is accepted as a
         // leading byte when at least one digit follows (`.5` -> `0.5`,
-        // matching real jq's own leniency beyond strict JSON), and a
-        // byte sequence that only *looks* number-shaped (`-e5`, `1e`,
-        // a bare `.`) is rejected outright rather than silently
+        // matching real jq's own leniency beyond strict JSON), a leading
+        // `+` is peeled like `-`, decNumber's special words (`nan`,
+        // `sNaN12`, `-Infinity`, `inf`) are numbers (#2877), and a byte
+        // sequence that only *looks* number-shaped (`-e5`, `1e`, a bare
+        // `.`, `nanx`, `+-1`) is rejected outright rather than silently
         // accepted as a truncated or zero-length span.
-        b'-' | b'.' | b'0'..=b'9' => succinctly::json::light::number_literal_end(bytes, pos),
+        b'+' | b'-' | b'.' | b'0'..=b'9' | b'n' | b'N' | b'i' | b'I' | b's' | b'S' => {
+            succinctly::json::light::jq_number_token_end(bytes, pos)
+        }
         _ => None,
     }
 }
@@ -5430,10 +5439,17 @@ fn evaluate_input_streaming(
     // "`Preserve` numbers + *jq* escaping", and keying the family on the
     // enum would assert an equivalence that does not hold. See
     // `OwnedValue::to_json_yq`'s own doc comment.
+    //
+    // #2877: `to_json_input_bridge`, not `to_json` -- a document `nan`/
+    // `Infinity` is a bare non-finite `Float` here, and the printer's
+    // `null`/`DBL_MAX` substitutions would re-read as a real `null` and a
+    // finite literal. The bridge variant writes the reindex tokens the
+    // reparse already decodes. The `--preserve-input` arm keeps
+    // `to_json_jq_preserve` (see that variant's doc comment for why).
     let json_str = if output_config.convention.preserves_source_values() {
         input.to_json_jq_preserve()
     } else {
-        input.to_json()
+        input.to_json_input_bridge()
     };
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -6581,9 +6597,11 @@ impl LiteralFormatter for JqCompatFormatter {
         // live against jq 1.7.1, where `1e400 | .` (identity, no
         // computation) echoes `1E+400`, not `null` or `DBL_MAX` text; only
         // an actual *computed* Infinity (`format_float` below) gets the
-        // `DBL_MAX` substitution. JSON's number grammar has no NaN spelling,
-        // so a NaN literal can't reach this function at all -- only via
-        // `format_float`.
+        // `DBL_MAX` substitution. RFC 8259's grammar has no NaN spelling,
+        // so no *valid* span reaching this line is a NaN; jq's own `nan`/
+        // `sNaN12` words (#2877) are not `is_valid_number` and take the
+        // sanitizing arm above, where `from_number_bytes` reads them as a
+        // bare `Float` and `format_float` prints jq's `null`.
         Cow::Owned(format_number_jq_compat(raw))
     }
 

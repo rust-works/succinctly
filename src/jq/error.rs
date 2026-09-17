@@ -1540,8 +1540,16 @@ impl EvalError {
     /// site, matching the "one classification, checked everywhere via a
     /// single predicate" architecture [`Self::is_decode_failure`]'s own doc
     /// comment already established for #1840.
+    ///
+    /// #2877: the re-run is the *lenient* validator, jq's own accept-set,
+    /// not the strict one. Every spelling lenient mode admits beyond RFC
+    /// 8259 (`007`, `.5`, `1.e5`, a lone low surrogate, `+1`, `nan`,
+    /// `Infinity`) is one the semi-index reads as a value without firing
+    /// any swallow point, so the strict validator's first complaint about
+    /// a document that also has a *real* fault (`[nan, 1 2]`) would name
+    /// the `nan` jq accepts, not the missing comma jq reports.
     pub fn malformed_json_text(text: &[u8]) -> Self {
-        match crate::json::validate::validate(text) {
+        match crate::json::validate::validate_jq_lenient(text) {
             Err(err) => Self::decode_failure(format!("Invalid JSON text: {}", err.kind)),
             // The validator disagreeing with the indexer means the two have
             // drifted apart. Report the generic form rather than claim the
