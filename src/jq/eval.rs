@@ -98061,7 +98061,7 @@ mod tests {
         // the real "number required" error instead.
         match eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
             QueryResult::Error(e) => assert!(e.message.contains("number required")),
-            other => panic!("expected number-required error, got: {other:?}"),
+            other => panic!("expected number-required error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#2937)"
         }
     }
 }
