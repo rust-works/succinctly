@@ -2893,13 +2893,36 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // #2209), so it must keep this fast path rather than falling into
         // the re-encoding writer below and losing both the speed and the
         // verbatim spelling.
+        //
         if indent.is_compact() && !sort_keys && numbers.preserves_source_values() {
-            if let Some(bytes) = self.raw_bytes() {
+            let Some(bytes) = self.raw_bytes() else {
+                return Err(StreamFailure::Fmt);
+            };
+            // #2985: a jq-escape-table convention (`JqPreserveInput`) can't
+            // take this fast path when the span contains a raw DEL byte
+            // (`0x7f`) -- jq's own escape table re-encodes it, and this
+            // path writes the *entire* raw span verbatim with no per-byte
+            // inspection otherwise. `Preserve` (yq's own, never a
+            // jq-escape-table convention) is unaffected and skips the scan
+            // entirely. Every *other* byte legal unescaped in JSON source
+            // is shared between both escape tables (confirmed by
+            // #2591/#2592's own scope), so DEL is the only reason a
+            // jq-escape-table convention can't take this branch
+            // unconditionally the way `Preserve` always could -- and this
+            // has to be a real scan, not a blanket exclusion: gating on
+            // `uses_jq_escape_table()` alone (an earlier draft) also
+            // disabled the fast path for a `JqPreserveInput` span with no
+            // DEL at all, silently canonicalizing an already-escaped
+            // `` to jq's own `\b` short form and breaking
+            // `test_preserve_input_keeps_jq_escape_table_2209`'s pinned
+            // "verbatim spelling survives" behavior, which predates #2209
+            // and has nothing to do with DEL.
+            let del_unsafe = numbers.uses_jq_escape_table() && bytes.contains(&0x7f);
+            if !del_unsafe {
                 // SAFETY: JSON input is valid UTF-8 (checked during indexing)
                 let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                 return Ok(out.write_str(s)?);
             }
-            return Err(StreamFailure::Fmt);
         }
         // #1676/#1576 review: a stray `,` in an *apparently* empty
         // container (`{,}`, `[,]`) has no child cursor for
@@ -3739,11 +3762,19 @@ fn write_json_string_pretty<Out: core::fmt::Write>(
     // jq's own escape table (unlike yq's -- `Preserve`) still escapes it on
     // output. The two conventions agree on every *other* byte legal
     // unescaped in source, so this is the one case the fast path below
-    // can't take unconditionally under `JqCompat`. `has_del` comes free
-    // from `raw_and_escaped`'s own existing scan (already visiting every
-    // byte of the span to find a backslash), so this check costs nothing
-    // beyond what that scan already pays for every span, escaped or not.
-    let del_unsafe = has_del && numbers == JsonConvention::JqCompat;
+    // can't take unconditionally under a jq-escape-table convention.
+    // `has_del` comes free from `raw_and_escaped`'s own existing scan
+    // (already visiting every byte of the span to find a backslash), so
+    // this check costs nothing beyond what that scan already pays for
+    // every span, escaped or not.
+    //
+    // #2985: keyed on `uses_jq_escape_table()`, not `== JqCompat` -- the
+    // latter silently excluded `JqPreserveInput`, which also uses jq's
+    // escape table (#2209) despite preserving source *values*, so a raw
+    // DEL echoed through unescaped under `--preserve-input` pretty-printing
+    // (`succinctly jq` with no `-c`), unlike real jq, which escapes it
+    // there too.
+    let del_unsafe = has_del && numbers.uses_jq_escape_table();
     // Unlike `print_json`'s own zero-copy check (`std::io::Write`, which
     // passes bytes through unvalidated), this writer is `core::fmt::Write`
     // -- a `str`-oriented trait -- so invalid UTF-8 in an unescaped span
