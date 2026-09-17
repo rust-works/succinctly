@@ -1970,9 +1970,9 @@ fn check(
                 *expr = *fallback;
                 check(expr, scope, var_scope, errors, reachable, occurrences);
             } else if is_jq_builtin(name, arity) {
-                next_call_occurrence(occurrences, name, arity);
+                next_call_occurrence(occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
-                    check(a, scope, var_scope, errors, reachable, occurrences);
+                    check(a, scope, var_scope, errors, reachable, occurrences); // omni-dev: coverage tolerate-line reason="same unreachable arm as the line above"
                 }
             } else {
                 let occurrence_index = next_call_occurrence(occurrences, name, arity);
