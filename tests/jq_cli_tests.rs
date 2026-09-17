@@ -59657,6 +59657,14 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
             ". as $x | IN(($x.a = 9))",
             "false",
         ),
+        // #2968 gave `any`/`all` cursor-threaded arms, so `cond` on a `gen`
+        // that yields the input itself sees the input's own node.
+        (
+            &["-c"][..],
+            r#"{"a":1}"#,
+            ". as $x | any(.; ($x.a = 9))",
+            "true",
+        ),
         (
             &["-c"][..],
             r#"{"a":1}"#,
@@ -59889,9 +59897,6 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
             r#"{"a":1}"#,
             r#"input | . as $x | ltrimstr("x") | ($x.a = 9)"#,
         ),
-        // `cond` runs on each element `gen` yields as a computed value,
-        // even when `gen` is `.`.
-        (&["-c"][..], r#"{"a":1}"#, ". as $x | any(.; ($x.a = 9))"),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
