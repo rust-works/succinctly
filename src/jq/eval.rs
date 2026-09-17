@@ -28572,7 +28572,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
-    first_outputs(eval_owned_input::<Vec<u64>, S>(expr, input, false))
+    first_outputs::<S>(eval_owned_input::<Vec<u64>, S>(expr, input, false))
 }
 
 /// [`eval_owned_multi_first`] over the update's own untouched input -- see
@@ -28581,11 +28581,13 @@ fn eval_owned_multi_first_bridged<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
 ) -> Result<Vec<OwnedValue>, EvalEscape> {
-    first_outputs(eval_owned_input_bridged::<Vec<u64>, S>(expr, input, false))
+    first_outputs::<S>(eval_owned_input_bridged::<Vec<u64>, S>(expr, input, false))
 }
 
 /// [`eval_owned_multi_first`]'s first-output rule over an owned result.
-fn first_outputs(result: QueryResult<'_, Vec<u64>>) -> Result<Vec<OwnedValue>, EvalEscape> {
+fn first_outputs<S: EvalSemantics>(
+    result: QueryResult<'_, Vec<u64>>,
+) -> Result<Vec<OwnedValue>, EvalEscape> {
     match result {
         QueryResult::Error(e) => Err(e.into()),
         // A *bare* break — nothing produced before it — has no prefix to
