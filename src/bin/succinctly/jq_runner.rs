@@ -2679,9 +2679,10 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                         Some((source, break_sites)) => {
                             report_unresolved_label(name, &at, source, break_sites, *occurrence);
                         }
+                        // omni-dev: coverage tolerate reason="unreachable in a single-process run by construction: `run_id_for` (the sole source of an `origin` id) always inserts a `run_origins` entry for the id it hands back -- from a real load's canonical path, or its own literal-path fallback on a resolve failure -- and a def body only ever gets stamped with an `origin` after its module loaded successfully, so `at` always names a file that existed and was readable moments earlier. Reaching this arm needs that same file to vanish (or become unreadable) in the narrow window between that load and this re-read, entirely outside this process's control (#2964)"
                         None => {
                             eprintln!("jq: error: $*label-{name} is not defined at {at}");
-                        }
+                        } // omni-dev: coverage end
                     }
                     continue;
                 }

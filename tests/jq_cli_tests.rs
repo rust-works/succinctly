@@ -6294,6 +6294,31 @@ fn test_namespaced_call_to_unimported_namespace_is_a_compile_error_1473() -> Res
     Ok(())
 }
 
+/// `report_unresolved_call`'s text-search fallback normally finds the
+/// failing call's real position by searching `source` for the exact
+/// `name/arity` string `rewrite_namespaced_calls` built (`{namespace}::{name}`,
+/// no spaces) -- but real jq's own grammar allows whitespace around `::`
+/// (confirmed live: `mymod :: func` parses and compiles the same as
+/// `mymod::func`). That whitespace survives into the AST's `namespace`/`name`
+/// parts untouched, so the rebuilt `mymod::func` search string no longer
+/// matches the source's own spacing byte-for-byte, and the search comes back
+/// empty. jq's own fallback then drops the line marker and source echo
+/// entirely, printing only the bare `at <location>` form.
+#[test]
+fn test_namespaced_call_with_whitespace_around_colons_loses_its_position() -> Result<()> {
+    let (output, code) = spawn_jq(&["-n", "mymod :: func"], None)?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(
+        stderr.contains("jq: error: mymod::func/0 is not defined at <top-level>\n"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_home_jq_file_autoload() -> Result<()> {
     // Create a temporary home directory with a .jq file
