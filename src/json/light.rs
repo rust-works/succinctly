@@ -2846,11 +2846,21 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     /// literal spelling, and it is truthy in jq even though a NaN *prints*
     /// as `null` (`jq -ne '[nan] | .[0]'` exits 0). The old literal-based
     /// test also called `[1.]`'s element falsy while printing it as `1`.
+    ///
+    /// This runs once per streamed output value (`.[]` over a large array
+    /// reaches it per element), so the ordinary case is settled by the
+    /// `is_valid_number` scan alone -- a valid RFC 8259 span always decodes
+    /// -- and only a lenient span pays for the decode.
     #[inline]
     fn is_falsy(&self, numbers: JsonConvention) -> bool {
         match self.value() {
             StandardJson::Null | StandardJson::Bool(false) => true,
-            StandardJson::Number(n) => numbers == JsonConvention::JqCompat && n.as_f64().is_err(),
+            StandardJson::Number(n) => {
+                numbers == JsonConvention::JqCompat && {
+                    let raw = n.raw_bytes();
+                    !crate::json::validate::is_valid_number(raw) && n.as_f64().is_err()
+                }
+            }
             _ => false,
         }
     }
