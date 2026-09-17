@@ -4773,12 +4773,10 @@ mod tests {
         assert_eq!(inf, INFINITY_SENTINEL);
         assert_eq!(neg, NEG_INFINITY_SENTINEL);
         for token in [&nan, &inf, &neg] {
+            let back = OwnedValue::from_number_bytes(token.as_bytes());
             assert!(
-                matches!(
-                    OwnedValue::from_number_bytes(token.as_bytes()),
-                    OwnedValue::Float(_)
-                ),
-                "{token} must read back as a bare Float"
+                matches!(back, OwnedValue::Float(_)),
+                "{token} must read back as a bare Float, got {back:?}"
             );
         }
         // `to_json` still substitutes for output.

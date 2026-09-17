@@ -6644,7 +6644,7 @@ mod tests {
                 let StandardJson::Number(n) = cursor.value() else {
                     panic!(
                         "{doc}: expected a Number at {start}, got {:?}",
-                        cursor.value()
+                        cursor.value() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
                     );
                 };
                 assert_eq!(n.raw_bytes(), token.as_bytes(), "{doc}");
@@ -6726,7 +6726,7 @@ mod tests {
                 assert!(
                     matches!(child.value(), StandardJson::Error(_)),
                     "{doc}: expected Error, got {:?}",
-                    child.value()
+                    child.value() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
                 );
                 assert_eq!(child.text_range(), None, "{doc}: text_range");
             }
@@ -6814,7 +6814,7 @@ mod tests {
             let index = JsonIndex::build(bytes);
             let root = index.root(bytes);
             let StandardJson::Number(n) = root.first_child().expect("one child").value() else {
-                panic!("expected a number");
+                panic!("expected a number"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
             };
             match expected {
                 None => assert!(n.as_f64().is_ok_and(f64::is_nan), "{token}"),
