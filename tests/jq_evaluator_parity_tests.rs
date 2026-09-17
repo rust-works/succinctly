@@ -2554,3 +2554,42 @@ fn test_eval_pipe_path_context_redirect_does_not_recurse_2416() {
         [r#"{"a":{"b":1,"e":2},"c":[10,20],"x":["b","e"]}"#]
     );
 }
+
+/// #2936: both evaluators read a >17-significant-digit literal -- from the
+/// document and from the program -- as jq's 17-digit-rounded double, and the
+/// two agree on every row. Expected values captured from `/usr/bin/jq` 1.7.1;
+/// each row differed on `main` at `00e907ab3`.
+#[test]
+fn test_float_literal_rounding_agrees_across_evaluators_2936() {
+    const DOC: &[u8] = br#"{"a":2.7293109604053567083,"b":[9377102121403479046,2.4703282292062327209e-324],"c":1.797693134862315808e308}"#;
+    for (filter, expected) in [
+        (".a + 0", "2.7293109604053565"),
+        (".a * 1", "2.7293109604053565"),
+        (".a | sqrt", "1.6520626381603563"),
+        (".a | length", "2.7293109604053565"),
+        (".a | fabs", "2.7293109604053565"),
+        (".a == (2.729310960405357 + 0)", "false"),
+        (".a < (2.729310960405357 + 0)", "true"),
+        (".b[0] + 0", "9377102121403478000"),
+        (".b[1] + 0", "0"),
+        (".c | isinfinite", "false"),
+        (".c + 0", "1.7976931348623157e+308"),
+        (".a |= . + 0 | .a", "2.7293109604053565"),
+        ("[.a, (2.7293109604053565 + 0)] | unique | length", "1"),
+        ("[.b[0], 9377102121403479046.0] | unique | length", "1"),
+        ("2.7293109604053567083 + 0", "2.7293109604053565"),
+        ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
+        (".a | tostring | tonumber + 0", "2.7293109604053565"),
+        (".a | tojson | fromjson + 0", "2.7293109604053565"),
+        // unchanged: display keeps the spelling, two literals compare exactly
+        (".a", "2.7293109604053567083"),
+        (".a | tojson", "\"2.7293109604053567083\""),
+        (".a == 2.7293109604053565", "false"),
+        ("869389897822472001 < 869389897822472004.9", "true"),
+    ] {
+        let full = full_outputs(DOC, filter);
+        let generic = generic_outputs(DOC, filter);
+        assert_eq!(as_strs(&full), [expected], "full evaluator: `{filter}`");
+        assert_eq!(full, generic, "evaluators disagree on `{filter}`");
+    }
+}

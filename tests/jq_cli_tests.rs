@@ -58627,27 +58627,23 @@ fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()
 #[test]
 fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()> {
     for (filter, current, jq_says) in [
-        // #2936: a >17-digit float literal is parsed with one correct
-        // rounding, not jq's 17-digit pre-rounding.
-        (
-            "2.7293109604053567083 + 0",
-            "2.729310960405357",
-            "2.7293109604053565",
-        ),
-        // #2937: the math builtins widen with a bare cast, and the floor
-        // family (and `length`) print exact digits where jq has a double.
-        // The `sqrt` row moved once already, from `...647` to `...646`, when
-        // #3045 replaced a Newton iteration with the platform's correctly
-        // rounded `sqrt`; the remaining ulp is the bare-cast widening of the
-        // literal (jq rounds it to 17 digits first), which is #2937's.
-        (
-            "869389897822472004 | sqrt",
-            "932410798.8555646",
-            "932410798.8555645",
-        ),
+        // #2936 closed the float-literal row: `2.7293109604053567083 + 0`
+        // is jq's `2.7293109604053565` now and lives in
+        // `test_float_literal_rounds_to_17_digits_2936` below.
+        //
+        // #2937: the floor family (and `length`) print exact digits where
+        // jq has a double. The `sqrt` row moved twice -- from `...647` to
+        // `...646` when #3045 replaced a Newton iteration with the
+        // platform's correctly rounded `sqrt`, then to jq's own `...645`
+        // when #2936 routed the cursor-level math readers through
+        // `document_number_f64`, which widens an integer literal the way
+        // jq does; the `floor` row moved with it, from the exact integer
+        // `...064` to the 17-digit-rounded double `...936` printed with
+        // its exact digits (jq prints the same double as `...000`), which
+        // is the display half #2937 still owns.
         (
             "869389897822472004 | floor",
-            "869389897822472064",
+            "869389897822471936",
             "869389897822472000",
         ),
         (
@@ -58664,6 +58660,230 @@ fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()>
             "`{filter}` moved -- if it now prints {jq_says} (jq's answer), update this row and close the tracked issue"
         );
     }
+    Ok(())
+}
+
+// =============================================================================
+// #2936: jq rounds every literal -- not just an `i64` -- to 17 significant
+// digits before converting it to a double (`jvp_literal_number_to_double`:
+// `decNumberReduce` under a 17-digit DECIMAL64 context, then `strtod`), and
+// it does so on every path a number enters through. Every row was captured
+// live from `/usr/bin/jq` 1.7.1. A row here had to *fail* on `main` at
+// `00e907ab3` (the known-bad build): the plain parse agrees with jq on most
+// literals, so only witnesses known to differ prove anything.
+// =============================================================================
+
+/// The witnesses, on every entry point: program literal, cursor route,
+/// materializing route, `--slurp`, `input`/`inputs`, `tonumber`, `fromjson`,
+/// `--argjson`, `--jsonargs`, `--slurpfile`, `--seq`, the `|=` bridge,
+/// `getpath`, `to_entries` and `tostream`.
+#[test]
+fn test_float_literal_rounds_to_17_digits_2936() -> Result<()> {
+    // (literal, `. + 0` in jq 1.7.1, the plain parse `main` printed)
+    let witnesses = [
+        (
+            "2.7293109604053567083",
+            "2.7293109604053565",
+            "2.729310960405357",
+        ),
+        // the subnormal half-way case: 17 digits round down to zero
+        ("2.4703282292062327209e-324", "0", "5e-324"),
+        // a 19-digit integer past `i64` (the plain parse printed `...480000`)
+        (
+            "9377102121403479046",
+            "9377102121403478000",
+            "9377102121403480000",
+        ),
+        // mantissa + exponent
+        (
+            "3.7199048661188564379e278",
+            "3.719904866118856e+278",
+            "3.719904866118857e+278",
+        ),
+    ];
+    for (literal, expected, _) in witnesses {
+        // Program literal, and its negation (the parser folds `-X` into
+        // `-1 * X`, so the rounded magnitude is negated, never re-rounded).
+        let (out, code) = run_jq_null(&format!("{literal} + 0"), &["-c"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), expected, "program literal {literal}");
+        // `-0 + 0` is `0` under IEEE 754, as jq prints it.
+        let neg_expected = if expected == "0" {
+            "0".to_string()
+        } else {
+            format!("-{expected}")
+        };
+        let (out, _, _) = run_jq_full(&["-nc", "--", &format!("-{literal} + 0")], None)?;
+        assert_eq!(
+            out.trim(),
+            neg_expected,
+            "negated program literal {literal}"
+        );
+
+        let doc = format!(r#"{{"a":{literal}}}"#);
+        for (filter, extra) in [
+            (".a + 0", vec![]),
+            (".a |= . + 0 | .a", vec![]),
+            (".a | tostring | tonumber + 0", vec![]),
+            (".a | tojson | fromjson + 0", vec![]),
+            ("getpath([\"a\"]) + 0", vec![]),
+            ("to_entries[0].value + 0", vec![]),
+            ("[tostream] | .[0][1] + 0", vec![]),
+            ("[paths(numbers) as $p | getpath($p)] | .[0] + 0", vec![]),
+            (".[0].a + 0", vec!["-s"]),
+            ("input.a + 0", vec!["-n"]),
+            ("[inputs][0].a + 0", vec!["-n"]),
+        ] {
+            let mut args = vec!["-c"];
+            args.extend(extra.iter());
+            args.push(filter);
+            let (out, stderr, code) = run_jq_full(&args, Some(&doc))?;
+            assert_eq!(code, 0, "{args:?} on {doc}: {stderr}");
+            assert_eq!(out.trim(), expected, "{args:?} on {doc}");
+        }
+
+        let (out, _, _) = run_jq_full(&["-nc", "--argjson", "x", literal, "$x + 0"], None)?;
+        assert_eq!(out.trim(), expected, "--argjson {literal}");
+        let (out, _, _) = run_jq_full(
+            &["-nc", "$ARGS.positional[0] + 0", "--jsonargs", literal],
+            None,
+        )?;
+        assert_eq!(out.trim(), expected, "--jsonargs {literal}");
+        let mut file = NamedTempFile::new()?;
+        writeln!(file, "{literal}")?;
+        let path = file.path().to_str().unwrap().to_string();
+        let (out, _, _) = run_jq_full(&["-nc", "--slurpfile", "s", &path, "$s[0] + 0"], None)?;
+        assert_eq!(out.trim(), expected, "--slurpfile {literal}");
+        let input = format!("\u{1e}{literal}\n");
+        let (out, _, _) = run_jq_full(&["--seq", "-c", ". + 0"], Some(&input))?;
+        assert_eq!(out.trim(), format!("\u{1e}{expected}"), "--seq {literal}");
+    }
+    Ok(())
+}
+
+/// The value, not just `+ 0`: comparison against a computed double,
+/// `unique`, the math and classification builtins on the cursor route, and
+/// the overflow boundary. Each row is jq 1.7.1's, and each differed on
+/// `main`.
+#[test]
+fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
+    for (filter, expected) in [
+        ("2.7293109604053567083 == (2.729310960405357 + 0)", "false"),
+        ("2.7293109604053567083 < (2.729310960405357 + 0)", "true"),
+        (
+            "[2.7293109604053567083, (2.7293109604053565 + 0)] | unique | length",
+            "1",
+        ),
+        ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
+        ("2.7293109604053567083 | length", "2.7293109604053565"),
+        ("2.7293109604053567083 | fabs", "2.7293109604053565"),
+        ("2.7293109604053567083 | -.", "-2.7293109604053565"),
+        ("2.7293109604053567083 * 1", "2.7293109604053565"),
+        // the overflow boundary: 17 digits round *down* to DBL_MAX
+        ("1.797693134862315808e308 | isinfinite", "false"),
+        ("1.797693134862315808e308 | isnormal", "true"),
+        ("1.797693134862315808e308 + 0", "1.7976931348623157e+308"),
+        // the same rows through a document, on the cursor route
+        ("[2.7293109604053567083] | .[0] | isinfinite", "false"),
+        (
+            "[2.7293109604053567083] | .[0] | finites",
+            "2.7293109604053567083",
+        ),
+        (
+            "[2.7293109604053567083] | .[0] | strftime(\"%S\")",
+            "\"02\"",
+        ),
+        ("[2.7293109604053567083] | .[] + 0", "2.7293109604053565"),
+        (
+            "[2.7293109604053567083] | map(. + 0)",
+            "[2.7293109604053565]",
+        ),
+        ("[2.7293109604053567083] | add", "2.7293109604053567083"),
+        ("[2.7293109604053567083] | min + 0", "2.7293109604053565"),
+        ("2.7293109604053567083 as $x | $x + 0", "2.7293109604053565"),
+        (
+            "[2.7293109604053567083] | reduce .[] as $x (0; $x) + 0",
+            "2.7293109604053565",
+        ),
+        (
+            "0.00000000000000000000000000001234567890123456789 + 0",
+            "1.2345678901234569e-29",
+        ),
+        // `tonumber` on the words Rust's parser lacks was #2877's; on a long
+        // literal it is this issue's
+        (
+            "\"2.7293109604053567083\" | tonumber | sqrt",
+            "1.6520626381603563",
+        ),
+        (
+            "\"[2.7293109604053567083]\" | fromjson | .[0] + 0",
+            "2.7293109604053565",
+        ),
+    ] {
+        let (out, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// The guard rows for `jq_numeric_cmp`'s two-literal shortcut: it orders by
+/// the doubles first, which is sound only when both come from the same
+/// 17-digit rounding. With only the `Float` side rounded these flipped
+/// (plain `869389897822472001` -> `...472064` > jq's `869389897822472004.9`
+/// -> `...471936`); with both rounded they tie at `...471936` and the exact
+/// decimal comparison decides. All three passed on `main` and must keep
+/// passing.
+#[test]
+fn test_mixed_int_float_literal_order_stays_exact_2936() -> Result<()> {
+    for (filter, expected) in [
+        ("869389897822472001 < 869389897822472004.9", "true"),
+        ("869389897822472004.9 > 869389897822472001", "true"),
+        (
+            "[869389897822472004.9, 869389897822472001] | sort",
+            "[869389897822472001,869389897822472004.9]",
+        ),
+        ("869389897822472004 == 869389897822472004.0", "true"),
+        ("869389897822472004 > 869389897822471936.5", "true"),
+    ] {
+        let (out, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// What must not move: display keeps the source spelling (the literal text
+/// is untouched, only the double it carries changed), and two literals
+/// still compare exactly by their digits.
+#[test]
+fn test_float_literal_rounding_leaves_display_and_literal_comparison_2936() -> Result<()> {
+    for (filter, expected) in [
+        ("2.7293109604053567083", "2.7293109604053567083"),
+        (
+            "2.7293109604053567083 | tojson",
+            "\"2.7293109604053567083\"",
+        ),
+        (
+            "2.7293109604053567083 | tostring",
+            "\"2.7293109604053567083\"",
+        ),
+        ("2.7293109604053567083 | @text", "\"2.7293109604053567083\""),
+        ("1.797693134862315808e308", "1.797693134862315808E+308"),
+        ("99999999999999999999", "99999999999999999999"),
+        ("2.7293109604053567083 == 2.7293109604053565", "false"),
+        ("[2.7293109604053567083] | .[0]", "2.7293109604053567083"),
+        (
+            "[2.7293109604053567083] | .[0] | tojson",
+            "\"2.7293109604053567083\"",
+        ),
+    ] {
+        let (out, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    let (out, _, _) = run_jq_full(&["-c", "."], Some("[2.7293109604053567083]"))?;
+    assert_eq!(out.trim(), "[2.7293109604053567083]");
     Ok(())
 }
 

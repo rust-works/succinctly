@@ -46128,6 +46128,58 @@ fn test_yq_large_int_arith_stays_exact_unaffected_by_2906() -> Result<()> {
     Ok(())
 }
 
+/// #2936's fix (jq mode only, see `jq_cli_tests.rs`) rounds a
+/// >17-significant-digit *float* literal to 17 digits before the double
+/// conversion, through the number-materialisation funnels shared by both
+/// modes (`OwnedValue::from_number_bytes::<S>` and friends). Real yq parses
+/// with Go's correctly-rounded `ParseFloat`, so every row here must keep
+/// the plain parse -- on the YAML document, through `tonumber`/`fromjson`,
+/// through a write (the reindex bridge under `YqSemantics`), on the `-p json`
+/// path, and as a program literal. Every value was captured live against
+/// yq v4.53.3; `9377102121403479046` (the over-i64 witness) is left out
+/// because real yq refuses it outright (`strconv.ParseInt ... value out of
+/// range`), a pre-existing divergence this issue does not touch.
+#[test]
+fn test_yq_float_literal_stays_correctly_rounded_unaffected_by_2936() -> Result<()> {
+    let input = "c: 2.7293109604053567083\nd: \"2.7293109604053567083\"\n";
+    for (filter, want) in [
+        (".c + 0", "2.729310960405357"),
+        (".c * 1", "2.729310960405357"),
+        (".d | tonumber + 0", "2.729310960405357"),
+        (".d | fromjson + 0", "2.729310960405357"),
+        (".c |= . + 0 | .c", "2.729310960405357"),
+        ("[.c, .c + 0] | .[1]", "2.729310960405357"),
+        (".c = 2.7293109604053567083 | .c + 0", "2.729310960405357"),
+        (".f = 2.7293109604053567083 | .f * 1", "2.729310960405357"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}` out={out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    let json = r#"{"a":2.7293109604053567083}"#;
+    for extra in [
+        &["-p", "json", "-o=json", "-I0"][..],
+        &["-p", "json", "-o=yaml"][..],
+    ] {
+        let (out, code) = run_yq_stdin(".a + 0", json, extra)?;
+        assert_eq!(code, 0, "{extra:?}");
+        assert_eq!(out.trim(), "2.729310960405357", "{extra:?}");
+    }
+    // The DOM route `--slurp` takes (`to_owned_canonicalizing_numbers_at_depth`
+    // via `from_number_literal_plain`, and the `YqSemantics` evaluator).
+    let (out, code) = run_yq_stdin(
+        ".[0].a + 0",
+        json,
+        &["-p", "json", "--slurp", "-o=json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2.729310960405357");
+    let (out, code) = run_yq_stdin("2.7293109604053567083 + 0", "", &["-n", "-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2.729310960405357");
+    Ok(())
+}
+
 /// #2259's jq-mode fix (see `jq_cli_tests.rs`) is shared, mode-generic code
 /// (`path_context_component_each`/`path_context_step_getpath`,
 /// `src/jq/eval_generic.rs`), so yq mode gets it too, behind
