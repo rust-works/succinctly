@@ -147,6 +147,16 @@ pub enum NumberRepr {
 /// number string decide between the two representations," shared by
 /// [`OwnedValue::from_number_literal_boxed`], [`OwnedValue::from_number_bytes`],
 /// and `parser.rs`'s `fold_index_key` so they can't silently diverge.
+///
+/// The `f64` arm is the **plain**, correctly-rounded parse -- real yq's
+/// number model (Go's `strconv.ParseFloat`). jq mode reads a literal's
+/// double differently once it carries more than 17 significant digits
+/// (#2936), so every funnel that materializes a literal for the evaluator
+/// goes through [`parse_i64_or_f64_in`] with its mode instead; this
+/// mode-less form is for the callers whose text can never exceed 17
+/// significant digits (a float's own shortest round-trip rendering,
+/// `from_document_float`), yq's own `from_number_literal_plain`, and the
+/// `Literal` constructor tests build with.
 pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     if let Ok(i) = s.parse::<i64>() {
         Some(NumberRepr::Int(i))
@@ -155,6 +165,148 @@ pub(crate) fn parse_i64_or_f64(s: &str) -> Option<NumberRepr> {
     } else {
         None
     }
+}
+
+/// [`parse_i64_or_f64`] under `S`'s number model (#2936): the `Int` arm is
+/// the exact `i64` in both modes (jq widens it through
+/// [`jq_literal_int_to_f64`] only when arithmetic reads it, #2906), and the
+/// `f64` arm -- every fraction, every exponent form, and every integer too
+/// big for `i64` -- is jq's 17-digit-rounded double
+/// ([`jq_literal_text_to_f64`]) when `EvalSemantics::DECNUMBER_LITERALS`
+/// and the plain parse otherwise.
+pub(crate) fn parse_i64_or_f64_in<S: EvalSemantics>(s: &str) -> Option<NumberRepr> {
+    if let Ok(i) = s.parse::<i64>() {
+        return Some(NumberRepr::Int(i));
+    }
+    let f = if S::DECNUMBER_LITERALS {
+        jq_literal_text_to_f64(s)?
+    } else {
+        s.parse::<f64>().ok()?
+    };
+    Some(NumberRepr::Float(f))
+}
+
+/// The number of significant decimal digits in a number literal's text
+/// (leading zeros before the first nonzero digit do not count, trailing
+/// zeros do -- `007.500` is 4, `1e400` is 1, `0.000` is 0), stopping at
+/// the first byte that is not part of the mantissa. Cheap enough to gate
+/// every document number: no allocation, one pass over at most the
+/// mantissa.
+fn significant_digit_count(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut seen_nonzero = false;
+    for &b in text.as_bytes() {
+        match b {
+            b'0' if !seen_nonzero => {}
+            b'0'..=b'9' => {
+                seen_nonzero = true;
+                count += 1;
+            }
+            b'+' | b'-' | b'.' => {}
+            _ => break,
+        }
+    }
+    count
+}
+
+/// Convert a number *literal*'s text to `f64` the way real jq 1.7.1 does
+/// (#2936): the sibling of [`jq_literal_int_to_f64`] for every literal that
+/// is not an exact `i64` -- a fraction, an exponent form, or an integer
+/// past `i64`'s range.
+///
+/// jq keeps the parsed decNumber and converts it to a double only when
+/// something reads it (`jvp_literal_number_to_double`, `src/jv.c`):
+/// `decNumberReduce` under a `DEC_INIT_DECIMAL64` context with `digits`
+/// raised to 17 (`DEC_NUBMER_DOUBLE_PRECISION`, round-half-even),
+/// `decNumberToString`, then a correctly-rounded `strtod`. So the decimal
+/// value is first rounded to 17 significant digits, half-even on the
+/// 18th, and only that shorter number is rounded to the nearest double.
+/// Rust's `str::parse::<f64>` is a single correct rounding of the whole
+/// literal, and the two disagree whenever the 17-digit intermediate sits on
+/// the other side of a double's rounding boundary -- on 2-6% of random
+/// 18-30-digit literals (measured against `/usr/bin/jq` over 4000 seeded
+/// cases, 4000/4000 matching this model):
+///
+/// ```text
+/// 2.7293109604053567083 + 0      jq: 2.7293109604053565    plain: 2.729310960405357
+/// 2.4703282292062327209e-324 + 0 jq: 0                     plain: 5e-324
+/// 1.797693134862315808e308       jq: finite (DBL_MAX)      plain: infinite
+/// ```
+///
+/// A literal with at most 17 significant digits is unchanged by the
+/// intermediate rounding, so it takes the plain parse straight away --
+/// which is nearly every document number. `Emax`/`Emin` of the DECIMAL64
+/// context (`384`/`-383`) are not modelled: every finite double lies inside
+/// that range, and a literal outside it is infinite or zero after the
+/// final parse either way (`1.00000000000000000001e400` and `e-390` are
+/// pinned). Accepts every spelling the literal funnels store, the lenient
+/// ones included (`.5`, `007.5`, `1.e5`, a leading `-`); `None` only when
+/// the text is not a number at all, which no funnel hands it.
+///
+/// Sign-symmetric by construction (the sign is peeled first and re-applied
+/// last), which is what lets the parser's unary-minus fold negate a
+/// rounded magnitude rather than re-round the negated text.
+///
+/// yq mode never calls this: real yq parses with Go's correctly-rounded
+/// `ParseFloat`, which the plain parse already is.
+pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
+    const DOUBLE_PRECISION_DIGITS: usize = 17;
+    if significant_digit_count(text) <= DOUBLE_PRECISION_DIGITS {
+        return text.parse::<f64>().ok();
+    }
+    let (negative, mut digits, mut exponent) = decompose_decimal_literal(text);
+    if digits.len() > DOUBLE_PRECISION_DIGITS {
+        // Round half-even on the 18th digit and everything after it. The
+        // digits carry no trailing zeros (`decompose_decimal_literal`
+        // strips them), so an exact tie is a tail of exactly `5`.
+        let tail = digits.split_off(DOUBLE_PRECISION_DIGITS);
+        exponent += tail.len() as i128;
+        let round_up = match tail[0] {
+            b'6'..=b'9' => true,
+            b'5' => tail.len() > 1 || (digits[DOUBLE_PRECISION_DIGITS - 1] - b'0') % 2 == 1,
+            _ => false,
+        };
+        if round_up {
+            // Propagate the carry; `999…9` becomes `1000…0`, i.e. a single
+            // `1` one place higher.
+            let mut i = digits.len();
+            loop {
+                if i == 0 {
+                    digits.clear();
+                    digits.push(b'1');
+                    exponent += DOUBLE_PRECISION_DIGITS as i128;
+                    break;
+                }
+                i -= 1;
+                if digits[i] == b'9' {
+                    digits[i] = b'0';
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    if digits.is_empty() {
+        return Some(if negative { -0.0 } else { 0.0 });
+    }
+    // `d.ddd…e<exp>`: the exponent of the leading digit is
+    // `exponent + digits.len() - 1`. Clamped far outside any double's
+    // range so the formatting can never fail and the parse saturates to
+    // infinity or zero exactly as `strtod` would.
+    let leading_exponent = (exponent + digits.len() as i128 - 1).clamp(-100_000, 100_000);
+    let mut spelled = String::with_capacity(digits.len() + 12);
+    if negative {
+        spelled.push('-');
+    }
+    spelled.push(digits[0] as char);
+    if digits.len() > 1 {
+        spelled.push('.');
+        spelled.extend(digits[1..].iter().map(|&d| d as char));
+    }
+    spelled.push('e');
+    spelled.push_str(&leading_exponent.to_string());
+    spelled.parse::<f64>().ok()
 }
 
 /// Convert an integer *literal* to `f64` the way real jq 1.7.1 does (#2906).
@@ -5197,6 +5349,150 @@ mod tests {
         format!("{sign}{:.16e}", n.unsigned_abs())
             .parse::<f64>()
             .unwrap()
+    }
+
+    /// #2936: [`jq_literal_text_to_f64`] against `/usr/bin/jq` 1.7.1 on
+    /// 2,015 literals -- `tests/data/jq-literal-17-digit-oracle-2936.tsv`,
+    /// captured as `[.[] | . + 0 | tojson]` over the whole table in one call.
+    /// The rows are seeded random fractions of 18-30 digits, 19-digit
+    /// integers past `i64`, 20-30-digit integers, mantissa+exponent forms
+    /// over `e-320..e300`, a near-tie generator whose 18th-digit tails are
+    /// `5`, `50`, `500001`, `49999`, `5000000000000001`, `51`, `45`, `55`
+    /// (uniform digits almost never produce a tie, so the alphabet is part
+    /// of the claim), and the lenient spellings (`.27…`, `007.29…`, `-2.7…`,
+    /// `9.99999999999999999e5`'s carry, the subnormal tie, the overflow
+    /// boundary, `e400`/`e-390`). jq prints a double with 17 significant
+    /// digits, so parsing its text back gives the exact double it held
+    /// (an infinity is written `inf`/`-inf`, since jq prints one as the
+    /// `DBL_MAX` text).
+    ///
+    /// The plain parse is the known-bad build: it must disagree with jq on
+    /// some rows (it does on 2-6% of random ones), or the table proves
+    /// nothing.
+    #[test]
+    fn test_jq_literal_text_to_f64_matches_jq_oracle_table_2936() {
+        let table = include_str!("../../tests/data/jq-literal-17-digit-oracle-2936.tsv");
+        let mut rows = 0;
+        let mut plain_disagrees = 0;
+        for line in table.lines() {
+            let Some((literal, jq_text)) = line.split_once('\t') else {
+                panic!("malformed oracle row: {line:?}");
+            };
+            rows += 1;
+            // jq prints an infinite double as the `DBL_MAX` text, so the
+            // capture asked `isinfinite` and wrote `inf`/`-inf` for those
+            // rows rather than a text that would parse as finite.
+            let expected: f64 = match jq_text {
+                "inf" => f64::INFINITY,
+                "-inf" => f64::NEG_INFINITY,
+                _ => jq_text
+                    .parse()
+                    .unwrap_or_else(|_| panic!("jq's own output must parse: {jq_text:?}")),
+            };
+            let got = jq_literal_text_to_f64(literal)
+                .unwrap_or_else(|| panic!("{literal:?} must be a number"));
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "{literal}: jq {jq_text}, got {got:e}"
+            );
+            let plain: f64 = literal.parse().unwrap();
+            if plain.to_bits() != expected.to_bits() {
+                plain_disagrees += 1;
+            }
+            // Sign symmetry: the negated text is the negated double.
+            if !literal.starts_with('-') {
+                let negated = format!("-{literal}");
+                assert_eq!(
+                    jq_literal_text_to_f64(&negated).map(f64::to_bits),
+                    Some((-got).to_bits()),
+                    "{negated}"
+                );
+            }
+            // The mode split: jq's parse is this helper, yq's is the plain one.
+            assert_eq!(
+                parse_i64_or_f64_in::<JqSemantics>(literal),
+                Some(match literal.parse::<i64>() {
+                    Ok(i) => NumberRepr::Int(i),
+                    Err(_) => NumberRepr::Float(got),
+                }),
+                "{literal}"
+            );
+            assert_eq!(
+                parse_i64_or_f64_in::<YqSemantics>(literal),
+                parse_i64_or_f64(literal),
+                "{literal}"
+            );
+        }
+        assert!(rows > 2000, "oracle table too small: {rows}");
+        assert!(
+            plain_disagrees > 40,
+            "the table must separate the plain parse from jq's ({plain_disagrees} rows do)"
+        );
+    }
+
+    /// #2936: the hand-checked rows, each captured from jq 1.7.1, and the
+    /// fast path's identity on every literal of at most 17 significant
+    /// digits.
+    #[test]
+    fn test_jq_literal_text_to_f64_rows_2936() {
+        for (literal, expected) in [
+            ("2.7293109604053567083", 2.7293109604053565),
+            ("869389897822472004.9", 869389897822471936.0),
+            ("99999999999999999999", 1e20),
+            ("9.99999999999999999e5", 1000000.0),
+            ("9.999999999999999950e22", 1e23),
+            ("2.4703282292062327209e-324", 0.0),
+            ("1.797693134862315808e308", f64::MAX),
+            ("1.00000000000000000001e400", f64::INFINITY),
+            ("1.00000000000000000001e-390", 0.0),
+            (
+                "0.00000000000000000000000000001234567890123456789",
+                1.2345678901234569e-29,
+            ),
+            (".27293109604053567083", 0.27293109604053567),
+            ("007.29310960405356708", 7.2931096040535675),
+            ("1.e5", 1e5),
+            ("-.5", -0.5),
+            ("0", 0.0),
+            ("-0", -0.0),
+            ("0.000", 0.0),
+            ("1e400", f64::INFINITY),
+        ] {
+            let got = jq_literal_text_to_f64(literal).unwrap();
+            assert_eq!(got.to_bits(), expected.to_bits(), "{literal}: got {got:e}");
+        }
+        for short in [
+            "0",
+            "1",
+            "-1",
+            "1.5",
+            "1.500",
+            "12345678901234567",
+            "1.2345678901234567",
+            "0.1",
+            "1e10",
+            "1E+10",
+            "-1.5e-3",
+            "9007199254740993",
+            "123456789012345678",
+            "999999999999999999",
+            "0.5000000000000000",
+            "3.141592653589793",
+        ] {
+            assert_eq!(
+                jq_literal_text_to_f64(short).map(f64::to_bits),
+                Some(short.parse::<f64>().unwrap().to_bits()),
+                "{short} has at most 17 significant digits and must take the plain parse"
+            );
+        }
+        assert_eq!(significant_digit_count("007.500"), 4);
+        assert_eq!(significant_digit_count("1e400"), 1);
+        assert_eq!(significant_digit_count("0.000"), 0);
+        assert_eq!(significant_digit_count("-.5"), 1);
+        assert_eq!(significant_digit_count("123456789012345678"), 18);
+        assert_eq!(jq_literal_text_to_f64("abc"), None);
+        assert_eq!(jq_literal_text_to_f64(""), None);
     }
 
     /// #2906: property check of [`jq_literal_int_to_f64`] over seeded
