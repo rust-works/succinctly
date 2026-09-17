@@ -46128,8 +46128,8 @@ fn test_yq_large_int_arith_stays_exact_unaffected_by_2906() -> Result<()> {
     Ok(())
 }
 
-/// #2936's fix (jq mode only, see `jq_cli_tests.rs`) rounds a
-/// >17-significant-digit *float* literal to 17 digits before the double
+/// #2936's fix (jq mode only, see `jq_cli_tests.rs`) rounds a *float*
+/// literal of more than 17 significant digits to 17 before the double
 /// conversion, through the number-materialisation funnels shared by both
 /// modes (`OwnedValue::from_number_bytes::<S>` and friends). Real yq parses
 /// with Go's correctly-rounded `ParseFloat`, so every row here must keep

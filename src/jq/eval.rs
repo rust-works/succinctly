@@ -54172,7 +54172,8 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// `shuffle` - fallback when cli feature is not enabled
 #[cfg(not(feature = "cli"))]
-fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
+#[allow(clippy::extra_unused_type_parameters)] // mirrors the `cli` signature, which reads `S`
+fn builtin_shuffle<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {

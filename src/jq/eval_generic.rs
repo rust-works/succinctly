@@ -3259,7 +3259,7 @@ fn fold_generic_owned_values<V: DocumentValue, S: EvalSemantics>(
         // `GenericResult::Error` arm below already forwards (#1247).
         GenericResult::One(v) => push(push_or_control!(to_owned::<S, _>(&v)), None),
         GenericResult::OneCursor(c) => {
-            push(push_or_control!(to_owned_cursor::<S, _>(&c)), Some(&c))
+            push(push_or_control!(to_owned_cursor::<S, _>(&c)), Some(&c));
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -20550,8 +20550,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // reported alongside. Same reasoning as
                     // `fold_pipe_stages`' own conversion arms.
                     let prefix: Vec<OwnedValue> = match cursor {
-                        // STYLE-0012: `Partial` prefix -- see the comment above the `match`.
                         Some(c) => {
+                            // STYLE-0012: `Partial` prefix -- see the comment above the `match`.
                             owned_or_err!(core::iter::repeat_with(|| to_owned_cursor::<S, _>(&c))
                                 .take(truthy_count)
                                 .collect::<Result<Vec<_>, _>>())
@@ -30158,7 +30158,7 @@ mod tests {
                     // `One` — see the `Builtin::Select` cursor-forwarding
                     // fix in `eval_builtin`.
                     GenericResult::OneCursor(c) => {
-                        results.push(to_owned_cursor::<JqSemantics, _>(&c).unwrap())
+                        results.push(to_owned_cursor::<JqSemantics, _>(&c).unwrap());
                     }
                     GenericResult::Owned(o) => results.push(o),
                     GenericResult::None => {} // Filtered out
