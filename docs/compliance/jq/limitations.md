@@ -5013,13 +5013,22 @@ Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by
 `test_closed_terms_do_not_validate_2173` (`IN(1, 2)` is deliberately *not* a closed term
 there: it reads `.`).
 
-**Residue.** `cond` stands at each `gen` output's position, which the constant rewriter
-cannot spell as the stage's own, so `path_context_resolvable` refuses a read inside `cond`
-and the routes that depend on that rewrite — `map_values(any(.; key == "c"))`, `.aa[] |=
-any(.; key == "c")`, `with_entries(.value |= any(.; key == "c"))` — still evaluate it with
-no position and answer `false` where the direct spelling `[.[] | any(.; key == "c")]`
-answers `[false,true]`. Pre-existing (the same routes answered the same before #2968) and
-tracked as [#3079](https://github.com/rust-works/succinctly/issues/3079).
+**A read inside `cond` on the rewrite routes (#3079).** `cond` stands at each `gen`
+output's position, which the constant rewriter cannot in general spell as the stage's
+own, so #2968 left `map_values(any(.; key == "c"))` and `.aa[] |= any(.; key == "c")`
+answering `false` where the direct spelling answers `[false,true]`.
+[#3079](https://github.com/rust-works/succinctly/issues/3079) closes that three ways: when
+`gen` is an identity passthrough (`.`, and `is_identity_passthrough`'s other spellings) the
+rewrite *can* express `cond`'s reads, so every rewrite route resolves them; the owned
+identity pipe (the `map_values`/`map`/`with_entries` positioned route) runs a navigating
+`gen` natively, probing `cond` from each `(value, identity)` pair
+(`eval_owned_identity_any_all`); and a rewrite route that can prefetch through that pipe
+(interpolation, an assignment's right side) does so for the navigating shape too. What
+remains is the one route with neither: a `|=` filter whose `gen` navigates and whose
+`cond` reads — `.aa |= any(.[]; key == "c")` answers `{"aa":false}` where the members'
+keys say `true`. `.aa |= any(.; key == "aa")` is resolved. Note `with_entries(.value |= any(.;
+key == "value"))`: the entry is `{key, value}`, so `key` there is `"value"` — real yq
+answers `with_entries(.value |= key)` the same way.
 
 Two further behaviours moved with the route, both toward jq: the `any`/`all` probe now stops
 `cond` at its first decisive output on both evaluators, so `[any(1; (true, ("C"|stderr)))]`
