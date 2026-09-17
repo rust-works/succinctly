@@ -2338,6 +2338,24 @@ fn report_unresolved_call(
     }
 }
 
+/// Print one "`header` is not defined"-shaped compile-error line against
+/// `source`, given the site's byte offset if a table lookup found one -- the
+/// print body [`report_unbound_var`] and [`report_unresolved_label`] both
+/// need, shared so a format change (added column info, a third line, a
+/// different caret style) has exactly one definition to update.
+fn report_site_error(header: &str, location: &str, source: &str, offset: Option<usize>) {
+    match offset {
+        Some(offset) => {
+            let (line_no, line_text, column) = line_at_offset(source, offset);
+            eprintln!("jq: error: {header} is not defined at {location}, line {line_no}:");
+            eprintln!("{line_text}{}", " ".repeat(column));
+        }
+        None => {
+            eprintln!("jq: error: {header} is not defined at {location}");
+        }
+    }
+}
+
 /// Report one unbound `$name` against `source` (the main filter, or a
 /// module's own text), at its `taken`-th recorded site -- the variable twin
 /// of [`report_unresolved_call`].
@@ -2356,18 +2374,15 @@ fn report_unbound_var(
     var_sites: &[jq::VarSite],
     taken: &mut usize,
 ) {
-    let site = var_sites.iter().filter(|v| v.name == name).nth(*taken);
-    match site {
-        Some(site) => {
-            *taken += 1;
-            let (line_no, line_text, column) = line_at_offset(source, site.offset);
-            eprintln!("jq: error: ${name} is not defined at {location}, line {line_no}:");
-            eprintln!("{line_text}{}", " ".repeat(column));
-        }
-        None => {
-            eprintln!("jq: error: ${name} is not defined at {location}");
-        }
+    let offset = var_sites
+        .iter()
+        .filter(|v| v.name == name)
+        .nth(*taken)
+        .map(|v| v.offset);
+    if offset.is_some() {
+        *taken += 1;
     }
+    report_site_error(&format!("${name}"), location, source, offset);
 }
 
 /// Report one out-of-scope `break $name` against `source` (the main filter,
@@ -2386,20 +2401,12 @@ fn report_unresolved_label(
     break_sites: &[jq::BreakSite],
     occurrence: usize,
 ) {
-    let site = break_sites
+    let offset = break_sites
         .iter()
         .filter(|b| b.name == name)
-        .nth(occurrence);
-    match site {
-        Some(site) => {
-            let (line_no, line_text, column) = line_at_offset(source, site.offset);
-            eprintln!("jq: error: $*label-{name} is not defined at {location}, line {line_no}:");
-            eprintln!("{line_text}{}", " ".repeat(column));
-        }
-        None => {
-            eprintln!("jq: error: $*label-{name} is not defined at {location}");
-        }
-    }
+        .nth(occurrence)
+        .map(|b| b.offset);
+    report_site_error(&format!("$*label-{name}"), location, source, offset);
 }
 
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {

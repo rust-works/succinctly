@@ -1375,20 +1375,25 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
     )
 }
 
-/// Whether `$name` resolves against `var_scope`, innermost first, stopping
-/// at the same module-scope floor as [`in_scope`] (#2962): a `$`-parameter
-/// of the def a dependency is spliced into is not the dependency's to see.
-fn in_var_scope(var_scope: &VarScope, name: &str) -> ScanResult<()> {
-    scan_scope(var_scope, String::as_str, |n| (n == name).then_some(()))
+/// Whether `name` resolves against a plain name-stack scope (`VarScope` or
+/// `LabelScope`, both bare `Vec<String>`), innermost first, stopping at the
+/// same module-scope floor as [`in_scope`] (#2962) — the shared lookup body
+/// [`in_var_scope`] and [`in_label_scope`] both wrap, so a change to how
+/// name-stack lookups work has exactly one definition to update.
+fn in_name_scope(scope: &[String], name: &str) -> ScanResult<()> {
+    scan_scope(scope, String::as_str, |n| (n == name).then_some(()))
 }
 
-/// Whether `$*label-name` resolves against `label_scope`, innermost first,
-/// stopping at the same module-scope floor as [`in_var_scope`] —
-/// [`in_var_scope`]'s sibling for labels (#2964), sharing the same
-/// `scan_scope` this file's other two lookups go through rather than a
-/// hand-rolled linear scan.
+/// [`in_name_scope`] for `$name` against `var_scope`: a `$`-parameter of the
+/// def a dependency is spliced into is not the dependency's to see.
+fn in_var_scope(var_scope: &VarScope, name: &str) -> ScanResult<()> {
+    in_name_scope(var_scope, name)
+}
+
+/// [`in_name_scope`] for `$*label-name` against `label_scope` —
+/// [`in_var_scope`]'s sibling for labels (#2964).
 fn in_label_scope(label_scope: &LabelScope, name: &str) -> ScanResult<()> {
-    scan_scope(label_scope, String::as_str, |n| (n == name).then_some(()))
+    in_name_scope(label_scope, name)
 }
 
 /// The innermost module run enclosing this point in `label_scope`,
@@ -1406,6 +1411,42 @@ fn enclosing_run(label_scope: &LabelScope) -> Option<u32> {
     scan_scope(label_scope, String::as_str, |_| None::<()>)
         .run
         .map(|(id, _)| id)
+}
+
+/// #2964: the compile-time label-scope check for one `break $name` site,
+/// shared by the bare [`Expr::Break`] arm and the `FuncCall` shadowed-`error`
+/// pre-check (which re-examines a break the shadowing branch would otherwise
+/// discard) — both need the identical bump-the-occurrence-counter-then-check
+/// sequence, and having two copies invites them drifting apart silently
+/// (this file's own [`scan_scope`] doc comment warns about exactly that
+/// failure mode, citing #106).
+fn check_break(
+    name: &str,
+    label_scope: &LabelScope,
+    errors: &mut Vec<ResolveError>,
+    break_occurrences: &mut BTreeMap<(Option<u32>, String), usize>,
+) {
+    // `enclosing_run` regardless of whether this break resolves -- both a
+    // bound and an unbound break consume a slot in their own origin's
+    // counter, mirroring how every break (bound or not) occupies a slot in
+    // that origin's own `collect_break_sites` table.
+    let origin = enclosing_run(label_scope);
+    let n = break_occurrences
+        .entry((origin, name.to_string()))
+        .or_insert(0);
+    let occurrence = *n;
+    *n += 1;
+    // Label scope is determined at the break's *own* lexical position -- a
+    // `label $x` only covers nodes nested inside its body, not siblings of
+    // that body. `label_scope` is a stack pushed/popped by the `Label` arm,
+    // so this check sees only genuinely enclosing labels.
+    if in_label_scope(label_scope, name).hit.is_none() {
+        errors.push(ResolveError::Break(UnresolvedLabel {
+            name: name.to_string(),
+            occurrence,
+            origin,
+        }));
+    }
 }
 
 /// A pattern's computed keys (`{(EXPR): P}`, #2677) are ordinary
@@ -1771,29 +1812,7 @@ fn check(
         // exact same class `CallSite`/`VarSite` already record for
         // calls/variables.
         Expr::Break(name) => {
-            // `enclosing_run` regardless of whether this break resolves --
-            // both a bound and an unbound break consume a slot in their own
-            // origin's counter, mirroring how every break (bound or not)
-            // occupies a slot in that origin's own `collect_break_sites`
-            // table.
-            let origin = enclosing_run(label_scope);
-            let n = break_occurrences
-                .entry((origin, name.clone()))
-                .or_insert(0);
-            let occurrence = *n;
-            *n += 1;
-            // Label scope is determined at the break's *own* lexical
-            // position — a `label $x` only covers nodes nested inside its
-            // body, not siblings of that body. `label_scope` is a stack
-            // pushed/popped by the `Label` arm below, so this check sees
-            // only genuinely enclosing labels.
-            if in_label_scope(label_scope, name).hit.is_none() {
-                errors.push(ResolveError::Break(UnresolvedLabel {
-                    name: name.clone(),
-                    occurrence,
-                    origin,
-                }));
-            }
+            check_break(name, label_scope, errors, break_occurrences);
         }
 
         // #2734: the leaf this whole pass exists to add. `$ENV`/`$__loc__`
@@ -2212,19 +2231,7 @@ fn check(
                     // `$*label-x is not defined`, rc=3 (confirmed live).
                     // Check BEFORE discarding.
                     if let Expr::Break(ref name) = *fallback {
-                        let origin = enclosing_run(label_scope);
-                        let n = break_occurrences
-                            .entry((origin, name.clone()))
-                            .or_insert(0);
-                        let occurrence = *n;
-                        *n += 1;
-                        if in_label_scope(label_scope, name).hit.is_none() {
-                            errors.push(ResolveError::Break(UnresolvedLabel {
-                                name: name.clone(),
-                                occurrence,
-                                origin,
-                            }));
-                        }
+                        check_break(name, label_scope, errors, break_occurrences);
                     }
                     *args = builtin_fallback_into_args(*fallback);
                     cloned_from.map(|from| {
