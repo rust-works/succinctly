@@ -1597,8 +1597,14 @@ error("late")))` is `Error: late` here and in real yq, which discards a failing 
 prefix ([#2326](https://github.com/rust-works/succinctly/issues/2326)) — reached one construct
 over: `cond` is now evaluated at the `gen` output's own position, on that route. A bare
 `cond` generator (`any(.[]; (true, error("late")))`) still answers `[true]`, exactly as
-`first((true, error("late")))` does: the same split `first` already has. The 99-row
-must-not-change sweep behind the PR found no other yq-mode row that moved.
+`first((true, error("late")))` does: the same split `first` already has.
+
+`skip` moved in the same direction, and further: its kept outputs are now the cursors its
+body produced rather than owned copies, so `skip(0; .)` keeps comments and anchors, `skip(0;
+.b) | tag` on an alias answers `""` as `.b | tag` does, and `[skip(0; .[] | (., . * 2))]` is
+`[1,2,3,2,4,6]` — the cursor route's (and real yq's) `[.[] | (., . * 2)]` order, where the
+owned route interleaved `[1,2,2,4,3,6]`. Every row that moved in yq mode moved to what the
+same expression already answered without the consumer around it.
 
 ### Residues
 
