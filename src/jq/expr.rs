@@ -1760,7 +1760,9 @@ pub enum Builtin {
     Builtins,
     /// `normals` - select only normal numbers (not zero, infinite, NaN, or subnormal)
     Normals,
-    /// `finites` - select only finite numbers (not infinite or NaN)
+    /// `finites` - select only non-infinite numbers (#3071: NaN passes
+    /// through, matching jq's own `select(isinfinite | not)`; not symmetric
+    /// with `normals` above, which does exclude NaN)
     Finites,
 
     // Phase 13: Iteration control

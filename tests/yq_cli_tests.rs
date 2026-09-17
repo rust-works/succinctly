@@ -34202,6 +34202,43 @@ fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
     Ok(())
 }
 
+/// #3071 (code review): `gmtime`/`localtime`'s seconds slot is now a genuine
+/// computed `f64` (needed to keep a NaN or fractional input, matching jq's
+/// own `tm2jv`), not an `OwnedValue::Int` -- so a whole-second timestamp's
+/// seconds slot now prints with yq's own float spelling (`0.0`/`!!float 0`)
+/// instead of collapsing to a bare `0`. This is *not* a succinctly quirk:
+/// it's the same convention yq already applies to every other computed
+/// float (`. + 0.0` prints `5.0` in real yq v4.53.3 too, confirmed live) --
+/// `gmtime` itself has no real-yq counterpart to match either way (gated
+/// behind `--jq-extensions`, #1907), so this pins the now-correct,
+/// internally-consistent shape rather than the pre-fix `0` that silently
+/// hid the seconds slot's real type.
+#[test]
+fn test_gmtime_localtime_seconds_slot_is_yq_float_shaped_3071() -> Result<()> {
+    let (out, code) = run_yq_stdin("gmtime", "0\n", &["--jq-extensions", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1970,0,1,0,0,0.0,4,0]");
+
+    let (out, code) = run_yq_stdin("gmtime", "0\n", &["--jq-extensions"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "- 1970\n- 0\n- 1\n- 0\n- 0\n- !!float 0\n- 4\n- 0"
+    );
+
+    // A NaN input still serializes its seconds slot as `null`/`~`, same as
+    // every other NaN this evaluator computes.
+    let (out, code) = run_yq_stdin(
+        "nan | gmtime",
+        "null\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1970,0,1,0,0,null,4,0]");
+
+    Ok(())
+}
+
 /// #3068 review: `from_unix` used to delegate straight to `builtin_todate`,
 /// which was harmless while `todate` was numeric-only. #3068 made `todate`
 /// also accept an 8-element broken-down-time array (matching real jq's
