@@ -46826,19 +46826,22 @@ fn test_break_in_included_module_names_its_own_file_2964() -> Result<()> {
 /// misattributed at least one of the two positions).
 ///
 /// The `jq: 2 compile errors` this pins is itself a *known, pre-existing*
-/// divergence from the oracle, not something #2964 verifies or introduces:
-/// confirmed live, `/usr/bin/jq` reports only **1** compile error for this
-/// exact program -- a main-body compile error suppresses a def-body one
-/// entirely, a gap already recorded (generically, for Call/Var too) in
+/// characterized bug, not something #2964 verifies or introduces: confirmed
+/// live, `/usr/bin/jq` reports only **1** compile error for this exact
+/// program -- a main-body compile error suppresses a def-body one entirely,
+/// a gap already recorded (generically, for Call/Var too) in
 /// `docs/compliance/jq/limitations.md`'s "Module-scope gaps that are
 /// genuinely open" section ("a main-*body* error suppresses def errors
 /// entirely"). This test's own job is the occurrence-counter/module-
 /// attribution claim above, not the error *count* -- the count is pinned
-/// as-is (2, matching succinctly's honest behavior) so a future change
-/// can't silently regress the counter claim without this test noticing,
-/// not because 2 is the oracle-correct answer.
+/// as-is (2, matching succinctly's honest behavior, verified identical
+/// before and after #2964's own dedup refactor) so a future change can't
+/// silently regress the counter claim without this test noticing, not
+/// because 2 is the oracle-correct answer. If the main-body/def-body
+/// suppression gap is ever closed, update this test's expected count to 1.
 #[test]
-fn test_break_occurrence_counters_do_not_cross_module_boundaries_2964() -> Result<()> {
+fn test_break_occurrence_counters_do_not_cross_module_boundaries_characterize_preexisting_error_count_bug_2964(
+) -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     std::fs::write(temp_dir.path().join("mymod.jq"), "def f: break $x;\n")?;
 
