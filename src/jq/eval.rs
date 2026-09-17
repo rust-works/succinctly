@@ -15949,6 +15949,18 @@ fn yq_parse_int64(s: &str) -> Option<i64> {
     }
 }
 
+/// Strips a single leading `+`/`-`, shared by every yq-float-grammar site
+/// below that needs to know the sign separately from the unsigned body
+/// (`yq_parse_float`'s hex-prefix check, `yq_float_special`'s `inf`/
+/// `infinity` check, `parse_hex_float_exponent`'s exponent sign).
+fn strip_sign(s: &str) -> (bool, &str) {
+    match s.as_bytes().first() {
+        Some(b'+') => (false, &s[1..]),
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    }
+}
+
 /// yq's float stage: Go's `ParseFloat` on the *original*, unstripped string
 /// (no blanket underscore removal the way the int stage above does).
 fn yq_parse_float(s: &str) -> Option<f64> {
@@ -15961,11 +15973,7 @@ fn yq_parse_float(s: &str) -> Option<f64> {
     if !yq_underscore_ok(s) {
         return None;
     }
-    let (neg, body) = match s.as_bytes().first() {
-        Some(b'+') => (false, &s[1..]),
-        Some(b'-') => (true, &s[1..]),
-        _ => (false, s),
-    };
+    let (neg, body) = strip_sign(s);
     if body.len() > 1 && body.as_bytes()[0] == b'0' && matches!(body.as_bytes()[1], b'x' | b'X') {
         return yq_parse_hex_float(&body[2..], neg);
     }
@@ -16004,11 +16012,7 @@ fn yq_float_special(s: &str) -> Option<f64> {
     if s.eq_ignore_ascii_case("nan") {
         return Some(f64::NAN);
     }
-    let (neg, body) = match s.as_bytes().first() {
-        Some(b'+') => (false, &s[1..]),
-        Some(b'-') => (true, &s[1..]),
-        _ => (false, s),
-    };
+    let (neg, body) = strip_sign(s);
     if body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity") {
         return Some(if neg {
             f64::NEG_INFINITY
@@ -16119,10 +16123,13 @@ fn yq_parse_hex_float(rest: &str, neg: bool) -> Option<f64> {
     let frac_len = frac_digits.len() as i64;
     let total_exp2 = exp_value.saturating_sub(frac_len.saturating_mul(4));
 
-    // Far beyond f64's real +-1075 exponent range -- clamps the bignum
-    // scaling loop below to bounded work regardless of how large a
-    // caller-supplied `p` exponent claims to be.
-    const EXP2_CLAMP: i64 = 5000;
+    // A comfortable margin over f64's real +-1075 exponent range -- clamps
+    // the bignum scaling loop below (worst case ~`EXP2_CLAMP` iterations,
+    // each an O(digits) pass over a growing `Vec<u8>`) to bounded work
+    // regardless of how large a caller-supplied `p` exponent claims to be,
+    // while staying tight enough that a crafted `"0x1p<near-clamp>"` input
+    // can't force a needlessly expensive single `tonumber` call.
+    const EXP2_CLAMP: i64 = 1100;
     if total_exp2 > EXP2_CLAMP {
         return None; // definite overflow
     }
@@ -16153,16 +16160,12 @@ fn yq_parse_hex_float(rest: &str, neg: bool) -> Option<f64> {
 /// absurdly long digit run (`yq_parse_hex_float`'s clamp handles the
 /// resulting magnitude either way).
 fn parse_hex_float_exponent(exp_part: &str) -> Option<i64> {
-    let (sign, digits): (i64, &str) = match exp_part.as_bytes().first() {
-        Some(b'+') => (1, &exp_part[1..]),
-        Some(b'-') => (-1, &exp_part[1..]),
-        _ => (1, exp_part),
-    };
+    let (neg, digits) = strip_sign(exp_part);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let magnitude = digits.parse::<i64>().unwrap_or(i64::MAX);
-    Some(sign.saturating_mul(magnitude))
+    Some(if neg { -magnitude } else { magnitude })
 }
 
 /// Little-endian decimal-digit bignum (`bn[0]` is the ones digit), just
