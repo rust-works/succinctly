@@ -20448,11 +20448,12 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             match at.prefetch {
                 Some(prefetch) => prefetched_literal(prefetch(expr)?),
                 None => {
+                    // omni-dev: coverage tolerate-line reason="unreachable by construction: path_context_resolvable admits an any(cond) read only through admits.prefetch, so the rewriter always has one -- the AnyCond arm above carries the identical assertion (#3079)"
                     debug_assert!(
                         false,
-                        "path_context_resolvable refuses an any(cond) read without a prefetch"
-                    );
-                    expr.clone()
+                        "any(cond) read reached the rewriter without a prefetch"
+                    ); // omni-dev: coverage tolerate-line reason="unreachable by construction, see above"
+                    expr.clone() // omni-dev: coverage tolerate-line reason="unreachable by construction, see above"
                 }
             }
         }
@@ -25962,7 +25963,8 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             let target_truthy = matches!(stage, Expr::Builtin(Builtin::AnyF(_)));
             if !matches!(&*value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
                 if optional {
-                    return Flow::Exhausted;
+                    // omni-dev: coverage tolerate-line reason="optional is never true through this pipe: `?` is eval_owned_identity_try, which catches the escape instead, and after #693 only the IndexExpr/SliceExpr special case ever sets it -- kept as any_all_f's scalar_fallback mirror"
+                    return Flow::Exhausted; // omni-dev: coverage tolerate-line reason="optional is never true here, see above"
                 }
                 return Flow::Escaped(Control::Error(EvalError::cannot_iterate_with(
                     S::TAG,

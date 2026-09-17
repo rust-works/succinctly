@@ -60399,6 +60399,68 @@ fn test_any_all_cond_while_until_native_arms_match_jq_2658() -> Result<()> {
             "[.[] | isvalid(key), key]",
             "[true,\"b\",true,\"d\"]",
         ),
+        // The same reads as top-level pipe stages, on the absent route, and
+        // on the prefetch routes (an assignment's right side, interpolation).
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            "[.[] | until(key == \"c\"; .c) | key]",
+            "[\"c\",\"c\"]",
+        ),
+        (
+            "{\"b\":{\"c\":1}}",
+            "[.nope | until(true; .) | key]",
+            "[\"nope\"]",
+        ),
+        (
+            "{\"b\":{\"c\":1}}",
+            "[.[] | until(true; .) | key]",
+            "[\"b\"]",
+        ),
+        ("{\"b\":{\"c\":1}}", "[.[] | any(true) | not]", "[false]"),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            ".bbb = any(key == \"b\") | .bbb",
+            "true",
+        ),
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            "\"\\(any(key == \"b\"))-\\(all(key == \"b\"))\"",
+            "\"true-false\"",
+        ),
+        // Recorded gap (#3079's class, `docs/compliance/jq/limitations.md`):
+        // a `cond` the owned identity pipe cannot run itself (`until`) makes
+        // it decline the stage, which falls to the no-cursor evaluator and
+        // reads `key` as `null`. Pinned so a change here is noticed.
+        (
+            "{\"b\":{\"c\":1},\"d\":{\"c\":2}}",
+            "map_values(any(until(true; key) == \"c\"))",
+            "{\"b\":false,\"d\":false}",
+        ),
+        // Escapes raised while a loop forks: a `cond` output or an `update`
+        // output whose buffered computation fails (`[1/0]` is a `LazySeq`),
+        // and an `update` that errors after a first output under a
+        // multi-output `cond` (the non-fast-path branch).
+        ("0", "try until([1/0]; .) catch \"c\"", "\"c\""),
+        ("0", "try [until(false; [1/0])] catch \"c\"", "\"c\""),
+        (
+            "0",
+            "try [until((.>0, .>0); (.+1, error(\"x\")))] catch .",
+            "\"x\"",
+        ),
+        // A downstream stop reaching a branch that forked.
+        ("0", "first(until(.>2; (.+1, .+2)))", "3"),
+        ("0", "first(until((.>1,.>3); .+1))", "2"),
+        ("0", "first(while((.<2,.<1); .+1))", "0"),
+        // Every item shape an `update` can hand the next state: a key with
+        // its value already decoded (`keys_unsorted[]`), a lazy key list
+        // (`keys`), a lazy array construction (`[..]`).
+        (
+            "{\"a\":1}",
+            "until(type == \"string\"; keys_unsorted[])",
+            "\"a\"",
+        ),
+        ("{\"a\":1}", "until(type == \"array\"; keys)", "[\"a\"]"),
+        ("[1,2]", "until(length == 1; [.[1:][]])", "[2]"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
         assert_eq!(code, 0, "cursor route `{filter}` on {input}: {stderr}");
@@ -60487,6 +60549,51 @@ fn test_isvalid_native_arm_matches_eager_rules_2658() -> Result<()> {
         let (stdout, stderr, code) = run_jq_stdin_streams(&owned, "", &["-nc"])?;
         assert_eq!(code, 0, "owned route `{owned}`: {stderr}");
         assert_eq!(stdout.trim(), want, "owned route `{owned}`");
+    }
+
+    // #1309: with a live input queue, an argument that reads `input` still
+    // crosses to `eval.rs` (its `Builtin::Inputs` arm lives there), on the
+    // streaming route and the collecting one alike -- for all five
+    // constructs. `isvalid(input | until(false; . + 1))` reaches the eager
+    // `builtin_isvalid` with the loop's uncatchable step-cap raise, which
+    // passes through it as on the generic route.
+    for (input, filter, want) in [
+        ("[1]\n2\n", "any(. == input)", "false"),
+        ("[1]\n2\n", "all(. == input)", "false"),
+        ("[1]\n1\n", "{v: any(. == input)}", "{\"v\":true}"),
+        ("0\n7\n", "until(. == 7; input)", "7"),
+        ("0\n7\n", "[while(. != 7; input)]", "[0]"),
+        ("0\n7\n", "{v: until(. == 7; input)}", "{\"v\":7}"),
+        ("1\n2\n", "isvalid(input)", "true"),
+        ("1\n2\n", "{v: isvalid(input)}", "{\"v\":true}"),
+        ("[]\n", "isvalid(.[] | input)", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {input:?}: {stderr}");
+        assert_eq!(stdout.trim(), want, "`{filter}` on {input:?}");
+    }
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("isvalid(input | until(false; . + 1))", "0\n0\n", &["-c"])?;
+    assert_eq!((stdout.trim(), code), ("", 5), "{stderr}");
+    assert!(
+        stderr.contains("until: maximum iterations exceeded"),
+        "{stderr:?}"
+    );
+
+    // #2594's stray-comma and #1194's malformed-member checks ride the
+    // element walk, as `.[]`'s own arm has them.
+    for (input, filter, want) in [
+        ("[,]", "any(true)", "expected JSON value, found ','"),
+        ("{,}", "all(false)", "expected string key, found ','"),
+        ("{\"a\" 1}", "any(true)", "expected ':', found '1'"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            ("", 5),
+            "`{filter}` on {input}: {stderr}"
+        );
+        assert!(stderr.contains(want), "`{filter}` on {input}: {stderr:?}");
     }
 
     // #791: `halt` inside `isvalid` exits the process, it is never `true`.
