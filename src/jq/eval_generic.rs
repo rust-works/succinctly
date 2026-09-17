@@ -21897,6 +21897,9 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Atan
             | Builtin::Atan2(..)
             | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::Libm2(..)
+            | Builtin::Libm3(..)
             | Builtin::BSearch(_)
             | Builtin::Booleans
             | Builtin::Ceil

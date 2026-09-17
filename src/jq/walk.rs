@@ -141,6 +141,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Asinh
         | Builtin::Acosh
         | Builtin::Atanh
+        | Builtin::Libm1(_)
         | Builtin::Infinite
         | Builtin::Nan
         | Builtin::IsInfinite
@@ -291,10 +292,13 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::SplitRegex(a, b)
         | Builtin::SplitsFlags(a, b)
         | Builtin::Skip(a, b)
-        | Builtin::AtPosition(a, b) => BuiltinKids::Two(a, b),
+        | Builtin::AtPosition(a, b)
+        | Builtin::Libm2(_, a, b) => BuiltinKids::Two(a, b),
 
-        // --- Three sub-expressions (2) -------------------------------------
-        Builtin::SubFlags(a, b, c) | Builtin::GsubFlags(a, b, c) => BuiltinKids::Three(a, b, c),
+        // --- Three sub-expressions (3) -------------------------------------
+        Builtin::SubFlags(a, b, c) | Builtin::GsubFlags(a, b, c) | Builtin::Libm3(_, a, b, c) => {
+            BuiltinKids::Three(a, b, c)
+        }
     }
 }
 
@@ -445,6 +449,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::Asinh
         | Builtin::Acosh
         | Builtin::Atanh
+        | Builtin::Libm1(_)
         | Builtin::Infinite
         | Builtin::Nan
         | Builtin::IsInfinite
@@ -580,6 +585,10 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::SetPath(a, b) => Builtin::SetPath(Box::new(f(a)), Box::new(f(b))),
         Builtin::Pow(a, b) => Builtin::Pow(Box::new(f(a)), Box::new(f(b))),
         Builtin::Atan2(a, b) => Builtin::Atan2(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Libm2(g, a, b) => Builtin::Libm2(*g, Box::new(f(a)), Box::new(f(b))),
+        Builtin::Libm3(g, a, b, c) => {
+            Builtin::Libm3(*g, Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
+        }
         Builtin::Limit(a, b) => Builtin::Limit(Box::new(f(a)), Box::new(f(b))),
         Builtin::NthStream(a, b) => Builtin::NthStream(Box::new(f(a)), Box::new(f(b))),
         Builtin::TestFlags(a, b) => Builtin::TestFlags(Box::new(f(a)), Box::new(f(b))),
@@ -1672,6 +1681,9 @@ fn stage_escapes_own_input(expr: &Expr) -> bool {
             | Builtin::Asinh
             | Builtin::Acosh
             | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::Libm2(..)
+            | Builtin::Libm3(..)
             | Builtin::Infinite
             | Builtin::Nan
             | Builtin::IsInfinite
@@ -2207,6 +2219,7 @@ mod tests {
             "INDEX(inputs; .)",   // UpperIndexStream(source, key)
             "IN(inputs; .)",      // UpperInSrc(source, target)
             "setpath([0]; 1)",    // SetPath(path, value)
+            "ldexp(2; 3)",        // Libm2(Ldexp, a, b) (#3042)
         ];
         for filter in two_field_cases {
             let builtin = find_builtin(filter);
@@ -2225,6 +2238,7 @@ mod tests {
         let three_field_cases = [
             r#"sub("a"; "b"; "g")"#,  // SubFlags(re, repl, flags)
             r#"gsub("a"; "b"; "g")"#, // GsubFlags(re, repl, flags)
+            "fma(2; 3; 4)",           // Libm3(Fma, a, b, c) (#3042)
         ];
         for filter in three_field_cases {
             let builtin = find_builtin(filter);

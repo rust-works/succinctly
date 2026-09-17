@@ -34,9 +34,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
-    Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param,
-    Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include, Libm1,
+    Libm2, Libm3, Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry,
+    ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
 
@@ -4045,6 +4045,93 @@ impl<'a> Parser<'a> {
         &rest[..end]
     }
 
+    /// The rest of jq's libm surface (#3042), table-driven from
+    /// [`Libm1::ALL`]/[`Libm2::ALL`]/[`Libm3::ALL`] so a new function is a
+    /// row there rather than another hand-copied keyword arm. Each arity
+    /// follows the arm it generalises: a unary name parses like `asin`, a
+    /// two-argument one like `pow` (with #2807's `expect_or_none` rewind and
+    /// #2391's `builtin_wrong_arity_or_expect` checkpoints), and `fma` is
+    /// the same shape with one more `;`. Every name is jq-only surface real
+    /// yq's lexer rejects, so all of it sits behind `--jq-extensions`.
+    fn try_parse_libm_builtin(&mut self) -> Result<Option<Builtin>, ParseError> {
+        for (name, f) in Libm1::ALL {
+            if self.matches_keyword(name) {
+                self.reject_unless_jq_extensions(name)?;
+                self.consume_keyword(name);
+                return Ok(Some(Builtin::Libm1(f)));
+            }
+        }
+        for (name, f) in Libm2::ALL {
+            if !self.matches_keyword(name) {
+                continue;
+            }
+            self.reject_unless_jq_extensions(name)?;
+            let keyword_start = self.pos;
+            self.consume_keyword(name);
+            self.skip_ws();
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
+            self.skip_ws();
+            let a = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![a]);
+            }
+            self.next();
+            self.skip_ws();
+            let b = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![a, b]);
+            }
+            self.next();
+            return Ok(Some(Builtin::Libm2(f, Box::new(a), Box::new(b))));
+        }
+        for (name, f) in Libm3::ALL {
+            if !self.matches_keyword(name) {
+                continue;
+            }
+            self.reject_unless_jq_extensions(name)?;
+            let keyword_start = self.pos;
+            self.consume_keyword(name);
+            self.skip_ws();
+            if let Err(early) = self.expect_or_none('(', keyword_start) {
+                return early;
+            }
+            self.next();
+            self.skip_ws();
+            let a = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![a]);
+            }
+            self.next();
+            self.skip_ws();
+            let b = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(';') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ';', vec![a, b]);
+            }
+            self.next();
+            self.skip_ws();
+            let c = self.parse_expr()?;
+            self.skip_ws();
+            if self.peek() != Some(')') {
+                return self.builtin_wrong_arity_or_expect(keyword_start, ')', vec![a, b, c]);
+            }
+            self.next();
+            return Ok(Some(Builtin::Libm3(
+                f,
+                Box::new(a),
+                Box::new(b),
+                Box::new(c),
+            )));
+        }
+        Ok(None)
+    }
+
     /// Try to parse a builtin function.
     /// Returns Some(Builtin) if a builtin was parsed, None if not a builtin.
     fn try_parse_builtin(&mut self) -> Result<Option<Builtin>, ParseError> {
@@ -5326,6 +5413,9 @@ impl<'a> Parser<'a> {
             self.reject_unless_jq_extensions("atanh")?;
             self.consume_keyword("atanh");
             return Ok(Some(Builtin::Atanh));
+        }
+        if let Some(libm) = self.try_parse_libm_builtin()? {
+            return Ok(Some(libm));
         }
         // atan2(y; x) - must check before atan
         if self.matches_keyword("atan2") {
@@ -9652,6 +9742,13 @@ mod tests {
             ("trunc", "1.5 | trunc"),
             ("isinfinite", "1 | isinfinite"),
             ("nan", "nan"),
+            // #3042's libm family, one of each arity.
+            ("cbrt", "8 | cbrt"),
+            ("frexp", "8 | frexp"),
+            ("significand", "8 | significand"),
+            ("ldexp", "ldexp(3; 2)"),
+            ("fmax", "fmax(1; 2)"),
+            ("fma", "fma(2; 3; 4)"),
         ];
 
         for (name, filter) in cases {
