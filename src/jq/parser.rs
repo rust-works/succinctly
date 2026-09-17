@@ -661,12 +661,13 @@ pub struct CallSite {
 /// own parse did: the caller may have parsed with different options. Callers
 /// pass the same `mode`/`jq_extensions` they used.
 pub fn collect_call_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<CallSite> {
-    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
-    let _ = parser.parse_program();
-    let mut sites = core::mem::take(&mut parser.call_sites);
-    sites.sort_by_key(|c| c.offset);
-    sites.dedup_by_key(|c| c.offset);
-    sites
+    collect_sites(
+        input,
+        mode,
+        jq_extensions,
+        |p| &mut p.call_sites,
+        |c| c.offset,
+    )
 }
 
 /// Where one `$name` variable reference begins in the filter source (#2734).
@@ -706,12 +707,13 @@ pub struct VarSite {
 /// string-literal occurrence, which it excludes by construction (only real
 /// `$name` reference sites are ever pushed).
 pub fn collect_var_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<VarSite> {
-    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
-    let _ = parser.parse_program();
-    let mut sites = core::mem::take(&mut parser.var_sites);
-    sites.sort_by_key(|v| v.offset);
-    sites.dedup_by_key(|v| v.offset);
-    sites
+    collect_sites(
+        input,
+        mode,
+        jq_extensions,
+        |p| &mut p.var_sites,
+        |v| v.offset,
+    )
 }
 
 /// A `break $name` site in a parsed filter, with the byte offset of its
@@ -750,11 +752,34 @@ pub struct BreakSite {
 /// of the scope one). Everything else — string-literal decoys, bound breaks
 /// earlier in source — is handled by construction.
 pub fn collect_break_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<BreakSite> {
+    collect_sites(
+        input,
+        mode,
+        jq_extensions,
+        |p| &mut p.break_sites,
+        |b| b.offset,
+    )
+}
+
+/// Shared body for [`collect_call_sites`]/[`collect_var_sites`]/
+/// [`collect_break_sites`]: parse `input` once, take one `Vec<T>` field off
+/// the parser via `field`, then sort and dedup it by `offset` -- the three
+/// callers differed only in which field and which element type, so a future
+/// fourth site table (any diagnostic kind needing a position `Expr` does not
+/// carry) is one `field`/`offset` pair here rather than a fourth copy of the
+/// parse-take-sort-dedup shape.
+fn collect_sites<'a, T>(
+    input: &'a str,
+    mode: ParserMode,
+    jq_extensions: bool,
+    field: impl for<'p> FnOnce(&'p mut Parser<'a>) -> &'p mut Vec<T>,
+    offset: impl Fn(&T) -> usize,
+) -> Vec<T> {
     let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
     let _ = parser.parse_program();
-    let mut sites = core::mem::take(&mut parser.break_sites);
-    sites.sort_by_key(|b| b.offset);
-    sites.dedup_by_key(|b| b.offset);
+    let mut sites = core::mem::take(field(&mut parser));
+    sites.sort_by_key(&offset);
+    sites.dedup_by_key(|t| offset(t));
     sites
 }
 
