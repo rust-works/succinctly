@@ -1675,6 +1675,18 @@ impl OutputConfig {
         // - No seq mode (would need to add RS characters)
         // - Source-preserving convention (jq's own would need to reformat
         //   numbers like 4e4 → 4E+4)
+        // - Never a jq-escape-table convention (#2985): this path writes
+        //   `json_bytes` verbatim with no per-byte inspection at all, so it
+        //   cannot re-encode a raw DEL byte (`0x7f`) the way jq's own
+        //   escape table does -- unlike the two other #2591/#2592 call
+        //   sites this issue also fixed, there is no per-field `has_del`
+        //   flag here to gate on; the whole-document echo has to be
+        //   disabled for any convention that would need it instead. Only
+        //   `Preserve` (yq's own) satisfies both this and
+        //   `preserves_source_values()` today -- `JqPreserveInput`
+        //   preserves source *values* but still uses jq's table (#2209),
+        //   so it now falls through to the slower per-field path below,
+        //   which already escapes DEL correctly.
         self.compact
             && !self.color_output
             && !self.sort_keys
@@ -1682,6 +1694,7 @@ impl OutputConfig {
             && !self.raw_output
             && !self.seq
             && self.convention.preserves_source_values()
+            && !self.convention.uses_jq_escape_table()
     }
 }
 
@@ -1728,8 +1741,10 @@ struct PreparedField<'a> {
     /// key escaping must agree with whatever the value side does -- so
     /// `write_object_key` gates this on the active `JsonConvention` exactly
     /// like `write_json_string_pretty`'s twin fix in `src/json/light.rs`,
-    /// not unconditionally. (Which *side* of the convention it should gate
-    /// on is FIXME(#2985) -- see `write_json_string_zero_copy`.)
+    /// not unconditionally: `JsonConvention::uses_jq_escape_table()`, not
+    /// `preserves_source_values()` (#2985 -- the two happened to agree
+    /// before `JqPreserveInput` existed, but that convention preserves
+    /// source *values* while still using jq's own escape table).
     has_del: bool,
 }
 
@@ -1925,15 +1940,18 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
 /// sibling ones in `print_json`/`keys_unsorted`, #2592) that used to each
 /// hand-roll this gate-and-branch shape independently.
 ///
-/// FIXME(#2985): the gate is keyed on the wrong axis. #2874 translated it
-/// behaviour-preservingly from `config.jq_compat` to
-/// `!preserves_source_values()`, but the escape table is a *mode* rule that
-/// `--preserve-input` must not touch (#2209) -- so this should read
-/// `uses_jq_escape_table()`, which is `true` for `JqPreserveInput` too. As
-/// written, `--preserve-input` echoes a raw DEL on the `-c`/`-S`/pretty
-/// routes while `-a`/`-s`/`-C` escape it, and real jq 1.7.1 escapes it on
-/// all of them. Fixing that is a behaviour change with its own oracle
-/// matrix, deliberately out of scope for #2874's no-behaviour-change pass.
+/// #2985: the gate is keyed on the escape-table axis, not the preserve axis
+/// -- `--preserve-input` must not turn off jq's own DEL escaping (#2209).
+/// #2874 translated this gate behaviour-preservingly from `config.jq_compat`
+/// to `!preserves_source_values()`, which happened to agree with
+/// `uses_jq_escape_table()` for the two conventions that existed then
+/// (`Preserve`/`JqCompat`) but diverges now that `JqPreserveInput` sits
+/// between them: it preserves source *values* (#2209) but still uses jq's
+/// escape table. Real jq 1.7.1 escapes a raw DEL on every route
+/// (`-c`/`-S`/pretty/`-a`/`-s`/`-C`) under `--preserve-input`; before this
+/// fix, only the non-zero-copy routes (`-a`/`-s`/`-C`, which go through
+/// `escape_json_body`'s own already-correct `uses_jq_escape_table()` check)
+/// agreed with it.
 fn write_json_string_zero_copy<Out: Write>(
     out: &mut Out,
     raw: &[u8],
@@ -1942,8 +1960,7 @@ fn write_json_string_zero_copy<Out: Write>(
     s: JsonString<'_>,
     config: &OutputConfig,
 ) -> Result<()> {
-    if !(config.ascii_output || escaped || has_del && !config.convention.preserves_source_values())
-    {
+    if !(config.ascii_output || escaped || has_del && config.convention.uses_jq_escape_table()) {
         out.write_all(raw)?;
     } else if let Ok(decoded) = s.as_str() {
         out.write_all(b"\"")?;

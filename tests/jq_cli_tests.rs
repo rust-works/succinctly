@@ -4020,21 +4020,23 @@ fn test_default_json_output_escapes_raw_del_byte_in_key_2591() -> Result<()> {
     Ok(())
 }
 
-/// #2591 (code review): `--preserve-input` selects the same
-/// `JsonConvention::Preserve` real yq uses (DEL left raw), not jq's own
-/// `JqCompat` table -- a DEL-bearing key must stay raw under this flag
-/// even though the identical key escapes under plain (non-preserve)
-/// default output, per the sibling test above. This is the regression the
-/// review agent caught: `write_object_key`'s zero-copy fast path first
-/// gated `has_del` unconditionally, which fixed default jq_compat output
-/// but broke this flag by forcing every DEL-bearing key through the
-/// jq-table slow path regardless of the active convention.
+/// #2985: `--preserve-input` (`JqPreserveInput`) still uses jq's own
+/// escape table (#2209) -- unlike yq's own `Preserve` -- so a DEL byte
+/// escapes under this flag exactly as it does under plain (non-preserve)
+/// default output, per the sibling test above. This corrects an earlier
+/// (#2591) expectation that predates #2209 splitting `JqPreserveInput`
+/// out from `Preserve`: escaping now forces the zero-copy fast path
+/// through the same re-encoding writer default output uses, which also
+/// normalizes the source's own space-after-colon spacing to succinctly's
+/// compact-mode canonical form -- consistent with `-c` compact mode's own
+/// contract, and not something `--preserve-input`'s documented promise
+/// (number spelling, duplicate keys) ever covered.
 #[test]
-fn test_preserve_input_leaves_raw_del_byte_in_key_unescaped_2591() -> Result<()> {
+fn test_preserve_input_escapes_raw_del_byte_in_key_2591() -> Result<()> {
     let input = "{\"xy\": \"v\"}";
     let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "."], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(out, "{\"xy\": \"v\"}\n", "stdout: {out:?}");
+    assert_eq!(out, "{\"x\\u007fy\":\"v\"}\n", "stdout: {out:?}");
     Ok(())
 }
 
@@ -4077,39 +4079,41 @@ fn test_keys_unsorted_pretty_output_escapes_raw_del_byte_2592() -> Result<()> {
     Ok(())
 }
 
-/// #2592 (code review): `--preserve-input` must leave a raw DEL byte
-/// unescaped at all three new sites, mirroring #2591's own
-/// `test_preserve_input_leaves_raw_del_byte_in_key_unescaped_2591` -- flagged
-/// by review as a test-coverage gap (the behavior was manually verified but
-/// not pinned by an automated test).
+/// #2985: mirrors `test_preserve_input_escapes_raw_del_byte_in_key_2591` --
+/// `--preserve-input` escapes a raw DEL byte at all three #2592 sibling
+/// sites too, since `JqPreserveInput` uses jq's escape table (#2209).
+/// Corrects the #2592-era expectation that predates that split.
 #[test]
-fn test_preserve_input_leaves_raw_del_byte_in_streamed_value_unescaped_2592() -> Result<()> {
+fn test_preserve_input_escapes_raw_del_byte_in_streamed_value_2592() -> Result<()> {
     let input = "[\"x\x7fy\"]";
     let (out, _, code) = run_jq_full(&["--preserve-input", "-c", ".[]"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(out, "\"x\x7fy\"\n", "stdout: {out:?}");
+    assert_eq!(out, "\"x\\u007fy\"\n", "stdout: {out:?}");
     Ok(())
 }
 
-/// #2592 (code review): `--preserve-input` twin for `keys_unsorted`'s
-/// compact-output loop.
+/// #2985: `--preserve-input` twin for `keys_unsorted`'s compact-output
+/// loop -- corrects the #2592-era expectation, same reasoning as above.
 #[test]
-fn test_preserve_input_leaves_raw_del_byte_in_keys_unsorted_compact_unescaped_2592() -> Result<()> {
+fn test_preserve_input_escapes_raw_del_byte_in_keys_unsorted_compact_2592() -> Result<()> {
     let input = "{\"x\x7fy\": 1}";
     let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "keys_unsorted"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(out, "[\"x\x7fy\"]\n", "stdout: {out:?}");
+    assert_eq!(out, "[\"x\\u007fy\"]\n", "stdout: {out:?}");
     Ok(())
 }
 
-/// #2592 (code review): `--preserve-input` twin for `keys_unsorted`'s
-/// pretty-output loop.
+/// #2985: `--preserve-input` twin for `keys_unsorted`'s pretty-output
+/// loop -- corrects the #2592-era expectation, same reasoning as above.
+/// Pretty mode already reformats indentation to succinctly's own style
+/// regardless of source spacing, so (unlike the compact-mode tests
+/// above) this one's shape is otherwise unaffected by the fix.
 #[test]
-fn test_preserve_input_leaves_raw_del_byte_in_keys_unsorted_pretty_unescaped_2592() -> Result<()> {
+fn test_preserve_input_escapes_raw_del_byte_in_keys_unsorted_pretty_2592() -> Result<()> {
     let input = "{\"x\x7fy\": 1}";
     let (out, _, code) = run_jq_full(&["--preserve-input", "keys_unsorted"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(out, "[\n  \"x\x7fy\"\n]\n", "stdout: {out:?}");
+    assert_eq!(out, "[\n  \"x\\u007fy\"\n]\n", "stdout: {out:?}");
     Ok(())
 }
 
