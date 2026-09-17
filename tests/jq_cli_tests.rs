@@ -45165,6 +45165,19 @@ fn test_libm_family_arity_shadowing_and_optional_3042() -> Result<()> {
             "[try (1 | pow10) catch .]",
             r#"["Error: pow10/0 not found at build time"]"#,
         ),
+        // `pow10` is a jq-level stub that never inspects `.` (PR #3067 review).
+        (
+            r#"[try ("x" | pow10) catch .]"#,
+            r#"["Error: pow10/0 not found at build time"]"#,
+        ),
+        // `fma` type-checks only once all three operands exist, a first
+        // (jq's LIBM_DDDD reads its three jvs before checking any).
+        (
+            r#"[try fma("x"; 1; "z") catch .]"#,
+            r#"["string (\"x\") number required"]"#,
+        ),
+        (r#"[fma(empty; 1; "z")]"#, "[]"),
+        (r#"[try fma(error("boom"); 1; "z") catch .]"#, r#"["boom"]"#),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");

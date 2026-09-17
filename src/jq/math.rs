@@ -86,10 +86,6 @@ libm_fns! {
     log1p(x) => log1p;
     tgamma(x) => tgamma;
     lgamma(x) => lgamma;
-    j0(x) => j0;
-    j1(x) => j1;
-    y0(x) => y0;
-    y1(x) => y1;
     rint(x) => rint;
     hypot(x, y) => hypot;
     fmod(x, y) => fmod;
@@ -98,6 +94,40 @@ libm_fns! {
     remainder(x, y) => remainder;
     nextafter(x, y) => nextafter;
     fma(x, y, z) => fma;
+}
+
+/// The Bessel functions, `lgamma_r` and `scalb` are POSIX rather than C99,
+/// and MSVC's UCRT exports them under `_j0`-style names or (for `lgamma_r`)
+/// not at all; the release workflow builds `x86_64-pc-windows-msvc`. There
+/// is no Windows jq to match bit for bit, so those targets use the `libm`
+/// crate for this group, as a `no_std` build does.
+macro_rules! posix_libm_fns {
+    ($( $name:ident ( $($arg:ident),+ ) ; )+) => {
+        $(
+            #[inline]
+            pub(crate) fn $name($($arg: f64),+) -> f64 {
+                #[cfg(all(feature = "std", not(target_os = "windows")))]
+                {
+                    extern "C" {
+                        fn $name($($arg: f64),+) -> f64;
+                    }
+                    // SAFETY: as for `libm_fns!`.
+                    unsafe { $name($($arg),+) }
+                }
+                #[cfg(any(not(feature = "std"), target_os = "windows"))]
+                {
+                    libm::$name($($arg),+)
+                }
+            }
+        )+
+    };
+}
+
+posix_libm_fns! {
+    j0(x);
+    j1(x);
+    y0(x);
+    y1(x);
 }
 
 /// The three functions a plain `extern "C"` declaration does **not** reach
@@ -269,7 +299,7 @@ pub(crate) fn scalbln(x: f64, n: f64) -> f64 {
 /// bound directly so succinctly prints the same as the jq beside it.
 #[inline]
 pub(crate) fn scalb(x: f64, y: f64) -> f64 {
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
         extern "C" {
             fn scalb(x: f64, y: f64) -> f64;
@@ -277,7 +307,7 @@ pub(crate) fn scalb(x: f64, y: f64) -> f64 {
         // SAFETY: as for `libm_fns!`.
         unsafe { scalb(x, y) }
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
         if y.is_nan() {
             return f64::NAN;
@@ -291,7 +321,7 @@ pub(crate) fn scalb(x: f64, y: f64) -> f64 {
 
 #[inline]
 pub(crate) fn jn(n: f64, x: f64) -> f64 {
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
         extern "C" {
             fn jn(n: core::ffi::c_int, x: f64) -> f64;
@@ -299,7 +329,7 @@ pub(crate) fn jn(n: f64, x: f64) -> f64 {
         // SAFETY: as for `libm_fns!`.
         unsafe { jn(c_int(n), x) }
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
         libm::jn(c_int(n), x)
     }
@@ -307,7 +337,7 @@ pub(crate) fn jn(n: f64, x: f64) -> f64 {
 
 #[inline]
 pub(crate) fn yn(n: f64, x: f64) -> f64 {
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
         extern "C" {
             fn yn(n: core::ffi::c_int, x: f64) -> f64;
@@ -315,7 +345,7 @@ pub(crate) fn yn(n: f64, x: f64) -> f64 {
         // SAFETY: as for `libm_fns!`.
         unsafe { yn(c_int(n), x) }
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
         libm::yn(c_int(n), x)
     }
@@ -362,7 +392,7 @@ pub(crate) fn modf(x: f64) -> (f64, f64) {
 /// `lgamma_r`: `lgamma` plus the sign of `gamma(x)`.
 #[inline]
 pub(crate) fn lgamma_r(x: f64) -> (f64, i32) {
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(target_os = "windows")))]
     {
         extern "C" {
             fn lgamma_r(x: f64, sign: *mut core::ffi::c_int) -> f64;
@@ -372,7 +402,7 @@ pub(crate) fn lgamma_r(x: f64) -> (f64, i32) {
         let v = unsafe { lgamma_r(x, &mut s) };
         (v, s)
     }
-    #[cfg(not(feature = "std"))]
+    #[cfg(any(not(feature = "std"), target_os = "windows"))]
     {
         libm::lgamma_r(x)
     }
@@ -566,12 +596,15 @@ mod tests {
     #[cfg(all(
         feature = "std",
         any(
-            target_os = "macos",
+            all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")
         )
     ))]
     #[test]
     fn platform_libm_family_matches_the_platform_jq_bit_for_bit() {
+        // The two `ldexp` rows are the AArch64 `fcvtzs` results; an Intel
+        // Mac's jq would print the x86 column's `0`s, so the macOS gate is
+        // narrowed to the architecture these were captured on.
         #[cfg(target_os = "macos")]
         let rows: &[(&str, f64, f64)] = &[
             ("cbrt", cbrt(27.0), 3.0),
