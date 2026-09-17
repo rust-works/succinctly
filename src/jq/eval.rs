@@ -97872,20 +97872,35 @@ mod tests {
         ));
     }
 
-    /// #2937: `math_operand`'s `Int`/integer-`NumberLiteral` widening under
-    /// both modes, mirroring `get_float_value_with`'s own rule -- and, for
-    /// the float-`NumberLiteral` sibling arm, a direct unit test rather than
-    /// an end-to-end `pow`/`atan2` filter: every input this session tried
-    /// (a filter literal, a document field, and `"2.50" | tonumber`, in
-    /// both jq and yq mode) reaches `math_operand` as a bare `Float`, not a
-    /// `NumberLiteral`, before ever reaching this function -- the
-    /// generator-argument materialization `fanout_two_args_lazy` uses
-    /// evidently normalizes it upstream. Calling `math_operand` directly is
-    /// what actually exercises the arm this function's own `match` commits
-    /// to handling, independent of whether today's evaluator plumbing
-    /// happens to construct that shape on any path yet.
+    /// #2937: `math_operand`'s five match arms, direct rather than through
+    /// an end-to-end `pow`/`atan2` filter -- every generator-argument shape
+    /// this session tried (a filter literal, a document field, `"2.50" |
+    /// tonumber`, and a computed `(1+1)`, in both jq and yq mode) reaches
+    /// `math_operand` as a `NumberLiteral`, never as a bare `Int`/`Float`;
+    /// jq mode's own decNumber-literal model (#2906) evidently keeps a
+    /// generator-resolved argument as a `NumberLiteral` even for a computed
+    /// value, through whatever materialization
+    /// `fanout_two_args_lazy`/`eval_each` performs on it. A bare `Int`/
+    /// `Float` is still a real, reachable shape for this function's
+    /// callers in principle (it is a plain `match` over `OwnedValue`, not a
+    /// `NumberLiteral`-only helper), so those two arms are pinned here too,
+    /// rather than narrowed away on the assumption that today's plumbing
+    /// never constructs one.
     #[test]
     fn math_operand_widens_number_literal_2937() {
+        assert_eq!(
+            math_operand::<JqSemantics>(&OwnedValue::Int(869_389_897_822_472_004), false),
+            Ok(jq_literal_int_to_f64(869_389_897_822_472_004))
+        );
+        assert_eq!(
+            math_operand::<YqSemantics>(&OwnedValue::Int(869_389_897_822_472_004), false),
+            Ok(869_389_897_822_472_004_i64 as f64)
+        );
+        assert_eq!(
+            math_operand::<JqSemantics>(&OwnedValue::Float(2.5), false),
+            Ok(2.5)
+        );
+
         let int_literal = OwnedValue::NumberLiteral(
             NumberRepr::Int(869_389_897_822_472_004),
             "869389897822472004".into(),
