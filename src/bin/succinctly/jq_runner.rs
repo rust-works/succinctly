@@ -22,8 +22,8 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::walk::{map_builtin_subexprs, map_pattern_subexprs, stamp_loc_file};
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
-    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Pattern, Program,
-    StreamStats, MAX_VALUE_TREE_DEPTH,
+    ErrorKind, EvalError, EvalErrorPayload, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue,
+    Param, Pattern, Program, StreamStats, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, JsonString, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -1836,7 +1836,7 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
     // unparseable output is strictly worse than the silent drop it was
     // reasoned about as; raise instead.
     let StandardJson::String(key) = frame.cursor(field.key_bp).value() else {
-        return Err(MalformedJsonError(EvalError::malformed_json_text(frame.text)).into());
+        return Err(MalformedJsonError::new(EvalError::malformed_json_text(frame.text)).into());
     };
     write_json_string_zero_copy(out, field.raw, field.escaped, field.has_del, key, config)?;
     out.write_all(b":")?;
@@ -1961,17 +1961,67 @@ fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
         (keys.is_malformed() || !keys.trailing_gap_ok(b'}')),
         doc_text,
     ) {
-        (true, Some(text)) => Err(MalformedJsonError(EvalError::malformed_json_text(text)).into()),
+        (true, Some(text)) => {
+            Err(MalformedJsonError::new(EvalError::malformed_json_text(text)).into())
+        }
         _ => Ok(()),
     }
 }
 
+/// A malformed-document error travelling through an `anyhow::Result`, to be
+/// `downcast` back out at the reporting boundary (#1194).
+///
+/// It carries the [`EvalError`]'s message and classification, not the
+/// `EvalError` itself: `anyhow::Error` needs `Send + Sync`, and since #2999
+/// `OwnedValue` holds `Rc`s, so an `EvalError` -- whose payload can be the
+/// raw value of `error(v)` -- no longer is either. Every error that reaches
+/// this wrapper is a decode or nesting-depth failure the evaluator raised
+/// itself, which never carries a value payload; [`Self::new`] checks that in
+/// debug builds and [`Self::to_eval_error`] rebuilds the same error for
+/// [`DiagnosticSink::report`](crate::output::DiagnosticSink::report).
 #[derive(Debug)]
-pub struct MalformedJsonError(pub EvalError);
+pub struct MalformedJsonError {
+    message: String,
+    kind: Option<ErrorKind>,
+}
+
+impl MalformedJsonError {
+    /// Wrap `err` for the `anyhow` channel.
+    pub fn new(err: EvalError) -> Self {
+        let kind = match err.value {
+            EvalErrorPayload::Kind(kind) => Some(kind),
+            EvalErrorPayload::None => None,
+            // Unreachable by construction (see the type's doc comment); in a
+            // release build the message alone is still the right diagnostic.
+            EvalErrorPayload::Value(_) => {
+                debug_assert!(
+                    false,
+                    "a malformed-document error never carries an error(v) payload"
+                );
+                None
+            }
+        };
+        Self {
+            message: err.message,
+            kind,
+        }
+    }
+
+    /// The [`EvalError`] this was built from.
+    pub fn to_eval_error(&self) -> EvalError {
+        EvalError {
+            message: self.message.clone(),
+            value: match self.kind {
+                Some(kind) => EvalErrorPayload::Kind(kind),
+                None => EvalErrorPayload::None,
+            },
+        }
+    }
+}
 
 impl std::fmt::Display for MalformedJsonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.message)
+        write!(f, "{}", self.message)
     }
 }
 
@@ -2022,8 +2072,9 @@ fn route_write_error<W: Write>(
     match write(out) {
         Ok(()) => Ok(false),
         Err(e) => match e.downcast_ref::<MalformedJsonError>() {
-            Some(MalformedJsonError(err)) => {
-                sink.report(DiagStyle::Jq, err, &at());
+            Some(malformed) => {
+                let err = malformed.to_eval_error();
+                sink.report(DiagStyle::Jq, &err, &at());
                 Ok(true)
             }
             // Same reasoning as the `--validate` early return elsewhere
@@ -2818,7 +2869,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         })
                         .collect();
 
-                    let row_value = OwnedValue::Array(fields);
+                    let row_value = OwnedValue::Array(fields.into());
 
                     // Evaluate expression on this row, streaming (#1653):
                     // each output must reach stdout before the next one is
@@ -3258,7 +3309,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // position to name. A non-slurped stream keeps its clean prefix
                 // and reports its parse error after it instead (#2961).
                 Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
-                    Ok(MalformedJsonError(err)) => {
+                    Ok(malformed) => {
+                        let err = malformed.to_eval_error();
                         let files = get_input_files(&args);
                         let file = files.first().map(|p| p.to_string_lossy().to_string());
                         sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
@@ -3520,7 +3572,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext> {
             let values = parse_json_stream(&contents)?;
             context
                 .named
-                .insert(name.clone(), OwnedValue::Array(values));
+                .insert(name.clone(), OwnedValue::Array(values.into()));
         }
     }
 
@@ -3561,7 +3613,7 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
     // Build positional array from context.positional
     args_obj.insert(
         "positional".to_string(),
-        OwnedValue::Array(context.positional.clone()),
+        OwnedValue::Array(context.positional.clone().into()),
     );
 
     OwnedValue::Object(args_obj.into())
@@ -3966,7 +4018,7 @@ fn get_inputs(
                 // document, rather than through `anyhow` at exit 1.
                 if args.slurp {
                     if let Some(error) = parse_error {
-                        return Ok(Err(anyhow::Error::from(MalformedJsonError(error))));
+                        return Ok(Err(anyhow::Error::from(MalformedJsonError::new(error))));
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -4042,7 +4094,7 @@ fn get_inputs(
             None => InputLocation::unknown(),
         };
         Ok(Ok((
-            vec![OwnedValue::Array(values)],
+            vec![OwnedValue::Array(values.into())],
             InputLocations::single(at),
             None,
         )))
@@ -4767,7 +4819,7 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
                     // caller reports a document error in jq's channel at
                     // exit 5, and can only recognise it by type (#1194).
                     .collect::<core::result::Result<Vec<_>, _>>()
-                    .map_err(|de| anyhow::Error::from(MalformedJsonError(de))),
+                    .map_err(|de| anyhow::Error::from(MalformedJsonError::new(de))),
                 Err(_) => Err(e),
             }
         }
@@ -4849,7 +4901,7 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             // this is the primary `--slurp`/`--slurpfile` document-input
             // path, worth the same defense-in-depth swap.
             json_bytes_to_owned_value_checked(&bytes[start..end])
-                .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?,
+                .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?,
         );
         prev_end = end;
     }
@@ -5356,7 +5408,7 @@ fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
                 OwnedValue::String(field_str)
             })
             .collect();
-        values.push(OwnedValue::Array(fields));
+        values.push(OwnedValue::Array(fields.into()));
     }
 
     values
@@ -6291,7 +6343,7 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
 /// anything beyond the one string already in hand.
 fn reject_raw_output0_nul(s: &str, config: &OutputConfig) -> Result<()> {
     if config.raw_output0 && s.as_bytes().contains(&0) {
-        return Err(MalformedJsonError(EvalError::new(
+        return Err(MalformedJsonError::new(EvalError::new(
             "Cannot dump a string containing NUL with --raw-output0 option",
         ))
         .into());
@@ -6428,7 +6480,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         // Rust's raw panic backtrace to stderr the same way bare `-e` did.
         let owned = value
             .try_materialize()
-            .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?;
+            .map_err(|e| anyhow::Error::from(MalformedJsonError::new(e)))?;
         out.write_all(format_json(&owned, config).as_bytes())?;
     }
 
@@ -6728,7 +6780,9 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
     };
     let expected = if index == 0 { None } else { Some(b',') };
     if !preceding_gap_ok(child_cursor.text(), start, expected) {
-        return Err(MalformedJsonError(EvalError::malformed_json_text(child_cursor.text())).into());
+        return Err(
+            MalformedJsonError::new(EvalError::malformed_json_text(child_cursor.text())).into(),
+        );
     }
     Ok(Some(start))
 }
@@ -7064,9 +7118,9 @@ where
                         // to scan, just the gap between `[` and `]`.
                         if let Some(open_pos) = container_pos {
                             if !c.trailing_element_gap_ok(open_pos + 1, b']') {
-                                return Err(MalformedJsonError(EvalError::malformed_json_text(
-                                    c.text(),
-                                ))
+                                return Err(MalformedJsonError::new(
+                                    EvalError::malformed_json_text(c.text()),
+                                )
                                 .into());
                             }
                         }
@@ -7130,9 +7184,9 @@ where
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b']') {
                                 array_scratch.truncate(base);
-                                return Err(MalformedJsonError(EvalError::malformed_json_text(
-                                    c.text(),
-                                ))
+                                return Err(MalformedJsonError::new(
+                                    EvalError::malformed_json_text(c.text()),
+                                )
                                 .into());
                             }
                         }
@@ -7196,9 +7250,9 @@ where
                         // arm's own empty-case check above.
                         if let Some(open_pos) = container_pos {
                             if !c.trailing_element_gap_ok(open_pos + 1, b'}') {
-                                return Err(MalformedJsonError(EvalError::malformed_json_text(
-                                    c.text(),
-                                ))
+                                return Err(MalformedJsonError::new(
+                                    EvalError::malformed_json_text(c.text()),
+                                )
                                 .into());
                             }
                         }
@@ -7269,9 +7323,9 @@ where
                             // written and stdout carries a stray `{`.
                             let StandardJson::String(k) = field.key() else {
                                 scratch.truncate(base);
-                                return Err(MalformedJsonError(EvalError::malformed_json_text(
-                                    frame.text,
-                                ))
+                                return Err(MalformedJsonError::new(
+                                    EvalError::malformed_json_text(frame.text),
+                                )
                                 .into());
                             };
                             // #1643: this key must be preceded by a `,` (or
@@ -7292,7 +7346,7 @@ where
                                     || !preceding_gap_ok(frame.text, value_start, Some(b':'))
                                 {
                                     scratch.truncate(base);
-                                    return Err(MalformedJsonError(
+                                    return Err(MalformedJsonError::new(
                                         EvalError::malformed_json_text(frame.text),
                                     )
                                     .into());
@@ -7329,7 +7383,7 @@ where
                         // without touching the BP tree at all.
                         if remaining.ends_unpaired() {
                             scratch.truncate(base);
-                            return Err(MalformedJsonError(EvalError::malformed_json_text(
+                            return Err(MalformedJsonError::new(EvalError::malformed_json_text(
                                 frame.text,
                             ))
                             .into());
@@ -7337,9 +7391,9 @@ where
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b'}') {
                                 scratch.truncate(base);
-                                return Err(MalformedJsonError(EvalError::malformed_json_text(
-                                    frame.text,
-                                ))
+                                return Err(MalformedJsonError::new(
+                                    EvalError::malformed_json_text(frame.text),
+                                )
                                 .into());
                             }
                         }
@@ -7404,7 +7458,9 @@ where
                 // clean diagnostic and jq's own exit 5 instead of a silent
                 // wrong answer (#1641).
                 StandardJson::Error(_) => {
-                    return Err(MalformedJsonError(EvalError::malformed_json_text(c.text())).into());
+                    return Err(
+                        MalformedJsonError::new(EvalError::malformed_json_text(c.text())).into(),
+                    );
                 }
             }
         }
@@ -7551,7 +7607,9 @@ where
             // `docs/compliance/jq/limitations.md`; it is the same trade the
             // YAML streaming path already makes, and for the same reason.
             if let Some(tail) = fields.unpaired_tail() {
-                return Err(MalformedJsonError(EvalError::malformed_json_text(tail.text())).into());
+                return Err(
+                    MalformedJsonError::new(EvalError::malformed_json_text(tail.text())).into(),
+                );
             }
             if fields.is_empty() {
                 out.write_all(b"[]")?;
@@ -7581,7 +7639,7 @@ where
                         // bracket is already out. Raising still beats the
                         // `[,"b"]` this used to print at exit 0 (#1194); see
                         // `docs/compliance/jq/limitations.md`.
-                        return Err(MalformedJsonError(EvalError::malformed_json_text(
+                        return Err(MalformedJsonError::new(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
                         .into());
@@ -7620,7 +7678,7 @@ where
                         // bracket is already out. Raising still beats the
                         // `[,"b"]` this used to print at exit 0 (#1194); see
                         // `docs/compliance/jq/limitations.md`.
-                        return Err(MalformedJsonError(EvalError::malformed_json_text(
+                        return Err(MalformedJsonError::new(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
                         .into());
@@ -8559,7 +8617,7 @@ mod tests {
     /// chain would print it.
     #[test]
     fn test_malformed_json_error_displays_its_message_1194() {
-        let wrapped = MalformedJsonError(EvalError::new("Invalid JSON text: whatever"));
+        let wrapped = MalformedJsonError::new(EvalError::new("Invalid JSON text: whatever"));
         assert_eq!(wrapped.to_string(), "Invalid JSON text: whatever");
 
         // And it survives the round trip `run_jq` actually performs.
@@ -8567,7 +8625,10 @@ mod tests {
         let recovered = boxed
             .downcast_ref::<MalformedJsonError>()
             .expect("run_jq recovers this by downcast");
-        assert_eq!(recovered.0.message, "Invalid JSON text: whatever");
+        assert_eq!(
+            recovered.to_eval_error().message,
+            "Invalid JSON text: whatever"
+        );
     }
 
     /// #1194: the defensive arm of `EvalError::malformed_json_text`.

@@ -1703,7 +1703,10 @@ mod tests {
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
-        assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
+        assert_eq!(
+            format_json(&OwnedValue::Array(vec![].into()), &pretty),
+            "[]"
+        );
         assert_eq!(
             format_json(&OwnedValue::Object(IndexMap::new().into()), &pretty),
             "{}"
@@ -1715,7 +1718,7 @@ mod tests {
         let mut obj = IndexMap::new();
         obj.insert(
             "é".to_string(),
-            OwnedValue::Array(vec![OwnedValue::String("ü".to_string())]),
+            OwnedValue::Array(vec![OwnedValue::String("ü".to_string())].into()),
         );
         let value = OwnedValue::Object(obj.into());
         let opts = JsonFormatOpts {
@@ -1771,7 +1774,7 @@ mod tests {
     fn linear_array_nest(depth: usize) -> OwnedValue {
         let mut v = OwnedValue::Null;
         for _ in 0..depth {
-            v = OwnedValue::Array(vec![v]);
+            v = OwnedValue::Array(vec![v].into());
         }
         v
     }

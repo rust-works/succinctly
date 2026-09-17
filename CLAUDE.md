@@ -464,7 +464,8 @@ for the full list.
 | `mmap-tests`        | Memory-mapped bitvector tests             |
 | `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
 | `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
-| `unboxed-object-map`| Measurement-only: un-box `OwnedValue::Object`'s map (#3000 A/B holdout; never ship) |
+| `unshared-containers`| Measurement-only: `Box` instead of `Rc` in `OwnedValue`'s containers (#2999 A/B holdout; never ship) |
+| `share-stats`       | Record every copy-on-write that copied, with its call site (#2999 clone audit) |
 
 ## Testing Strategy
 
