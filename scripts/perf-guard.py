@@ -263,7 +263,7 @@ DEFAULT_THRESHOLD = 5.0
 # **Remove these three entries once `main` has moved past #2999** -- with
 # `--baseline-binary` the checked-in file is never consulted, so once the
 # merge-base includes the change these rows read ~0% again and the overrides
-# only blind them. Tracked by the follow-up filed on #2999.
+# only blind them. Tracked by #3077.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_keys_unsorted": 10.0,

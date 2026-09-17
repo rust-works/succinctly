@@ -33,11 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now carries a `succinctly::jq::ArrayVec` (an alias for `ArrayOf<OwnedValue>`), not
   a `Vec<OwnedValue>`, and `OwnedValue::Object`'s `ObjectMap` is refcounted rather
   than boxed. Both wrappers are transparent the same way `ObjectMap` already was —
-  they `Deref` to the `Vec`/`IndexMap`, iterate in all three forms, convert both
-  ways with `From`, and an `ArrayVec` compares equal to a bare `Vec` in either
-  direction — so a read-side `OwnedValue::Array(items) => items.len()` needs no
-  change and only construction needs `.into()` (or `OwnedValue::array_from(vec)`,
-  which already existed). `as_array`/`as_array_mut`/`as_object`/`as_object_mut`
+  they `Deref` to the `Vec`/`IndexMap`, iterate in all three forms (the by-value
+  iterators, `succinctly::jq::ArrayIntoIter`/`ObjectMapIntoIter`, are double-ended and
+  exact-size like the `Vec`/`IndexMap` ones they replace, so `.into_iter().rev()` still
+  compiles), convert both ways with `From`, and an `ArrayVec` compares equal to a bare
+  `Vec` in either direction — so a read-side `OwnedValue::Array(items) => items.len()`
+  needs no change and only construction needs `.into()` (or
+  `OwnedValue::array_from(vec)`, which already existed). `as_array`/`as_array_mut`/`as_object`/`as_object_mut`
   keep their exact signatures. `OwnedValue` is no longer `Send`/`Sync` (it never
   crossed a thread in this crate; nothing in `src/jq` carries either bound).
 
