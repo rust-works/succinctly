@@ -925,14 +925,19 @@ is the revert that established what the other one costs.
    always establish, where a positive witness cannot (an empty container or a scalar carries
    no cursor to recover a node id from). The generic funnels, which already prove their
    markers against a live cursor, take the non-demoting `eval_each_owned_bridged` so the proof
-   is kept. The two classes #2642 deliberately excluded are closed with it: the owned-identity
+   is kept (and a re-entry whose expression holds no assignment, builtin or call skips the
+   rebuild, since only a resolver invocation can read a demotion). The two classes #2642
+   deliberately excluded are closed with it: the owned-identity
    route (`eval_owned_identity_stages`/`owned_identity_values`, the `OwnedIdentity`/#2072
    machinery a `key`/`parent`/`path` sibling routes through) now checks against
-   `OwnedIdentity::root_witness` — the base node itself only while the value is that node's
-   own, unrebuilt value (`OwnedIdentity::exact`, cleared by every stage rule that places a new
-   value: `sort`, `to_entries`, a write), never `ancestors.is_empty()` alone, which would
-   certify `sort`'s new array; `.foo | . as $x | (parent, ($x.a = 9))` still writes and
-   `.foo | . as $x | sort | (parent, ($x[0] = 9))` now refuses — and a `catch` handler's
+   `OwnedIdentity::root_witness` — the base node itself while the value is that node's own,
+   unrebuilt value (`OwnedIdentity::exact`), and otherwise the owned root's own token
+   (`OwnedIdentity::root`, fresh for every root the pipe starts and every value a stage
+   rebuilds at a position: `sort`, `to_entries`, a write), never `ancestors.is_empty()` alone,
+   which would certify `sort`'s new array; `.foo | . as $x | (parent, ($x.a = 9))` still
+   writes, `input | . as $x | ((path | empty), ($x.a = 9))` (a bind at a detached root, nothing
+   rebuilt since) still writes, and `.foo | . as $x | sort | (parent, ($x[0] = 9))` now
+   refuses — and a `catch` handler's
    markers are checked against the payload's own node (`try_payload_root`): `error($x)` and
    `$x | error` raise the marker's node verbatim, as jq's `catch` then sees the same `jv`, so
    `. as $x | try error($x) catch path($x)` stays `[]`, while a value-equal payload

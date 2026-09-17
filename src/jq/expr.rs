@@ -210,6 +210,12 @@ pub enum BindOrigin {
         /// `base`/`chain` alone cannot: they model yq position, which a
         /// rebuilt value (`sort`, a write) keeps.
         exact: bool,
+        /// The identity pipe's own token for the owned root (#3036,
+        /// `OwnedIdentity::root`): fresh for every root it starts and every
+        /// value a stage rebuilds at a position, so a marker bound at a
+        /// *detached* root (an `input`, a literal) still names that root
+        /// and no other -- `base` is `None` there and `exact` cannot help.
+        root: u64,
     },
 }
 

@@ -59390,6 +59390,14 @@ fn test_tracked_var_rebuilt_root_in_evaluator_routes_refuse_3036() -> Result<()>
             r#"{"foo":[2,1]}"#,
             ".foo | . as $x | sort | (path | empty), ($x[0] = 9)",
         ),
+        // The detached-root twin: a rebuild at a detached position gets a
+        // fresh root token, so the marker bound at the previous one no
+        // longer names it.
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | ((path | empty), ({a:1} | ($x.a = 9)))",
+        ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
         argv.push(filter);
@@ -59512,6 +59520,29 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
             &["-c"][..],
             r#"{"a":1}"#,
             ". as $x | try ($x | error) catch ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        // A bind at a *detached* owned root on the identity route (a
+        // sibling `path`/`key` read forces it): the root's own token
+        // (`OwnedIdentity::root`) certifies the marker, since nothing was
+        // rebuilt between the bind and the write. Extension builtins, so
+        // pinned against `main`'s own answer rather than jq.
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | ((path | empty), ($x.a = 9))",
+            r#"{"a":9}"#,
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | ((key | empty), path($x))",
+            "[]",
+        ),
+        (
+            &["-n", "-c"][..],
+            r#"{"a":1}"#,
+            "input | . as $x | ((path | empty), (. as $y | ($x.a = 9)))",
             r#"{"a":9}"#,
         ),
     ] {
