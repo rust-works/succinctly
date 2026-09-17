@@ -4025,18 +4025,23 @@ fn test_default_json_output_escapes_raw_del_byte_in_key_2591() -> Result<()> {
 /// escapes under this flag exactly as it does under plain (non-preserve)
 /// default output, per the sibling test above. This corrects an earlier
 /// (#2591) expectation that predates #2209 splitting `JqPreserveInput`
-/// out from `Preserve`: escaping now forces the zero-copy fast path
-/// through the same re-encoding writer default output uses, which also
-/// normalizes the source's own space-after-colon spacing to succinctly's
-/// compact-mode canonical form -- consistent with `-c` compact mode's own
-/// contract, and not something `--preserve-input`'s documented promise
-/// (number spelling, duplicate keys) ever covered.
+/// out from `Preserve`.
+///
+/// Unlike the non-preserve case, this still takes `stream_json`'s
+/// whole-document raw-echo fast path -- it substitutes DEL's escape in
+/// place rather than falling back to the slower re-encoding writer, so
+/// `--preserve-input`'s pre-existing (and independent of this issue)
+/// verbatim space-after-colon preservation still applies here exactly as
+/// it does for a DEL-free document under the same flags. See
+/// `can_use_raw_identity`/`stream_json`'s own doc comments for why a
+/// fallback to the slow path was rejected: it would make that leniency
+/// depend on whether an unrelated DEL byte happens to also be present.
 #[test]
 fn test_preserve_input_escapes_raw_del_byte_in_key_2591() -> Result<()> {
     let input = "{\"xy\": \"v\"}";
     let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "."], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(out, "{\"x\\u007fy\":\"v\"}\n", "stdout: {out:?}");
+    assert_eq!(out, "{\"x\\u007fy\": \"v\"}\n", "stdout: {out:?}");
     Ok(())
 }
 
@@ -60237,10 +60242,11 @@ fn test_duplicate_key_axis_follows_the_same_convention_2874() -> Result<()> {
 /// where it meant `uses_jq_escape_table()` would silently render jq-mode
 /// strings through yq's table.
 ///
-/// The one site where exactly that is still true is the DEL zero-copy gate
-/// -- a pre-existing bug this pass deliberately preserved rather than fixed
-/// (FIXME(#2985)). Backspace is the probe here precisely because it takes
-/// the non-DEL path, and so pins the rule that does hold today.
+/// The DEL zero-copy gate had exactly that bug at the time this test was
+/// written, deliberately left unfixed to keep this pass narrowly scoped --
+/// fixed since by #2985. Backspace is the probe here precisely because it
+/// takes the non-DEL path, and so pins the rule that held even before that
+/// fix and still holds today.
 #[test]
 fn test_preserve_input_keeps_jq_escape_table_2874() -> Result<()> {
     // A backspace: jq's table has the short form, yq's spells it as the

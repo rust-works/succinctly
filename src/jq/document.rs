@@ -118,12 +118,14 @@ impl IndentSpec {
 /// type exists to provide, so prefer the match to a helper call wherever
 /// the consumer genuinely has a per-variant answer.
 ///
-/// Two consumers are deliberately *not* keyed on it, each with its reason
-/// recorded where it lives: [`OwnedValue::to_json_yq`](crate::jq::OwnedValue)
-/// (its formatting family hardcodes jq's escape table for every variant, so
-/// mapping `Preserve` onto it would assert a false equivalence), and the
-/// CLI's DEL zero-copy gate, which reads the preserve axis where it means
-/// the escape one (FIXME(#2985)).
+/// One consumer is deliberately *not* keyed on it:
+/// [`OwnedValue::to_json_yq`](crate::jq::OwnedValue) hardcodes jq's escape
+/// table for every variant in its formatting family, so mapping `Preserve`
+/// onto it would assert a false equivalence. The CLI's raw-byte-echo fast
+/// paths (`can_use_raw_identity`/`stream_json`/`write_json_string_pretty`/
+/// `write_json_string_zero_copy`) used to have the same bug in the other
+/// direction, reading the preserve axis where they meant the escape one --
+/// fixed in #2985 via [`Self::del_needs_escaping`].
 ///
 /// - `Preserve`: echo the document's source number spelling verbatim
 ///   (`1e100` stays `1e100`), use yq's escape table (no `\b`/`\f` short
@@ -185,6 +187,26 @@ impl JsonConvention {
     #[must_use]
     pub fn uses_jq_escape_table(self) -> bool {
         matches!(self, Self::JqCompat | Self::JqPreserveInput)
+    }
+
+    /// Whether a raw DEL byte (`0x7f`) found in `bytes` needs escaping on
+    /// output under this convention (#2985). Only a jq-escape-table
+    /// convention re-encodes DEL at all -- `Preserve` (yq's own) always
+    /// leaves it raw regardless of content -- so this is
+    /// [`Self::uses_jq_escape_table`] short-circuited before the byte scan,
+    /// not a third independent axis.
+    ///
+    /// Centralizes the one check every raw-byte-echo fast path
+    /// (`can_use_raw_identity`/`stream_json`/`write_json_string_pretty`/
+    /// `write_json_string_zero_copy`) needs before it can skip its own
+    /// per-byte escaping and echo a span verbatim -- each of those
+    /// independently got this wrong at least once during #2985 by reading
+    /// [`Self::preserves_source_values`] or comparing `== JqCompat`
+    /// directly instead. A future fast path calling this instead of
+    /// re-deriving the check can't reintroduce that mixup.
+    #[must_use]
+    pub fn del_needs_escaping(self, bytes: &[u8]) -> bool {
+        self.uses_jq_escape_table() && bytes.contains(&0x7f)
     }
 }
 
