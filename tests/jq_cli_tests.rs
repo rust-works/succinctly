@@ -58845,10 +58845,36 @@ fn test_mixed_int_float_literal_order_stays_exact_2936() -> Result<()> {
         ),
         ("869389897822472004 == 869389897822472004.0", "true"),
         ("869389897822472004 > 869389897822471936.5", "true"),
+        // the binary/ternary math family widens an `Int` operand the same
+        // way (code review of #2936: `math_operand` was the last bare cast)
+        ("pow(869389897822472004; 1)", "869389897822472000"),
+        ("fma(869389897822472004; 1; 0)", "869389897822472000"),
+        ("fmin(869389897822472004; 1e30)", "869389897822472000"),
+        ("ldexp(869389897822472004; 0)", "869389897822472000"),
     ] {
         let (out, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
         assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// A malformed number-shaped span with 18+ digits keeps #966's `null` on
+/// the materializing route (code review of #2936: the slow path read a
+/// valid prefix out of it and printed a fabricated value). jq rejects each
+/// document outright; succinctly's recorded #966 leniency is the `null`.
+#[test]
+fn test_malformed_long_number_span_stays_null_2936() -> Result<()> {
+    for doc in [
+        "[123456789012345678901e]",
+        "[123456789012345678901e+]",
+        "[123456789012345678901.2.3]",
+        "[1.23456789012345678901e5e5]",
+        "[1234567.2.3]",
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", "map(.)"], Some(doc))?;
+        assert_eq!(code, 0, "{doc}");
+        assert_eq!(out.trim(), "[null]", "{doc}");
     }
     Ok(())
 }

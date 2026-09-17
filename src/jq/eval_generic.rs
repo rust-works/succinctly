@@ -215,6 +215,21 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
     }
 }
 
+/// A document number's double under `S`'s number model, for the
+/// cursor-level reads in this evaluator that never build an `OwnedValue`
+/// (#2936): the `DocumentValue` twin of `eval.rs`'s `json_number_f64`. The
+/// literal text comes from `number_literal()` (a preservable spelling, both
+/// formats), so a lenient span or a bridge token takes the plain `as_f64()`
+/// exactly as before.
+fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) -> Option<f64> {
+    match value.number_literal() {
+        Some(literal) => {
+            crate::jq::value::document_number_f64::<S>(literal.as_bytes(), || value.as_f64())
+        }
+        None => value.as_f64(),
+    }
+}
+
 /// Checked sibling of [`to_owned`] (#2299): identical materialization
 /// logic, `check_nesting_depth` (catchable) in place of
 /// `assert_nesting_depth` (panic).
@@ -233,21 +248,6 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
 /// of nesting. Mirrors `yq_runner.rs`'s own
 /// `to_owned_canonicalizing_numbers_at_depth`, the established precedent
 /// for this exact "same recursion shape, panic swapped for a checked
-/// A document number's double under `S`'s number model, for the
-/// cursor-level reads in this evaluator that never build an `OwnedValue`
-/// (#2936): the `DocumentValue` twin of `eval.rs`'s `json_number_f64`. The
-/// literal text comes from `number_literal()` (a preservable spelling, both
-/// formats), so a lenient span or a bridge token takes the plain `as_f64()`
-/// exactly as before.
-fn document_number_f64_generic<S: EvalSemantics, V: DocumentValue>(value: &V) -> Option<f64> {
-    match value.number_literal() {
-        Some(literal) => {
-            crate::jq::value::document_number_f64::<S>(literal.as_bytes(), || value.as_f64())
-        }
-        None => value.as_f64(),
-    }
-}
-
 /// guard" duplication -- accepting the same drift risk that precedent
 /// already accepts, in exchange for the same zero-added-walk cost.
 pub fn to_owned_checked<S: EvalSemantics, V: DocumentValue>(

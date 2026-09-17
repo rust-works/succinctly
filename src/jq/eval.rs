@@ -52537,13 +52537,21 @@ fn builtin_exp2<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// function carried.
 /// `Err(None)` means an `optional` context swallowed the type mismatch, so the
 /// caller yields no output; `Err(Some(e))` is a real error.
-fn math_operand(value: &OwnedValue, optional: bool) -> Result<f64, Option<EvalError>> {
+///
+/// An `Int` operand widens through `int_to_f64::<S>` (#2906's 17-digit rule
+/// in jq mode, a plain cast in yq) -- the bare `as f64` this had until
+/// #2936's review was the last bare-cast widening in the math family
+/// (`pow(869389897822472004; 1)` printed `…472100` where jq prints
+/// `…472000`).
+fn math_operand<S: EvalSemantics>(
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<f64, Option<EvalError>> {
     match value {
-        OwnedValue::Int(n) => Ok(*n as f64),
-        OwnedValue::Float(n) => Ok(*n),
-        OwnedValue::NumberLiteral(..) => value
-            .as_f64()
-            .ok_or_else(|| Some(EvalError::new("invalid number"))),
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+            Ok(int_to_f64::<S>(*n))
+        }
+        OwnedValue::Float(n) | OwnedValue::NumberLiteral(NumberRepr::Float(n), _) => Ok(*n),
         _ if optional => Err(None),
         // jq's `LIBM_DDD` wording (`pow("a"; 1)` is `string ("a") number
         // required`, captured live against 1.7.1), shared with the unary
@@ -52571,12 +52579,12 @@ fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has neither builtin (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |exp, base| {
-            let base = match math_operand(&base, optional) {
+            let base = match math_operand::<S>(&base, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
             };
-            let exp = match math_operand(&exp, optional) {
+            let exp = match math_operand::<S>(&exp, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
@@ -52674,12 +52682,12 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has neither builtin (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |x, y| {
-            let y = match math_operand(&y, optional) {
+            let y = match math_operand::<S>(&y, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
             };
-            let x = match math_operand(&x, optional) {
+            let x = match math_operand::<S>(&x, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
@@ -52844,12 +52852,12 @@ fn builtin_libm2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has none of these builtins (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |b, a| {
-            let a = match math_operand(&a, optional) {
+            let a = match math_operand::<S>(&a, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
             };
-            let b = match math_operand(&b, optional) {
+            let b = match math_operand::<S>(&b, optional) {
                 Ok(n) => n,
                 Err(None) => return QueryResult::None,
                 Err(Some(e)) => return QueryResult::Error(e),
@@ -52906,9 +52914,9 @@ fn builtin_libm3<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `boom` (all captured live; PR #3067 review).
             fanout_arg::<W, S, _>(a_expr, value.clone(), optional, ArgFanout::All, |a| {
                 let (a, b, c) = match (
-                    math_operand(&a, optional),
-                    math_operand(&b, optional),
-                    math_operand(&c, optional),
+                    math_operand::<S>(&a, optional),
+                    math_operand::<S>(&b, optional),
+                    math_operand::<S>(&c, optional),
                 ) {
                     (Ok(a), Ok(b), Ok(c)) => (a, b, c),
                     (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
