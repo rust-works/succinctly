@@ -2144,7 +2144,17 @@ pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
 /// The scan delegates to [`crate::util::simd::escape::find_json_escape`],
 /// whose predicate (`"`, `\`, or `< 0x20`) is already exactly this
 /// function's three-way question, at 16-32 bytes per iteration instead of
-/// the byte-at-a-time loop this replaced.
+/// the byte-at-a-time loop this replaced. The scanner sees the *rest of the
+/// document*, not the string, so its length-vs-scalar threshold never fires
+/// here and one SIMD chunk resolves every string shorter than the chunk: the
+/// cost per string is flat, and on x86_64 it is dominated by the dispatch
+/// (an `avx2_enabled` read and a non-inlinable `#[target_feature]` call)
+/// rather than by the bytes scanned. That reads as slightly *more*
+/// instructions than the scalar loop on short-string documents (+2.2% on
+/// the perf guard's `users_keys_unsorted` row) while running faster in
+/// wall-clock time on every shape measured, so the trade was kept as is --
+/// see `docs/optimizations/simd.md` § "Instruction counts vs wall-clock"
+/// (#2963) before reaching for a short-string fast path.
 pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
     debug_assert_eq!(bytes.get(start), Some(&b'"'));
     let mut i = start + 1;

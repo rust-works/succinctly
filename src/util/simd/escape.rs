@@ -44,11 +44,23 @@ use core::arch::aarch64::*;
 #[cfg(all(target_arch = "x86_64", not(feature = "scalar-yaml")))]
 use core::arch::x86_64::*;
 
-/// Extract a bitmask from the high bit of each byte in a NEON vector.
+/// Pack a NEON compare result (every lane `0x00` or `0xFF`) into a `u64` with
+/// one *nibble* per byte lane: nibble `i` is `0xF` iff lane `i` matched, so
+/// `mask != 0` is "any match" and `mask.trailing_zeros() / 4` is the first
+/// matching lane. Shared across escape predicates (position extraction is
+/// predicate-agnostic).
 ///
-/// Returns a `u16` where bit `i` is set iff byte `i` has its high bit set. Shared
-/// across escape predicates (position extraction is predicate-agnostic). This is
-/// the same multiplication-trick emulation used elsewhere in the crate.
+/// This is the `shrn` narrowing trick, not the multiply-based emulation the
+/// crate's other `movemask`s use: `vshrn_n_u16::<4>` takes the top nibble of
+/// each lane and its neighbour's bottom nibble in one instruction, so the
+/// whole extraction is one vector op and one vector-to-GPR transfer. The
+/// multiply form needed two lane extracts, two 64-bit multiplies and the
+/// shifts/or to recombine them, and that latency sat on the critical path of
+/// every 16-byte chunk -- the document splitter resolves each string with one
+/// chunk (#2878), so on short-string documents it was paid once per string
+/// and the scalar loop it replaced beat it in wall-clock time on an M4 Pro
+/// (#2963). A nibble mask costs nothing the consumers care about: they only
+/// test it for zero and take its trailing zeros.
 #[cfg(all(
     target_arch = "aarch64",
     not(feature = "broadword-yaml"),
@@ -56,17 +68,13 @@ use core::arch::x86_64::*;
 ))]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn neon_movemask(v: uint8x16_t) -> u16 {
-    // Shift right by 7 → 0 or 1 in each byte.
-    let high_bits = vshrq_n_u8::<7>(v);
-    // Extract as two u64 lanes.
-    let low_u64 = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(high_bits));
-    let high_u64 = vgetq_lane_u64::<1>(vreinterpretq_u64_u8(high_bits));
-    // Pack 8 bytes into 8 bits with the classic multiply.
-    const MAGIC: u64 = 0x0102040810204080;
-    let low_packed = (low_u64.wrapping_mul(MAGIC) >> 56) as u8;
-    let high_packed = (high_u64.wrapping_mul(MAGIC) >> 56) as u8;
-    (low_packed as u16) | ((high_packed as u16) << 8)
+unsafe fn neon_nibble_mask(v: uint8x16_t) -> u64 {
+    // Each u16 lane is two adjacent bytes; shifting it right by 4 and
+    // narrowing keeps byte 2k's high nibble in the low half and byte 2k+1's
+    // low nibble in the high half of result byte k -- nibble i of the u64 is
+    // therefore lane i of `v`.
+    let nibbles = vshrn_n_u16::<4>(vreinterpretq_u16_u8(v));
+    vget_lane_u64::<0>(vreinterpret_u64_u8(nibbles))
 }
 
 /// Whether the 32-byte AVX2 kernels should be dispatched.
@@ -161,9 +169,10 @@ macro_rules! define_escape_scanner {
                 while offset + 16 <= data_len {
                     let chunk = vld1q_u8(data.as_ptr().add(offset));
                     let matches = super::$neon_mask(chunk);
-                    let mask = super::neon_movemask(matches);
+                    let mask = super::neon_nibble_mask(matches);
                     if mask != 0 {
-                        return start + offset + mask.trailing_zeros() as usize;
+                        // One nibble per lane: the first set nibble's index.
+                        return start + offset + (mask.trailing_zeros() / 4) as usize;
                     }
                     offset += 16;
                 }
@@ -942,6 +951,41 @@ mod tests {
         fn neon_returns_len_when_start_past_end() {
             // The kernel's own `start >= len` guard, not reached through find().
             assert_eq!(super::super::json_escape::neon(b"abc", 9), 3);
+        }
+
+        /// The `shrn` nibble mask (#2963) maps lane `i` to nibble `i` and
+        /// nothing else: pinned directly, lane by lane, so a lane-order slip
+        /// (the narrowing interleaves neighbouring bytes) cannot hide behind
+        /// the single-match sweep above, and with two matches per chunk so
+        /// `trailing_zeros / 4` is checked to pick the *first* one.
+        #[test]
+        fn neon_nibble_mask_maps_each_lane_to_its_nibble_2963() {
+            use core::arch::aarch64::vld1q_u8;
+            for i in 0..16 {
+                let mut lanes = [0u8; 16];
+                lanes[i] = 0xFF;
+                // SAFETY: NEON is mandatory on aarch64; `lanes` is 16 bytes.
+                let mask = unsafe { super::super::neon_nibble_mask(vld1q_u8(lanes.as_ptr())) };
+                assert_eq!(mask, 0xFu64 << (4 * i), "lane {i}");
+                assert_eq!(mask.trailing_zeros() / 4, i as u32, "lane {i}");
+                for j in (i + 1)..16 {
+                    lanes[j] = 0xFF;
+                    // SAFETY: as above.
+                    let mask = unsafe { super::super::neon_nibble_mask(vld1q_u8(lanes.as_ptr())) };
+                    assert_eq!(mask.trailing_zeros() / 4, i as u32, "lanes {i}+{j}");
+                    lanes[j] = 0;
+                }
+            }
+            // SAFETY: as above.
+            assert_eq!(
+                unsafe { super::super::neon_nibble_mask(vld1q_u8([0u8; 16].as_ptr())) },
+                0
+            );
+            assert_eq!(
+                // SAFETY: as above.
+                unsafe { super::super::neon_nibble_mask(vld1q_u8([0xFFu8; 16].as_ptr())) },
+                u64::MAX
+            );
         }
     }
 
