@@ -37793,18 +37793,18 @@ fn eval_static_component_fallback<S: EvalSemantics>(
 /// move -- the `=`/`|=`/`del()` side.
 ///
 /// A bare [`Expr::Field`]/[`Expr::Index`] -- the overwhelmingly common shape
-/// in a static tail (`.c.c.c...c[0]`) -- is navigated destructively here.
-/// [`IndexMap::swap_remove_index`]/[`Vec::swap_remove`] -- not the
-/// order-preserving `shift_remove`/`Vec::remove` -- are what make this O(1)
-/// instead of O(n), and are safe here specifically because the container being
-/// consumed is *never read again*: every sibling still inside it is simply
-/// dropped, in whatever order swap-removal leaves them, the moment this
-/// function returns. (A container whose remaining order or contents an
-/// *other* live reference could still observe would need the order-preserving
-/// removal instead -- this one has no such reference; see
-/// `value_after_components`'s own doc comment for why. The borrowing twin,
-/// [`navigate_static_component_ref`], removes nothing at all and so carries no
-/// such requirement.)
+/// in a static tail (`.c.c.c...c[0]`) -- is navigated destructively here,
+/// through [`ObjectMapOf::take_entry`]/[`ArrayOf::take_element`]: a
+/// swap-removal (O(1), not the order-preserving `shift_remove`/`Vec::remove`)
+/// when this walk holds the container's only handle, since the container is
+/// *never read again* -- every sibling still inside it is simply dropped, in
+/// whatever order swap-removal leaves them, the moment this function returns
+/// -- and a clone of just the child when the container is shared with a
+/// document still live elsewhere (#2999). The second case is what the sharing
+/// makes necessary: the pre-#2999 form swap-removed unconditionally, which on
+/// a shared container would first copy the whole container to remove one
+/// child from it. (The borrowing twin, [`navigate_static_component_ref`],
+/// removes nothing at all and so carries no such requirement.)
 ///
 /// Anything else -- [`Expr::Slice`] (jq's own array slice keeps the sliced
 /// sub-range regardless, so there is no equivalent "don't clone the sibling"
@@ -37828,14 +37828,16 @@ fn navigate_static_component<S: EvalSemantics>(
             // A missing key is `null`, not an error, exactly as
             // `eval_owned_fast_path`'s own `Field` arm has it.
             StaticAccess::Field(name) => match current {
-                OwnedValue::Object(mut map) => map.swap_remove(name).unwrap_or(OwnedValue::Null),
+                OwnedValue::Object(map) => map.take_entry(name).unwrap_or(OwnedValue::Null),
                 // Unreachable: `classify_static_component` answers `Field`
                 // only for an object. `null` is what it would answer for a
                 // key that is not there anyway, so this needs no panic.
                 _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Field only for OwnedValue::Object, and it was handed this very value (#2190)"
             },
             StaticAccess::Index(i) => match current {
-                OwnedValue::Array(mut items) => items.swap_remove(i),
+                // `classify_static_component` answers `Index` only for an
+                // in-range index, so the `None` here is unreachable too.
+                OwnedValue::Array(items) => items.take_element(i).unwrap_or(OwnedValue::Null),
                 // Unreachable, and `null`, for the same reasons.
                 _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Index only for OwnedValue::Array, and it was handed this very value (#2190)"
             },
@@ -97417,5 +97419,125 @@ mod tests {
             matches!(yq, QueryResult::None),
             "yq mode yields nothing past the root"
         );
+    }
+}
+
+/// #2999: the copies structural sharing removes from the write routes,
+/// pinned as forced-copy counts rather than left to an A/B. Each test runs a
+/// filter over a freshly materialised document and asserts exactly which
+/// copy-on-write points fired, by kind. `share_stats` records nothing in a
+/// build that has nothing to share, so the module is gated like the pins in
+/// `value.rs`.
+#[cfg(test)]
+#[cfg(not(feature = "unshared-containers"))]
+mod share_audit_2999 {
+    use alloc::collections::BTreeMap;
+
+    use super::*;
+    use crate::jq::parse;
+    use crate::jq::share_stats::{self, Kind};
+    use crate::json::JsonIndex;
+
+    fn ints(n: i64) -> Vec<u8> {
+        let body: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+        format!("[{}]", body.join(",")).into_bytes()
+    }
+
+    fn objs(n: i64) -> Vec<u8> {
+        let body: Vec<String> = (0..n).map(|i| format!("{{\"a\":{i},\"b\":{i}}}")).collect();
+        format!("[{}]", body.join(",")).into_bytes()
+    }
+
+    /// Evaluate `filter` over `json`, dropping the result inside the
+    /// measurement (so a copy hiding in a drop path would be counted too --
+    /// drops never copy), and assert the forced copies it made, by kind. A
+    /// mismatch prints every recording site, which is the audit list.
+    #[track_caller]
+    fn assert_forced(json: &[u8], filter: &str, expected: &[(Kind, u64)]) {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        let (ok, recorded) = share_stats::measure(|| {
+            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let ok = !matches!(result, QueryResult::Error(_));
+            drop(result);
+            ok
+        });
+        assert!(ok, "{filter} errored");
+        let mut by_kind = BTreeMap::new();
+        for (site, n) in &recorded {
+            *by_kind.entry(site.kind).or_insert(0) += n;
+        }
+        let expected: BTreeMap<Kind, u64> = expected.iter().copied().collect();
+        assert_eq!(
+            by_kind,
+            expected,
+            "{filter}: forced copies by site:\n{}",
+            share_stats::report()
+                .is_empty()
+                .then(|| recorded
+                    .iter()
+                    .map(|(s, n)| format!("{n:>8}  {:<16} {}:{}\n", s.kind.label(), s.file, s.line))
+                    .collect::<String>())
+                .unwrap_or_default()
+        );
+    }
+
+    /// The eager single-path route owns its document outright: nothing is
+    /// shared, so nothing is ever copied on write.
+    #[test]
+    fn eager_single_path_write_copies_nothing() {
+        assert_forced(&ints(1000), ".[0] = 0", &[]);
+        assert_forced(&objs(1000), ".[0].a = 1", &[]);
+    }
+
+    /// The streaming route keeps the pristine document beside the written
+    /// one. Before #2999 that was a deep copy of all 1,000 elements up front;
+    /// now the clone is a refcount bump and the first write copies the one
+    /// `Vec` of element handles, once. The second path writes into a
+    /// document that is already unique.
+    #[test]
+    fn streaming_multi_path_write_copies_the_spine_once() {
+        assert_forced(&ints(1000), ".[(0,1)] = 0", &[(Kind::ArrayMakeMut, 1)]);
+    }
+
+    /// Nested: the array copy is 1,000 *handles* (a refcount bump each), and
+    /// only the two objects actually written are copied -- never the other
+    /// 998.
+    #[test]
+    fn streaming_nested_write_copies_the_array_of_handles_and_the_written_objects() {
+        assert_forced(
+            &objs(1000),
+            ".[(0,1)].a = 1",
+            &[(Kind::ArrayMakeMut, 1), (Kind::ObjectMakeMut, 2)],
+        );
+    }
+
+    /// A multi-output right side forks one document per output. Only the
+    /// last output takes the pristine document by move; every earlier one
+    /// clones it and copies the spine on its first write -- so N outputs
+    /// cost N - 1 spine copies, not N deep copies.
+    #[test]
+    fn rhs_fork_copies_the_spine_once_per_extra_output() {
+        assert_forced(&ints(1000), ".[(0,1)] = (1,2)", &[(Kind::ArrayMakeMut, 1)]);
+        assert_forced(
+            &ints(1000),
+            ".[(0,1)] = (1,2,3)",
+            &[(Kind::ArrayMakeMut, 2)],
+        );
+    }
+
+    /// `|=` and `del` over the same multi-path shape.
+    #[test]
+    fn update_and_delete_multi_path_shapes() {
+        assert_forced(&ints(1000), ".[(0,1)] |= 0", &[(Kind::ArrayMakeMut, 1)]);
+        assert_forced(&ints(1000), "del(.[(0,1)])", &[]);
+    }
+
+    /// Reads share and never copy: binding the document to a variable and
+    /// reading it back through the binding is free.
+    #[test]
+    fn reads_through_a_binding_copy_nothing() {
+        assert_forced(&objs(1000), ". as $d | [$d[0], $d[1], ($d | length)]", &[]);
     }
 }
