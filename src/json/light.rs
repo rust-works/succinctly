@@ -2147,22 +2147,53 @@ pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
 /// the byte-at-a-time loop this replaced. The scanner sees the *rest of the
 /// document*, not the string, so its length-vs-scalar threshold never fires
 /// here and one SIMD chunk resolves every string shorter than the chunk: the
-/// cost per string is flat, and on x86_64 it is dominated by the dispatch
-/// (an `avx2_enabled` read and a non-inlinable `#[target_feature]` call)
-/// rather than by the bytes scanned. That reads as slightly *more*
+/// cost per string is flat, and dominated by the chunk's fixed cost rather
+/// than by the bytes scanned. On x86_64 that reads as slightly *more*
 /// instructions than the scalar loop on short-string documents (+2.2% on
 /// the perf guard's `users_keys_unsorted` row) while running faster in
-/// wall-clock time on every shape measured, so the trade was kept as is --
-/// see `docs/optimizations/simd.md` § "Instruction counts vs wall-clock"
-/// (#2963) before reaching for a short-string fast path.
+/// wall-clock time on every shape measured, so it is left alone there. On
+/// aarch64 the same flat cost is a latency chain (NEON compare, movemask,
+/// vector-to-GPR transfer) that a short scalar loop beats, so the first
+/// `STRING_SCALAR_PREFIX` bytes are probed a word at a time first -- see
+/// `docs/optimizations/simd.md` § "Instruction counts vs wall-clock" (#2963)
+/// for both measurements before moving that line.
+///
+/// `#[inline(always)]` is load-bearing, as it is on `find_json_escape`
+/// (O3): the probe and the chunk path each materialise a set of constants,
+/// and out of line they are rebuilt on every call -- one call per string
+/// -- on top of a prologue and epilogue. Fat LTO stopped inlining this
+/// function on its own once the probe was added, and the ARM64 perf guard
+/// read the difference as +6.2% on `users_keys_unsorted`; inlined into the
+/// splitter's loops the constants hoist and the per-string cost is the
+/// probe itself. On x86_64 the same inlining reads -2.7% instructions on
+/// that row and times neutral on a 7950X.
+#[inline(always)]
 pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+    string_literal_end_probed::<STRING_SCALAR_PREFIX>(bytes, start)
+}
+
+/// How many bytes [`string_literal_end`] probes with 64-bit word arithmetic
+/// before handing the rest of the document to the SIMD scanner: a multiple
+/// of 8, or zero to disable the probe.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const STRING_SCALAR_PREFIX: usize = 8;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const STRING_SCALAR_PREFIX: usize = 0;
+
+/// [`string_literal_end`] with the probe length as a parameter, so
+/// both the probed and the unprobed path are testable on every architecture.
+#[inline(always)]
+pub(crate) fn string_literal_end_probed<const PREFIX: usize>(
+    bytes: &[u8],
+    start: usize,
+) -> Option<usize> {
     debug_assert_eq!(bytes.get(start), Some(&b'"'));
     let mut i = start + 1;
     loop {
         // `find_json_escape` returns `bytes.len()` when it finds nothing and
         // when `i` is already past the end, so the `\` -at-EOF case below
         // lands here as "unterminated" without a separate bounds check.
-        let hit = crate::util::simd::escape::find_json_escape(bytes, i);
+        let hit = next_string_special::<PREFIX>(bytes, i);
         match bytes.get(hit) {
             Some(b'"') => return Some(hit + 1),
             // Skip the escaped byte. A `\` as the final byte pushes `i` past
@@ -2174,6 +2205,73 @@ pub fn string_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
             None => return None,
         }
     }
+}
+
+/// The index of the first `"`, `\` or control byte at or after `i`, or
+/// `bytes.len()`: `find_json_escape`, behind a word-at-a-time probe of the
+/// first `PREFIX` bytes.
+///
+/// The probe is O3's own finding (#87: "scalar is faster for tails shorter
+/// than 16 bytes") applied where the scanner's threshold cannot express it.
+/// That threshold compares against the *buffer* remainder, and here the
+/// buffer is the whole document, so from inside a string it is never short;
+/// the string is. Resolving the first few bytes in general registers settles
+/// most strings of a small-record document (84% of the perf guard's `users`
+/// shape are 8 bytes or shorter) without a SIMD chunk whose result must
+/// travel back from a vector register before the next string can start. A
+/// string longer than the probe pays the probe and then the chunk from
+/// `i + PREFIX` on, which skips the bytes already checked.
+///
+/// The probe is one 64-bit load per 8 bytes and a handful of ALU ops
+/// ([`word_special_mask`]), not a byte loop: a byte loop over the same
+/// window read +8.8% on the perf guard's ARM64 instruction count for the
+/// wall-clock win, and the guard cannot see the latter (#2963).
+///
+/// Fewer than 8 bytes left at `i` (including `i` past the end, a `\` as the
+/// last byte) skips the probe; the scanner's own tail handling and
+/// past-the-end fast exit cover it.
+#[inline(always)]
+fn next_string_special<const PREFIX: usize>(bytes: &[u8], i: usize) -> usize {
+    debug_assert!(PREFIX % 8 == 0, "the probe is measured in 64-bit words");
+    if PREFIX > 0 {
+        let mut at = i;
+        while at + 8 <= bytes.len() && at < i + PREFIX {
+            // `at + 8 <= len` was just checked, so the slice is in bounds.
+            let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+            let mask = word_special_mask(word);
+            if mask != 0 {
+                // The lowest set bit is exact (see `word_special_mask`); it
+                // is the high bit of the first special byte.
+                return at + (mask.trailing_zeros() / 8) as usize;
+            }
+            at += 8;
+        }
+        return crate::util::simd::escape::find_json_escape(bytes, at);
+    }
+    crate::util::simd::escape::find_json_escape(bytes, i)
+}
+
+/// A mask whose *lowest* set bit is the high bit of the first byte of
+/// `word` (little-endian byte order) that is `"`, `\` or below `0x20`; zero
+/// when no byte is. Bits above that first hit may be spurious, so callers
+/// use `mask.trailing_zeros() / 8` and nothing else.
+///
+/// The three terms are the classic `haszero` / `hasless` word tricks
+/// (`(x - 0x01..01) & !x & 0x80..80`): each term's borrow chain starts only
+/// at a byte that genuinely satisfies its test, so a false positive can only
+/// sit *above* a true hit of that same term -- and therefore above the
+/// lowest true hit of the OR. The `!x` factor keeps a byte at or above
+/// `0x80` (every UTF-8 continuation and lead byte) from testing positive
+/// without a borrow-in.
+#[inline(always)]
+fn word_special_mask(word: u64) -> u64 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let quote = word ^ (ONES * b'"' as u64);
+    let backslash = word ^ (ONES * b'\\' as u64);
+    let below_space = word.wrapping_sub(ONES * 0x20) & !word;
+    (quote.wrapping_sub(ONES) & !quote | backslash.wrapping_sub(ONES) & !backslash | below_space)
+        & HIGHS
 }
 
 /// Find the end of a number-*shaped* span starting at `start` in `text`
@@ -6585,6 +6683,191 @@ mod tests {
             .position(|w| w == b"\"ok\"")
             .expect("second literal present");
         assert_eq!(string_literal_end(doc, second), Some(second + 4));
+    }
+
+    /// `word_special_mask`'s contract is "lowest set bit is exact": every
+    /// byte value at every one of the 8 positions, alone, and then with a
+    /// borrow-provoking neighbour above it (`0x20`, which the `hasless`
+    /// term flags spuriously only *after* a true hit below it), so the
+    /// first-hit index never moves (#2963).
+    #[test]
+    fn test_word_special_mask_lowest_bit_is_exact_2963() {
+        let is_special = |b: u8| b == b'"' || b == b'\\' || b < 0x20;
+        for pos in 0..8 {
+            for byte in 0u8..=255 {
+                let mut w = [b'a'; 8];
+                w[pos] = byte;
+                let mask = word_special_mask(u64::from_le_bytes(w));
+                if is_special(byte) {
+                    assert_eq!(
+                        mask.trailing_zeros() / 8,
+                        pos as u32,
+                        "0x{byte:02X} at {pos}"
+                    );
+                } else {
+                    assert_eq!(mask, 0, "0x{byte:02X} at {pos} is not special");
+                }
+                if is_special(byte) && pos < 7 {
+                    for above in [0x20u8, 0x21, 0x80, 0xFF, b'"', 0x00] {
+                        w[pos + 1] = above;
+                        let mask = word_special_mask(u64::from_le_bytes(w));
+                        assert_eq!(
+                            mask.trailing_zeros() / 8,
+                            pos as u32,
+                            "0x{byte:02X} at {pos} with 0x{above:02X} above"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(word_special_mask(u64::from_le_bytes(*b"abcdefgh")), 0);
+        assert_eq!(word_special_mask(u64::from_le_bytes([0xFF; 8])), 0);
+        assert_eq!(word_special_mask(u64::from_le_bytes([0x20; 8])), 0);
+        assert_eq!(word_special_mask(u64::from_le_bytes([0x80; 8])), 0);
+    }
+
+    /// Independent scalar reference for the tests below -- the pre-#2878
+    /// loop, with the control-character rule -- kept separate from
+    /// `next_string_special`'s own probe so a shared bug cannot hide.
+    fn reference_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => return Some(i + 1),
+                b'\\' => i += 2,
+                b if b < 0x20 => return None,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// Every probe length the tests exercise: off, the shipped aarch64
+    /// value, and one chunk wide. Each runs on every architecture.
+    fn for_each_probe(mut check: impl FnMut(&str, fn(&[u8], usize) -> Option<usize>)) {
+        check("K=0", string_literal_end_probed::<0>);
+        check("K=8", string_literal_end_probed::<8>);
+        check("K=16", string_literal_end_probed::<16>);
+        check("shipped", string_literal_end);
+    }
+
+    /// The probed byte at every offset that matters for an 8-byte probe --
+    /// the last byte inside it, the first two past it, and the far edge of
+    /// the SIMD chunk that follows -- and every byte value at each one, so a
+    /// byte the probe accepts and the chunk rejects (or the reverse, and the
+    /// word trick's `>= 0x80` bytes in particular) cannot slip between the
+    /// two (#2963).
+    #[test]
+    fn test_string_literal_end_probe_edges_agree_with_reference_2963() {
+        for_each_probe(|label, scan| {
+            for pos in [1usize, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33] {
+                for byte in 0u8..=0xFF {
+                    let mut doc = vec![b'a'; pos + 40];
+                    doc[0] = b'"';
+                    doc[pos] = byte;
+                    doc[pos + 20] = b'"';
+                    assert_eq!(
+                        scan(&doc, 0),
+                        reference_string_end(&doc, 0),
+                        "{label}: byte 0x{byte:02X} at offset {pos}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Escapes across the probe boundary: a `\` as the probe's last byte so
+    /// the byte it protects lands on the far side, an escaped quote
+    /// straddling the boundary, and a `\` as the buffer's last byte inside
+    /// the window, which must still read as unterminated (#2963).
+    #[test]
+    fn test_string_literal_end_probe_boundary_escapes_2963() {
+        for_each_probe(|label, scan| {
+            for k in [8usize, 16] {
+                // `\` on the probe's last byte (index k: the probe starts at
+                // 1) protects a `"` on the first byte past it.
+                let mut doc = vec![b'a'; k + 8];
+                doc[0] = b'"';
+                doc[k] = b'\\';
+                doc[k + 1] = b'"';
+                doc[k + 7] = b'"';
+                assert_eq!(scan(&doc, 0), Some(k + 8), "{label}: escape at {k}");
+                assert_eq!(scan(&doc, 0), reference_string_end(&doc, 0), "{label}");
+                // A `\` at k+1 with the protected `"` at k+2 straddles the
+                // boundary from the other side.
+                let mut doc = vec![b'a'; k + 10];
+                doc[0] = b'"';
+                doc[k + 1] = b'\\';
+                doc[k + 2] = b'"';
+                doc[k + 9] = b'"';
+                assert_eq!(scan(&doc, 0), Some(k + 10), "{label}: escape at {}", k + 1);
+                // `\` as the final byte, inside the window.
+                let mut doc = vec![b'a'; k / 2];
+                doc[0] = b'"';
+                doc[k / 2 - 1] = b'\\';
+                assert_eq!(scan(&doc, 0), None, "{label}: trailing escape");
+            }
+        });
+    }
+
+    /// Buffers shorter than the probe: an unterminated string, a `start`
+    /// within the probe's reach of the end, and a `start` that is the last
+    /// byte. The probe must stop at the buffer's end, never read past it
+    /// (#2963).
+    #[test]
+    fn test_string_literal_end_probe_stops_at_buffer_end_2963() {
+        for_each_probe(|label, scan| {
+            assert_eq!(scan(b"\"abc", 0), None, "{label}");
+            assert_eq!(scan(b"\"", 0), None, "{label}");
+            assert_eq!(scan(b"\"ab\"", 0), Some(4), "{label}");
+            let doc = b"[1234567890, \"xy\"]";
+            let start = doc.len() - 5;
+            assert_eq!(scan(doc, start), Some(doc.len() - 1), "{label}");
+            assert_eq!(
+                scan(doc, doc.len() - 2),
+                None,
+                "{label}: opening quote last"
+            );
+        });
+    }
+
+    /// Randomised agreement with the scalar reference over strings of 0-80
+    /// bytes drawn from the bytes that matter (`"`, `\`, the control
+    /// boundary, DEL, and two non-ASCII bytes), at random start offsets so
+    /// the probe window lands at every alignment (#2963).
+    #[test]
+    fn test_string_literal_end_probe_matches_reference_randomised_2963() {
+        const ALPHABET: [u8; 9] = [b'a', b'"', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF];
+        let mut state = 0x2963_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let lead = (next() % 40) as usize;
+            let len = (next() % 81) as usize;
+            let mut doc = Vec::with_capacity(lead + len + 2);
+            doc.extend(core::iter::repeat_n(b'a', lead));
+            doc.push(b'"');
+            for _ in 0..len {
+                // Weight towards plain bytes so many strings are long and
+                // reach the chunk behind the probe.
+                doc.push(if next() % 4 != 0 {
+                    b'a'
+                } else {
+                    ALPHABET[(next() % 9) as usize]
+                });
+            }
+            if next() % 4 != 0 {
+                doc.push(b'"');
+            }
+            let want = reference_string_end(&doc, lead);
+            for_each_probe(|label, scan| {
+                assert_eq!(scan(&doc, lead), want, "{label}: {doc:?} from {lead}");
+            });
+        }
     }
 
     /// Companion to the test above: `nested_number_span` -- unlike
