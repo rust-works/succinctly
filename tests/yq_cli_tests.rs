@@ -48112,3 +48112,42 @@ fn test_yq_any_all_cond_isvalid_loops_keep_eager_answers_2658() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3093: `length` on a boolean in yq mode must answer the text width of
+/// its rendering (`false` => 5, `true` => 4) on the *owned* route too, not
+/// just the cursor route that already got it right via a scalar's own
+/// source spelling. Every row captured live against yq v4.53.3; the two
+/// bracketed `-n` cases mix a boolean and a number in one array specifically
+/// because #2658's differential caught this exact combination going wrong
+/// (the number was already fine, the boolean errored the whole pipeline).
+#[test]
+fn test_yq_length_of_owned_boolean_3093() -> Result<()> {
+    // Cursor route (materializes nothing): already correct before this fix.
+    let (stdout, code) = run_yq_stdin(
+        "[.a | length, .b | length]",
+        "a: false\nb: 12\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim(), "[5,2]");
+
+    // Owned/`-n` route: previously errored on the boolean alone.
+    let (stdout, code) = run_yq_stdin(
+        "[(false | length), (12 | length)]",
+        "",
+        &["-n", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim(), "[5,2]");
+
+    let (stdout, code) = run_yq_stdin("(true | length)", "", &["-n", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim(), "4");
+
+    // A write forces the DOM/owned path (ADR-0017) -- same rule applies.
+    let (stdout, code) = run_yq_stdin(".a |= (. | length)", "a: false\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stdout {stdout:?}");
+    assert_eq!(stdout.trim(), r#"{"a":5}"#);
+
+    Ok(())
+}
