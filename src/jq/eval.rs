@@ -45882,18 +45882,19 @@ const DELETE_TRIE_ROOT: u32 = 0;
 struct DeleteTrieNode {
     /// This node's own prefix is itself one of the resolved `del()` paths.
     ///
-    /// Read only by this node's *parent*, when it batches its terminal
-    /// children into one [`delete_keys`] call — never by the node itself on
-    /// the way in. That mirrors the pre-#1690 `delete_expr_paths_at`, whose own
-    /// exhausted-path check (`paths.iter().any(|path| path.len() == start)`)
-    /// is unreachable for `start > 0`: everything a `groups` bucket collects
-    /// there has `len() >= start + 2`, so only the top-level call can ever
-    /// see a path exhausted at its own position. Checking it here instead
-    /// would be a real behaviour change, not a shortcut — `{"a":"s"} |
-    /// del(.a, .a[0])` raises `Cannot index string with number` today
-    /// because the recursion into `.a` still runs even though `.a` is
-    /// already doomed, and short-circuiting on `terminal` would silently
-    /// swallow that.
+    /// Read by this node's *parent* when it batches its terminal children
+    /// into one [`delete_keys`] call, and, in jq mode, by the walk into a
+    /// continuation child (`delete_trie_object`'s `field_groups` loop,
+    /// `delete_trie_array`'s `index_groups` loop): jq's `delpaths_sorted`
+    /// never recurses into a key whose shortest path ends here, so jq mode
+    /// skips the continuation and lets the terminal `delete_keys` batch
+    /// remove it wholesale instead (#2929). `{"a":"s"} | del(.a, .a[0])`
+    /// still raises "Cannot index string with number" — that comes from
+    /// `resolve_del_path_branches` validating `.a[0]` before the trie is
+    /// even built, not from this walk, confirmed live. yq mode keeps
+    /// walking unconditionally: real yq *does* raise from inside a doomed
+    /// key jq wouldn't reach (`[[1,2]] | del(.[0], .[0][-5])` raises
+    /// "index [-5] out of range" in yq, confirmed live).
     terminal: bool,
     /// Child edges keyed by object field name, in first-occurrence order
     /// across the resolved paths — the pre-#1690 `delete_expr_object_paths`'s `terminal`
@@ -45982,8 +45983,14 @@ impl DeleteTrieNode {
 /// (#476/#527),
 /// same non-array type-error wording and ordering (#1322/#1331), same
 /// single-batch [`delete_keys`] call for terminal keys (#424), same
-/// insertion-ordered grouping (#1301). The one thing they do *not* mirror is
-/// the per-position re-grouping, which is what the trie replaces.
+/// insertion-ordered grouping for error priority (#1301). In jq mode they
+/// also now mirror the two `delpaths_sorted` (`src/jv_aux.c`) rules
+/// [`delete_paths_sorted`] already implements: a key whose shortest path
+/// ends at this node is never walked into, only deleted wholesale
+/// (`DeleteTrieNode::terminal`'s doc comment), and an array continuation
+/// alongside a slice sibling runs in jq's key order, not insertion order
+/// (`jq_delpaths_array_step_key`) — #2929. The one thing they do not mirror
+/// is the per-position re-grouping, which is what the trie replaces.
 struct DeleteTrie {
     nodes: Vec<DeleteTrieNode>,
 }
@@ -46455,6 +46462,16 @@ fn delete_trie_object(
             .fields
             .get_index(slot)
             .expect("field_groups holds live fields indices");
+        // jq's `delpaths_sorted`: a key whose shortest path ends here is
+        // wholly doomed, and jq never recurses into it — `del(.a, .a[0])`'s
+        // "Cannot index string with number" on `{"a":"s"}` comes from
+        // `resolve_del_path_branches` validating `.a[0]` up front, not from
+        // this walk, so skipping the continuation here doesn't lose it
+        // (#2929). yq mode keeps walking: real yq raises from inside a
+        // doomed key that jq wouldn't even reach (confirmed live).
+        if !yq_mode && trie.node(child).terminal {
+            continue;
+        }
         match entries.get_mut(name.as_str()) {
             Some(target) => {
                 let old = core::mem::replace(target, OwnedValue::Null);
@@ -46478,6 +46495,21 @@ fn delete_trie_object(
     }
 
     Ok(value)
+}
+
+/// jq's `jv_sort` order for an array `del()` continuation's own step, used
+/// to reorder `delete_trie_array`'s `index_groups` when a slice
+/// continuation is present (#2929): `Index(a)` vs `Index(b)` compares `a`
+/// numerically; every `Index` sorts before every `Slice`; `Slice(s1, e1)`
+/// vs `Slice(s2, e2)` compares `e1` with `e2` first, then `s1` with `s2`,
+/// with `None` sorting before `Some(n)` — exactly `Option<i64>`'s derived
+/// `Ord`, which the `(Option<i64>, Option<i64>)` tail of the returned tuple
+/// relies on directly rather than re-implementing the `None`-first rule.
+fn jq_delpaths_array_step_key(step: &ArrayStep) -> (u8, i64, Option<i64>, Option<i64>) {
+    match *step {
+        ArrayStep::Index(idx) => (0, idx, None, None),
+        ArrayStep::Slice(s, e) => (1, 0, e, s),
+    }
 }
 
 /// The pre-#1690 `delete_expr_array_paths`'s counterpart.
@@ -46597,11 +46629,49 @@ fn delete_trie_array(
     }
 
     if let OwnedValue::Array(arr) = &mut value {
-        for &slot in &node.index_groups {
+        // jq's `delpaths_sorted` visits array continuations in `jv_sort`
+        // key order (numbers ascending, then slice descriptors comparing on
+        // `end` first, then `start`, `null` sorting before a number) — only
+        // observable when a slice continuation is present, since deleting
+        // inside one splices a shorter sub-array back and shifts every
+        // later position (#2929). `index_groups` order otherwise (first
+        // resolved path wins) stays put: it's jq's own error-priority order
+        // (#1301) and reordering it unconditionally would regress that.
+        // Gating on "has a slice group" also keeps a filtered-descent
+        // node's index-only `index_groups` (which can run to millions of
+        // entries, #1690) off the sort.
+        let sorted_index_groups;
+        let index_groups: &[usize] = if !yq_mode
+            && node.index_groups.iter().any(|&slot| {
+                matches!(
+                    node.indices.get_index(slot).map(|(step, _)| step),
+                    Some(ArrayStep::Slice(..))
+                )
+            }) {
+            let mut sorted = node.index_groups.clone();
+            sorted.sort_by_key(|&slot| {
+                let (step, _) = node
+                    .indices
+                    .get_index(slot)
+                    .expect("index_groups holds live indices indices");
+                jq_delpaths_array_step_key(step)
+            });
+            sorted_index_groups = sorted;
+            &sorted_index_groups
+        } else {
+            &node.index_groups
+        };
+        for &slot in index_groups {
             let (step, &child) = node
                 .indices
                 .get_index(slot)
                 .expect("index_groups holds live indices indices");
+            // Same jq-only doomed-key skip as `delete_trie_object`'s
+            // `field_groups` loop above — see `DeleteTrieNode::terminal`'s
+            // doc comment.
+            if !yq_mode && trie.node(child).terminal {
+                continue;
+            }
             match step {
                 ArrayStep::Index(idx) => {
                     let key = OwnedValue::Int(*idx);
@@ -46643,9 +46713,14 @@ fn delete_trie_array(
                         | DeleteIndexResolution::Skip => delete_trie_through_absent(trie, child)?,
                     }
                 }
-                // Deleting *through* a slice deletes inside the sub-array and
-                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is
-                // `[1,[3]]`.
+                // Deleting *through* a slice deletes inside the sub-array
+                // and splices it back: `[1,[2],[3]] | del(.[1:3][0])` is
+                // `[1,[3]]`. Splicing shifts every later position, which is
+                // exactly why this arm's own visit order matters and, in jq
+                // mode, now runs in jq's key order (the sort above) rather
+                // than first-resolved order, and never under a key this
+                // node's terminal-skip above already deleted wholesale
+                // (#2929).
                 ArrayStep::Slice(s, e) => {
                     let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
                     let sub = OwnedValue::Array(arr[range.clone()].to_vec());

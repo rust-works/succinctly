@@ -27349,6 +27349,49 @@ fn test_yq_del_slice_outcome_iterate_prefix_scalar_and_null_1432() -> Result<()>
     Ok(())
 }
 
+/// #2929's Y1-Y3: the `DeleteTrie` doomed-key subsumption (fix A) and jq
+/// key-order sort (fix B) are both gated `!yq_mode` -- these pin that real
+/// yq's own, pre-existing behaviour for the same shapes stays untouched.
+#[test]
+fn test_yq_del_trie_untouched_by_2929() -> Result<()> {
+    // Y1: yq pads a doomed-and-continued index with `null` rather than
+    // subsuming the continuation the way jq mode's fix A now does.
+    let (out, code) = run_yq_stdin("del(.[3], .[3].a)", "[]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[null,null,null]");
+
+    // Y2: yq raises from inside a doomed key that jq mode's fix A would now
+    // skip -- the walk-through-a-doomed-key behaviour fix A removes in jq
+    // mode is exactly what yq mode still needs to raise this.
+    let (out, stderr, code) = run_yq_stdin_with_stderr("del(.[0], .[0][-5])", "[[1, 2]]\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(out.is_empty());
+    assert!(
+        stderr.contains("index [-5] out of range, array size is 2"),
+        "unexpected stderr: {stderr}"
+    );
+
+    // Y3: yq's own slice `del()` rewrite/no-op runs before the trie is ever
+    // built, so neither fix reaches it -- both shapes leave the document
+    // unchanged.
+    let (out, code) = run_yq_stdin(
+        "del(.[0:1] | ..)",
+        "[1, 2, 3, 4, 5]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3,4,5]");
+    let (out, code) = run_yq_stdin(
+        "del(.[3:5][0], .[0:2][0])",
+        "[1, 2, 3, 4, 5]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3,4,5]");
+
+    Ok(())
+}
+
 /// #1223: a comma-grouped multi-path `del()` used to crash when a sibling's
 /// chained-slice target was an `Object`, instead of applying #1162's own
 /// parent-key-drop rule (which the *single-path* form of this exact query
