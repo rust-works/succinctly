@@ -51720,6 +51720,20 @@ fn format_strftime(
     let overflow = EvalError::broken_down_time_out_of_range;
     let mut result = String::new();
     let mut chars = fmt.chars().peekable();
+    // `%I`/`%r`/`%l` all need the 12-hour form; computed once rather than
+    // three times, matching the abbreviated weekday/month arrays' own
+    // extraction just below.
+    let hour12 = if hour == 0 {
+        12
+    } else if hour > 12 {
+        hour - 12
+    } else {
+        hour
+    };
+    const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTH_ABBR: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
 
     while let Some(c) = chars.next() {
         if c == '%' {
@@ -51731,20 +51745,68 @@ fn format_strftime(
                 Some('d') => result.push_str(&format!("{day:02}")),
                 Some('e') => result.push_str(&format!("{day:2}")),
                 Some('H') => result.push_str(&format!("{hour:02}")),
-                Some('I') => result.push_str(&format!(
-                    "{:02}",
-                    if hour == 0 {
-                        12
-                    } else if hour > 12 {
-                        hour - 12
-                    } else {
-                        hour
-                    }
-                )),
+                Some('I') => result.push_str(&format!("{hour12:02}")),
+                // Blank- (not zero-) padded hours (glibc/BSD `strftime`).
+                Some('k') => result.push_str(&format!("{hour:2}")),
+                Some('l') => result.push_str(&format!("{hour12:2}")),
                 Some('M') => result.push_str(&format!("{minute:02}")),
                 Some('S') => result.push_str(&format!("{second:02}")),
                 Some('p') => result.push_str(if hour < 12 { "AM" } else { "PM" }),
-                Some('P') => result.push_str(if hour < 12 { "am" } else { "pm" }),
+                // Confirmed live against the pinned oracle (macOS libc's
+                // `strftime`, #3055): `%P` prints the bare letter `P`
+                // regardless of am/pm, not lowercase `am`/`pm` (glibc's own
+                // rule) -- macOS doesn't implement `%P` and falls back to
+                // printing the specifier letter unprefixed.
+                Some('P') => result.push('P'),
+                // POSIX's `%E`/`%O` "alternative representation" modifiers:
+                // the pinned oracle's C library has no locale-specific
+                // alternatives and treats every modified specifier as a
+                // pure pass-through to its plain form (confirmed live for
+                // every letter below, e.g. `%EY`/`%Oy`/`%Ez` all match
+                // `%Y`/`%y`/`%z` exactly, #3055). Two different fallbacks
+                // when nothing recognized follows, both confirmed live: at
+                // true end-of-format it's the bare modifier letter (the
+                // case this issue's own repro pins); followed by anything
+                // else unrecognized (a literal character, `%` starting a
+                // new specifier) it produces nothing at all, and that
+                // following character/specifier is processed normally on
+                // the *next* loop iteration -- `%E-`/`%O-` are the empty
+                // string, not `E-`/`O-`.
+                Some(letter @ ('E' | 'O')) => match chars.peek().copied() {
+                    Some(next) if "YymdeHIMSuUVWwcCxXz".contains(next) => {
+                        chars.next();
+                        let plain = format_strftime(
+                            &format!("%{next}"),
+                            year,
+                            month,
+                            day,
+                            hour,
+                            minute,
+                            second,
+                            weekday,
+                            yearday,
+                            zone_offset,
+                            zone_name,
+                        )?; // omni-dev: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: the call's own argument lines (immediately above) show 3 hits under the #3055 test's three E/O pass-through rows, but this closing-token line is never itself credited -- verified via the raw lcov DA: records"
+                        result.push_str(&plain);
+                    }
+                    Some(_) => {}
+                    None => result.push(letter),
+                },
+                // `%c`/`%r` are fixed compositions of the fields above
+                // (C's `"%a %b %e %H:%M:%S %Y"` / `"%I:%M:%S %p"`); `%x`/`%X`
+                // are merged into `%D`/`%T` below, which the oracle confirms
+                // are byte-identical to them. All pinned against the oracle
+                // rather than recursing into this same matcher.
+                Some('c') => result.push_str(&format!(
+                    "{} {} {day:2} {hour:02}:{minute:02}:{second:02} {year:04}",
+                    WEEKDAY_ABBR[weekday as usize % 7],
+                    MONTH_ABBR[(month - 1) as usize % 12],
+                )),
+                Some('r') => result.push_str(&format!(
+                    "{hour12:02}:{minute:02}:{second:02} {}",
+                    if hour < 12 { "AM" } else { "PM" }
+                )),
                 Some('j') => result.push_str(&format!(
                     "{:03}",
                     yearday.checked_add(1).ok_or_else(overflow)? // 1-indexed
@@ -51754,8 +51816,7 @@ fn format_strftime(
                     result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }));
                 } // Monday=1
                 Some('a') => {
-                    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-                    result.push_str(names[weekday as usize % 7]);
+                    result.push_str(WEEKDAY_ABBR[weekday as usize % 7]);
                 }
                 Some('A') => {
                     let names = [
@@ -51770,11 +51831,7 @@ fn format_strftime(
                     result.push_str(names[weekday as usize % 7]);
                 }
                 Some('b' | 'h') => {
-                    let names = [
-                        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
-                        "Nov", "Dec",
-                    ];
-                    result.push_str(names[(month - 1) as usize % 12]);
+                    result.push_str(MONTH_ABBR[(month - 1) as usize % 12]);
                 }
                 Some('B') => {
                     let names = [
@@ -51794,10 +51851,12 @@ fn format_strftime(
                     result.push_str(names[(month - 1) as usize % 12]);
                 }
                 Some('C') => result.push_str(&format!("{:02}", year / 100)),
-                Some('D') => result.push_str(&format!("{:02}/{:02}/{:02}", month, day, year % 100)),
+                Some('D' | 'x') => {
+                    result.push_str(&format!("{month:02}/{day:02}/{:02}", year % 100));
+                }
                 Some('F') => result.push_str(&format!("{year:04}-{month:02}-{day:02}")),
                 Some('R') => result.push_str(&format!("{hour:02}:{minute:02}")),
-                Some('T') => result.push_str(&format!("{hour:02}:{minute:02}:{second:02}")),
+                Some('T' | 'X') => result.push_str(&format!("{hour:02}:{minute:02}:{second:02}")),
                 Some('n') => result.push('\n'),
                 Some('t') => result.push('\t'),
                 // `strftime` formats in UTC; `strflocaltime` passes its zone.
@@ -84529,6 +84588,79 @@ mod tests {
         query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "02 00");
+            }
+        );
+    }
+
+    /// #3055: `%c`/`%x`/`%X`/`%r`/`%k`/`%l` were left as literal text
+    /// (unrecognized-specifier fallback), and `%P` printed lowercase
+    /// `am`/`pm` (glibc's own rule) instead of the bare letter `P` macOS
+    /// libc's `strftime` -- the pinned oracle -- actually prints, which
+    /// doesn't even depend on am/pm (confirmed at both an afternoon and a
+    /// midnight timestamp below). `%E`/`%O` are POSIX "alternative
+    /// representation" modifiers: pass through to their plain specifier
+    /// when a recognized one follows (`%EY`/`%Oy`/`%Ez` all confirmed
+    /// live to match `%Y`/`%y`/`%z` exactly); the bare-letter fallback is
+    /// only for a true end-of-format `%E`/`%O` (`%O` in the row below,
+    /// last in its format string) -- followed by anything else
+    /// unrecognized it's silently empty instead (`%E` in the row below,
+    /// followed by a literal `|`), also confirmed live. Every row
+    /// confirmed against `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn test_strftime_missing_specifiers_3055() {
+        // 2023-11-14T22:13:20Z: exercises 2-digit day/hour, PM.
+        query!(b"1700000000", r#"gmtime | strftime("%c|%x|%X|%r|%k|%l|%P|%E|%O")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(
+                    s,
+                    "Tue Nov 14 22:13:20 2023|11/14/23|22:13:20|10:13:20 PM|22|10|P||O"
+                );
+            }
+        );
+        // `%E`/`%O` immediately followed by a recognized specifier letter
+        // pass through to it unchanged.
+        query!(b"1700000000", r#"gmtime | strftime("%EY %Oy %Ez")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2023 23 +0000");
+            }
+        );
+        // %a/%b/%I unchanged by the shared-constant/shared-hour12 refactor
+        // above (no prior test exercised any of the three).
+        query!(b"1700000000", r#"gmtime | strftime("%a %b %I")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Tue Nov 10");
+            }
+        );
+        // Epoch (1970-01-01T00:00:00Z): single-digit day (%e blank pad in
+        // %c) and midnight -- %k/%l blank-pad to width 2, %I/%r wrap to 12,
+        // and %P stays "P" even though the hour is AM.
+        query!(b"0", r#"gmtime | strftime("%c|%x|%X|%r|%k|%l|%P")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(
+                    s,
+                    "Thu Jan  1 00:00:00 1970|01/01/70|00:00:00|12:00:00 AM| 0|12|P"
+                );
+            }
+        );
+        // Single-digit 12/24-hour values on both sides of noon: %k/%l are
+        // blank- not zero-padded (distinct from %H/%I), and %l wraps 13->1
+        // the same way %I does.
+        query!(b"3600", r#"gmtime | strftime("%k|%l")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, " 1| 1");
+            }
+        );
+        query!(b"82800", r#"gmtime | strftime("%k|%l")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "23|11");
+            }
+        );
+        // %D/%x and %T/%X are byte-identical on the pinned oracle (both
+        // the C-locale defaults), confirmed still agreeing after merging
+        // their match arms.
+        query!(b"1700000000", r#"gmtime | strftime("%D=%x %T=%X")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "11/14/23=11/14/23 22:13:20=22:13:20");
             }
         );
     }
