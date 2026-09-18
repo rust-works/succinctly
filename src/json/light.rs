@@ -2630,23 +2630,31 @@ pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -
 /// (`{"a" 1, "b": 2} | length`), and the alternative is silently wrong
 /// output. `scripts/perf-guard.py`'s baseline needs a deliberate
 /// `--update-baseline` run on a pinned bench box to reflect this.
+///
+/// Recognises both delimiter bytes, exactly as [`preceding_gap_ok`] does,
+/// not only `:` -- #2720 review: scanning for `:` alone `break`s on the `,`
+/// of a `:,` sequence with `found` already set, so `{"a":,1}` read as one
+/// well-formed field here where the backward scan (`preceding_gap_ok`, the
+/// check `effective_fields_checked` runs) refused it; `length` answered `1`
+/// for it, and once the identity writer validated through this scan too
+/// (#2720) it printed `{"a": 1}` where jq and the materializing path exit 5.
 pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
     let mut i = key_end;
-    let mut found = false;
+    let mut found = None;
     while i < text.len() {
         match text[i] {
-            b':' => {
-                if found {
+            b @ (b',' | b':') => {
+                if found.is_some() {
                     return false; // doubled delimiter
                 }
-                found = true;
+                found = Some(b);
                 i += 1;
             }
             b if b.is_ascii_whitespace() => i += 1,
             _ => break,
         }
     }
-    found
+    found == Some(b':')
 }
 
 /// Whether nothing but whitespace separates `gap_start` (a container's last
