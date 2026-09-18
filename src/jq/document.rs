@@ -2905,6 +2905,46 @@ pub fn collapsed_fields<F: DocumentFields>(
     Some(collapse_repeated(fields.all_fields()))
 }
 
+/// [`collapsed_fields_if`], refusing an object whose members the format's
+/// grammar never allowed (#1194, #1677, #2261) -- the streaming writer's
+/// gate (#2720).
+///
+/// `Ok(None)` is the answer a writer wants for the overwhelmingly common
+/// object: well-formed, no repeated key, so the fields can be streamed
+/// straight off `uncons` in document order with nothing materialized.
+/// `Ok(Some(..))` is the collapsed list for an object that does repeat a key
+/// under a collapsing mode, and `Err` the same `malformed_member_error` the
+/// materializing [`effective_fields_checked`] raises. One `census` walk --
+/// key-only, 8 bytes per field -- answers all three, where
+/// `effective_fields_checked` walked every field's value as well and kept
+/// a 144-byte `DocumentField` per field: on perf-guard's 2 MB `wide`
+/// fixture (a 158,981-field object) that list was 22.9 MB for a 2 MB input,
+/// and building it was half of the identity print's instructions (#2720's
+/// attribution on a 7950X).
+///
+/// The checks are `census`'s: the same `,`/`:` delimiter checks (#1677,
+/// key-side, as `effective_len_checked` already relies on for `length`),
+/// the bareword/non-string key check (#1194), an unpaired tail, and a
+/// trailing stray `,` after the real last field (#2261). The error carries
+/// no member position either way -- both constructors read only the
+/// document text -- so a caller switching between the two sees the same
+/// diagnostic.
+#[allow(clippy::type_complexity)] // STYLE-0004: mirrors collapsed_fields's own Option<Vec<DocumentField<..>>>, plus a Result for the #1194 check
+pub fn collapsed_fields_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Option<Vec<DocumentField<F::Value, F::Cursor>>>, EvalError> {
+    let census = census(fields);
+    if census.malformed {
+        return Err(fields.malformed_member_error());
+    }
+    if collapse && census.repeated {
+        Ok(Some(collapse_repeated(fields.all_fields())))
+    } else {
+        Ok(None)
+    }
+}
+
 /// [`collapsed_fields`], but skipped outright when the mode doesn't
 /// collapse (yq) -- the single guard the two positional `LazyKeys` arms
 /// (`Index`, `Last`) both need before they can answer.
