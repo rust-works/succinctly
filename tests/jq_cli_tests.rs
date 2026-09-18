@@ -27427,8 +27427,9 @@ fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
             "path(5 | . as {a: $v} ?// $v | .b?)",
             "",
             // jq names `$v`'s body (`element "b" of 5`), retrying past the
-            // walk; here the walk's own refusal stands (see limitations.md).
-            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 5\n",
+            // walk -- and since #3120 so does succinctly: the walk's refusal
+            // against the carried register is exact (`5` is not the root).
+            "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"b\" of 5\n",
             5,
         ),
         (
@@ -56433,11 +56434,6 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
             "del(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
         ),
         // jq: ["a"]
-        (
-            d,
-            "path(. as $x | 5 | $x as {a:$q} ?// $z | if $q then $q else $z end)",
-        ),
-        // jq: ["a"]
         (d, "path(. as {a:$q} | .a as $z | $z)"),
         // jq: ["a"]
         (d, "path(. as {a:$q} ?// $z | .a)"),
@@ -56446,6 +56442,22 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
     }
+    // One former refuse-only pin of this block answers since #3120: the
+    // marker-headed source on an untracked stage is checked against the
+    // *carried* register, which `$x` is, so the first alternative walks to
+    // `["a"]` and its body answers -- jq's `["a"]`, no retry involved.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(. as $x | 5 | $x as {a:$q} ?// $z | if $q then $q else $z end)",
+        ],
+        Some(d),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        (r#"["a"]"#, 0),
+        "stderr={stderr}"
+    );
 
     // The other invocation route (`-n`, no stdin): jq's `-n` seeds `.` as
     // `null`, so these are the same two rows as the `null` accept-table
@@ -60772,6 +60784,106 @@ fn test_identity_bind_below_root_is_not_the_root_2978() -> Result<()> {
             stderr.trim_end(),
             r#"jq: error (at <stdin>:0): Invalid path expression near attempt to access element "b" of {"b":1}"#,
             "#2978: `{filter}`"
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
+// #3043 / #3120: a destructuring bind on an untracked stage is checked
+// against the carried register, never the stage's own value
+// ============================================================================
+
+/// The write forms from #3043's table: `del`/`|=` on a `null` literal stage
+/// used to succeed as silent no-ops (exit 0, document echoed) where jq 1.7.1
+/// exits 5 at the pattern's first step, because the walk compared the `null`
+/// source with the stage's own `null` instead of with jq's register (the
+/// document root). #3124 part A is the same defect with a constructed source
+/// and a `?`-suppressed body. Every row: exit 5, nothing on stdout, jq's
+/// exact message.
+#[test]
+fn test_destructure_on_null_stage_refuses_like_jq_3120() -> Result<()> {
+    for (input, filter, element) in [
+        (r#"{"a":1}"#, r"del(null | . as [$v] | empty)", "0"),
+        (r#"{"a":1}"#, r"(null | . as [$v] | empty) |= 5", "0"),
+        (
+            r#"{"a":1}"#,
+            r"(null | . as {a:{b:$v}} | empty) = 5",
+            r#""a""#,
+        ),
+        (
+            r#"{"a":[1]}"#,
+            r"path(null | .a as {arr:[$v]} | .arr[]?)",
+            r#""arr""#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"path(null | ([.a] | .[0]) as [$v1] | ($v1 | .[]?))",
+            "0",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(try error(null) catch (. as {a:$q} | $q))",
+            r#""a""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "#3120: `{filter}` must refuse with nothing emitted; stderr={stderr:?}"
+        );
+        assert_eq!(
+            stderr.trim_end(),
+            format!(
+                "jq: error (at <stdin>:0): Invalid path expression near attempt to access element {element} of null"
+            ),
+            "#3120: `{filter}`"
+        );
+    }
+    Ok(())
+}
+
+/// With the register in hand the same arm now *answers* where jq does: a
+/// marker that is the register at the head of the pattern on an untracked
+/// stage (#2649 residue 2, #2979 family B -- `alt-untracked-stage-marker-head`
+/// was pinned as "MUST stay a refusal" only because the register was out of
+/// the arm's sight), including the write, and a `?//` whose refused first
+/// alternative is provably not the register retries as jq's fork does.
+#[test]
+fn test_destructure_on_untracked_stage_answers_with_the_register_3120() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"a":1}"#,
+            r"path(. as $x | 5 | $x as {a:$q} ?// $z | $q)",
+            r#"["a"]"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"del(. as $x | 5 | $x as {a:$q} ?// $z | $q)",
+            "{}",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"(. as $x | 5 | $x as {a:$q} | $q) = 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"[path(5 | 5 as {a:$v} ?// $v | empty)]",
+            "[]",
+        ),
+        (
+            r#"{"a":null}"#,
+            r"path(.a | null | . as {b:$v} | $v)",
+            r#"["a","b"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "#3120: `{filter}` -- stderr: {stderr:?}"
         );
     }
     Ok(())
