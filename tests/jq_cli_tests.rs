@@ -59910,6 +59910,82 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
     Ok(())
 }
 
+// ============================================================================
+// #2978: an identity-passthrough bind (`. as $x`) inside a resolver
+// invocation carries the position `.` was frozen at, so `getpath` can
+// compose one from it
+// ============================================================================
+
+/// The issue's own repro, read and written (`path`, `del`, `=`), plus the
+/// same bind below the invocation root. `main` refused every row with
+/// `Invalid path expression near attempt to access element "b" of {"b":2}`;
+/// jq 1.7.1 answers each exactly as pinned here (captured live).
+#[test]
+fn test_identity_bind_position_composes_with_getpath_2978() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"a":{"b":2}}"#,
+            r#"path(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":2},"c":1}"#,
+            r#"del(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+            r#"{"a":{},"c":1}"#,
+        ),
+        (
+            r#"{"a":{"b":2}}"#,
+            r#"(. as $x | .a | $x | getpath(["a"]) | .b) = 9"#,
+            r#"{"a":{"b":9}}"#,
+        ),
+        (
+            r#"{"x":{"a":{"b":2}}}"#,
+            r#"path(.x | . as $v | .a | $v | getpath(["a"]) | .b)"#,
+            r#"["x","a","b"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "#2978: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The load-bearing trap pair: an identity bind *below* the root
+/// (`.a | . as $x` binds `["a"]`'s node, not `[]`'s), whose composed
+/// `getpath(["a","c"])` result is `["a","a","c"]` -- a node holding a value
+/// equal to the register's at `["a","c"]`. A rule that assumed an identity
+/// bind sits at the invocation root would compose `["a","c"]`, answer the
+/// register's path, and then *delete the wrong node*. jq 1.7.1 refuses
+/// both, with this exact message; so does succinctly, before and after.
+#[test]
+fn test_identity_bind_below_root_is_not_the_root_2978() -> Result<()> {
+    let input = r#"{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}"#;
+    for filter in [
+        r#"path(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+        r#"del(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2978: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "#2978: `{filter}` must emit nothing before refusing"
+        );
+        assert_eq!(
+            stderr.trim_end(),
+            r#"jq: error (at <stdin>:0): Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            "#2978: `{filter}`"
+        );
+    }
+    Ok(())
+}
+
 /// #2696: a bounded consumer over bare `..` must still answer exactly what
 /// jq answers -- captured live against jq 1.7.1 on the same document as
 /// `test_bare_recurse_family_order_unchanged_by_lazy_sink_2696`. This is the

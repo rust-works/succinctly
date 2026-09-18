@@ -1566,9 +1566,9 @@ answers `["b"]` — and classified the two residuals appended below):
   per-step register" *and* "still identical to the persistent one") without regressing the
   `[]` case above — recorded rather than built, since the exit code and value already match
   and only wording differs.
-- **`getpath` is transparent to the path register, and succinctly now models it — except when
-  the input's position comes from an identity-passthrough bind
-  ([#2896](https://github.com/rust-works/succinctly/issues/2896)).** The mechanism recorded
+- **`getpath` is transparent to the path register, and succinctly now models it
+  ([#2896](https://github.com/rust-works/succinctly/issues/2896),
+  [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded
   here as *hypothesized* is now confirmed behaviourally against jq 1.7.1, with a probe that
   isolates each half. jq's `f_getpath` is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, so
   (a) on an input that is not the register it returns the value and leaves the register
@@ -1598,16 +1598,38 @@ answers `["b"]` — and classified the two residuals appended below):
   $ echo '{"a":{"b":2}}' | succinctly jq     'del(foreach .[] as $k (.; getpath(["a"]); .b))'
   {"a":{}}
   ```
-  **What still refuses**: a `getpath` whose *input* is a variable bound by an
-  identity-passthrough source (`. as $x`), as in the `(b)` probe above. Such a binding is
-  deliberately marked `Origin::Snapshot` — the #844 value-equality witness, which carries no
-  position — so there is nothing for `getpath`'s result to compose its own position from, and
-  the branch gets no provenance rather than a guessed one. A navigated bind (`.a as $y`), a
-  fold accumulator seeded from a trackable INIT/UPDATE branch, and another `getpath`'s own
-  result all do carry a position, so those compose. This is the safe direction — a refusal,
-  never a fabricated path — and is tracked as
-  [#2978](https://github.com/rust-works/succinctly/issues/2978); closing it means giving an
-  identity-passthrough bind a position without narrowing `Origin::Snapshot`'s own acceptance.
+  #2896 left one input without a position to compose from: a variable bound by an
+  identity-passthrough source (`. as $x`, and every spelling `is_identity_passthrough`
+  recognises), as in the `(b)` probe above, which was marked `Origin::Snapshot` — the #844
+  value-equality witness, position-less by construction. #2978 closed that: a bind made inside
+  a resolver invocation while the branch is trackable now carries `Origin::SnapshotAt`, the
+  same value-equality witness plus the position `.` was frozen at (`Frame::at`, which by
+  #2042's invariant *is* the register's position there — including below the invocation root,
+  `path(.x | . as $v | .a | $v | getpath(["a"]) | .b)` is `["x","a","b"]`). `Frame::certifies`
+  admits it exactly as it admits `Snapshot`, so no #844 shape narrowed; only the positional
+  readers (`getpath`'s result composition, the register-preservation proof) see the position.
+  A rebind from such a marker (`$x as $y`) inherits the *marker's* position, never the frame's,
+  which is what keeps `path(. as $x | .a | ($x as $y | .c | $y | getpath(["c"]) | .b))`
+  refusing as jq does. The acceptance oracle is `scripts/jq-bind-origin-oracle-sweep.sh`'s
+  `identity-*` rows and `scripts/jq-bind-origin-fuzz.py`, whose alphabet gained a navigation
+  prefix before the first bind (so `. as $v` is drawn below the root) and a nested rebind use.
+
+  **What still refuses** after #2978, each a refusal where jq answers, never a fabricated path:
+  - an `if` bind source whose arms sit at *different* positions —
+    `path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)`,
+    `["a","b"]` in jq. `identity_bind_position` is static (the condition is not evaluated),
+    so it proves a position only when both arms prove the same one; otherwise the bind stays a
+    bare `Snapshot`;
+  - a navigated source headed by such a marker (`$x.a as $w`): `resolve_bind_source_witness`
+    re-roots only an `Origin::At` head, so this still binds by value;
+  - a bind made in *value* mode, outside any resolver invocation, whose node is an ancestor of
+    a later invocation's root: `. as $x | .a | path($x | getpath(["a"]) | .b)` is `["b"]` in jq
+    (the `getpath` lands on the invocation's own root). Only a bind made inside the invocation
+    has a `Frame` to take a position from; a value-mode bind has no invocation at all, so its
+    marker stays a bare `Snapshot`. The same family as
+    [#3037](https://github.com/rust-works/succinctly/issues/3037)'s value-mode navigated
+    binds. (Wrapping the whole pipe in `path(...)` makes both refuse: the inner `path()`'s
+    result is then not a path expression of the outer one.)
 
   **Also still refusing**: `getpath` as a fold *SOURCE*
   (`path(foreach getpath(["a"]) as $x (...))`), which is a separate position from the
