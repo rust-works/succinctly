@@ -1289,6 +1289,15 @@ the matcher. Consequences, every one confirmed live against jq 1.7.1 and pinned 
   keeps first, array keeps last, both inverted under `?//`") was this rule as seen from index
   order.
 
+One bound of succinctly's own: a single pattern (one `?//` alternative, all nesting levels)
+holds at most 4096 computed keys (`MAX_PATTERN_COMPUTED_KEYS`, a clean parse error past it,
+beside `MAX_PATTERN_DEPTH`'s 256 nesting levels from #1240). The matcher runs the rest of the
+walk from inside each computed key's own generator callback, so every computed key on a match
+path is one native frame of the evaluation stack -- a pattern with 100k of them overflowed the
+CLI's 256 MB stack, a process abort rather than an answer, which is the one kind of divergence
+ADR-0018 permits. A literal key costs no frame, so a pattern's *width* is unbounded (a million
+literal entries walk fine, as before #2872); jq itself accepts any number of computed keys.
+
 Before #2872 value mode built the whole cartesian product of every key's outputs eagerly, and
 path position and both folds refused any key with other than exactly one output through an
 ordinary *catchable* error — which `?//` and `try` read as "this alternative did not match" and
