@@ -9146,8 +9146,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // navigation, nothing observable per output, and the #2061/#2168
         // route that avoids materializing the document at all), and a
         // document the reindex bridge would not round-trip identically
-        // keeps the bridge -- and so keeps the collecting behaviour, a
-        // recorded residual (#2925).
+        // keeps the bridge -- which now forwards demand too (#2925), so
+        // every route here streams.
         Expr::Builtin(Builtin::Path(path_expr))
             if !(cursor.is_some() && path_expr_is_cursor_navigable(path_expr)) =>
         {
@@ -9165,20 +9165,29 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
             if !reindex_bridge_is_identity(&owned) {
-                // Hand the bridge the document already materialized above,
-                // the way the eager arm does -- re-entering `eval_single`
-                // would run `RootWitness::of` + `demote_for_reentry` +
-                // `to_owned_with_cursor` a second time over the whole
-                // document to rebuild exactly these values.
+                // #2925: demand-forwarding, not `eval_on_owned`'s eager
+                // collect -- a consumer wrapping this arm (`limit`, `first`,
+                // `label`/`break`) can now stop the walk early on a document
+                // the reindex bridge would not round-trip identically (an
+                // over-256-char number literal, a NaN spelling), matching
+                // jq's own generator order instead of over-running it.
+                // `eval_each_owned`, not `eval_on_owned` -- `eval.rs`'s
+                // `eval_each` has its own lazy `Builtin::Path` arm (#2908),
+                // the same demand-forwarding entry point
+                // `bridge_to_each_owned_flow` above uses. `Reentry::Against(root)`,
+                // the same as that sibling call and unlike `demoted` above:
+                // `owned_builtin_expr` is the *whole* `Builtin::Path` wrapper,
+                // so `reentry.reroot`'s precheck sees the resolver-reaching
+                // node itself (the reason `demoted` reroots `path_expr`
+                // directly instead, per its own comment) and reroots exactly
+                // once, inside this call.
                 let owned_builtin_expr = Expr::Builtin(Builtin::Path(path_expr.clone()));
-                return drain_result_generic(
-                    eval_on_owned::<S, _>(
-                        &owned_builtin_expr,
-                        owned,
-                        optional,
-                        Reentry::Against(root),
-                    ),
-                    sink,
+                return eval_each_owned::<S>(
+                    &owned_builtin_expr,
+                    &owned,
+                    optional,
+                    Reentry::Against(root),
+                    &mut |v| sink.push(GenericItem::Owned(v)),
                 );
             }
             each_path_on_owned::<S>(&demoted, &owned, false, &mut |v| {
