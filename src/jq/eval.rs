@@ -79225,10 +79225,12 @@ mod tests {
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
         };
         let mut on_update_calls = 0;
+        // omni-dev: coverage tolerate reason="the closure is asserted never called below (on_update_calls stays 0) -- Err(_) with optional=true short-circuits fold_step_each before this sink runs (#3122)"
         let flow = fold_step_each::<JqSemantics>(&expr, OwnedValue::Int(1), true, &mut |_| {
             on_update_calls += 1;
             Demand::Continue
         });
+        // omni-dev: coverage end
         assert_eq!(on_update_calls, 0);
         assert!(matches!(flow, Flow::Exhausted));
     }
@@ -88595,6 +88597,29 @@ mod tests {
         );
     }
 
+    /// #3122: [`eval_path_context_pipe_owned`]'s own marker-demotion
+    /// precheck. `needs_path_context` deliberately does not recurse into a
+    /// `?//`-alternative chain's body (`patterns.len() > 1`, mirroring its
+    /// identical carve-out for `reduce`/`foreach`'s UPDATE, both documented
+    /// on that function), so a `key` sitting inside one reaches this
+    /// evaluator's own `eval_pipe` bridge with the routing decision already
+    /// made against `false` at the top level -- and a `Snapshot` marker
+    /// bound before the chain (`. as $m`, still a live document node here
+    /// since the eager evaluator's `eval_as` never re-entered a resolver in
+    /// between) reaches the bridge un-demoted, exactly the shape this
+    /// door's own `has_demotable_marker` precheck exists to catch before
+    /// the pipe crosses into a rebuilt document.
+    #[test]
+    fn test_hidden_pipe_inside_alternative_chain_demotes_a_live_marker_3122() {
+        assert_eq!(
+            outputs(
+                b"{\"a\":{\"b\":1}}",
+                ". as $m | (1 as $q ?// $q | .a | [key, $m])"
+            ),
+            vec![r#"["a",{"a":{"b":1}}]"#]
+        );
+    }
+
     /// Spine 2416 (the exit), door 2: a value the reindex bridge would
     /// re-spell must not take it.
     ///
@@ -88688,6 +88713,22 @@ mod tests {
         assert_eq!(
             eval_all_outputs(b"[10,20]", &[7, 8], ".[] | file_index | tostring"),
             vec![r#""7""#, r#""8""#]
+        );
+    }
+
+    /// #3122: `eval_owned_with_file_index`'s own fast path -- a filter that
+    /// `needs_path_context` can see nothing in (no `file_index`/`key`/
+    /// `parent`/`path`) skips the reindex-and-walk door entirely and goes
+    /// straight through the ordinary owned evaluator via `Reentry::REBUILT`,
+    /// the overwhelming-majority case the function's own doc comment
+    /// describes. Every other test in this module that reaches
+    /// `eval_owned_with_file_index` deliberately uses a path-context
+    /// filter to exercise the door itself, so none of them cover this arm.
+    #[test]
+    fn test_eval_all_fast_path_skips_path_context_door_3122() {
+        assert_eq!(
+            eval_all_outputs(b"[10,20]", &[7, 8], ".[] | . + 1"),
+            vec!["11", "21"]
         );
     }
 
@@ -97955,6 +97996,51 @@ mod tests {
         }
     }
 
+    /// `rewrite_markers`' own precheck (#3122 coverage review): its
+    /// `any_subexpr` gate decides once, for the *whole* expression, whether
+    /// to walk at all -- so a marker that itself needs no change (a
+    /// `Snapshot` already naming `root`'s own node, neither demotable nor
+    /// promotable) is still visited and cloned back untouched whenever a
+    /// *sibling* marker in the same expression is the one that tripped the
+    /// gate. `reroot_markers_only_lifts_the_roots_own_node_3037` above pairs
+    /// a demotion with a promotion -- both change -- so it never exercises
+    /// this "walked but left alone" arm; this test pairs a demotion with a
+    /// marker that already matches `root` exactly.
+    #[test]
+    fn rewrite_markers_leaves_an_already_matching_sibling_untouched_3122() {
+        let value = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let node = |node: usize, document: usize| BindOrigin::Node { node, document };
+        let marker = |node: Option<BindOrigin>| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin: Origin::Snapshot,
+                node,
+            }))
+        };
+        let origin_of = |e: &Expr| match e {
+            Expr::TrackedVar(m) => m.origin.clone(),
+            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3122)"
+        };
+        let root = RootWitness::Node {
+            node: 3,
+            document: 9,
+        };
+        // First marker names another node: demoted. Second already names
+        // `root` exactly: `marker_needs_demotion` refuses (its node matches)
+        // and `marker_is_root` refuses too (its origin is `Snapshot`, not
+        // `Untracked`), so `reroot_rewrite` answers `None` for it -- the
+        // walk still reaches it (the first marker already proved a rewrite
+        // is needed somewhere) and clones it back with the same origin.
+        let mixed = Expr::Comma(vec![marker(Some(node(4, 9))), marker(Some(node(3, 9)))]);
+        match reroot_markers::<JqSemantics>(&mixed, &root).as_ref() {
+            Expr::Comma(parts) => {
+                assert_eq!(origin_of(&parts[0]), Origin::Untracked);
+                assert_eq!(origin_of(&parts[1]), Origin::Snapshot);
+            }
+            other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3122)"
+        }
+    }
+
     /// yq mode is untouched (#3037): real yq's assignment through a
     /// variable is a no-op that prints the document unchanged, where
     /// succinctly refuses loudly -- a pre-existing divergence in the safe
@@ -98019,10 +98105,11 @@ mod tests {
             let Cow::Owned(Expr::Builtin(Builtin::Path(inner))) =
                 demote_for_reentry(&resolving, root)
             else {
+                // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
                 panic!("a mismatching root must rebuild the resolver-reaching expression");
             };
             let Expr::TrackedVar(demoted) = inner.as_ref() else {
-                panic!("the rebuilt expression keeps its shape");
+                panic!("the rebuilt expression keeps its shape"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if demote_for_reentry's own let-else assertion condition is false (#3122)"
             };
             assert_eq!(demoted.origin, Origin::Untracked);
         }
@@ -98062,9 +98149,11 @@ mod tests {
         let Cow::Owned(Expr::Builtin(Builtin::Path(inner))) =
             Reentry::Against(own).reroot::<JqSemantics>(&resolving)
         else {
+            // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
             panic!("the root's own untracked marker must be promoted where a resolver reads it");
         };
         let Expr::TrackedVar(promoted) = inner.as_ref() else {
+            // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if reroot's own let-else assertion condition is false (#3122)"
             panic!("the rebuilt expression keeps its shape");
         };
         assert_eq!(promoted.origin, Origin::Snapshot);

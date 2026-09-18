@@ -26778,6 +26778,28 @@ mod tests {
         assert_eq!(one_owned_json(b"[1]", "[path(.)]"), "[[]]");
     }
 
+    /// #3122: `eval_single`'s own `Expr::Pipe` arm, `cursor.is_none()` branch
+    /// -- `eval_using` (the value-only entry point) handed a pipe with a
+    /// path-context stage (`[key]`). No cursor exists to answer `key` from
+    /// directly, so this arm materializes the value and hands the whole pipe
+    /// to `eval_on_owned` under `Reentry::REBUILT`, which reindexes it into
+    /// a throwaway document rather than losing the position outright
+    /// (`key` still answers `"a"`, not `null`). No existing test drives a
+    /// *multi-stage* pipe whose first stage alone needs path context through
+    /// this exact door.
+    #[test]
+    fn test_eval_using_pipe_with_path_context_stage_has_no_cursor_3122() {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse(".a | [key]").unwrap();
+        let result = eval_using::<JqSemantics, _>(&expr, value);
+        assert_eq!(
+            result.collect_owned::<JqSemantics>().unwrap(),
+            vec![OwnedValue::Array(vec![OwnedValue::string("a")].into())]
+        );
+    }
+
     /// temporary JSON index is dropped, preserving the complete preorder.
     #[test]
     fn cursorless_recursive_descent_bridge_preserves_values_2661() {
@@ -27130,6 +27152,29 @@ mod tests {
                 "sanity: the jq-mode bridge hands back {computed:?} unchanged"
             );
         }
+    }
+
+    /// #3122: `eval_builtin`'s `Builtin::Path` arm, the fallback taken when
+    /// `path_expr` is not cursor-navigable (`first(.a)` -- a resolver call,
+    /// not a plain field/index/pipe chain `path_expr_is_cursor_navigable`
+    /// recognises) *and* the document holds a value
+    /// [`reindex_bridge_is_identity`] refuses -- a `NumberLiteral` past
+    /// `REINDEX_LITERAL_LEN_CAP` here. `builtin_path_on_owned`'s direct,
+    /// no-round-trip route is only sound when the bridge would be a no-op,
+    /// so this shape falls all the way through to `eval_on_owned` under
+    /// `Reentry::Against(root)` instead, the same round trip the pre-#2061
+    /// evaluator always paid.
+    #[test]
+    fn test_path_non_navigable_falls_back_when_reindex_is_not_identity_3122() {
+        let long = "1".repeat(super::REINDEX_LITERAL_LEN_CAP + 1);
+        let json = alloc::format!(r#"{{"a":[1,2],"big":{long}}}"#);
+        let index = JsonIndex::build(json.as_bytes());
+        let expr = crate::jq::parse("path(first(.a))").unwrap();
+        let result = eval_with_cursor_using::<JqSemantics, _>(&expr, index.root(json.as_bytes()));
+        assert_eq!(
+            result.collect_owned::<JqSemantics>().unwrap(),
+            vec![OwnedValue::Array(vec![OwnedValue::string("a")].into())]
+        );
     }
 
     /// The one thing [`reindex_bridge_is_identity`]'s `Int` arm rests on, and
