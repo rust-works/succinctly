@@ -45,6 +45,15 @@
 # write operators, plus the two refusals kept on purpose (the reasons are in
 # REFUSE_ONLY below and in limitations.md).
 #
+# The `nested-*`, `catch-*` and `computed-identity-bind-*` rows are #3133: an
+# untracked stage's `Frame` carries the register's value into a pipe nested
+# under `try`/`if`/`,` and into a `catch` handler (jq restores the register to
+# the `try`'s entry when it catches), so a marker there re-establishes and a
+# write through it lands -- `del(. as {a:$w} | try ($w | .b))` echoed the
+# document where jq writes. The same change makes `. as $x` on an untracked
+# stage an Untracked marker (a computed `.` is no node), closing a
+# pre-existing write-through of a constructed copy.
+#
 # The `untracked-*` rows are #3043/#3120: a destructuring bind on an
 # *untracked* stage checks its first pattern step against the register the
 # pipe carried in (`resolve_seq_stage` hands it to `resolve_as_pattern`),
@@ -420,6 +429,29 @@ untracked-bare-alt-keeps-register-del	{"a":1}	del(. as $x | 5 | $x as [$v] ?// $
 untracked-opaque-stage-lost-register	{"a":{"b":null}}	del(reduce 1 as $i (null; null) | . as [$v] ?// $v | empty)
 untracked-later-step-refusal-no-retry	{"a":{"b":[1]}}	path(.a as $x | .a | 5 | $x as {b:[$q,$r]} ?// $w | $w)
 untracked-later-step-refusal-trackable-twin	{"a":{"b":[1]}}	path(.a as $x | .a | $x as {b:[$q,$r]} ?// $w | $w)
+nested-try-body-keeps-register	{"a":{"b":1}}	del(. as {a:$w} | try ($w | .b))
+nested-try-body-keeps-register-untracked	{"a":{"b":1}}	del(. as $x | 5 | $x as {a:$w} | try ($w | .b))
+nested-optional-body-keeps-register	{"a":{"b":1}}	del(. as $x | 5 | $x as {a:$w} | ($w | .b)?)
+nested-optional-bare-alt-keeps-register	{"a":1}	del(. as $x | 5 | $x as [$w] ?// $z | ($z | .a)?)
+nested-try-source-keeps-register	{"a":{"b":1}}	del(.a as $x | .a | 5 | try ($x as {b:$q} | $q))
+nested-try-sibling-copy-control	{"a":{"b":1},"c":{"b":1}}	del(.a as $y | .c | 5 | try ($y | .b))
+nested-pipe-null-register	{"a":null}	path(.a | 5 | (null | .b))
+nested-pipe-non-null-register	{"a":{"b":1}}	path(.a | 5 | (null | .b))
+catch-restores-entry-register	null	path(try (.a | error(null)) catch .b)
+catch-restores-entry-register-refuses	{"x":{"a":1,"b":2}}	path(.x | try (.a | error(null)) catch .b)
+catch-rebuilt-payload-refuses	{"x":{"a":1,"b":2}}	path(.x | try (.a | error({"a":1,"b":2})) catch .b)
+catch-marker-reestablishes-untracked	{"a":{"b":1}}	path(.a as $y | .a | 5 | try error(1) catch $y)
+catch-marker-reestablishes-del	{"a":{"b":1}}	del(.a as $y | .a | 5 | try error(1) catch $y)
+catch-marker-navigates	{"a":{"b":1}}	path(.a as $y | .a | try error(1) catch ($y | .b))
+catch-payload-handed-on	{"a":{"b":1}}	[path(.a | (try error(null) catch .) | empty)]
+catch-payload-handed-on-refuses	{"a":{"b":1}}	path(.a | (try error(null) catch .) | .b)
+catch-payload-own-node-refuse-only	{"a":{"b":1}}	path(.a | try error(.) catch .)
+computed-identity-bind-untracked	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as $x | $x)
+computed-identity-bind-untracked-del	{"a":{"b":{"c":1}}}	del(.a | {b:{c:1}} | . as $x | $x)
+computed-identity-bind-navigates	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as $x | $x | .b | .c)
+computed-identity-bind-null-register	{"a":null}	path(.a | null | . as $x | $x | .b)
+computed-identity-bind-marker-source	{"a":{"b":{"c":1}}}	path(. as $x | 5 | $x as $y | $y)
+computed-identity-bind-mixed-if	{"a":{"b":{"c":1}}}	path(. as $x | 5 | (if true then $x else . end) as $y | $y)
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -442,12 +474,8 @@ negative-index-spelling:a negative index is stored as written, so .[-2] never ma
 full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
 marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
 slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice components differ, so the spelling never matches (open-ended twin of full-slice-is-the-array)
-catch-handler-var:the handler resolves under an unknown frame and a raising try stage does not carry the register; pre-existing, the root marker refuses too
-literal-then-fold-untracked-init:after a literal the register is only carried, and a fold with an untracked INIT seeds its register from the ambient literal; pre-existing, the root marker refuses too
 destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
 destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
-destructure-alt-artefact-guard:#2649 artefact guard -- MUST stay a refusal: retrying here would answer [] where jq answers ["a",0]; answering anything makes this row mismatch (fabrication assertion, not a bare allowlist entry)
-destructure-alt-artefact-guard-del:#2649 artefact guard -- the write twin: a retry would delete the whole document where jq deletes .a[0]
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
@@ -466,10 +494,10 @@ navigated-bind-owned-root:#3037 residual -- a navigated bind on an owned-rooted 
 navigated-bind-input-root:#3037 residual -- same as navigated-bind-owned-root, on the input-queue route
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
-untracked-catch-handler-null-document:#3120 -- a catch handler runs under an untracked frame with no register in hand, since the try body's navigation may have moved it before raising, so the walk refuses; jq answers only because this document is null. The same rule fabricated a del on any other document, see untracked-catch-handler-del, so this coincidence is not kept
-untracked-nested-if-null-register:#3120 -- a nested pipe inside if/try carries no register, so with a null register behind a non-matching literal the walk cannot know jq's verdict, which is to accept here; refused before #3120 too
 untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
 untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
+catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node itself and jq answers ["a"]; the payload equals the register by value but is not null/bool and carries no marker, so it cannot be told from a rebuilt copy (catch-rebuilt-payload-refuses) and the handler stays untracked
+computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then

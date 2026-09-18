@@ -28906,10 +28906,30 @@ fn slice_bound_component_value(bound: Option<i64>, key: Option<&SliceBoundKey>) 
 /// navigated position at all ([`Frame::enter`]'s syntactic gate), so the
 /// per-stage extension below is free for the ordinary write workloads
 /// (`.[] |= f`, `del(.[] | select(..))`) that never use one.
+///
+/// `register` (#3133) is the register's *value* at `at`, carried only while
+/// the branch this frame belongs to is untracked and the enclosing pipe
+/// still holds the register (`resolve_seq_stage`'s `carried_register`) --
+/// `None` while trackable (the register is the ambient value itself) and
+/// wherever `at` is not provable. It exists so a pipe nested under
+/// `try`/`if`/`,`, and a `catch` handler, which `resolve_node_sink` reaches
+/// with the same ambient value but no `PathBranch` to carry the register in,
+/// can seed themselves with it instead of resolving register-less: `del(. as
+/// {a:$w} | try ($w | .b))` discarded the write jq performs, because `$w`
+/// had nothing to re-establish against inside the `try`. It is *value*
+/// information and independent of `at`: the `null`/`bool` identity rule and
+/// a `Snapshot` marker's value rule need no position (`null | path(try (.a |
+/// error(null)) catch .b)` is `["b"]` in a program whose `at` the
+/// [`may_bind_navigated`] gate left `None`), while an `Origin::At` marker
+/// still certifies against `at` alone. It is cleared by every constructor
+/// that moves or forgets the position, so the same one-directional
+/// invariant covers it: a wrong `Some` would re-establish a value on a
+/// register it is not identical to.
 #[derive(Debug, Clone)]
 pub(crate) struct Frame {
     invocation: u64,
     at: Option<Rc<PathPrefix>>,
+    register: Option<Rc<OwnedValue>>,
 }
 
 /// Next [`Frame::invocation`]. A plain atomic rather than a
@@ -28923,7 +28943,11 @@ impl Frame {
     fn enter(expr: &Expr) -> Self {
         let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64;
         let at = may_bind_navigated(expr).then(PathPrefix::root);
-        Self { invocation, at }
+        Self {
+            invocation,
+            at,
+            register: None,
+        }
     }
 
     /// `invocation`, at the absolute position `path` -- how a marker-headed
@@ -28932,6 +28956,7 @@ impl Frame {
         Self {
             invocation,
             at: Some(path),
+            register: None,
         }
     }
 
@@ -28940,7 +28965,25 @@ impl Frame {
         Self {
             invocation: self.invocation,
             at: None,
+            register: None,
         }
+    }
+
+    /// The same frame carrying `register` as the live register's value
+    /// (#3133), or none.
+    fn with_register(&self, register: Option<&OwnedValue>) -> Self {
+        Self {
+            invocation: self.invocation,
+            at: self.at.clone(),
+            // Structural sharing (#2999) makes this clone a refcount bump
+            // for a container, and the register is nearly always one.
+            register: register.map(|value| Rc::new(value.clone())),
+        }
+    }
+
+    /// The register value this frame carries, if any (#3133).
+    fn register(&self) -> Option<&OwnedValue> {
+        self.register.as_deref()
     }
 
     /// The same invocation, `path` further along from `at`. Free at the
@@ -28959,6 +29002,13 @@ impl Frame {
         Self {
             invocation: self.invocation,
             at,
+            // A moved position is a different node; only an empty `path`
+            // keeps the register (#3133).
+            register: if path.depth() == 0 {
+                self.register.clone()
+            } else {
+                None
+            },
         }
     }
 
@@ -30971,14 +31021,39 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // message shape this resolver did not reproduce at all; `resolve_catch`
         // below now raises it correctly by marking the handler's payload
         // untracked, #843.)
+        //
+        // #3133: a caught error restores jq's register to where it was at
+        // the `try`'s entry (its fork point saves and restores the path
+        // state) -- confirmed live, `null | path(try (.a | error(null))
+        // catch .b)` is `["b"]`, and with a non-null register the handler's
+        // `.b` refuses against it. That register is `value` itself while
+        // trackable, otherwise whatever this stage's frame carries; the
+        // handler is resolved with it in hand (`resolve_catch_sink`).
         Expr::Try { expr, catch } => {
+            let entry_register = if trackable {
+                Some(value)
+            } else {
+                frame.register()
+            };
             match resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
-                    resolve_catch_sink::<S>(catch.as_deref(), e.payload(), frame, keep, sink)
+                    resolve_catch_sink::<S>(
+                        catch.as_deref(),
+                        e.payload(),
+                        frame,
+                        entry_register,
+                        keep,
+                        sink,
+                    )
                 }
-                ResolveFlow::Escaped(EvalEscape::Break(_)) => {
-                    resolve_catch_sink::<S>(catch.as_deref(), OwnedValue::Null, frame, keep, sink)
-                }
+                ResolveFlow::Escaped(EvalEscape::Break(_)) => resolve_catch_sink::<S>(
+                    catch.as_deref(),
+                    OwnedValue::Null,
+                    frame,
+                    entry_register,
+                    keep,
+                    sink,
+                ),
                 other => other,
             }
         }
@@ -31108,7 +31183,19 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             patterns,
             body,
         } if S::TAG == EvalTag::Jq => resolve_as_pattern::<S>(
-            expr, patterns, body, value, trackable, snapshot, frame, keep, None, sink,
+            expr,
+            patterns,
+            body,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            // #3133: nested under `try`/`if`/`,`, the frame carries the
+            // register the enclosing stage held; `resolve_seq_stage`'s own
+            // dispatch hands it in directly.
+            frame.register(),
+            sink,
         ),
         // #2234: `stderr`/`debug`/`debug(msg)` are true identity passthroughs
         // in jq -- their value-mode implementations (`builtin_stderr`/
@@ -36418,6 +36505,7 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     payload: OwnedValue,
     frame: &Frame,
+    entry_register: Option<&OwnedValue>,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -36426,15 +36514,50 @@ fn resolve_catch_sink<'a, S: EvalSemantics>(
     };
     // A caught error/break payload is never a snapshot (#1591): jq's own
     // handler binding is unrelated to any `$x` frozen elsewhere in scope.
-    resolve_against_cow_sink::<S>(
-        catch_expr,
-        Cow::Owned(payload),
-        false,
-        &Snapshot::No,
-        &frame.unknown(),
-        keep,
-        sink,
-    )
+    //
+    // #3133: the handler runs against the payload with the register jq
+    // restored at the `try`'s entry -- at this frame's own position (`at` is
+    // the register's position, trackable or carried) and holding
+    // `entry_register`. It is resolved as a seeded pipe, exactly as a
+    // destructuring bind's body is: untracked with that register in hand,
+    // so a `$y` marker for it re-establishes (`path(.a as $y | .a | try
+    // error(1) catch $y)` is jq's `["a"]`; it refused under the old
+    // `frame.unknown()`), or trackable outright when the payload is a
+    // `null`/`bool` identical to the register by jq's `jv_identical` (`null
+    // | path(try (.a | error(null)) catch .b)` is `["b"]`). A frame whose
+    // position is not provable carries no register either (`with_register`
+    // keeps them tied), so nothing widens there: the seed is then a plain
+    // untracked branch, as before.
+    //
+    // Driven through `resolve_seq_stage` directly, every stage dynamic,
+    // rather than `resolve_seq_from_seed`: that function's static-tail fast
+    // path refuses an untracked seed on the spot, which is right for a
+    // pattern body (it ends the pipe) but not for a handler, whose untracked
+    // output must reach the stages after the `try` exactly as the direct
+    // route used to hand it on -- `[path(.a | (try error(null) catch .) |
+    // empty)]` is jq's `[]`, and an eager refusal here turned it into an
+    // exit 5.
+    let frame = frame.with_register(entry_register);
+    let seed = match frame.register() {
+        Some(register) if null_bool_identical(&payload, register) => {
+            PathBranch::new(PathPrefix::root(), Cow::Owned(payload), true)
+        }
+        Some(register) => {
+            PathBranch::passthrough(PathPrefix::root(), Cow::Owned(payload), false, Snapshot::No)
+                .with_register(Some(Cow::Owned(register.clone())))
+        }
+        None => PathBranch::untracked(Cow::Owned(payload)),
+    };
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, catch_expr);
+    let Some(last) = flat.len().checked_sub(1) else {
+        // A no-op handler (`catch .`): the payload itself, handed on.
+        return match sink(seed) {
+            Demand::Continue => ResolveFlow::Exhausted,
+            Demand::Stop => ResolveFlow::Stopped,
+        };
+    };
+    resolve_seq_stage::<S>(&flat, last, 0, seed, &frame, keep, sink)
 }
 
 /// Shared "defer the escape, queue what's left" step for `recurse`'s two
@@ -39473,7 +39596,12 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
     .with_register(if trackable {
         None
     } else {
-        register.map(Cow::Borrowed)
+        // #3133: a nested pipe (the `Pipe` arm passes `None`) inherits the
+        // register the enclosing stage's frame carries, so `try ($w | .b)`
+        // can re-establish `$w` exactly as the bare `$w | .b` stage does.
+        register
+            .map(Cow::Borrowed)
+            .or_else(|| frame.register().map(|reg| Cow::Owned(reg.clone())))
     });
     resolve_seq_from_seed::<S>(exprs, seed, frame, keep, sink)
 }
@@ -39721,7 +39849,14 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // non-navigating stage has stepped off it (`prefix` does not advance
     // for those). What an `Origin::At` marker met in this stage, directly
     // or through a passthrough, is certified against.
-    let stage_frame = frame.extend(&prefix);
+    // #3133: an untracked stage's frame also carries the register's *value*,
+    // so a pipe nested in this stage (under `try`/`if`/`,`) or its `catch`
+    // handler can seed itself with it -- see `Frame::register`.
+    let stage_frame = frame.extend(&prefix).with_register(if branch_trackable {
+        None
+    } else {
+        carried_register.as_deref()
+    });
     // Whether this stage can carry a live path register across itself
     // at all (#1573). `false` is the answer for every stage this
     // resolver cannot see inside, because jq's register moves on any
@@ -39746,13 +39881,19 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             &stage_frame,
         );
     let mut downstream: Option<ResolveFlow> = None;
-    // `step_certified` (#3120): the step came from the untracked-stage
-    // `AsPattern` route below, which checked its pattern walk against the
-    // carried register itself and seeded its body with the register the walk
-    // moved to -- so a trackable step from it is a proven re-establishment
-    // at `prefix + components`, not something "untracked is absorbing" may
-    // demote. Every other route passes `false` and keeps that rule.
-    let mut place_step = |step: PathBranch<'a>, step_certified: bool| -> Demand {
+    // Whether a *trackable* step out of an untracked stage is a proven
+    // re-establishment rather than something "untracked is absorbing" must
+    // demote (#3120, generalised by #3133). From an untracked input, no route
+    // can produce a trackable branch except by re-establishing against a
+    // register -- `resolve_leaf` hands back untracked branches, the recurse
+    // family refuses -- and the only register any nested route has is the
+    // one this stage handed down (`stage_frame.register()`: the `AsPattern`
+    // route's walk and seeded body, a pipe under `try`/`if`/`,`, a `catch`
+    // handler). So when this stage carried one, the step's own verdict
+    // stands, at `prefix + components`; with none in hand the rule below is
+    // unchanged and a nested route cannot have re-established anything.
+    let step_may_reestablish = stage_frame.register().is_some();
+    let mut place_step = |step: PathBranch<'a>| -> Demand {
         let PathBranch {
             path: components,
             value: resulting,
@@ -39789,14 +39930,23 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         } else {
             PathPrefix::extend_many(&prefix, components.to_vec())
         };
+        let trackable =
+            reestablished || ((branch_trackable || step_may_reestablish) && step_trackable);
         let placed = PathBranch {
-            register: carry_register(
-                &facts,
-                reestablished,
-                trackable_step_eligible,
-                &carried_register,
-                step_register,
-            ),
+            // A trackable branch is its own register (`with_register`'s
+            // invariant); only an untracked one carries the live register
+            // forward.
+            register: if trackable {
+                None
+            } else {
+                carry_register(
+                    &facts,
+                    reestablished,
+                    trackable_step_eligible,
+                    &carried_register,
+                    step_register,
+                )
+            },
             path,
             value: resulting,
             // Untracked is absorbing: nothing downstream can
@@ -39814,7 +39964,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             // so the variable re-establishes the register's position
             // rather than reaching a new one. See
             // `reestablishes_register`.
-            trackable: reestablished || ((branch_trackable || step_certified) && step_trackable),
+            trackable,
             // Unlike `trackable`, this comes from the *step* alone:
             // the value leaving this stage is the step's own output,
             // so `.a | $x` still hands back the frozen snapshot
@@ -39877,7 +40027,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             &stage_frame,
             stage_keep,
             carried_register.as_deref(),
-            &mut |step| place_step(step, true),
+            &mut place_step,
         ),
         _ => resolve_against_cow_sink::<S>(
             element,
@@ -39886,7 +40036,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             &branch_snapshot,
             &stage_frame,
             stage_keep,
-            &mut |step| place_step(step, false),
+            &mut place_step,
         ),
     };
     match downstream {
@@ -40739,21 +40889,30 @@ pub(crate) fn substitute_bound_var_from(
     substitute_bound_var_at(bind_expr, body, var_name, bound, None, None, node)
 }
 
-/// The absolute position an identity-passthrough bind source freezes `.`
-/// at, when provable (#2978) -- the [`Origin::SnapshotAt`] its marker
-/// should carry instead of a bare [`Origin::Snapshot`], or `None` to keep
-/// the bare one. Recurses over exactly [`is_identity_passthrough`]'s
-/// grammar, so a source that predicate does not recognise answers `None`
-/// here too (and never reaches [`substitute_bound_var_at`]'s identity
-/// branch anyway).
+/// The [`Origin`] an identity-passthrough bind source freezes `.` with,
+/// inside a resolver invocation (#2978, #3133): the [`Origin::SnapshotAt`]
+/// its marker should carry instead of a bare [`Origin::Snapshot`] when the
+/// position is provable, the [`Origin::Untracked`] it must carry when `.`
+/// is not a document node at all, or `None` to keep the bare `Snapshot`.
+/// Recurses over exactly [`is_identity_passthrough`]'s grammar, so a source
+/// that predicate does not recognise answers `None` here too (and never
+/// reaches [`substitute_bound_var_at`]'s identity branch anyway).
 ///
 /// - `.`: while the branch is `trackable`, the register *is* the ambient
 ///   `.`, and `Frame::at` is its absolute path by #2042's invariant (or
 ///   `None` when not provable) -- so the position is exactly `frame`'s,
 ///   including below the invocation root (`path(.x | . as $v | .a | $v |
-///   getpath(["a"]) | .b)` is `["x","a","b"]`). Off the register the frame
-///   names the *carried* register, not `.`, and nothing is minted: `path(.a
-///   | {b:{c:1}} | . as $x | $x | getpath(["b"]) | .c)` must keep refusing.
+///   getpath(["a"]) | .b)` is `["x","a","b"]`). Off the register, `.` is a
+///   value the stage *computed* (a literal, a construction, an opaque
+///   call), not the register's node nor any node's: the marker is
+///   `Untracked` (#3133). `Snapshot`'s value rule is sound only for a
+///   snapshot of a real node, and a constructed copy equal to the register
+///   is exactly the rebuilt copy #2642 closed at the funnels -- `del(.a |
+///   {b:{c:1}} | . as $x | $x)` on `{"a":{"b":{"c":1}}}` deleted `.a`
+///   where jq refuses, and once a pipe nested in the body carries the
+///   register (#3133) `... | $x | .b | .c` navigated through it too. A
+///   `null`/`bool` `.` loses nothing: jq's `jv_identical` admits those by
+///   value, and so does [`register_identical`], marker or not.
 /// - a marker source (`$x as $y`): **the marker's own** position, never the
 ///   frame's -- `$x` bound at the root and rebound at `["a"]` is still the
 ///   root's node, and `path(. as $x | .a | ($x as $y | .c | $y |
@@ -40805,7 +40964,9 @@ fn identity_bind_position<S: EvalSemantics>(
                 invocation: frame.invocation,
                 path: BindPath(Rc::clone(at)),
             }),
-            Expr::Identity => None,
+            Expr::Identity => Some(Origin::Untracked),
+            // A marker source rebinds the marker's own node: its origin
+            // travels with it, whatever stage the rebind happens on.
             Expr::TrackedVar(marker) => match &marker.origin {
                 Origin::SnapshotAt { .. } => Some(marker.origin.clone()),
                 Origin::Snapshot | Origin::At { .. } | Origin::Untracked => None,
@@ -40815,9 +40976,20 @@ fn identity_bind_position<S: EvalSemantics>(
                 else_branch,
                 ..
             } => {
-                let then_at = position(then_branch, trackable, frame)?;
-                let else_at = position(else_branch, trackable, frame)?;
-                (then_at == else_at).then_some(then_at)
+                let then_at = position(then_branch, trackable, frame);
+                let else_at = position(else_branch, trackable, frame);
+                match (then_at, else_at) {
+                    // Both arms prove the same thing.
+                    (a, b) if a == b => a,
+                    // One arm is a computed `.`: the bind may be that, so
+                    // it can only be certified as it would be (#3133).
+                    (Some(Origin::Untracked), _) | (_, Some(Origin::Untracked)) => {
+                        Some(Origin::Untracked)
+                    }
+                    // Two positions that differ, or a position beside a
+                    // bare snapshot: the bare value rule.
+                    _ => None,
+                }
             }
             Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
                 position(expr, trackable, frame)
@@ -40836,7 +41008,9 @@ fn identity_bind_position<S: EvalSemantics>(
 /// what a navigated sibling binding would have gotten -- or, when the
 /// resolver call site could prove where `.` was frozen
 /// ([`identity_bind_position`], #2978), the `Origin::SnapshotAt` it
-/// passes as `identity_at`, which is that same rule plus a position.
+/// passes as `identity_at`, which is that same rule plus a position; or,
+/// when that site knows `.` was a computed value rather than a node
+/// (#3133), the `Origin::Untracked` it passes instead.
 /// Otherwise an explicit `origin` (the #2042 witness: a navigated source
 /// resolved *inside* a `path()`/`del()`/assignment invocation, from
 /// [`resolve_bind_source_witness`]) is kept as-is. With neither but a
@@ -40856,8 +41030,11 @@ fn substitute_bound_var_at(
 ) -> Expr {
     let origin = if is_identity_passthrough(bind_expr) {
         debug_assert!(
-            matches!(identity_at, None | Some(Origin::SnapshotAt { .. })),
-            "identity_at is a SnapshotAt or nothing: {identity_at:?}"
+            matches!(
+                identity_at,
+                None | Some(Origin::SnapshotAt { .. } | Origin::Untracked)
+            ),
+            "identity_at is a SnapshotAt, an Untracked, or nothing: {identity_at:?}"
         );
         identity_at.unwrap_or(Origin::Snapshot)
     } else if let Some(origin) = origin {
@@ -96422,6 +96599,15 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // catch-handler-var, refuse-only until #3133: jq restores the
+            // register to the `try`'s entry when it catches, and the
+            // handler now runs with that register in hand, so `$y` -- which
+            // *is* it -- re-establishes
+            (
+                br#"{"a":{"b":1}}"#,
+                r#"path(.a as $y | .a | try error("x") catch $y)"#,
+                r#"[["a"]]"#,
+            ),
             // destructure-stage (#2649): `[$q]` on an object is jq's own
             // "Cannot index object with number", the `?// $q` alternative
             // performs no step and restores the register, so `$y` is still
@@ -96939,15 +97125,6 @@ mod tests {
                 "path(.a[1:] as $y | .a[1:3] | $y)",
                 r#"[["a",{"start":1,"end":3}]]"#,
             ),
-            // catch-handler-var: the handler resolves against the error
-            // payload under an unknown frame, and a raising `try` stage does
-            // not carry the register (pre-existing: the root-marker
-            // spelling refuses too)
-            (
-                br#"{"a":{"b":1}}"#,
-                r#"path(.a as $y | .a | try error("x") catch $y)"#,
-                r#"[["a"]]"#,
-            ),
         ];
         for (input, filter, jq_answer) in rows {
             match bind_origin_outputs(input, filter) {
@@ -97174,29 +97351,35 @@ mod tests {
     /// comparing the `null` payload with the handler's own *ambient* `null`
     /// rather than with jq's register. The same rule fabricated on any other
     /// document: on `{"a":1}` jq refuses (the register is the root, and
-    /// `null` is not it) while `del(...)` wrote `{}` (#3043/#3120). A catch
-    /// handler runs under an untracked frame with no register in hand (the
-    /// try body may have navigated before raising), so the walk now refuses
-    /// unconditionally there: the fabrication is closed, and the `null`
-    /// document's coincidental agreement is a recorded refuse-only residual
-    /// (`limitations.md`).
+    /// `null` is not it) while `del(...)` wrote `{}` (#3043/#3120). #3120
+    /// made the handler refuse unconditionally (no register in hand); #3133
+    /// hands it the register jq restores at the `try`'s entry, so the walk
+    /// is checked against the real one: `["a"]` on the `null` document (the
+    /// register *is* `null`), jq's refusal on `{"a":1}`, both read and
+    /// written.
     #[test]
-    fn test_as_pattern_in_catch_handler_refuses_without_a_register_3120() {
-        for doc in [&b"null"[..], &br#"{"a":1}"#[..]] {
-            for filter in [
-                r"path(try error(null) catch (. as {a:$q} | $q))",
-                r"del(try error(null) catch (. as {a:$q} | $q))",
-            ] {
-                query!(doc, filter,
-                    QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
-                        assert_eq!(
-                            e.message,
-                            r#"Invalid path expression near attempt to access element "a" of null"#,
-                            "{filter}"
-                        );
-                    }
-                );
-            }
+    fn test_as_pattern_in_catch_handler_checks_the_entry_register_3133() {
+        assert_eq!(
+            outputs(b"null", r"path(try error(null) catch (. as {a:$q} | $q))"),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(b"null", r"del(try error(null) catch (. as {a:$q} | $q))"),
+            ["null"]
+        );
+        for filter in [
+            r"path(try error(null) catch (. as {a:$q} | $q))",
+            r"del(try error(null) catch (. as {a:$q} | $q))",
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(
+                        e.message,
+                        r#"Invalid path expression near attempt to access element "a" of null"#,
+                        "{filter}"
+                    );
+                }
+            );
         }
     }
 
@@ -98954,41 +99137,211 @@ mod tests {
         }
     }
 
-    /// #3133 characterization (found in #3120's review): a pipe nested under
-    /// `try`/`?` in a pattern body carries no register, so a `$w` marker
-    /// there cannot re-establish, its navigation raises the resolver's own
-    /// refusal, and `try` catches it -- where jq, whose register `$w` *is*,
-    /// writes. jq answers `{"a":{}}` (row 1-3) and `{}` (row 4); succinctly
-    /// echoes the document at exit 0. Row 1 does so on `main` too; rows 2-4
-    /// used to refuse loudly only because the untracked-stage *walk*
-    /// refused, and reach the same discard now that the walk answers. This
-    /// pins the current wrong outputs on purpose so the #3133 fix flips a
-    /// test rather than a silent row -- see `limitations.md`.
+    /// #3133: a pipe nested under `try`/`?` in a pattern body used to carry
+    /// no register, so a `$w` marker there could not re-establish, its
+    /// navigation raised the resolver's own refusal, and `try` caught it --
+    /// the write jq performs was silently discarded (exit 0, document
+    /// echoed; row 1 on `main`, rows 2-4 once #3120 let the walk answer).
+    /// The stage's frame now carries the register into the nested pipe, so
+    /// every row writes exactly what jq writes.
     #[test]
-    fn test_nested_try_body_discards_the_write_characterization_3133() {
-        for (doc, filter, echoed) in [
+    fn test_nested_try_body_keeps_the_register_3133() {
+        for (doc, filter, want) in [
             (
                 &br#"{"a":{"b":1}}"#[..],
                 r"del(. as {a:$w} | try ($w | .b))",
-                r#"{"a":{"b":1}}"#,
+                r#"{"a":{}}"#,
             ),
             (
                 &br#"{"a":{"b":1}}"#[..],
                 r"del(. as $x | 5 | $x as {a:$w} | try ($w | .b))",
-                r#"{"a":{"b":1}}"#,
+                r#"{"a":{}}"#,
             ),
             (
                 &br#"{"a":{"b":1}}"#[..],
                 r"del(. as $x | 5 | $x as {a:$w} | ($w | .b)?)",
-                r#"{"a":{"b":1}}"#,
+                r#"{"a":{}}"#,
             ),
             (
                 &br#"{"a":1}"#[..],
                 r"del(. as $x | 5 | $x as [$w] ?// $z | ($z | .a)?)",
-                r#"{"a":1}"#,
+                "{}",
+            ),
+            // The issue's own source-position twin, and its read.
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"del(.a as $x | .a | 5 | try ($x as {b:$q} | $q))",
+                r#"{"a":{}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"(.a as $x | .a | 5 | try ($x as {b:$q} | $q)) |= 9",
+                r#"{"a":{"b":9}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a as $x | .a | 5 | try ($x as {b:$q} | $q))",
+                r#"["a","b"]"#,
+            ),
+            // ... and the sibling-copy control stays exactly jq's: `$y` is
+            // not the register, `try` catches jq's own refusal, nothing is
+            // written.
+            (
+                &br#"{"a":{"b":1},"c":{"b":1}}"#[..],
+                r"del(.a as $y | .c | 5 | try ($y | .b))",
+                r#"{"a":{"b":1},"c":{"b":1}}"#,
             ),
         ] {
-            assert_eq!(outputs(doc, filter), [echoed], "{filter} (see #3133)");
+            assert_eq!(outputs(doc, filter), [want], "{filter}");
+        }
+    }
+
+    /// #3133: a `catch` handler runs with the register jq restores at the
+    /// `try`'s entry (confirmed live against jq 1.7.1 for every row), and a
+    /// `null`/`bool` payload identical to it seeds the handler trackable.
+    /// The refusal rows are the controls: a non-null register against a
+    /// `null` payload, a payload equal to the register but rebuilt, and the
+    /// handler's untracked output reaching -- not pre-empting -- the stages
+    /// after the `try`.
+    #[test]
+    fn test_catch_handler_runs_with_the_entry_register_3133() {
+        for (doc, filter, want) in [
+            (
+                &b"null"[..],
+                r"path(try (.a | error(null)) catch .b)",
+                r#"["b"]"#,
+            ),
+            (
+                &br#"{"a":null}"#[..],
+                r"path(.a | (try error(null) catch .) | .b)",
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a as $y | .a | try error(1) catch $y)",
+                r#"["a"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a as $y | .a | try (.b | error(1)) catch $y)",
+                r#"["a"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a as $y | .a | try error(1) catch ($y | .b))",
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(. as $x | try error($x) catch $x)",
+                "[]",
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"[path(.a | (try error(null) catch .) | empty)]",
+                "[]",
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), [want], "{filter}");
+        }
+        for (doc, filter, message) in [
+            (
+                &br#"{"x":{"a":1,"b":2}}"#[..],
+                r"path(.x | try (.a | error(null)) catch .b)",
+                r#"Invalid path expression near attempt to access element "b" of null"#,
+            ),
+            (
+                &br#"{"x":{"a":1,"b":2}}"#[..],
+                r#"path(.x | try (.a | error({"a":1,"b":2})) catch .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"a":1,"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a | (try error(null) catch .) | .b)",
+                r#"Invalid path expression near attempt to access element "b" of null"#,
+            ),
+            // Refuse-only: `error(.)` raises the register's own node, which
+            // a value-equal payload cannot be told apart from a rebuilt copy.
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a | try error(.) catch .)",
+                r#"Invalid path expression with result {"b":1}"#,
+            ),
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, message, "{filter}");
+                }
+            );
+        }
+    }
+
+    /// #3133: `. as $x` on an untracked stage binds a value the stage
+    /// computed, not a node, so its marker is `Untracked` -- before, it was
+    /// a `Snapshot`, and the value rule certified a constructed copy against
+    /// the register: `del(.a | {b:{c:1}} | . as $x | $x)` deleted `.a` on
+    /// `main` where jq refuses (and with the register reaching nested pipes,
+    /// `$x | .b | .c` would have navigated through it too). A marker source
+    /// keeps its own origin, and a `null`/`bool` `.` is admitted by value as
+    /// jq's `jv_identical` admits it.
+    #[test]
+    // jq filter literals like `{b:{c:1}}` are not formatting strings.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_identity_bind_on_untracked_stage_is_untracked_3133() {
+        let doc = br#"{"a":{"b":{"c":1}}}"#;
+        for (filter, message) in [
+            (
+                r"path(.a | {b:{c:1}} | . as $x | $x)",
+                r#"Invalid path expression with result {"b":{"c":1}}"#,
+            ),
+            (
+                r"del(.a | {b:{c:1}} | . as $x | $x)",
+                r#"Invalid path expression with result {"b":{"c":1}}"#,
+            ),
+            (
+                r"path(.a | {b:{c:1}} | . as $x | $x | .b | .c)",
+                r#"Invalid path expression near attempt to access element "b" of {"b":{"c":1}}"#,
+            ),
+            (
+                r#"path(.a | {b:{c:1}} | . as $x | $x | getpath(["b"]) | .c)"#,
+                r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
+            ),
+            (
+                r"path(.a | 5 | (try . catch 1) as $x | $x)",
+                "Invalid path expression with result 5",
+            ),
+            // Refuse-only: the condition is not evaluated, so a mixed `if`
+            // binds Untracked where jq binds the marker.
+            (
+                r"path(. as $x | 5 | (if true then $x else . end) as $y | $y)",
+                r#"Invalid path expression with result {"a":{"b":{"c":1}}}"#,
+            ),
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, message, "{filter}");
+                }
+            );
+        }
+        for (doc, filter, want) in [
+            (
+                &br#"{"a":null}"#[..],
+                r"path(.a | null | . as $x | $x | .b)",
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":true}"#[..],
+                r"path(.a | true | . as $x | $x)",
+                r#"["a"]"#,
+            ),
+            (&doc[..], r"path(. as $x | 5 | $x as $y | $y)", "[]"),
+            (
+                &doc[..],
+                r"path(.a | select(true) | . as $x | $x)",
+                r#"["a"]"#,
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), [want], "{filter}");
         }
     }
 

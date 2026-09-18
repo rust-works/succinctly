@@ -882,7 +882,6 @@ is the revert that established what the other one costs.
    | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`                     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                                                                                                 |
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
    | `path(.a[1:] as $y \| .a[1:3] \| $y)` on `{"a":[1,2,3]}` | `["a",{"start":1,"end":3}]` | jq's `.a[1:]` and `.a[1:3]` of a 3-array are the same jv (same offset and length); the slice components differ, so the spelling never matches                                                                             |
-   | `path(.a as $y \| .a \| try error("x") catch $y)`        | `["a"]`                     | the handler resolves under an unknown frame and a raising `try` stage does not carry the register — pre-existing: `path(. as $x \| try error("x") catch $x)` refuses too (jq `[]`)                                        |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
 
    Two related divergences were pre-existing and out of scope for #2042, tracked separately:
@@ -1087,14 +1086,18 @@ is the revert that established what the other one costs.
    `test_as_pattern_arm_is_jq_mode_only_2649` pins that outcome as unaffected by this change.
 
    `?//` alternatives retry as they do in value mode, with one deliberate exception: the
-   **artefact guard**. This resolver raises refusals jq never raises — a nested `Pipe` carries
-   no register, so a `$q[0]` under an `if` or a `,` raises near-access even though the register
-   is standing right there — and retrying on one of those lands on the *wrong* alternative,
+   **artefact guard**. This resolver can raise refusals jq never raises — until
+   [#3133](https://github.com/rust-works/succinctly/issues/3133) a nested `Pipe` carried no
+   register, so a `$q[0]` under an `if` or a `,` raised near-access even though the register
+   was standing right there — and retrying on one of those lands on the *wrong* alternative,
    which a write then goes through. `path(. as {a:$q} ?// $z \| if $q then $q[0] else $z end)`
    is `["a",0]` in jq and would otherwise have answered `[]`, and the matching
    `del(. as {a:$q} ?// $z \| if $q then $q[0] else $z end)` on `{"a":[1,2,3]}` is `{"a":[2,3]}`
    in jq and would have deleted through that fabricated `[]`. So a body error of the resolver's
-   own two kinds (`UntrackedNavigation`/`InvalidPathExpression`) never retries. (On an
+   own two kinds (`UntrackedNavigation`/`InvalidPathExpression`) never retries. (Since #3133
+   the untracked stage's `Frame` carries the register into that nested pipe, so both rows
+   answer as jq does — the guard is kept for the refusals that remain artefacts, such as a
+   register lost to an opaque stage.) (On an
    untracked stage the arm once kept the old opaque-leaf fall-through, since it could not see
    the register the first step is compared against; since
    [#3120](https://github.com/rust-works/succinctly/issues/3120) `resolve_seq_stage` hands it
@@ -1156,9 +1159,10 @@ is the revert that established what the other one costs.
 
    Two refusals remain where jq might answer, and one refuses with different wording, all
    deliberate: the resolver's *own* refusals
-   never retry (a nested pipe carries no register, so `$q[0]` inside an `if` refuses here
-   where jq navigates, and retrying on that artefact would bind a different alternative than
-   jq and write through it), and a walk refusal retries only when it is jq's own verdict.
+   never retry (before #3133 a nested pipe carried no register, so `$q[0]` inside an `if`
+   refused here where jq navigates, and retrying on that artefact would have bound a different
+   alternative than jq and written through it; the rule stays for the artefacts that remain),
+   and a walk refusal retries only when it is jq's own verdict.
    For a source element that is not register-derived, the walk compares the element with
    the register by value where jq compares nodes; when the two are equal and not
    `null`/boolean, or the register is lost, the refusal is a guess and propagates instead:
@@ -1213,50 +1217,56 @@ is the revert that established what the other one costs.
    re-establish against).
 
    Where no register can be handed in, the walk refuses unconditionally rather than guess.
-   Three refuse-only residuals, each pinned in `scripts/jq-bind-origin-oracle-sweep.sh`, and
-   one pre-existing discarded write:
-   - a `catch` handler runs under an untracked frame with no register (the `try` body may have
-     navigated before raising): `path(try error(null) catch (. as {a:$q} \| $q))` on a `null`
-     document is `["a"]` in jq and refuses here. It *agreed* before #3120 only by comparing
-     the `null` payload with the handler's own `null` ambient, and that same comparison wrote
-     `del(...)` → `{}` on `{"a":1}` where jq refuses — so the coincidence is not kept;
-   - a nested pipe (inside `if`/`try`, not a parenthesised group, which is flattened into the
-     enclosing pipe) carries no register, so a `null`/`bool` register behind a non-matching
-     literal cannot be recognised there: `path(.a \| 5 \| if true then (null as {b:$v} \| $v)
-     else . end)` on `{"a":null}` is `["a","b"]` in jq and refuses here (it refused before
-     #3120 too). When the literal *matches* the register (`.a \| null \| if ...` on
-     `{"a":null}`) the literal re-establishes it and the nested bind is trackable, so that
-     shape answers;
+   Two of the residuals #3120 recorded here — a `catch` handler with no register, and a pipe
+   nested under `if`/`try` with a `null`/`bool` register behind a non-matching literal — are
+   closed by [#3133](https://github.com/rust-works/succinctly/issues/3133) below. What
+   remains, each pinned in `scripts/jq-bind-origin-oracle-sweep.sh`:
    - an *opaque* stage (`reduce`, a `def` call, `first(..)`) drops the carried register
      (`cannot_move_register`, #1573), so after one the walk refuses without retrying:
      `del(reduce 1 as $i (null; null) \| . as [$v] ?// $v \| empty)` on `{"a":{"b":null}}`
      echoes the document in jq (the step is refused there too, and the retried `$v` body is
      `empty`) and exits 5 here. `main` echoed it by the ambient-`null` coincidence the fix
      removes.
-   - **Not refuse-only:** a pipe nested under `try`/`?` in the *body* carries no register,
-     so a `$w` marker there cannot re-establish, its navigation raises the resolver's own
-     refusal, and `try` catches it exactly as jq's `try` catches its own path errors — but jq
-     had no error to catch, because `$w` *is* its register. On a trackable stage this is
-     pre-existing (`del(. as {a:$w} \| try ($w \| .b))` on `{"a":{"b":1}}` is `{"a":{}}` in
-     jq and a silent no-op — exit 0, document echoed — on `main`). On an untracked stage the
-     same body used to refuse loudly only because the *walk* refused; now that the walk
-     answers, the body's discard is reached there too: `del(. as $x \| 5 \| $x as {a:$w} \|
-     try ($w \| .b))`, `del(... \| ($w \| .b)?)` and, via the bare alternative, `del(. as $x
-     \| 5 \| $x as [$w] ?// $z \| ($z \| .a)?)` (jq `{}`) all echo the document. The same
-     loss in the *source* position: `del(.a as $x \| .a \| 5 \| try ($x as {b:$q} \| $q))`
-     is `{"a":{}}` in jq and echoes here, as on `main`. The nested pipe is where the register
-     is lost, not the pattern arm; closing it means threading the carried register through
-     `resolve_node_sink`'s `Try`/`If`/`Comma` arms into their nested pipes — the "nested pipe
-     carries no register" limitation this section already records for `$q[0]` under `if`.
-     Filed as [#3133](https://github.com/rust-works/succinctly/issues/3133); the rows are
-     pinned as a characterization in
-     `test_nested_try_body_discards_the_write_characterization_3133` (`src/jq/eval.rs`) so
-     that fix flips them visibly.
    - a later-step refusal after a marker-certified first step does not retry `?//` (review):
      `refusal_is_exact` is decided per source (`bound != register`), and a marker that *is*
      the register is value-equal to it, so `path(.a as $x \| .a \| 5 \| $x as {b:[$q,$r]} ?//
      $w \| $w)` on `{"a":{"b":[1]}}` refuses at element `0` of `[1]` where jq retries onto
      `$w` and answers `["a"]`; the same shape on a trackable stage retries and agrees.
+
+   **The register reaches a nested pipe and a `catch` handler** —
+   [#3133](https://github.com/rust-works/succinctly/issues/3133). A pipe nested under
+   `try`/`if`/`,` is resolved by `resolve_node_sink`, which has no `PathBranch` to carry the
+   register in, so it used to start register-less: a `$w` marker there could not
+   re-establish, its navigation raised the resolver's own refusal, and `try` caught it as jq's
+   `try` catches its own path errors — but jq had no error to catch, since `$w` *is* its
+   register, and the write was silently discarded: `del(. as {a:$w} \| try ($w \| .b))` on
+   `{"a":{"b":1}}` echoed the document where jq writes `{"a":{}}` (and `del(.a as $x \| .a \|
+   5 \| try ($x as {b:$q} \| $q))` likewise, the same loss in the source position). An
+   untracked stage's `Frame` now carries the register's *value* beside its position, and a
+   nested pipe seeds itself from it; the outer stage trusts a trackable step out of such a
+   stage, since from an untracked input only a re-establishment against that very register
+   can produce one. A `catch` handler gets the register jq restores at the `try`'s entry (its
+   fork point saves and restores the path state — confirmed live, `null \| path(try (.a \|
+   error(null)) catch .b)` is `["b"]`, and with a non-null register the handler's `.b`
+   refuses): `path(.a as $y \| .a \| try error(1) catch $y)` is jq's `["a"]` (the
+   `catch-handler-var` row the #2042 table carried), and the `null`-document destructuring
+   row #3120 recorded as a residual answers again — for the right reason this time. The
+   handler's output is still handed on to the stages after the `try` rather than refused on
+   the spot (`[path(.a \| (try error(null) catch .) \| empty)]` is `[]`).
+
+   The same change closes a pre-existing write-through: `. as $x` on an *untracked* stage
+   binds a value the stage computed, not a node, yet carried `Origin::Snapshot`, whose value
+   rule then certified a constructed copy against the register — `del(.a \| {b:{c:1}} \| . as
+   $x \| $x)` on `{"a":{"b":{"c":1}}}` deleted `.a` where jq refuses, and with the register
+   now reaching nested pipes `... \| $x \| .b \| .c` would have navigated through it too.
+   Such a bind is `Origin::Untracked` now (`identity_bind_position`); a marker source keeps
+   its own origin, and a `null`/`bool` `.` loses nothing since `jv_identical` admits those by
+   value. Two refuse-only residuals, both in the sweep: `path(.a \| try error(.) catch .)` —
+   `error(.)` raises the register node itself and jq answers `["a"]`, but a payload equal to
+   the register by value cannot be told from a rebuilt copy (`error({"a":1,"b":2})` refuses in
+   jq), so the handler stays untracked unless the payload is `null`/`bool`; and `(if true
+   then $x else . end) as $y` on an untracked stage, which binds `Untracked` because the
+   condition is not evaluated where jq evaluates it and binds the marker.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an
@@ -1765,7 +1775,11 @@ answers `["b"]` — and classified the two residuals appended below):
   - a `try` whose body holds an `if` whose condition happens *not* to raise —
     `path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)`,
     `["a","k","b"]` in jq. The raise-free gate above is static and cannot tell it from the
-    raising twin, so the bind is a plain value;
+    raising twin, so the bind is a plain value. Note that when such a `$x` is then navigated
+    *inside* a `try` (`((try (if .a then . else . end) catch 1) as $v | try ($v | .b?)) |= .`),
+    the plain value's refusal is caught by that `try` exactly as jq's own path errors are, and
+    the write jq performs (`"b":null`) is silently skipped rather than refused — the same
+    static gate, surfacing through `try` instead of as an exit 5 (found by #3133's fuzz);
   - an `if` bind source whose arms sit at *different* positions —
     `path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)`,
     `["a","b"]` in jq. `identity_bind_position` is static (the condition is not evaluated),
