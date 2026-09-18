@@ -71,7 +71,14 @@ const AUTO_LOAD_RUN_ID: u32 = 0;
 pub struct ModuleLoader {
     /// Search path for modules (in order of priority)
     search_path: Vec<PathBuf>,
-    /// Loaded modules (path -> function definitions: name, params, body)
+    /// Loaded modules, keyed by [`Self::run_key`] -- the same canonical-file
+    /// key [`Self::run_ids`]/[`Self::run_origins`] intern by, not the literal
+    /// path a caller happened to write (function definitions: name, params,
+    /// body). Two different literal spellings of one module (`"dep"` from one
+    /// includer, `"./dep"` from another) canonicalize to the same key here,
+    /// so the module loads once regardless of how many spellings reach it
+    /// (#2955) -- keying on the literal path used to let each spelling load
+    /// and cache its own copy.
     loaded_modules: BTreeMap<String, FuncDefList>,
     /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
     auto_loaded_defs: FuncDefList,
@@ -96,23 +103,15 @@ pub struct ModuleLoader {
     run_origins: BTreeMap<u32, String>,
     /// Next unused run id. `0` is reserved for `~/.jq`.
     next_run_id: u32,
-    /// `run id -> the run ids of that module's own dependencies`, in
-    /// declaration order (#2955). Read by [`Self::hoist_order`] to place each
-    /// linked module outside everything that depends on it.
-    deps_of: BTreeMap<u32, Vec<u32>>,
-    /// `run id -> loaded_modules key` for every module some other module
-    /// depends on (#2955): the modules that get a link run of their own.
-    ///
-    /// Deliberately keyed the same way [`Self::loaded_modules`] itself is --
-    /// the literal path a `dependency_signatures` call was made with, not
-    /// [`Self::run_origins`]'s canonicalized one -- because
-    /// [`Self::link_dependency_runs`] uses this only to index straight into
-    /// `loaded_modules`. If the same module is reached via two literal
-    /// spellings that canonicalize to one id, the later spelling overwrites
-    /// the earlier here, but `loaded_modules` always has an entry for
-    /// whichever spelling wins (`dependency_signatures` inserts both from the
-    /// same call), so the lookup this feeds never misses.
-    link_keys: BTreeMap<u32, String>,
+    /// `run id -> (decl_index, run id)` of that module's own dependencies
+    /// (#2955), `decl_index` shared across `include`/`import` exactly as
+    /// [`Import::decl_index`]/[`Include::decl_index`] number them. Read by
+    /// [`Self::hoist_order`], which sorts by `decl_index` before recursing --
+    /// insertion order alone is *not* declaration order here, because
+    /// [`Self::module_dep_defs`] records all of a module's `include`s before
+    /// any of its `import`s, regardless of how the two are interleaved in the
+    /// source.
+    deps_of: BTreeMap<u32, Vec<(usize, u32)>>,
 }
 
 /// A [`ModuleLoader`] failure, structured enough to report in jq's own
@@ -768,7 +767,6 @@ impl ModuleLoader {
             run_origins,
             next_run_id: AUTO_LOAD_RUN_ID + 1,
             deps_of: BTreeMap::new(),
-            link_keys: BTreeMap::new(),
         }
     }
 
@@ -823,6 +821,14 @@ impl ModuleLoader {
     /// splicing the dependencies into the exported chain, is what real jq
     /// does.
     fn ensure_module_loaded(&mut self, module_path: &str) -> Result<&FuncDefList, ModuleLoadError> {
+        // Keyed by the canonical file (#2955), not `module_path` as written:
+        // two spellings of the same module (`"dep"`, `"./dep"`) must share one
+        // cache entry, or each distinct spelling pays its own full
+        // parse-and-bind pass. `run_key` is the same canonicalize-or-fall-back
+        // helper `run_id_for` interns run ids by, so this map and `run_ids`
+        // agree on what "the same module" means.
+        let key = self.run_key(module_path);
+
         // `contains_key` -> load -> `insert` -> re-`get`, rather than the
         // `entry` spelling this used to have (#2865). `entry` holds a mutable
         // borrow of `loaded_modules` across the whole load, which the loader
@@ -831,14 +837,14 @@ impl ModuleLoader {
         // comment here was written to avoid comes back, as the cost of
         // recursion being possible at all. It is genuinely unreachable: the
         // insert immediately above it is unconditional on this path.
-        if !self.loaded_modules.contains_key(module_path) {
+        if !self.loaded_modules.contains_key(&key) {
             let defs = self.load_and_bind_module(module_path)?;
-            self.loaded_modules.insert(module_path.to_string(), defs);
+            self.loaded_modules.insert(key.clone(), defs);
         }
 
         Ok(self
             .loaded_modules
-            .get(module_path)
+            .get(&key)
             .expect("just inserted above, or already present"))
     }
 
@@ -981,7 +987,7 @@ impl ModuleLoader {
 
         for include in &program.includes {
             let id = self.run_id_for(&include.path);
-            let sigs = self.dependency_signatures(&include.path, id, own_id)?;
+            let sigs = self.dependency_signatures(&include.path, id, own_id, include.decl_index)?;
             defs.push((id, None, sigs));
         }
 
@@ -1017,7 +1023,7 @@ impl ModuleLoader {
                 continue;
             }
             let id = self.run_id_for(&import.path);
-            let sigs = self.dependency_signatures(&import.path, id, own_id)?;
+            let sigs = self.dependency_signatures(&import.path, id, own_id, import.decl_index)?;
             defs.push((id, Some(import.alias.clone()), sigs));
         }
 
@@ -1028,20 +1034,26 @@ impl ModuleLoader {
     /// and borrow out its defs' signatures (#2955): the names and parameters
     /// the stubs are built from. The bodies stay in the cache, to be linked
     /// once by [`Self::process_program`], which is what this also records:
-    /// that `id` needs a link run, and that `own_id` depends on it.
+    /// that `id` needs a link run, and that `own_id` depends on it at
+    /// `decl_index` -- the position [`Self::hoist_order`] sorts by, since
+    /// `own_id`'s dependencies are recorded include-block-then-import-block
+    /// here (see [`Self::module_dep_defs`]), not in true source order.
     fn dependency_signatures(
         &mut self,
         module_path: &str,
         id: u32,
         own_id: u32,
+        decl_index: usize,
     ) -> Result<Vec<(String, Vec<Param>)>, ModuleLoadError> {
         let sigs = self
             .ensure_module_loaded(module_path)?
             .iter()
             .map(|(name, params, _)| (name.clone(), params.clone()))
             .collect();
-        self.link_keys.insert(id, module_path.to_string());
-        self.deps_of.entry(own_id).or_default().push(id);
+        self.deps_of
+            .entry(own_id)
+            .or_default()
+            .push((decl_index, id));
         Ok(sigs)
     }
 
@@ -1076,7 +1088,15 @@ impl ModuleLoader {
         ) {
             if expanded.insert(id) {
                 if let Some(deps) = loader.deps_of.get(&id) {
-                    for &dep in deps.iter().rev() {
+                    // Sorted here rather than relying on `deps`' insertion
+                    // order: `dependency_signatures` records a module's
+                    // includes before its imports (see `module_dep_defs`),
+                    // which is not source order when the two are
+                    // interleaved. `decl_index` is the true order; last
+                    // declared first, same rule as `top_ids` below.
+                    let mut deps = deps.clone();
+                    deps.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
+                    for (_, dep) in deps {
                         visit(loader, dep, true, expanded, recorded, order);
                     }
                 }
@@ -1354,21 +1374,28 @@ impl ModuleLoader {
         // missing link, in a program jq runs).
         //
         // This is the top-level twin of the per-linked-module fixed point
-        // below: same "grow `wanted`/`kept` until nothing new resolves"
-        // shape, over a different candidate list (`top`'s alias-qualified
-        // entries here, `defs`'s bare-named ones there) because a module can
-        // be imported under several different aliases at the top level but a
-        // hoisted link run is keyed by one globally unique id. A retry rule
-        // fixed in one almost certainly needs the same fix in the other.
+        // below: both share `grow_to_fixed_point` for the "grow until
+        // nothing new resolves" iteration itself, but what a visit *does*
+        // still differs, over a different candidate list (`top`'s
+        // alias-qualified entries here, `defs`'s bare-named ones there)
+        // because a module can be imported under several different aliases
+        // at the top level but a hoisted link run is keyed by one globally
+        // unique id. A retry rule fixed in one almost certainly needs the
+        // same fix in the other.
         let mut wanted: BTreeSet<String> = called_func_names(&program.expr);
         let mut top: Vec<(String, &Expr, Option<&str>, bool)> = Vec::new();
         for include in &program.includes {
-            if let Some(defs) = self.loaded_modules.get(&include.path) {
+            // `loaded_modules` is keyed canonically (#2955); `include.path` is
+            // the literal spelling as written, so it has to go through
+            // `run_key` the same way `ensure_module_loaded` does, or a
+            // spelling that differs from whichever one populated the cache
+            // would miss here even though the module is loaded.
+            if let Some(defs) = self.loaded_modules.get(&self.run_key(&include.path)) {
                 top.extend(defs.iter().map(|(n, _, b)| (n.clone(), b, None, false)));
             }
         }
         for import in program.imports.iter().filter(|i| !i.data) {
-            if let Some(defs) = self.loaded_modules.get(&import.path) {
+            if let Some(defs) = self.loaded_modules.get(&self.run_key(&import.path)) {
                 let ns = import.alias.as_str();
                 top.extend(
                     defs.iter()
@@ -1381,35 +1408,30 @@ impl ModuleLoader {
                 .iter()
                 .map(|(n, _, b)| (n.clone(), b, None, false)),
         );
-        loop {
-            let mut grew = false;
-            for (name, body, alias, kept) in &mut top {
-                if *kept || !wanted.contains(name.as_str()) {
-                    continue;
-                }
-                *kept = true;
-                let before = wanted.len();
-                for called in called_func_names(body) {
-                    if let Some(alias) = alias {
-                        if !called.contains("::") {
-                            wanted.insert(format!("{alias}::{called}"));
-                        }
+        grow_to_fixed_point(top.len(), |i| {
+            let (name, body, alias, kept) = &mut top[i];
+            if *kept || !wanted.contains(name.as_str()) {
+                return false;
+            }
+            *kept = true;
+            let before = wanted.len();
+            for called in called_func_names(body) {
+                if let Some(alias) = alias {
+                    if !called.contains("::") {
+                        wanted.insert(format!("{alias}::{called}"));
                     }
-                    wanted.insert(called);
                 }
-                grew |= wanted.len() != before;
+                wanted.insert(called);
             }
-            if !grew {
-                break;
-            }
-        }
+            wanted.len() != before
+        });
 
         for &id in order.iter().rev() {
-            let Some(defs) = self
-                .link_keys
-                .get(&id)
-                .and_then(|k| self.loaded_modules.get(k))
-            else {
+            // `run_origin` and `loaded_modules` are both keyed by the same
+            // canonical file (#2955), so `id`'s origin is directly a
+            // `loaded_modules` key -- no separate `id -> loaded_modules key`
+            // map is needed once both agree on canonicalization.
+            let Some(defs) = self.run_origin(id).and_then(|k| self.loaded_modules.get(k)) else {
                 continue;
             };
 
@@ -1422,34 +1444,39 @@ impl ModuleLoader {
                 .collect();
 
             // Seeds: this module's defs some stub already names. Then the
-            // fixed point over its own bare sibling calls -- the per-module
-            // twin of the top-level closure above; see its comment for why
-            // the two are not one shared function.
+            // fixed point over its own bare sibling calls, via the same
+            // `grow_to_fixed_point` the top-level closure above uses -- what
+            // a visit *does* still differs (this one grows a local
+            // `kept_names` by sibling name, and only forwards a link name
+            // into the shared `wanted`, where the top-level one grows
+            // `wanted` itself and retries an alias), because a module can be
+            // `import`ed under several different aliases at the top level
+            // but a hoisted link run is keyed by one globally unique id --
+            // see the top-level closure's comment for the oracle rows this
+            // asymmetry is checked against. A retry rule fixed in one almost
+            // certainly needs the same fix in the other.
             let mut kept_names: BTreeSet<&str> = defs
                 .iter()
                 .map(|(name, _, _)| name.as_str())
                 .filter(|name| wanted.contains(&jq::ModuleRun::link_name(id, name)))
                 .collect();
             let mut keep = vec![false; defs.len()];
-            loop {
+            grow_to_fixed_point(defs.len(), |i| {
+                let (name, _, body) = &defs[i];
+                if keep[i] || !kept_names.contains(name.as_str()) {
+                    return false;
+                }
+                keep[i] = true;
                 let mut grew = false;
-                for (i, (name, _, body)) in defs.iter().enumerate() {
-                    if keep[i] || !kept_names.contains(name.as_str()) {
-                        continue;
-                    }
-                    keep[i] = true;
-                    for called in called_func_names(body) {
-                        if jq::ModuleRun::is_link_name(&called) {
-                            wanted.insert(called);
-                        } else if let Some(&sibling_i) = name_index.get(called.as_str()) {
-                            grew |= kept_names.insert(defs[sibling_i].0.as_str());
-                        }
+                for called in called_func_names(body) {
+                    if jq::ModuleRun::is_link_name(&called) {
+                        wanted.insert(called);
+                    } else if let Some(&sibling_i) = name_index.get(called.as_str()) {
+                        grew |= kept_names.insert(defs[sibling_i].0.as_str());
                     }
                 }
-                if !grew {
-                    break;
-                }
-            }
+                grew
+            });
 
             let linked: FuncDefList = defs
                 .iter()
@@ -1467,6 +1494,26 @@ impl ModuleLoader {
             expr = wrap_run(expr, linked, id, Some(&alias));
         }
         expr
+    }
+}
+
+/// Visit every index in `0..len` via `expand`, repeating the full pass until
+/// one changes nothing -- the "grow until nothing new resolves" fixed point
+/// [`ModuleLoader::link_dependency_runs`]'s two reachability closures both
+/// need, pulled out once so a fix to the iteration itself (when to stop,
+/// what order a pass visits) is made in one place rather than two. `expand`
+/// reports whether visiting `i` changed anything it manages; the two callers
+/// still decide, separately, what a visit *does* -- see each call site's own
+/// comment for why that differs.
+fn grow_to_fixed_point(len: usize, mut expand: impl FnMut(usize) -> bool) {
+    loop {
+        let mut grew = false;
+        for i in 0..len {
+            grew |= expand(i);
+        }
+        if !grew {
+            break;
+        }
     }
 }
 
@@ -8414,6 +8461,53 @@ mod tests {
             assert!(
                 names.iter().all(|n| !n.starts_with('\u{0}')),
                 "hidden spelling leaked: {names:?}"
+            );
+        }
+    }
+
+    /// #2955 review: `loaded_modules` must be keyed by the canonical file
+    /// (`ModuleLoader::run_key`), not the literal path a caller wrote, or two
+    /// spellings of one module reaching it from different includers (`"dep"`
+    /// from one, `"./dep"` from another) parse and bind it twice.
+    ///
+    /// Output was never wrong on this path -- a `dependency_signatures` call
+    /// records both the `loaded_modules` entry and the `run_id_for`/
+    /// `run_origins` entry for the same spelling in the same call, so the
+    /// linking step downstream always found *a* copy of the module -- but
+    /// before this test's fix, each distinct literal spelling paid its own
+    /// full parse-and-bind pass, including recursively loading *that*
+    /// module's own dependencies again. #2955 exists specifically to bound
+    /// module-loading cost, so a wide fan-out where many consumers each
+    /// spell a shared leaf module slightly differently would reintroduce
+    /// part of the duplication the linking fix eliminates.
+    mod duplicate_spelling_shares_one_load_2955 {
+        use super::*;
+
+        #[test]
+        fn two_spellings_of_one_module_load_once() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("common.jq"), "def cfn: 42;\n").expect("write common");
+            std::fs::write(
+                dir.path().join("s1.jq"),
+                "include \"common\";\ndef s1fn: cfn + 1;\n",
+            )
+            .expect("write s1");
+            std::fs::write(
+                dir.path().join("s2.jq"),
+                "include \"./common\";\ndef s2fn: cfn + 2;\n",
+            )
+            .expect("write s2");
+
+            let mut loader = ModuleLoader::new(&[dir.path().to_path_buf()]);
+            loader.load_module("s1").expect("load s1");
+            loader.load_module("s2").expect("load s2");
+
+            assert_eq!(
+                loader.loaded_modules.len(),
+                3,
+                "common.jq must load once despite the two spellings (s1, s2 and one \
+                 common entry): {:?}",
+                loader.loaded_modules.keys().collect::<Vec<_>>()
             );
         }
     }
