@@ -48227,3 +48227,72 @@ fn test_yq_length_of_owned_boolean_3093() -> Result<()> {
 
     Ok(())
 }
+
+/// #2641: `getpath_walk_cursor`'s array-slice fast path (`src/jq/eval_generic.rs`,
+/// added by #2604) stays `O(doc)` -- flat, not exponential -- on #1804's
+/// alias fan-out shape (`aN: &aN [*a(N-1), *a(N-1)]`) as long as the sliced
+/// range does not contain the aliased element. This is the accepted-gap half
+/// of the story: unlike #1804's `select`/`if` walk, this one *cannot*
+/// short-circuit at an alias when the range does include it, because a slice
+/// has to hand back the element's own value, not just test that it exists
+/// (see docs/compliance/yq/limitations.md's #1804/#2476/#2173 history block).
+/// N=30 is deep enough that a regression back to `O(2^N)` would not finish in
+/// any reasonable bound, not merely run slow -- same margin rationale as
+/// `test_select_and_if_truthiness_flat_over_alias_fanout_1804`.
+#[test]
+fn test_getpath_slice_out_of_range_flat_over_alias_fanout_2641() -> Result<()> {
+    let mut doc = String::from("a0: &a0 [1]\n");
+    for i in 1..=30 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+    doc.push_str("items: [*a30, 2, 3]\n");
+
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#"getpath(["items",{"start":1,"end":3}]) | length"#,
+        &doc,
+        &["--jq-extensions"],
+    )?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "2");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "an out-of-range getpath slice over a 30-level alias fan-out took {elapsed:?} \
+         -- O(2^N) blowup regressed into the range this slice never touches"
+    );
+
+    Ok(())
+}
+
+/// #2641's other half: a *navigated* `getpath` read (a plain index, not a
+/// slice) never materializes anything -- it walks to the element and hands
+/// back a cursor -- so it stays flat over the same fan-out shape even when
+/// the path runs straight through the aliased element, unlike the slice case
+/// above whose in-range cost is exponential by construction (not tested here
+/// for that reason -- see docs/compliance/yq/limitations.md).
+#[test]
+fn test_getpath_navigated_index_flat_over_alias_fanout_2641() -> Result<()> {
+    let mut doc = String::from("a0: &a0 [1]\n");
+    for i in 1..=30 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+    doc.push_str("items: [*a30, 2, 3]\n");
+
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#"getpath(["items", 0]) | length"#,
+        &doc,
+        &["--jq-extensions"],
+    )?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "2");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "a navigated getpath index over a 30-level alias fan-out took {elapsed:?} \
+         -- O(2^N) blowup regressed"
+    );
+
+    Ok(())
+}
