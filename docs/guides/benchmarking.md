@@ -1059,12 +1059,30 @@ issue's binaries) — which is itself the layout diagnosis confirmed: the effect
 compiler's partitioning of one tree, not to the code.
 
 What it costs: release builds compile **~3x slower** on both boxes (the earlier 1.4-1.9x figure
-for `cgu1` alone, from a busy M5 Max laptop, is superseded by the idle-box numbers above), and
-the x86 jq identity path gives back 4-6% — a *deterministic*, `cg_annotate`-attributable
+for `cgu1` alone, from a busy M5 Max laptop, is superseded by the idle-box numbers above). The
+x86 jq identity path used to give back 4-6% too — a *deterministic*, `cg_annotate`-attributable
 inlining outcome (#2655's second finding put an equivalent `Ir` delta in `json/light.rs`,
-`trees/bp.rs`, `document.rs` and `memcpy`), which is a fixable follow-up in a way a layout
-lottery never was — tracked as #2720. `[profile.bench]` inherits `release`, so `cargo bench`
-builds pay the same compile cost and measure the same code.
+`trees/bp.rs`, `document.rs` and `memcpy`). #2720 attributed it with callgrind: under
+`cgu1+fat` the inherent `JsonFields::uncons` stopped being inlined into the trait wrapper the
+identity writer walked its fields with, adding a call and two `memcpy`s of a 96-byte return per
+object member. The profile change had only re-priced work the writer should never have done —
+it materialized every field of an object (a 144-byte `DocumentField` each, 22.9 MB for the 2 MB
+`wide` fixture, half of the print's instructions) before writing the first — and removing that
+work (stream the fields off one validating key walk, materialize only for `-S` or a repeated
+key) recovered 86% of the `wide` delta and all of `users` in `Ir` (`wide_identity` 583.5 M →
+564.9 M against the default profile's 561.9 M; `users_identity` 354.3 M → 330.3 M against
+341.7 M), and far more in wall-clock, where the field list's allocation and cache traffic had
+been invisible to `Ir`: 7950X `wide` identity **−29%**, `users` −15%, M4 Pro `users` −5%
+and `-S` −5..−8%, everything else inside each box's control floor. The `#[inline]` hints the
+attribution suggested measured as noise (±0.1% `Ir`) and were not kept. `[profile.bench]`
+inherits `release`, so `cargo bench` builds pay the same compile cost and measure the same code.
+
+One measurement lesson from that issue: a *comment-only* edit is not a layout holdout —
+rustc emits a byte-identical binary for it — so the band a real code change moves unrelated
+rows by has to come from a code change that the timed queries cannot reach (a yq-only helper
+in `yq_runner.rs` served). On the 7950X that band was −2..−4% on identity rows and up to −17%
+on 5 ms `keys_unsorted`/`length` runs, with `Ir` identical to within 500 instructions — so a
+short row's wall-clock move without an `Ir` move is layout, and only `Ir` can settle it.
 
 Also worth knowing: #595's x86-only 12-28% `block_scalars` anomaly was closed as "expected, no
 action — binary code-layout artifact from the recompile," using cachegrind to show flat
