@@ -17600,8 +17600,6 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
     let produced_from = out.len();
-    let mut targets = Vec::new();
-    let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
     // #2916: both bound streams are pulled lazily through
     // `path_context_component_each_bound` -- confirmed live against jq
     // 1.7.1 that the end bound is re-evaluated fresh *per start value*
@@ -17612,16 +17610,36 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     // values`/a local `bound` closure, so a start value's side effects fired
     // even when an earlier one, or the target itself, had already failed.
     //
+    // `target` (`E`) is stepped lazily too, memoized on the first `(s, e)`
+    // pair actually reached -- see `path_context_step_computed_index`'s own
+    // doc comment for why an unconditional-eager step (the first draft's
+    // mistake here too, caught by review) fires `E`'s own side effects
+    // before `S`'s, reversing jq's real nesting order.
+    //
     // `was_read_only`: see `path_context_step_computed_index`'s own doc
     // comment -- same defensive re-entry, same reason, applied at both
     // nesting levels since either sink's own navigation-sensitive work
     // (`owned_identity_values`) needs it restored, not just the outermost.
+    let mut targets: LazyTargetSteps<V> = None;
     let was_read_only = yq_read_only_context::active();
     let mut walk_error: Option<Control> = None;
+    // The end generator's own escape (a `halt` mid-stream, say), separate
+    // from `walk_error`: unlike a navigation/target failure, this is a
+    // *generator's* escape and must still take yq mode's truncation rule
+    // through `path_context_component_escape` below, same as `starts_control`
+    // already does -- review found the first draft folded it into
+    // `walk_error` instead, which bypassed that truncation and let a
+    // yq-mode `halt` inside `end` leak a position real yq discards.
+    let mut end_escape: Option<Control> = None;
     let starts_control = path_context_component_each_bound::<S, V>(start, pos, &mut |s| {
         let _scope = was_read_only.then(yq_read_only_context::enter);
         let ends_control = path_context_component_each_bound::<S, V>(end, pos, &mut |e| {
             let _scope = was_read_only.then(yq_read_only_context::enter);
+            let (targets_vec, _) = targets.get_or_insert_with(|| {
+                let mut t = Vec::new();
+                let stepped = path_context_step_target::<S, V>(target, pos, &mut t);
+                (t, stepped)
+            });
             let slice = Expr::SliceExpr {
                 target: Box::new(Expr::Identity),
                 start: Some(Box::new(Expr::tracked_value(s.clone()))),
@@ -17634,7 +17652,7 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
             };
             let component = (S::TAG != EvalTag::Yq)
                 .then(|| literal_component_from_values(s.clone(), e.clone()));
-            for tpos in &targets {
+            for tpos in targets_vec.iter() {
                 let value: Rc<OwnedValue> = match &tpos.node {
                     PathNode::At(c) => match to_owned_cursor::<S, _>(c) {
                         Ok(v) => Rc::new(v),
@@ -17665,12 +17683,22 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
             return Demand::Stop;
         }
         match ends_control {
-            Some(control) => stop_with_escape(&mut walk_error, control),
+            Some(control) => {
+                end_escape = Some(control);
+                Demand::Stop
+            }
             None => Demand::Continue,
         }
     });
     if let Some(control) = walk_error {
         return Err(control);
+    }
+    if let Some(control) = end_escape {
+        return Err(path_context_component_escape::<S, V>(
+            out,
+            produced_from,
+            control,
+        ));
     }
     if let Some(control) = starts_control {
         return Err(path_context_component_escape::<S, V>(
@@ -17679,7 +17707,12 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
             control,
         ));
     }
-    stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
+    match targets {
+        Some((_, stepped)) => {
+            stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
+        }
+        None => Ok(()),
+    }
 }
 
 /// The integer argument of a position-navigation builtin (`at_offset`,
@@ -18224,6 +18257,13 @@ fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
 /// before the error (both pinned in `tests/jq_cli_tests.rs` since #2100).
 /// jq 1.7.1 has no `key` at all and real yq's lexer rejects the spelling, so
 /// the pins are succinctly's own; what the exit had to keep is the answer.
+/// A [`path_context_step_target`] call's own result, memoized on first use
+/// by [`path_context_step_computed_index`] and [`path_context_step_computed_slice`]
+/// (#2916) -- both step `target` lazily now, once the first component/bound
+/// value actually needs it, rather than unconditionally before their own
+/// generator starts.
+type LazyTargetSteps<V> = Option<(Vec<PathContextPos<V>>, Result<(), Control>)>;
+
 fn path_context_step_target<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     pos: &PathContextPos<V>,
@@ -18266,14 +18306,26 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
     let produced_from = out.len();
-    let mut targets = Vec::new();
-    let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
     // #2916: `key`'s generator is pulled lazily through
     // `path_context_component_each` (#2259's own primitive), one key at a
     // time, so a navigation failure on an earlier key stops the generator
     // before a later key's own side effects fire -- matching real jq's `K
     // as $k | E | .[$k]` desugaring. This used to drain the whole key
     // generator up front via the eager `path_context_component_values`.
+    //
+    // `target` is stepped lazily too, memoized on the *first* key the sink
+    // actually receives, rather than unconditionally before the key stream
+    // starts -- review found the first draft's eager `target` step ran
+    // before `key`'s own side effects had a chance to, reversing jq's own
+    // order (`K`'s side effect must fire first). Confirmed live against jq
+    // 1.7.1's own non-path-context evaluation of the equivalent shape
+    // (succinctly's `key` has no jq counterpart to pin the path-context
+    // route directly against): `(.a|debug("E"))[(debug("K")|"b")]` prints
+    // `K` then `E`, and with a key generator that produces *zero* values at
+    // all (`(.a|debug("E"))[(empty)]`), `E`'s debug never fires at all --
+    // `target` is only ever stepped because a key needed it, exactly what
+    // memoizing on first use gives for free and the old unconditional-eager
+    // step never had.
     //
     // `was_read_only` (#2470/#2916 interaction): captured *before* the pull,
     // and re-entered inside the sink around the navigation itself. yq's
@@ -18296,11 +18348,17 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     // `(.a[("z"+"z")] | key) + "!"` on `{"a":{"b":1}}` answered `"zz!"`
     // instead of yq's own `"!"` (`.a` has no `"zz"` key, and the miss must
     // read as nothing, not as a real `"zz"` position, inside this operand).
+    let mut targets: LazyTargetSteps<V> = None;
     let was_read_only = yq_read_only_context::active();
     let mut walk_error: Option<Control> = None;
     let components_control = path_context_component_each::<S, V>(key, pos, &mut |component| {
         let _scope = was_read_only.then(yq_read_only_context::enter);
-        for tpos in &targets {
+        let (targets, _) = targets.get_or_insert_with(|| {
+            let mut t = Vec::new();
+            let stepped = path_context_step_target::<S, V>(target, pos, &mut t);
+            (t, stepped)
+        });
+        for tpos in targets.iter() {
             match path_component_step_expr(&component) {
                 Some(step) => {
                     let step = if bracket_optional {
@@ -18345,8 +18403,15 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     }
     // The target's own escape after some targets (#2328: `(.a,.b,error("x"))
     // [(0+0)] | key` prints only `Error: x` in yq v4.53.3, `0`, `0` and then
-    // the error in jq mode) takes the same mode split.
-    stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
+    // the error in jq mode) takes the same mode split -- `target` was never
+    // stepped at all (`targets` still `None`) when the key stream produced
+    // no values, so there is no escape to report.
+    match targets {
+        Some((_, stepped)) => {
+            stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
+        }
+        None => Ok(()),
+    }
 }
 
 /// Every value a computed component takes at `pos` (#2471), pulled lazily

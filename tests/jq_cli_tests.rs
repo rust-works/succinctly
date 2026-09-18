@@ -60709,20 +60709,33 @@ fn test_path_context_sibling_sites_pull_their_generators_lazily_2916() -> Result
 
     // Every site's successful, multi-output shape must still produce jq's
     // own values and ordering -- laziness must not change *what* comes out,
-    // only *when* a not-needed later output's side effects run.
+    // only *when* a not-needed later output's side effects run. Each filter
+    // is wrapped in `path(...)`, not just collected as a plain value, so
+    // these actually exercise `path_context_step_generic`/the four sites
+    // this issue touches rather than the ordinary (unmodified) generic
+    // evaluator -- confirmed live against `/usr/bin/jq` 1.7.1.
     for (filter, want) in [
-        (r#"[.a[("x","y")]]"#, "[1,2]"),
-        (r"[if (true,false) then 1 else 2 end]", "[1,2]"),
-        (r"[limit((1,2); 1,2,3)]", "[1,1,2]"),
+        (r#"[path(.a[("x","y")])]"#, r#"[["a","x"],["a","y"]]"#),
+        (
+            r"[path(if (true,false) then .x else .y end)]",
+            r#"[["x"],["y"]]"#,
+        ),
+        (
+            r"[path(limit((1,2); .x, .y, .x))]",
+            r#"[["x"],["x"],["y"]]"#,
+        ),
     ] {
-        let input = r#"{"a":{"x":1,"y":2}}"#;
+        let input = r#"{"a":{"x":1,"y":2},"x":1,"y":2}"#;
         let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
         assert_eq!(stdout.trim(), want, "`{filter}`");
     }
-    let (stdout, code) = run_jq_stdin(r"[.a[(0,1):(2,3)]]", r#"{"a":[1,2,3,4,5]}"#, &["-c"])?;
+    let (stdout, code) = run_jq_stdin(r"[path(.a[(0,1):(2,3)])]", r#"{"a":[1,2,3,4,5]}"#, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[[1,2],[1,2,3],[2],[2,3]]");
+    assert_eq!(
+        stdout.trim(),
+        r#"[["a",{"start":0,"end":2}],["a",{"start":0,"end":3}],["a",{"start":1,"end":2}],["a",{"start":1,"end":3}]]"#
+    );
 
     Ok(())
 }
