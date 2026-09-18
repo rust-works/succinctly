@@ -35538,9 +35538,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     // zero steps, and the alternative still wins).
                     Flow::Exhausted => return Demand::Continue,
                     Flow::Stopped { .. } => {
-                        unreachable!(
-                            "the step sink records an outcome before answering Demand::Stop"
-                        ) // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                        unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                     }
                     // A pattern-walk refusal leaves the accumulator untouched
                     // for the branch it refused (`LOADVN` has not run for it),
@@ -36111,9 +36109,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     // zero steps, and the alternative still wins).
                     Flow::Exhausted => return Demand::Continue,
                     Flow::Stopped { .. } => {
-                        unreachable!(
-                            "the step sink records an outcome before answering Demand::Stop"
-                        ) // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                        unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                     }
                     // See `resolve_reduce`'s identical arms.
                     Flow::Escaped(Control::Error(e)) => {
@@ -42984,9 +42980,9 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                         state = last_update.take().unwrap_or(OwnedValue::Null);
                         match update_flow {
                             Flow::Exhausted => Demand::Continue,
-                            Flow::Stopped { .. } => unreachable!(
-                        "on_update always records a `step_outcome` before answering Demand::Stop"
-                    ),
+                            Flow::Stopped { .. } => {
+                                unreachable!("outcome recorded first") // omni-dev: coverage tolerate-line reason="unreachable: on_update records a `step_outcome` before every Demand::Stop it answers, and the fallback match runs only when it recorded none (#2872)"
+                            }
                             Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
                                 outcome = Some(AlternativeOutcome::Retry);
                                 Demand::Stop

@@ -57252,11 +57252,149 @@ fn test_pattern_computed_key_fans_out_in_folds_2872() -> Result<()> {
         assert_eq!(stdout, expected, "`{filter}`");
     }
 
-    // A halt in a key halts the fold, never retried.
-    let filter = "reduce . as {(\"a\", halt_error(7)):$q} ?// $r (0; .+$q)";
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1,"b":2}"#))?;
-    assert_eq!(code, 7, "`{filter}`: stdout={stdout} stderr={stderr}");
-    assert_eq!(stderr, "{\"a\":1,\"b\":2}\n");
+    // A halt in a key halts the fold, never retried -- in value and in path
+    // position, with whatever the earlier branches already emitted kept.
+    // (`halt_error` dumps its input -- the fold's source element -- to
+    // stderr.)
+    for (input, filter, expected_stdout, expected_stderr) in [
+        (
+            r#"{"a":1,"b":2}"#,
+            "reduce . as {(\"a\", halt_error(7)):$q} ?// $r (0; .+$q)",
+            "",
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            r#"{"a":{"c":1}}"#,
+            "path(reduce .[] as {(\"c\", halt_error(7)):$q} (.; .))",
+            "",
+            "{\"c\":1}\n",
+        ),
+        (
+            r#"{"a":{"c":1}}"#,
+            "path(foreach .[] as {(\"c\", halt_error(7)):$q} (.; .; $q))",
+            "[\"a\",\"c\"]\n",
+            "{\"c\":1}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 7, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected_stdout, "`{filter}`");
+        assert_eq!(stderr, expected_stderr, "`{filter}`");
+    }
+
+    // A `break` in a key inside a path-mode fold retries the next
+    // alternative (after the steps its earlier outputs ran) or unwinds to
+    // its label when there is none.
+    for (input, filter, expected) in [
+        (
+            r#"{"a":{"c":1}}"#,
+            "[label $o | path(reduce .[] as {(\"c\", break $o):$q} ?// $z (.; .))]",
+            "[[]]\n",
+        ),
+        (
+            r#"{"a":{"c":1}}"#,
+            "[label $o | path(reduce .[] as {(\"c\", break $o):$q} (.; .))]",
+            "[]\n",
+        ),
+        (
+            r#"{"a":1}"#,
+            "[label $o | path(. as {(break $o):$q} ?// {a:$q} | $q)]",
+            "[[\"a\"]]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+    let filter = "[label $o | path(foreach .[] as {(\"c\", break $o):$q} ?// $z (.; .; $q))]";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"c":1}}"#))?;
+    assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): Invalid path expression with result null\n"
+    );
+
+    Ok(())
+}
+
+/// #2872 (review): the walker's mixed shapes -- a literal-key run ahead of
+/// a forking entry, a forking element behind plain ones, `{$b: P}` in both
+/// runs, a refusal inside either run, more than 16 bindings (the linear
+/// duplicate-name check), and the owned-identity pipe's stop and escape
+/// arms. Every row confirmed live against jq 1.7.1.
+#[test]
+fn test_pattern_computed_key_walker_shapes_2872() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":{"x":1,"y":2}}"#, "[. as {a:{(\"x\",\"y\"):$q}} | $q]", "[1,2]\n"),
+        (r#"{"a":1,"b":2}"#, "[. as {$a, (\"b\"):$q} | [$a,$q]]", "[[1,2]]\n"),
+        (
+            r#"{"b":{"x":1,"y":2}}"#,
+            "[. as {$b: {(\"x\",\"y\"):$q}} | [$b,$q]]",
+            "[[{\"x\":1,\"y\":2},1],[{\"x\":1,\"y\":2},2]]\n",
+        ),
+        (r#"[{"a":1,"b":2}, 3]"#, "[. as [{(\"a\",\"b\"):$q}, $x] | [$q,$x]]", "[[1,3],[2,3]]\n"),
+        (r"null", "[path(. as {a:$x, b:$x} | $x)]", "[[\"a\",\"b\"]]\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            ". as {a:$x,b:$x,c:$x,d:$x,e:$x,f:$x,g:$x,h:$x,i:$x,j:$x,k:$x,l:$x,m:$x,n:$x,o:$x,p:$x,q:$x,b:$y} | [$x,$y]",
+            "[1,2]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            ". as {a:$x,b:$x,c:$x,d:$x,e:$x,f:$x,g:$x,h:$x,i:$x,j:$x,k:$x,l:$x,m:$x,n:$x,o:$x,p:$x,q:$x,b:$y} ?// $z | [$x,$y]",
+            "[null,2]\n",
+        ),
+        (r#"{"a":{"x":1,"y":2}}"#, "[limit(1; .a | . as {(\"x\",\"y\"):$q} | $q)]", "[1]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+    for (input, filter, expected_stderr) in [
+        (
+            r"[1]",
+            ". as {a:$x, (\"b\"):$q} | $x",
+            "Cannot index array with string \"a\"",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as {a:[$x], (\"b\"):$q} | $x",
+            "Cannot index number with number",
+        ),
+        (
+            r"5",
+            ". as [{(\"a\"):$q}, $x] | $q",
+            "Cannot index number with number",
+        ),
+        (
+            r"5",
+            ". as [{(\"a\"):$q}] | $q",
+            "Cannot index number with number",
+        ),
+        (
+            r#"[{"a":1}, 3]"#,
+            ". as [{(\"a\"):$q}, [$x]] | $q",
+            "Cannot index number with number",
+        ),
+        (
+            r"[1]",
+            "def k: true; path(. as {(k):$q} | $q)",
+            "Cannot index array with boolean",
+        ),
+        (
+            r#"{"a":{"x":1,"y":2}}"#,
+            "[.a | . as {(\"x\", error(\"E\")):$q} | $q]",
+            "E",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(
+            stderr,
+            format!("jq: error (at <stdin>:0): {expected_stderr}\n"),
+            "`{filter}`"
+        );
+    }
 
     Ok(())
 }
