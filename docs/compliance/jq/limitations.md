@@ -1033,7 +1033,11 @@ is the revert that established what the other one costs.
    bind; scoped separately), the embed row (#2889), the routes that re-enter the eager
    evaluator with an *owned* accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`,
    a `catch` handler: `eval.rs`'s own `eval_as` carries no node for a navigated bind, and there
-   is no cursor at that funnel to promote against), and a `null`/`bool` marker at an
+   is no cursor at that funnel to promote against), a navigated bind on an *owned-rooted*
+   document (`input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as $y | .a | ($y.b) = 9'`,
+   a `tojson|fromjson`-rebuilt root: the marker's node is an `OwnedIdentity` position, and
+   `marker_is_root` reads only a document node against a live cursor — no `OwnedRoot` twin),
+   and a `null`/`bool` marker at an
    equal-valued sibling (`.a as $y | .c | $y |= 5` on `{"a":true,"c":true}`: jq's
    `jv_identical` admits those by value regardless of node, the resolver's `TrackedVar` arm
    consults the origin first — pre-existing). The library entry point `succinctly::jq::eval`
