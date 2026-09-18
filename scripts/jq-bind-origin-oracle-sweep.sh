@@ -45,6 +45,16 @@
 # write operators, plus the two refusals kept on purpose (the reasons are in
 # REFUSE_ONLY below and in limitations.md).
 #
+# The `untracked-*` rows are #3043/#3120: a destructuring bind on an
+# *untracked* stage checks its first pattern step against the register the
+# pipe carried in (`resolve_seq_stage` hands it to `resolve_as_pattern`),
+# never against the stage's own value -- a `null` literal stage used to pass
+# the null-identity clause against itself where jq refuses against the
+# document root, and `del`/`|=` wrote through it. With the register in hand
+# the #2649 residue-2 / #2979 family-B rows answer (their REFUSE_ONLY
+# entries are gone), and a `?//` first-step refusal that is provably jq's
+# own verdict (the source is not even value-equal to the register) retries.
+#
 # The `identity-*` rows are #2978: an identity-passthrough bind (`. as $x`,
 # and every spelling `is_identity_passthrough` recognises) made inside a
 # resolver invocation carries the position `.` was frozen at
@@ -94,7 +104,10 @@ if [[ "${1:-}" != "--list-cases" ]]; then
 fi
 
 # id <TAB> input <TAB> filter
-CASES=$(cat <<'CASES_EOF'
+# `read -d ''`, not `$(cat <<EOF)`: bash scans a command substitution's body for
+# quotes and parens even inside a quoted heredoc, so a filter or a reason with an
+# apostrophe or an unbalanced paren in it used to break the whole script (#3120).
+read -r -d '' CASES <<'CASES_EOF' || true
 same-node-sibling-pipe	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | $y)
 equal-sibling-pipe	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .c | $y)
 bare-var-at-root	{"a":{"b":1}}	path(.a as $y | $y)
@@ -385,19 +398,36 @@ identity-trap-raising-try-value-rule-del	{"a":{"k":{"b":1}}}	del(.a | (try (if e
 identity-trap-raising-try-alternative	{"a":{"k":{"b":1}}}	path(.a | ((try (if error("e") then . else . end)) // {"b":1}) as $x | .k | $x | .b)
 identity-raise-free-try-nested	{"a":{"k":{"b":1}}}	path(.a | (try (try . catch 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)
 identity-try-if-nonraising	{"a":{"k":{"b":1}}}	path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)
+untracked-null-stage-array	{"a":1}	path(null | . as [$v] | empty)
+untracked-null-stage-object	{"a":1}	path(null | . as {a:{b:$v}} | empty)
+untracked-null-stage-below-root	{"a":1}	path(.a | null | . as [$v] | empty)
+untracked-null-stage-del	{"a":1}	del(null | . as [$v] | empty)
+untracked-null-stage-update	{"a":1}	(null | . as [$v] | empty) |= 5
+untracked-null-stage-optional-body	{"a":[1]}	path(null | .a as {arr:[$v]} | .arr[]?)
+untracked-null-stage-constructed-source	{"a":1}	path(null | ([.a] | .[0]) as [$v1] | ($v1 | .[]?))
+untracked-null-stage-null-register	{"a":null}	path(.a | null | . as {b:$v} | $v)
+untracked-null-stage-null-document	null	[path(null | . as [$v] | empty)]
+untracked-stage-marker-head-single	{"a":1}	path(. as $x | 5 | $x as {a:$q} | $q)
+untracked-stage-marker-head-del	{"a":1}	del(. as $x | 5 | $x as {a:$q} ?// $z | $q)
+untracked-stage-marker-not-register	{"a":1}	path(. as $x | 5 | $x as {a:$q} | $x)
+untracked-stage-equal-value-guess	{"a":{"b":1}}	path(.a | {b:1} | . as {b:$v} ?// $z | $z)
+untracked-catch-handler-null-document	null	path(try error(null) catch (. as {a:$q} | $q))
+untracked-catch-handler-del	{"a":1}	del(try error(null) catch (. as {a:$q} | $q))
+untracked-nested-if-refuses	{"a":1}	path(.a | null | if true then (. as {b:$v} | empty) else . end)
+untracked-nested-if-null-register	{"a":null}	path(.a | 5 | if true then (null as {b:$v} | $v) else . end)
+untracked-bare-alt-keeps-register	{"a":1}	path(. as $x | 5 | $x as [$v] ?// $z | $z)
+untracked-bare-alt-keeps-register-del	{"a":1}	del(. as $x | 5 | $x as [$v] ?// $z | $z.a)
+untracked-opaque-stage-lost-register	{"a":{"b":null}}	del(reduce 1 as $i (null; null) | . as [$v] ?// $v | empty)
 CASES_EOF
-)
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
 # reason it is deliberately left refusing. A new one is a sweep failure.
 # Quoted heredoc: a reason may quote a filter verbatim ($q, "a") without
-# the shell expanding it -- but keep single quotes *balanced* across the
-# block: bash still scans them while finding the end of the enclosing
-# `$( )`, and an odd count fails the whole script with "unexpected EOF
-# while looking for matching `''" (#2978 review round). Likewise never open
-# a `(` before a `#`: bash reads the `#` as a comment to end of line inside
-# the `$( )`, so the closing `)` vanishes (#3037).
-REFUSE_ONLY=$(cat <<'REFUSE_EOF'
+# the shell expanding it. Read with `read -d ''` rather than `$(cat <<EOF)`
+# for the reason given at CASES above (#3037 hit the same scanner from the
+# other side: a `(` before a `#` in a reason made bash read the `#` as a
+# comment inside the `$( )`, so the closing `)` vanished).
+read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
 value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
 tojson-between:tojson/fromjson are not on cannot_move_register's proven allowlist (#2041)
 def-body-in-path:a def inside path() resolves as an opaque leaf, before #2042 too
@@ -413,16 +443,11 @@ slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice c
 catch-handler-var:the handler resolves under an unknown frame and a raising try stage does not carry the register; pre-existing, the root marker refuses too
 literal-then-fold-untracked-init:after a literal the register is only carried, and a fold with an untracked INIT seeds its register from the ambient literal; pre-existing, the root marker refuses too
 destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
-destructure-pattern-on-bound-copy:#2649 residue 1 -- a nested pattern whose source is the bound copy ($q as [$x]); the arm's source rule only trusts Identity/TrackedVar at the head of a trackable stage
-destructure-marker-source-literal:#2649 residue 2 -- a marker-headed pattern source on an untracked stage; the arm cannot see the register the stage carries, and reading stage_frame alone would fabricate
-destructure-marker-source-navigated:#2649 residue 2 -- same as destructure-marker-source-literal with a navigated bind (.b as $y | .b | 5 | $y as {c:$w})
 destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
 destructure-alt-artefact-guard:#2649 artefact guard -- MUST stay a refusal: retrying here would answer [] where jq answers ["a",0]; answering anything makes this row mismatch (fabrication assertion, not a bare allowlist entry)
 destructure-alt-artefact-guard-del:#2649 artefact guard -- the write twin: a retry would delete the whole document where jq deletes .a[0]
 destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
 carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
-alt-untracked-stage-zero-output:#2979 family B -- on an untracked stage the walk's verdict is a guess, so its refusal propagates rather than retrying; jq retries onto $v and answers nothing
-alt-untracked-stage-marker-head:#2979 family B -- MUST stay a refusal: the marker is the register in jq (["a"]); a retry would bind $z instead, and del/= would write through it
 destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
 in-evaluator-input-embed-array:#3036 -- the in-evaluator twin of the #2642 owned-embed residual: `[.] | .[0]` materializes the element as an owned copy, which re-enters eval.rs as a fresh document (limitations.md, #3036)
 in-evaluator-input-embed-object:#3036 -- same as in-evaluator-input-embed-array for `{k:.} | .k`
@@ -439,8 +464,10 @@ navigated-bind-owned-root:#3037 residual -- a navigated bind on an owned-rooted 
 navigated-bind-input-root:#3037 residual -- same as navigated-bind-owned-root, on the input-queue route
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
+untracked-catch-handler-null-document:#3120 -- a catch handler runs under an untracked frame with no register in hand, since the try body's navigation may have moved it before raising, so the walk refuses; jq answers only because this document is null. The same rule fabricated a del on any other document, see untracked-catch-handler-del, so this coincidence is not kept
+untracked-nested-if-null-register:#3120 -- a nested pipe inside if/try carries no register, so with a null register behind a non-matching literal the walk cannot know jq's verdict, which is to accept here; refused before #3120 too
+untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
 REFUSE_EOF
-)
 
 if [[ "${1:-}" == "--list-cases" ]]; then
   printf '%s\n' "$CASES"
