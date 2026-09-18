@@ -101,6 +101,14 @@ SOURCES = [
     ("($p.b? | .c?)", True), ("(($p | .b?) | .c?)", True), ("(.c | $p | .b?)", True),
     ("(try $p.b? catch \"X\")", True), ("(5 | $p | .b?)", True), ("($p | ..)", True),
     ("($p[0:1]?)", True),
+    # #2978: every spelling `is_identity_passthrough` recognises, not just
+    # bare `.` -- each now freezes `.` *with its position*, and the `//`
+    # arm's soundness argument (the right operand only runs below a
+    # `null`/`false` register) is a claim the pool has to be able to test.
+    # `.` alone was 1 draw in 40, too rare to reach the getpath-stage uses
+    # that consume the position.
+    ("(. // 1)", False), ("(try . catch 1)", False), ("(if true then . else . end)", False),
+    ("(if .a then . else . end)", False), ("(. // $p)", True), ("(if true then . else $p end)", True),
 ]
 NAV = [".a", ".c", ".x", ".x.a", ".b?", ".arr[0]?", ".arr[]?"]
 LITERAL = ["5", "null", "true", "\"z\""]
@@ -153,7 +161,28 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "($v | foreach (1) as $i (.a; getpath([\"b\"]); .))",
         "($v | foreach (1,2) as $i (.; getpath([\"a\"]); .b?))",
         "foreach (1) as $i (.; $v | getpath([\"a\"]); .b?)",
-        "($v | foreach .[]? as $i (.; getpath([\"a\"]); .b?))"]
+        "($v | foreach .[]? as $i (.; getpath([\"a\"]); .b?))",
+        # #2978: a *nested* bind from a marker source, used at a deeper
+        # register inside the parentheses. An identity-passthrough bind now
+        # carries the position `.` was frozen at, and a rebind from it
+        # (`$v as $w`) must inherit the *marker's* position, never the
+        # frame's -- `$v` bound at the root and rebound at `["a"]` is still
+        # the root's node, so `getpath(["c"])` from it is `["c"]`, not
+        # `["a","c"]`. The second form composes back onto the register.
+        "(.a | ($v as $w | .c | $w | getpath([\"c\"]) | .b?))",
+        "(.a | ($v as $w | .c | $w | getpath([\"a\",\"c\"]) | .b?))",
+        "(.x | ($v as $w | .a | $w | getpath([\"x\",\"a\"]) | .b?))"]
+
+# #2978: an optional navigation *prefix* before the first bind, so `. as $v`
+# can be drawn below the invocation root. `program()` put every bind at the
+# head of the pipe, which meant the fuzz could not emit the one shape the
+# #2978 hazard lives in: an identity bind at `["x"]` whose position a wrong
+# rule would take for `[]`, composing `getpath(["a"])` to the register's own
+# path (`["x","a"]`) for a node that is really `["x","x","a"]`-shaped. The
+# documents already hold `x.a` as a copy of `a` precisely so an equal value
+# sits at a different node.
+PREFIX = [".x", ".a", ".arr[]?", ".x.a"]
+PREFIX_P = 0.3
 
 # #2649 destructuring patterns: (pattern, the variable the body then uses).
 # `V` is replaced by this bind's generated name, `W` by its sibling.
@@ -263,6 +292,8 @@ def stage(rng, v):
 def program(rng):
     n_bind = rng.choice([1, 1, 2])
     parts = []; prev = None
+    if rng.random() < PREFIX_P:
+        parts.append(rng.choice(PREFIX))
     for i in range(n_bind):
         v = f"$v{i}"
         cands = [s for s, needs in SOURCES if not needs or prev]
@@ -330,9 +361,9 @@ def main():
     if not version.startswith(pin):
         sys.exit(f"error: {a.jq} is not the pinned oracle ({pin}): {version!r}")
     if a.self_test:
-        for name, pool in [("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
-                           ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES),
-                           ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
+        for name, pool in [("PREFIX", PREFIX), ("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV),
+                           ("LITERAL", LITERAL), ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES),
+                           ("USES", USES), ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
                            ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
