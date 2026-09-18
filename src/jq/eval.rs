@@ -29023,12 +29023,13 @@ impl RootWitness {
 /// re-entry has to say what its value's root is rather than guess a name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Reentry {
-    /// Already demoted for this value's document upstream: the value is that
-    /// document's root or a node reached from it by navigation alone (a
-    /// generic funnel or an enclosing re-entry demoted the markers against
-    /// its root), or the caller ran [`demote_for_reentry`] on this same
-    /// expression itself (a fold or loop hoisting a static operand out of
-    /// its per-element path). Nothing left to demote.
+    /// Already rerooted for this value's document upstream: the value is
+    /// that document's root or a node reached from it by navigation alone (a
+    /// generic funnel or an enclosing re-entry rerooted the markers against
+    /// its root), or the caller ran [`reroot_for_reentry`] (or its
+    /// demote-only twin [`demote_for_reentry`], for an `Owned` root) on this
+    /// same expression itself (a fold or loop hoisting a static operand out
+    /// of its per-element path). Nothing left to rewrite.
     Proven,
     /// The value may be a rebuilt copy of whatever the markers name, or the
     /// very node a value-mode bind was frozen from: reroot against this
