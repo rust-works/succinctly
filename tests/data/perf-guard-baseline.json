@@ -16,19 +16,19 @@
     "wide_keys_unsorted": 288167767
   },
   "x86_64": {
-    "arrays_first_map_iterate": 125314842,
-    "arrays_identity": 682123832,
-    "arrays_map_iterate": 1185894362,
-    "users_assign_scores": 1234919022,
-    "users_del_bound_select": 1270130433,
-    "users_del_select": 1239165632,
-    "users_identity": 330722186,
-    "users_keys_unsorted": 66022431,
-    "users_path_walk": 318352042,
-    "users_yq_del_select": 3127845447,
-    "users_yq_keys_unsorted": 82782496,
-    "wide_escaped_keys_unsorted": 375294099,
-    "wide_identity": 565733669,
-    "wide_keys_unsorted": 348386711
+    "arrays_first_map_iterate": 125137212,
+    "arrays_identity": 681945875,
+    "arrays_map_iterate": 1182882059,
+    "users_assign_scores": 1158563767,
+    "users_del_bound_select": 1203672368,
+    "users_del_select": 1172170233,
+    "users_identity": 330666183,
+    "users_keys_unsorted": 65968142,
+    "users_path_walk": 318278801,
+    "users_yq_del_select": 3128344506,
+    "users_yq_keys_unsorted": 82728369,
+    "wide_escaped_keys_unsorted": 375206419,
+    "wide_identity": 565637300,
+    "wide_keys_unsorted": 348290533
   }
 }
