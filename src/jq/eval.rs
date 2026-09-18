@@ -46005,8 +46005,8 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `REINDEX_LITERAL_LEN_CAP`, or a NaN spelling -- a bare `Float` has
     // been bridge-identity since #2902). The *lazy* `eval_each_generic` arm
     // for the same builtin no longer reaches here on that route (#2925): it
-    // hands the same non-identity case to `eval_each_owned_bridged` instead,
-    // which re-enters through `eval_each`'s own lazy `Builtin::Path` arm
+    // hands the same non-identity case to `eval_each_owned` instead, which
+    // re-enters through `eval_each`'s own lazy `Builtin::Path` arm
     // (`each_path`), not this eager one.
     let owned = to_owned_or_suppress!(&value, optional);
     builtin_path_on_owned::<W, S>(expr, &owned, optional)
