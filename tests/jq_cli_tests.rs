@@ -27482,8 +27482,11 @@ fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
 }
 
 /// #2962: a module's dependencies are bound in their own scope, as jq binds
-/// a module's block, even though succinctly wraps them inside each def body
-/// that reaches them.
+/// a module's block. (Since #2955 that is literally so: a dependency module
+/// is linked once, as a run of its own, and a def reaches it through a
+/// forwarding stub -- the rows below were captured when the loader still
+/// copied dependency bodies into each reaching def, and they must not
+/// change.)
 ///
 /// Every row is captured whole from jq 1.7.1 -- stdout, stderr (with the
 /// module directory as `<DIR>`) and exit code -- over the fixture files the
@@ -27496,9 +27499,9 @@ fn test_fold_alternation_pattern_writes_match_jq_2979() -> Result<()> {
 /// - **A dependency sharing the def's (name, arity), or a parameter's name,
 ///   was excluded**, stranding the other dependencies that call it (`R1`,
 ///   `R8`, `R13`, `R24`, `R27`, `R28`, `R29`, `R31`, `R32`), or captured the
-///   def's own binding (`R3`, `R25`). Such a dependency is now renamed, with
-///   the calls that reach it.
-/// - **The rename is scope-aware**: a nested def of the same name (`R21`), a
+///   def's own binding (`R3`, `R25`). Such a name gets no stub, and the
+///   other dependencies' calls to it are answered inside their own run.
+/// - **Binding is scope-aware**: a nested def of the same name (`R21`), a
 ///   parameter (`R22`, `R26`, `R30`), a dependency's own dependency (`R23`,
 ///   and past its run's end marker `R33`), a later same-name entry (`R27`,
 ///   `R28`) and declaration order (`R24`) each keep a call bound where jq
@@ -27870,6 +27873,57 @@ fn test_transitive_include_chain_does_not_blow_up_2865() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "1");
 
+    Ok(())
+}
+
+/// #2955: a module chain whose defs each call **more than one** def from
+/// the level below stays linear in size.
+///
+/// The `_2865` guard above has fan-out 1, which its referenced-closure
+/// filter flattened; with fan-out `F` the copies compounded as `F^L`
+/// regardless (the issue's 14 x 4 x 2 chain: 680 MB peak RSS against jq's
+/// 2.5 MB, in release). Linking each dependency module once makes the
+/// processed program linear -- the unit test `link_size_guard_2955` in
+/// `jq_runner.rs` counts the nodes -- and this is the end-to-end row: the
+/// issue's own two shapes, completing with jq's answers (both captured
+/// live). Modest on purpose: evaluation itself still visits `F^L` calls,
+/// as jq does, so a wall-clock bound would flake on a loaded CI box.
+#[test]
+fn test_fan_out_module_chain_stays_linear_2955() -> Result<()> {
+    fn chain(levels: usize, defs: usize, fan_out: usize) -> Vec<(String, String)> {
+        let mut modules = Vec::new();
+        let mut base = String::new();
+        for i in 0..defs {
+            base.push_str(&format!(
+                "def f0_{i}: {i};
+"
+            ));
+        }
+        modules.push(("m0".to_string(), base));
+        for level in 1..levels {
+            let mut contents = format!("include \"m{}\";\n", level - 1);
+            for i in 0..defs {
+                let calls: Vec<String> = (0..fan_out)
+                    .map(|k| format!("f{}_{}", level - 1, (i + k) % defs))
+                    .collect();
+                contents.push_str(&format!("def f{level}_{i}: {};\n", calls.join(" + ")));
+            }
+            modules.push((format!("m{level}"), contents));
+        }
+        modules
+    }
+
+    for (levels, defs, fan_out, want) in [(8, 6, 3, "5211"), (12, 4, 2, "3072")] {
+        let modules = chain(levels, defs, fan_out);
+        let borrowed: Vec<(&str, &str)> = modules
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.as_str()))
+            .collect();
+        let filter = format!(r#"include "m{}"; f{}_0"#, levels - 1, levels - 1);
+        let (stdout, stderr, code) = run_jq_with_modules(&borrowed, &["-nc", &filter])?;
+        assert_eq!(code, 0, "{levels}x{defs}x{fan_out}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{levels}x{defs}x{fan_out}");
+    }
     Ok(())
 }
 
@@ -46531,37 +46585,301 @@ fn test_unbound_variable_from_included_module_names_its_own_line_2962() -> Resul
     Ok(())
 }
 
-/// #2962 / #3058: a dependency copied into two reached defs reports its
-/// unbound variable once per copy. jq reports it once (`jq: 1 compile
-/// error`), so the count is #3058's divergence, shared with calls. What this
-/// pins is the second report's form: the site table has no second
-/// occurrence, and the reporter names the file alone rather than searching
-/// the text for a coincidental `$nosuch` -- here, the one in a string.
+/// #3058 (closed by #2955): a compile error inside a dependency reached
+/// from two defs is reported **once**, as jq reports it -- the dependency is
+/// linked once and its body checked once, where the copying loader checked
+/// one copy per reaching def and printed `jq: 2 compile errors`, the second
+/// without a line (its site table had no second occurrence). Three shapes,
+/// each captured whole from jq 1.7.1: an unbound variable, an unresolved
+/// call, and the module reached both as a top-level `include` and as a
+/// dependency (one report, because the top-level copy's body is never
+/// reached and so never checked, #2740). The residual -- the main filter
+/// *also* calling the top-level copy directly -- still reports twice; it is
+/// recorded in `docs/compliance/jq/limitations.md`.
 #[test]
-fn test_unbound_variable_in_a_twice_copied_dependency_3058() -> Result<()> {
+fn test_dependency_error_is_reported_once_3058() -> Result<()> {
+    let rows: &[ModuleRow] = &[
+        (
+            "variable",
+            &[
+                ("dep", "def g: $nosuch;\ndef s: \"$nosuch\";\n"),
+                ("mid", "include \"dep\"; def a: g; def b: g;\n"),
+            ],
+            r#"include "mid"; a, b"#,
+            "jq: error: $nosuch is not defined at <DIR>/dep.jq, line 1:\ndef g: $nosuch;       \njq: 1 compile error\n",
+        ),
+        (
+            "call",
+            &[
+                ("depc", "def bad: nosuch;\n"),
+                ("midc", "include \"depc\"; def h: bad; def k: bad;\n"),
+            ],
+            r#"include "midc"; [h, k]"#,
+            "jq: error: nosuch/0 is not defined at <DIR>/depc.jq, line 1:\ndef bad: nosuch;         \njq: 1 compile error\n",
+        ),
+        (
+            "include-and-dependency",
+            &[
+                ("depc", "def bad: nosuch;\n"),
+                ("midc", "include \"depc\"; def h: bad; def k: bad;\n"),
+            ],
+            r#"include "depc"; include "midc"; [h, k]"#,
+            "jq: error: nosuch/0 is not defined at <DIR>/depc.jq, line 1:\ndef bad: nosuch;         \njq: 1 compile error\n",
+        ),
+    ];
+    run_module_rows(rows, &[])
+}
+
+/// One `(id, modules, filter, expected)` row of a module matrix: the
+/// `(name, contents)` pairs to write as `<name>.jq`, the filter to run over
+/// them, and the one stream the row asserts on.
+type ModuleRow<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
+
+/// Run each `(id, modules, filter, want_stderr)` row of a compile-error
+/// matrix: write the modules, run `succinctly jq -L <dir> -nc <extra...>
+/// <filter>`, and assert empty stdout, exit 3 and `want_stderr` byte for
+/// byte with `<DIR>` standing for the canonical module directory.
+fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
+    for (id, modules, filter, want_stderr) in rows {
+        let temp_dir = tempfile::tempdir()?;
+        for (name, contents) in *modules {
+            std::fs::write(temp_dir.path().join(format!("{name}.jq")), contents)?;
+        }
+        let dir = std::fs::canonicalize(temp_dir.path())?;
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut command = Command::new(succinctly_bin());
+                command
+                    .args(["jq", "-L"])
+                    .arg(temp_dir.path())
+                    .args(["-nc"])
+                    .args(extra)
+                    .arg(filter);
+                command
+            },
+            None,
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        let want_stderr = want_stderr.replace("<DIR>", &dir.to_string_lossy());
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", want_stderr.as_str(), 3),
+            "{id}: {filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #2955: compile errors across a module chain come out in jq 1.7.1's order
+/// -- a dependency's before its includer's, the last-declared dependency's
+/// first, and a chain's deepest module first. All three shapes captured
+/// whole from the pinned binary.
+///
+/// That order is not chosen by the resolver: it is the order the linked
+/// runs are wrapped in (`ModuleLoader::hoist_order`), outermost first, and
+/// `resolve::check` walks the chain from the outside in. The copying loader
+/// printed the includer's own error first, then its dependencies in
+/// declaration order (`A G K` for the first row, against jq's `K G A`).
+#[test]
+fn test_dependency_errors_report_in_jq_order_2955() -> Result<()> {
+    let rows: &[ModuleRow] = &[
+        (
+            "two dependencies, last declared first",
+            &[
+                ("ig", "def g: nosuchG;\n"),
+                ("ik", "def k: nosuchK;\n"),
+                ("mid3", "include \"ig\"; include \"ik\"; def a: nosuchA; def h: [k, g];\n"),
+            ],
+            r#"include "mid3"; [a, h]"#,
+            "jq: error: nosuchK/0 is not defined at <DIR>/ik.jq, line 1:\ndef k: nosuchK;       \njq: error: nosuchG/0 is not defined at <DIR>/ig.jq, line 1:\ndef g: nosuchG;       \njq: error: nosuchA/0 is not defined at <DIR>/mid3.jq, line 1:\ninclude \"ig\"; include \"ik\"; def a: nosuchA; def h: [k, g];                                   \njq: 3 compile errors\n",
+        ),
+        (
+            "the same two, declared the other way round",
+            &[
+                ("ig", "def g: nosuchG;\n"),
+                ("ik", "def k: nosuchK;\n"),
+                ("mid3r", "include \"ik\"; include \"ig\"; def a: nosuchA; def h: [k, g];\n"),
+            ],
+            r#"include "mid3r"; [a, h]"#,
+            "jq: error: nosuchG/0 is not defined at <DIR>/ig.jq, line 1:\ndef g: nosuchG;       \njq: error: nosuchK/0 is not defined at <DIR>/ik.jq, line 1:\ndef k: nosuchK;       \njq: error: nosuchA/0 is not defined at <DIR>/mid3r.jq, line 1:\ninclude \"ik\"; include \"ig\"; def a: nosuchA; def h: [k, g];                                   \njq: 3 compile errors\n",
+        ),
+        (
+            "a chain, deepest first",
+            &[
+                ("l0", "def z: nosuchZ;\n"),
+                ("l1", "include \"l0\"; def y: [z, nosuchY];\n"),
+                ("l2", "include \"l1\"; def x: [y, nosuchX];\n"),
+            ],
+            r#"include "l2"; x"#,
+            "jq: error: nosuchZ/0 is not defined at <DIR>/l0.jq, line 1:\ndef z: nosuchZ;       \njq: error: nosuchY/0 is not defined at <DIR>/l1.jq, line 1:\ninclude \"l0\"; def y: [z, nosuchY];                         \njq: error: nosuchX/0 is not defined at <DIR>/l2.jq, line 1:\ninclude \"l1\"; def x: [y, nosuchX];                         \njq: 3 compile errors\n",
+        ),
+    ];
+    run_module_rows(rows, &[])
+}
+
+/// #2955: a dependency module is linked **once** and reached through
+/// forwarding stubs, and every scoping row jq answers still comes out the
+/// same. Each row captured live from jq 1.7.1 (`stdout`, exit 0).
+///
+/// - a dependency `import`ed inside a module, whose def calls a sibling by
+///   its bare name (#2989's residual one level down: the copying loader
+///   dropped the sibling and reported `g/0 is not defined`);
+/// - a top-level `import`ed module whose def is reached only through a
+///   sibling's bare call, and itself depends on a third module (the
+///   referenced closure must retry the bare call under the alias, as the
+///   resolver does; found by review of this change);
+/// - one dependency reached through two different including modules (one
+///   link run, both stubs);
+/// - a `$param` and a closure param forwarded through a stub;
+/// - `path(...)` through a stub;
+/// - a dependency def with a parameter named like itself, called through a
+///   stub of the same shape;
+/// - two same-name defs in one dependency: the later one is what its
+///   sibling and its consumer both see;
+/// - a dependency's siblings calling each other and a deeper dependency;
+/// - a self-recursive dependency def called through a stub, at a depth a
+///   copied body also reached;
+/// - a consumer's own recursive def calling a dependency whose body names
+///   the consumer's own name (the #2962 family: the dependency's `c` is its
+///   own sibling, never the consumer's).
+///
+/// Non-re-export is pinned with a compile error in
+/// `test_transitive_include_does_not_leak_to_the_includer_2865` and the
+/// `_2962` matrix above; nothing here re-tests it.
+#[test]
+fn test_linked_dependency_keeps_jq_scoping_2955() -> Result<()> {
+    let rows: &[ModuleRow] = &[
+        (
+            "nested import, bare sibling call",
+            &[
+                ("inner3", "def g: 42; def k: [g];\n"),
+                ("impk", "import \"inner3\" as i; def h: i::k;\n"),
+            ],
+            r#"include "impk"; h"#,
+            "[42]\n",
+        ),
+        (
+            "imported module's sibling reached bare, with its own dependency",
+            &[
+                ("dep", "def d: 1;\n"),
+                ("m", "include \"dep\"; def g: d; def k: g;\n"),
+            ],
+            r#"import "m" as ns; ns::k"#,
+            "1\n",
+        ),
+        (
+            "one dependency, two includers",
+            &[
+                ("dep", "def d: 1;\n"),
+                ("a", "include \"dep\"; def fa: d + 1;\n"),
+                ("b", "include \"dep\"; def fb: d + 2;\n"),
+            ],
+            r#"include "a"; include "b"; [fa, fb]"#,
+            "[2,3]\n",
+        ),
+        (
+            "$param and closure param through a stub",
+            &[
+                ("dep", "def g($x; f): [$x, f];\n"),
+                ("m", "include \"dep\"; def h: g(1; 3,4);\n"),
+            ],
+            r#"include "m"; [h]"#,
+            "[[1,3,4]]\n",
+        ),
+        (
+            "path() through a stub",
+            &[
+                ("dep", "def p: .a.b;\n"),
+                ("m", "include \"dep\"; def q: path(p);\n"),
+            ],
+            r#"include "m"; {a:{b:1}} | q"#,
+            "[\"a\",\"b\"]\n",
+        ),
+        (
+            "parameter named like the def",
+            &[
+                ("dep", "def g(g): g;\n"),
+                ("m", "include \"dep\"; def h: g(7);\n"),
+            ],
+            r#"include "m"; h"#,
+            "7\n",
+        ),
+        (
+            "same name twice in the dependency",
+            &[
+                ("dep", "def c: 7; def c: 8; def g: c;\n"),
+                ("m", "include \"dep\"; def h: [g, c];\n"),
+            ],
+            r#"include "m"; h"#,
+            "[8,8]\n",
+        ),
+        (
+            "siblings and a deeper dependency",
+            &[
+                ("l0", "def z: 3;\n"),
+                ("l1", "include \"l0\"; def y: z + 1; def y2: y * 2;\n"),
+                ("l2", "include \"l1\"; def x: [y, y2];\n"),
+            ],
+            r#"include "l2"; x"#,
+            "[4,8]\n",
+        ),
+        (
+            "recursion inside the dependency",
+            &[
+                (
+                    "dep",
+                    "def down(n): if n == 0 then \"bottom\" else down(n - 1) end;\n",
+                ),
+                ("m", "include \"dep\"; def h: down(3000);\n"),
+            ],
+            r#"include "m"; h"#,
+            "\"bottom\"\n",
+        ),
+        (
+            "consumer recursion through a dependency that names the consumer's name",
+            &[
+                ("dep", "def c: 7; def g: c;\n"),
+                (
+                    "mid",
+                    "include \"dep\"; def c: if . == 0 then g else (. - 1 | c) end;\n",
+                ),
+            ],
+            r#"include "mid"; 3 | c"#,
+            "7\n",
+        ),
+    ];
+    for (id, modules, filter, want_stdout) in rows {
+        let (stdout, stderr, code) = run_jq_with_modules(modules, &["-nc", filter])?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (*want_stdout, "", 0),
+            "{id}: {filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #2955: the recursion-depth guard names a linked def as the user wrote
+/// it, never by its link spelling (`ModuleRun::display_name`). Real jq has
+/// no such guard (it recurses until the process dies), so the message is
+/// succinctly's own; what is pinned is the name in it.
+#[test]
+fn test_depth_guard_names_a_linked_def_as_written_2955() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(
         &[
-            ("dep", "def g: $nosuch;\ndef s: \"$nosuch\";\n"),
-            ("mid", "include \"dep\"; def a: g; def b: g;\n"),
+            ("dep", "def loop: 1 + loop;\n"),
+            ("m", "include \"dep\"; def h: loop;\n"),
         ],
-        &["-nc", r#"include "mid"; a, b"#],
+        &["-nc", r#"include "m"; h"#],
     )?;
-    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 4, "stderr: {stderr:?}");
-    assert!(
-        lines[0].starts_with("jq: error: $nosuch is not defined at ")
-            && lines[0].ends_with("dep.jq, line 1:"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): loop/0 exceeded maximum recursion depth\n"
     );
-    assert_eq!(lines[1], "def g: $nosuch;       ");
-    assert!(
-        lines[2].starts_with("jq: error: $nosuch is not defined at ")
-            && lines[2].ends_with("dep.jq"),
-        "the second copy names the file only, never line 2's string: {stderr:?}"
-    );
-    assert_eq!(lines[3], "jq: 2 compile errors");
+    assert!(!stderr.contains('\u{0}'), "a link name leaked: {stderr:?}");
     Ok(())
 }
 
