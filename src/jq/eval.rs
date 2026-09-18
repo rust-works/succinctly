@@ -31634,17 +31634,14 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // never certifies, so this refuses exactly as it did before #2072
         // gave every `as` binding a `TrackedVar` wrapper -- except the one
         // case jq's own `jv_identical` admits regardless of node identity
-        // (#3136): `null`/`true`/`false` are identical by value alone (the
-        // same carve-out `null_bool_identical` makes for `register_identical`
-        // and the pattern-walk's own first-step check), so an
-        // `Origin::Untracked` marker at an equal-valued sibling still
+        // (#3136): `null`/`true`/`false` are identical by value alone, so
+        // an `Origin::Untracked` marker at an equal-valued sibling still
         // certifies when its value is one of those three, where the
-        // node-identity rule above never can.
+        // node-identity rule above never can. [`marker_identical`] is
+        // shared with `resolves_to_register`'s identical arm so the two
+        // can't silently diverge.
         Expr::TrackedVar(marker) => {
-            if trackable
-                && marker.value == *value
-                && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, value))
-            {
+            if trackable && marker_identical(marker, value, frame) {
                 Ok(vec![PathBranch::new(
                     PathPrefix::root(),
                     Cow::Borrowed(value),
@@ -51746,7 +51743,9 @@ fn format_strftime(
                 Some('e') => result.push_str(&format!("{day:2}")),
                 Some('H') => result.push_str(&format!("{hour:02}")),
                 Some('I') => result.push_str(&format!("{hour12:02}")),
-                // Blank- (not zero-) padded hours (glibc/BSD `strftime`).
+                // Blank- (not zero-) padded hours. Confirmed live against
+                // the pinned oracle (#3055): `strftime("%k")`/`("%l")` on a
+                // single-digit hour are `" 1"`/`" 1"`, not `"01"`/`"01"`.
                 Some('k') => result.push_str(&format!("{hour:2}")),
                 Some('l') => result.push_str(&format!("{hour12:2}")),
                 Some('M') => result.push_str(&format!("{minute:02}")),
@@ -51771,7 +51770,13 @@ fn format_strftime(
                 // new specifier) it produces nothing at all, and that
                 // following character/specifier is processed normally on
                 // the *next* loop iteration -- `%E-`/`%O-` are the empty
-                // string, not `E-`/`O-`.
+                // string, not `E-`/`O-`. The allow-list below is a second,
+                // hand-maintained copy of "every letter this match
+                // recognizes" (review, #3055) -- a future specifier added
+                // above needs a matching decision made here too, or its
+                // own `%E<x>`/`%O<x>` silently falls to the unrecognized
+                // fallback instead of whatever pass-through the oracle
+                // might actually implement.
                 Some(letter @ ('E' | 'O')) => match chars.peek().copied() {
                     Some(next) if "YymdeHIMSuUVWwcCxXz".contains(next) => {
                         chars.next();
