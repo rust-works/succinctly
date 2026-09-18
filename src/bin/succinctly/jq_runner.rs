@@ -102,6 +102,16 @@ pub struct ModuleLoader {
     deps_of: BTreeMap<u32, Vec<u32>>,
     /// `run id -> loaded_modules key` for every module some other module
     /// depends on (#2955): the modules that get a link run of their own.
+    ///
+    /// Deliberately keyed the same way [`Self::loaded_modules`] itself is --
+    /// the literal path a `dependency_signatures` call was made with, not
+    /// [`Self::run_origins`]'s canonicalized one -- because
+    /// [`Self::link_dependency_runs`] uses this only to index straight into
+    /// `loaded_modules`. If the same module is reached via two literal
+    /// spellings that canonicalize to one id, the later spelling overwrites
+    /// the earlier here, but `loaded_modules` always has an entry for
+    /// whichever spelling wins (`dependency_signatures` inserts both from the
+    /// same call), so the lookup this feeds never misses.
     link_keys: BTreeMap<u32, String>,
 }
 
@@ -634,8 +644,12 @@ fn dep_stubs_for(
             Some(alias) => format!("{alias}::{dep_name}"),
             None => dep_name.clone(),
         };
-        let clashes = (dep_name == name && dep_params.len() == arity)
-            || (dep_params.is_empty() && param_names.contains(dep_name.as_str()));
+        // A qualified `alias::name` call can never collide with the
+        // consuming def's own bare (name, arity) or a bare parameter name --
+        // only an `include`d (unaliased) dependency's bare spelling can.
+        let clashes = alias.is_none()
+            && ((dep_name == name && dep_params.len() == arity)
+                || (dep_params.is_empty() && param_names.contains(dep_name.as_str())));
         if clashes || !called.contains(&stub_name) {
             continue;
         }
@@ -1044,7 +1058,14 @@ impl ModuleLoader {
     /// module that is also a top-level `include`/`import` is walked for its
     /// dependencies but not recorded for itself unless something depends on
     /// it: its top-level run already carries its defs.
-    fn hoist_order(&self, program: &Program) -> Vec<u32> {
+    ///
+    /// `top_ids` is each top-level `include`/non-data `import`'s
+    /// `(decl_index, run id)`, exactly as [`Self::process_program`] already
+    /// resolved them via [`Self::run_id_for`] while wrapping their runs --
+    /// passed in rather than re-derived from `Program`'s paths so this does
+    /// not repeat the same `resolve_module_in`/`canonicalize` filesystem
+    /// lookups a second time for every call.
+    fn hoist_order(&self, top_ids: &[(usize, u32)]) -> Vec<u32> {
         fn visit(
             loader: &ModuleLoader,
             id: u32,
@@ -1065,31 +1086,15 @@ impl ModuleLoader {
             }
         }
 
-        // Top-level directives, last declared first, exactly as their runs
-        // nest (`process_program` wraps the last-declared include innermost).
-        let mut top: Vec<(usize, &str)> = program
-            .includes
-            .iter()
-            .map(|i| (i.decl_index, i.path.as_str()))
-            .chain(
-                program
-                    .imports
-                    .iter()
-                    .filter(|i| !i.data)
-                    .map(|i| (i.decl_index, i.path.as_str())),
-            )
-            .collect();
+        // Last declared first, exactly as their runs nest (`process_program`
+        // wraps the last-declared include innermost).
+        let mut top: Vec<(usize, u32)> = top_ids.to_vec();
         top.sort_by_key(|(decl, _)| core::cmp::Reverse(*decl));
 
         let mut expanded = BTreeSet::new();
         let mut recorded = BTreeSet::new();
         let mut order = Vec::new();
-        for (_, path) in top {
-            // Already interned by the load that recorded its dependencies;
-            // an unresolvable path is not in `deps_of` and contributes nothing.
-            let Some(&id) = self.run_ids.get(&self.run_key(path)) else {
-                continue;
-            };
+        for (_, id) in top {
             visit(self, id, false, &mut expanded, &mut recorded, &mut order);
         }
         order
@@ -1182,6 +1187,11 @@ impl ModuleLoader {
         // order below is bit-for-bit what it was before this issue.
 
         let mut last_err: Option<(usize, ModuleLoadError)> = None;
+        // Every top-level `include`/non-data `import`'s (decl_index, run id),
+        // collected as each is resolved below so `link_dependency_runs` ->
+        // `hoist_order` can place them without re-resolving the same paths
+        // through the filesystem a second time.
+        let mut top_ids: Vec<(usize, u32)> = Vec::new();
 
         // #2682: each `expr = FuncDef { .., then: expr }` wraps the *previous*
         // `expr` one layer further in, so whichever source is processed
@@ -1217,6 +1227,7 @@ impl ModuleLoader {
             // first -- and reversing the two `include`s made it agree with
             // jq again, by accident.
             let id = self.run_id_for(&include.path);
+            top_ids.push((include.decl_index, id));
             expr = wrap_run(expr, defs, id, None);
         }
 
@@ -1264,6 +1275,7 @@ impl ModuleLoader {
             // of their bodies is retried as `alias::name` by the resolver,
             // and only within this run.
             let id = self.run_id_for(&import.path);
+            top_ids.push((import.decl_index, id));
             expr = wrap_run(expr, defs, id, Some(namespace));
         }
 
@@ -1271,7 +1283,7 @@ impl ModuleLoader {
             return Err(e);
         }
 
-        expr = self.link_dependency_runs(program, expr);
+        expr = self.link_dependency_runs(program, &top_ids, expr);
 
         // Transform NamespacedCall expressions to regular FuncCall expressions
         expr = rewrite_namespaced_calls(expr);
@@ -1318,8 +1330,13 @@ impl ModuleLoader {
     /// innermost-first rule among them is the module's own (`def c: 7; def
     /// c: 8; def g: c;` exports `g` as 8, and `def c: 7; def g: c; def c: 8;
     /// def k: [g, c];` as `[7, 8]`, both as jq answers).
-    fn link_dependency_runs(&self, program: &Program, mut expr: Expr) -> Expr {
-        let order = self.hoist_order(program);
+    fn link_dependency_runs(
+        &self,
+        program: &Program,
+        top_ids: &[(usize, u32)],
+        mut expr: Expr,
+    ) -> Expr {
+        let order = self.hoist_order(top_ids);
         if order.is_empty() {
             return expr;
         }
@@ -1335,6 +1352,14 @@ impl ModuleLoader {
         // same way, or a sibling reached only that way looks unreached and
         // what *it* depends on is never linked (a compile error naming the
         // missing link, in a program jq runs).
+        //
+        // This is the top-level twin of the per-linked-module fixed point
+        // below: same "grow `wanted`/`kept` until nothing new resolves"
+        // shape, over a different candidate list (`top`'s alias-qualified
+        // entries here, `defs`'s bare-named ones there) because a module can
+        // be imported under several different aliases at the top level but a
+        // hoisted link run is keyed by one globally unique id. A retry rule
+        // fixed in one almost certainly needs the same fix in the other.
         let mut wanted: BTreeSet<String> = called_func_names(&program.expr);
         let mut top: Vec<(String, &Expr, Option<&str>, bool)> = Vec::new();
         for include in &program.includes {
@@ -1388,8 +1413,18 @@ impl ModuleLoader {
                 continue;
             };
 
+            // Name -> index, built once so the fixed point below is O(log D)
+            // per sibling call rather than an O(D) scan of the whole module.
+            let name_index: BTreeMap<&str, usize> = defs
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _, _))| (name.as_str(), i))
+                .collect();
+
             // Seeds: this module's defs some stub already names. Then the
-            // fixed point over its own bare sibling calls.
+            // fixed point over its own bare sibling calls -- the per-module
+            // twin of the top-level closure above; see its comment for why
+            // the two are not one shared function.
             let mut kept_names: BTreeSet<&str> = defs
                 .iter()
                 .map(|(name, _, _)| name.as_str())
@@ -1406,12 +1441,8 @@ impl ModuleLoader {
                     for called in called_func_names(body) {
                         if jq::ModuleRun::is_link_name(&called) {
                             wanted.insert(called);
-                        } else if let Some(sibling) = defs
-                            .iter()
-                            .map(|(n, _, _)| n.as_str())
-                            .find(|n| *n == called)
-                        {
-                            grew |= kept_names.insert(sibling);
+                        } else if let Some(&sibling_i) = name_index.get(called.as_str()) {
+                            grew |= kept_names.insert(defs[sibling_i].0.as_str());
                         }
                     }
                 }
@@ -2502,6 +2533,11 @@ fn report_unresolved_call(
     occurrence_index: usize,
     resume_from: &mut usize,
 ) {
+    // #2955: a link-run pruning gap could in principle leave a stub's target
+    // unresolved, surfacing its internal `\0link:<id>::name` spelling here.
+    // `display_name` is a no-op for every ordinary name, so this costs
+    // nothing on the common path.
+    let name = jq::ModuleRun::display_name(name);
     // #2635: `occurrence_index` (from `resolve::UnresolvedCall`, computed
     // while walking the same tree in the same source order) counts *every*
     // earlier call to this `(name, arity)` pair, resolved or not -- not
@@ -2771,6 +2807,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                             );
                         }
                         None => {
+                            let name = jq::ModuleRun::display_name(name);
                             eprintln!("jq: error: {name}/{arity} is not defined at {at}");
                         }
                     }

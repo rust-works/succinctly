@@ -27760,6 +27760,39 @@ fn test_dependencies_are_bound_in_their_own_scope_2962() -> Result<()> {
             "",
             0,
         ),
+        // R34-R36: an `import ... as ns;` dependency's bare name can equal
+        // the consuming def's own name, a param name, or the consuming def's
+        // own recursive call -- none of which can ever clash with the actual
+        // call spelling `ns::name`, since a qualified name can never equal a
+        // bare one. `dep_stubs_for`'s clash test used to compare the
+        // dependency's *bare* name against the consumer's own (name, arity)
+        // and params regardless of whether the dependency was aliased,
+        // wrongly dropping the stub and turning a working call into a
+        // spurious compile error. Live-verified against jq 1.7.1.
+        (
+            "R34",
+            &[("m34", "import \"dep34\" as ns; def g: ns::g;\n"), ("dep34", "def g: 99;\n")],
+            "include \"m34\"; g",
+            "99\n",
+            "",
+            0,
+        ),
+        (
+            "R35",
+            &[("m35", "import \"dep35\" as ns; def h(g): ns::g;\n"), ("dep35", "def g: 99;\n")],
+            "include \"m35\"; h(1)",
+            "99\n",
+            "",
+            0,
+        ),
+        (
+            "R36",
+            &[("m36", "import \"dep36\" as ns; def rec: if . == 0 then ns::rec else (. - 1 | rec) end;\n"), ("dep36", "def rec: 99;\n")],
+            "include \"m36\"; 1 | rec",
+            "99\n",
+            "",
+            0,
+        ),
     ];
 
     for (id, modules, filter, want_stdout, want_stderr, want_code) in rows {
