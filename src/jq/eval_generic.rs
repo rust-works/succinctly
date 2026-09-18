@@ -17321,15 +17321,39 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             then_branch,
             else_branch,
         } => {
+            // #2916: `cond`'s generator is pulled lazily through
+            // `path_context_component_each` (#2259's own primitive), one
+            // condition value at a time, so a branch failure stops the
+            // generator before a later condition's side effects fire --
+            // matching real jq's `cond as $c | if $c then ... else ... end`
+            // desugaring. This used to drain the whole generator up front
+            // via the eager `path_context_component_values`.
+            //
+            // `was_read_only`: see `path_context_step_computed_index`'s own
+            // doc comment for the mechanism and its live repro -- the same
+            // defensive re-entry applies here for the identical reason
+            // (`path_context_component_each`'s demand-driven producer
+            // suspends yq's read-only-operand scope around every value it
+            // hands to *this* sink, but the branch this sink steps is the
+            // `if`'s own remaining work, not a downstream consumer of
+            // `cond`'s output).
+            let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let (conds, control) = path_context_component_values::<S, V>(cond, pos);
-            for c in conds {
+            let mut walk_error: Option<Control> = None;
+            let control = path_context_component_each::<S, V>(cond, pos, &mut |c| {
+                let _scope = was_read_only.then(yq_read_only_context::enter);
                 let branch = if c.is_truthy() {
                     then_branch
                 } else {
                     else_branch
                 };
-                path_context_step_generic::<S, V>(branch, pos, out)?;
+                match path_context_step_generic::<S, V>(branch, pos, out) {
+                    Ok(()) => Demand::Continue,
+                    Err(control) => stop_with_escape(&mut walk_error, control),
+                }
+            });
+            if let Some(control) = walk_error {
+                return Err(control);
             }
             control.map_or(Ok(()), |c| {
                 Err(path_context_component_escape::<S, V>(out, produced_from, c))
@@ -17365,15 +17389,31 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Shared(inner) => path_context_step_generic::<S, V>(inner, pos, out),
         Expr::FirstExpr(inner) => path_context_step_bounded::<S, V>(inner, Some(1), pos, out),
         Expr::Limit { n, expr } => {
+            // #2916: `n`'s generator is pulled lazily (same reasoning as
+            // `Expr::If`'s arm just above), so a later count value's own
+            // side effects never fire once an earlier one has already
+            // raised, matching real jq's `n as $n | limit($n; expr)`
+            // desugaring. This used to drain the whole generator up front.
+            //
+            // `was_read_only`: see `path_context_step_computed_index`'s own
+            // doc comment -- same defensive re-entry, same reason.
+            let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let (counts, control) = path_context_component_values::<S, V>(n, pos);
-            for n_value in counts {
+            let mut walk_error: Option<Control> = None;
+            let control = path_context_component_each::<S, V>(n, pos, &mut |n_value| {
+                let _scope = was_read_only.then(yq_read_only_context::enter);
                 let take = match classify_limit_n(n_value) {
                     Ok(LimitN::Unlimited) => None,
                     Ok(LimitN::Take(n)) => Some(n),
-                    Err(e) => return Err(Control::Error(e)),
+                    Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
                 };
-                path_context_step_bounded::<S, V>(expr, take, pos, out)?;
+                match path_context_step_bounded::<S, V>(expr, take, pos, out) {
+                    Ok(()) => Demand::Continue,
+                    Err(control) => stop_with_escape(&mut walk_error, control),
+                }
+            });
+            if let Some(control) = walk_error {
+                return Err(control);
             }
             control.map_or(Ok(()), |c| {
                 Err(path_context_component_escape::<S, V>(out, produced_from, c))
@@ -17385,6 +17425,13 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // are dropped, once per count value, with the count's own escape
         // reported after the positions already produced exactly as `limit`
         // reports its count's.
+        //
+        // `n`'s generator is still the eager `path_context_component_values`
+        // here, unlike `Expr::Limit`'s own arm above -- the same
+        // eager-drain-vs-side-effect-ordering gap #2916 fixed for
+        // `Expr::If`/`Expr::Limit`, but this arm postdates that issue (added
+        // by #2968) so it was never in scope there either. Tracked
+        // separately (follow-up filed alongside #2916).
         Expr::Builtin(Builtin::Skip(n, expr)) => {
             let produced_from = out.len();
             let (counts, control) = path_context_component_values::<S, V>(n, pos);
@@ -17524,6 +17571,26 @@ fn path_context_push_owned_children<V: DocumentValue>(
 /// the same shape in the owned domain. Each `(s, t)` pair is applied to each
 /// target position as a literal slice of its materialized value, so the
 /// mode's slice rule has one definition ([`owned_nav_children`]).
+/// [`path_context_component_each`] for a slice bound that may be absent
+/// (`.a[:3]`'s missing start, `.a[1:]`'s missing end): a live bound
+/// delegates to it directly, and a missing one is the constant `null`
+/// bound real jq substitutes, pulled through `sink` exactly like any other
+/// single-value generator -- there is only ever one value to pull, so
+/// `sink`'s own `Demand::Stop` has nothing left to stop.
+fn path_context_component_each_bound<S: EvalSemantics, V: DocumentValue>(
+    expr: Option<&Expr>,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Control> {
+    match expr {
+        Some(e) => path_context_component_each::<S, V>(e, pos, sink),
+        None => {
+            sink(OwnedValue::Null);
+            None
+        }
+    }
+}
+
 fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     start: Option<&Expr>,
@@ -17532,19 +17599,29 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
-    let bound = |e: Option<&Expr>| -> (Vec<OwnedValue>, Option<Control>) {
-        match e {
-            Some(e) => path_context_component_values::<S, V>(e, pos),
-            None => (vec![OwnedValue::Null], None),
-        }
-    };
     let produced_from = out.len();
-    let (starts, starts_control) = bound(start);
-    let (ends, ends_control) = bound(end);
     let mut targets = Vec::new();
     let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
-    for s in &starts {
-        for e in &ends {
+    // #2916: both bound streams are pulled lazily through
+    // `path_context_component_each_bound` -- confirmed live against jq
+    // 1.7.1 that the end bound is re-evaluated fresh *per start value*
+    // (`.a[(0,1):(debug("end")|3)]` prints the debug line twice), matching
+    // `S as $s | T as $t | E | .[$s:$t]`'s nesting exactly: `T` is pulled
+    // inside the sink for each `S` value, not once up front. This used to
+    // drain both generators up front via the eager `path_context_component_
+    // values`/a local `bound` closure, so a start value's side effects fired
+    // even when an earlier one, or the target itself, had already failed.
+    //
+    // `was_read_only`: see `path_context_step_computed_index`'s own doc
+    // comment -- same defensive re-entry, same reason, applied at both
+    // nesting levels since either sink's own navigation-sensitive work
+    // (`owned_identity_values`) needs it restored, not just the outermost.
+    let was_read_only = yq_read_only_context::active();
+    let mut walk_error: Option<Control> = None;
+    let starts_control = path_context_component_each_bound::<S, V>(start, pos, &mut |s| {
+        let _scope = was_read_only.then(yq_read_only_context::enter);
+        let ends_control = path_context_component_each_bound::<S, V>(end, pos, &mut |e| {
+            let _scope = was_read_only.then(yq_read_only_context::enter);
             let slice = Expr::SliceExpr {
                 target: Box::new(Expr::Identity),
                 start: Some(Box::new(Expr::tracked_value(s.clone()))),
@@ -17559,7 +17636,10 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
                 .then(|| literal_component_from_values(s.clone(), e.clone()));
             for tpos in &targets {
                 let value: Rc<OwnedValue> = match &tpos.node {
-                    PathNode::At(c) => Rc::new(to_owned_cursor::<S, _>(c).map_err(Control::Error)?),
+                    PathNode::At(c) => match to_owned_cursor::<S, _>(c) {
+                        Ok(v) => Rc::new(v),
+                        Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
+                    },
                     PathNode::Absent => Rc::new(OwnedValue::Null),
                     PathNode::Owned(v) => Rc::clone(v),
                 };
@@ -17571,19 +17651,26 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
                     out,
                 );
                 if let Some(control) = control {
-                    return Err(control);
+                    return stop_with_escape(&mut walk_error, control);
                 }
             }
-        }
+            Demand::Continue
+        });
         // An escape in the end stream is raised once per start, after the
-        // slices that start produced (`S` outer, `T` middle, jq's own order).
-        if let Some(control) = &ends_control {
-            return Err(path_context_component_escape::<S, V>(
-                out,
-                produced_from,
-                control.clone(),
-            ));
+        // slices that start produced (`S` outer, `T` middle, jq's own
+        // order) -- a walk/target failure inside the `T` sink already took
+        // priority and stopped everything, so only surface `ends_control`
+        // when nothing else already has.
+        if walk_error.is_some() {
+            return Demand::Stop;
         }
+        match ends_control {
+            Some(control) => stop_with_escape(&mut walk_error, control),
+            None => Demand::Continue,
+        }
+    });
+    if let Some(control) = walk_error {
+        return Err(control);
     }
     if let Some(control) = starts_control {
         return Err(path_context_component_escape::<S, V>(
@@ -17935,13 +18022,15 @@ fn path_context_getpath_walk_one<S: EvalSemantics, V: DocumentValue>(
 /// This fix closes the specific gap #2259 reported (a walk failure not
 /// stopping a *reachable* later output), not that broader, shared ceiling.
 ///
-/// Three sibling call sites of [`path_context_component_values`] have the
-/// identical eager-drain-vs-side-effect-ordering bug and are not converted
-/// here: `path_context_step_computed_index`'s key stream,
+/// Four sibling call sites of [`path_context_component_values`] had the
+/// identical eager-drain-vs-side-effect-ordering bug and were not converted
+/// here, deliberately -- this fix is scoped to the one call site #2259
+/// actually reported: `path_context_step_computed_index`'s key stream,
 /// `path_context_step_computed_slice`'s bounds, and the `Expr::If`/
-/// `Expr::Limit` arms of `path_context_step_generic`. Tracked as #2916
-/// rather than folded into this fix, which is scoped to the one call site
-/// #2259 actually reported.
+/// `Expr::Limit` arms of `path_context_step_generic`. Fixed separately in
+/// #2916 rather than folded into this one. `Expr::Builtin(Builtin::Skip)`'s
+/// count arm has the same shape too (added by #2968, after #2916 was
+/// filed) and remains unconverted -- see that arm's own call site.
 ///
 /// A walk failure is reported directly (bypassing
 /// [`path_context_component_escape`], which only ranks the *generator's
@@ -18177,19 +18266,52 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
     let produced_from = out.len();
-    let (components, components_control) = path_context_component_values::<S, V>(key, pos);
     let mut targets = Vec::new();
     let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
-    for component in &components {
+    // #2916: `key`'s generator is pulled lazily through
+    // `path_context_component_each` (#2259's own primitive), one key at a
+    // time, so a navigation failure on an earlier key stops the generator
+    // before a later key's own side effects fire -- matching real jq's `K
+    // as $k | E | .[$k]` desugaring. This used to drain the whole key
+    // generator up front via the eager `path_context_component_values`.
+    //
+    // `was_read_only` (#2470/#2916 interaction): captured *before* the pull,
+    // and re-entered inside the sink around the navigation itself. yq's
+    // read-only-operand scope (`(.zzz | key) + 1` reading the miss as
+    // "nothing" rather than `null`) is ambient, ridden on a thread-local,
+    // not a parameter -- and `read_only_operand_strategy_generic`'s own
+    // sink-suspension rule (`yq_read_only_context::suspend`, entered around
+    // every demand-driven producer's `sink.push`) fires here too, because
+    // `key`'s own generic evaluation is exactly such a producer: the
+    // moment `key` yields a value, whatever consumes it runs "on the stack
+    // inside the producing call" under a *suspended* scope, on the theory
+    // that a consumer is downstream of the operand and must not inherit it.
+    // That theory holds for `path_context_component_values`'s own sink
+    // (an inert `Vec::push`, run *after* the whole key generator has
+    // finished and its own suspend/restore cycle is long over) but not for
+    // this one: the navigation this sink performs *is* the operand's own
+    // remaining work, not a downstream consumer of `key`'s output, so it
+    // must run under whatever read-only state was ambient before `key` was
+    // ever pulled -- confirmed live: without restoring it here,
+    // `(.a[("z"+"z")] | key) + "!"` on `{"a":{"b":1}}` answered `"zz!"`
+    // instead of yq's own `"!"` (`.a` has no `"zz"` key, and the miss must
+    // read as nothing, not as a real `"zz"` position, inside this operand).
+    let was_read_only = yq_read_only_context::active();
+    let mut walk_error: Option<Control> = None;
+    let components_control = path_context_component_each::<S, V>(key, pos, &mut |component| {
+        let _scope = was_read_only.then(yq_read_only_context::enter);
         for tpos in &targets {
-            match path_component_step_expr(component) {
+            match path_component_step_expr(&component) {
                 Some(step) => {
                     let step = if bracket_optional {
                         Expr::Optional(Box::new(step))
                     } else {
                         step
                     };
-                    path_context_step_generic::<S, V>(&step, tpos, out)?;
+                    match path_context_step_generic::<S, V>(&step, tpos, out) {
+                        Ok(()) => {}
+                        Err(control) => return stop_with_escape(&mut walk_error, control),
+                    }
                 }
                 // A component no navigation can take (`null`, a boolean, a
                 // container): the same error the value route raises, from
@@ -18198,13 +18320,18 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
                 // is empty, `.c[null] | key` raises.
                 None if bracket_optional => {}
                 None => {
-                    return Err(Control::Error(EvalError::cannot_index(
+                    let err = Control::Error(EvalError::cannot_index(
                         path_node_type_name::<V>(&tpos.node),
-                        component,
-                    )))
+                        &component,
+                    ));
+                    return stop_with_escape(&mut walk_error, err);
                 }
             }
         }
+        Demand::Continue
+    });
+    if let Some(control) = walk_error {
+        return Err(control);
     }
     // The key stream's own escape (a `halt` after some keys, #1897) is
     // reported after every position the keys before it reached -- jq's
