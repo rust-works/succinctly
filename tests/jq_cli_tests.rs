@@ -30959,11 +30959,28 @@ fn test_identity_writer_streams_or_materializes_by_gate_2720() -> Result<()> {
         (r#"{"a":1,"b"}"#, &["."][..]),
         ("{a:1}", &["."][..]),
         (r#"{"b":1,"a":2,"b":3,}"#, &["."][..]),
+        // A `,` where the value should be (#2720 review): the key-only
+        // walk's forward scan used to stop at the `,` with its `:` already
+        // found and read this as well-formed, where the materializing walk's
+        // backward scan refused it -- so the streaming branch printed
+        // `{"a": 1}` at exit 0, and `length` had answered `1` for years.
+        (r#"{"a":,1}"#, &["."][..]),
+        (r#"{"a":,1}"#, &["-c", "."][..]),
+        (r#"{"a":,1}"#, &["--preserve-input", "."][..]),
+        (r#"{"a" :,1}"#, &["."][..]),
+        (r#"{"a":1,"b":,2}"#, &["."][..]),
+        (r#"{"a":1,"a":,2}"#, &["."][..]),
+        (r#"{"a":,{"x":1}}"#, &["."][..]),
+        (r#"{"a":1,"b":,2}"#, &["length"][..]),
     ] {
         let (stdout, stderr, code) = run_jq_full(args, Some(input))?;
         assert_eq!(code, 5, "{input} {args:?}: stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "{input} {args:?} wrote {stdout:?}");
     }
+    // The streaming `keys_unsorted` writer refuses through the same scan,
+    // after the prefix it had already emitted (its own pre-existing model).
+    let (_, stderr, code) = run_jq_full(&["keys_unsorted"], Some(r#"{"a":,1}"#))?;
+    assert_eq!(code, 5, "stderr={stderr}");
     let (stdout, _, code) = run_jq_full(&["."], Some(r#"{"a":{"b":1,}}"#))?;
     assert_eq!(code, 5);
     assert_eq!(stdout, "{\n  \"a\": ");
