@@ -332,6 +332,8 @@ identity-bind-rebuilt-copy-trap	{"a":{"b":2}}	path(. as $x | .a | ($x | tojson |
 identity-bind-alternative-null-register	{"a":null}	path(.a | (. // {"c":{"b":1}}) as $x | .c | $x | getpath(["c"]) | .b)
 identity-bind-try-catch-body-trap	{"a":{"b":{"c":1}},"b":{"c":1}}	path(. as $p | .a | (try (if error("x") then . else . end) catch $p) as $x | .b | $x | getpath(["b"]) | .c)
 identity-bind-try-catch-body-trap-del	{"a":{"b":{"c":1}},"b":{"c":1}}	del(. as $p | .a | (try (if error("x") then . else . end) catch $p) as $x | .b | $x | getpath(["b"]) | .c)
+identity-bind-alternative-empty-left-trap	{"a":{"b":{"c":1}},"b":{"c":1}}	path(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)
+identity-bind-alternative-empty-left-trap-del	{"a":{"b":{"c":1}},"b":{"c":1}}	del(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)
 identity-bind-if-arms-disagree	{"a":{"b":2}}	path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)
 identity-bind-marker-headed-source-off-position	{"a":{"b":1},"c":{"b":1}}	path(. as $x | .a | ($x.a as $w | $w | .b))
 CASES_EOF

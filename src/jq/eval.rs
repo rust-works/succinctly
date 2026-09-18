@@ -40381,21 +40381,24 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
 ///   provable *and equal* -- which arm ran is not known here, so a
 ///   disagreement (`(if true then $p else . end)` with `$p` at `[]` and `.`
 ///   at `["a"]`) mints nothing.
-/// - `try A catch B`: `A`'s, but only when `A` **provably cannot raise**
-///   (`.`, a marker, or a `try` of one -- [`never_raises`]). The wider
-///   grammar does not guarantee that: an `if`'s *condition* is
+/// - `try A catch B`: `A`'s, but only when `A` **provably yields `.` exactly
+///   once** (`.`, a marker, or a `try` of one -- [`yields_exactly_once`]).
+///   The wider grammar does not guarantee that: an `if`'s *condition* is
 ///   unconstrained, so `try (if error("x") then . else . end) catch $p`
 ///   binds `B`'s value -- `$p`, frozen at some other position -- and
 ///   tagging it with `.`'s position composed `["a","b","c"]` where jq
-///   refuses, and `del()` wrote through it (found in review). A `//` whose
-///   right side raises is not the same leak: it only runs on a `null`/
-///   `false` register, where the next bullet's argument applies.
-/// - `A // B`: `A`'s. `B` runs only when `A`'s node is `null`/`false`. Every
+///   refuses, and `del()` wrote through it (found in review).
+/// - `A // B`: `A`'s, under the same restriction on `A`. With `A` always
+///   yielding `.` once, `B` runs only when `.` is `null`/`false`: every
 ///   position below a `null` holds `null`, which [`null_bool_identical`]
 ///   admits by value regardless of position, and nothing below a `false` is
 ///   reachable at all (navigating it raises) -- so a `B`-derived value can
 ///   never meet a register it is not value-identical to, and `A`'s position
-///   is sound for the pair.
+///   is sound for the pair. Without the restriction the *empty* direction
+///   leaks the same way `try` did: `(if empty then . else . end) // $p`
+///   yields nothing from `A`, so `B` runs on a live register (found in
+///   review). `//` does not suppress a raise from `A` (`error("x") // 1`
+///   raises in jq 1.7.1), so only the empty direction needed closing.
 ///
 /// jq mode only, mirroring [`getpath_result_position`]'s single mint site:
 /// the yq positional readers are unreachable anyway, but a `SnapshotAt`
@@ -40424,31 +40427,35 @@ fn identity_bind_position<S: EvalSemantics>(
                 let else_at = walk(else_branch, trackable, frame)?;
                 (then_at == else_at).then_some(then_at)
             }
-            Expr::Try { expr, .. } => {
-                if never_raises(expr) {
-                    walk(expr, trackable, frame)
+            // `try`'s handler and `//`'s right side are both reachable only
+            // when the left side fails to yield `.` -- by raising, or by
+            // yielding nothing -- so both take the same gate.
+            Expr::Try { expr: inner, .. } | Expr::Alternative(inner, _) => {
+                if yields_exactly_once(inner) {
+                    walk(inner, trackable, frame)
                 } else {
                     None
                 }
             }
-            Expr::Alternative(left, _) => walk(left, trackable, frame),
             _ => None,
         }
     }
     walk(source, trackable, frame)
 }
 
-/// Whether an identity-passthrough source can be proven never to raise, so
-/// a `try` around it never runs its `catch` body ([`identity_bind_position`],
-/// #2978 review): `.`, a marker, or a `try` of one (whose handler is then
-/// unreachable, whatever it is). Deliberately narrower than
-/// [`is_identity_passthrough`]'s grammar -- an `if` condition or a `//`
-/// right side may raise -- and declining here only costs a position, never
-/// an acceptance the value rule already grants.
-fn never_raises(source: &Expr) -> bool {
+/// Whether an identity-passthrough source provably yields `.` exactly once
+/// -- never raising, never producing zero outputs -- so a `try` around it
+/// never runs its handler and a `//` after it never runs its right side
+/// ([`identity_bind_position`], #2978 review): `.`, a marker, or a `try` of
+/// one (whose handler is then unreachable, whatever it is). Deliberately
+/// narrower than [`is_identity_passthrough`]'s grammar -- an `if` condition
+/// may raise (`if error("x") then . else . end`) or yield nothing (`if empty
+/// then . else . end`) -- and declining here only costs a position, never an
+/// acceptance the value rule already grants.
+fn yields_exactly_once(source: &Expr) -> bool {
     match unwrap_paren(source) {
         Expr::Identity | Expr::TrackedVar(_) => true,
-        Expr::Try { expr, .. } => never_raises(expr),
+        Expr::Try { expr, .. } => yields_exactly_once(expr),
         _ => false,
     }
 }
@@ -95293,7 +95300,10 @@ mod tests {
     /// - `try (if error("x") then . else . end) catch $p`: the source
     ///   raises before its passthrough arm yields, so the bound value is
     ///   the *catch* body's (`$p`, frozen elsewhere), and `.`'s position
-    ///   would be a lie about it. `never_raises` gates the `try` arm.
+    ///   would be a lie about it. `yields_exactly_once` gates the `try` arm.
+    /// - `(if empty then . else . end) // $p`: the same leak through `//`'s
+    ///   *empty* direction -- the left side yields nothing, so the right
+    ///   side runs on a live register. The same gate closes it.
     #[test]
     fn test_identity_bind_position_negative_controls_2978() {
         for (doc, filter, expected) in [
@@ -95348,6 +95358,19 @@ mod tests {
             (
                 &br#"{"a":{"b":{"c":1}},"b":{"c":1}}"#[..],
                 r#"del(. as $p | .a | (try (if error("x") then . else . end) catch $p) as $x | .b | $x | getpath(["b"]) | .c)"#,
+                r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
+            ),
+            // The `//` twin, in the *empty* direction: the left side yields
+            // nothing, so the right side runs on a live register (review
+            // finding). Read and write.
+            (
+                &br#"{"a":{"b":{"c":1}},"b":{"c":1}}"#[..],
+                r#"path(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)"#,
+                r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
+            ),
+            (
+                &br#"{"a":{"b":{"c":1}},"b":{"c":1}}"#[..],
+                r#"del(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)"#,
                 r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
             ),
         ] {

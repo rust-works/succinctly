@@ -183,6 +183,9 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         # passthrough arm yields binds the catch body, not `.`.
         "(.a | (try (if error(\"x\") then . else . end) catch $v) as $w | .b? | $w | getpath([\"b\"]) | .c?)",
         "((try (if error(\"x\") then . else . end) catch $v) as $w | $w | getpath([\"a\"]) | .b?)",
+        # ... and the `//` twin in the empty direction.
+        "(.a | ((if empty then . else . end) // $v) as $w | .b? | $w | getpath([\"b\"]) | .c?)",
+        "(((if empty then . else . end) // $v) as $w | $w | getpath([\"a\"]) | .b?)",
         "(($v // 1) as $w | .a | $w | getpath([\"a\"]) | .b?)"]
 
 # #2978: an optional navigation *before* the first bind, so `. as $v` (and
