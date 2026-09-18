@@ -46706,14 +46706,24 @@ fn run_module_rows(rows: &[ModuleRow], extra: &[&str]) -> Result<()> {
 
 /// #2955: compile errors across a module chain come out in jq 1.7.1's order
 /// -- a dependency's before its includer's, the last-declared dependency's
-/// first, and a chain's deepest module first. All three shapes captured
-/// whole from the pinned binary.
+/// first, and a chain's deepest module first. All shapes captured whole from
+/// the pinned binary.
 ///
 /// That order is not chosen by the resolver: it is the order the linked
 /// runs are wrapped in (`ModuleLoader::hoist_order`), outermost first, and
 /// `resolve::check` walks the chain from the outside in. The copying loader
 /// printed the includer's own error first, then its dependencies in
 /// declaration order (`A G K` for the first row, against jq's `K G A`).
+///
+/// The last row pins a regression `hoist_order` reintroduced: `deps_of` is
+/// recorded by `module_dep_defs` as all of a module's `include`s then all of
+/// its `import`s (see that function's own doc comment for why), which is
+/// not source order when the two are interleaved. Sorting only `top_ids`
+/// (the top-level directives) by `decl_index` and trusting `deps_of`'s
+/// insertion order for nested dependencies reported `adep2955` before
+/// `bdep2955` -- reversed from jq, which reports the last-declared
+/// dependency inside `mid2955` (`bdep2955`) first. `hoist_order` now sorts
+/// `deps_of` entries by their own recorded `decl_index` the same way.
 #[test]
 fn test_dependency_errors_report_in_jq_order_2955() -> Result<()> {
     let rows: &[ModuleRow] = &[
@@ -46746,6 +46756,19 @@ fn test_dependency_errors_report_in_jq_order_2955() -> Result<()> {
             ],
             r#"include "l2"; x"#,
             "jq: error: nosuchZ/0 is not defined at <DIR>/l0.jq, line 1:\ndef z: nosuchZ;       \njq: error: nosuchY/0 is not defined at <DIR>/l1.jq, line 1:\ninclude \"l0\"; def y: [z, nosuchY];                         \njq: error: nosuchX/0 is not defined at <DIR>/l2.jq, line 1:\ninclude \"l1\"; def x: [y, nosuchX];                         \njq: 3 compile errors\n",
+        ),
+        (
+            "a dependency module mixing include and import, last-declared first",
+            &[
+                ("adep2955", "def afn: nosuchA;\n"),
+                ("bdep2955", "def bfn: nosuchB;\n"),
+                (
+                    "mid2955",
+                    "import \"adep2955\" as a; include \"bdep2955\"; def use: a::afn + bfn;\n",
+                ),
+            ],
+            r#"include "mid2955"; use"#,
+            "jq: error: nosuchB/0 is not defined at <DIR>/bdep2955.jq, line 1:\ndef bfn: nosuchB;         \njq: error: nosuchA/0 is not defined at <DIR>/adep2955.jq, line 1:\ndef afn: nosuchA;         \njq: 2 compile errors\n",
         ),
     ];
     run_module_rows(rows, &[])
