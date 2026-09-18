@@ -3622,44 +3622,19 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             // (missing/doubled `,`/`:`) gaps this writer used to have.
             let mut items = effective_fields_checked(&fields, numbers == JsonConvention::JqCompat)
                 .map_err(StreamFailure::Decode)?;
-            // #1676: a trailing `,` (`{"a":1,}`) -- `effective_fields_checked`
-            // (and its own `ends_unpaired` check) only catches an *unpaired*
-            // trailing key (`{"a":1,"b"}`), not a dangling comma after a
-            // complete pair, since `uncons` simply stops at the last real
-            // field either way.
-            //
-            // Deliberately re-walks `fields` (unchecked -- delimiters are
-            // already known good from `effective_fields_checked` above) for
-            // the *true* last field in raw source/cursor order, rather than
-            // using `items.last()`: when `collapse` is true, `items` is
-            // `effective_fields_checked`'s already-collapsed, first-
-            // position-ordered result, whose own last entry can be a
-            // *earlier* duplicate key's position in the source text --
-            // `{"b":1,"a":2,"b":3}` collapses to `[b, a]` for `items`, but
-            // `a`'s value in the source is followed by `,"b":3}`, not `}`,
-            // so checking `items.last()` there would misfire on a
-            // perfectly well-formed document. The raw last field is always
-            // the right one to check regardless of collapsing, since a
-            // trailing comma is a property of the source text's own tail,
-            // not of whichever field ends up last in the display order.
-            let mut last_raw_field = None;
-            let mut raw_walk = fields;
-            while let Some((field, rest)) = raw_walk.uncons() {
-                last_raw_field = Some(field);
-                raw_walk = rest;
-            }
-            if let Some(last) = last_raw_field {
-                let last_value_cursor = last.value_cursor();
-                if let Some(pos) = last_value_cursor.text_position() {
-                    if let Some(end) = scalar_end_pos(pos, &last.value()) {
-                        if !trailing_gap_ok(last_value_cursor.text(), end, b'}') {
-                            return Err(StreamFailure::Decode(EvalError::malformed_json_text(
-                                last_value_cursor.text(),
-                            )));
-                        }
-                    }
-                }
-            }
+            // #1676's trailing-`,` check (`{"a":1,}`) used to be a third walk
+            // over `fields` here, for the *raw* last field (never
+            // `items.last()`: collapsing keeps first positions, so
+            // `{"b":1,"a":2,"b":3}` collapses to `[b, a]` while the source
+            // ends `,"b":3}`). `effective_fields_checked` has run exactly
+            // that check on its own raw walk's last value cursor since
+            // #2261 (`trailing_element_gap_ok(&last, b'}')` is the same
+            // predicate: container -> skip, else `scalar_text_end` then
+            // `trailing_gap_ok`), so the walk was a duplicate -- half a
+            // percent of the identity print on a wide object, retired by
+            // #2720. `test_jq_trailing_leading_comma_now_rejected_1676`
+            // (`tests/jq_cli_tests.rs`) still pins the refusal through the
+            // one remaining definition.
             out.write_char('{')?;
             let next_indent = current_indent + indent_spaces;
             let mut first = true;
