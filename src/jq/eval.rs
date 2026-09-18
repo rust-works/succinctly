@@ -6251,140 +6251,108 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let last_idx = patterns.len() - 1;
     // #1366: a genuine `?//`-chain (2+ patterns) inverts real jq's
     // duplicate-binding dedup rule relative to a bare pattern -- see
-    // `extract_pattern_bindings`'s own doc comment.
+    // `dedup_pattern_match`'s own doc comment.
     let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        // #2677: a computed key's own generator can yield more than one
-        // binding-set (`{("a","b"):$q}` fans out one full run of `body` per
-        // key it yields, jq's own nested-fork compilation of
-        // `gen_object_matcher`) -- every binding-set here runs `body` in
-        // turn, *not* a try-until-one-succeeds loop like the alternatives
-        // loop itself; only once every binding-set's own body has run does
-        // this alternative's own trailing `control` (the key generator's
-        // own error/break/halt, or a structural mismatch) get the *same*
-        // is_last/continue retry treatment the pre-#2677 single-binding-set
-        // shape already gave a match failure. A body failure partway
-        // through the fan-out abandons the *remaining* binding-sets of
-        // this same alternative (jq's single-threaded generator model) and
-        // retries the next `?//` alternative from there -- confirmed live:
+        // #2872: `body` runs once per binding set as the matcher completes
+        // it (`each_pattern_binding_set`), so a computed key's second
+        // output is only ever produced once the first's body has run to
+        // completion -- jq's own nested-fork compilation. A body failure
+        // partway through stops the walk (jq's single-threaded generator
+        // model: the remaining key outputs are never produced) and retries
+        // the next `?//` alternative from there -- confirmed live:
         // `[. as {("a","b"):$q} ?// $z | if $q==2 then error("boom") else
         // $q end]` on `{"a":1,"b":2}` is `[1,null]` (the first output
-        // survives, "b"'s own binding-set is never tried, and the retried
-        // `$z` alternative's own `$q` is unbound -> null).
-        let (binding_sets, key_control) =
-            extract_pattern_bindings::<S>(pattern, bound_val, invert_dedup);
-
-        let mut retry_next_alternative = false;
-        for bindings in &binding_sets {
-            let null_value = OwnedValue::Null;
-            let substituted_body = substitute_vars(
-                body,
-                as_var_refs(bindings).chain(
-                    all_var_names
-                        .iter()
-                        .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                        .map(|name| (name.as_str(), &null_value)),
-                ),
-            );
-
-            // #2180 WP3 review: cleared per attempt, so what the retry
-            // decision below reads is exactly "did this attempt's own
-            // evaluation end in a `Halt`/decode failure a driver had to
-            // stash out-of-band" -- see [`nonretryable_stop`].
-            clear_nonretryable_stop();
-            match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
-                Flow::Exhausted => {}
-                // #1519: a satisfied consumer is jq's escaping `break`, so
-                // it retries the next alternative just like `Control::Break`
-                // below. `pending` is dropped on the retry rather than
-                // carried: it is only ever `Some` when an eager fallback had
-                // already raised a trailing control before the stop, and
-                // real jq -- which would never have evaluated that far --
-                // ignores it, the same reasoning `builtin_isempty` records
-                // at its own `Flow::Stopped` arm.
-                Flow::Stopped { pending } => {
-                    if is_retryable_stop(is_last) {
-                        retry_next_alternative = true;
-                        break;
-                    }
-                    return Flow::Stopped { pending };
-                }
-                // #1620/#1660: same uncatchable exclusion as
-                // `try_pattern_alternatives` -- always propagates, `is_last`
-                // or not. #2132 widened it from `is_decode_failure()` to the
-                // shared value-position predicate: a resource cap raised
-                // inside a `?//` body was read as "this alternative failed,
-                // try the next", and the truncated body passed as the next
-                // alternative's clean answer.
-                Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-                    return Flow::Escaped(Control::Error(e));
-                }
-                // #1457: `Break` falls through like `Error`, not immediately
-                // like `Halt` -- same live-verified correction
-                // `try_pattern_alternatives` itself documents.
-                Flow::Escaped(Control::Error(e)) => {
-                    if is_last {
-                        return Flow::Escaped(Control::Error(e));
-                    }
-                    retry_next_alternative = true;
-                    break;
-                }
-                Flow::Escaped(Control::Break(label)) => {
-                    if is_last {
-                        return Flow::Escaped(Control::Break(label));
-                    }
-                    retry_next_alternative = true;
-                    break;
-                }
-                Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
-            }
+        // survives, "b"'s own binding set is never tried, and the retried
+        // `$z` alternative's own `$q` is unbound -> null). The body's
+        // verdict, richer than the `Demand` a sink can answer, is recorded
+        // in `outcome`.
+        enum BodyOutcome {
+            Retry,
+            Return(Flow),
         }
-        // #2873 review: `key_control` was computed eagerly, before any
-        // binding-set's body ran, so a `Halt` (or an uncatchable `Error`) it
-        // carries already happened -- real jq's own uncatchability rule
-        // (`Control`'s own doc comment) means it must win regardless of
-        // whatever an *earlier* binding-set's body already decided about
-        // retrying the next `?//` alternative. Dropping it here (behind the
-        // `retry_next_alternative` check below) silently turned a real
-        // `halt`/`halt_error` into an ordinary alternative fallthrough --
-        // confirmed live: `. as {("a", halt_error(7)):$q} ?// $z | if
-        // $q==1 then error("boom") else ($q // $z) end` on `{"a":1}` must
-        // halt (exit 7), not fall through to `$z`.
-        match &key_control {
-            Some(Control::Halt(code)) => return Flow::Escaped(Control::Halt(*code)),
-            Some(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-                return Flow::Escaped(Control::Error(e.clone()));
-            }
-            _ => {}
-        }
+        let mut outcome: Option<BodyOutcome> = None;
+        let walk =
+            each_pattern_binding_set::<S>(pattern, bound_val, invert_dedup, &mut |bindings| {
+                let null_value = OwnedValue::Null;
+                let substituted_body = substitute_vars(
+                    body,
+                    as_var_refs(bindings).chain(
+                        all_var_names
+                            .iter()
+                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                            .map(|name| (name.as_str(), &null_value)),
+                    ),
+                );
 
-        if retry_next_alternative {
-            continue;
+                // #2180 WP3 review: cleared per attempt, so what the retry
+                // decision below reads is exactly "did this attempt's own
+                // evaluation end in a `Halt`/decode failure a driver had to
+                // stash out-of-band" -- see [`nonretryable_stop`].
+                clear_nonretryable_stop();
+                match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
+                    Flow::Exhausted => Demand::Continue,
+                    // #1519: a satisfied consumer is jq's escaping `break`, so
+                    // it retries the next alternative just like `Control::Break`
+                    // below. `pending` is dropped on the retry rather than
+                    // carried: it is only ever `Some` when an eager fallback had
+                    // already raised a trailing control before the stop, and
+                    // real jq -- which would never have evaluated that far --
+                    // ignores it, the same reasoning `builtin_isempty` records
+                    // at its own `Flow::Stopped` arm.
+                    Flow::Stopped { pending } => {
+                        outcome = Some(if is_retryable_stop(is_last) {
+                            BodyOutcome::Retry
+                        } else {
+                            BodyOutcome::Return(Flow::Stopped { pending })
+                        });
+                        Demand::Stop
+                    }
+                    // `is_retryable_control`: an uncatchable error (#1620/#1660,
+                    // widened by #2132 to the shared value-position predicate)
+                    // and `halt` always propagate, `is_last` or not; an
+                    // ordinary error and a `break` (#1457) fall through to the
+                    // next alternative unless this is the last one.
+                    Flow::Escaped(control) => {
+                        outcome = Some(if is_retryable_control(&control, is_last) {
+                            BodyOutcome::Retry
+                        } else {
+                            BodyOutcome::Return(Flow::Escaped(control))
+                        });
+                        Demand::Stop
+                    }
+                }
+            });
+        match outcome {
+            Some(BodyOutcome::Retry) => continue,
+            Some(BodyOutcome::Return(flow)) => return flow,
+            None => {}
         }
-
-        // Every binding-set's own body ran to completion. Now the key
-        // generator's *own* trailing control (if it stopped early rather
-        // than exhausting) gets the same is_last/continue treatment a
-        // pre-#2677 match failure already had. `Halt` and an uncatchable
-        // `Error` were already handled above.
-        match key_control {
-            None => return Flow::Exhausted,
-            Some(Control::Error(e)) => {
-                if is_last {
-                    return Flow::Escaped(Control::Error(e));
-                }
-                continue;
+        match walk {
+            // Every binding set's body ran to completion -- including none
+            // at all for a zero-output key, which still wins the chain.
+            Flow::Exhausted => return Flow::Exhausted,
+            Flow::Stopped { .. } => {
+                unreachable!("the body sink records an outcome before answering Demand::Stop")
+                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
-            Some(Control::Break(label)) => {
-                if is_last {
-                    return Flow::Escaped(Control::Break(label));
+            // The matcher's own trailing control -- a pattern step's error
+            // (a structural mismatch), or the key generator's own
+            // error/break/halt, discovered only after every earlier
+            // binding set's body ran -- gets the same is_last/continue
+            // treatment a match failure always had. Lazy, so a `halt`
+            // behind a body error is never reached (jq 1.7.1: `. as {("a",
+            // halt_error(7)):$q} ?// $z | if $q==1 then error("boom") else
+            // ($q // $z) end` on `{"a":1}` prints `{"a":1}` at exit 0).
+            Flow::Escaped(control) => {
+                if is_retryable_control(&control, is_last) {
+                    continue;
                 }
-                continue;
+                return Flow::Escaped(control);
             }
-            Some(Control::Halt(_)) => unreachable!("handled above"),
         }
     }
 
@@ -31014,7 +30982,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // | .a)` raises "near attempt to access element "a" of <root>" (the
         // root is no longer the register), and `path(. as {a:$q, b:$r} |
         // ...)` raises at the *second* step whatever the body. All confirmed
-        // live against jq 1.7.1; see [`walk_pattern`] for the step model and
+        // live against jq 1.7.1; see [`PathPatternMode`] for the step model and
         // [`resolve_as_pattern`] for how the body is then seeded.
         //
         // jq mode only: real yq's lexer rejects any destructuring pattern,
@@ -31136,7 +31104,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   $x))`, whose SOURCE is the literal `([1])`) — see
         //   `resolve_reduce`/`resolve_foreach` and `FoldRegister` for how a
         //   register-derived element's own destructuring is walked
-        //   (`walk_pattern`, shared with #2649), and
+        //   (`each_pattern_walk`, shared with #2649), and
         //   `docs/compliance/jq/limitations.md` for the residual refuse-only
         //   gap this still leaves (yq mode, and jq mode's own known
         //   `resolve_leaf`-message-wording gap on an ordinary accumulator
@@ -31145,7 +31113,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //
         // - **`?//`-alternatives** (`patterns.len() > 1`) are threaded
         //   through both resolvers since #2979, with jq's own backtracking
-        //   rules (`bind_fold_alternative`, `path_alternative_retries`) and
+        //   rules (`each_fold_alternative`, `path_alternative_retries`) and
         //   #1365's null-fill for names the matching alternative doesn't
         //   bind. They used to fall through to the by-value catch-all,
         //   which can only refuse on an output it emits -- so a chain whose
@@ -34160,7 +34128,7 @@ struct PatternRegister {
 /// - `None` (a computed element): jq's register is untouched by this
 ///   element, so `path_intact` is checked against wherever it already was —
 ///   the fold's own persistent `reg` — which only ever admits the walk
-///   through `walk_pattern_step`'s `null`/`bool` identity exception, never
+///   through `PathPatternMode::step`'s `null`/`bool` identity exception, never
 ///   through `reg.value == elem.value` (a structural coincidence, not a real
 ///   `jv_identical`). Confirmed live: `path(foreach (null) as {a:$x} (.; .;
 ///   $x))` is `["a"]` on a `null` document (the ambient register is `null`
@@ -34182,129 +34150,20 @@ fn fold_pattern_seed(elem: &FoldSourceValue, reg: &FoldRegister) -> PatternRegis
     }
 }
 
-/// One binding produced by [`walk_pattern`]: the variable, its value, and --
-/// when the value is provably the register's node at that point -- the
-/// [`Origin::At`] marker that lets a `$var` reference in the body
-/// re-establish the register ([`Frame::certifies`]). `None` binds by value
-/// only.
+/// One binding produced by a path-mode walk ([`each_pattern_walk`]): the
+/// variable, its value, and -- when the value is provably the register's
+/// node at that point -- the [`Origin::At`] marker that lets a `$var`
+/// reference in the body re-establish the register ([`Frame::certifies`]).
+/// `None` binds by value only.
+#[derive(Clone)]
 struct PatternBinding {
     name: String,
     value: OwnedValue,
     origin: Option<Origin>,
 }
 
-/// One tracked index step of a destructuring pattern: an object entry's key
-/// or an array element's position. [`Self::component`] derives the [`Expr`]
-/// path component the register is extended by; a refusal names the input
-/// value separately, from the caller's own `input` (see
-/// [`walk_pattern_step`]).
-enum PatternStep<'a> {
-    Field(&'a str),
-    /// A signed array index, matching `.[EXPR]`'s own path-recording rule:
-    /// `path(.[-1])` on real jq is `[-1]`, the *raw* key, not the
-    /// wraparound-resolved position -- `child()` below resolves the
-    /// wraparound only when actually reading the element, same as
-    /// `index_one_owned`. Every pre-#2873 call site (array-pattern
-    /// positional matching, `[$a,$b]`) only ever builds this from a small
-    /// non-negative `usize` position, so widening from `usize` to `i64`
-    /// (#2873, to carry a computed key's own possibly-negative/out-of-range
-    /// numeric value) changes nothing for that existing caller.
-    Index(i64),
-}
-
-impl PatternStep<'_> {
-    /// The path component this step appends to the register's path.
-    fn component(&self) -> Expr {
-        match self {
-            Self::Field(key) => Expr::Field((*key).to_string()),
-            Self::Index(i) => Expr::Index { idx: *i, key: None },
-        }
-    }
-
-    /// Read `input[step]` the way jq's `jv_get` does: `null` yields `null`
-    /// for any key or index, an object/array yields the member or `null`
-    /// when it is absent, and any other kind is the ordinary
-    /// `Cannot index <type> with ...` error -- exactly the messages
-    /// [`extract_pattern_bindings`] raises in value mode. That function's
-    /// `null` short-circuit is deliberately *not* reproduced: jq still
-    /// performs (and tracks) every step on `null`, so `{}` gives
-    /// `path(. as {a:{b:$q}} | $q)` = `["a","b"]`.
-    fn child(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
-        match (self, input) {
-            (_, OwnedValue::Null) => Ok(OwnedValue::Null),
-            (Self::Field(key), OwnedValue::Object(obj)) => {
-                Ok(obj.get(*key).cloned().unwrap_or(OwnedValue::Null))
-            }
-            (Self::Field(key), _) => Err(EvalError::cannot_index_with_field(
-                owned_type_name(input),
-                key,
-            )),
-            (Self::Index(i), OwnedValue::Array(arr)) => {
-                // #2873: wraparound-resolve a negative index the same way
-                // `index_one_owned` does -- a pre-#2873 caller always passes
-                // a non-negative position, so this is a no-op there.
-                let resolved = if *i < 0 { arr.len() as i64 + *i } else { *i };
-                let element = usize::try_from(resolved)
-                    .ok()
-                    .and_then(|idx| arr.get(idx))
-                    .cloned()
-                    .unwrap_or(OwnedValue::Null);
-                Ok(element)
-            }
-            (Self::Index(_), _) => Err(EvalError::cannot_index_with_type(
-                owned_type_name(input),
-                "number",
-            )),
-        }
-    }
-}
-
-/// A computed key's resolved value, ahead of building the [`PatternStep`]
-/// it drives (#2873): a string indexes an object by field, a number indexes
-/// an array by position -- jq's generic `INDEX` bytecode, not an
-/// object-only special case. Kept separate from `PatternStep` itself
-/// because the two live at different points in `walk_pattern`'s Object
-/// arm: this is resolved once per entry (from either a literal or a
-/// computed key expression), `PatternStep` is built from it fresh right
-/// before each step.
-enum ResolvedPatternKey<'a> {
-    Field(Cow<'a, str>),
-    Index(i64),
-}
-
-/// Perform one tracked pattern step from `input`, returning the child value
-/// and the register it moves to. The identity check runs *before* the kind
-/// check, matching jq's `path_intact`-then-`jv_get` order.
-fn walk_pattern_step(
-    step: &PatternStep<'_>,
-    input: &OwnedValue,
-    reg: &PatternRegister,
-) -> Result<(OwnedValue, PatternRegister), EvalError> {
-    let component = step.component();
-    // jq's `path_intact`: the step's input must be the register's own node.
-    // Only `null`/`true`/`false` are `jv_identical` by value, which is what
-    // lets a second entry step from a `null` parent (`null | . as {a:$q,
-    // b:$r}` walks to `["a","b"]`).
-    if !(reg.is_input || null_bool_identical(input, &reg.value)) {
-        let Some(element) = navigation_element(&component) else {
-            unreachable!("a pattern step's component is always Field/Index") // omni-dev: coverage tolerate-line reason="unreachable: PatternStep::component only ever builds Expr::Field/Expr::Index, and navigation_element answers Some for both (#2649)"
-        };
-        return Err(EvalError::invalid_path_expression_near_access(
-            &element, input,
-        ));
-    }
-    let child = step.child(input)?;
-    let moved = PatternRegister {
-        path: PathPrefix::extend(&reg.path, component),
-        value: child.clone(),
-        is_input: true,
-    };
-    Ok((child, moved))
-}
-
-/// Walk `pattern` over `input` the way jq's destructuring matcher does in
-/// path position (#2649), collecting the bindings into `out` and returning
-/// where the path register ends up.
+/// Path mode of the destructuring matcher (#2649, #2872): jq's register
+/// walked step by step.
 ///
 /// jq compiles `SRC as PATTERN | BODY` so that `SRC` runs with tracking
 /// suspended but every index step *inside* the pattern runs tracked: before
@@ -34315,166 +34174,141 @@ fn walk_pattern_step(
 ///
 /// - **identity before kind**: the `path_intact` refusal precedes `jv_get`,
 ///   so `path(. as {a:$q} | ($q|.[0]) as [$z] | $z)` is "near attempt to
-///   access element 0 of 1", not "Cannot index number with number".
-/// - **`null` still steps**: unlike value mode's `null` short-circuit
-///   ([`extract_pattern_bindings`]), each step is performed and tracked on a
-///   `null` input, and `null`/booleans are `jv_identical` by value, so the
-///   walk continues across entries.
-/// - **entry order**: object entries run in source order
-///   (`gen_object_matcher`), array elements in **reverse** index order --
-///   `gen_array_matcher` nests each earlier element *after* the later one,
-///   so `path(. as [$x,$y] | x)` on `[1,2,3]` refuses at element `0` (the
-///   step for index `1` ran first and moved the register), while `path(.a as
-///   [$x,$y] | x)` on `{"a":[1,2,3]}` refuses at element `1` -- the source is
-///   not the register, so the very first step fails.
+///   access element 0 of 1", not "Cannot index number with number". A
+///   computed key of an unindexable kind is the one exception, refused ahead
+///   of the identity check exactly as jq's `INDEX` refuses it before
+///   anything else ([`PatternKey::component`]).
+/// - **`null` still steps**: each step is performed and tracked on a `null`
+///   input, and `null`/booleans are `jv_identical` by value, so the walk
+///   continues across entries (`{}` gives `path(. as {a:{b:$q}} | $q)` =
+///   `["a","b"]`).
+/// - **entry order**: object entries run in source order, array elements in
+///   **reverse** index order -- `path(. as [$x,$y] | x)` on `[1,2,3]`
+///   refuses at element `0` (the step for index `1` ran first and moved the
+///   register), while `path(.a as [$x,$y] | x)` on `{"a":[1,2,3]}` refuses
+///   at element `1` -- the source is not the register, so the very first
+///   step fails. Every entry after a container's first steps from the
+///   *parent* input again, which is no longer the register's node -- only
+///   the null/bool value clause can still admit it.
 /// - **`{$b: P}` is one step**: the entry binds `$b` to `V[b]` and then runs
 ///   `P` on that same value (one `INDEX` in jq's compilation), where an
 ///   explicit `{b:$m, b:$n}` performs two and refuses at the second.
 /// - **a bare `$x` performs no step**: it binds the current input and leaves
 ///   the register alone, marked with [`Frame::origin_at`] exactly when that
 ///   input *is* the register's node.
-fn walk_pattern<S: EvalSemantics>(
-    pattern: &Pattern,
-    input: &OwnedValue,
-    reg: PatternRegister,
-    frame: &Frame,
-    out: &mut Vec<PatternBinding>,
-) -> Result<PatternRegister, EvalError> {
-    match pattern {
-        Pattern::Var(name) => {
-            let origin = if reg.is_input {
-                frame.origin_at(&reg.path)
-            } else {
-                None
+/// - **a computed key branches the register** (#2872): each output of a
+///   key generator is its own tracked step from the same parent, so the
+///   walk -- and the body after it -- runs once per branch, each with the
+///   register the branch moved.
+struct PathPatternMode<'f> {
+    frame: &'f Frame,
+}
+
+impl PatternMode for PathPatternMode<'_> {
+    type Reg = PatternRegister;
+    type Binding = PatternBinding;
+
+    fn step(
+        &self,
+        key: &PatternKey<'_>,
+        input: &OwnedValue,
+        reg: &PatternRegister,
+        first: bool,
+    ) -> Result<(OwnedValue, PatternRegister), EvalError> {
+        let component = key.component(input)?;
+        // jq's `path_intact`: the step's input must be the register's own
+        // node. Only `null`/`true`/`false` are `jv_identical` by value,
+        // which is what lets a second entry step from a `null` parent
+        // (`null | . as {a:$q, b:$r}` walks to `["a","b"]`).
+        if !((first && reg.is_input) || null_bool_identical(input, &reg.value)) {
+            let Some(element) = navigation_element(&component) else {
+                unreachable!("a pattern step's component is always Field/Index")
+                // omni-dev: coverage tolerate-line reason="unreachable: PatternKey::component only ever builds Expr::Field/Expr::Index, and navigation_element answers Some for both (#2649)"
             };
-            out.push(PatternBinding {
-                name: name.clone(),
-                value: input.clone(),
-                origin,
-            });
-            Ok(reg)
+            return Err(EvalError::invalid_path_expression_near_access(
+                &element, input,
+            ));
         }
-        Pattern::Object(entries) => {
-            let mut reg = reg;
-            let mut first = true;
-            for entry in entries {
-                // Every entry after the first steps from the *parent* input
-                // again, which is no longer the register's node -- only the
-                // null/bool value clause in the identity check can still
-                // admit it. The register the walk *returns* keeps the mark
-                // the last step left it with: that is what the body is
-                // seeded from, not something further steps run against.
-                if !first {
-                    reg.is_input = false;
-                }
-                first = false;
-                // #2677: a computed key is resolved against `input` -- the
-                // pattern's own current node -- exactly like value mode's
-                // identical resolution in `fold_object_pattern_entry`
-                // (this function's own doc comment there has the full
-                // derivation, oracle-verified against jq 1.7.1 in *both*
-                // positions: the "Cannot index X with Y" wording is the
-                // same in path mode as value mode, since it comes from the
-                // key-resolution step, not from `walk_pattern_step`'s own
-                // *separate* register-tracking check below, whose "near
-                // attempt to access" wording is unrelated). Scoped down to
-                // exactly one valid string output for this first increment
-                // -- see `extract_single_pattern_binding`'s own doc comment
-                // for why 0/2+/break/halt refuse clearly here too rather
-                // than being modelled.
-                let key: ResolvedPatternKey = match &entry.key {
-                    ObjectKey::Literal(key) => {
-                        ResolvedPatternKey::Field(Cow::Borrowed(key.as_str()))
-                    }
-                    ObjectKey::Expr(key_expr) => {
-                        // `reg.is_input` is this walk's own `trackable`
-                        // (#3036 review): while true, `input` is still the
-                        // register's node, so `key_expr` must not have its
-                        // own markers demoted just because a computed key
-                        // resolves by value rather than through a sink --
-                        // see `eval_each_owned_at`'s "computed key" case.
-                        let (mut key_values, control) =
-                            eval_owned_expr_fork_at::<S>(key_expr, input, reg.is_input, false);
-                        match (key_values.len(), control) {
-                            (1, None) => match key_values.pop().unwrap() {
-                                OwnedValue::String(s) => ResolvedPatternKey::Field(Cow::Owned(s)),
-                                // #2873 review: real jq's `INDEX` bytecode is
-                                // generic, not object-only -- a numeric
-                                // computed key indexes an array target
-                                // exactly like `.[EXPR]` does in value mode
-                                // (`fold_object_pattern_entry`'s identical
-                                // fix and doc comment). A NaN key has no
-                                // index, matching `numeric_key_to_index`'s
-                                // own contract -- `i64::MAX` is a plain
-                                // guaranteed-out-of-range sentinel `child()`
-                                // resolves to `null`, not a real path
-                                // position.
-                                v @ (OwnedValue::Int(_)
-                                | OwnedValue::Float(_)
-                                | OwnedValue::NumberLiteral(..)) => ResolvedPatternKey::Index(
-                                    numeric_key_to_index(&v).unwrap_or(i64::MAX),
-                                ),
-                                other => {
-                                    return Err(EvalError::cannot_index_with_type(
-                                        owned_type_name(input),
-                                        owned_type_name(&other),
-                                    ));
-                                }
-                            },
-                            (0, Some(Control::Error(e))) => return Err(e),
-                            _ => {
-                                return Err(EvalError::new(
-                                    "a computed key in a destructuring pattern produced zero \
-                                     outputs, more than one output, or was interrupted by \
-                                     break/halt, none of which are yet supported in path \
-                                     position (#2677)",
-                                ));
-                            }
-                        }
-                    }
-                };
-                let step = match &key {
-                    ResolvedPatternKey::Field(s) => PatternStep::Field(s),
-                    ResolvedPatternKey::Index(i) => PatternStep::Index(*i),
-                };
-                let (child, moved) = walk_pattern_step(&step, input, &reg)?;
-                // `{$b: P}`: the bind names the node the register just moved
-                // to, so it carries that position's marker, and is pushed
-                // ahead of `P`'s own bindings (matching value mode's order).
-                if let Some(bind) = &entry.bind {
-                    out.push(PatternBinding {
-                        name: bind.clone(),
-                        value: child.clone(),
-                        origin: frame.origin_at(&moved.path),
-                    });
-                }
-                reg = walk_pattern::<S>(&entry.pattern, &child, moved, frame, out)?;
-            }
-            Ok(reg)
-        }
-        Pattern::Array(patterns) => {
-            let mut reg = reg;
-            let mut first = true;
-            for (i, pat) in patterns.iter().enumerate().rev() {
-                // As in the object arm: only the highest index (the element
-                // jq's right-to-left matcher runs first) steps from the
-                // register's own node.
-                if !first {
-                    reg.is_input = false;
-                }
-                first = false;
-                let step = PatternStep::Index(i as i64);
-                let (child, moved) = walk_pattern_step(&step, input, &reg)?;
-                reg = walk_pattern::<S>(pat, &child, moved, frame, out)?;
-            }
-            Ok(reg)
+        let child = key.child(input)?;
+        let moved = PatternRegister {
+            path: PathPrefix::extend(&reg.path, component),
+            value: child.clone(),
+            is_input: true,
+        };
+        Ok((child, moved))
+    }
+
+    fn bind(&self, name: &str, value: &OwnedValue, reg: &PatternRegister) -> PatternBinding {
+        // The marker names the register's position exactly when the bound
+        // value *is* the register's node there: always after a step (the
+        // child is the node the register just moved to), and for a bare
+        // `$x` only while the walk still sits on the register's own node.
+        let origin = if reg.is_input {
+            self.frame.origin_at(&reg.path)
+        } else {
+            None
+        };
+        PatternBinding {
+            name: name.to_string(),
+            value: value.clone(),
+            origin,
         }
     }
+
+    fn key_input_tracked(&self, reg: &PatternRegister, first: bool) -> bool {
+        // `reg.is_input` is this walk's own `trackable` (#3036 review),
+        // and only the container's first step is still from the
+        // register's node.
+        first && reg.is_input
+    }
+
+    fn name(binding: &PatternBinding) -> &str {
+        &binding.name
+    }
+}
+
+/// Every branch of `pattern`'s walk over `input` from `seed` in path mode,
+/// offered to `sink` one at a time with the register the branch ended on
+/// and its bindings (already deduplicated, see [`dedup_pattern_match`]) --
+/// the path-mode twin of [`each_pattern_binding_set`], shared by
+/// [`resolve_as_pattern`] and both path-mode folds. `invert` is whether
+/// this pattern is one alternative of a genuine `?//` chain.
+///
+/// The returned [`Flow`] is the walk's own: `Stopped` means `sink` stopped
+/// it, `Escaped` a step's refusal or a key generator's trailing control,
+/// raised after every branch completed before it was offered.
+fn each_pattern_walk<S: EvalSemantics>(
+    pattern: &Pattern,
+    input: &OwnedValue,
+    seed: PatternRegister,
+    frame: &Frame,
+    invert: bool,
+    sink: &mut dyn FnMut(PatternRegister, &[PatternBinding]) -> Demand,
+) -> Flow {
+    let mode = PathPatternMode { frame };
+    let mut out: Vec<PatternBinding> = Vec::new();
+    walk_pattern_each::<PathPatternMode<'_>, S>(
+        &mode,
+        pattern,
+        input,
+        seed,
+        &mut out,
+        &mut |reg, out| {
+            let demand = match dedup_pattern_match::<PathPatternMode<'_>>(out, invert) {
+                Some(deduped) => sink(reg, &deduped),
+                None => sink(reg, out),
+            };
+            match demand {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            }
+        },
+    )
 }
 
 /// The `Expr::AsPattern` arm of [`resolve_node_sink`] (#2649): jq's
 /// destructuring bind in path position. The arm's own comment gives the jq
-/// model, [`walk_pattern`] the per-step rule; this function drives the
+/// model, [`PathPatternMode`] the per-step rule; this function drives the
 /// alternatives and seeds the body.
 ///
 /// **The body is a seeded pipe.** After the walk, jq's register sits at the
@@ -34543,6 +34377,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // #2978: a bare `$x` alternative of an identity source gets the same
     // positioned snapshot the `As` arm mints -- see `identity_bind_position`.
     let identity_at = identity_bind_position::<S>(source, trackable, frame);
+    let invert_dedup = patterns.len() > 1;
     for bound in &sources {
         // jq's `path_intact` at the pattern's first step: is the source
         // value the register's own node? While `trackable` the register is
@@ -34560,68 +34395,135 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
             };
         for (i, pattern) in patterns.iter().enumerate() {
             let is_last = i == last_idx;
-            let mut bindings = Vec::new();
             let seed = PatternRegister {
                 path: PathPrefix::root(),
                 value: value.clone(),
                 is_input: identical,
             };
-            let reg = match walk_pattern::<S>(pattern, bound, seed, frame, &mut bindings) {
-                Ok(reg) => reg,
-                // Off the register (`!trackable`), a first-step refusal is
-                // a guess, not jq's verdict -- see the dispatch arm -- so it
-                // never retries (#2979).
-                Err(e) => {
-                    if is_last || (!trackable && is_resolver_refusal(&e)) {
+            // The body's own verdict, when it is richer than "stop the
+            // walk": which the sink can only answer with a `Demand`, so it
+            // is recorded here (the `ended`/`outcome` idiom every driver in
+            // this file uses).
+            enum BranchOutcome {
+                Retry,
+                Return(ResolveFlow),
+            }
+            let mut outcome: Option<BranchOutcome> = None;
+            // #2872: one body run per branch of the walk, as it completes --
+            // a computed key's outputs branch the register, and the `?//`
+            // rules below apply per branch, partway through the stream:
+            // a body error after k branches moves to the next alternative
+            // and the paths already emitted stand (jq never un-emits).
+            let walk = each_pattern_walk::<S>(
+                pattern,
+                bound,
+                seed,
+                frame,
+                invert_dedup,
+                &mut |reg, bindings| {
+                    let substituted = bind_pattern_body(
+                        source,
+                        body,
+                        pattern,
+                        bound,
+                        identity_at.clone(),
+                        bindings,
+                        &all_names,
+                    );
+                    clear_nonretryable_stop();
+                    let flow = if reg.path.depth() == 0 {
+                        // No step ran (a bare `$x` alternative, or an empty
+                        // pattern): the register is untouched, so the body
+                        // resolves exactly as the `As` arm's does.
+                        resolve_node_sink::<S>(
+                            &substituted,
+                            value,
+                            trackable,
+                            snapshot,
+                            frame,
+                            keep,
+                            sink,
+                        )
+                    } else {
+                        let seed = if null_bool_identical(value, &reg.value) {
+                            PathBranch::new(reg.path, Cow::Borrowed(value), true)
+                        } else {
+                            PathBranch::passthrough(
+                                reg.path,
+                                Cow::Borrowed(value),
+                                false,
+                                Snapshot::No,
+                            )
+                            .with_register(Some(Cow::Owned(reg.value)))
+                        };
+                        resolve_seq_from_seed::<S>(
+                            core::slice::from_ref(&substituted),
+                            seed,
+                            frame,
+                            keep,
+                            sink,
+                        )
+                    };
+                    match flow {
+                        ResolveFlow::Exhausted => Demand::Continue,
+                        ResolveFlow::Stopped => {
+                            outcome = Some(if is_retryable_stop(is_last) {
+                                BranchOutcome::Retry
+                            } else {
+                                BranchOutcome::Return(ResolveFlow::Stopped)
+                            });
+                            Demand::Stop
+                        }
+                        ResolveFlow::Escaped(escape) => {
+                            outcome = Some(if path_alternative_retries(&escape, is_last) {
+                                BranchOutcome::Retry
+                            } else {
+                                BranchOutcome::Return(ResolveFlow::Escaped(escape))
+                            });
+                            Demand::Stop
+                        }
+                    }
+                },
+            );
+            match outcome {
+                Some(BranchOutcome::Retry) => continue,
+                Some(BranchOutcome::Return(flow)) => return flow,
+                None => {}
+            }
+            match walk {
+                // Every branch's body ran to completion -- including the
+                // zero-branch case of a zero-output key, which matches and
+                // binds nothing (jq: `[path(. as {(empty):$q} ?// $z | $q)]`
+                // is `[]`, `$z` never tried).
+                Flow::Exhausted => break,
+                Flow::Stopped { .. } => {
+                    unreachable!("the sink above records an outcome before answering Demand::Stop")
+                    // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                }
+                // The walk's own refusal (a pattern step), or the key
+                // generator's own trailing control -- given the same
+                // is_last/continue treatment a pre-#2872 match failure
+                // already had, with `halt` and an uncatchable error always
+                // propagating. Off the register (`!trackable`), a first-step
+                // refusal is a guess, not jq's verdict -- see the dispatch
+                // arm -- so it never retries (#2979).
+                Flow::Escaped(Control::Error(e)) => {
+                    if is_last
+                        || (!trackable && is_resolver_refusal(&e))
+                        || e.is_uncatchable_at_value_position()
+                    {
                         return ResolveFlow::Escaped(e.into());
                     }
                     continue;
                 }
-            };
-            let substituted = bind_pattern_body(
-                source,
-                body,
-                pattern,
-                bound,
-                identity_at.clone(),
-                bindings,
-                &all_names,
-                patterns.len() > 1,
-            );
-            clear_nonretryable_stop();
-            let flow = if reg.path.depth() == 0 {
-                // No step ran (a bare `$x` alternative, or an empty
-                // pattern): the register is untouched, so the body resolves
-                // exactly as the `As` arm's does.
-                resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
-            } else {
-                let seed = if null_bool_identical(value, &reg.value) {
-                    PathBranch::new(reg.path, Cow::Borrowed(value), true)
-                } else {
-                    PathBranch::passthrough(reg.path, Cow::Borrowed(value), false, Snapshot::No)
-                        .with_register(Some(Cow::Owned(reg.value)))
-                };
-                resolve_seq_from_seed::<S>(
-                    core::slice::from_ref(&substituted),
-                    seed,
-                    frame,
-                    keep,
-                    sink,
-                )
-            };
-            match flow {
-                ResolveFlow::Exhausted => break,
-                ResolveFlow::Stopped => {
-                    if is_retryable_stop(is_last) {
-                        continue;
+                Flow::Escaped(Control::Break(label)) => {
+                    if is_last {
+                        return ResolveFlow::Escaped(EvalEscape::Break(label));
                     }
-                    return ResolveFlow::Stopped;
+                    continue;
                 }
-                ResolveFlow::Escaped(escape) => {
-                    if path_alternative_retries(&escape, is_last) {
-                        continue;
-                    }
-                    return ResolveFlow::Escaped(escape);
+                Flow::Escaped(Control::Halt(code)) => {
+                    return ResolveFlow::Escaped(EvalEscape::Halt(code));
                 }
             }
         }
@@ -34632,7 +34534,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     }
 }
 
-/// Splice one alternative's bindings into `body` for [`resolve_as_pattern`].
+/// Splice one branch's bindings into `body` for [`resolve_as_pattern`].
 ///
 /// A binding whose value the walk proved to be the register's node at some
 /// position carries an `Origin::At` marker for it (`substitute_var_impl` with
@@ -34642,7 +34544,8 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
 /// `Origin::Snapshot` -- or the `Origin::SnapshotAt` the caller proved as
 /// `identity_at` (#2978) -- exactly as under `As`. Names any *other*
 /// alternative binds become `null`, as in value mode
-/// (`each_pattern_alternatives`).
+/// (`each_pattern_alternatives`). `bindings` arrive already deduplicated
+/// ([`each_pattern_walk`]).
 #[allow(clippy::too_many_arguments)] // STYLE-0004: one splice per alternative, the walk's own inputs
 fn bind_pattern_body(
     source: &Expr,
@@ -34650,21 +34553,19 @@ fn bind_pattern_body(
     pattern: &Pattern,
     bound: &OwnedValue,
     identity_at: Option<Origin>,
-    bindings: Vec<PatternBinding>,
+    bindings: &[PatternBinding],
     all_names: &[String],
-    invert_dedup: bool,
 ) -> Expr {
     let mut bound_names: Vec<String> = Vec::new();
     let mut substituted = match pattern {
         Pattern::Var(name) => {
             bound_names.push(name.clone());
-            let origin = bindings.into_iter().next().and_then(|b| b.origin);
+            let origin = bindings.first().and_then(|b| b.origin.clone());
             substitute_bound_var_at(source, body, name, bound, identity_at, origin, None)
         }
         Pattern::Object(_) | Pattern::Array(_) => {
-            let bindings = dedup_pattern_bindings(pattern, bindings, invert_dedup);
             bound_names.extend(bindings.iter().map(|b| b.name.clone()));
-            apply_pattern_bindings(body, &bindings)
+            apply_pattern_bindings(body, bindings)
         }
     };
     let null_value = OwnedValue::Null;
@@ -34694,33 +34595,6 @@ fn apply_pattern_bindings(expr: &Expr, bindings: &[PatternBinding]) -> Expr {
         };
     }
     substituted
-}
-
-/// The duplicate-name rule of [`extract_pattern_bindings`]
-/// (`dedup_object_bindings`/`dedup_array_bindings`) applied to a walk's
-/// bindings, so `{a:$x, b:$x}` binds the same occurrence in path mode as in
-/// value mode: an object pattern keeps the first, an array pattern the last,
-/// both inverted under `?//`. (Only reachable with a `null` parent -- any
-/// other duplicate refuses at the second step -- but the surviving
-/// occurrence decides which marker `$x` carries.)
-fn dedup_pattern_bindings(
-    pattern: &Pattern,
-    bindings: Vec<PatternBinding>,
-    invert: bool,
-) -> Vec<PatternBinding> {
-    let keep_first = match pattern {
-        Pattern::Array(_) => invert,
-        Pattern::Object(_) | Pattern::Var(_) => !invert,
-    };
-    if keep_first {
-        dedup_keep_first_by(bindings, pattern_binding_name)
-    } else {
-        dedup_keep_last_by(bindings, pattern_binding_name)
-    }
-}
-
-fn pattern_binding_name(binding: &PatternBinding) -> &str {
-    &binding.name
 }
 
 /// Whether every node of `source` is one the resolver walks exactly as the
@@ -35119,15 +34993,12 @@ struct FoldAlternative {
     walked: Option<PatternRegister>,
 }
 
-/// Why binding one fold alternative failed, and whether a `?//` chain may
-/// act on the failure by trying the next alternative.
-struct FoldBindFailure {
-    error: EvalError,
-    retryable: bool,
-}
-
 /// Bind `pattern` over one source element for [`resolve_reduce`] and
-/// [`resolve_foreach`] -- the per-alternative half of both folds (#2979).
+/// [`resolve_foreach`] -- the per-alternative half of both folds (#2979),
+/// offering one bound [`FoldAlternative`] per branch of the pattern's walk
+/// to `sink` (#2872: a computed key's outputs are separate branches, each
+/// its own fold step with its own register; a literal-key pattern has
+/// exactly one).
 ///
 /// A destructuring pattern is walked the way #2676 walks it, seeded by
 /// [`fold_pattern_seed`]; a bare `$var` performs no step and is substituted
@@ -35140,6 +35011,103 @@ struct FoldBindFailure {
 /// single pattern: then there is nothing to null-fill, and the duplicate-name
 /// rule is not inverted.
 ///
+/// The returned [`Flow`] is the walk's own ([`each_pattern_walk`]):
+/// `Stopped` means `sink` stopped it, `Escaped` a pattern step's refusal or
+/// the key generator's own trailing control, raised after every branch
+/// that completed before it. Whether a refusal may retry the next
+/// alternative is [`fold_walk_refusal_retries`]'s question.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `resolve_foreach`
+fn each_fold_alternative<S: EvalSemantics>(
+    pattern: &Pattern,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+    frame: &Frame,
+    update: &Expr,
+    extract: Option<&Expr>,
+    alternatives: Option<&[String]>,
+    keep_origins: bool,
+    sink: &mut dyn FnMut(FoldAlternative) -> Demand,
+) -> Flow {
+    let null = OwnedValue::Null;
+    let null_fill = |mut update: Expr, mut extract: Option<Expr>, bound_names: &[String]| {
+        for name in alternatives.unwrap_or_default() {
+            if !bound_names.contains(name) {
+                update = substitute_var(&update, name, &null);
+                extract = extract.map(|ext| substitute_var(&ext, name, &null));
+            }
+        }
+        (update, extract)
+    };
+    match pattern {
+        Pattern::Object(_) | Pattern::Array(_) => {
+            let seed = fold_pattern_seed(elem, reg);
+            each_pattern_walk::<S>(
+                pattern,
+                &elem.value,
+                seed,
+                frame,
+                alternatives.is_some(),
+                &mut |walked, bindings| {
+                    let untracked: Vec<PatternBinding>;
+                    let bindings = if keep_origins {
+                        bindings
+                    } else {
+                        untracked = bindings
+                            .iter()
+                            .map(|b| PatternBinding {
+                                name: b.name.clone(),
+                                value: b.value.clone(),
+                                origin: None,
+                            })
+                            .collect();
+                        &untracked
+                    };
+                    let update = apply_pattern_bindings(update, bindings);
+                    let extract = extract.map(|ext| apply_pattern_bindings(ext, bindings));
+                    let bound_names: Vec<String> = if alternatives.is_some() {
+                        bindings.iter().map(|b| b.name.clone()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let (update, extract) = null_fill(update, extract, &bound_names);
+                    sink(FoldAlternative {
+                        update,
+                        extract,
+                        walked: Some(walked),
+                    })
+                },
+            )
+        }
+        Pattern::Var(name) => {
+            let binding = [(name.clone(), elem.value.clone())];
+            let (update, extract) = if elem.register_path.is_some() {
+                let (var, value) = &binding[0];
+                (
+                    substitute_var_tracked(update, var, value),
+                    extract.map(|ext| substitute_var_tracked(ext, var, value)),
+                )
+            } else {
+                (
+                    substitute_vars(update, as_var_refs(&binding)),
+                    extract.map(|ext| substitute_vars(ext, as_var_refs(&binding))),
+                )
+            };
+            let (update, extract) = null_fill(update, extract, core::slice::from_ref(name));
+            match sink(FoldAlternative {
+                update,
+                extract,
+                walked: None,
+            }) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            }
+        }
+    }
+}
+
+/// Whether a pattern-walk refusal out of [`each_fold_alternative`] may act
+/// as "this alternative did not match, try the next" (#2979).
+///
 /// **A walk refusal is retryable only when it is jq's own verdict.** jq runs
 /// the next alternative when a pattern step fails `path_intact`, so a walk
 /// error normally retries (rule 1 of the #2979 plan). But the walk can only
@@ -35150,88 +35118,21 @@ struct FoldBindFailure {
 /// alternative -- so retrying would bind a different alternative than jq
 /// does, and `del`/`=` would write through it. That refusal propagates
 /// instead: a refusal where jq might answer, never an answer jq would not
-/// give.
-#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `resolve_foreach`
-fn bind_fold_alternative<S: EvalSemantics>(
-    pattern: &Pattern,
+/// give. A key generator's own uncatchable error (a decode failure, a
+/// resource cap) never retries either, as nowhere else does.
+fn fold_walk_refusal_retries(
     elem: &FoldSourceValue,
     reg: &FoldRegister,
-    frame: &Frame,
-    update: &Expr,
-    extract: Option<&Expr>,
-    alternatives: Option<&[String]>,
-    keep_origins: bool,
-) -> Result<FoldAlternative, FoldBindFailure> {
-    let mut bound_names: Vec<String> = Vec::new();
-    let (mut update, mut extract, walked) = match pattern {
-        Pattern::Object(_) | Pattern::Array(_) => {
-            let seed = fold_pattern_seed(elem, reg);
-            let mut bindings = Vec::new();
-            let walked = match walk_pattern::<S>(pattern, &elem.value, seed, frame, &mut bindings) {
-                Ok(walked) => walked,
-                Err(error) => {
-                    let guessed = elem.register_path.is_none()
-                        && (!reg.trackable
-                            || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
-                                && elem.value == reg.value));
-                    let retryable = !(guessed && is_resolver_refusal(&error));
-                    return Err(FoldBindFailure { error, retryable });
-                }
-            };
-            let mut bindings = dedup_pattern_bindings(pattern, bindings, alternatives.is_some());
-            if !keep_origins {
-                for binding in &mut bindings {
-                    binding.origin = None;
-                }
-            }
-            let update = apply_pattern_bindings(update, &bindings);
-            let extract = extract.map(|ext| apply_pattern_bindings(ext, &bindings));
-            if alternatives.is_some() {
-                bound_names.extend(bindings.into_iter().map(|b| b.name));
-            }
-            (update, extract, Some(walked))
-        }
-        Pattern::Var(name) => {
-            // omni-dev: coverage tolerate reason="unreachable arm: a bare `$var` pattern has no computed key and no step, so `extract_pattern_bindings` always yields exactly one binding set for it (#2979)"
-            let binding = match extract_single_pattern_binding::<S>(pattern, &elem.value, false) {
-                Ok(binding) => binding,
-                Err(error) => {
-                    return Err(FoldBindFailure {
-                        error,
-                        retryable: true,
-                    })
-                }
-            };
-            // omni-dev: coverage end
-            bound_names.push(name.clone());
-            if elem.register_path.is_some() {
-                let (var, value) = &binding[0];
-                (
-                    substitute_var_tracked(update, var, value),
-                    extract.map(|ext| substitute_var_tracked(ext, var, value)),
-                    None,
-                )
-            } else {
-                (
-                    substitute_vars(update, as_var_refs(&binding)),
-                    extract.map(|ext| substitute_vars(ext, as_var_refs(&binding))),
-                    None,
-                )
-            }
-        }
-    };
-    let null = OwnedValue::Null;
-    for name in alternatives.unwrap_or_default() {
-        if !bound_names.contains(name) {
-            update = substitute_var(&update, name, &null);
-            extract = extract.map(|ext| substitute_var(&ext, name, &null));
-        }
+    error: &EvalError,
+) -> bool {
+    let guessed = elem.register_path.is_none()
+        && (!reg.trackable
+            || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
+                && elem.value == reg.value));
+    if error.is_uncatchable_at_value_position() {
+        return false;
     }
-    Ok(FoldAlternative {
-        update,
-        extract,
-        walked,
-    })
+    !(guessed && is_resolver_refusal(error))
 }
 
 /// The resolver's own two refusal kinds (#2979): a pattern step or a
@@ -35457,7 +35358,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // error inside it backtracks to the next alternative:
             //
             // - a pattern-walk refusal leaves the accumulator untouched, since
-            //   `LOADVN` has not run (`bind_fold_alternative` decides whether
+            //   `LOADVN` has not run (`fold_walk_refusal_retries` decides whether
             //   the refusal is jq's own, or a guess that must not retry);
             // - an UPDATE escape leaves it at UPDATE's last output before the
             //   escape, or `null` when there was none (`LOADVN` nulled it),
@@ -35491,7 +35392,19 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // `{"a":..,"b":..}` exactly as `path(reduce .b as {c:$x} (.;
                 // $x))` does). A position marker would admit nothing that
                 // check does not already refuse.
-                let substituted = match bind_fold_alternative::<S>(
+                //
+                // #2872: one UPDATE run per branch of the walk, each its own
+                // fold step with the accumulator threaded through -- a
+                // computed key's outputs are separate branches (`path(reduce
+                // . as {("a","b"):$q} (.; $q))` runs UPDATE twice). The
+                // step's own verdict, richer than the `Demand` a sink can
+                // answer, is recorded out-of-band in `outcome`.
+                enum StepOutcome {
+                    Retry,
+                    Return(Demand),
+                }
+                let mut outcome: Option<StepOutcome> = None;
+                let walk = each_fold_alternative::<S>(
                     pattern,
                     &elem,
                     &reg,
@@ -35500,111 +35413,149 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     None,
                     alternatives,
                     false,
-                ) {
-                    Ok(bound) => bound.update,
-                    Err(failure) if failure.retryable && !is_last => continue,
-                    Err(failure) => {
-                        return stop_with_escape(&mut aborted, Control::Error(failure.error))
-                    }
-                };
-                // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
-                // (#2161) — `acc_at_register` alone is the previous step's
-                // `branch_provenance`, a path comparison, which is `false` from
-                // step 2 onward because UPDATE's whole job is to navigate away
-                // from the register. jq's actual rule is
-                // `jv_identical(current_input, value_at_path)`: this step is at
-                // the register when the accumulator arriving at it is still the
-                // register's own value, which `register_identical` answers
-                // directly. `||`, not a replacement — `register_identical`
-                // demands `snapshot || Null | Bool`, so it alone is `false` for
-                // step 1 of an object-valued register, where the carried
-                // provenance is the correct `true`. jq mode only, for the same
-                // reason `resolve_foreach`'s widening is: on the *write* side an
-                // un-gated widening turns a refusal into a write where real yq
-                // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
-                // v4.53.3).
-                //
-                // Checked against `acc`'s own *effective* value — `acc.as_ref()`
-                // unwrapped to `&OwnedValue::Null`, not gated on `acc.is_some()`
-                // -- because a step whose UPDATE produced zero outputs (`empty`)
-                // leaves `acc` as `None`, and the very next line already treats
-                // that the same as a real `Null` accumulator
-                // (`unwrap_or(OwnedValue::Null)`) when it becomes `acc_input`.
-                // Skipping the check on `None` missed exactly that case: a
-                // `null`/`bool` register is unconditionally identical to a
-                // `null` accumulator via `register_identical`'s kind-based
-                // clause, `None` included, since there is no pointer/snapshot
-                // involved for that arm at all. Confirmed live against jq 1.7.1:
-                // `path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a
-                // end))` on `{"a":1,"b":null}` is `["b"]`, matching only once
-                // this is unconditional.
-                let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
-                acc_at_register = acc_at_register
-                    || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
-                let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-                // Charged once per UPDATE that runs, as value mode charges
-                // (#695): the element's own charge above covers the first,
-                // and an alternative whose bind failed ran nothing.
-                if ran_update {
-                    if let Some(control) = charge_budget(&mut budget, "reduce") {
-                        return stop_with_escape(&mut aborted, control);
-                    }
-                }
-                ran_update = true;
-                match reg.resolve::<S>(
-                    &substituted,
-                    acc_input,
-                    acc_at_register,
-                    &acc_snapshot,
-                    keep,
-                ) {
-                    Ok(branches) => {
-                        // Only the last output of a multi-output UPDATE
-                        // becomes the new accumulator (same rule as
-                        // `eval_reduce`) — the *path* is discarded here: it is
-                        // re-derived from scratch against the same fixed `reg`
-                        // at every subsequent step, never carried forward as a
-                        // value flows from one step to the next (see this
-                        // function's own doc comment and `FoldRegister`'s).
+                    &mut |bound| {
+                        let substituted = bound.update;
+                        // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
+                        // (#2161) — `acc_at_register` alone is the previous step's
+                        // `branch_provenance`, a path comparison, which is `false` from
+                        // step 2 onward because UPDATE's whole job is to navigate away
+                        // from the register. jq's actual rule is
+                        // `jv_identical(current_input, value_at_path)`: this step is at
+                        // the register when the accumulator arriving at it is still the
+                        // register's own value, which `register_identical` answers
+                        // directly. `||`, not a replacement — `register_identical`
+                        // demands `snapshot || Null | Bool`, so it alone is `false` for
+                        // step 1 of an object-valued register, where the carried
+                        // provenance is the correct `true`. jq mode only, for the same
+                        // reason `resolve_foreach`'s widening is: on the *write* side an
+                        // un-gated widening turns a refusal into a write where real yq
+                        // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
+                        // v4.53.3).
                         //
-                        // What is carried forward is only whether jq would still
-                        // be holding this exact value at the register — its
-                        // provenance, not its path (#1466), via
-                        // `FoldRegister::branch_provenance` (#1590). Always
-                        // relative to the fold's own *persistent* `reg`, even
-                        // on a step that just used a per-source-element
-                        // register instead — the persistent register is what
-                        // every step *without* its own source-derived register
-                        // (including reduce's own final emission below) is
-                        // still checked against. The widening just above only
-                        // affects what is fed *into* this step's `reg.resolve`;
-                        // this carry-forward still derives the *next* step's
-                        // starting point purely from this step's own output
-                        // branch, same as before #2632.
-                        let last = branches.into_iter().last();
-                        (acc_at_register, acc_snapshot) =
-                            reg.branch_provenance::<S>(last.as_ref(), frame);
-                        acc = last.map(|b| b.value.into_owned());
-                        return Demand::Continue;
+                        // Checked against `acc`'s own *effective* value — `acc.as_ref()`
+                        // unwrapped to `&OwnedValue::Null`, not gated on `acc.is_some()`
+                        // -- because a step whose UPDATE produced zero outputs (`empty`)
+                        // leaves `acc` as `None`, and the very next line already treats
+                        // that the same as a real `Null` accumulator
+                        // (`unwrap_or(OwnedValue::Null)`) when it becomes `acc_input`.
+                        // Skipping the check on `None` missed exactly that case: a
+                        // `null`/`bool` register is unconditionally identical to a
+                        // `null` accumulator via `register_identical`'s kind-based
+                        // clause, `None` included, since there is no pointer/snapshot
+                        // involved for that arm at all. Confirmed live against jq 1.7.1:
+                        // `path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a
+                        // end))` on `{"a":1,"b":null}` is `["b"]`, matching only once
+                        // this is unconditional.
+                        let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
+                        acc_at_register = acc_at_register
+                            || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
+                        let acc_input = acc.take().unwrap_or(OwnedValue::Null);
+                        // Charged once per UPDATE that runs, as value mode charges
+                        // (#695): the element's own charge above covers the first,
+                        // and an alternative whose bind failed ran nothing.
+                        if ran_update {
+                            if let Some(control) = charge_budget(&mut budget, "reduce") {
+                                outcome = Some(StepOutcome::Return(stop_with_escape(
+                                    &mut aborted,
+                                    control,
+                                )));
+                                return Demand::Stop;
+                            }
+                        }
+                        ran_update = true;
+                        match reg.resolve::<S>(
+                            &substituted,
+                            acc_input,
+                            acc_at_register,
+                            &acc_snapshot,
+                            keep,
+                        ) {
+                            Ok(branches) => {
+                                // Only the last output of a multi-output UPDATE
+                                // becomes the new accumulator (same rule as
+                                // `eval_reduce`) — the *path* is discarded here: it is
+                                // re-derived from scratch against the same fixed `reg`
+                                // at every subsequent step, never carried forward as a
+                                // value flows from one step to the next (see this
+                                // function's own doc comment and `FoldRegister`'s).
+                                //
+                                // What is carried forward is only whether jq would still
+                                // be holding this exact value at the register — its
+                                // provenance, not its path (#1466), via
+                                // `FoldRegister::branch_provenance` (#1590). Always
+                                // relative to the fold's own *persistent* `reg`, even
+                                // on a step that just used a per-source-element
+                                // register instead — the persistent register is what
+                                // every step *without* its own source-derived register
+                                // (including reduce's own final emission below) is
+                                // still checked against. The widening just above only
+                                // affects what is fed *into* this step's `reg.resolve`;
+                                // this carry-forward still derives the *next* step's
+                                // starting point purely from this step's own output
+                                // branch, same as before #2632.
+                                let last = branches.into_iter().last();
+                                (acc_at_register, acc_snapshot) =
+                                    reg.branch_provenance::<S>(last.as_ref(), frame);
+                                acc = last.map(|b| b.value.into_owned());
+                                Demand::Continue
+                            }
+                            Err((prefix, e)) => {
+                                // What a retried alternative resumes from. Irrelevant
+                                // once the escape propagates: the whole fork aborts
+                                // here, same as `eval_reduce`'s own `aborted =
+                                // Some(control); break;`, and nothing past this
+                                // element is ever pulled from the source.
+                                let last = prefix.into_iter().last();
+                                (acc_at_register, acc_snapshot) =
+                                    reg.branch_provenance::<S>(last.as_ref(), frame);
+                                acc = last.map(|b| b.value.into_owned());
+                                outcome = Some(if path_alternative_retries(&e, is_last) {
+                                    StepOutcome::Retry
+                                } else {
+                                    StepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
+                                });
+                                Demand::Stop
+                            }
+                        }
+                    },
+                );
+                match outcome {
+                    Some(StepOutcome::Retry) => continue,
+                    Some(StepOutcome::Return(demand)) => return demand,
+                    None => {}
+                }
+                match walk {
+                    // Every branch's UPDATE ran (none, for a zero-output key:
+                    // zero steps, and the alternative still wins).
+                    Flow::Exhausted => return Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        unreachable!(
+                            "the step sink records an outcome before answering Demand::Stop"
+                        ) // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                     }
-                    Err((prefix, e)) => {
-                        // What a retried alternative resumes from. Irrelevant
-                        // once the escape propagates: the whole fork aborts
-                        // here, same as `eval_reduce`'s own `aborted =
-                        // Some(control); break;`, and nothing past this
-                        // element is ever pulled from the source.
-                        let last = prefix.into_iter().last();
-                        (acc_at_register, acc_snapshot) =
-                            reg.branch_provenance::<S>(last.as_ref(), frame);
-                        acc = last.map(|b| b.value.into_owned());
-                        if path_alternative_retries(&e, is_last) {
+                    // A pattern-walk refusal leaves the accumulator untouched
+                    // for the branch it refused (`LOADVN` has not run for it),
+                    // and retries only when it is jq's own verdict
+                    // (`fold_walk_refusal_retries`); a key generator's `break`
+                    // retries like any other, `halt` never.
+                    Flow::Escaped(Control::Error(e)) => {
+                        if !is_last && fold_walk_refusal_retries(&elem, &reg, &e) {
                             continue;
                         }
-                        return stop_with_escape(&mut aborted, e.into());
+                        return stop_with_escape(&mut aborted, Control::Error(e));
+                    }
+                    Flow::Escaped(Control::Break(label)) => {
+                        if !is_last {
+                            continue;
+                        }
+                        return stop_with_escape(&mut aborted, Control::Break(label));
+                    }
+                    Flow::Escaped(Control::Halt(code)) => {
+                        return stop_with_escape(&mut aborted, Control::Halt(code));
                     }
                 }
             }
-            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a bind failure, an UPDATE success, and an UPDATE escape that `path_alternative_retries` never retries on the last alternative (#2979)"
+            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
         if let Some(control) = reclaim_fold_escape(aborted, source_control) {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
@@ -35811,7 +35762,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             }
             // #2979: one attempt per `?//` alternative, in order -- see
             // `resolve_reduce`'s identical loop for jq's backtracking rules
-            // and `bind_fold_alternative` for the bind. `foreach` adds rule 3:
+            // and `each_fold_alternative` for the bind. `foreach` adds rule 3:
             // an escape *after* the state was stored (EXTRACT, the emission's
             // own downstream, or `path()`'s terminal refusal answering
             // `Demand::Stop`) retries from that stored state, and whatever
@@ -35819,10 +35770,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // `try_foreach_step_alternatives` rule.
             //
             // #2676: a destructuring pattern is walked the same way a plain
-            // `. as PATTERN` bind is (#2649's `walk_pattern`) — jq's own
+            // `. as PATTERN` bind is (#2649's walk, `PathPatternMode`) — jq's own
             // compiled matcher performs real, tracked `INDEX` steps here
             // too, checked against whatever `value_at_path` currently is,
-            // exactly as `walk_pattern_step`'s own `path_intact` rule
+            // exactly as `PathPatternMode::step`'s own `path_intact` rule
             // already models. Seeded two ways depending on whether *this*
             // source element is itself register-derived:
             //
@@ -35834,7 +35785,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             //   this element, so path_intact is checked against wherever it
             //   already was — the fold's own persistent `reg` (mirroring the
             //   bare-`$var` `None` arm below) — which only ever admits the
-            //   walk through `walk_pattern_step`'s `null`/`bool` identity
+            //   walk through `PathPatternMode::step`'s `null`/`bool` identity
             //   exception, never through `reg.value == elem.value` (a
             //   structural coincidence, not a real `jv_identical`). Confirmed
             //   live: `path(foreach (null) as {a:$x} (.; .; $x))` is `["a"]`
@@ -35855,12 +35806,23 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             // UPDATE/EXTRACT failure.
             let last_idx = patterns.len() - 1;
             let mut ran_update = false;
-            'alternatives: for (i, pattern) in patterns.iter().enumerate() {
+            for (i, pattern) in patterns.iter().enumerate() {
                 let is_last = i == last_idx;
                 if alternatives.is_some() {
                     clear_nonretryable_stop();
                 }
-                let bound = match bind_fold_alternative::<S>(
+                // #2872: one step per branch of the walk, the state threaded
+                // through, each with the register its branch moved --
+                // `path(foreach .[] as {("c","d"):$q} (.; .; $q))` on
+                // `{"a":{..},"b":{..}}` is `["a","c"]`, `["a","d"]`,
+                // `["b","c"]`, `["b","d"]`. See `resolve_reduce`'s identical
+                // `outcome` slot.
+                enum StepOutcome {
+                    Retry,
+                    Return(Demand),
+                }
+                let mut outcome: Option<StepOutcome> = None;
+                let walk = each_fold_alternative::<S>(
                     pattern,
                     &elem,
                     &reg,
@@ -35869,247 +35831,300 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     extract,
                     alternatives,
                     true,
-                ) {
-                    Ok(bound) => bound,
-                    Err(failure) if failure.retryable && !is_last => continue,
-                    Err(failure) => {
-                        return stop_with_escape(&mut aborted, Control::Error(failure.error))
-                    }
-                };
-                // #2031: see `resolve_reduce`'s identical per-step register
-                // override.
-                let (active_reg, active_at_register) = if let Some(walked_reg) = &bound.walked {
-                    let step_reg = FoldRegister {
-                        path: Rc::clone(&walked_reg.path),
-                        value: walked_reg.value.clone(),
-                        trackable: walked_reg.is_input,
-                        frame: frame.extend(&walked_reg.path),
-                    };
-                    let at_register = register_identical(
-                        &step_reg.value,
-                        &step_reg.frame,
-                        &state,
-                        &state_snapshot,
-                    );
-                    (step_reg, at_register)
-                } else {
-                    match &elem.register_path {
-                        Some(path) => {
-                            let step_reg = FoldRegister {
-                                path: Rc::clone(path),
-                                value: elem.value.clone(),
-                                trackable: true,
-                                frame: frame.extend(path),
-                            };
-                            let at_register = register_identical(
-                                &step_reg.value,
-                                &step_reg.frame,
-                                &state,
-                                &state_snapshot,
-                            );
-                            (step_reg, at_register)
-                        }
-                        // #2161: `state_at_register` cannot come from the previous
-                        // step's `branch_provenance`, which answers "did the last
-                        // UPDATE branch end *at* the register's own path". The
-                        // register is fixed for the whole fold and UPDATE almost
-                        // always navigates away from it, so that answer is `false`
-                        // from step 2 onward and every later step refuses its own
-                        // navigation as untracked -- even though real jq re-enters
-                        // each step from the register, not from the previous step's
-                        // result.
-                        //
-                        // The register's own doc comment already states the model
-                        // ("fixed once per INIT fork -- never advances across
-                        // source-element iterations"): what decides a step is jq's
-                        // `jv_identical(current_input, value_at_path)`, i.e. whether
-                        // the accumulator coming into this step is still the
-                        // register's own value. That is exactly the check the
-                        // `Some(path)` arm above already performs via
-                        // `register_identical`, and it is the missing *second* way
-                        // a step can be at the register.
-                        //
-                        // It has to be an `||` rather than a replacement, because
-                        // neither answer subsumes the other. `register_identical`
-                        // demands `snapshot || Null | Bool` -- structural equality
-                        // is not jq's pointer identity, so a container counts only
-                        // when it is known to be the frozen node itself. So it
-                        // answers `false` for step 1 of an object-valued register,
-                        // where the carried `init_branch.trackable` is the correct
-                        // `true`; and the carried provenance answers `false` from
-                        // step 2 onward, where the identity check is the correct
-                        // `true` for a `null`/`bool` accumulator. Dropping either
-                        // half regresses one of the two shapes below.
-                        //
-                        // **jq mode only**, for exactly the reason
-                        // [`trackable_step_register_eligible`] gates its own
-                        // re-establishment the same way: the new half turns a step
-                        // that would have refused into one that navigates, and on
-                        // the *write* side that is a write where yq no-ops. Live
-                        // against yq v4.53.3, `(null | .a) = 5` on `null` is a
-                        // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
-                        // `a: 5` would be exactly the silent corruption that gate's
-                        // doc comment calls "a worse outcome than the refusal it
-                        // would replace". yq mode therefore stays refuse-only here,
-                        // as it already is for the single-step and carried-forward
-                        // shapes. The carried half is left ungated: it is the
-                        // pre-existing behaviour, not something this change
-                        // introduces.
-                        //
-                        // Live against jq 1.7.1, on `{"a":1}`:
-                        //
-                        // ```console
-                        // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
-                        // ["b","a"]
-                        // ["b","a"]
-                        // ["b","a"]
-                        // ```
-                        //
-                        // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
-                        // `["b","a"]` once and then raises "attempt to access
-                        // element \"a\" of {\"a\":9}" -- the accumulator has stopped
-                        // being the register's value, so step 2 is genuinely
-                        // untracked. Both fall out of the identity check; neither
-                        // falls out of the path comparison.
-                        None => (
-                            FoldRegister {
-                                path: Rc::clone(&reg.path),
-                                value: reg.value.clone(),
-                                trackable: reg.trackable,
-                                frame: reg.frame.clone(),
-                            },
-                            state_at_register
-                                || reg.identical(&state, &state_snapshot, S::TAG == EvalTag::Jq),
-                        ),
-                    }
-                };
-                // See `resolve_reduce`'s identical charge.
-                if ran_update {
-                    if let Some(control) = charge_budget(&mut budget, "foreach") {
-                        return stop_with_escape(&mut aborted, control);
-                    }
-                }
-                ran_update = true;
-                // An UPDATE escape still delivers the outputs before it, as
-                // jq's generator does (`path(foreach (1) as $x (.; (.a,
-                // error("x"))))` prints `["a"]` before raising), and then
-                // either retries from the last of them or propagates.
-                let (update_branches, update_escape) = match active_reg.resolve::<S>(
-                    &bound.update,
-                    core::mem::replace(&mut state, OwnedValue::Null),
-                    active_at_register,
-                    &state_snapshot,
-                    keep,
-                ) {
-                    Ok(branches) => (branches, None),
-                    Err((prefix, e)) => (prefix, Some(e)),
-                };
-                // Each UPDATE output becomes the state *before* it is emitted --
-                // jq stores it first, then runs EXTRACT/emits -- so the last one
-                // carries forward as the next element's state (same rule as
-                // `eval_foreach`), with its provenance (#1590, mirroring
-                // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
-                // ordering is observable once a stop is retried by a source
-                // `?//`: the retried step re-enters from the refused output, not
-                // from the state before it, which is how `path(foreach (1 as $x
-                // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
-                // then . else $v end))` names `1` in jq 1.7.1's second refusal.
-                if update_branches.is_empty() {
-                    (state_at_register, state_snapshot) = reg.branch_provenance::<S>(None, frame);
-                }
-                for update_branch in &update_branches {
-                    // Every output, not just the last: a review pass tried
-                    // carrying only the last one (the others are read straight
-                    // off `update_branch` for EXTRACT/emission, so the clone
-                    // looked like waste) and the oracle disagreed -- once an
-                    // earlier output's emission is refused and the source's
-                    // `?//` retries, the retried step must see *that* output as
-                    // its state, or `path(foreach (1 as $x ?// $y | if $x == 1
-                    // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
-                    // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
-                    // "result 1" -- a wrong accept, the write-side hazard class.
-                    (state_at_register, state_snapshot) =
-                        reg.branch_provenance::<S>(Some(update_branch), frame);
-                    state = update_branch.value.clone().into_owned();
-                    if let Some(ext_expr) = &bound.extract {
-                        if let Some(control) = charge_budget(&mut budget, "foreach") {
-                            return stop_with_escape(&mut aborted, control);
-                        }
-                        let extract_reg = active_reg.advance(update_branch, &bound.update, frame);
-                        // `update_branch` is itself already relocated (it's
-                        // `active_reg.resolve()`'s own output above), and
-                        // `advance()` built `extract_reg` from this same
-                        // branch, so `extract_reg`'s own `branch_provenance` of
-                        // it answers exactly `update_branch`'s `(trackable,
-                        // snapshot)` — structurally, not by a second
-                        // `identical()` check (#1590).
-                        let (extract_at_register, extract_snapshot) =
-                            extract_reg.branch_provenance::<S>(Some(update_branch), frame);
-                        match drain_path_result(
-                            extract_reg.resolve::<S>(
-                                ext_expr,
-                                update_branch.value.clone().into_owned(),
-                                extract_at_register,
-                                &extract_snapshot,
-                                keep,
-                            ),
-                            sink,
-                        ) {
-                            // #2979 rule 3: anything after `STOREV` that escapes --
-                            // EXTRACT, or the terminal `path()` check refusing the
-                            // branch -- retries the next alternative from the
-                            // state already stored, which is `update_branch`.
-                            ResolveFlow::Stopped => {
-                                if is_retryable_stop(is_last) {
-                                    continue 'alternatives;
+                    &mut |bound| {
+                        // #2031: see `resolve_reduce`'s identical per-step register
+                        // override.
+                        let (active_reg, active_at_register) =
+                            if let Some(walked_reg) = &bound.walked {
+                                let step_reg = FoldRegister {
+                                    path: Rc::clone(&walked_reg.path),
+                                    value: walked_reg.value.clone(),
+                                    trackable: walked_reg.is_input,
+                                    frame: frame.extend(&walked_reg.path),
+                                };
+                                let at_register = register_identical(
+                                    &step_reg.value,
+                                    &step_reg.frame,
+                                    &state,
+                                    &state_snapshot,
+                                );
+                                (step_reg, at_register)
+                            } else {
+                                match &elem.register_path {
+                                    Some(path) => {
+                                        let step_reg = FoldRegister {
+                                            path: Rc::clone(path),
+                                            value: elem.value.clone(),
+                                            trackable: true,
+                                            frame: frame.extend(path),
+                                        };
+                                        let at_register = register_identical(
+                                            &step_reg.value,
+                                            &step_reg.frame,
+                                            &state,
+                                            &state_snapshot,
+                                        );
+                                        (step_reg, at_register)
+                                    }
+                                    // #2161: `state_at_register` cannot come from the previous
+                                    // step's `branch_provenance`, which answers "did the last
+                                    // UPDATE branch end *at* the register's own path". The
+                                    // register is fixed for the whole fold and UPDATE almost
+                                    // always navigates away from it, so that answer is `false`
+                                    // from step 2 onward and every later step refuses its own
+                                    // navigation as untracked -- even though real jq re-enters
+                                    // each step from the register, not from the previous step's
+                                    // result.
+                                    //
+                                    // The register's own doc comment already states the model
+                                    // ("fixed once per INIT fork -- never advances across
+                                    // source-element iterations"): what decides a step is jq's
+                                    // `jv_identical(current_input, value_at_path)`, i.e. whether
+                                    // the accumulator coming into this step is still the
+                                    // register's own value. That is exactly the check the
+                                    // `Some(path)` arm above already performs via
+                                    // `register_identical`, and it is the missing *second* way
+                                    // a step can be at the register.
+                                    //
+                                    // It has to be an `||` rather than a replacement, because
+                                    // neither answer subsumes the other. `register_identical`
+                                    // demands `snapshot || Null | Bool` -- structural equality
+                                    // is not jq's pointer identity, so a container counts only
+                                    // when it is known to be the frozen node itself. So it
+                                    // answers `false` for step 1 of an object-valued register,
+                                    // where the carried `init_branch.trackable` is the correct
+                                    // `true`; and the carried provenance answers `false` from
+                                    // step 2 onward, where the identity check is the correct
+                                    // `true` for a `null`/`bool` accumulator. Dropping either
+                                    // half regresses one of the two shapes below.
+                                    //
+                                    // **jq mode only**, for exactly the reason
+                                    // [`trackable_step_register_eligible`] gates its own
+                                    // re-establishment the same way: the new half turns a step
+                                    // that would have refused into one that navigates, and on
+                                    // the *write* side that is a write where yq no-ops. Live
+                                    // against yq v4.53.3, `(null | .a) = 5` on `null` is a
+                                    // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
+                                    // `a: 5` would be exactly the silent corruption that gate's
+                                    // doc comment calls "a worse outcome than the refusal it
+                                    // would replace". yq mode therefore stays refuse-only here,
+                                    // as it already is for the single-step and carried-forward
+                                    // shapes. The carried half is left ungated: it is the
+                                    // pre-existing behaviour, not something this change
+                                    // introduces.
+                                    //
+                                    // Live against jq 1.7.1, on `{"a":1}`:
+                                    //
+                                    // ```console
+                                    // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
+                                    // ["b","a"]
+                                    // ["b","a"]
+                                    // ["b","a"]
+                                    // ```
+                                    //
+                                    // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
+                                    // `["b","a"]` once and then raises "attempt to access
+                                    // element \"a\" of {\"a\":9}" -- the accumulator has stopped
+                                    // being the register's value, so step 2 is genuinely
+                                    // untracked. Both fall out of the identity check; neither
+                                    // falls out of the path comparison.
+                                    None => (
+                                        FoldRegister {
+                                            path: Rc::clone(&reg.path),
+                                            value: reg.value.clone(),
+                                            trackable: reg.trackable,
+                                            frame: reg.frame.clone(),
+                                        },
+                                        state_at_register
+                                            || reg.identical(
+                                                &state,
+                                                &state_snapshot,
+                                                S::TAG == EvalTag::Jq,
+                                            ),
+                                    ),
                                 }
-                                downstream_stopped = true;
+                            };
+                        // See `resolve_reduce`'s identical charge.
+                        if ran_update {
+                            if let Some(control) = charge_budget(&mut budget, "foreach") {
+                                outcome = Some(StepOutcome::Return(stop_with_escape(
+                                    &mut aborted,
+                                    control,
+                                )));
                                 return Demand::Stop;
                             }
-                            ResolveFlow::Escaped(e) => {
-                                if path_alternative_retries(&e, is_last) {
-                                    continue 'alternatives;
-                                }
-                                return stop_with_escape(&mut aborted, e.into());
-                            }
-                            ResolveFlow::Exhausted => {}
                         }
-                    } else {
-                        let emitted = if update_branch.trackable {
-                            PathBranch::new(
-                                update_branch.path.clone(),
-                                update_branch.value.clone(),
-                                true,
-                            )
-                        } else {
-                            // `demoted`, not `untracked`: an emitted value that is
-                            // still a frozen snapshot must stay recognisable to an
-                            // outer register when this `foreach` is nested inside
-                            // another fold (#1466) — same rule as `relocate`'s own
-                            // demotion arm.
-                            PathBranch::demoted(
-                                update_branch.snapshot.clone(),
-                                update_branch.value.clone(),
-                            )
+                        ran_update = true;
+                        // An UPDATE escape still delivers the outputs before it, as
+                        // jq's generator does (`path(foreach (1) as $x (.; (.a,
+                        // error("x"))))` prints `["a"]` before raising), and then
+                        // either retries from the last of them or propagates.
+                        let (update_branches, update_escape) = match active_reg.resolve::<S>(
+                            &bound.update,
+                            core::mem::replace(&mut state, OwnedValue::Null),
+                            active_at_register,
+                            &state_snapshot,
+                            keep,
+                        ) {
+                            Ok(branches) => (branches, None),
+                            Err((prefix, e)) => (prefix, Some(e)),
                         };
-                        if sink(emitted) == Demand::Stop {
-                            if is_retryable_stop(is_last) {
-                                continue 'alternatives;
+                        // Each UPDATE output becomes the state *before* it is emitted --
+                        // jq stores it first, then runs EXTRACT/emits -- so the last one
+                        // carries forward as the next element's state (same rule as
+                        // `eval_foreach`), with its provenance (#1590, mirroring
+                        // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
+                        // ordering is observable once a stop is retried by a source
+                        // `?//`: the retried step re-enters from the refused output, not
+                        // from the state before it, which is how `path(foreach (1 as $x
+                        // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
+                        // then . else $v end))` names `1` in jq 1.7.1's second refusal.
+                        if update_branches.is_empty() {
+                            (state_at_register, state_snapshot) =
+                                reg.branch_provenance::<S>(None, frame);
+                        }
+                        for update_branch in &update_branches {
+                            // Every output, not just the last: a review pass tried
+                            // carrying only the last one (the others are read straight
+                            // off `update_branch` for EXTRACT/emission, so the clone
+                            // looked like waste) and the oracle disagreed -- once an
+                            // earlier output's emission is refused and the source's
+                            // `?//` retries, the retried step must see *that* output as
+                            // its state, or `path(foreach (1 as $x ?// $y | if $x == 1
+                            // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
+                            // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
+                            // "result 1" -- a wrong accept, the write-side hazard class.
+                            (state_at_register, state_snapshot) =
+                                reg.branch_provenance::<S>(Some(update_branch), frame);
+                            state = update_branch.value.clone().into_owned();
+                            if let Some(ext_expr) = &bound.extract {
+                                if let Some(control) = charge_budget(&mut budget, "foreach") {
+                                    outcome = Some(StepOutcome::Return(stop_with_escape(
+                                        &mut aborted,
+                                        control,
+                                    )));
+                                    return Demand::Stop;
+                                }
+                                let extract_reg =
+                                    active_reg.advance(update_branch, &bound.update, frame);
+                                // `update_branch` is itself already relocated (it's
+                                // `active_reg.resolve()`'s own output above), and
+                                // `advance()` built `extract_reg` from this same
+                                // branch, so `extract_reg`'s own `branch_provenance` of
+                                // it answers exactly `update_branch`'s `(trackable,
+                                // snapshot)` — structurally, not by a second
+                                // `identical()` check (#1590).
+                                let (extract_at_register, extract_snapshot) =
+                                    extract_reg.branch_provenance::<S>(Some(update_branch), frame);
+                                match drain_path_result(
+                                    extract_reg.resolve::<S>(
+                                        ext_expr,
+                                        update_branch.value.clone().into_owned(),
+                                        extract_at_register,
+                                        &extract_snapshot,
+                                        keep,
+                                    ),
+                                    sink,
+                                ) {
+                                    // #2979 rule 3: anything after `STOREV` that escapes --
+                                    // EXTRACT, or the terminal `path()` check refusing the
+                                    // branch -- retries the next alternative from the
+                                    // state already stored, which is `update_branch`.
+                                    ResolveFlow::Stopped => {
+                                        outcome = Some(if is_retryable_stop(is_last) {
+                                            StepOutcome::Retry
+                                        } else {
+                                            downstream_stopped = true;
+                                            StepOutcome::Return(Demand::Stop)
+                                        });
+                                        return Demand::Stop;
+                                    }
+                                    ResolveFlow::Escaped(e) => {
+                                        outcome = Some(if path_alternative_retries(&e, is_last) {
+                                            StepOutcome::Retry
+                                        } else {
+                                            StepOutcome::Return(stop_with_escape(
+                                                &mut aborted,
+                                                e.into(),
+                                            ))
+                                        });
+                                        return Demand::Stop;
+                                    }
+                                    ResolveFlow::Exhausted => {}
+                                }
+                            } else {
+                                let emitted = if update_branch.trackable {
+                                    PathBranch::new(
+                                        update_branch.path.clone(),
+                                        update_branch.value.clone(),
+                                        true,
+                                    )
+                                } else {
+                                    // `demoted`, not `untracked`: an emitted value that is
+                                    // still a frozen snapshot must stay recognisable to an
+                                    // outer register when this `foreach` is nested inside
+                                    // another fold (#1466) — same rule as `relocate`'s own
+                                    // demotion arm.
+                                    PathBranch::demoted(
+                                        update_branch.snapshot.clone(),
+                                        update_branch.value.clone(),
+                                    )
+                                };
+                                if sink(emitted) == Demand::Stop {
+                                    outcome = Some(if is_retryable_stop(is_last) {
+                                        StepOutcome::Retry
+                                    } else {
+                                        downstream_stopped = true;
+                                        StepOutcome::Return(Demand::Stop)
+                                    });
+                                    return Demand::Stop;
+                                }
                             }
-                            downstream_stopped = true;
+                        }
+                        if let Some(e) = update_escape {
+                            outcome = Some(if path_alternative_retries(&e, is_last) {
+                                StepOutcome::Retry
+                            } else {
+                                StepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
+                            });
                             return Demand::Stop;
                         }
+                        Demand::Continue
+                    },
+                );
+                match outcome {
+                    Some(StepOutcome::Retry) => continue,
+                    Some(StepOutcome::Return(demand)) => return demand,
+                    None => {}
+                }
+                match walk {
+                    // Every branch's step ran (none, for a zero-output key:
+                    // zero steps, and the alternative still wins).
+                    Flow::Exhausted => return Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        unreachable!(
+                            "the step sink records an outcome before answering Demand::Stop"
+                        ) // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                    }
+                    // See `resolve_reduce`'s identical arms.
+                    Flow::Escaped(Control::Error(e)) => {
+                        if !is_last && fold_walk_refusal_retries(&elem, &reg, &e) {
+                            continue;
+                        }
+                        return stop_with_escape(&mut aborted, Control::Error(e));
+                    }
+                    Flow::Escaped(Control::Break(label)) => {
+                        if !is_last {
+                            continue;
+                        }
+                        return stop_with_escape(&mut aborted, Control::Break(label));
+                    }
+                    Flow::Escaped(Control::Halt(code)) => {
+                        return stop_with_escape(&mut aborted, Control::Halt(code));
                     }
                 }
-                if let Some(e) = update_escape {
-                    if path_alternative_retries(&e, is_last) {
-                        continue;
-                    }
-                    return stop_with_escape(&mut aborted, e.into());
-                }
-                return Demand::Continue;
             }
-            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- `is_retryable_stop` and `path_alternative_retries` never retry on the last alternative (#2979)"
+            unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
         // The source stream's own trailing control belongs to this fork
         // too, applied after its own inner drive — mirrors `eval_foreach`'s
@@ -40261,8 +40276,8 @@ where
 
 /// Adapt an owned `(name, value)` binding list into the `(&str,
 /// &OwnedValue)` pairs [`substitute_vars`](substitute_vars) needs -- pattern
-/// bindings are stored owned (`extract_pattern_bindings` clones each name
-/// and value out of the matched document), while `substitute_vars`'s public
+/// bindings are stored owned (the matcher, `each_pattern_binding_set`, clones
+/// each name and value out of the matched document), while `substitute_vars`'s public
 /// contract takes references, matching its other caller
 /// (`--arg`/`--argjson` substitution, which already holds refs into
 /// `EvalContext`). Named so this one-line, logic-free projection has a
@@ -41009,79 +41024,119 @@ pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
 /// reaches UPDATE) -- each run is a genuine extra evaluator invocation
 /// (#695).
 ///
-/// Takes each alternative's UPDATE *already* destructured and substituted
-/// (`substituted_updates`, one entry per pattern, `Err` if that pattern
-/// failed to match `input_val`) rather than the raw `patterns`/`update` --
-/// this is independent of any accumulator/INIT fork, so the caller hoists
-/// it once per input element outside the INIT-fork loop, restoring the
-/// pre-#1365 single-pattern code's own #695 hoist (which a first version
-/// of this function lost by redoing the bind on every call: code review
-/// flagged this as an efficiency regression for every ordinary,
-/// non-`?//` `reduce`/`foreach` call with more than one INIT output).
+/// Binds `patterns` against `input_val` itself (#2872), one fold step per
+/// binding set the matcher completes: a computed key's outputs are separate
+/// steps with the accumulator threaded through, so the per-element
+/// substitution matrix earlier versions hoisted (#695, #1365) has no
+/// single row left to hoist. Since #2899 the source is re-driven per INIT
+/// fork anyway, so nothing is bound more than once per element per fork.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `reduce_forks`
 fn try_reduce_step_alternatives<S: EvalSemantics>(
-    substituted_updates: &[Result<Expr, EvalError>],
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    update: &Expr,
+    input_val: &OwnedValue,
     acc_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
     resolver_free: bool,
 ) -> (OwnedValue, Option<Control>) {
-    let last_idx = substituted_updates.len() - 1;
+    let last_idx = patterns.len() - 1;
+    let invert_dedup = patterns.len() > 1;
     let mut state = acc_input;
 
-    for (i, substituted) in substituted_updates.iter().enumerate() {
+    for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let substituted = match substituted {
-            Ok(expr) => expr,
-            Err(e) => {
-                if is_last {
-                    return (state, Some(Control::Error(e.clone())));
-                }
-                continue;
-            }
-        };
-
-        if let Some(control) = charge_budget(budget, "reduce") {
-            return (state, Some(control));
+        // #2872: one UPDATE run per binding set the matcher completes, the
+        // accumulator threaded from step to step -- see
+        // [`try_foreach_step_alternatives`]'s identical shape for the
+        // fan-out and retry rules.
+        enum StepOutcome {
+            Retry,
+            Return(Control),
         }
+        let mut outcome: Option<StepOutcome> = None;
+        let walk =
+            each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+                let substituted = substitute_fold_step(update, bindings, all_var_names);
 
-        // #2157: `state` is unconditionally overwritten by the very next
-        // statement regardless of which branch runs, so there is no live
-        // borrow of its old value to preserve -- the one call site where
-        // `fold_step_each` can move `state` straight into `arith_combine`
-        // instead of `eval_owned_expr_fork`'s own `&OwnedValue`-forced
-        // clone.
-        //
-        // #2668: `reduce`'s UPDATE never lets a downstream consumer stop it
-        // early -- there is no per-step visible output for one to stop
-        // after, unlike `foreach`'s EXTRACT (confirmed live: reduce's own
-        // UPDATE position matches jq exactly both before and after this
-        // fix, only `reduce`'s INIT was the affected position) -- so
-        // `on_update` here always asks for more; it exists only to capture
-        // UPDATE's last delivered output, the same value the old
-        // `update_vals.into_iter().last()` read off the collected `Vec`.
-        let mut last_val: Option<OwnedValue> = None;
-        let flow = fold_step_each::<S>(substituted, state, optional, resolver_free, &mut |v| {
-            last_val = Some(v);
-            Demand::Continue
-        });
-        // Unconditional, mirroring the pre-#1365 single-pattern fold's own
-        // "acc = update_vals.into_iter().last()" -- run even when `flow` is
-        // `Escaped`, since a retried alternative resumes from exactly this
-        // value (see doc comment above).
-        state = last_val.unwrap_or(OwnedValue::Null);
-        match flow {
+                if let Some(control) = charge_budget(budget, "reduce") {
+                    outcome = Some(StepOutcome::Return(control));
+                    return Demand::Stop;
+                }
+
+                // #2157: `state` is unconditionally overwritten by the very next
+                // statement regardless of which branch runs, so there is no live
+                // borrow of its old value to preserve -- the one call site where
+                // `fold_step_each` can move `state` straight into `arith_combine`
+                // instead of `eval_owned_expr_fork`'s own `&OwnedValue`-forced
+                // clone.
+                //
+                // #2668: `reduce`'s UPDATE never lets a downstream consumer stop it
+                // early -- there is no per-step visible output for one to stop
+                // after, unlike `foreach`'s EXTRACT (confirmed live: reduce's own
+                // UPDATE position matches jq exactly both before and after this
+                // fix, only `reduce`'s INIT was the affected position) -- so
+                // `on_update` here always asks for more; it exists only to capture
+                // UPDATE's last delivered output, the same value the old
+                // `update_vals.into_iter().last()` read off the collected `Vec`.
+                let mut last_val: Option<OwnedValue> = None;
+                let step_state = core::mem::replace(&mut state, OwnedValue::Null);
+                let flow = fold_step_each::<S>(
+                    &substituted,
+                    step_state,
+                    optional,
+                    resolver_free,
+                    &mut |v| {
+                        last_val = Some(v);
+                        Demand::Continue
+                    },
+                );
+                // Unconditional, mirroring the pre-#1365 single-pattern fold's own
+                // "acc = update_vals.into_iter().last()" -- run even when `flow` is
+                // `Escaped`, since a retried alternative resumes from exactly this
+                // value (see doc comment above).
+                state = last_val.unwrap_or(OwnedValue::Null);
+                match flow {
+                    Flow::Exhausted => Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        unreachable!("on_update above always answers Demand::Continue")
+                    }
+                    // #1570: routed through the shared predicate instead of a
+                    // hand-rolled copy of the same match (also used by
+                    // `try_foreach_step_alternatives`'s retries and
+                    // `each_pattern_alternatives`) -- see its own doc comment for
+                    // the #1620/#1660 decode-failure exclusion this absorbs
+                    // unchanged.
+                    Flow::Escaped(control) => {
+                        outcome = Some(if is_retryable_control(&control, is_last) {
+                            StepOutcome::Retry
+                        } else {
+                            StepOutcome::Return(control)
+                        });
+                        Demand::Stop
+                    }
+                }
+            });
+        match outcome {
+            Some(StepOutcome::Retry) => continue,
+            Some(StepOutcome::Return(control)) => return (state, Some(control)),
+            None => {}
+        }
+        match walk {
+            // Every step ran (none, for a zero-output key: the accumulator
+            // is untouched, and the alternative still wins).
             Flow::Exhausted => return (state, None),
             Flow::Stopped { .. } => {
-                unreachable!("on_update above always answers Demand::Continue")
+                unreachable!("the step sink records an outcome before answering Demand::Stop")
+                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
-            // #1570: routed through the shared predicate instead of a
-            // hand-rolled copy of the same match (also used by
-            // `try_foreach_step_alternatives`'s two retries and
-            // `try_pattern_alternatives`'s own `Partial` arm) -- see its own
-            // doc comment for the #1620/#1660 decode-failure exclusion this
-            // absorbs unchanged (not currently reachable through any live
-            // input here, kept for parity with the sibling functions).
+            // A pattern-match failure leaves `state` where the steps already
+            // run left it (untouched when none ran, since UPDATE never ran)
+            // and falls through unless this is the last alternative; so does
+            // the key generator's own error/break; `halt` and an uncatchable
+            // error propagate.
             Flow::Escaped(control) => {
                 if is_retryable_control(&control, is_last) {
                     continue;
@@ -41092,7 +41147,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     }
 
     unreachable!(
-        "substituted_updates is non-empty by construction; the loop always returns on its last iteration"
+        "patterns is non-empty by construction; the loop always returns on its last iteration"
     )
 }
 
@@ -42293,7 +42348,7 @@ fn detach_from_temp_document<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// EXTRACT only ever evaluate fully-materialized `OwnedValue`s here, never a
 /// cursor over the original document's raw bytes. Kept for parity and as a
 /// guard against a future change reopening a path to one.
-fn is_retryable_control(control: &Control, is_last: bool) -> bool {
+pub(crate) fn is_retryable_control(control: &Control, is_last: bool) -> bool {
     match control {
         // #2132: the shared value-position predicate -- a resource cap is
         // no more a reason to try the next alternative than a decode
@@ -42682,240 +42737,287 @@ pub(crate) fn clear_nonretryable_stop() {
 /// against was captured live, and none of them needed the two rules to
 /// differ.
 ///
-/// Takes each alternative already destructured and substituted
-/// (`substituted_steps`, one `(UPDATE, EXTRACT)` pair per pattern, `Err`
-/// if that pattern failed to match `input_val`) rather than the raw
-/// `patterns`/`update`/`extract` -- same reasoning as
-/// [`try_reduce_step_alternatives`]'s own matrix parameter: this is
-/// independent of any accumulator/INIT fork, so the caller hoists it once
-/// per input element outside the INIT-fork loop (#695).
-pub(crate) type ForeachStepAlternative = Result<(Expr, Option<Expr>), EvalError>;
-
+/// Binds `patterns` against `input_val` itself (#2872), one fold step per
+/// binding set the matcher completes -- see [`try_reduce_step_alternatives`]
+/// for why the pre-#2872 per-element substitution matrix is gone.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `foreach_forks`
 fn try_foreach_step_alternatives<S: EvalSemantics>(
-    substituted_steps: &[ForeachStepAlternative],
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    update: &Expr,
+    extract: Option<&Expr>,
+    input_val: &OwnedValue,
     state_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
     resolver_free: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> (OwnedValue, Flow) {
-    let last_idx = substituted_steps.len() - 1;
+    let last_idx = patterns.len() - 1;
+    let invert_dedup = patterns.len() > 1;
     let mut state = state_input;
 
-    'alternatives: for (i, step) in substituted_steps.iter().enumerate() {
+    for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let (substituted_update, substituted_extract) = match step {
-            Ok(pair) => pair,
-            Err(e) => {
-                if is_last {
-                    return (state, Flow::Escaped(Control::Error(e.clone())));
-                }
-                continue;
-            }
-        };
-
-        // #2180 WP3 review: one attempt, one clear -- see
-        // [`each_pattern_alternatives`]'s identical call and
-        // [`nonretryable_stop`] for why the flag is cleared here rather than
-        // by whoever set it.
-        clear_nonretryable_stop();
-
-        if let Some(control) = charge_budget(budget, "foreach") {
-            return (state, Flow::Escaped(control));
+        // #2872: one fold step per binding set the matcher completes, the
+        // state threaded from step to step -- a computed key's outputs are
+        // separate steps (`[foreach (.,.) as {("a","b"):$q} (0; .+$q)]` on
+        // `{"a":1,"b":2}` is `[1,3,4,6]`), a zero-output key is zero steps
+        // and still wins the chain, and a key error/break after k steps
+        // retries the next alternative from the state those steps left
+        // (`[label $o | reduce . as {("a", break $o):$q} ?// $r (0; .+1)]`
+        // is `[2]`; same rule for `foreach`). The alternative's verdict is
+        // recorded in `outcome`; each step's own in `step_outcome`.
+        enum AlternativeOutcome {
+            Retry,
+            Return(Flow),
         }
+        let mut outcome: Option<AlternativeOutcome> = None;
+        let walk =
+            each_pattern_binding_set::<S>(pattern, input_val, invert_dedup, &mut |bindings| {
+                let substituted_update = substitute_fold_step(update, bindings, all_var_names);
+                let substituted_extract =
+                    extract.map(|ext| substitute_fold_step(ext, bindings, all_var_names));
 
-        // #2668: EXTRACT (or the implicit identity when omitted) now runs
-        // from *inside* `on_update`, called once per UPDATE output as it is
-        // produced rather than after every output has been collected into a
-        // `Vec` -- so a consumer's `Demand::Stop` (from EXTRACT's own
-        // generator, or the implicit-identity `sink` call) reaches UPDATE's
-        // own generator before it produces anything further, and with it
-        // any `?//` bind inside UPDATE (see `fold_step_each`'s doc comment).
-        // Live against jq 1.7.1, input `1`:
-        // `[first(foreach (1) as $v (0; . + (1 as $x ?// $y | 1)))]` is
-        // `[1,1]` (UPDATE's own `?//` retries once on the consumer's stop),
-        // matching the identical rule EXTRACT's own chain already had
-        // (`[first(foreach (1) as $x (0; .+1; (1 as $a ?// $b | .)))]` is
-        // `[1,1,2,2]`).
-        //
-        // `on_update` can only answer `Demand`, so the richer verdict this
-        // loop needs (which alternative to retry, with what state, or which
-        // terminal `Flow` to return) is stashed in `outcome` -- the same
-        // out-of-band pattern [`foreach_forks`]'s own `ended` uses for
-        // exactly the same reason (a per-element sink can't itself `continue
-        // 'alternatives` across the closure boundary). `last_update` tracks
-        // the surviving accumulator when every EXTRACT call this attempt
-        // made stayed `Flow::Exhausted` -- `fold_step_each`'s own returned
-        // `Flow` in that case just reports "UPDATE's generator ran to
-        // completion/errored/produced nothing," never `Stopped` (nothing
-        // ever answered `Demand::Stop`), which is why the fallback match
-        // below never reaches the `Flow::Stopped` arm.
-        enum StepOutcome {
-            Retry(OwnedValue),
-            Return(OwnedValue, Flow),
-        }
-        let mut outcome: Option<StepOutcome> = None;
-        let mut last_update: Option<OwnedValue> = None;
+                // #2180 WP3 review: one attempt, one clear -- see
+                // [`each_pattern_alternatives`]'s identical call and
+                // [`nonretryable_stop`] for why the flag is cleared here rather than
+                // by whoever set it.
+                clear_nonretryable_stop();
 
-        let on_update = &mut |update_val: OwnedValue| -> Demand {
-            // EXTRACT's own `Flow`, computed the same way whether EXTRACT is
-            // written or implicit, so the arms below decide once rather than
-            // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
-            // branch used to carry its own copy of the retry rule).
-            let ext_flow = match substituted_extract {
-                Some(ext_expr) => {
-                    // Charged separately from the UPDATE bind above: a single
-                    // UPDATE can fan out into far more EXTRACT evals than
-                    // there are source elements (#695), and that width needs
-                    // its own accounting. Conditional on EXTRACT being
-                    // present, exactly as before -- the implicit-identity
-                    // form performs no extra evaluation to charge for.
-                    if let Some(control) = charge_budget(budget, "foreach") {
-                        // `update_val` is also the state a `?//` retry at
-                        // this same position would resume from (#1458), but
-                        // a budget cap is never retryable -- straight to
-                        // the terminal, same as the pre-#2668 direct
-                        // `return` here.
-                        outcome = Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
-                        return Demand::Stop;
+                if let Some(control) = charge_budget(budget, "foreach") {
+                    outcome = Some(AlternativeOutcome::Return(Flow::Escaped(control)));
+                    return Demand::Stop;
+                }
+
+                // #2668: EXTRACT (or the implicit identity when omitted) now runs
+                // from *inside* `on_update`, called once per UPDATE output as it is
+                // produced rather than after every output has been collected into a
+                // `Vec` -- so a consumer's `Demand::Stop` (from EXTRACT's own
+                // generator, or the implicit-identity `sink` call) reaches UPDATE's
+                // own generator before it produces anything further, and with it
+                // any `?//` bind inside UPDATE (see `fold_step_each`'s doc comment).
+                // Live against jq 1.7.1, input `1`:
+                // `[first(foreach (1) as $v (0; . + (1 as $x ?// $y | 1)))]` is
+                // `[1,1]` (UPDATE's own `?//` retries once on the consumer's stop),
+                // matching the identical rule EXTRACT's own chain already had
+                // (`[first(foreach (1) as $x (0; .+1; (1 as $a ?// $b | .)))]` is
+                // `[1,1,2,2]`).
+                //
+                // `on_update` can only answer `Demand`, so the richer verdict this
+                // loop needs (which alternative to retry, with what state, or which
+                // terminal `Flow` to return) is stashed in `outcome` -- the same
+                // out-of-band pattern [`foreach_forks`]'s own `ended` uses for
+                // exactly the same reason (a per-element sink can't itself `continue
+                // 'alternatives` across the closure boundary). `last_update` tracks
+                // the surviving accumulator when every EXTRACT call this attempt
+                // made stayed `Flow::Exhausted` -- `fold_step_each`'s own returned
+                // `Flow` in that case just reports "UPDATE's generator ran to
+                // completion/errored/produced nothing," never `Stopped` (nothing
+                // ever answered `Demand::Stop`), which is why the fallback match
+                // below never reaches the `Flow::Stopped` arm.
+                enum StepOutcome {
+                    Retry(OwnedValue),
+                    Return(OwnedValue, Flow),
+                }
+                let mut step_outcome: Option<StepOutcome> = None;
+                let mut last_update: Option<OwnedValue> = None;
+
+                let on_update = &mut |update_val: OwnedValue| -> Demand {
+                    // EXTRACT's own `Flow`, computed the same way whether EXTRACT is
+                    // written or implicit, so the arms below decide once rather than
+                    // twice (#2180 WP3 review: the `else if sink(..) == Demand::Stop`
+                    // branch used to carry its own copy of the retry rule).
+                    let ext_flow = match &substituted_extract {
+                        Some(ext_expr) => {
+                            // Charged separately from the UPDATE bind above: a single
+                            // UPDATE can fan out into far more EXTRACT evals than
+                            // there are source elements (#695), and that width needs
+                            // its own accounting. Conditional on EXTRACT being
+                            // present, exactly as before -- the implicit-identity
+                            // form performs no extra evaluation to charge for.
+                            if let Some(control) = charge_budget(budget, "foreach") {
+                                // `update_val` is also the state a `?//` retry at
+                                // this same position would resume from (#1458), but
+                                // a budget cap is never retryable -- straight to
+                                // the terminal, same as the pre-#2668 direct
+                                // `return` here.
+                                step_outcome =
+                                    Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                                return Demand::Stop;
+                            }
+                            // #2180 WP3: EXTRACT is *driven* through the
+                            // demand-forwarding [`eval_each_owned`] rather than
+                            // collected by `eval_owned_expr_fork` and spliced in
+                            // afterwards, so a wrapping consumer's [`Demand::Stop`]
+                            // reaches EXTRACT's own generator -- and, with it, any
+                            // `?//` bind inside it. Live against jq 1.7.1, input `1`:
+                            // `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?//
+                            // $b | .)))]` is `[1,1,2,2]` (EXTRACT's own chain answers
+                            // twice per foreach alternative), and
+                            // `first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))`
+                            // writes nothing to stderr -- both were `[1]` and a
+                            // leaked `E` while this call collected first and pushed
+                            // afterwards.
+                            //
+                            // The outputs still reach the consumer before this step's
+                            // own terminator does, which is what `outputs.extend(..)`
+                            // before reading `ext_control` used to encode
+                            // positionally (#494): here they are simply already
+                            // pushed by the time the `Flow` is inspected.
+                            if resolver_free {
+                                eval_each_owned_bridged::<S>(ext_expr, &update_val, optional, sink)
+                            } else {
+                                eval_each_owned::<S>(ext_expr, &update_val, optional, sink)
+                            }
+                        }
+                        // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
+                        // $x (init; update)` to `(init; update; .)`), so the push
+                        // lands at the identical position and every arm below applies
+                        // unchanged -- live-verified, `[first(foreach (1) as $x ?//
+                        // $y (0;.+1))]` is `[1,2]`, the same answer the explicit-`.`
+                        // spelling gives. The clone is the one this loop cannot
+                        // remove: the value is simultaneously this step's output and
+                        // its next accumulator.
+                        None => match sink(update_val.clone()) {
+                            Demand::Continue => Flow::Exhausted,
+                            Demand::Stop => Flow::Stopped { pending: None },
+                        },
+                    };
+                    match ext_flow {
+                        Flow::Exhausted => {
+                            last_update = Some(update_val);
+                            Demand::Continue
+                        }
+                        // The stop is jq's escaping `break` in different clothes,
+                        // so it takes `Control::Break`'s own rule at this exact
+                        // position -- retry the next alternative, seeded with the
+                        // failed EXTRACT call's own input, not a fresh state
+                        // ([`is_retryable_stop`], the arm below, and #1519's
+                        // lesson). That is why
+                        // `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is
+                        // `[1,2]` in jq 1.7.1 and not `[1,1]`: UPDATE ran once on
+                        // state `0` giving `1`, and the retried alternative runs
+                        // UPDATE again on that `1`, giving `2`.
+                        Flow::Stopped { .. } if is_retryable_stop(is_last) => {
+                            step_outcome = Some(StepOutcome::Retry(update_val));
+                            Demand::Stop
+                        }
+                        // Nothing left to fall through to: the stop is this
+                        // step's terminator, and `update_val` is the accumulator
+                        // it leaves behind (see the budget arm above).
+                        Flow::Stopped { .. } => {
+                            step_outcome = Some(StepOutcome::Return(
+                                update_val,
+                                Flow::Stopped { pending: None },
+                            ));
+                            Demand::Stop
+                        }
+                        // #1458: real jq retries here too, but with a state-
+                        // threading rule found nowhere else in this file -- the
+                        // *next* alternative's UPDATE resumes from this failed
+                        // EXTRACT call's own input (`update_val`), not the pre-
+                        // attempt state and not `update_vals.last()` (this same
+                        // attempt's own final UPDATE output, which may not even
+                        // be `update_val` -- the failure can land on an earlier
+                        // one while later ones sit unprocessed). Every subsequent
+                        // UPDATE output this attempt would have gone on to produce,
+                        // and this attempt's own trailing terminator (if UPDATE
+                        // itself also partially failed), are both abandoned in
+                        // favor of the next alternative's fresh UPDATE-then-EXTRACT
+                        // run -- matching the doc comment's oracle repro, where the
+                        // retry re-runs UPDATE wholesale rather than resuming this
+                        // attempt's own remaining outputs. `on_update` answering
+                        // `Demand::Stop` here is exactly what stops UPDATE's own
+                        // generator from producing those later outputs at all.
+                        Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
+                            step_outcome = Some(StepOutcome::Retry(update_val));
+                            Demand::Stop
+                        }
+                        // Same accumulator-on-abort reasoning as the budget-check
+                        // return above.
+                        Flow::Escaped(control) => {
+                            step_outcome =
+                                Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
+                            Demand::Stop
+                        }
                     }
-                    // #2180 WP3: EXTRACT is *driven* through the
-                    // demand-forwarding [`eval_each_owned`] rather than
-                    // collected by `eval_owned_expr_fork` and spliced in
-                    // afterwards, so a wrapping consumer's [`Demand::Stop`]
-                    // reaches EXTRACT's own generator -- and, with it, any
-                    // `?//` bind inside it. Live against jq 1.7.1, input `1`:
-                    // `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?//
-                    // $b | .)))]` is `[1,1,2,2]` (EXTRACT's own chain answers
-                    // twice per foreach alternative), and
-                    // `first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))`
-                    // writes nothing to stderr -- both were `[1]` and a
-                    // leaked `E` while this call collected first and pushed
-                    // afterwards.
-                    //
-                    // The outputs still reach the consumer before this step's
-                    // own terminator does, which is what `outputs.extend(..)`
-                    // before reading `ext_control` used to encode
-                    // positionally (#494): here they are simply already
-                    // pushed by the time the `Flow` is inspected.
-                    if resolver_free {
-                        eval_each_owned_bridged::<S>(ext_expr, &update_val, optional, sink)
-                    } else {
-                        eval_each_owned::<S>(ext_expr, &update_val, optional, sink)
+                };
+
+                let step_state = core::mem::replace(&mut state, OwnedValue::Null);
+                let update_flow = fold_step_each::<S>(
+                    &substituted_update,
+                    step_state,
+                    optional,
+                    resolver_free,
+                    on_update,
+                );
+
+                match step_outcome {
+                    Some(StepOutcome::Retry(update_val)) => {
+                        state = update_val;
+                        outcome = Some(AlternativeOutcome::Retry);
+                        Demand::Stop
                     }
-                }
-                // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as
-                // $x (init; update)` to `(init; update; .)`), so the push
-                // lands at the identical position and every arm below applies
-                // unchanged -- live-verified, `[first(foreach (1) as $x ?//
-                // $y (0;.+1))]` is `[1,2]`, the same answer the explicit-`.`
-                // spelling gives. The clone is the one this loop cannot
-                // remove: the value is simultaneously this step's output and
-                // its next accumulator.
-                None => match sink(update_val.clone()) {
-                    Demand::Continue => Flow::Exhausted,
-                    Demand::Stop => Flow::Stopped { pending: None },
-                },
-            };
-            match ext_flow {
-                Flow::Exhausted => {
-                    last_update = Some(update_val);
-                    Demand::Continue
-                }
-                // The stop is jq's escaping `break` in different clothes,
-                // so it takes `Control::Break`'s own rule at this exact
-                // position -- retry the next alternative, seeded with the
-                // failed EXTRACT call's own input, not a fresh state
-                // ([`is_retryable_stop`], the arm below, and #1519's
-                // lesson). That is why
-                // `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is
-                // `[1,2]` in jq 1.7.1 and not `[1,1]`: UPDATE ran once on
-                // state `0` giving `1`, and the retried alternative runs
-                // UPDATE again on that `1`, giving `2`.
-                Flow::Stopped { .. } if is_retryable_stop(is_last) => {
-                    outcome = Some(StepOutcome::Retry(update_val));
-                    Demand::Stop
-                }
-                // Nothing left to fall through to: the stop is this
-                // step's terminator, and `update_val` is the accumulator
-                // it leaves behind (see the budget arm above).
-                Flow::Stopped { .. } => {
-                    outcome = Some(StepOutcome::Return(
-                        update_val,
-                        Flow::Stopped { pending: None },
-                    ));
-                    Demand::Stop
-                }
-                // #1458: real jq retries here too, but with a state-
-                // threading rule found nowhere else in this file -- the
-                // *next* alternative's UPDATE resumes from this failed
-                // EXTRACT call's own input (`update_val`), not the pre-
-                // attempt state and not `update_vals.last()` (this same
-                // attempt's own final UPDATE output, which may not even
-                // be `update_val` -- the failure can land on an earlier
-                // one while later ones sit unprocessed). Every subsequent
-                // UPDATE output this attempt would have gone on to produce,
-                // and this attempt's own trailing terminator (if UPDATE
-                // itself also partially failed), are both abandoned in
-                // favor of the next alternative's fresh UPDATE-then-EXTRACT
-                // run -- matching the doc comment's oracle repro, where the
-                // retry re-runs UPDATE wholesale rather than resuming this
-                // attempt's own remaining outputs. `on_update` answering
-                // `Demand::Stop` here is exactly what stops UPDATE's own
-                // generator from producing those later outputs at all.
-                Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
-                    outcome = Some(StepOutcome::Retry(update_val));
-                    Demand::Stop
-                }
-                // Same accumulator-on-abort reasoning as the budget-check
-                // return above.
-                Flow::Escaped(control) => {
-                    outcome = Some(StepOutcome::Return(update_val, Flow::Escaped(control)));
-                    Demand::Stop
-                }
-            }
-        };
-
-        let update_flow = fold_step_each::<S>(
-            substituted_update,
-            state,
-            optional,
-            resolver_free,
-            on_update,
-        );
-
-        match outcome {
-            Some(StepOutcome::Retry(update_val)) => {
-                state = update_val;
-                continue 'alternatives;
-            }
-            Some(StepOutcome::Return(update_val, flow)) => {
-                return (update_val, flow);
-            }
-            // `on_update` was never called with an output that led it to
-            // answer `Demand::Stop` -- either because UPDATE produced no
-            // output at all (an `optional`-suppressed combine failure, or a
-            // general-path stream with zero outputs), or every output it did
-            // produce ran through EXTRACT and stayed `Flow::Exhausted`. Either
-            // way `update_flow` (UPDATE's own generator terminal) is the
-            // fallback, exactly mirroring the old `update_control` check.
-            None => {
-                state = last_update.take().unwrap_or(OwnedValue::Null);
-                match update_flow {
-                    Flow::Exhausted => return (state, Flow::Exhausted),
-                    Flow::Stopped { .. } => unreachable!(
-                        "on_update always records an `outcome` before answering Demand::Stop"
+                    Some(StepOutcome::Return(update_val, flow)) => {
+                        state = update_val;
+                        outcome = Some(AlternativeOutcome::Return(flow));
+                        Demand::Stop
+                    }
+                    // `on_update` was never called with an output that led it to
+                    // answer `Demand::Stop` -- either because UPDATE produced no
+                    // output at all (an `optional`-suppressed combine failure, or a
+                    // general-path stream with zero outputs), or every output it did
+                    // produce ran through EXTRACT and stayed `Flow::Exhausted`. Either
+                    // way `update_flow` (UPDATE's own generator terminal) is the
+                    // fallback, exactly mirroring the old `update_control` check.
+                    None => {
+                        state = last_update.take().unwrap_or(OwnedValue::Null);
+                        match update_flow {
+                            Flow::Exhausted => Demand::Continue,
+                            Flow::Stopped { .. } => unreachable!(
+                        "on_update always records a `step_outcome` before answering Demand::Stop"
                     ),
-                    Flow::Escaped(control) if is_retryable_control(&control, is_last) => continue,
-                    Flow::Escaped(control) => return (state, Flow::Escaped(control)),
+                            Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
+                                outcome = Some(AlternativeOutcome::Retry);
+                                Demand::Stop
+                            }
+                            Flow::Escaped(control) => {
+                                outcome = Some(AlternativeOutcome::Return(Flow::Escaped(control)));
+                                Demand::Stop
+                            }
+                        }
+                    }
                 }
+            });
+        match outcome {
+            Some(AlternativeOutcome::Retry) => continue,
+            Some(AlternativeOutcome::Return(flow)) => return (state, flow),
+            None => {}
+        }
+        match walk {
+            // Every step ran to completion (none, for a zero-output key).
+            Flow::Exhausted => return (state, Flow::Exhausted),
+            Flow::Stopped { .. } => {
+                unreachable!("the step sink records an outcome before answering Demand::Stop")
+                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+            }
+            // A pattern-match failure (a step's error), or the key
+            // generator's own trailing error/break/halt after the steps its
+            // earlier outputs ran: the state those steps left is what the
+            // next alternative resumes from, and what an abort hands back.
+            Flow::Escaped(control) => {
+                if is_retryable_control(&control, is_last) {
+                    continue;
+                }
+                return (state, Flow::Escaped(control));
             }
         }
     }
 
     unreachable!(
-        "substituted_steps is non-empty by construction; the loop always returns on its last iteration"
+        "patterns is non-empty by construction; the loop always returns on its last iteration"
     )
 }
 
@@ -43102,49 +43204,28 @@ pub(crate) fn pattern_alternatives_var_names(patterns: &[Pattern]) -> Vec<String
     all_var_names
 }
 
-/// Destructure one source element against every `?//` alternative and
-/// substitute the resulting bindings into UPDATE/EXTRACT — one
-/// [`ForeachStepAlternative`] per pattern, `Err` where that pattern failed to
-/// match.
-///
-/// Lifted out of the pre-#2180 substitution-matrix build so the
-/// demand-driven path, which sees source elements one at a time and can
-/// therefore never hoist a whole matrix, could share it (#768/#822). WP3's
-/// review then drove the eager path the same way, so the matrix form is gone
-/// entirely and this is the only spelling left.
-pub(crate) fn substitute_foreach_steps<S: EvalSemantics>(
-    patterns: &[Pattern],
+/// Substitute one binding set into a fold's UPDATE or EXTRACT: the bound
+/// names, plus `null` for every name only *another* `?//` alternative binds
+/// (#1365/#1368 -- bound and null-filled names never overlap, since the
+/// filter excludes anything `bindings` already covers, so one
+/// `substitute_vars` call does both). Shared by both fold drivers; since
+/// #2872 it runs once per binding set the matcher completes, so there is
+/// no per-element substitution matrix left to hoist anywhere.
+pub(crate) fn substitute_fold_step(
+    expr: &Expr,
+    bindings: &[(String, OwnedValue)],
     all_var_names: &[String],
-    update: &Expr,
-    extract: Option<&Expr>,
-    input_val: &OwnedValue,
-    invert_dedup: bool,
-) -> Vec<ForeachStepAlternative> {
-    patterns
-        .iter()
-        .map(|pattern| {
-            let bindings = extract_single_pattern_binding::<S>(pattern, input_val, invert_dedup)?;
-            // #1368: bound and null-filled names never overlap (the
-            // filter below excludes anything `bindings` already
-            // covers), so fold order between the two groups can't
-            // matter -- one `substitute_vars` call via `as_var_refs`
-            // replaces the old `substitute_bindings` call plus a
-            // separate manual null-fill loop.
-            let null_value = OwnedValue::Null;
-            let null_fill = |expr: &Expr| {
-                substitute_vars(
-                    expr,
-                    as_var_refs(&bindings).chain(
-                        all_var_names
-                            .iter()
-                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                            .map(|name| (name.as_str(), &null_value)),
-                    ),
-                )
-            };
-            Ok((null_fill(update), extract.map(null_fill)))
-        })
-        .collect()
+) -> Expr {
+    let null_value = OwnedValue::Null;
+    substitute_vars(
+        expr,
+        as_var_refs(bindings).chain(
+            all_var_names
+                .iter()
+                .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                .map(|name| (name.as_str(), &null_value)),
+        ),
+    )
 }
 
 /// [`foreach_forks`]'s per-element callback: one source element in, the
@@ -43237,7 +43318,6 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // (`foreach empty as $x (...)`, `foreach halt_error as $x (empty; .)`)
     // from paying for a `Vec` build/sort/dedup it will never use.
     let mut all_var_names: Option<Vec<String>> = None;
-    let invert_dedup = patterns.len() > 1;
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
 
     // The one thing a fork's own callback can't report through its
@@ -43267,17 +43347,13 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
             // the way the pre-review eager path did (#695), and with the
             // eager path now driven the same way there is no matrix left to
             // hoist anywhere.
-            let row = substitute_foreach_steps::<S>(
+            let step_state = core::mem::replace(&mut state, OwnedValue::Null);
+            let (new_state, step_flow) = try_foreach_step_alternatives::<S>(
                 patterns,
                 all_var_names,
                 update,
                 extract,
                 &input_val,
-                invert_dedup,
-            );
-            let step_state = core::mem::replace(&mut state, OwnedValue::Null);
-            let (new_state, step_flow) = try_foreach_step_alternatives::<S>(
-                &row,
                 step_state,
                 optional,
                 &mut budget,
@@ -43357,10 +43433,10 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
 ///   whole reduce into a fully independent execution over the source" was
 ///   already the stated rule, and only the *values* were being reused.
 ///
-/// Per-element substitution ([`substitute_foreach_steps`], with no EXTRACT)
-/// replaces the hoisted `substituted_updates_matrix`: a demand-driven drive
-/// sees one element at a time and has no matrix to hoist, exactly as #2180
-/// WP3 found for `foreach`. That is a real trade — the matrix amortized the
+/// Per-element binding (the matcher under [`try_reduce_step_alternatives`],
+/// with no EXTRACT) replaces the hoisted `substituted_updates_matrix`: a
+/// demand-driven drive sees one element at a time and has no matrix to hoist,
+/// exactly as #2180 WP3 found for `foreach`. That is a real trade — the matrix amortized the
 /// AST rebuild across INIT forks — but it is not a loss here, because the
 /// source is now re-driven per fork anyway and each fork sees its own
 /// elements.
@@ -43380,7 +43456,6 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // uses, and #2440's short-circuit is structural here rather than an
     // early return this could sit above.
     let mut all_var_names: Option<Vec<String>> = None;
-    let invert_dedup = patterns.len() > 1;
     // Shared across every INIT fork (#695), the same "whole tree, not
     // per-fork" accounting the collecting version used.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
@@ -43398,20 +43473,12 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
 
         let flow = drive_source(&mut |input_val| {
             ended = None;
-            let row: Vec<Result<Expr, EvalError>> = substitute_foreach_steps::<S>(
+            let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
+            let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
                 patterns,
                 all_var_names,
                 update,
-                None,
                 &input_val,
-                invert_dedup,
-            )
-            .into_iter()
-            .map(|alternative| alternative.map(|(update, _no_extract)| update))
-            .collect();
-            let step_acc = core::mem::replace(&mut acc, OwnedValue::Null);
-            let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
-                &row,
                 step_acc,
                 optional,
                 &mut budget,
@@ -55661,12 +55728,11 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             &value,
             optional,
         ) {
-            Ok((vs, None)) => all_results.extend(vs),
-            Ok((vs, Some(control))) => {
+            (vs, None) => all_results.extend(vs),
+            (vs, Some(control)) => {
                 all_results.extend(vs);
                 return partial(all_results, control);
             }
-            Err(e) => return e.into(),
         }
     }
 
@@ -55677,48 +55743,32 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Try each `?//`-separated pattern alternative against `bound_val`, in
-/// order. The first alternative whose pattern matches *and* whose
-/// substituted body doesn't error wins. A pattern-match failure, a body
-/// `error(...)`/type error, or a body `break` falls through to the next
-/// alternative; `halt` and empty output do not. On the *last* alternative,
-/// any of these is the final outcome -- this degrades to exactly the
-/// pre-`?//` single-pattern behavior when `patterns` has one element.
+/// order, collecting the body's outputs -- the eager form of
+/// [`each_pattern_alternatives`], for [`eval_as_pattern`]'s `eval_single`
+/// dispatch. Since #2872 it *is* that function under a collecting sink,
+/// rather than a second copy of the alternative loop (#1457/#1462/#2027
+/// each found the two copies disagreeing), so every retry rule -- a
+/// pattern-match failure, a body error or `break` falls through unless
+/// this is the last alternative, `halt` and an uncatchable error never do,
+/// each attempted alternative's partial output before its failure is kept
+/// -- lives in one place. A trailing `Control` comes back beside whatever
+/// was collected, so a `Partial` prefix is never dropped.
 ///
-/// **`break` retrying (rather than propagating immediately) is corrected
-/// behavior, not the original design** -- #1457, found and fixed while
-/// implementing `reduce`/`foreach`'s own `?//` support (#1365), whose
-/// accumulator-rollback retry loop needed the exact same break-vs-halt
-/// question answered and got it live-verified there first. This function's
-/// own prior doc comment claimed break propagates immediately just like
-/// halt, matching neither a real design decision nor a passing test --
-/// verified wrong against the pinned oracle (jq 1.7.1): `label $out | (.
-/// as {a:$x} ?// {a:$y} | if $x==1 then break $out else [$x,$y] end)` on
-/// `{"a":1}` is `[null,1]` (alt2's output), not an empty result from an
-/// uncaught break reaching `label $out`. `halt` alone was and remains
-/// correct: `. as {a:$x} ?// {a:$y} | if $x==1 then halt else [$x,$y] end`
-/// on `{"a":1}` terminates the process immediately with no output, never
-/// retried.
-///
-/// A body error's or break's own partial output (if the body is itself a
-/// generator, e.g. `(1, error("x"))` or `(1, break $out)`) is *not*
-/// discarded on fallthrough -- confirmed live for both: each tried
-/// alternative's own partial output before its error/break is kept, not
-/// just the winning alternative's (or the last one's, if none win) -- so
-/// the returned `Vec<OwnedValue>` accumulates across every alternative
-/// actually attempted, not just the final one.
-///
-/// **A *pattern-match* failure on the last alternative must carry `carried`
-/// forward too** (code review, #1462) -- it is just another way this
-/// function's own last alternative can fail, exactly like a body
-/// error/break/halt, and every one of those already returns
-/// `Ok((carried, Some(control)))` rather than discarding the prefix. This
-/// arm alone used to `return Err(e)`, silently dropping `carried` and
-/// diverging from real jq (confirmed live, jq 1.7.1: `[1] as [$a] ?// {b:$c}
-/// | ($a, error("boom"))` prints `1` then the error) -- and, since Stage 5
-/// added a sink-based twin of this exact loop (`each_pattern_alternatives`,
-/// which never had anywhere to drop a prefix already pushed to its sink),
-/// the same jq expression was answering two different ways in the same
-/// binary depending on which evaluator reached it.
+/// #2027: the collected items are converted with `into_owned_lossy`, which
+/// looked like a live silent-corruption gap (the same #1746/#1755 shape
+/// fixed elsewhere in this file) but is confirmed CLI-unreachable, not
+/// merely untested. `eval_generic.rs`'s eager `eval_single` has no native
+/// `Expr::As`/`Expr::AsPattern` arm, so every real CLI as-binding query
+/// reaches this function only via that module's wildcard `_` bridge, which
+/// calls `to_owned_with_cursor` -- a genuinely fallible, `EvalError`-raising
+/// conversion -- on the *whole* ambient value before `full_eval` ever hands
+/// control to `eval_as_pattern`. That upstream conversion recursively
+/// decodes every string reachable from the ambient value (everything `body`
+/// could possibly navigate to, since `body` runs against that same value),
+/// so any genuine decode failure anywhere in it already raised before this
+/// loop starts -- confirmed live via reachability probes. Direct internal
+/// calls (this file's own `query!`-based tests) bypass that bridge and so
+/// remain a real way to exercise this arm's behavior.
 fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
@@ -55726,142 +55776,28 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound_val: &OwnedValue,
     value: &StandardJson<'_, W>,
     optional: bool,
-) -> Result<(Vec<OwnedValue>, Option<Control>), EvalError> {
-    let last_idx = patterns.len() - 1;
+) -> (Vec<OwnedValue>, Option<Control>) {
     let mut carried: Vec<OwnedValue> = Vec::new();
-    // #1366 code review: a genuine `?//`-chain (2+ patterns) inverts real
-    // jq's duplicate-binding dedup rule relative to a bare, non-`?//`
-    // pattern -- `patterns.len() > 1` is the actual test, not "did this call
-    // come through `try_pattern_alternatives`", since `eval_as_pattern`
-    // routes a bare pattern through here too as a one-element list. See
-    // `extract_pattern_bindings`'s own doc comment for the live-verified
-    // evidence.
-    let invert_dedup = patterns.len() > 1;
-
-    for (i, pattern) in patterns.iter().enumerate() {
-        let is_last = i == last_idx;
-
-        let bindings = match extract_single_pattern_binding::<S>(pattern, bound_val, invert_dedup) {
-            Ok(b) => b,
-            Err(e) => {
-                if is_last {
-                    return Ok((carried, Some(Control::Error(e))));
-                }
-                continue;
-            }
-        };
-
-        // #1368 code review: this and `eval_reduce`/`eval_foreach`'s own
-        // step-alternative matrices are the same clone-then-fold-
-        // `substitute_var` shape `substitute_vars` already implements once.
-        // Bound and null-filled names never overlap (the filter below
-        // excludes anything `bindings` already covers), so fold order
-        // between the two groups can't matter -- safe to combine into one
-        // `substitute_vars` call instead of hand-rolling two separate loops
-        // over the same `substituted_body`.
-        let null_value = OwnedValue::Null;
-        let substituted_body = substitute_vars(
-            body,
-            as_var_refs(&bindings).chain(
-                all_var_names
-                    .iter()
-                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                    .map(|name| (name.as_str(), &null_value)),
-            ),
-        );
-
-        // #2027: the `One`/`Many` arms' bare `to_owned_lossy` below looked like a
-        // live silent-corruption gap (the same #1746/#1755 shape fixed
-        // elsewhere in this file) but is confirmed CLI-unreachable, not
-        // merely untested. `eval_generic.rs`'s eager `eval_single` has no
-        // native `Expr::As`/`Expr::AsPattern` arm, so every real CLI
-        // as-binding query reaches this function only via that module's
-        // wildcard `_` bridge, which calls `to_owned_with_cursor` -- a
-        // genuinely fallible, `EvalError`-raising conversion, not this
-        // file's own infallible `to_owned_lossy` -- on the *whole* ambient value
-        // before `full_eval` ever hands control to `eval_as_pattern`. That
-        // upstream conversion recursively decodes every string reachable
-        // from the ambient value (everything `body` could possibly
-        // navigate to, since `body` runs against that same value), so any
-        // genuine decode failure anywhere in it already raised before this
-        // loop starts -- confirmed live via reachability probes: on a
-        // document with a decode-failure-inducing string, `eval_as_pattern`
-        // and this function are never entered at all (even when the bad
-        // field is completely untouched by the query), while an
-        // all-valid document reaches both. Direct internal calls (e.g. this
-        // file's own `query!`-based tests) bypass that bridge and so remain
-        // a real way to exercise this arm's behavior -- matching the
-        // #1953/#1972 lesson this file's own comments already name
-        // elsewhere.
-        match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => {
-                carried.push(to_owned_lossy::<S, _>(&v));
-                return Ok((carried, None));
-            }
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => {
-                carried.extend(vs.iter().map(to_owned_lossy::<S, _>));
-                return Ok((carried, None));
-            }
-            QueryResult::Owned(v) => {
-                carried.push(v);
-                return Ok((carried, None));
-            }
-            QueryResult::ManyOwned(vs) => {
-                carried.extend(vs);
-                return Ok((carried, None));
-            }
-            QueryResult::None => return Ok((carried, None)),
-            // #1620/#1660: a decode failure must never be treated as "this
-            // alternative failed to match, try the next one" -- it always
-            // propagates, `is_last` or not, the same way `eval_try` never
-            // suppresses it regardless of whether a `catch` handler exists.
-            // #2132: widened from `is_decode_failure()` to the shared
-            // value-position predicate, same reasoning as
-            // `each_pattern_alternatives`.
-            QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
-                return Ok((carried, Some(Control::Error(e))));
-            }
-            QueryResult::Error(e) => {
-                if is_last {
-                    return Ok((carried, Some(Control::Error(e))));
-                }
-                continue;
-            }
-            // #1457: `Break` falls through like `Error`, not immediately
-            // like `Halt` -- verified live against the pinned oracle (jq
-            // 1.7.1), correcting this arm's own prior claim otherwise. See
-            // this function's own doc comment for the exact repro.
-            QueryResult::Break(label) => {
-                if is_last {
-                    return Ok((carried, Some(Control::Break(label))));
-                }
-                continue;
-            }
-            QueryResult::Halt(code) => return Ok((carried, Some(Control::Halt(code)))),
-            // `is_retryable_control` (#1660 code review): this arm used to
-            // hand-roll the same three-way decode-failure/`is_last`/`Halt`
-            // classification `is_retryable_control` already centralizes for
-            // `try_foreach_step_alternatives`'s two call sites -- reusing it
-            // here instead closes the gap its own doc comment warns about
-            // (a third independently-maintained copy silently diverging,
-            // the way `try_pattern_alternatives`'s pre-#1660 copy of this
-            // exact predicate already once did, #1457).
-            QueryResult::Partial(vs, control) => {
-                carried.extend(vs);
-                if is_retryable_control(&control, is_last) {
-                    continue;
-                }
-                return Ok((carried, Some(control)));
-            }
+    let flow = each_pattern_alternatives::<W, S>(
+        patterns,
+        all_var_names,
+        body,
+        bound_val,
+        value,
+        optional,
+        &mut |item| {
+            carried.push(item.into_owned_lossy::<S>());
+            Demand::Continue
+        },
+    );
+    match flow {
+        Flow::Exhausted => (carried, None),
+        Flow::Escaped(control) => (carried, Some(control)),
+        Flow::Stopped { .. } => {
+            unreachable!("the collecting sink above never answers Demand::Stop")
+            // omni-dev: coverage tolerate-line reason="unreachable: the sink is a plain collector that always answers Demand::Continue (#2872)"
         }
     }
-
-    unreachable!(
-        "patterns is always non-empty by construction (the parser never \
-         builds an empty AsPattern), and every loop iteration above \
-         returns on its `is_last` pass"
-    )
 }
 
 /// Collect every variable name a pattern would bind, recursively.
@@ -55890,371 +55826,417 @@ pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<Strin
 
 // #1368: this used to be `substitute_bindings`, a private fold over
 // `bindings` that was body-for-body the existing `substitute_vars` --
-// removed. `eval_reduce`/`eval_foreach`'s step-alternative matrices call
-// `substitute_vars(expr, as_var_refs(&bindings))` directly instead.
+// removed. The fold drivers call `substitute_vars(expr, as_var_refs(..))`
+// directly instead.
 
-/// Extract variable bindings from a pattern matching an OwnedValue.
-/// `invert` is `false` for an ordinary, single pattern (`. as PATTERN`,
-/// `reduce`/`foreach`'s own pattern -- neither supports `?//` at all) and
-/// `true` when called for one alternative of a genuine `?// `-chain (#1366
-/// code review: `patterns.len() > 1` in `try_pattern_alternatives`, *not*
-/// "which function called this" -- `eval_as_pattern` degrades a bare,
-/// non-`?//` pattern to a one-element alternatives list and still reaches
-/// `try_pattern_alternatives`, so the caller alone can't distinguish the
-/// two cases). Real jq's own duplicate-binding rule flips depending on
-/// this, for *both* container kinds and at *every* nesting depth --
-/// confirmed live (jq 1.7.1): `[1,2] | . as [$a,$a] | $a` is `2` (last
-/// wins) but `[1,2] | . as [$a,$a] ?// [$a,$a] | $a` is `1` (first wins,
-/// same pattern, only a trivial self-alternative added); symmetrically
-/// `{"x":1,"y":2} | . as {x:$a,y:$a} | $a` is `1` (first wins) but
-/// `... ?// $z | $a` is `2` (last wins). Also confirmed at a nested
-/// depth -- `{"x":[1,2]} | . as {x:[$a,$a]} ?// $z | $a` is `1`, still
-/// inverted for the *inner* array sub-pattern too, not just the outermost
-/// container -- so `invert` threads through every recursive call
-/// unchanged, it is not computed once and only applied at the top.
-///
-/// **#2677**: returns every alternative binding-set a computed key's own
-/// generator can produce, plus whatever [`Control`] stopped generation
-/// early (a key expression's own error/break/halt, or a structural
-/// mismatch) -- [`eval_owned_expr_fork`]'s own `(Vec<T>, Option<Control>)`
-/// shape, reused here rather than inventing a sink/stream abstraction. A
-/// pattern with no computed key anywhere in it still produces exactly one
-/// binding-set on success, matching this function's pre-#2677
-/// single-`Result` shape byte-for-byte. jq compiles multiple entries (and a
-/// multi-output computed key within one entry) as nested generator forks
-/// (`gen_object_matcher`), so entries run left to right and, within one
-/// entry, its own key outputs run in the order its expression yields them --
-/// confirmed live: `{"a":1,"b":2} | . as {("a","b"):$q} | $q` prints `1`
-/// then `2`. The very first failure anywhere -- a key expression's own
-/// error, a non-string key value, an `INDEX` against a non-object, or a
-/// recursive sub-pattern failure -- stops the whole pipeline immediately
-/// (jq's own single-threaded generator model), keeping every combination
-/// already completed before that point (confirmed live:
-/// `[. as {("a",1,"b"):$q} ?// $q | $q]` on `{"a":1,"b":2}` is
-/// `[1,{"a":1,"b":2}]` -- the `1` key output already succeeded and its
-/// binding was consumed by the body *before* the `1` (number) key output's
-/// own type error aborted the rest of that alternative, retrying `?//`'s
-/// own next alternative from there).
-pub(crate) fn extract_pattern_bindings<S: EvalSemantics>(
+// ============================================================================
+// Destructuring patterns: the demand-driven matcher (#2872)
+// ============================================================================
+//
+// jq compiles `SRC as PATTERN | BODY` into straight-line matcher bytecode
+// with backtracking (`gen_object_matcher`/`gen_array_matcher` in its
+// `compile.c`): every object entry is `DUP; <key>; INDEX; <sub-matcher>` in
+// source order, every array element the same with a constant index, nested
+// so that the *last* element runs first, and a computed key is an ordinary
+// generator fork -- a later entry's key runs again for each output of an
+// earlier one, and BODY runs at the end of every completed path through the
+// matcher. Nothing is materialized up front: the second key output is only
+// produced when something backtracks for it, so `first(. as {("a",
+// (input|"b")):$q} | $q)` never consumes an input, and `error`/`break`/
+// `halt` inside a key fire exactly where the walk reaches them.
+//
+// [`walk_pattern_each`] is that machine, written as a continuation-passing
+// walk shared by value mode (`. as PATTERN`, `reduce`/`foreach`'s own
+// pattern) and path mode (`path()`/`del()`/an assignment target, where every
+// index step also moves the register) through [`PatternMode`]. Before
+// #2872 value mode built the whole cartesian product of every key's outputs
+// eagerly (`extract_pattern_bindings`), which got the evaluation order,
+// `input` consumption and re-evaluation count wrong, and path mode and both
+// folds refused any key with other than exactly one output through an
+// ordinary *catchable* error -- which `?//` and `try` then read as "this
+// alternative did not match" and answered wrongly, including a silently
+// dropped write (`(. as {("a","c"):$q} ?// {a:$q} | $q) |= "X"`).
+
+/// One index step a destructuring pattern performs, as the matcher sees it
+/// before a [`PatternMode`] decides how to take it.
+enum PatternKey<'a> {
+    /// A literal object key: `{a: P}`, `{"a": P}`, `{$a}`.
+    Field(&'a str),
+    /// An array element's own position: `[P, Q]`.
+    Position(i64),
+    /// One output of a computed key (`{(EXPR): P}`, `{"\(EXPR)": P}`),
+    /// whatever its kind -- jq's `INDEX` bytecode is generic, so a number
+    /// indexes an array target exactly like `.[EXPR]` does (#2873), and any
+    /// other kind raises `INDEX`'s own "Cannot index <type> with <type>".
+    Computed(&'a OwnedValue),
+}
+
+impl PatternKey<'_> {
+    /// Read `input[key]` the way jq's `jv_get` does: `null` yields `null`
+    /// for any string or number key, an object/array yields the member or
+    /// `null` when it is absent (a negative position wraps, a float
+    /// truncates, NaN is out of range), and any other pairing is the
+    /// ordinary `Cannot index <type> with ...` error. Both modes read through
+    /// this one function, so the wording and the `null` rule cannot drift
+    /// between them -- value mode used to short-circuit a `null` target
+    /// before evaluating any key (#1239), which is why `null | . as
+    /// {(error("E")):$q} | $q` answered `null` where jq raises `E`.
+    fn child(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
+        match (self, input) {
+            (Self::Field(key), OwnedValue::Object(obj)) => {
+                Ok(obj.get(*key).cloned().unwrap_or(OwnedValue::Null))
+            }
+            (Self::Field(_) | Self::Position(_), OwnedValue::Null) => Ok(OwnedValue::Null),
+            (Self::Field(key), _) => Err(EvalError::cannot_index_with_field(
+                owned_type_name(input),
+                key,
+            )),
+            (Self::Position(i), OwnedValue::Array(arr)) => {
+                let resolved = if *i < 0 { arr.len() as i64 + *i } else { *i };
+                Ok(usize::try_from(resolved)
+                    .ok()
+                    .and_then(|idx| arr.get(idx))
+                    .cloned()
+                    .unwrap_or(OwnedValue::Null))
+            }
+            (Self::Position(_), _) => Err(EvalError::cannot_index_with_type(
+                owned_type_name(input),
+                "number",
+            )),
+            (Self::Computed(key), _) => match index_one_owned(input, key, false) {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"), // omni-dev: coverage tolerate-line reason="unreachable: `optional: false` makes index_one_owned answer Ok(Some)/Err only (#2872)"
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    /// The path component this step appends to the register (path mode):
+    /// a string key is a field, a numeric key an index that keeps its own
+    /// spelling exactly as `.[EXPR]` does (`numeric_path_component`, #1088),
+    /// and any other kind is [`Self::child`]'s error -- checked here, ahead
+    /// of the register's identity check, because jq's `INDEX` needs the key
+    /// value in hand before it can do anything else with it.
+    fn component(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
+        match self {
+            Self::Field(key) => Ok(Expr::Field((*key).to_string())),
+            Self::Position(i) => Ok(Expr::Index { idx: *i, key: None }),
+            Self::Computed(key) => match key {
+                OwnedValue::String(s) => Ok(Expr::Field(s.clone())),
+                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                    // A NaN key has no index (`numeric_key_to_index`'s own
+                    // contract); `i64::MAX` is a guaranteed-out-of-range
+                    // position `child` resolves to `null`, not a real one.
+                    let idx = numeric_key_to_index(key).unwrap_or(i64::MAX);
+                    Ok(numeric_path_component(idx, key))
+                }
+                other => Err(EvalError::cannot_index_with_type(
+                    owned_type_name(input),
+                    owned_type_name(other),
+                )),
+            },
+        }
+    }
+}
+
+/// What a [`walk_pattern_each`] caller supplies: how one index step is
+/// taken and how one variable is bound. Value mode carries no register and
+/// binds by value; path mode ([`PathPatternMode`]) threads jq's path
+/// register through every step and marks a binding with the position it
+/// was proven to sit at.
+trait PatternMode {
+    /// The state one step moves: `()` in value mode, the register in path
+    /// mode.
+    type Reg: Clone;
+    /// One bound variable.
+    type Binding;
+
+    /// Perform `key` on `input`, which the walk reached at `reg`: the child
+    /// value and the state the walk continues from. `first` is whether this
+    /// is the first step its container performs (object entry 0, the last
+    /// array element); every later entry steps from the container again,
+    /// which path mode's identity check has to know.
+    fn step(
+        &self,
+        key: &PatternKey<'_>,
+        input: &OwnedValue,
+        reg: &Self::Reg,
+        first: bool,
+    ) -> Result<(OwnedValue, Self::Reg), EvalError>;
+
+    /// Bind `name` to `value`, the walk sitting at `reg`.
+    fn bind(&self, name: &str, value: &OwnedValue, reg: &Self::Reg) -> Self::Binding;
+
+    /// Whether the input a computed key is about to run against is a node
+    /// the resolver is tracking (#3036): value mode never is; path mode is
+    /// while the container's first step is still from the register's own
+    /// node. A key evaluated on a tracked node must not have its own
+    /// markers demoted just because it resolves by value -- see
+    /// [`eval_each_owned_at`].
+    fn key_input_tracked(&self, reg: &Self::Reg, first: bool) -> bool;
+
+    /// The name a binding carries, for the duplicate-name rule.
+    fn name(binding: &Self::Binding) -> &str;
+}
+
+/// Value mode: no register, bindings by value.
+struct ValuePatternMode;
+
+impl PatternMode for ValuePatternMode {
+    type Reg = ();
+    type Binding = (String, OwnedValue);
+
+    fn step(
+        &self,
+        key: &PatternKey<'_>,
+        input: &OwnedValue,
+        _reg: &(),
+        _first: bool,
+    ) -> Result<(OwnedValue, ()), EvalError> {
+        Ok((key.child(input)?, ()))
+    }
+
+    fn bind(&self, name: &str, value: &OwnedValue, _reg: &()) -> Self::Binding {
+        (name.to_string(), value.clone())
+    }
+
+    fn key_input_tracked(&self, _reg: &(), _first: bool) -> bool {
+        false
+    }
+
+    fn name(binding: &Self::Binding) -> &str {
+        &binding.0
+    }
+}
+
+/// The walk's continuation: called once per completed match with the state
+/// the walk ended in and the bindings in visit order; anything but
+/// [`Flow::Exhausted`] stops the walk and is handed back verbatim.
+type PatternMatchSink<'s, M> =
+    &'s mut dyn FnMut(<M as PatternMode>::Reg, &mut Vec<<M as PatternMode>::Binding>) -> Flow;
+
+/// Walk `pattern` over `input` from `reg`, calling `sink` once per completed
+/// match (see the module comment above for jq's model). Bindings accumulate
+/// in `out` in visit order and are unwound on backtrack, so a caller sees
+/// exactly the bindings of the match at hand and no allocation is made per
+/// match. The returned [`Flow`] is the walk's own verdict: `Exhausted` once
+/// every match has been offered, `Stopped`/`Escaped` verbatim from `sink`,
+/// or `Escaped` with a step's error or a key generator's own trailing
+/// control (an `error`/`break`/`halt` inside a key expression), raised after
+/// every match completed before it was offered -- jq's single-threaded
+/// generator model, in which the first failure anywhere ends the whole
+/// pipeline and keeps what already ran.
+fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
+    mode: &M,
     pattern: &Pattern,
-    value: &OwnedValue,
-    invert: bool,
-) -> (Vec<Vec<(String, OwnedValue)>>, Option<Control>) {
+    input: &OwnedValue,
+    reg: M::Reg,
+    out: &mut Vec<M::Binding>,
+    sink: PatternMatchSink<'_, M>,
+) -> Flow {
     match pattern {
-        Pattern::Var(name) => (vec![vec![(name.clone(), value.clone())]], None),
+        // A bare `$x` performs no step: it binds the current input and
+        // leaves the register alone.
+        Pattern::Var(name) => {
+            out.push(mode.bind(name, input, &reg));
+            let flow = sink(reg, out);
+            out.pop();
+            flow
+        }
         Pattern::Object(entries) => {
-            // Real jq lets `null` absorb any further field access the same
-            // way plain `.foo` on `null` does (`null | .foo` is `null`) --
-            // every variable this pattern (and anything nested inside it)
-            // would bind resolves to `null` instead of hard-erroring (#1239).
-            // Every entry binds the same `Null` value here regardless of
-            // `invert`, but still routed through the same dedup call (#1366
-            // code review) so this path upholds the same "no duplicate
-            // names in the result" invariant every other path does, rather
-            // than relying on "every value happens to be Null anyway" to
-            // paper over a skipped step. No entry's own key expression is
-            // evaluated here either -- confirmed live,
-            // `null | . as {(error("x")):$q} | $q` is `null`, not a raised
-            // `"x"`, so `null` short-circuits before any key expression
-            // (computed or not) ever runs, same as it already did for a
-            // literal key.
-            if matches!(value, OwnedValue::Null) {
-                let mut names = Vec::new();
-                collect_pattern_var_names(pattern, &mut names);
-                let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
-                return (vec![dedup_object_bindings(bindings, invert)], None);
-            }
-            let mut frontier: Vec<Vec<(String, OwnedValue)>> = vec![Vec::new()];
-            for entry in entries {
-                let (next, control) =
-                    fold_object_pattern_entry::<S>(entry, value, frontier, invert);
-                frontier = next;
-                if let Some(control) = control {
-                    // A later entry never runs once an earlier one has
-                    // stopped generation -- jq's own sequential generator
-                    // model, and the reason this doesn't also dedup+return
-                    // the partial `frontier` through the loop's normal exit
-                    // below (which still applies the `#1366` dedup rule to
-                    // whatever combinations already completed).
-                    let deduped = frontier
-                        .into_iter()
-                        .map(|b| dedup_object_bindings(b, invert))
-                        .collect();
-                    return (deduped, Some(control));
-                }
-            }
-            // #1366: an object pattern binding the same variable name from
-            // more than one field (`{x:$a,y:$a}`) keeps the *first* field's
-            // value in real jq, regardless of the object's own key order --
-            // confirmed live (jq 1.7.1): `{"x":1,"y":2} | . as {y:$a,x:$a} |
-            // $a` is `2` (y's value, since y is listed first in the
-            // pattern) on both `{"x":1,"y":2}` and the differently-ordered
-            // `{"y":2,"x":1}`, so this is the *pattern's* field order, not
-            // the value's. Opposite of the Array arm below, and inverted
-            // again under `?//` -- see `extract_pattern_bindings`'s own doc
-            // comment and `dedup_object_bindings`'s for why.
-            let deduped = frontier
-                .into_iter()
-                .map(|b| dedup_object_bindings(b, invert))
-                .collect();
-            (deduped, None)
+            walk_object_entries::<M, S>(mode, entries, true, input, reg, out, sink)
         }
-        Pattern::Array(patterns) => {
-            // Same `null`-absorbs-further-access tolerance as the Object arm
-            // above, for array-shaped destructuring (#1239); same "route
-            // through the real dedup step anyway" reasoning too. Array
-            // patterns have no computed keys of their own (positional), but
-            // a nested `Pattern::Object` element can still carry one.
-            if matches!(value, OwnedValue::Null) {
-                let mut names = Vec::new();
-                collect_pattern_var_names(pattern, &mut names);
-                let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
-                return (vec![dedup_array_bindings(bindings, invert)], None);
-            }
-            let arr = match value {
-                OwnedValue::Array(a) => a,
-                _ => {
-                    let err = EvalError::cannot_index_with_type(owned_type_name(value), "number");
-                    return (Vec::new(), Some(Control::Error(err)));
-                }
-            };
-            let mut frontier: Vec<Vec<(String, OwnedValue)>> = vec![Vec::new()];
-            for (i, pat) in patterns.iter().enumerate() {
-                let elem_value = arr.get(i).cloned().unwrap_or(OwnedValue::Null);
-                let (sub_results, sub_control) =
-                    extract_pattern_bindings::<S>(pat, &elem_value, invert);
-                // No pre-sized capacity hint: `frontier.len() *
-                // sub_results.len()` is a product of two generator fan-outs
-                // an attacker-controlled query could grow arbitrarily
-                // large, and `Vec::with_capacity` on that product risks an
-                // uncatchable allocation panic/abort rather than jq's own
-                // "stream one output at a time" behavior for a cross
-                // product this size (#1669/#1721's own guard exists for
-                // exactly this class) -- an unsized `Vec::new()` growing by
-                // ordinary amortized `push` is the safe default here.
-                let mut next = Vec::new();
-                for partial in &frontier {
-                    for sub in &sub_results {
-                        let mut combined = partial.clone();
-                        combined.extend(sub.iter().cloned());
-                        next.push(combined);
-                    }
-                }
-                frontier = next;
-                if let Some(control) = sub_control {
-                    let deduped = frontier
-                        .into_iter()
-                        .map(|b| dedup_array_bindings(b, invert))
-                        .collect();
-                    return (deduped, Some(control));
-                }
-            }
-            // #1366: an array pattern binding the same variable name at more
-            // than one position (`[$a,$a]`) keeps the *last* position's
-            // value in real jq -- confirmed live: `[1,2] | . as [$a,$a] |
-            // $a` is `2`. Opposite of the Object arm above, and inverted
-            // again under `?//`.
-            let deduped = frontier
-                .into_iter()
-                .map(|b| dedup_array_bindings(b, invert))
-                .collect();
-            (deduped, None)
+        // Array elements are matched right to left: jq's `gen_array_matcher`
+        // nests each earlier element *after* the later one, so the highest
+        // index steps from the register's own node and is the outermost
+        // fork -- `. as [{("K1"|stderr|"a"):$x},{("K2"|stderr|"a"):$y}]`
+        // writes `K2K1`, in both modes.
+        Pattern::Array(elements) => {
+            walk_array_elements::<M, S>(mode, elements, true, input, reg, out, sink)
         }
     }
 }
 
-/// One [`Pattern::Object`] entry's own contribution to
-/// [`extract_pattern_bindings`]'s cartesian fold (#2677): for every key
-/// value `entry.key` yields against `value` (one for a
-/// [`ObjectKey::Literal`], possibly many for an [`ObjectKey::Expr`]
-/// generator) and every already-accumulated partial binding-set in
-/// `frontier`, extends that partial set with the entry's own `{$bind}`
-/// marker (if any) and every binding its sub-pattern produces against the
-/// matched field -- the full `frontier × keys × sub_pattern_bindings`
-/// cross product, in that nesting order (matches jq's own left-to-right,
-/// outer-to-inner generator compilation). Stops at the first failure
-/// anywhere in that generation, keeping whatever combinations already
-/// completed.
-fn fold_object_pattern_entry<S: EvalSemantics>(
-    entry: &PatternEntry,
-    value: &OwnedValue,
-    frontier: Vec<Vec<(String, OwnedValue)>>,
-    invert: bool,
-) -> (Vec<Vec<(String, OwnedValue)>>, Option<Control>) {
-    // The key expression runs against `value` -- the pattern's own current
-    // node -- regardless of whether `value` even is an object: real jq's
-    // `INDEX` bytecode needs the key *value* in hand before it can raise
-    // its own "Cannot index <type> with <type>" (confirmed live: `{("a"):
-    // $q}` on `[1,2,3]` raises "Cannot index array with string \"a\"" --
-    // the literal key evaluates fine, and only the *subsequent* indexing
-    // attempt fails; `{(.a):$q}` on `5` raises "Cannot index number with
-    // string \"a\"" too, but via the key expression's *own* `.a` navigation
-    // failing on `5`, a different mechanism landing on the same wording).
-    let (key_values, key_control): (Vec<OwnedValue>, Option<Control>) = match &entry.key {
-        ObjectKey::Literal(key) => (vec![OwnedValue::String(key.clone())], None),
-        ObjectKey::Expr(key_expr) => eval_owned_expr_fork::<S>(key_expr, value, false),
+/// Match `entries` in source order (`gen_object_matcher`): entry 0's key
+/// outputs are the outermost fork, and every completed sub-match continues
+/// with the rest of the entries, re-running their keys.
+fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
+    mode: &M,
+    entries: &[PatternEntry],
+    first: bool,
+    input: &OwnedValue,
+    reg: M::Reg,
+    out: &mut Vec<M::Binding>,
+    sink: PatternMatchSink<'_, M>,
+) -> Flow {
+    let Some((entry, rest)) = entries.split_first() else {
+        return sink(reg, out);
     };
-
-    // #2873 perf review: the overwhelmingly common pattern -- literal keys
-    // only, nowhere in this entry or its sub-pattern -- always keeps
-    // `key_values`/`frontier`/`sub_results` at length 1, so the general
-    // `frontier × key_values × sub_results` cartesian fold below (needed
-    // once a computed key can fan out to 2+ outputs) would still pay an
-    // extra `partial.clone()` per pattern entry, turning what used to be an
-    // O(1)-amortized `Vec::extend` per entry back into an O(entries) clone
-    // per entry -- on the hot `.[] as {...}` path. `key_values.len() == 1`
-    // is known up front and guarantees the loop below runs exactly once,
-    // so this fast path is handled entirely outside it (letting the
-    // borrow checker see `frontier` is moved at most once), consuming
-    // `frontier`/`sub_results` in place instead of cloning.
-    if key_values.len() == 1 {
-        let key_value = &key_values[0];
-        let field_value = match index_one_owned(value, key_value, false) {
-            Ok(Some(v)) => v,
-            Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"),
-            Err(err) => return (Vec::new(), Some(Control::Error(err))),
+    let mut per_key = |key: PatternKey<'_>, out: &mut Vec<M::Binding>| -> Flow {
+        let (child, moved) = match mode.step(&key, input, &reg, first) {
+            Ok(stepped) => stepped,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        let (sub_results, sub_control) =
-            extract_pattern_bindings::<S>(&entry.pattern, &field_value, invert);
-        // `sub_control` (the sub-pattern's own trailing control) takes
-        // priority when present, matching the general loop's immediate
-        // `return` on a `Some(control)`; when it's `None`, the single
-        // key_value's processing has run to completion, so this is exactly
-        // the "loop finished normally" case the general path falls through
-        // to `(new_frontier, key_control)` for -- `key_control` is the
-        // *key generator's own* trailing control (e.g. `Some(Halt(_))` from
-        // `{("a", halt_error(7)):$q}`'s second output) and must not be
-        // dropped here (#2873 review: an earlier version of this fast path
-        // did exactly that).
-        if frontier.len() == 1 && sub_results.len() == 1 {
-            let mut combined = frontier.into_iter().next().unwrap();
-            if let Some(bind) = &entry.bind {
-                combined.push((bind.clone(), field_value.clone()));
-            }
-            combined.extend(sub_results.into_iter().next().unwrap());
-            return (vec![combined], sub_control.or(key_control));
+        let mark = out.len();
+        // `{$b: P}` binds `$b` to the matched value *before* running `P`
+        // against that same value -- one `INDEX` step in jq's compilation
+        // (#2649) -- so the bind sits ahead of `P`'s own bindings in visit
+        // order, which is what the duplicate-name rule reads.
+        if let Some(bind) = &entry.bind {
+            out.push(mode.bind(bind, &child, &moved));
         }
-        let mut new_frontier = Vec::new();
-        for partial in &frontier {
-            for sub in &sub_results {
-                let mut combined = partial.clone();
-                if let Some(bind) = &entry.bind {
-                    combined.push((bind.clone(), field_value.clone()));
+        let flow =
+            walk_pattern_each::<M, S>(mode, &entry.pattern, &child, moved, out, &mut |reg, out| {
+                walk_object_entries::<M, S>(mode, rest, false, input, reg, out, sink)
+            });
+        out.truncate(mark);
+        flow
+    };
+    match &entry.key {
+        ObjectKey::Literal(key) => per_key(PatternKey::Field(key), out),
+        // The key expression runs against `input` -- the pattern's own
+        // current node, whatever its kind: jq's `INDEX` needs the key value
+        // before it can raise its own "Cannot index <type> with <type>"
+        // (confirmed live: `{("a"):$q}` on `[1,2,3]` raises `Cannot index
+        // array with string "a"` -- the key evaluates fine, only the
+        // indexing fails). Pulled one output at a time, so the walk under
+        // each output runs before the next is ever produced.
+        ObjectKey::Expr(key_expr) => {
+            let mut ended: Option<Flow> = None;
+            let tracked = mode.key_input_tracked(&reg, first);
+            let key_flow = eval_each_owned_at::<S>(key_expr, input, tracked, false, &mut |key| {
+                match per_key(PatternKey::Computed(&key), out) {
+                    Flow::Exhausted => Demand::Continue,
+                    // Classified on the way out (`stop_with_downstream`), so
+                    // a `?//` *inside the key expression* never retries past
+                    // a halt or an uncatchable error the walk below raised.
+                    other => stop_with_downstream(&mut ended, other),
                 }
-                combined.extend(sub.iter().cloned());
-                new_frontier.push(combined);
+            });
+            match ended {
+                Some(flow) => flow,
+                // The key generator's own verdict: exhausted, or its own
+                // trailing error/break/halt, raised only after every match
+                // its earlier outputs completed has already been offered.
+                None => key_flow,
             }
-        }
-        return (new_frontier, sub_control.or(key_control));
-    }
-
-    let mut new_frontier = Vec::new();
-    for key_value in &key_values {
-        // real jq's `INDEX` bytecode is generic, not object-only -- a
-        // computed key can resolve to a *number* and index into an *array*
-        // target exactly like `.[EXPR]` does (confirmed live: `def one: 1;
-        // [10,20,30] as {(one):$q} | $q` is `20` in real jq; a bare
-        // non-string *literal* key like `{(1):$q}` is instead a
-        // compile-time check in real jq, not modelled here, matching object
-        // construction's own pre-existing, out-of-scope gap for the
-        // identical shape). [`index_one_owned`] is the same generic
-        // `.[EXPR]` operator's owned-value implementation used elsewhere
-        // (`nth`, `(.a|tostring)[$k]`), so reusing it here gets jq's own
-        // object/array/null dispatch, key-type errors ("Cannot index
-        // <type> with <type>"/"Cannot index <type> with string \"...\""),
-        // float truncation and negative-index wraparound for free instead
-        // of a narrower, string-only special case.
-        let field_value = match index_one_owned(value, key_value, false) {
-            Ok(Some(v)) => v,
-            Ok(None) => unreachable!("index_one_owned(.., optional: false) never suppresses"),
-            Err(err) => return (new_frontier, Some(Control::Error(err))),
-        };
-        let (sub_results, sub_control) =
-            extract_pattern_bindings::<S>(&entry.pattern, &field_value, invert);
-
-        for partial in &frontier {
-            for sub in &sub_results {
-                let mut combined = partial.clone();
-                // `{$b: P}` binds `$b` to the matched value *before* running
-                // `P` against that same value (one `INDEX` step in jq's own
-                // compilation, #2649) -- pushed ahead of the sub-pattern's
-                // own bindings so this preserves the existing order (and
-                // hence `dedup_object_bindings`'s first/last-wins result)
-                // exactly as when this was desugared into two separate
-                // entries.
-                if let Some(bind) = &entry.bind {
-                    combined.push((bind.clone(), field_value.clone()));
-                }
-                combined.extend(sub.iter().cloned());
-                new_frontier.push(combined);
-            }
-        }
-        if let Some(control) = sub_control {
-            return (new_frontier, Some(control));
         }
     }
-    (new_frontier, key_control)
 }
 
-/// [`extract_pattern_bindings`], collapsed back to its pre-#2677
-/// single-`Result` shape (#2677 step 3, first increment): a pattern with no
-/// computed key anywhere still produces exactly one binding-set with no
-/// trailing control, so every existing call site is unaffected byte-for-
-/// byte, and so does a computed key whose own expression yields exactly one
-/// valid string (the common real-world shape -- `{(.key): $q}`, `{"\(.k)":
-/// $q}`). A computed key that is itself a *generator* (`{("a","b"):$q}`,
-/// jq's own multi-output fan-out per key) needs each call site's own
-/// alternative-retry/fold-matrix machinery threaded through to fan out
-/// correctly rather than silently keeping one output or dropping the rest
-/// -- not yet done (tracked on #2677 itself), so it -- along with the rarer
-/// zero-output (`{(empty):$q}`) and `break`/`halt`-inside-a-key-expression
-/// shapes -- refuses clearly here instead, at every one of this adapter's
-/// call sites uniformly, rather than risking a wrong answer at any one of
-/// them individually.
-pub(crate) fn extract_single_pattern_binding<S: EvalSemantics>(
+/// Match `elements` right to left (`gen_array_matcher`), the last element's
+/// step being the container's first.
+fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
+    mode: &M,
+    elements: &[Pattern],
+    first: bool,
+    input: &OwnedValue,
+    reg: M::Reg,
+    out: &mut Vec<M::Binding>,
+    sink: PatternMatchSink<'_, M>,
+) -> Flow {
+    let Some((element, rest)) = elements.split_last() else {
+        return sink(reg, out);
+    };
+    let key = PatternKey::Position(rest.len() as i64);
+    let (child, moved) = match mode.step(&key, input, &reg, first) {
+        Ok(stepped) => stepped,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let mark = out.len();
+    let flow = walk_pattern_each::<M, S>(mode, element, &child, moved, out, &mut |reg, out| {
+        walk_array_elements::<M, S>(mode, rest, false, input, reg, out, sink)
+    });
+    out.truncate(mark);
+    flow
+}
+
+/// Apply jq's duplicate-name rule to one completed match's bindings, given
+/// in visit order: a bare pattern keeps the **first** occurrence, a genuine
+/// `?//` chain (`invert`, 2+ alternatives) the **last**, for every container
+/// kind and at every nesting depth.
+///
+/// Both follow from jq's compilation. In a bare pattern `bind_matcher` binds
+/// the body's `$x` references to the first `STOREV $x` in block order --
+/// which is visit order: object entries in source order, array elements
+/// right to left -- and every later store lands in a slot nothing reads. In
+/// a `?//` chain every alternative's stores are bound to one preamble slot
+/// per name, so the last store executed wins. The pre-#2872 spelling of the
+/// same rule ("object keeps first, array keeps last, both inverted under
+/// `?//`", #1366) is this rule as seen from index order; that spelling
+/// needed a dedup per container level to get a nested `{a:[$x,$x],b:$x}`
+/// right, where one pass over visit order does. Confirmed live (jq 1.7.1):
+/// `{"a":[1,2],"b":3} | . as {a:[$x,$x],b:$x} | $x` is `2`, `... ?// $z |
+/// $x` is `3`; `[[1,2],3] | . as [[$x,$x],$x] | $x` is `3`, `... ?// $z |
+/// $x` is `1`; `{"x":1,"y":2} | . as {y:$a,x:$a} | $a` is `2` on both key
+/// orders of the input (the pattern's order, not the value's).
+///
+/// Returns `None` when no name repeats -- the overwhelmingly common case,
+/// which then costs one pass over a handful of names and no allocation.
+fn dedup_pattern_match<M: PatternMode>(
+    bindings: &[M::Binding],
+    invert: bool,
+) -> Option<Vec<M::Binding>>
+where
+    M::Binding: Clone,
+{
+    let repeated = bindings.iter().enumerate().any(|(i, b)| {
+        bindings[..i]
+            .iter()
+            .any(|earlier| M::name(earlier) == M::name(b))
+    });
+    if !repeated {
+        return None;
+    }
+    let owned = bindings.to_vec();
+    Some(if invert {
+        dedup_keep_last_by(owned, M::name)
+    } else {
+        dedup_keep_first_by(owned, M::name)
+    })
+}
+
+/// A value-mode consumer of one binding set: the bound `(name, value)`
+/// pairs in visit order, deduplicated.
+pub(crate) type BindingSetSink<'s> = &'s mut dyn FnMut(&[(String, OwnedValue)]) -> Demand;
+
+/// Every binding set `pattern` produces against `value` in value mode, in
+/// jq's order, offered to `sink` one at a time until it answers
+/// [`Demand::Stop`] -- the entry point every value-mode consumer of a
+/// destructuring pattern shares (`. as PATTERN` in both evaluators, the
+/// owned-identity pipe, and `reduce`/`foreach`'s own pattern). `invert` is
+/// `patterns.len() > 1` at the call site: whether this pattern is one
+/// alternative of a genuine `?//` chain (see [`dedup_pattern_match`]).
+///
+/// The returned [`Flow`] is the walk's own (see [`walk_pattern_each`]):
+/// `Stopped` means `sink` stopped it, `Escaped` is a step's error or a key
+/// generator's trailing control, raised after every binding set that
+/// completed before it was offered. `sink`'s own verdict, when it has one
+/// richer than "stop", has to be recorded out-of-band by the caller.
+pub(crate) fn each_pattern_binding_set<S: EvalSemantics>(
     pattern: &Pattern,
     value: &OwnedValue,
     invert: bool,
-) -> Result<Vec<(String, OwnedValue)>, EvalError> {
-    let (mut binding_sets, control) = extract_pattern_bindings::<S>(pattern, value, invert);
-    match (binding_sets.len(), control) {
-        (1, None) => Ok(binding_sets.pop().unwrap()),
-        (0, Some(Control::Error(e))) => Err(e),
-        _ => Err(EvalError::new(
-            "a computed key in a destructuring pattern produced zero outputs, more than \
-             one output, or was interrupted by break/halt, none of which are yet \
-             supported at this call site (#2677)",
-        )),
-    }
-}
-
-/// Object-pattern dedup: keep-first when `invert` is `false` (the ordinary,
-/// non-`?//` rule), keep-last when `true` (real jq's `?//`-alternative
-/// rule, confirmed the opposite -- see `extract_pattern_bindings`'s own doc
-/// comment for the live-verified evidence).
-fn dedup_object_bindings(
-    bindings: Vec<(String, OwnedValue)>,
-    invert: bool,
-) -> Vec<(String, OwnedValue)> {
-    if invert {
-        dedup_keep_last_binding(bindings)
-    } else {
-        dedup_keep_first_binding(bindings)
-    }
-}
-
-/// Array-pattern dedup: keep-last when `invert` is `false` (the ordinary,
-/// non-`?//` rule), keep-first when `true` (real jq's `?//`-alternative
-/// rule) -- the mirror image of [`dedup_object_bindings`].
-fn dedup_array_bindings(
-    bindings: Vec<(String, OwnedValue)>,
-    invert: bool,
-) -> Vec<(String, OwnedValue)> {
-    if invert {
-        dedup_keep_first_binding(bindings)
-    } else {
-        dedup_keep_last_binding(bindings)
-    }
+    sink: BindingSetSink<'_>,
+) -> Flow {
+    let mut out: Vec<(String, OwnedValue)> = Vec::new();
+    walk_pattern_each::<ValuePatternMode, S>(
+        &ValuePatternMode,
+        pattern,
+        value,
+        (),
+        &mut out,
+        &mut |(), out| {
+            let demand = match dedup_pattern_match::<ValuePatternMode>(out, invert) {
+                Some(deduped) => sink(&deduped),
+                None => sink(out),
+            };
+            match demand {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            }
+        },
+    )
 }
 
 /// Drop every item after the first for each repeated `name`, keeping
@@ -56286,14 +56268,6 @@ fn dedup_keep_last_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str)
         map.insert(name(&item).to_string(), item);
     }
     map.into_values().collect()
-}
-
-fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    dedup_keep_first_by(bindings, |(name, _)| name.as_str())
-}
-
-fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    dedup_keep_last_by(bindings, |(name, _)| name.as_str())
 }
 
 /// Evaluate `def name(params): body; then` (#1371).
@@ -77477,9 +77451,9 @@ mod tests {
     /// #1201: `reduce`/`foreach`'s own `as` clause now accepts a full
     /// destructuring pattern (object or array), not just a bare `$var` --
     /// the parser now calls the same `parse_pattern` `. as PATTERN` uses,
-    /// and the evaluator destructures each input element via
-    /// `extract_pattern_bindings`, the same primitive `. as PATTERN` uses
-    /// internally. Oracle-verified against jq 1.7.1.
+    /// and the evaluator destructures each input element via the same
+    /// matcher `. as PATTERN` uses internally (`each_pattern_binding_set`
+    /// since #2872). Oracle-verified against jq 1.7.1.
     #[test]
     fn test_reduce_foreach_accept_a_full_pattern_1201() {
         query!(br#"[{"a":1},{"a":2}]"#, r"reduce .[] as {a: $a} (0; . + $a)",
@@ -95562,7 +95536,7 @@ mod tests {
     }
 
     /// #2649: `{"a":[1,2,3],"b":{"c":5}}` -- the probe input every
-    /// `walk_pattern` row below was captured against (jq 1.7.1).
+    /// walk row below was captured against (jq 1.7.1).
     fn walk_pattern_input_2649() -> OwnedValue {
         let mut inner = IndexMap::new();
         inner.insert("c".to_string(), OwnedValue::Int(5));
@@ -95579,10 +95553,6 @@ mod tests {
 
     fn walk_pattern_field_2649(name: &str) -> Expr {
         Expr::Field(name.to_string())
-    }
-
-    fn walk_pattern_index_2649(idx: i64) -> Expr {
-        Expr::Index { idx, key: None }
     }
 
     /// Parse `filter` (an `as`-pattern pipe) into the alternatives it
@@ -95617,8 +95587,28 @@ mod tests {
             value: input.clone(),
             is_input,
         };
+        // #2872: the walk delivers each completed branch to a sink; these
+        // patterns have no computed key, so there is at most one, and a
+        // refusal unwinds its bindings (the sink never runs).
         let mut out = Vec::new();
-        let result = walk_pattern::<JqSemantics>(&patterns[alt], input, seed, &frame, &mut out);
+        let mut reached: Option<PatternRegister> = None;
+        let flow = each_pattern_walk::<JqSemantics>(
+            &patterns[alt],
+            input,
+            seed,
+            &frame,
+            false,
+            &mut |reg, bindings| {
+                reached = Some(reg);
+                out = bindings.to_vec();
+                Demand::Continue
+            },
+        );
+        let result = match flow {
+            Flow::Exhausted => Ok(reached.expect("a literal-key pattern completes exactly once")),
+            Flow::Escaped(Control::Error(e)) => Err(e),
+            Flow::Stopped { .. } | Flow::Escaped(_) => panic!("unexpected walk verdict"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a literal-key pattern's walk either completes or refuses with an error (#2872)"
+        };
         (frame, result, out)
     }
 
@@ -95699,9 +95689,8 @@ mod tests {
             "{}",
             err.message
         );
-        // The first entry's binding was already collected before the refusal.
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].name, "q");
+        // A refused walk completes no branch, so nothing is bound (#2872).
+        assert!(bindings.is_empty());
     }
 
     /// #2649: array elements run in **reverse** index order
@@ -95721,13 +95710,9 @@ mod tests {
             "{}",
             err.message
         );
-        assert_eq!(bindings.len(), 1, "`$y` bound before `$x` was attempted");
-        assert_eq!(bindings[0].name, "y");
-        assert_eq!(bindings[0].value, OwnedValue::Int(2));
-        assert_eq!(
-            walk_pattern_origin_path_2649(&bindings[0].origin),
-            vec![walk_pattern_index_2649(1)]
-        );
+        // Element 1 stepped first (it is the one that did *not* refuse);
+        // the refusal then unwound its binding (#2872).
+        assert!(bindings.is_empty());
 
         // With an untracked seed the *first* step attempted is the one that
         // reports -- element 1, not element 0.
@@ -95835,7 +95820,7 @@ mod tests {
 
     /// #2649: the identity check passes but the kind check does not -- these
     /// are jq's ordinary indexing errors, the same ones
-    /// [`extract_pattern_bindings`] raises in value mode.
+    /// [`PatternKey::child`] raises in value mode.
     #[test]
     fn test_walk_pattern_kind_errors_2649() {
         let input = walk_pattern_input_2649();
@@ -95886,6 +95871,110 @@ mod tests {
             bindings[0].origin.is_none(),
             "no marker when the value is merely equal to the register"
         );
+    }
+
+    /// The value-mode matcher over `filter`'s only pattern, collecting every
+    /// binding set (names only) until `stop_after` sets have been offered.
+    fn binding_sets_2872(
+        filter: &str,
+        input: &OwnedValue,
+        invert: bool,
+        stop_after: Option<usize>,
+    ) -> (Vec<Vec<(String, OwnedValue)>>, Flow) {
+        let (_, patterns) = walk_pattern_alternatives_2649(filter);
+        let mut sets = Vec::new();
+        let flow =
+            each_pattern_binding_set::<JqSemantics>(&patterns[0], input, invert, &mut |bindings| {
+                sets.push(bindings.to_vec());
+                if stop_after == Some(sets.len()) {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            });
+        (sets, flow)
+    }
+
+    /// A document, materialized (the identity query's one owned output).
+    fn owned_doc_2872(json: &[u8]) -> OwnedValue {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let mut outputs = eval::<Vec<u64>, JqSemantics>(&parse(".").unwrap(), cursor)
+            .collect_owned::<JqSemantics>();
+        outputs.pop().expect("identity yields the document")
+    }
+
+    fn names_2872(sets: &[Vec<(String, OwnedValue)>]) -> Vec<Vec<&str>> {
+        sets.iter()
+            .map(|set| set.iter().map(|(n, _)| n.as_str()).collect())
+            .collect()
+    }
+
+    /// #2872: bindings arrive in jq's block order -- object entries in
+    /// source order, array elements right to left, `{$b: P}`'s bind ahead
+    /// of `P`'s -- which is the order the duplicate-name rule reads.
+    #[test]
+    fn test_pattern_matcher_visits_in_block_order_2872() {
+        let input = owned_doc_2872(br#"[{"a":1},{"b":2}]"#);
+        let (sets, flow) = binding_sets_2872(". as [{a:$x},{b:$y}] | .", &input, false, None);
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(names_2872(&sets), vec![vec!["y", "x"]]);
+
+        let input = owned_doc_2872(br#"{"k":{"c":5}}"#);
+        let (sets, _) = binding_sets_2872(". as {$k:{c:$x}} | .", &input, false, None);
+        assert_eq!(names_2872(&sets), vec![vec!["k", "x"]]);
+    }
+
+    /// #2872: a computed key's outputs are produced on demand -- a sink that
+    /// stops after the first binding set never sees the key's later error,
+    /// and the walk reports `Stopped`, not `Escaped`; a sink that keeps
+    /// going gets the binding set first and the key's own error last.
+    #[test]
+    fn test_pattern_matcher_pulls_keys_on_demand_2872() {
+        let input = owned_doc_2872(br#"{"a":1,"b":2}"#);
+        let filter = ". as {(\"a\", error(\"E\")):$q} | .";
+        let (sets, flow) = binding_sets_2872(filter, &input, false, Some(1));
+        assert_eq!(sets, vec![vec![("q".to_string(), OwnedValue::Int(1))]]);
+        assert!(
+            matches!(flow, Flow::Stopped { .. }),
+            "the error is never reached"
+        );
+
+        let (sets, flow) = binding_sets_2872(filter, &input, false, None);
+        assert_eq!(sets.len(), 1);
+        match flow {
+            Flow::Escaped(Control::Error(e)) => assert_eq!(e.message, "E"),
+            _ => panic!("the key's trailing error escapes after the binding set"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the assertion above is the test (#2872)"
+        }
+
+        // A later entry's key runs once per earlier binding: two outputs
+        // for the first entry, one for the second -> two binding sets, and
+        // the second entry's binding repeats.
+        let (sets, flow) =
+            binding_sets_2872(". as {(\"a\",\"b\"):$q, a:$r} | .", &input, false, None);
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(names_2872(&sets), vec![vec!["q", "r"], vec!["q", "r"]]);
+        assert_eq!(sets[0][0].1, OwnedValue::Int(1));
+        assert_eq!(sets[1][0].1, OwnedValue::Int(2));
+
+        // A zero-output key completes no match and escapes nothing.
+        let (sets, flow) = binding_sets_2872(". as {(empty):$q} | .", &input, false, None);
+        assert!(sets.is_empty());
+        assert!(matches!(flow, Flow::Exhausted));
+    }
+
+    /// #2872: the duplicate-name rule is one pass over visit order -- first
+    /// occurrence for a bare pattern, last for a `?//` alternative -- at
+    /// every nesting depth (jq 1.7.1: `{"a":[1,2],"b":3} | . as
+    /// {a:[$x,$x],b:$x} | $x` is `2`, and `3` under `?//`).
+    #[test]
+    fn test_pattern_matcher_dedups_in_visit_order_2872() {
+        let input = owned_doc_2872(br#"{"a":[1,2],"b":3}"#);
+        let filter = ". as {a:[$x,$x],b:$x} | .";
+        let (sets, _) = binding_sets_2872(filter, &input, false, None);
+        assert_eq!(sets, vec![vec![("x".to_string(), OwnedValue::Int(2))]]);
+        let (sets, _) = binding_sets_2872(filter, &input, true, None);
+        assert_eq!(sets, vec![vec![("x".to_string(), OwnedValue::Int(3))]]);
     }
 
     #[test]
@@ -98085,7 +98174,7 @@ mod tests {
     }
 
     /// #2676: a fold's own destructuring pattern is tracked exactly the way
-    /// a plain `. as PATTERN` bind is (#2649's `walk_pattern`), whenever the
+    /// a plain `. as PATTERN` bind is (#2649's walk, `PathPatternMode`), whenever the
     /// fold's SOURCE resolves through the path register. Every row here is
     /// confirmed live against jq 1.7.1 (the issue's own repro, plus the
     /// follow-up probes that pinned the `None`-register seeding rule).
@@ -98126,7 +98215,7 @@ mod tests {
         // Refused: real jq's own array-pattern matcher walks in *reverse*
         // index order, so a second element's own step runs first and moves
         // the register off the array node -- the first element's step then
-        // fails `path_intact` (#2649's `walk_pattern` doc comment has the
+        // fails `path_intact` (#2649's `PathPatternMode` doc comment has the
         // full derivation; this is the same rule, one level up).
         let refuses = |src: &str, want: &str| {
             let expr = parse(src).unwrap();
@@ -98161,7 +98250,7 @@ mod tests {
 
         // A `null`/`bool`-valued fold register still lets a *computed*
         // (non-register-derived) source element's own destructuring step
-        // through, mirroring `walk_pattern_step`'s `null_bool_identical`
+        // through, mirroring `PathPatternMode::step`'s `null_bool_identical`
         // exception -- confirmed live: `path(foreach (null) as {a:$x} (.;
         // .; $x))` on a `null` document is `["a"]`.
         assert_eq!(
@@ -98204,7 +98293,7 @@ mod tests {
 
         // `reduce`'s own accumulator is checked against the fold's
         // persistent register regardless of pattern shape (see this
-        // function's own doc comment above `walk_pattern`'s reuse in
+        // function's own doc comment above the walk's reuse in
         // `resolve_reduce`), so a destructured var referenced *directly* in
         // UPDATE always refuses there -- confirmed live: `path(reduce . as
         // {b:{c:$x}} (.; $x))` raises "Invalid path expression with result

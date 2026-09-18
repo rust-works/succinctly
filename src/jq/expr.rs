@@ -1160,7 +1160,7 @@ pub struct Include {
 /// Exclusively constructed by the parser's `parse_pattern` (`src/jq/parser.rs`),
 /// which caps recursion at `MAX_PATTERN_DEPTH` (256) and returns a clean parse
 /// error past that rather than overflowing the stack (#1240). Every recursive
-/// `Pattern`-walking function elsewhere (`extract_pattern_bindings`,
+/// `Pattern`-walking function elsewhere (`walk_pattern_each`,
 /// `collect_pattern_var_names`, `pattern_binds_var` in `src/jq/eval.rs`) is
 /// therefore transitively bounded by that same limit too, and deliberately
 /// carries no depth counter of its own -- there is no other construction path

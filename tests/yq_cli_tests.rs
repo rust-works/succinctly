@@ -28797,7 +28797,7 @@ fn test_jq_urid_malformed_escape_errors_1138() -> Result<()> {
     Ok(())
 }
 
-/// #1239: destructuring under yq shares `extract_pattern_bindings` with jq
+/// #1239: destructuring under yq shares the pattern matcher with jq
 /// mode, so the same null-propagation fix applies here too -- a nested
 /// pattern under an absent field resolves to `null` instead of erroring.
 #[test]
