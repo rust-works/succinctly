@@ -499,8 +499,8 @@ type Scope = Vec<(String, usize)>;
 /// # The rule
 ///
 /// The loader brackets every *run* of defs it wraps (each `include`, the
-/// `~/.jq` block, each `import`, and each per-origin group of dependencies
-/// wrapped into a body) between a begin and an end marker:
+/// `~/.jq` block, each `import`, and each module linked once as some other
+/// module's dependency, #2955) between a begin and an end marker:
 ///
 /// ```text
 /// def <NUL>run:begin:<id>[:<alias>]: .;   ...the run's defs...   def <NUL>run:end:<id>: .;
@@ -515,6 +515,22 @@ type Scope = Vec<(String, usize)>;
 /// *around* the current point) and a begin marker with no matching end is the
 /// **floor** -- everything below it belongs to some other module and is
 /// invisible from here.
+///
+/// ### Link runs (#2955)
+///
+/// A module that another module depends on is emitted **once**, outermost,
+/// as a run whose alias is [`Self::link_alias`] and whose defs carry the
+/// qualified spelling [`Self::link_name`] -- `<NUL>link:<id>::<name>` -- so
+/// the run exports nothing a user can spell. Inside it, a bare sibling call
+/// misses those names, floors at the run's own begin marker, and is retried
+/// under the alias exactly as a bare call inside an `import`ed module is
+/// (#2989); the retry renames the call in place, so the evaluator binds it
+/// with no change of its own. A consumer reaches the run through a
+/// forwarding stub the loader wraps into its body, `def g: <NUL>link:<id>::g;`,
+/// and that lookup is the one kind that **crosses floors**: the stub sits
+/// inside some run of its own, and its target is outside every run. Nothing
+/// lexable can spell a link name, so only a stub or a retried sibling call
+/// ever makes such a lookup.
 pub struct ModuleRun;
 
 /// One parsed marker name.
@@ -533,10 +549,11 @@ pub enum RunMarker<'a> {
 const RUN_BEGIN: &str = "\u{0}run:begin:";
 /// Sibling of [`RUN_BEGIN`].
 const RUN_END: &str = "\u{0}run:end:";
-/// The prefix of a dependency renamed out of a def's way (#2962) -- see
-/// [`ModuleRun::renamed_dep`]. Not a marker: [`ModuleRun::parse`] reads it as
-/// an ordinary def, which is what it is.
-const DEP_RENAME: &str = "\u{0}dep:";
+/// The prefix of a linked module's alias and of every def inside its run
+/// (#2955) -- see [`ModuleRun::link_alias`] and [`ModuleRun::link_name`]. Not
+/// a marker: [`ModuleRun::parse`] reads a link name as an ordinary def, which
+/// is what it is.
+const LINK: &str = "\u{0}link:";
 
 impl ModuleRun {
     /// The name of the def that opens run `id`, carrying `alias` when the
@@ -579,29 +596,39 @@ impl ModuleRun {
             .map(|id| RunMarker::End { id })
     }
 
-    /// The name a dependency is renamed to when it would otherwise collide
-    /// with the def it is wrapped into (#2962): entry `index` of run `id`'s
-    /// dependency group, originally called `name`.
-    ///
-    /// A dependency bound into a def's body sits *inside* that def's scope,
-    /// so a dependency sharing the def's (name, arity), or named after one of
-    /// its parameters, would shadow the def's own binding for the body. jq
-    /// binds a module's block in its own scope and never has the clash. The
-    /// NUL prefix keeps the new name out of reach of anything a user can
-    /// write, exactly as it does for the markers.
+    /// The alias of the run that links module `id` once (#2955): what its
+    /// begin marker carries, so a bare sibling call inside the run is retried
+    /// as [`Self::link_name`] by the same code that retries a bare call inside
+    /// an `import`ed module (#2989). The NUL prefix keeps it out of reach of
+    /// anything a user can write, exactly as it does for the markers.
     #[must_use]
-    pub fn renamed_dep(id: u32, index: usize, name: &str) -> String {
-        alloc::format!("{DEP_RENAME}{id}:{index}:{name}")
+    pub fn link_alias(id: u32) -> String {
+        alloc::format!("{LINK}{id}")
     }
 
-    /// `name` as a user wrote it: [`Self::renamed_dep`] undone, and any other
+    /// The name def `name` is emitted under inside module `id`'s link run,
+    /// and the name a consumer's forwarding stub calls: `<alias>::<name>`,
+    /// the same shape an `import "m" as a;` gives `a::name`.
+    #[must_use]
+    pub fn link_name(id: u32, name: &str) -> String {
+        alloc::format!("{LINK}{id}::{name}")
+    }
+
+    /// Whether `name` is a [`Self::link_name`] -- the one lookup that is
+    /// allowed to cross a scope floor (see `scan_scope`).
+    #[must_use]
+    pub fn is_link_name(name: &str) -> bool {
+        name.starts_with(LINK)
+    }
+
+    /// `name` as a user wrote it: [`Self::link_name`] undone, and any other
     /// name returned unchanged. For messages that name a def, so an internal
     /// spelling never reaches the terminal.
     #[must_use]
     pub fn display_name(name: &str) -> &str {
-        name.strip_prefix(DEP_RENAME)
-            .and_then(|rest| rest.splitn(3, ':').nth(2))
-            .unwrap_or(name)
+        name.strip_prefix(LINK)
+            .and_then(|rest| rest.split_once("::"))
+            .map_or(name, |(_, written)| written)
     }
 }
 
@@ -627,6 +654,15 @@ pub(crate) struct ScanResult<T> {
 /// open run, which callers need for the `import` retry (#2989) and for
 /// attributing a compile error to the module it came from.
 ///
+/// `crosses_floors` is the one exception (#2955): a lookup for a
+/// [`ModuleRun::link_name`] steps over an open begin marker instead of
+/// stopping at it. The name it wants lives in a link run wrapped outside
+/// every module run, and the stub or retried sibling call asking for it sits
+/// inside one; nothing lexable spells such a name, so no user-written call
+/// can ride this exception across a boundary. Callers compute it from the
+/// name they look up rather than deciding it themselves, so the two lookups
+/// that can meet a link name ([`in_scope`], [`reach_in_scope`]) cannot drift.
+///
 /// Both walks in this file share it, rather than each spelling the marker
 /// bookkeeping out: the file's own header already flags the two as the pair
 /// that must stay in lock-step, and "which names are visible here" is exactly
@@ -635,6 +671,7 @@ fn scan_scope<'a, E, T>(
     scope: &'a [E],
     name_of: impl Fn(&'a E) -> &'a str,
     mut probe: impl FnMut(&'a E) -> Option<T>,
+    crosses_floors: bool,
 ) -> ScanResult<T> {
     // Counts end markers seen but not yet matched by an opener. A run whose
     // end we have already passed is *closed*: it is wrapped around this
@@ -646,7 +683,7 @@ fn scan_scope<'a, E, T>(
             Some(RunMarker::Begin { id, alias }) => {
                 if closed > 0 {
                     closed -= 1;
-                } else {
+                } else if !crosses_floors {
                     // An open run: nothing below it is visible from inside
                     // this module body, and it names who wrote the code here.
                     return ScanResult {
@@ -736,6 +773,7 @@ fn reach_in_scope(scope: &ReachScope, name: &str, arity: usize) -> ScanResult<Sc
         scope,
         |(n, _, _)| n.as_str(),
         |(n, a, hit)| (*a == arity && n == name).then_some(*hit),
+        ModuleRun::is_link_name(name),
     )
 }
 
@@ -1383,6 +1421,7 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
         scope,
         |(n, _)| n.as_str(),
         |(n, a)| (*a == arity && n == name).then_some(()),
+        ModuleRun::is_link_name(name),
     )
 }
 
@@ -1392,7 +1431,7 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> ScanResult<()> {
 /// [`in_var_scope`] and [`in_label_scope`] both wrap, so a change to how
 /// name-stack lookups work has exactly one definition to update.
 fn in_name_scope(scope: &[String], name: &str) -> ScanResult<()> {
-    scan_scope(scope, String::as_str, |n| (n == name).then_some(()))
+    scan_scope(scope, String::as_str, |n| (n == name).then_some(()), false)
 }
 
 /// [`in_name_scope`] for `$name` against `var_scope`: a `$`-parameter of the
@@ -1419,7 +1458,7 @@ fn in_label_scope(label_scope: &LabelScope, name: &str) -> ScanResult<()> {
 /// the same [`scan_scope`] walk with a probe that never matches, so it
 /// always runs to the floor (or the top) instead of stopping early.
 fn enclosing_run(label_scope: &LabelScope) -> Option<u32> {
-    scan_scope(label_scope, String::as_str, |_| None::<()>)
+    scan_scope(label_scope, String::as_str, |_| None::<()>, false)
         .run
         .map(|(id, _)| id)
 }
@@ -3145,8 +3184,10 @@ mod tests {
         use super::*;
 
         /// Build a `Scope` from a compact spelling: `"begin:1"` / `"end:1"` /
-        /// `"begin:1@a"` are markers, anything else is a def of that name at
-        /// arity 0.
+        /// `"begin:1@a"` are markers, `"link:1"` opens module 1's link run
+        /// (a begin marker carrying its link alias, #2955), `"1::g"` is the
+        /// def `g` as emitted inside that run, and anything else is a def of
+        /// that name at arity 0.
         fn scope_of(entries: &[&str]) -> Scope {
             entries
                 .iter()
@@ -3160,6 +3201,11 @@ mod tests {
                         }
                     } else if let Some(id) = e.strip_prefix("end:") {
                         ModuleRun::end_marker(id.parse().expect("id"))
+                    } else if let Some(id) = e.strip_prefix("link:") {
+                        let id = id.parse().expect("id");
+                        ModuleRun::begin_marker(id, Some(&ModuleRun::link_alias(id)))
+                    } else if let Some((id, name)) = e.split_once("::") {
+                        ModuleRun::link_name(id.parse().expect("id"), name)
                     } else {
                         (*e).to_string()
                     };
@@ -3261,19 +3307,76 @@ mod tests {
             }
         }
 
-        /// #2962: a renamed dependency is an ordinary def to the scan, and
-        /// its display name is the one the user wrote -- including a name
-        /// that itself contains `:` (an `alias::name`).
+        /// #2955: a link name is an ordinary def to the scan, its display
+        /// name is the one the user wrote -- including a name that itself
+        /// contains `::` -- and a begin marker carrying a link alias parses
+        /// back to that alias (the `import` retry reads it from there).
         #[test]
-        fn renamed_deps_are_ordinary_defs_and_display_as_written() {
-            let renamed = ModuleRun::renamed_dep(4, 2, "c");
-            assert_eq!(ModuleRun::parse(&renamed), None);
-            assert_eq!(ModuleRun::display_name(&renamed), "c");
-            let renamed = ModuleRun::renamed_dep(4, 2, "ns::c");
-            assert_eq!(ModuleRun::display_name(&renamed), "ns::c");
+        fn link_names_are_ordinary_defs_and_display_as_written() {
+            let linked = ModuleRun::link_name(4, "c");
+            assert_eq!(ModuleRun::parse(&linked), None);
+            assert!(ModuleRun::is_link_name(&linked));
+            assert_eq!(ModuleRun::display_name(&linked), "c");
+            assert_eq!(
+                ModuleRun::display_name(&ModuleRun::link_name(4, "ns::c")),
+                "ns::c"
+            );
             for ordinary in ["c", "ns::c", ""] {
+                assert!(!ModuleRun::is_link_name(ordinary));
                 assert_eq!(ModuleRun::display_name(ordinary), ordinary);
             }
+            assert_eq!(
+                format!("{}::c", ModuleRun::link_alias(4)),
+                linked,
+                "the retry spells `alias::name`, so the two must compose"
+            );
+            let alias = ModuleRun::link_alias(4);
+            assert_eq!(
+                ModuleRun::parse(&ModuleRun::begin_marker(4, Some(&alias))),
+                Some(RunMarker::Begin {
+                    id: 4,
+                    alias: Some(alias.as_str())
+                })
+            );
+        }
+
+        /// #2955: a consumer's forwarding stub sits inside its own module's
+        /// run and calls a def in a link run wrapped outside it. That one
+        /// lookup crosses the floor; a bare lookup from the same point still
+        /// does not, and the link run's defs are unreachable by their bare
+        /// names from anywhere.
+        #[test]
+        fn a_link_name_lookup_crosses_the_floor_and_nothing_else_does() {
+            // `link:2 { 2::g } end:2 { begin:1 { h, <stub body here> } }`
+            let chain = ["link:2", "2::g", "end:2", "begin:1", "h"];
+            let target = ModuleRun::link_name(2, "g");
+            assert!(
+                visible(&chain, &target),
+                "the stub's target, across run 1's floor"
+            );
+            assert!(!visible(&chain, "g"), "never by its bare name");
+            assert!(visible(&chain, "h"));
+
+            // From the main filter, below every end marker: still not `g`.
+            let chain = ["link:2", "2::g", "end:2", "begin:1", "h", "end:1"];
+            assert!(!visible(&chain, "g"), "a link run re-exports nothing");
+            assert!(visible(&chain, "h"));
+
+            // Inside the link run itself, a bare sibling call misses and
+            // reports the link alias, which is what the retry needs.
+            let scan = in_scope(&scope_of(&["link:2", "2::g", "2::k"]), "g", 0);
+            assert!(scan.hit.is_none());
+            assert_eq!(scan.run, Some((2, Some(ModuleRun::link_alias(2)))));
+            assert!(
+                visible(&["link:2", "2::g", "2::k"], &target),
+                "...and the retry hits"
+            );
+
+            // A dependency of a dependency: the inner link run's stub crosses
+            // its own run's floor into the closed outer link run.
+            let chain = ["link:3", "3::z", "end:3", "link:2", "2::g"];
+            assert!(visible(&chain, &ModuleRun::link_name(3, "z")));
+            assert!(!visible(&chain, "z"));
         }
     }
 
