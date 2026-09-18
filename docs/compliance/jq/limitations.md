@@ -1566,9 +1566,9 @@ answers `["b"]` — and classified the two residuals appended below):
   per-step register" *and* "still identical to the persistent one") without regressing the
   `[]` case above — recorded rather than built, since the exit code and value already match
   and only wording differs.
-- **`getpath` is transparent to the path register, and succinctly now models it — except when
-  the input's position comes from an identity-passthrough bind
-  ([#2896](https://github.com/rust-works/succinctly/issues/2896)).** The mechanism recorded
+- **`getpath` is transparent to the path register, and succinctly now models it
+  ([#2896](https://github.com/rust-works/succinctly/issues/2896),
+  [#2978](https://github.com/rust-works/succinctly/issues/2978)).** The mechanism recorded
   here as *hypothesized* is now confirmed behaviourally against jq 1.7.1, with a probe that
   isolates each half. jq's `f_getpath` is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, so
   (a) on an input that is not the register it returns the value and leaves the register
@@ -1598,16 +1598,41 @@ answers `["b"]` — and classified the two residuals appended below):
   $ echo '{"a":{"b":2}}' | succinctly jq     'del(foreach .[] as $k (.; getpath(["a"]); .b))'
   {"a":{}}
   ```
-  **What still refuses**: a `getpath` whose *input* is a variable bound by an
-  identity-passthrough source (`. as $x`), as in the `(b)` probe above. Such a binding is
-  deliberately marked `Origin::Snapshot` — the #844 value-equality witness, which carries no
-  position — so there is nothing for `getpath`'s result to compose its own position from, and
-  the branch gets no provenance rather than a guessed one. A navigated bind (`.a as $y`), a
-  fold accumulator seeded from a trackable INIT/UPDATE branch, and another `getpath`'s own
-  result all do carry a position, so those compose. This is the safe direction — a refusal,
-  never a fabricated path — and is tracked as
-  [#2978](https://github.com/rust-works/succinctly/issues/2978); closing it means giving an
-  identity-passthrough bind a position without narrowing `Origin::Snapshot`'s own acceptance.
+  The `(b)` probe's own bind form — a `getpath` whose *input* is a variable bound by an
+  identity-passthrough source (`. as $x`) — composed nothing until #2978. Such a binding is
+  marked with the #844 value-equality witness (`Origin::Snapshot`), which carries no position.
+  #2978 gives it one *without* narrowing that witness: a `. as $x` made inside a resolver
+  invocation while `.` is still the register is marked `Origin::SnapshotAt`, certified by the
+  same value rule as `Snapshot` but also carrying the register's absolute path at the bind
+  (`Frame::at`, the #2042 invariant every navigated bind's `Origin::At` already rests on),
+  which `getpath`'s result then composes from. The position is minted for `.` only while the
+  branch is trackable (a bind after a construction stage gets none), inherited from a marker
+  source (`$x as $y`) rather than read off the frame, and for an `if` source only when both
+  arms agree — each of the other rules fabricates a path on a sibling or a rebuilt copy, and
+  `scripts/jq-bind-origin-oracle-sweep.sh`'s `identity-bind-*-trap` rows pin all three. So
+  the following now agree with jq in both directions, below the root too:
+  ```
+  $ echo '{"a":{"b":2}}'         | succinctly jq -c 'path(. as $x | .a | $x | getpath(["a"]) | .b)'
+  ["a","b"]
+  $ echo '{"a":{"b":2}}'         | succinctly jq -c '(. as $x | .a | $x | getpath(["a"]) | .b) = 9'
+  {"a":{"b":9}}
+  $ echo '{"x":{"a":{"b":2}}}'   | succinctly jq -c 'path(.x | . as $v | .a | $v | getpath(["a"]) | .b)'
+  ["x","a","b"]
+  ```
+  **What still refuses** (safe direction, both pinned by
+  `test_identity_bind_position_residuals_still_refuse_2978`): an `if`-wrapped identity source
+  whose arms sit at *different* positions — `path(. as $p | .a | (if true then $p else . end)
+  as $x | $x | getpath(["a"]) | .b)` is `["a","b"]` in jq; which arm ran is not known at the
+  bind site, so no position is minted — and a marker used inside a *nested* `path()`
+  (`path(. as $x | .a | path($x | getpath(["a"]) | .b))`): the position is in the outer
+  invocation's coordinates, jq answers `["b"]` inside and then refuses the outer `path()`
+  with `Invalid path expression with result ["b"]`, succinctly refuses inside instead — both
+  exit 5, wording differs. And a *navigated* source headed by such a marker, used off the
+  marker's own position (`path(. as $x | .a | ($x.a as $w | $w | .b))` on
+  `{"a":{"b":1},"c":{"b":1}}`, jq `["a","b"]`): an `At`-headed source is re-rooted at the
+  marker's position, but a `SnapshotAt`-headed one still resolves against the ambient (`.a`,
+  where `$x` is not certified) and falls back to binding by value — a possible later widening,
+  refuse-only today.
 
   **Also still refusing**: `getpath` as a fold *SOURCE*
   (`path(foreach getpath(["a"]) as $x (...))`), which is a separate position from the

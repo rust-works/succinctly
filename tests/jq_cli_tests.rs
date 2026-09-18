@@ -59910,6 +59910,66 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
     Ok(())
 }
 
+/// #2978: an identity-passthrough bind (`. as $x`) made inside a
+/// `path()`/`del()`/assignment resolution while `.` is the register now
+/// carries its own position, so `getpath` on the marker composes an
+/// absolute path from it -- the `(b)` half of #2896's mechanism, which
+/// used to refuse for this one bind form. Read and both writes, captured
+/// live against jq 1.7.1.
+#[test]
+fn test_identity_bind_getpath_composes_its_position_2978() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"a":{"b":2}}"#,
+            r#"path(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+            r#"["a","b"]"#,
+        ),
+        (
+            r#"{"a":{"b":2},"c":1}"#,
+            r#"del(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+            r#"{"a":{},"c":1}"#,
+        ),
+        (
+            r#"{"a":{"b":2}}"#,
+            r#"(. as $x | .a | $x | getpath(["a"]) | .b) = 9"#,
+            r#"{"a":{"b":9}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#2978: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#2978: `{filter}`");
+    }
+    Ok(())
+}
+
+/// The trap the fix must not fall into (#2978): an identity bind made
+/// *below* the invocation root (`.a | . as $x`) is at `["a"]`, not `[]`.
+/// A rule that assumed the root would compose `["a","c"]` -- the
+/// register's own path -- for a node that is really `["a","a","c"]`, and
+/// `del()` would write through it. jq 1.7.1 refuses both, with this exact
+/// message.
+#[test]
+fn test_identity_bind_below_root_does_not_assume_root_2978() -> Result<()> {
+    let input = r#"{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}"#;
+    for filter in [
+        r#"path(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+        r#"del(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2978: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#
+            ),
+            "#2978: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2696: a bounded consumer over bare `..` must still answer exactly what
 /// jq answers -- captured live against jq 1.7.1 on the same document as
 /// `test_bare_recurse_family_order_unchanged_by_lazy_sink_2696`. This is the

@@ -140,6 +140,19 @@ pub struct Tracked {
 ///   *and* the invocation matches -- a nested `path()` call is a second
 ///   invocation with its own root, and a path from one is meaningless in
 ///   the other.
+/// - [`Origin::SnapshotAt`] -- the #2978 witness: an identity-passthrough
+///   binding made inside a resolver invocation *while the branch was still
+///   trackable*, so `.` was the register's own node and `Frame::at` proved
+///   its absolute position. It is **certified exactly like `Snapshot`** --
+///   by value equality, unconditionally -- so nothing `Snapshot` accepts is
+///   narrowed; what it adds is the bound node's position, read only by the
+///   positional composers (`getpath`'s result, `Snapshot::position`), so
+///   `path(. as $x | .a | $x | getpath(["a"]) | .b)` can compose `["a","b"]`
+///   from it the way a navigated bind's `At` already does. It is a fourth
+///   variant rather than a field on `Tracked` so the position rides the
+///   existing `Snapshot::Marked(Origin)` provenance channel through every
+///   pass-through arm with no new plumbing, and so every exhaustive `match`
+///   on `Origin` is forced to say what it does with it.
 /// - [`Origin::Untracked`] -- the #2072 witness for a binding whose source
 ///   navigated, made *outside* any resolver invocation (an ordinary `as`
 ///   binding, not one syntactically inside `path()`'s argument): there is
@@ -157,6 +170,16 @@ pub enum Origin {
     At {
         /// The resolver invocation (one `path()`/`del()`/assignment target
         /// resolution) the binding was made in.
+        invocation: u64,
+        /// The bound node's absolute path within that invocation.
+        path: super::eval::BindPath,
+    },
+    /// Frozen from `.` itself (an identity passthrough) at a provable
+    /// position inside a resolver invocation (#2978). Certified exactly like
+    /// [`Origin::Snapshot`] (value equality); additionally proves the bound
+    /// node's absolute position, for positional readers only.
+    SnapshotAt {
+        /// The resolver invocation the binding was made in.
         invocation: u64,
         /// The bound node's absolute path within that invocation.
         path: super::eval::BindPath,

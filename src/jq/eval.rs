@@ -28999,20 +28999,41 @@ impl Frame {
         })
     }
 
+    /// The [`Origin::SnapshotAt`] for an identity-passthrough binding made
+    /// at this frame's own position (#2978), or `None` when that position is
+    /// not provable. The caller ([`identity_bind_position`]) has already
+    /// established that `.` *is* the register here (`trackable`); this only
+    /// reads off where the register is.
+    fn identity_origin(&self) -> Option<Origin> {
+        self.at.as_ref().map(|at| Origin::SnapshotAt {
+            invocation: self.invocation,
+            path: BindPath(Rc::clone(at)),
+        })
+    }
+
     /// Whether a marker with `origin` names exactly this frame's position.
     /// A [`Origin::Snapshot`] marker carries no position and is always
     /// admitted here -- its own rule (value equality) is the caller's.
-    /// [`Origin::Untracked`] (#2072: a navigated bind made outside any
-    /// resolver invocation) never certifies -- there is no invocation for it
-    /// to have been made in.
+    /// [`Origin::SnapshotAt`] (#2978) is admitted by that same value rule,
+    /// unconditionally: the position it carries is for the positional
+    /// readers ([`Snapshot::position`]), never a narrowing of what
+    /// `Snapshot` accepts. [`Origin::Untracked`] (#2072: a navigated bind
+    /// made outside any resolver invocation) never certifies -- there is no
+    /// invocation for it to have been made in.
     fn certifies(&self, origin: &Origin) -> bool {
         match origin {
-            Origin::Snapshot => true,
-            Origin::At { invocation, path } => {
-                *invocation == self.invocation && self.at.as_ref().is_some_and(|at| *at == path.0)
-            }
+            Origin::Snapshot | Origin::SnapshotAt { .. } => true,
+            Origin::At { invocation, path } => self.names(*invocation, path),
             Origin::Untracked => false,
         }
+    }
+
+    /// Whether this frame sits exactly at `path` within `invocation` -- the
+    /// position-only half of [`Frame::certifies`], for the one reader that
+    /// must compare *positions* and not admit a `SnapshotAt` by its value
+    /// rule ([`getpath_preserves_register`]'s equal-value proof, #2978).
+    fn names(&self, invocation: u64, path: &BindPath) -> bool {
+        invocation == self.invocation && self.at.as_ref().is_some_and(|at| *at == path.0)
     }
 }
 
@@ -29150,8 +29171,14 @@ pub(crate) fn try_payload_root(body: &Expr) -> RootWitness {
 /// rebuilt copy as if it were the original. `null`/`bool` values are exempt
 /// -- jq's `jv_identical` treats those as identical by value regardless of
 /// node, the same carve-out `null_bool_identical` makes elsewhere.
+///
+/// A [`Origin::SnapshotAt`] marker (#2978) is admitted by `certifies`'s
+/// value rule exactly as a `Snapshot` one is, so it is demoted under exactly
+/// the same condition -- a `matches!` over both, not an `!=` against one,
+/// because the compiler cannot flag a `PartialEq` miss here and a marker
+/// that skipped this check would reopen the #2642 hole.
 fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
-    if marker.origin != Origin::Snapshot {
+    if !matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. }) {
         return false;
     }
     if matches!(marker.value, OwnedValue::Null | OwnedValue::Bool(_)) {
@@ -29423,17 +29450,27 @@ impl Snapshot {
         matches!(self, Self::Marked(_))
     }
 
-    /// The origin this provenance proves a *position* with, for the two
-    /// readers that treat `Marked(At)` and `At` alike — [`register_identical`]
-    /// and the `getpath` arm's own input-position lookup. `Origin::Snapshot`
-    /// carries no position and answers `None`, as does an unprovenanced
-    /// branch.
-    fn position(&self) -> Option<&Origin> {
+    /// The absolute position this provenance proves, as `(invocation,
+    /// path)`, for the two readers that treat `Marked(At)` and `At` alike —
+    /// [`getpath_result_position`] and [`getpath_preserves_register`]. A
+    /// [`Origin::SnapshotAt`] (#2978) proves one too: an identity-passthrough
+    /// bind made while `.` was the register at a known position. Only
+    /// `Origin::Snapshot`/`Untracked` carry none and answer `None`, as does
+    /// an unprovenanced branch.
+    ///
+    /// Deliberately *not* the `Origin` itself: the two callers must compare
+    /// positions ([`Frame::names`]), and handing back an `Origin` would let
+    /// one reach for [`Frame::certifies`] instead, whose value rule admits a
+    /// `SnapshotAt` from anywhere.
+    fn position(&self) -> Option<(u64, &BindPath)> {
         match self {
             Self::No => None,
-            Self::Marked(origin) | Self::At(origin) => {
-                matches!(origin, Origin::At { .. }).then_some(origin)
-            }
+            Self::Marked(origin) | Self::At(origin) => match origin {
+                Origin::At { invocation, path } | Origin::SnapshotAt { invocation, path } => {
+                    Some((*invocation, path))
+                }
+                Origin::Snapshot | Origin::Untracked => None,
+            },
         }
     }
 }
@@ -30935,18 +30972,42 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // moves the register (`path(.a as $y | .b)` is `["b"]`) and never
         // raises a path error of its own; the body still resolves against
         // this arm's own `value`, `trackable` and `frame`, exactly as before.
-        Expr::As { expr, var, body } => resolve_bind_source_sink::<S>(
-            expr,
-            body,
-            var,
-            value,
-            trackable,
-            frame,
-            &mut |bound, origin| {
-                let substituted = substitute_bound_var_at(expr, body, var, &bound, origin, None);
-                resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
-            },
-        ),
+        //
+        // #2978: an identity-passthrough source (`. as $x`) binds `.` itself,
+        // and while the branch is trackable that is the register at
+        // `frame.at` -- computed once per `As` node, before the source is
+        // driven, so every bound value of a multi-output source shares it.
+        Expr::As { expr, var, body } => {
+            let identity_position = identity_bind_position::<S>(expr, trackable, frame);
+            resolve_bind_source_sink::<S>(
+                expr,
+                body,
+                var,
+                value,
+                trackable,
+                frame,
+                &mut |bound, origin| {
+                    let substituted = substitute_bound_var_at(
+                        expr,
+                        body,
+                        var,
+                        &bound,
+                        origin,
+                        identity_position.clone(),
+                        None,
+                    );
+                    resolve_node_sink::<S>(
+                        &substituted,
+                        value,
+                        trackable,
+                        snapshot,
+                        frame,
+                        keep,
+                        sink,
+                    )
+                },
+            )
+        }
         // #2649: `SRC as PATTERN | body`, jq's destructuring bind. Like `As`
         // above, jq evaluates SRC with tracking suspended, so the source
         // itself never moves the register -- but the *pattern* is compiled
@@ -33005,9 +33066,14 @@ fn cannot_move_register(expr: &Expr) -> bool {
 /// Both confirmed live against jq 1.7.1. Composing that needs the input's
 /// own absolute position, which for an untracked branch is exactly what a
 /// positional ambient ([`Snapshot::position`]) carries — a `$x` marker
-/// (`Marked(Origin::At)`), or another `getpath`'s own result (`At`). With
+/// bound from a navigated position (`Marked(Origin::At)`) or, since #2978,
+/// from `.` itself at a provable position (`Marked(Origin::SnapshotAt)`,
+/// the `(b)` probe above), or another `getpath`'s own result (`At`). With
 /// none, there is nothing to compose from and the result gets no
-/// provenance, which costs a refusal.
+/// provenance, which costs a refusal. The output is always a positional
+/// `Snapshot::At(Origin::At { .. })`, whatever the input's origin: the
+/// result is a navigated node, never a frozen `.`, so it must not inherit
+/// `SnapshotAt`'s value-equality admission.
 ///
 /// A mark from a *different* resolver invocation is likewise dropped: its
 /// path is a position in another invocation's coordinate system, and
@@ -33039,12 +33105,10 @@ fn getpath_result_position<S: EvalSemantics>(
         return Snapshot::No;
     }
     match input_snapshot.position() {
-        Some(Origin::At { invocation, path }) if *invocation == frame.invocation => {
-            Snapshot::At(Origin::At {
-                invocation: *invocation,
-                path: BindPath(PathPrefix::extend_many(&path.0, components.to_vec())),
-            })
-        }
+        Some((invocation, path)) if invocation == frame.invocation => Snapshot::At(Origin::At {
+            invocation,
+            path: BindPath(PathPrefix::extend_many(&path.0, components.to_vec())),
+        }),
         _ => Snapshot::No,
     }
 }
@@ -33156,8 +33220,13 @@ fn is_empty_literal_path(keys: &Expr) -> bool {
 ///   provable and is not the register's.** `stage_frame` is where this
 ///   stage's input sits (the carried register's position, once a
 ///   non-navigating stage has stepped off it), so a positional mark that
-///   [`Frame::certifies`] rejects names a different node of an equal value —
+///   [`Frame::names`] rejects names a different node of an equal value —
 ///   exactly the sibling-copy shape [`register_identical`] exists to refuse.
+///   `names`, not `certifies` (#2978): a `SnapshotAt` mark carries a
+///   position, but `certifies` admits it by value from anywhere, so through
+///   `certifies` this proof could never fire for one -- the position it was
+///   given to carry would go unread, costing the acceptance for no gain in
+///   soundness.
 ///
 /// When the values are equal and *nothing* certifies a position, this
 /// answers `false` and the register is dropped exactly as before — a
@@ -33199,7 +33268,7 @@ fn getpath_preserves_register<S: EvalSemantics>(
     input != register
         || branch_snapshot
             .position()
-            .is_some_and(|origin| !stage_frame.certifies(origin))
+            .is_some_and(|(invocation, path)| !stage_frame.names(invocation, path))
 }
 
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
@@ -34482,6 +34551,10 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     let head = unwrap_paren(source);
     let all_names = pattern_alternatives_var_names(patterns);
     let last_idx = patterns.len() - 1;
+    // #2978: a bare `$x` alternative of an identity source gets the same
+    // positioned snapshot the `As` arm mints -- same helper, same
+    // `trackable`/`frame`, computed once for every alternative and source.
+    let identity_position = identity_bind_position::<S>(source, trackable, frame);
     for bound in &sources {
         // jq's `path_intact` at the pattern's first step: is the source
         // value the register's own node? While `trackable` the register is
@@ -34525,6 +34598,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 bindings,
                 &all_names,
                 patterns.len() > 1,
+                identity_position.clone(),
             );
             clear_nonretryable_stop();
             let flow = if reg.path.depth() == 0 {
@@ -34577,8 +34651,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
 /// a [`LazyMarker`], the same splice `substitute_bound_var_at` performs);
 /// one bound by value only is a plain literal. A bare `$x` alternative goes
 /// through `substitute_bound_var_at` itself so an identity source gets its
-/// `Origin::Snapshot` exactly as under `As`. Names any *other* alternative
-/// binds become `null`, as in value mode (`each_pattern_alternatives`).
+/// `Origin::Snapshot` -- or, with a provable position (`identity_position`,
+/// #2978), `Origin::SnapshotAt` -- exactly as under `As`. Names any *other*
+/// alternative binds become `null`, as in value mode
+/// (`each_pattern_alternatives`).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_as_pattern`
 fn bind_pattern_body(
     source: &Expr,
     body: &Expr,
@@ -34587,13 +34664,14 @@ fn bind_pattern_body(
     bindings: Vec<PatternBinding>,
     all_names: &[String],
     invert_dedup: bool,
+    identity_position: Option<Origin>,
 ) -> Expr {
     let mut bound_names: Vec<String> = Vec::new();
     let mut substituted = match pattern {
         Pattern::Var(name) => {
             bound_names.push(name.clone());
             let origin = bindings.into_iter().next().and_then(|b| b.origin);
-            substitute_bound_var_at(source, body, name, bound, origin, None)
+            substitute_bound_var_at(source, body, name, bound, origin, identity_position, None)
         }
         Pattern::Object(_) | Pattern::Array(_) => {
             let bindings = dedup_pattern_bindings(pattern, bindings, invert_dedup);
@@ -40259,7 +40337,10 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
         // #2042: only a marker frozen from `.` itself is a passthrough of
         // `.`; one bound from a navigated position is that *node*, and a
         // binding from it inherits its origin instead (`resolve_bind_source_witness`).
-        Expr::TrackedVar(marker) => matches!(marker.origin, Origin::Snapshot),
+        // #2978: a positioned identity snapshot is still frozen from `.`.
+        Expr::TrackedVar(marker) => {
+            matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. })
+        }
         Expr::If {
             then_branch,
             else_branch,
@@ -40269,6 +40350,79 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
         Expr::Alternative(left, _) => is_identity_passthrough(left),
         _ => false,
     }
+}
+
+/// The absolute position an identity-passthrough bind source (`. as $x`,
+/// [`is_identity_passthrough`]) binds its variable *from*, as an
+/// [`Origin::SnapshotAt`], or `None` when it is not provable (#2978).
+///
+/// Recurses over exactly `is_identity_passthrough`'s grammar, so a source
+/// that predicate does not admit answers `None` here and the caller keeps
+/// its ordinary rule. Per form:
+///
+/// - `.`: while the branch is `trackable`, the register *is* the ambient
+///   `.`, and `Frame::at` is -- by #2042's invariant -- that register's
+///   absolute path within the invocation, or `None` when unprovable. So
+///   `trackable && frame.at.is_some()` proves `.`'s position exactly,
+///   including below the invocation root (`path(.x | . as $v | ...)` binds
+///   `$v` at `["x"]`). Once the branch has stepped off the register
+///   (`path(.a | {b:{c:1}} | . as $x | ...)`), `frame.at` names the carried
+///   register rather than `.`, so nothing is minted. This is the same
+///   witness every navigated bind's `Origin::At` already rests on, with an
+///   empty relative path.
+/// - a marker (`$p as $x`): **the marker's own position**, never the
+///   frame's. `$p` is a frozen value, not the ambient; a `SnapshotAt` marker
+///   carries where it was frozen, a plain `Snapshot` carries nothing.
+///   Using the frame's position here would bind `$x` to wherever the pipe
+///   currently sits -- `path(. as $x | .a | ($x as $y | .c | $y |
+///   getpath(["c"]) | .b))` would compose `["a","c"]` for a value that is
+///   the root's `.c`, and `del()` would write through it.
+/// - `if c then A else B end`: both arms' positions, only when both are
+///   provable *and equal* -- which arm ran is not known here, so a
+///   disagreement (`(if true then $p else . end)` with `$p` at `[]` and `.`
+///   at `["a"]`) mints nothing.
+/// - `try A catch B`: `A`'s. The grammar admits only sources that cannot
+///   raise, so `B` never runs.
+/// - `A // B`: `A`'s. `B` runs only when `A`'s node is `null`/`false`. Every
+///   position below a `null` holds `null`, which [`null_bool_identical`]
+///   admits by value regardless of position, and nothing below a `false` is
+///   reachable at all (navigating it raises) -- so a `B`-derived value can
+///   never meet a register it is not value-identical to, and `A`'s position
+///   is sound for the pair.
+///
+/// jq mode only, mirroring [`getpath_result_position`]'s single mint site:
+/// the yq positional readers are unreachable anyway, but a `SnapshotAt`
+/// should not exist in yq mode at all.
+fn identity_bind_position<S: EvalSemantics>(
+    source: &Expr,
+    trackable: bool,
+    frame: &Frame,
+) -> Option<Origin> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    fn walk(source: &Expr, trackable: bool, frame: &Frame) -> Option<Origin> {
+        match unwrap_paren(source) {
+            Expr::Identity => trackable.then(|| frame.identity_origin()).flatten(),
+            Expr::TrackedVar(marker) => match &marker.origin {
+                Origin::SnapshotAt { .. } => Some(marker.origin.clone()),
+                Origin::Snapshot | Origin::At { .. } | Origin::Untracked => None,
+            },
+            Expr::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_at = walk(then_branch, trackable, frame)?;
+                let else_at = walk(else_branch, trackable, frame)?;
+                (then_at == else_at).then_some(then_at)
+            }
+            Expr::Try { expr, .. } => walk(expr, trackable, frame),
+            Expr::Alternative(left, _) => walk(left, trackable, frame),
+            _ => None,
+        }
+    }
+    walk(source, trackable, frame)
 }
 
 /// Substitute a variable in an expression with a value, without marking the
@@ -40350,7 +40504,7 @@ pub(crate) fn substitute_bound_var(
     var_name: &str,
     bound: &OwnedValue,
 ) -> Expr {
-    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None)
+    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None, None)
 }
 
 /// [`substitute_bound_var`] for a binding site that knows the document node
@@ -40365,31 +40519,37 @@ pub(crate) fn substitute_bound_var_from(
     bound: &OwnedValue,
     node: Option<BindOrigin>,
 ) -> Expr {
-    substitute_bound_var_at(bind_expr, body, var_name, bound, None, node)
+    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None, node)
 }
 
 /// [`substitute_bound_var`]/[`substitute_bound_var_from`]'s shared core.
 ///
-/// An identity passthrough always gets `Origin::Snapshot`, `origin`
-/// notwithstanding -- the #844 value-equality rule applies regardless of
-/// what a navigated sibling binding would have gotten. Otherwise an
-/// explicit `origin` (the #2042 witness: a navigated source resolved
-/// *inside* a `path()`/`del()`/assignment invocation, from
-/// [`resolve_bind_source_witness`]) is kept as-is. With neither but a `node` (the
-/// #2072 witness: a navigated source outside any resolver invocation), the
-/// marker is `Origin::Untracked` -- carried for the cursor routes only,
-/// never certified by `resolve_node`. With none of the three this is a
-/// plain, unwrapped literal substitution, same as `substitute_var`.
+/// An identity passthrough always gets the #844 value-equality rule,
+/// `origin` notwithstanding -- regardless of what a navigated sibling
+/// binding would have gotten. That is `Origin::Snapshot`, or, when the
+/// resolver call site proved where `.` sat as it bound
+/// (`identity_position`, from [`identity_bind_position`], #2978), the
+/// position-carrying `Origin::SnapshotAt`, which `Frame::certifies` admits
+/// by exactly the same value rule. The value-mode callers above have no
+/// frame and pass `None`. Otherwise an explicit `origin` (the #2042 witness:
+/// a navigated source resolved *inside* a `path()`/`del()`/assignment
+/// invocation, from [`resolve_bind_source_witness`]) is kept as-is. With
+/// neither but a `node` (the #2072 witness: a navigated source outside any
+/// resolver invocation), the marker is `Origin::Untracked` -- carried for
+/// the cursor routes only, never certified by `resolve_node`. With none of
+/// the three this is a plain, unwrapped literal substitution, same as
+/// `substitute_var`.
 fn substitute_bound_var_at(
     bind_expr: &Expr,
     body: &Expr,
     var_name: &str,
     bound: &OwnedValue,
     origin: Option<Origin>,
+    identity_position: Option<Origin>,
     node: Option<BindOrigin>,
 ) -> Expr {
     let origin = if is_identity_passthrough(bind_expr) {
-        Origin::Snapshot
+        identity_position.unwrap_or(Origin::Snapshot)
     } else if let Some(origin) = origin {
         origin
     } else if node.is_some() {
@@ -65800,7 +65960,7 @@ mod tests {
     /// parses to -- only `substitute_var_impl` builds one) is fast-pathed
     /// like the literal it stands in for, and agrees with the bridge on
     /// every value it can hold, both as the expression's own result and as
-    /// a comparison/boolean operand, under both origins a marker can carry.
+    /// a comparison/boolean operand, under every origin a marker can carry.
     /// The marker's value ranges over the same spellings as the input so
     /// the `NumberLiteral`-vs-`Int` representation claim
     /// (`produces_fresh_value`) is diffed on the marker's own value, not
@@ -65828,6 +65988,11 @@ mod tests {
                     Expr::Field("a".to_string()),
                 )),
             },
+            Origin::SnapshotAt {
+                invocation: 7,
+                path: BindPath(PathPrefix::root()),
+            },
+            Origin::Untracked,
         ];
         let values = pure_value_matrix();
         for src in shapes {
@@ -94969,6 +95134,303 @@ mod tests {
                 );
             }
         );
+    }
+
+    // =========================================================================
+    // #2978: an identity-passthrough bind (`. as $x`) made while `.` is the
+    // register carries its own position (`Origin::SnapshotAt`), so
+    // `getpath`'s result can compose from it exactly as from a navigated
+    // bind's `Origin::At` -- without narrowing what `Origin::Snapshot`
+    // accepts. Every expectation below is jq 1.7.1's own, captured live
+    // (`scripts/jq-bind-origin-oracle-sweep.sh` carries the same rows).
+    // =========================================================================
+
+    /// The filed repro and its write-side twins, plus every identity
+    /// spelling `is_identity_passthrough` admits: a bind below the root, a
+    /// marker source, a nested bind, `//`/`try`/`if` wrappers, a `?//`
+    /// bare-variable alternative, two `getpath` stages composing, and a
+    /// fold seeded from the marker. All refused on `main`.
+    #[test]
+    fn test_identity_bind_carries_its_position_for_getpath_2978() {
+        for (doc, filter, expected) in [
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2},"c":1}"#[..],
+                r#"del(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"{"a":{},"c":1}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"(. as $x | .a | $x | getpath(["a"]) | .b) = 9"#,
+                r#"{"a":{"b":9}}"#,
+            ),
+            // Below the invocation root: `$v` is bound at `["x"]`, not `[]`.
+            (
+                &br#"{"x":{"a":{"b":2}}}"#[..],
+                r#"path(.x | . as $v | .a | $v | getpath(["a"]) | .b)"#,
+                r#"["x","a","b"]"#,
+            ),
+            (
+                &br#"{"x":{"a":{"b":2}}}"#[..],
+                r#"del(.x | . as $v | .a | $v | getpath(["a"]) | .b)"#,
+                r#"{"x":{"a":{}}}"#,
+            ),
+            // ... with an equal-valued sibling subtree at `["a"]` that a
+            // root-assuming rule would have composed against.
+            (
+                &br#"{"a":{"k":{"b":1}},"c":{"k":{"b":1}}}"#[..],
+                r#"path(.c | . as $x | .k | $x | getpath(["k"]) | .b)"#,
+                r#"["c","k","b"]"#,
+            ),
+            // A marker source inherits the marker's own position.
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | $x as $y | .a | $y | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            // ... even when the pipe has since moved to `["a"]`.
+            (
+                &br#"{"a":{"c":{"b":1}},"c":{"b":1}}"#[..],
+                r#"path(. as $x | .a | ($x as $y | .c | $y | getpath(["a","c"]) | .b))"#,
+                r#"["a","c","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path((. // 1) as $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path((try . catch 1) as $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path((if true then . else . end) as $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as [$x] ?// $x | .a | $x | getpath(["a"]) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":{"c":1}}}"#[..],
+                r#"path(. as $x | .a.b | $x | getpath(["a"]) | getpath(["b"]) | .c)"#,
+                r#"["a","b","c"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | reduce (1) as $i ($x; getpath(["a"])) | .b)"#,
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | foreach (1) as $i ($x; getpath(["a"]); .b))"#,
+                r#"["a","b"]"#,
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), [expected], "{filter}");
+        }
+    }
+
+    /// The traps, each a plausible wrong rule turned into a fabrication --
+    /// the direction `del()`/`=` write through. All raise in jq 1.7.1 with
+    /// exactly these messages, and must keep raising:
+    ///
+    /// - `["c"]` below `$x`: `getpath` lands on a sibling holding an equal
+    ///   (or unequal) value -- value-only certification of the composed
+    ///   result.
+    /// - `.a | . as $x`, then `getpath(["a","c"])`: "an identity bind is at
+    ///   the invocation root" composes `["a","c"]`, the register's own path,
+    ///   for a node that is really `["a","a","c"]`. The `del` twin is the
+    ///   write.
+    /// - `$x as $y` at `["a"]`: "a marker source binds at the *frame's*
+    ///   position" composes `["a","c"]` for the root's `.c`.
+    /// - a constructed `.`: "use `frame.at` off the register" -- `frame.at`
+    ///   is the carried register, not the rebuilt ambient.
+    /// - `tojson | fromjson`: a rebuilt copy inheriting a position.
+    /// - `(. // {..}) as $x` on a `null` register: the `//` rule is sound
+    ///   only because a `B`-derived value never meets a register it is not
+    ///   value-identical to -- here `null` ≠ `{"b":1}` and it refuses.
+    #[test]
+    fn test_identity_bind_position_negative_controls_2978() {
+        for (doc, filter, expected) in [
+            (
+                &br#"{"a":{"b":2},"c":{"b":2}}"#[..],
+                r#"path(. as $x | .a | $x | getpath(["c"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":2},"c":{"b":3}}"#[..],
+                r#"path(. as $x | .a | $x | getpath(["c"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":3}"#,
+            ),
+            (
+                &br#"{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}"#[..],
+                r#"path(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            ),
+            (
+                &br#"{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}"#[..],
+                r#"del(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            ),
+            (
+                &br#"{"a":{"c":{"b":1}},"c":{"b":1}}"#[..],
+                r#"path(. as $x | .a | ($x as $y | .c | $y | getpath(["c"]) | .b))"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            ),
+            (
+                &br#"{"a":{"b":{"c":1}}}"#[..],
+                r#"path(.a | {b:{c:1}} | . as $x | $x | getpath(["b"]) | .c)"#,
+                r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | ($x | tojson | fromjson) | getpath(["a"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
+            ),
+            (
+                &br#"{"a":null}"#[..],
+                r#"path(.a | (. // {"c":{"b":1}}) as $x | .c | $x | getpath(["c"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            ),
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, expected, "{filter}");
+                }
+            );
+        }
+    }
+
+    /// What still refuses, pinned so a later widening is deliberate. Both
+    /// are refusals on `main` too, with these same messages:
+    ///
+    /// - an `if` whose arms sit at *different* positions (`$p` at `[]`, `.`
+    ///   at `["a"]`): which arm ran is not known at the bind site, so no
+    ///   position is minted. jq answers `["a","b"]`.
+    /// - a nested `path()`: the marker's position is in the *outer*
+    ///   invocation's coordinates, and the inner one is a fresh invocation
+    ///   whose root is `.a`. jq answers `["b"]` inside and then refuses the
+    ///   outer `path()` with `Invalid path expression with result ["b"]`;
+    ///   succinctly refuses inside instead -- both refuse, wording differs.
+    /// - a *navigated* source headed by the marker, used off the marker's
+    ///   own position: `resolve_bind_source_witness` re-roots an `At`-headed
+    ///   source at the marker's position, but not a `SnapshotAt`-headed
+    ///   one, which resolves against the ambient (`.a`, where `$x` is not
+    ///   certified) and binds by value. jq answers `["a","b"]`.
+    #[test]
+    fn test_identity_bind_position_residuals_still_refuse_2978() {
+        for (doc, filter, expected) in [
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":2}}"#[..],
+                r#"path(. as $x | .a | path($x | getpath(["a"]) | .b))"#,
+                r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
+            ),
+            (
+                &br#"{"a":{"b":1},"c":{"b":1}}"#[..],
+                r"path(. as $x | .a | ($x.a as $w | $w | .b))",
+                r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+            ),
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, expected, "{filter}");
+                }
+            );
+        }
+    }
+
+    /// yq mode mints nothing (the same single-choke-point rule as
+    /// `getpath_result_position`'s): the filed repro keeps refusing there,
+    /// with `main`'s own message.
+    #[test]
+    fn test_yq_mode_identity_bind_position_unchanged_2978() {
+        yq_query!(
+            br#"{"a":{"b":2}}"#,
+            r#"path(. as $x | .a | $x | getpath(["a"]) | .b)"#,
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of {"b":2}"#
+                );
+            }
+        );
+    }
+
+    /// `marker_needs_demotion` (#2642) is a `PartialEq`-style check the
+    /// compiler cannot force to cover a new variant: a `SnapshotAt` marker
+    /// is admitted by `certifies`'s value rule exactly as a `Snapshot` one
+    /// is, so it must be demoted under exactly the same conditions -- a
+    /// mismatched root, an `Owned` root, no recorded node -- and exempted
+    /// under the same ones (a matching root, a `null`/`bool` value).
+    #[test]
+    fn test_snapshot_at_marker_demotes_like_snapshot_2978() {
+        let at = || Origin::SnapshotAt {
+            invocation: 1,
+            path: BindPath(PathPrefix::root()),
+        };
+        let marker = |origin: Origin, value: OwnedValue, node: Option<BindOrigin>| Tracked {
+            value,
+            origin,
+            node,
+        };
+        let here = BindOrigin::Node {
+            node: 3,
+            document: 9,
+        };
+        let root = RootWitness::Node {
+            node: 3,
+            document: 9,
+        };
+        let other_root = RootWitness::Node {
+            node: 4,
+            document: 9,
+        };
+        for origin in [Origin::Snapshot, at()] {
+            let m = marker(origin.clone(), OwnedValue::Int(1), Some(here.clone()));
+            assert!(!marker_needs_demotion(&m, &root), "{origin:?}: same root");
+            assert!(
+                marker_needs_demotion(&m, &other_root),
+                "{origin:?}: other root"
+            );
+            assert!(
+                marker_needs_demotion(&m, &RootWitness::Owned),
+                "{origin:?}: owned root"
+            );
+            let no_node = marker(origin.clone(), OwnedValue::Int(1), None);
+            assert!(
+                marker_needs_demotion(&no_node, &root),
+                "{origin:?}: no node"
+            );
+            let null = marker(origin.clone(), OwnedValue::Null, None);
+            assert!(
+                !marker_needs_demotion(&null, &other_root),
+                "{origin:?}: null exempt"
+            );
+        }
+        // The two origins `certifies` never admits by value are never demoted.
+        for origin in [
+            Origin::Untracked,
+            Origin::At {
+                invocation: 1,
+                path: BindPath(PathPrefix::root()),
+            },
+        ] {
+            let m = marker(origin.clone(), OwnedValue::Int(1), None);
+            assert!(!marker_needs_demotion(&m, &other_root), "{origin:?}");
+        }
     }
 
     /// What the conservative allowlist costs, pinned so a later widening is

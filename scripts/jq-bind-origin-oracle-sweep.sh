@@ -45,6 +45,15 @@
 # write operators, plus the two refusals kept on purpose (the reasons are in
 # REFUSE_ONLY below and in limitations.md).
 #
+# The `identity-bind-*` rows are #2978: an identity-passthrough bind
+# (`. as $x`) made while `.` is the register carries its own position
+# (`Origin::SnapshotAt`), so a `getpath` on the marker composes an absolute
+# position from it the way a navigated bind's `Origin::At` already did. The
+# `*-trap` rows are the wrong rules each turned into a fabrication -- "an
+# identity bind is at the invocation root", "a marker source binds at the
+# frame's position", "use frame.at off the register", a rebuilt copy -- and
+# are carried as `agree` rows: both binaries must exit 5.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -297,6 +306,31 @@ in-evaluator-resolver-select-cond	{"a":1}	. as $x | path(select(($x.a = 9) | tru
 in-evaluator-resolver-computed-key	{"a":1}	. as $x | .[($x.a = 9 | "a")] = 5
 in-evaluator-update-paren-root	{"a":1}	. as $x | (.) |= ($x.a = 9)
 in-evaluator-update-second-path	{"a":1,"b":2}	. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else . end)
+identity-bind-getpath-path	{"a":{"b":2}}	path(. as $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-getpath-del	{"a":{"b":2},"c":1}	del(. as $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-getpath-assign	{"a":{"b":2}}	(. as $x | .a | $x | getpath(["a"]) | .b) = 9
+identity-bind-below-root	{"x":{"a":{"b":2}}}	path(.x | . as $v | .a | $v | getpath(["a"]) | .b)
+identity-bind-below-root-del	{"x":{"a":{"b":2}}}	del(.x | . as $v | .a | $v | getpath(["a"]) | .b)
+identity-bind-below-root-equal-sibling	{"a":{"k":{"b":1}},"c":{"k":{"b":1}}}	path(.c | . as $x | .k | $x | getpath(["k"]) | .b)
+identity-bind-marker-source	{"a":{"b":2}}	path(. as $x | $x as $y | .a | $y | getpath(["a"]) | .b)
+identity-bind-nested-marker-source	{"a":{"c":{"b":1}},"c":{"b":1}}	path(. as $x | .a | ($x as $y | .c | $y | getpath(["a","c"]) | .b))
+identity-bind-alternative-source	{"a":{"b":2}}	path((. // 1) as $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-try-source	{"a":{"b":2}}	path((try . catch 1) as $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-if-source	{"a":{"b":2}}	path((if true then . else . end) as $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-alt-pattern	{"a":{"b":2}}	path(. as [$x] ?// $x | .a | $x | getpath(["a"]) | .b)
+identity-bind-two-getpaths	{"a":{"b":{"c":1}}}	path(. as $x | .a.b | $x | getpath(["a"]) | getpath(["b"]) | .c)
+identity-bind-reduce-seed	{"a":{"b":2}}	path(. as $x | .a | reduce (1) as $i ($x; getpath(["a"])) | .b)
+identity-bind-foreach-seed	{"a":{"b":2}}	path(. as $x | .a | foreach (1) as $i ($x; getpath(["a"]); .b))
+identity-bind-sibling-equal	{"a":{"b":2},"c":{"b":2}}	path(. as $x | .a | $x | getpath(["c"]) | .b)
+identity-bind-sibling-unequal	{"a":{"b":2},"c":{"b":3}}	path(. as $x | .a | $x | getpath(["c"]) | .b)
+identity-bind-not-root-trap	{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}	path(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)
+identity-bind-not-root-trap-del	{"a":{"c":{"b":1},"a":{"c":{"b":1}}}}	del(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)
+identity-bind-marker-not-frame-trap	{"a":{"c":{"b":1}},"c":{"b":1}}	path(. as $x | .a | ($x as $y | .c | $y | getpath(["c"]) | .b))
+identity-bind-rebuilt-ambient-trap	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as $x | $x | getpath(["b"]) | .c)
+identity-bind-rebuilt-copy-trap	{"a":{"b":2}}	path(. as $x | .a | ($x | tojson | fromjson) | getpath(["a"]) | .b)
+identity-bind-alternative-null-register	{"a":null}	path(.a | (. // {"c":{"b":1}}) as $x | .c | $x | getpath(["c"]) | .b)
+identity-bind-if-arms-disagree	{"a":{"b":2}}	path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)
+identity-bind-marker-headed-source-off-position	{"a":{"b":1},"c":{"b":1}}	path(. as $x | .a | ($x.a as $w | $w | .b))
 CASES_EOF
 )
 
@@ -336,6 +370,8 @@ in-evaluator-input-embed-object:#3036 -- same as in-evaluator-input-embed-array 
 in-evaluator-input-reduce-empty:#3036 -- same as in-evaluator-input-embed-array for a fold that returns its accumulator unchanged
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
 in-evaluator-input-catch-own-value:#3036 -- on the input-queue route the marker carries no node witness, so `try_payload_root` cannot prove the payload is its node; the generic route keeps it accepted
+identity-bind-if-arms-disagree:#2978 residual -- an if source whose arms sit at different positions ($p at [], . at ["a"]); which arm ran is not known at the bind site, so no position is minted and getpath has nothing to compose from
+identity-bind-marker-headed-source-off-position:#2978 residual -- a navigated source headed by a SnapshotAt marker is not re-rooted at the position of the marker the way an At-headed one is; off that position it resolves against the ambient, where $x is not certified, and binds by value (pre-existing: the baseline binary refuses identically)
 REFUSE_EOF
 )
 

@@ -64,6 +64,18 @@ drawn from the same pool so a route that changes the answer is visible next
 to ones that must not. The stdin carries the document twice so `input` has
 a second, equal-valued document to read.
 
+#2978 gave an identity-passthrough bind (`. as $v`) made while `.` is the
+register a *position* of its own, so `getpath` can compose from it. The
+hazard that introduces is a `.` bind made *below* the invocation root --
+`path(.a | . as $x | .c | $x | getpath(["a","c"]) | .b)` must refuse, and a
+rule that assumed the bind was at the root would compose the register's
+own path for a different node -- yet `program()` put every bind at the head
+of the pipe, so that shape was unreachable. `PREFIX` now optionally opens
+the pipe with a navigation before the first bind, and `USES` gains a
+parenthesised nested bind of the marker (`(.a | ($v as $w | .c | $w |
+getpath([..]) | .b?))`), the shape where "a marker source binds at the
+*frame's* position" would fabricate.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -153,7 +165,26 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "($v | foreach (1) as $i (.a; getpath([\"b\"]); .))",
         "($v | foreach (1,2) as $i (.; getpath([\"a\"]); .b?))",
         "foreach (1) as $i (.; $v | getpath([\"a\"]); .b?)",
-        "($v | foreach .[]? as $i (.; getpath([\"a\"]); .b?))"]
+        "($v | foreach .[]? as $i (.; getpath([\"a\"]); .b?))",
+        # #2978: the marker re-bound *inside* a parenthesised sub-pipe that
+        # has already navigated away from where `$v` was bound, then used
+        # through `getpath`. `$w` must inherit `$v`'s own position, never
+        # the sub-pipe's: on `{"a":{"c":{"b":1}},"c":{"b":1}}`,
+        # `path(. as $v | .a | ($v as $w | .c | $w | getpath(["c"]) | .b))`
+        # refuses in jq (`$w | getpath(["c"])` is the root's `.c`, not
+        # `.a.c`), while `getpath(["a","c"])` in the same slot answers.
+        "(.a | ($v as $w | .c | $w | getpath([\"c\"]) | .b?))",
+        "(.a | ($v as $w | .c | $w | getpath([\"a\",\"c\"]) | .b?))",
+        "(.x | ($v as $w | .a | $w | getpath([\"x\",\"a\"]) | .b?))",
+        "(.c | ($v as $w | $w | getpath([\"c\"]) | .b?))",
+        "((if true then $v else . end) as $w | $w | getpath([\"a\"]) | .b?)",
+        "((try $v catch 1) as $w | .a | $w | getpath([\"a\"]) | .b?)",
+        "(($v // 1) as $w | .a | $w | getpath([\"a\"]) | .b?)"]
+
+# #2978: an optional navigation *before* the first bind, so `. as $v` (and
+# every other source) can be bound below the invocation root. The empty
+# prefix keeps the pre-#2978 distribution as the common case.
+PREFIX = ["", "", "", ".x | ", ".a | ", ".arr[]? | ", "(.a | .c?) | "]
 
 # #2649 destructuring patterns: (pattern, the variable the body then uses).
 # `V` is replaced by this bind's generated name, `W` by its sibling.
@@ -262,7 +293,7 @@ def stage(rng, v):
 
 def program(rng):
     n_bind = rng.choice([1, 1, 2])
-    parts = []; prev = None
+    parts = [p for p in [rng.choice(PREFIX).rstrip(" |")] if p]; prev = None
     for i in range(n_bind):
         v = f"$v{i}"
         cands = [s for s, needs in SOURCES if not needs or prev]
@@ -330,7 +361,8 @@ def main():
     if not version.startswith(pin):
         sys.exit(f"error: {a.jq} is not the pinned oracle ({pin}): {version!r}")
     if a.self_test:
-        for name, pool in [("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
+        for name, pool in [("PREFIX", [p or "(none)" for p in PREFIX]),
+                           ("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
                            ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES),
                            ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
                            ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES)]:
