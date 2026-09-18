@@ -33546,7 +33546,24 @@ fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &
         Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
             resolves_to_register(expr, trackable, reg, frame)
         }
-        Expr::Alternative(left, _) if trackable && reg.is_truthy() => {
+        // #3119 third review round: `trackable && reg.is_truthy()` alone
+        // only proves `left`, *if it produces an output*, is truthy --
+        // never filtered by `//` -- not that it produces one at all. An
+        // `If` reached directly as `head` is self-correcting (a `bound`
+        // this loop sees is always a real fork output, so an empty
+        // condition just means that output never existed); nested under
+        // `//` it is not, because `//` silently substitutes an unrelated
+        // `B` whenever `left` yields nothing, not only when `left`
+        // raises. `is_raise_free_identity_passthrough` is what excludes
+        // `If` (and anything containing one) from `left` here, the same
+        // guard `Try`'s arm above already needs and for the identical
+        // reason (confirmed live: `del(.a | ((if empty then . else . end)
+        // // {"p":100,"q":200}) as {p:$x} | $x)` on
+        // `{"a":{"p":1,"q":2}}` wrote `{"a":{"q":2}}` without this guard,
+        // where jq refuses).
+        Expr::Alternative(left, _)
+            if trackable && reg.is_truthy() && is_raise_free_identity_passthrough(left) =>
+        {
             resolves_to_register(left, trackable, reg, frame)
         }
         _ => false,
@@ -34674,30 +34691,32 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // jq's `value_at_path` entering this stage: `value` itself while
     // trackable, otherwise whatever the enclosing pipe carried in (#3120).
     let register = if trackable { Some(value) } else { register };
+    // jq's `path_intact` at the pattern's first step: is the source value
+    // the register's own node? `resolves_to_register` (#3119) answers this
+    // for `head`/`trackable`/`register`/`frame`, which are all fixed before
+    // this loop starts, so it is computed once rather than per `bound`; a
+    // bare `.`/`TrackedVar` head is exactly what it recognizes at its own
+    // leaves, so this delegates fully rather than re-implementing them here
+    // (its own doc explains why `is_identity_passthrough` is unsound to
+    // reuse instead). Unrecognized shapes get no fallback here -- unlike
+    // the loop's own per-`bound` null/bool check below -- matching this
+    // arm's pre-#3119 behavior for a bare `.`/`TrackedVar` head exactly.
+    let head_resolves_to_register =
+        register.is_some_and(|reg| resolves_to_register(head, trackable, reg, frame));
     for bound in &sources {
-        // jq's `path_intact` at the pattern's first step: is the source
-        // value the register's own node? `.` is, while `trackable`; a marker
-        // the frame certifies is (the `TrackedVar` arm's own rule; on an
-        // untracked stage `frame` sits at the carried register's own
-        // position, which is exactly what an `Origin::At` is certified
-        // against); anything else only by jq's null/bool value identity
-        // against the register. No register in hand: never.
-        let identical = register.is_some_and(|reg| match head {
-            Expr::Identity => trackable,
-            Expr::TrackedVar(marker) => marker.value == *reg && frame.certifies(&marker.origin),
-            // #3119: every other identity-passthrough-shaped head, judged
-            // by `resolves_to_register` (not `is_identity_passthrough`,
-            // whose weaker guarantee is unsound to reuse for an immediate
-            // verdict -- see that function's own doc). A shape it refuses
-            // still gets the same null/bool value-identity fallback the
-            // catch-all below applies, since a `B`/handler-derived value
-            // that happens to match the register that way coincides with
-            // jq's own `jv_identical` verdict regardless of shape.
-            Expr::If { .. } | Expr::Try { .. } | Expr::Alternative(..) => {
-                resolves_to_register(head, trackable, reg, frame) || null_bool_identical(bound, reg)
+        // A shape `resolves_to_register` refuses (including one it was
+        // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
+        // jq's own null/bool value-identity fallback per `bound`, since a
+        // `B`/handler-derived value that happens to match the register
+        // that way coincides with jq's own `jv_identical` verdict
+        // regardless of shape.
+        let identical = match head {
+            Expr::Identity | Expr::TrackedVar(_) => head_resolves_to_register,
+            _ => {
+                head_resolves_to_register
+                    || register.is_some_and(|reg| null_bool_identical(bound, reg))
             }
-            _ => null_bool_identical(bound, reg),
-        });
+        };
         // Whether a first-step refusal is jq's own verdict rather than this
         // arm's guess: the source is not even value-equal to the register,
         // so it cannot be the register's node whatever jq's pointer says.
@@ -99237,11 +99256,21 @@ mod tests {
     /// twin of rows 1/3, not in the issue but the same gap (`if`'s own
     /// `Expr` variant, not just `try`/`Alternative`); row 9 is a confirmed
     /// refuse-only divergence from `resolves_to_register`'s own extra
-    /// runtime gate (see its doc comment). The final block is a second
-    /// review round's two findings against the *first* fix -- see
-    /// `resolves_to_register`'s own doc comment for why a naive
-    /// `is_identity_passthrough`-reuse for `If`/`Try` was unsound. Every
-    /// row is confirmed live against `/usr/bin/jq` 1.7.1.
+    /// runtime gate (see its doc comment, and
+    /// [docs/compliance/jq/limitations.md](../../../docs/compliance/jq/limitations.md)).
+    /// The next block is a second review round's two findings against the
+    /// *first* fix -- see `resolves_to_register`'s own doc comment for why
+    /// a naive `is_identity_passthrough`-reuse for `If`/`Try` was unsound.
+    /// The next two rows are a *third* review round's finding: the
+    /// `Alternative` arm's `reg.is_truthy()` gate alone doesn't prove
+    /// `left` produces a value at all, only that it isn't filtered if it
+    /// does -- an `If` on `left` with an empty-yielding condition slipped
+    /// through and got `B`'s unrelated literal certified as the register.
+    /// The final two rows are coverage for `resolves_to_register`'s own
+    /// design: the null/bool fallback is load-bearing (not vestigial), and
+    /// the `If` arm's `&&` (not `||`) is what a mismatched-branch case
+    /// refuses on, both confirmed live. Every row is confirmed live
+    /// against `/usr/bin/jq` 1.7.1.
     #[test]
     // Several rows' filter strings are jq object-construction literals
     // (`{a:1}`), not formatting strings; clippy cannot tell the two apart
@@ -99361,6 +99390,59 @@ mod tests {
                 r"path(. as $x | .a | ($x // 1) as {b:$v} | $v)",
                 Err(
                     r#"Invalid path expression near attempt to access element "b" of {"a":{"other":1},"b":"X"}"#
+                        .to_string(),
+                ),
+            ),
+            // #3119 third review round: `resolves_to_register`'s
+            // `Alternative` arm gated only on `trackable && reg.is_truthy()`,
+            // which proves `left` is never *filtered* by `//` if it
+            // produces a value, not that it produces one at all. `left`
+            // containing an `If` whose condition can itself yield nothing
+            // (`if empty then . else . end`) slipped through: `//` falls
+            // through to `B` regardless of the register's truthiness
+            // whenever `left` yields empty, and `B` (a fresh literal) was
+            // wrongly certified as the register's own node.
+            (
+                r#"{"a":{"p":1,"q":2}}"#,
+                r"path(.a | ((if empty then . else . end) // {p:100,q:200}) as {p:$x} | $x)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "p" of {"p":100,"q":200}"#
+                        .to_string(),
+                ),
+            ),
+            (
+                r#"{"a":{"p":1,"q":2},"c":"keep"}"#,
+                r"del(.a | ((if empty then . else . end) // {p:100,q:200}) as {p:$x} | $x)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "p" of {"p":100,"q":200}"#
+                        .to_string(),
+                ),
+            ),
+            // Coverage: a case where `resolves_to_register` itself refuses
+            // (an unrecognized `If` head, one branch a plain literal) but
+            // the null/bool value-identity fallback still admits it,
+            // because the register genuinely is `null` and the literal
+            // branch taken is also `null` -- proves the fallback in
+            // `resolve_as_pattern`'s own dispatch is load-bearing, not
+            // vestigial.
+            (
+                r#"{"a":null}"#,
+                r"path(.a | (if true then null else . end) as $v ?// $z | $v)",
+                Ok(&[r#"["a"]"#]),
+            ),
+            // Coverage: a case where `resolves_to_register`'s `If` arm's
+            // `&&` (both branches must independently resolve) is what
+            // refuses, proving it isn't accidentally `||` -- the condition
+            // is always true here, so jq answers (it only evaluates the
+            // taken branch); the static check can't know that without
+            // evaluating the condition, so this is refuse-only, the safe
+            // direction, matching `test_identity_bind_position_traps_keep_refusing_2978`'s
+            // row 9 for the same shape in the sibling mechanism.
+            (
+                r#"{"a":{"b":1}}"#,
+                r"path(.a | (if true then . else 5 end) as {b:$v} | $v)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "b" of {"b":1}"#
                         .to_string(),
                 ),
             ),
