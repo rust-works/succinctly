@@ -17464,11 +17464,10 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
                 };
                 let mut branch = Vec::new();
-                match path_context_step_generic::<S, V>(expr, pos, &mut branch) {
-                    Ok(()) => {
-                        out.extend(branch.into_iter().skip(drop));
-                        Demand::Continue
-                    }
+                let stepped = path_context_step_generic::<S, V>(expr, pos, &mut branch);
+                out.extend(branch.into_iter().skip(drop));
+                match stepped {
+                    Ok(()) => Demand::Continue,
                     Err(control) => stop_with_escape(&mut walk_error, control),
                 }
             });
