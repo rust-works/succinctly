@@ -258,12 +258,35 @@ DEFAULT_THRESHOLD = 5.0
 # the key-only value-delimiter scan).
 # 12% clears the measured number with headroom; remove once `main` has moved
 # past #2720, per the rule above (alongside #3077's three).
+#
+# `users_assign_scores` (#3009): faster on both architectures. A write
+# produces an owned document and then prints it, and printing one used to
+# rebuild the whole tree as `lazy::JqValue` first -- freeing each source map
+# and allocating the destination one, which since #3000 lands in a different
+# allocator bin. #3009 prints the owned tree directly. Measured by this guard
+# on its own runners against the PR's merge-base:
+#
+#                          users_assign_scores   users_del_select   users_del_bound_select
+#   ARM64-Linux                  -6.4%               -5.7%                -5.5%
+#   x86_64                       -6.3%               -5.6%                -5.5%
+#
+# `arrays_map_iterate` (the `LazySeq` route, which #3009 does not touch)
+# reads -0.3%/-0.4%; every other row is within +/-0.0%.
+# 12% clears the measured number with headroom, matching #2720's entry for
+# a move of the same size. Remove once `main` has moved past #3009, per the
+# rule above -- tracked by #3161.
+#
+# The two `del` rows need no entry of their own *only because* #2999's 20%
+# entries above already cover them: #3009 moves them past the 5% default
+# too. So #3077 must not remove those two until `main` carries #3009 as
+# well, or they fail at the default -- #3161 records the coupling.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_del_select": 20.0,
     "users_del_bound_select": 20.0,
     "users_yq_del_select": 12.0,
     "users_identity": 12.0,
+    "users_assign_scores": 12.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
