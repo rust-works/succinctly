@@ -95,6 +95,10 @@ const CLOSED: &[&str] = &[
     "reduce (1,2,3) as $x (0; . + $x)",
     "[foreach (1,2) as $x (0; . + $x)]",
     "[foreach (1,2) as $x (0; . + $x; . * 10)]",
+    // #2872: a computed key runs against the source element, not the
+    // document, so a plain navigation inside it is closed.
+    "reduce ({\"k\":\"a\",\"a\":1}) as {(.k):$x} (0; . + $x)",
+    "[foreach ({\"k\":\"a\",\"a\":1}, {\"k\":\"b\",\"b\":2}) as {(.k, \"k\"):$x} (0; . + ($x|tostring|length))]",
     // The ambient-transparent wrappers carry the refinement through.
     "(1 | .) | .a?",
     "[1 | .]",
@@ -235,6 +239,12 @@ const READING: &[&str] = &[
     "1 | load(input)",
     "reduce (1,2) as $x (0; input)",
     "[foreach (1,2) as $x (0; .; parent)]",
+    // #2872: a computed key in the fold's own pattern runs against the
+    // source element, so it reaches the document only through a side
+    // channel -- the same channels `update` is checked for.
+    "reduce ({\"a\":1}) as {(input):$x} (0; . + $x)",
+    "[foreach ({\"a\":1}) as {(parent|tostring):$x} (0; . + $x)]",
+    "reduce ({\"a\":1}) as [{(input):$x}] ?// $y (0; . + $x)",
     // An unresolved call carries no body to inspect.
     "1 | f",
     // A reading first stage keeps the whole pipe reading, at any depth.

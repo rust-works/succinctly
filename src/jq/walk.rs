@@ -755,6 +755,22 @@ pub fn map_pattern_subexprs(pattern: &Pattern, f: &mut dyn FnMut(&Expr) -> Expr)
     }
 }
 
+/// Whether any computed-key expression inside `pattern` satisfies `pred`.
+///
+/// The read-only sibling of [`map_pattern_subexprs`] (#2872). A pattern
+/// holds no other `Expr`: a literal key, a `$name` shorthand and the
+/// pattern's own shape carry nothing for `pred` to see.
+pub fn any_pattern_key(pattern: &Pattern, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    match pattern {
+        Pattern::Var(_) => false,
+        Pattern::Object(entries) => entries.iter().any(|entry| {
+            matches!(&entry.key, ObjectKey::Expr(k) if pred(k))
+                || any_pattern_key(&entry.pattern, pred)
+        }),
+        Pattern::Array(patterns) => patterns.iter().any(|p| any_pattern_key(p, pred)),
+    }
+}
+
 pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
     match expr {
         // --- Leaves: no `Expr` child, nothing for `f` to see -----------------
@@ -1414,38 +1430,42 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
         },
 
         // `input` and `init` are evaluated against the document; `update`
-        // (and `foreach`'s `extract`) against the accumulator.
-        // `patterns` is not consulted: since #2677/#2873, `PatternEntry::key`
-        // can be an `ObjectKey::Expr`, a computed key evaluated against the
-        // *document* -- so this arm is a known, deliberately deferred gap
-        // (tracked in the #2873 follow-up, #2872), not an oversight. Missing
-        // it here is safe-direction-only: this function's callers use `true`
-        // to justify an optimization/early check, so a false `false` from an
-        // unconsulted computed key can only lose that optimization or defer
-        // a check to run later (as an ordinary runtime error instead), never
-        // produce a wrong value -- see `docs/compliance/jq/limitations.md`'s
-        // "three residual walker gaps" entry.
+        // (and `foreach`'s `extract`) against the accumulator. A computed
+        // key in `patterns` (#2677) runs against the *source element* -- the
+        // pattern's own current node, a rebound `.`, never the document
+        // (`{"k":"x","x":5} | {"k":"y","y":7} as {(.k):$q} | $q` is `7`) --
+        // so, like `update`, it reaches the document only through a side
+        // channel `stage_escapes_own_input` classifies (`input`,
+        // `$__loc__`, a path-context builtin). #2872 closed this arm; the
+        // `AsPattern` arm below falls through to `any_subexpr`, whose own
+        // pattern-key blind spot is #3017's.
         Expr::Reduce {
             input,
+            patterns,
             init,
             update,
-            ..
         } => {
             reads_ambient_value(input)
                 || reads_ambient_value(init)
                 || stage_escapes_own_input(update)
+                || patterns
+                    .iter()
+                    .any(|p| any_pattern_key(p, &mut stage_escapes_own_input))
         }
         Expr::Foreach {
             input,
+            patterns,
             init,
             update,
             extract,
-            ..
         } => {
             reads_ambient_value(input)
                 || reads_ambient_value(init)
                 || stage_escapes_own_input(update)
                 || extract.as_deref().is_some_and(stage_escapes_own_input)
+                || patterns
+                    .iter()
+                    .any(|p| any_pattern_key(p, &mut stage_escapes_own_input))
         }
 
         // Ambient-transparent wrappers: each child is evaluated against the
