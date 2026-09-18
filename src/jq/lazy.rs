@@ -1051,6 +1051,87 @@ mod tests {
         );
     }
 
+    /// #3009: `jq_runner.rs`'s `to_jq_values` no longer rebuilds an owned
+    /// result into a `JqValue` before printing it, so the depth rejection it
+    /// used to inherit from [`JqValue::try_from_owned`] now comes from
+    /// [`OwnedValue::check_tree_depth`] instead. The two must agree exactly
+    /// -- not merely "both reject deep trees" -- because
+    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+    /// pins the *observable* result (empty stdout, exit 5, that message) of
+    /// whichever one fires.
+    ///
+    /// Swept either side of the ceiling in both container shapes: an
+    /// off-by-one here is invisible until a 383-deep value is wrongly
+    /// suppressed or a 384-deep one is wrongly printed as a partial prefix.
+    #[test]
+    fn check_tree_depth_matches_try_from_owned_3009() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        fn array_nest(depth: usize) -> OwnedValue {
+            let mut v = OwnedValue::Int(0);
+            for _ in 0..depth {
+                v = OwnedValue::array_from(alloc::vec![v]);
+            }
+            v
+        }
+
+        fn object_nest(depth: usize) -> OwnedValue {
+            let mut v = OwnedValue::Int(0);
+            for _ in 0..depth {
+                v = OwnedValue::object_from([("k".to_string(), v)]);
+            }
+            v
+        }
+
+        for build in [
+            array_nest as fn(usize) -> OwnedValue,
+            object_nest as fn(usize) -> OwnedValue,
+        ] {
+            for depth in [
+                0,
+                1,
+                MAX_VALUE_TREE_DEPTH - 2,
+                MAX_VALUE_TREE_DEPTH - 1,
+                MAX_VALUE_TREE_DEPTH,
+                MAX_VALUE_TREE_DEPTH + 1,
+            ] {
+                let value = build(depth);
+                let checked = value.check_tree_depth().err().map(|e| e.to_string());
+                let rebuilt = JqValue::<'_, alloc::vec::Vec<u64>>::try_from_owned(value)
+                    .err()
+                    .map(|e| e.to_string());
+                assert_eq!(
+                    checked, rebuilt,
+                    "check_tree_depth and try_from_owned disagree at nesting depth {depth}"
+                );
+            }
+        }
+    }
+
+    /// #3009 sibling: the sweep above proves the two agree, but both could
+    /// agree on the wrong ceiling. Pin the boundary itself -- a value nested
+    /// exactly to the limit passes, one level more does not, and the message
+    /// is the shared one the CLI's diagnostic is asserted against.
+    #[test]
+    fn check_tree_depth_boundary_is_max_value_tree_depth_3009() {
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let mut at_limit = OwnedValue::Int(0);
+        for _ in 0..MAX_VALUE_TREE_DEPTH - 1 {
+            at_limit = OwnedValue::array_from(alloc::vec![at_limit]);
+        }
+        assert!(at_limit.check_tree_depth().is_ok());
+
+        let past_limit = OwnedValue::array_from(alloc::vec![at_limit]);
+        let err = past_limit
+            .check_tree_depth()
+            .expect_err("one level past the ceiling must be rejected");
+        assert_eq!(
+            err.to_string(),
+            crate::jq::value::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
+        );
+    }
+
     /// #2868: these real JSON cursors must preserve source spelling on
     /// both walks. Include jq's accepted non-RFC spellings, overflow and
     /// underflow, rather than only ordinary i64 inputs.

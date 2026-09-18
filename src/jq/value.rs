@@ -3278,6 +3278,65 @@ impl OwnedValue {
         }
     }
 
+    /// Whether this tree is shallow enough to hand to a printer, reported as
+    /// an [`EvalError`] rather than a panic (#3009).
+    ///
+    /// Exactly [`JqValue::try_from_owned`](super::lazy::JqValue::try_from_owned)'s
+    /// depth contract with the rebuild removed: a node at depth `d` fails
+    /// iff `d >= MAX_VALUE_TREE_DEPTH`, tested *before* descending into it,
+    /// reporting the shared [`nesting_depth_exceeded_message`]. That equality
+    /// is the whole point and is pinned by
+    /// `check_tree_depth_matches_try_from_owned_3009` in `lazy.rs`, next to
+    /// the function it has to agree with.
+    ///
+    /// `jq_runner.rs`'s `to_jq_values` used to get this check for free from a
+    /// conversion it no longer performs, and the behaviour that conversion
+    /// was holding up is pinned:
+    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+    /// requires an over-deep value built by an ordinary recursive `def` to
+    /// produce *nothing* on stdout (exit 5, clean diagnostic), which a
+    /// depth check inside the writer cannot deliver -- by the time it fires,
+    /// 384 levels of `[` have already been flushed. So the check has to stay
+    /// at this pipeline position even though the conversion did not.
+    ///
+    /// Allocation-free, which is what makes it an acceptable stand-in: it
+    /// walks the tree it was handed and builds nothing, where the conversion
+    /// it replaces freed and re-allocated every container it visited.
+    pub fn check_tree_depth(&self) -> Result<(), EvalError> {
+        self.check_tree_depth_at(0)
+    }
+
+    fn check_tree_depth_at(&self, depth: usize) -> Result<(), EvalError> {
+        check_value_tree_depth(depth)?;
+        match self {
+            // Children in document order, so the node this reports on is the
+            // same one `try_from_owned`'s short-circuiting `collect` would
+            // have stopped at. The message is depth-only, so this cannot
+            // change *what* is reported -- it keeps the two walks
+            // step-for-step comparable for anyone checking the claim above.
+            Self::Array(arr) => {
+                for v in arr {
+                    v.check_tree_depth_at(depth + 1)?;
+                }
+            }
+            Self::Object(obj) => {
+                for (_, v) in obj {
+                    v.check_tree_depth_at(depth + 1)?;
+                }
+            }
+            // Listed rather than wildcarded: a future container-shaped
+            // variant must fail to compile here instead of silently
+            // reporting a deep tree as shallow.
+            Self::Null
+            | Self::Bool(_)
+            | Self::Int(_)
+            | Self::Float(_)
+            | Self::NumberLiteral(..)
+            | Self::String(_) => {}
+        }
+        Ok(())
+    }
+
     /// Format this value as JSON string.
     ///
     /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
