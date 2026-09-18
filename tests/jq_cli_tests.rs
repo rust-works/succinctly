@@ -60703,6 +60703,106 @@ fn test_getpath_path_context_pulls_argument_generator_lazily_2259() -> Result<()
     Ok(())
 }
 
+/// #2916: four sibling call sites of `path_context_component_values` had the
+/// identical eager-drain-vs-side-effect-ordering bug #2259 fixed for
+/// `getpath` above -- `.E[K]`'s key stream, `.E[S:T]`'s start/end bound
+/// streams, `if`'s condition arm, and `limit`'s count arm. All four
+/// confirmed live against `/usr/bin/jq` 1.7.1 (using succinctly's own `|
+/// key` to force path-context routing, since real jq has no `key/0`).
+#[test]
+fn test_path_context_sibling_sites_pull_their_generators_lazily_2916() -> Result<()> {
+    // Site 1: `path_context_step_computed_index`'s key stream. The first key
+    // (`1`) already fails to navigate `.a` (`5`, not indexable), so the
+    // second alternative's `debug("late")` must never run.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams(r#".a[(1,(debug("late")|2))] | key"#, r#"{"a":5}"#, &["-c"])?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr={stderr:?}"
+    );
+
+    // Site 2: `path_context_step_computed_slice`'s bound streams. The first
+    // start value (`1`) already fails (`.a` is `5`, not sliceable), so the
+    // second alternative's `debug("late")` must never run.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#".a[(1,(debug("late")|2)):3] | key"#,
+        r#"{"a":5}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr={stderr:?}"
+    );
+
+    // Site 2b: the end bound is re-evaluated fresh *per start value*, not
+    // once up front -- confirmed live against jq 1.7.1's own `path(...)`:
+    // `path(.a[(0,1):(debug("end")|3)])` on `{"a":[1,2,3,4,5]}` prints the
+    // debug line twice, once per start value, interleaved with each
+    // resulting slice descriptor.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"path(.a[(0,1):(debug("end")|3)])"#,
+        r#"{"a":[1,2,3,4,5]}"#,
+        &["-c", "--unbuffered"],
+    )?;
+    assert_eq!(code, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stderr.matches("DEBUG").count(), 2, "stderr={stderr:?}");
+    assert_eq!(
+        stdout,
+        "[\"a\",{\"start\":0,\"end\":3}]\n[\"a\",{\"start\":1,\"end\":3}]\n"
+    );
+
+    // Site 3: `if`'s condition arm. The first condition (`true`) already
+    // takes `then`, which raises, so the second alternative's
+    // `debug("late")` must never run.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"(if (true, (debug("late")|false)) then error("boom") else empty end) | key"#,
+        "{}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
+    assert!(stderr.contains("boom"), "stderr={stderr:?}");
+
+    // Site 4: `limit`'s count arm. The first count (`1`) already runs the
+    // body, which raises, so the second alternative's `debug("late")` must
+    // never run.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"(limit((1,(debug("late")|"bad")); error("boom"))) | key"#,
+        "{}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
+    assert!(stderr.contains("boom"), "stderr={stderr:?}");
+
+    // Every site's successful, multi-output shape must still produce jq's
+    // own values and ordering -- laziness must not change *what* comes out,
+    // only *when* a not-needed later output's side effects run.
+    for (filter, want) in [
+        (r#"[.a[("x","y")]]"#, "[1,2]"),
+        (r"[if (true,false) then 1 else 2 end]", "[1,2]"),
+        (r"[limit((1,2); 1,2,3)]", "[1,1,2]"),
+    ] {
+        let input = r#"{"a":{"x":1,"y":2}}"#;
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+    let (stdout, code) = run_jq_stdin(r"[.a[(0,1):(2,3)]]", r#"{"a":[1,2,3,4,5]}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[[1,2],[1,2,3],[2],[2,3]]");
+
+    Ok(())
+}
+
 /// #2761: jq 1.7.1 rejects the identity seed at the terminal, but names
 /// iteration when a continuation discards that seed and asks for more.
 #[test]
