@@ -415,6 +415,11 @@ def main():
     ap.add_argument("-n", type=int, default=500)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--show", type=int, default=8)
+    ap.add_argument("--fold-p", type=float, default=None,
+                    help="probability a program is a fold (default FOLD_P). A fold-only fix's "
+                         "changed code is reachable only from a fold, so a stock run draws too "
+                         "few to see its rare shapes -- #3145's review found a fabricated write "
+                         "at --fold-p 1.0 that 18,000 stock programs had missed")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -430,6 +435,11 @@ def main():
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
+    # `--fold-p 1.0` drives every program through `fold_program`; the other
+    # routes keep their own shares of what is left.
+    fold_p = FOLD_P if a.fold_p is None else a.fold_p
+    route_p = ROUTE_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
+    value_bind_p = VALUE_BIND_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
     kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "both-reject",
              "fabricate-baseline", "mismatch-baseline", "timeout"]
     counts = {k: 0 for k in kinds}
@@ -438,13 +448,13 @@ def main():
         dv = doc(rng)
         d = json.dumps(dv)
         r = rng.random()
-        if r < ROUTE_P:
+        if r < route_p:
             # #3036: the document twice, so `input` reads a second copy.
             f, d = route_program(rng, dv), d + "\n" + d
-        elif r < ROUTE_P + VALUE_BIND_P:
+        elif r < route_p + value_bind_p:
             # #3037: same ROUTES, so `input` needs its second copy too.
             f, d = value_bind_program(rng, dv), d + "\n" + d
-        elif r < ROUTE_P + VALUE_BIND_P + FOLD_P:
+        elif r < route_p + value_bind_p + fold_p:
             f = fold_program(rng)
         else:
             f = program(rng)
@@ -458,7 +468,7 @@ def main():
         counts[c] += 1
         if c != "agree" and len(examples[c]) < a.show:
             examples[c].append((d, f, j, s))
-    print(f"seed={a.seed} n={a.n} " + " ".join(f"{k}={v}" for k, v in counts.items() if v or k in kinds[:4]))
+    print(f"seed={a.seed} n={a.n} fold_p={fold_p:g} " + " ".join(f"{k}={v}" for k, v in counts.items() if v or k in kinds[:4]))
     for c in kinds[1:]:
         for d, f, j, s in examples[c]:
             print(f"[{c}] {f}\n    on {d}\n    jq[{j[0]}]: {j[1].strip()[:120]}\n    sc[{s[0]}]: {s[1].strip()[:120]}")

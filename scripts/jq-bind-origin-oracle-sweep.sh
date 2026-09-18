@@ -458,6 +458,8 @@ fold-body-nested-try	{"a":{"b":1}}	del(foreach .a as $v (.; try ($v | .b); .))
 fold-body-nested-if	{"a":{"b":1}}	path(foreach .a as $v (.; if true then ($v | .b) else . end; .))
 fold-extract-nested-try	{"a":{"b":1}}	path(.a as $y | .a | foreach range(1) as $i (0; .; try ($y | .b)))
 fold-body-nested-try-sibling-control	{"a":{"b":1},"c":{"b":1}}	del(.a as $y | foreach .c as $v (.; try ($y | .b); .))
+fold-body-fanout-declines	{"a":{"b":1}}	(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9
+fold-body-fanout-declines-del	{"a":{"b":1}}	del(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?)))
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -504,6 +506,8 @@ untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a 
 untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
 catch-payload-own-node-refuse-only:#3133 -- error(.) raises the register node itself and jq answers ["a"]; the payload equals the register by value but is not null/bool and carries no marker, so it cannot be told from a rebuilt copy (catch-rebuilt-payload-refuses) and the handler stays untracked
 computed-identity-bind-mixed-if:#3133 -- an if source with one arm a computed `.` and the other a marker binds Untracked on an untracked stage (the condition is not evaluated); jq evaluates it and binds the marker
+fold-body-fanout-declines:#3145 review -- the register reaches a fold body only when that body cannot fan out: a nested pipe sees it while a sibling branch of the same multi-output body does not, so an UPDATE that refused wholesale could half-succeed and drive a ?// retry jq never performs, writing a key jq never names. Refusing the whole body is the safe side of that asymmetry
+fold-body-fanout-declines-del:#3145 review -- the del twin: jq writes {"a":{}}, the half-success wrote nothing at exit 0, and declining refuses loudly instead
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
