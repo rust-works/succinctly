@@ -1607,9 +1607,11 @@ answers `["b"]` — and classified the two residuals appended below):
   (`Frame::at`, the #2042 invariant every navigated bind's `Origin::At` already rests on),
   which `getpath`'s result then composes from. The position is minted for `.` only while the
   branch is trackable (a bind after a construction stage gets none), inherited from a marker
-  source (`$x as $y`) rather than read off the frame, and for an `if` source only when both
-  arms agree — each of the other rules fabricates a path on a sibling or a rebuilt copy, and
-  `scripts/jq-bind-origin-oracle-sweep.sh`'s `identity-bind-*-trap` rows pin all three. So
+  source (`$x as $y`) rather than read off the frame, for an `if` source only when both arms
+  agree, and for a `try` source only when what it wraps provably cannot raise (else the
+  *catch* body is what got bound) — each of the other rules fabricates a path on a sibling or
+  a rebuilt copy, and `scripts/jq-bind-origin-oracle-sweep.sh`'s `identity-bind-*-trap` rows
+  pin all four. So
   the following now agree with jq in both directions, below the root too:
   ```
   $ echo '{"a":{"b":2}}'         | succinctly jq -c 'path(. as $x | .a | $x | getpath(["a"]) | .b)'

@@ -179,6 +179,10 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "(.c | ($v as $w | $w | getpath([\"c\"]) | .b?))",
         "((if true then $v else . end) as $w | $w | getpath([\"a\"]) | .b?)",
         "((try $v catch 1) as $w | .a | $w | getpath([\"a\"]) | .b?)",
+        # Review finding on #2978: a `try` whose source raises *before* its
+        # passthrough arm yields binds the catch body, not `.`.
+        "(.a | (try (if error(\"x\") then . else . end) catch $v) as $w | .b? | $w | getpath([\"b\"]) | .c?)",
+        "((try (if error(\"x\") then . else . end) catch $v) as $w | $w | getpath([\"a\"]) | .b?)",
         "(($v // 1) as $w | .a | $w | getpath([\"a\"]) | .b?)"]
 
 # #2978: an optional navigation *before* the first bind, so `. as $v` (and
