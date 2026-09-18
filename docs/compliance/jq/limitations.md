@@ -3569,6 +3569,15 @@ from 879 MB to 544 MB on the M4 Pro (−38%) and 984 MB to 596 MB on the 7950X (
 against 543 MB and 518 MB for the single-path `.[0].a = 1`. Sharing the scalars' strings
 too (ADR-0024's option D) is what would close the rest.
 
+Every absolute peak-RSS figure in the two paragraphs above predates
+[#3009](https://github.com/rust-works/succinctly/issues/3009), which stopped the CLI rebuilding
+an owned result as a `lazy::JqValue` before printing it. A write produces an owned document and
+then prints it, so both sides of each comparison carried that rebuild and both have since fallen
+by a similar proportion — on the 200,000-int repro, `.[$k] = 0` by 17% and `.[(0,1)] = 0` by 18%
+(Apple M5 Max, interleaved, minimum of 9), leaving the *gap* these numbers are quoted for
+essentially where it was, +36% → +34%. The per-machine absolutes have not been re-measured on
+the M4 Pro or the 7950X; the ratios and the argument they support are unaffected.
+
 What #2974 costs, measured on generated `users` documents (release, `cgu1+fat`, seven
 interleaved repetitions of each binary, median wall time and maximum peak RSS, outputs
 identical; the baseline is the commit #2974 branched from):
