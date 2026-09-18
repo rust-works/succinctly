@@ -2541,9 +2541,9 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    document_token_of, effective_fields_checked, key_is_malformed, trailing_element_gap_ok,
-    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
-    JsonConvention,
+    collapsed_fields_checked, document_token_of, effective_fields_checked, key_is_malformed,
+    trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -3606,39 +3606,30 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
             if fields.is_empty() {
                 return Ok(out.write_str("{}")?);
             }
-            // `effective_fields_checked` (`src/jq/document.rs`) is the
-            // validating sibling of `effective_fields` this writer used to
-            // call (#1576 review): besides applying the mode's own
-            // `COLLAPSE_DUPLICATE_KEYS` rule the same way (true for jq --
+            // The mode's own `COLLAPSE_DUPLICATE_KEYS` rule (true for jq --
             // a repeated key collapses to one field, first position, last
             // value, exactly `IndexMap::insert` semantics; false for
             // `--preserve-input`/yq, every occurrence kept, real yq's own
             // behavior #1008 -- the same axis `numbers` already selects,
             // ADR-0018 rule 5, so `JqCompat` doubles as the collapse flag
-            // here too), it also runs the same `key_is_malformed`/
-            // `key_delimiter_ok`/`value_delimiter_ok`/`ends_unpaired`
-            // checks `to_owned_at_depth`'s own object loop performs --
-            // closing the #1194 (bareword/non-string key) and #1677/#1676
-            // (missing/doubled `,`/`:`) gaps this writer used to have.
-            let mut items = effective_fields_checked(&fields, numbers == JsonConvention::JqCompat)
-                .map_err(StreamFailure::Decode)?;
-            // #1676's trailing-`,` check (`{"a":1,}`) used to be a third walk
-            // over `fields` here, for the *raw* last field (never
-            // `items.last()`: collapsing keeps first positions, so
-            // `{"b":1,"a":2,"b":3}` collapses to `[b, a]` while the source
-            // ends `,"b":3}`). `effective_fields_checked` has run exactly
-            // that check on its own raw walk's last value cursor since
-            // #2261 (`trailing_element_gap_ok(&last, b'}')` is the same
-            // predicate: container -> skip, else `scalar_text_end` then
-            // `trailing_gap_ok`), so the walk was a duplicate -- half a
-            // percent of the identity print on a wide object, retired by
-            // #2720. `test_jq_trailing_leading_comma_now_rejected_1676`
-            // (`tests/jq_cli_tests.rs`) still pins the refusal through the
-            // one remaining definition.
-            out.write_char('{')?;
-            let next_indent = current_indent + indent_spaces;
-            let mut first = true;
-            if sort_keys {
+            // here too).
+            let collapse = numbers == JsonConvention::JqCompat;
+            // #2720: the fields are materialized only when the writer
+            // genuinely needs all of them in hand before it can write the
+            // first -- `-S` (every key, to sort) and an object that
+            // actually repeats a key under a collapsing mode (a later
+            // occurrence changes an earlier field's value). Every other
+            // object -- the common one -- is validated by one key-only
+            // walk (`collapsed_fields_checked`, #1194/#1677/#2261's checks,
+            // the same ones the materializing `effective_fields_checked`
+            // runs) and then streamed straight off `uncons` in document
+            // order. The materialized path used to be unconditional: a
+            // 144-byte `DocumentField` per field, 22.9 MB for perf-guard's
+            // 2 MB `wide` fixture, and half of the identity print's
+            // instructions on a 7950X.
+            let materialized = if sort_keys {
+                let items =
+                    effective_fields_checked(&fields, collapse).map_err(StreamFailure::Decode)?;
                 // Sort by the *decoded* key, matching `-S`'s meaning
                 // everywhere else in this codebase (`write_object_entries`
                 // in `src/jq/stream.rs`, `YamlCursor::stream_json_value` in
@@ -3659,43 +3650,61 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     keyed.push((key_str.into_owned(), field));
                 }
                 keyed.sort_by(|a, b| a.0.cmp(&b.0));
-                items = keyed.into_iter().map(|(_, field)| field).collect();
-            }
-            for field in items {
-                if !first {
-                    out.write_char(',')?;
+                Some(
+                    keyed
+                        .into_iter()
+                        .map(|(_, field)| field)
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                collapsed_fields_checked(&fields, collapse).map_err(StreamFailure::Decode)?
+            };
+            out.write_char('{')?;
+            let next_indent = current_indent + indent_spaces;
+            let mut first = true;
+            match materialized {
+                Some(items) => {
+                    for field in items {
+                        stream_json_field(
+                            out,
+                            field.key,
+                            field.value,
+                            &field.value_cursor,
+                            first,
+                            next_indent,
+                            indent_spaces,
+                            unit,
+                            sort_keys,
+                            numbers,
+                            depth,
+                        )?;
+                        first = false;
+                    }
                 }
-                first = false;
-                if indent_spaces > 0 {
-                    out.write_char('\n')?;
-                    write_json_indent(out, next_indent, unit)?;
+                None => {
+                    // The inherent `JsonFields::uncons`, not the trait's:
+                    // two cursors per field and nothing decoded until the
+                    // writer asks (`key()`/`value()` below), where the trait
+                    // wrapper materializes a `DocumentField` up front.
+                    let mut walk = fields;
+                    while let Some((field, rest)) = JsonFields::uncons(&walk) {
+                        stream_json_field(
+                            out,
+                            field.key(),
+                            field.value(),
+                            &field.value_cursor(),
+                            first,
+                            next_indent,
+                            indent_spaces,
+                            unit,
+                            sort_keys,
+                            numbers,
+                            depth,
+                        )?;
+                        first = false;
+                        walk = rest;
+                    }
                 }
-                if let StandardJson::String(k) = field.key {
-                    write_json_string_pretty(out, k, numbers)?;
-                } else {
-                    out.write_str("\"\"")?;
-                }
-                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
-                // #1576 review: same nested-empty-container gap as the array
-                // arm above (see `empty_container_gap_ok`'s doc comment) --
-                // `stream_json`'s root-only check never reaches a field's
-                // value here, so `{"a": {"b": {,}}}` needs its own check
-                // against this field's own value cursor.
-                if !empty_container_gap_ok(&field.value_cursor, &field.value) {
-                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
-                        field.value_cursor.text(),
-                    )));
-                }
-                stream_json_pretty(
-                    out,
-                    field.value,
-                    next_indent,
-                    indent_spaces,
-                    unit,
-                    sort_keys,
-                    numbers,
-                    depth + 1,
-                )?;
             }
             if indent_spaces > 0 {
                 out.write_char('\n')?;
@@ -3729,6 +3738,58 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         // #2286.
         StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::decode_failure(msg))),
     }
+}
+
+/// One object member of [`stream_json_pretty`]'s object arm -- the
+/// separator, indentation, key, `:`, the nested-empty-container check and
+/// the value's own recursive render -- shared by its materialized and
+/// streaming loops (#2720) so the two cannot drift.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: stream_json_pretty's own ambients, plus the field
+fn stream_json_field<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    key: StandardJson<'_, W>,
+    value: StandardJson<'_, W>,
+    value_cursor: &JsonCursor<'_, W>,
+    first: bool,
+    next_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    numbers: JsonConvention,
+    depth: usize,
+) -> StreamResult {
+    if !first {
+        out.write_char(',')?;
+    }
+    if indent_spaces > 0 {
+        out.write_char('\n')?;
+        write_json_indent(out, next_indent, unit)?;
+    }
+    if let StandardJson::String(k) = key {
+        write_json_string_pretty(out, k, numbers)?;
+    } else {
+        out.write_str("\"\"")?;
+    }
+    out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+    // #1576 review: same nested-empty-container gap as the array arm (see
+    // `empty_container_gap_ok`'s doc comment) -- `stream_json`'s root-only
+    // check never reaches a field's value here, so `{"a": {"b": {,}}}`
+    // needs its own check against this field's own value cursor.
+    if !empty_container_gap_ok(value_cursor, &value) {
+        return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+            value_cursor.text(),
+        )));
+    }
+    stream_json_pretty(
+        out,
+        value,
+        next_indent,
+        indent_spaces,
+        unit,
+        sort_keys,
+        numbers,
+        depth + 1,
+    )
 }
 
 /// Write a JSON string value using `numbers`'s escaping convention
