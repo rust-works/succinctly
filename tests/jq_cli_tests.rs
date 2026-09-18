@@ -559,6 +559,61 @@ fn test_custom_indent() -> Result<()> {
     Ok(())
 }
 
+/// #3155: `--indent 0` is compact, on every route.
+///
+/// jq 1.7.1 prints `--indent 0` compactly -- confirmed live,
+/// `jq --indent 0 '{a:[1,2]}'` gives `{"a":[1,2]}`. succinctly had two
+/// answers to this. `output.rs`'s `format_json` keyed compactness off
+/// `indent.is_empty()` and was right; the streaming `print_json` keyed it off
+/// `config.compact` (i.e. `-c` alone) and emitted newlines with zero-width
+/// indents instead.
+///
+/// The split stayed invisible while the routes never met -- the eager
+/// `-n`/`--slurp`/DSV route used `format_json`, the lazy route used
+/// `print_json`. #3009 merged the two owned writers, which would have carried
+/// the *wrong* spelling onto the route that was right; both printers now key
+/// off the indent string too.
+///
+/// Covers both routes deliberately: `-n` is the eager one (the regression
+/// this would have been), a plain filter over stdin is the lazy one (the
+/// pre-existing divergence this closes), and `to_entries` forces the owned
+/// print path specifically.
+#[test]
+fn test_indent_zero_is_compact_on_every_route_3155() -> Result<()> {
+    // Eager route: `-n` never reads a document, so it takes the materializing
+    // writer.
+    let (stdout, stderr, code) = run_jq_full(&["-n", "--indent", "0", "{a:[1,2]}"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+
+    // Eager route via `--slurp`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["--slurp", "--indent", "0", ".[0]"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+
+    // Lazy route, cursor-backed identity.
+    let (stdout, stderr, code) = run_jq_full(&["--indent", "0", "."], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+
+    // Lazy route, owned result -- the #3009 print path itself.
+    let (stdout, stderr, code) =
+        run_jq_full(&["--indent", "0", "to_entries"], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"key\":\"a\",\"value\":[1,2]}]\n");
+
+    // `--indent 1` is *not* compact, so the fix keys off emptiness rather
+    // than off "the indent is small".
+    let (stdout, stderr, code) = run_jq_full(&["--indent", "1", "."], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\n \"a\": 1\n}\n");
+
+    Ok(())
+}
+
 /// #2009: `-c`/`--tab`/`--indent` are one output-format knob in real jq --
 /// whichever is given last wins, live-verified against jq 1.7.1
 /// (`jq -c --tab '.'` pretty-prints with tabs; `jq --tab -c '.'` stays
