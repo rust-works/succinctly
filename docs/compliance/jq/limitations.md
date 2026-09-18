@@ -3451,6 +3451,16 @@ Two deliberate remainders:
   a `%*s` whose width follows the failing node's start column for a simple undefined name but
   points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
   trailing whitespace either way.
+- **`succinctly` tolerates whitespace around `::` in a namespaced call
+  (`mymod :: func`); both reference tools reject it outright as a syntax
+  error.** `Parser::parse_func_call_or_error`/`parse_namespaced_call`
+  (`src/jq/parser.rs`) both `skip_ws()` around the `::` token; jq 1.7.1 and
+  yq v4.53.3 both treat it as a single non-whitespace-separated token
+  (confirmed live: `unexpected ':'` / `lexer: invalid input text`, neither
+  ever reaching a "not defined" diagnostic). Not a deliberate ADR-0018
+  extension — an undetected pre-existing leniency, found incidentally while
+  adding `report_unresolved_call` coverage for #2964. Tracked as
+  [#3116](https://github.com/rust-works/succinctly/issues/3116).
 
 Every builtin the pinned jq defines is implemented since #3042 (the libm family) and #3046
 (`JOIN`, `format`, `input_filename`, ...). The roster captured from the pinned oracle
