@@ -3432,7 +3432,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                                 sink,
                                 &mut out,
                                 || at.resolve(),
-                                |o| write_output(o, &result, &output_config),
+                                |o| write_output_owned_value(o, &result, &output_config),
                             )?;
                             Ok(!stop)
                         },
@@ -3972,7 +3972,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             sink,
                             &mut out,
                             || ErrorAt::Live(&locations).resolve(),
-                            |o| write_output(o, &result, &output_config),
+                            |o| write_output_owned_value(o, &result, &output_config),
                         )?;
                         Ok(!stop)
                     },
@@ -4027,7 +4027,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                                 sink,
                                 &mut out,
                                 || ErrorAt::Live(&locations).resolve(),
-                                |o| write_output(o, &result, &output_config),
+                                |o| write_output_owned_value(o, &result, &output_config),
                             )?;
                             Ok(!stop)
                         },
@@ -4064,7 +4064,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             sink,
                             &mut out,
                             || at.resolve(),
-                            |o| write_output(o, &result, &output_config),
+                            |o| write_output_owned_value(o, &result, &output_config),
                         )?;
                         Ok(!stop)
                     },
@@ -7231,23 +7231,6 @@ fn owned_raw_str<'v>(value: &'v OwnedValue, config: &OutputConfig) -> Option<Cow
     }
 }
 
-fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
-    if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
-        return Ok(());
-    }
-
-    // Not computed until this non-raw fallthrough path actually needs it
-    // (code review, #1830) -- the raw-output early return above never
-    // touches it, so computing it unconditionally wasted a full
-    // JSON-formatting pass on every raw-output string reaching this
-    // writer (the "materializing path", `-n`/`inputs`/DSV input).
-    let output = format_json(value, config);
-    out.write_all(output.as_bytes())?;
-    write_terminator(out, config)?;
-
-    Ok(())
-}
-
 /// [`write_output_jq_value`]'s twin for an already-owned result (#3009).
 ///
 /// Same record shape as its sibling -- shared prologue, then a JSON body,
@@ -7262,12 +7245,13 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
 ///   owned tree *into* a `JqValue` only for `try_materialize` to convert it
 ///   straight back, three traversals to print one value.
 ///
-/// Distinct from [`write_output`] above, which serves the eager `-n`/
-/// `--slurp`/DSV route and still formats through `format_json`
-/// unconditionally. Pointing that one at `print_owned_json` too is a
-/// separate byte-identity question -- the differential test here proves each
-/// writer equals *today's* behaviour, not that the two writers equal each
-/// other -- so it is deliberately left alone.
+/// Also serves the eager `-n`/`--slurp`/DSV-input route (formerly a separate
+/// `write_output`, which formatted through `format_json` unconditionally for
+/// every config, including plain `-c`): `write_output_owned_value_matches_old_write_output_3009`
+/// proves the fast branch is byte-identical to that route's old
+/// always-`format_json` output before this function took over its call
+/// sites, the same discipline as the differential test against
+/// `write_output_jq_value` below.
 fn write_output_owned_value<Out: Write>(
     out: &mut Out,
     value: &OwnedValue,
@@ -7674,6 +7658,79 @@ fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<Owned
     generic_to_owned::<JqSemantics, _>(&cursor.value())
 }
 
+/// The bracket/brace-delimited, comma-and-indent-joined skeleton shared by
+/// `print_json`'s and `print_owned_json`'s `Array`/`Object` arms (#3009
+/// review): both walked a `len == 0` special case, a `compact` branch and a
+/// pretty branch with identical comma/separator/indent placement, differing
+/// only in what one element's own bytes are. Factored out so that skeleton
+/// has one definition instead of four near-identical copies (two containers
+/// x two printers) to keep in sync.
+///
+/// `write_item` gets `out` and one `T` (an array element, or an object's
+/// `(key, value)` pair) and owns writing that element's bytes -- including,
+/// for an object, the `"key":` prefix, since key escaping differs per
+/// printer's `ascii_output` handling only in which string it escapes, not in
+/// this skeleton.
+///
+/// `layout` bundles the four values `print_json`/`print_owned_json` already
+/// compute together from `config`/`level` at the top of each function
+/// (`compact` plus the three strings it gates) -- one group, not
+/// `#[allow(clippy::too_many_arguments)]`'s usual `scratch`/`array_scratch`
+/// situation of independent buffers that only look related.
+struct JsonContainerLayout<'a> {
+    compact: bool,
+    separator: &'a str,
+    next_indent: &'a str,
+    current_indent: &'a str,
+}
+
+fn write_json_container<Out, I, T>(
+    out: &mut Out,
+    items: I,
+    len: usize,
+    brackets: (u8, u8),
+    layout: &JsonContainerLayout<'_>,
+    mut write_item: impl FnMut(&mut Out, T) -> Result<()>,
+) -> Result<()>
+where
+    Out: Write,
+    I: IntoIterator<Item = T>,
+{
+    let (open, close) = brackets;
+    let JsonContainerLayout {
+        compact,
+        separator,
+        next_indent,
+        current_indent,
+    } = *layout;
+    if len == 0 {
+        out.write_all(&[open, close])?;
+        return Ok(());
+    }
+    out.write_all(&[open])?;
+    if !compact {
+        out.write_all(separator.as_bytes())?;
+    }
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
+            if !compact {
+                out.write_all(separator.as_bytes())?;
+            }
+        }
+        if !compact {
+            out.write_all(next_indent.as_bytes())?;
+        }
+        write_item(out, item)?;
+    }
+    if !compact {
+        out.write_all(separator.as_bytes())?;
+        out.write_all(current_indent.as_bytes())?;
+    }
+    out.write_all(&[close])?;
+    Ok(())
+}
+
 /// Print a JqValue as JSON using the provided literal formatter.
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
@@ -7776,7 +7833,21 @@ where
         "{}",
         succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
     );
-    let compact = config.compact;
+    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
+    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
+    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
+    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
+    // so already agreed with the reference; these two streaming printers
+    // keyed it off `config.compact` alone and emitted newlines with
+    // zero-width indents instead (#3155).
+    //
+    // That split used to be invisible because the two routes never met: the
+    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
+    // lazy route streamed through here. Merging the owned writers put the
+    // reference-correct route onto this code, so the divergence had to be
+    // settled rather than documented -- and it is settled in the reference's
+    // favour, per ADR-0018.
+    let compact = config.compact || config.indent_string.is_empty();
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -7790,6 +7861,12 @@ where
     };
     let separator = if compact { "" } else { "\n" };
     let space_after_colon = if compact { "" } else { " " };
+    let container_layout = JsonContainerLayout {
+        compact,
+        separator,
+        next_indent: &next_indent,
+        current_indent: &current_indent,
+    };
 
     match value {
         JqValue::Null => out.write_all(b"null")?,
@@ -8195,14 +8272,13 @@ where
             out.write_all(b"\"")?;
         }
         JqValue::Array(arr) => {
-            if arr.is_empty() {
-                out.write_all(b"[]")?;
-            } else if compact {
-                out.write_all(b"[")?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
+            write_json_container(
+                out,
+                arr.iter(),
+                arr.len(),
+                (b'[', b']'),
+                &container_layout,
+                |out, v| {
                     print_json(
                         out,
                         v,
@@ -8212,72 +8288,18 @@ where
                         scratch,
                         array_scratch,
                         None,
-                    )?;
-                }
-                out.write_all(b"]")?;
-            } else {
-                out.write_all(b"[")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
-                    print_json(
-                        out,
-                        v,
-                        formatter,
-                        config,
-                        level + 1,
-                        scratch,
-                        array_scratch,
-                        None,
-                    )?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"]")?;
-            }
+                    )
+                },
+            )?;
         }
         JqValue::Object(obj) => {
-            if obj.is_empty() {
-                out.write_all(b"{}")?;
-            } else if compact {
-                out.write_all(b"{")?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
-                    print_json(
-                        out,
-                        v,
-                        formatter,
-                        config,
-                        level + 1,
-                        scratch,
-                        array_scratch,
-                        None,
-                    )?;
-                }
-                out.write_all(b"}")?;
-            } else {
-                out.write_all(b"{")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
+            write_json_container(
+                out,
+                obj.iter(),
+                obj.len(),
+                (b'{', b'}'),
+                &container_layout,
+                |out, (k, v)| {
                     out.write_all(b"\"")?;
                     let escaped = if config.ascii_output {
                         escape_json_string_ascii(k)
@@ -8296,12 +8318,9 @@ where
                         scratch,
                         array_scratch,
                         None,
-                    )?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"}")?;
-            }
+                    )
+                },
+            )?;
         }
         // Genuinely lazy: stream each key's raw bytes straight from its
         // cursor, same zero-copy convention as `JqValue::Cursor`'s
@@ -8515,7 +8534,21 @@ where
         "{}",
         succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
     );
-    let compact = config.compact;
+    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
+    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
+    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
+    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
+    // so already agreed with the reference; these two streaming printers
+    // keyed it off `config.compact` alone and emitted newlines with
+    // zero-width indents instead (#3155).
+    //
+    // That split used to be invisible because the two routes never met: the
+    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
+    // lazy route streamed through here. Merging the owned writers put the
+    // reference-correct route onto this code, so the divergence had to be
+    // settled rather than documented -- and it is settled in the reference's
+    // favour, per ADR-0018.
+    let compact = config.compact || config.indent_string.is_empty();
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -8529,6 +8562,12 @@ where
     };
     let separator = if compact { "" } else { "\n" };
     let space_after_colon = if compact { "" } else { " " };
+    let container_layout = JsonContainerLayout {
+        compact,
+        separator,
+        next_indent: &next_indent,
+        current_indent: &current_indent,
+    };
 
     match value {
         OwnedValue::Null => out.write_all(b"null")?,
@@ -8551,62 +8590,23 @@ where
             out.write_all(b"\"")?;
         }
         OwnedValue::Array(arr) => {
-            if arr.is_empty() {
-                out.write_all(b"[]")?;
-            } else if compact {
-                out.write_all(b"[")?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
-                    print_owned_json(out, v, formatter, config, level + 1)?;
-                }
-                out.write_all(b"]")?;
-            } else {
-                out.write_all(b"[")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
-                    print_owned_json(out, v, formatter, config, level + 1)?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"]")?;
-            }
+            write_json_container(
+                out,
+                arr.iter(),
+                arr.len(),
+                (b'[', b']'),
+                &container_layout,
+                |out, v| print_owned_json(out, v, formatter, config, level + 1),
+            )?;
         }
         OwnedValue::Object(obj) => {
-            if obj.is_empty() {
-                out.write_all(b"{}")?;
-            } else if compact {
-                out.write_all(b"{")?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                    }
-                    out.write_all(b"\"")?;
-                    let escaped = if config.ascii_output {
-                        escape_json_string_ascii(k)
-                    } else {
-                        escape_json_string(k)
-                    };
-                    out.write_all(escaped.as_bytes())?;
-                    out.write_all(b"\":")?;
-                    print_owned_json(out, v, formatter, config, level + 1)?;
-                }
-                out.write_all(b"}")?;
-            } else {
-                out.write_all(b"{")?;
-                out.write_all(separator.as_bytes())?;
-                for (i, (k, v)) in obj.iter().enumerate() {
-                    if i > 0 {
-                        out.write_all(b",")?;
-                        out.write_all(separator.as_bytes())?;
-                    }
-                    out.write_all(next_indent.as_bytes())?;
+            write_json_container(
+                out,
+                obj.iter(),
+                obj.len(),
+                (b'{', b'}'),
+                &container_layout,
+                |out, (k, v)| {
                     out.write_all(b"\"")?;
                     let escaped = if config.ascii_output {
                         escape_json_string_ascii(k)
@@ -8616,12 +8616,9 @@ where
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
                     out.write_all(space_after_colon.as_bytes())?;
-                    print_owned_json(out, v, formatter, config, level + 1)?;
-                }
-                out.write_all(separator.as_bytes())?;
-                out.write_all(current_indent.as_bytes())?;
-                out.write_all(b"}")?;
-            }
+                    print_owned_json(out, v, formatter, config, level + 1)
+                },
+            )?;
         }
     }
     Ok(())
@@ -9815,16 +9812,21 @@ mod tests {
     /// under.
     ///
     /// `compact` and `indent_string` are varied *together* rather than as an
-    /// independent product, because only four of their combinations are
-    /// reachable from `OutputConfig::from_args`: `-c` gives `("" , true)`,
-    /// and each pretty spelling gives its own indent with `compact` false.
-    /// The fifth, `--indent 0` -> `("", false)`, is deliberately excluded --
-    /// see the differential test's own doc comment.
+    /// independent product, because only five of their combinations are
+    /// reachable from `OutputConfig::from_args`: `-c` gives `("", true)`,
+    /// `--indent 0` gives `("", false)`, and each remaining pretty spelling
+    /// gives its own indent with `compact` false.
     #[cfg(test)]
     fn owned_print_configs_3009() -> Vec<OutputConfig> {
         let mut configs = Vec::new();
         for (indent_string, compact) in [
             (String::new(), true),
+            // `--indent 0`: an empty indent with `compact` false. Previously
+            // excluded here because the two printers disagreed with
+            // `format_json` about it; both now key compactness off the indent
+            // string as well, matching jq 1.7.1, so this shape is covered
+            // like any other (#3155).
+            (String::new(), false),
             ("  ".to_string(), false),
             ("    ".to_string(), false),
             ("\t".to_string(), false),
@@ -9936,16 +9938,15 @@ mod tests {
     /// the *body*: everything below the prologue, where the two routes
     /// genuinely differ.
     ///
-    /// **`--indent 0` is excluded on purpose.** `print_json` keys compact off
-    /// `config.compact` (which is `args.compact_output` alone) while
-    /// `indent_string` is `""`, so it emits newlines with zero-width
-    /// indents; `format_json` keys it off `indent.is_empty()` and prints
-    /// compact. jq 1.7.1 agrees with `format_json` -- confirmed live, its
-    /// `--indent 0` output is compact -- so the lazy route has a
-    /// pre-existing divergence from the reference that no test covers.
-    /// Including it here would either fail for a reason #3009 did not cause
-    /// or force a stdout change into a PR whose contract is that stdout does
-    /// not change. Filed separately.
+    /// **`--indent 0` is covered, and settling it was not optional.** Both
+    /// printers used to key compactness off `config.compact` alone, so with
+    /// an empty `indent_string` they emitted newlines with zero-width
+    /// indents, while `format_json` keyed it off `indent.is_empty()` and
+    /// printed compact. jq 1.7.1 agrees with `format_json` (confirmed live).
+    /// While the eager `-n`/`--slurp`/DSV route had its own writer this was
+    /// a dormant divergence on the lazy route only; merging the two owned
+    /// writers would have carried the *wrong* spelling onto the route that
+    /// was right, so both printers now key off the indent string too.
     #[test]
     fn write_output_owned_value_matches_rebuilt_route_3009() {
         let corpus = owned_print_corpus_3009();
@@ -9972,6 +9973,59 @@ mod tests {
                 assert_eq!(
                     String::from_utf8_lossy(&direct),
                     String::from_utf8_lossy(&via_rebuild),
+                    "byte mismatch for {value:?} under `{flags}`"
+                );
+            }
+        }
+    }
+
+    /// #3009 follow-up: `write_output_owned_value` now also serves the
+    /// `-n`/`--slurp`/DSV-input route that used to be a separate
+    /// `write_output`, which formatted through `format_json` unconditionally
+    /// for every config and never took `print_owned_json`'s fast path. This
+    /// proves the fast branch matches that old, always-`format_json` route
+    /// byte-for-byte before trusting the merge of the two call sites -- the
+    /// same corpus/config sweep as the rebuilt-route test above, replicating
+    /// the old function's exact body (shared prologue, `format_json`, shared
+    /// terminator) as the oracle since the function itself no longer exists
+    /// to call directly.
+    #[test]
+    fn write_output_owned_value_matches_old_write_output_3009() {
+        fn old_write_output<Out: Write>(
+            out: &mut Out,
+            value: &OwnedValue,
+            config: &OutputConfig,
+        ) -> Result<()> {
+            if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
+                return Ok(());
+            }
+            out.write_all(format_json(value, config).as_bytes())?;
+            write_terminator(out, config)?;
+            Ok(())
+        }
+
+        let corpus = owned_print_corpus_3009();
+        let configs = owned_print_configs_3009();
+        for value in &corpus {
+            for config in &configs {
+                let mut direct = Vec::new();
+                let direct_err = write_output_owned_value(&mut direct, value, config)
+                    .err()
+                    .map(|e| e.to_string());
+
+                let mut via_old = Vec::new();
+                let old_err = old_write_output(&mut via_old, value, config)
+                    .err()
+                    .map(|e| e.to_string());
+
+                let flags = describe_config_3009(config);
+                assert_eq!(
+                    direct_err, old_err,
+                    "error mismatch for {value:?} under `{flags}`"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&direct),
+                    String::from_utf8_lossy(&via_old),
                     "byte mismatch for {value:?} under `{flags}`"
                 );
             }
