@@ -31638,8 +31638,8 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // node-identity rule above never can.
         Expr::TrackedVar(marker) => {
             if trackable
-                && (marker.value == *value && frame.certifies(&marker.origin)
-                    || null_bool_identical(&marker.value, value))
+                && marker.value == *value
+                && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, value))
             {
                 Ok(vec![PathBranch::new(
                     PathPrefix::root(),
@@ -33597,7 +33597,13 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &Frame) -> bool {
     match unwrap_paren(expr) {
         Expr::Identity => trackable,
-        Expr::TrackedVar(marker) => marker.value == *reg && frame.certifies(&marker.origin),
+        // #3136: the same null/bool carve-out `resolve_node_eager`'s own
+        // `TrackedVar` arm needs -- jq's `jv_identical` admits those three
+        // values by value alone, regardless of node.
+        Expr::TrackedVar(marker) => {
+            marker.value == *reg
+                && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, reg))
+        }
         Expr::If {
             then_branch,
             else_branch,

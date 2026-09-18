@@ -161,10 +161,13 @@ pub struct Tracked {
 /// - [`Origin::Untracked`] -- the #2072 witness for a binding whose source
 ///   navigated, made *outside* any resolver invocation (an ordinary `as`
 ///   binding, not one syntactically inside `path()`'s argument): there is
-///   no invocation to certify against, so this marker always refuses,
-///   exactly as an un-wrapped literal did before #2072 gave every `as`
-///   binding a `TrackedVar` wrapper so its `Tracked::node` could carry
-///   cursor identity. `path(.a as $y | .c | $y)` still refuses, matching jq.
+///   no invocation to certify against, so this marker refuses by node
+///   identity, exactly as an un-wrapped literal did before #2072 gave every
+///   `as` binding a `TrackedVar` wrapper so its `Tracked::node` could carry
+///   cursor identity. `path(.a as $y | .c | $y)` on `{"a":{"b":1},"c":{"b":1}}`
+///   still refuses, matching jq -- but jq's own `jv_identical` admits
+///   `null`/`true`/`false` by value regardless of node (#3136), so the same
+///   filter on `{"a":true,"c":true}` answers `[]` on both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Origin {
     /// Frozen from the ambient input itself; certified by value equality
@@ -190,7 +193,8 @@ pub enum Origin {
         path: super::eval::BindPath,
     },
     /// Frozen from a navigated position outside any resolver invocation
-    /// (#2072); never certified.
+    /// (#2072); never certified by node identity, only by the null/bool
+    /// value-identity carve-out (#3136) every other `Origin` also gets.
     Untracked,
 }
 

@@ -863,7 +863,10 @@ is the revert that established what the other one costs.
    equal-valued sibling `path(.a as $y \| .c \| $y)` still refuses — exactly the #1466 class
    the frame witness exists to keep closed, now for navigated bindings too. yq mode is
    unchanged: `substitute_bound_var`'s widening is jq-mode only
-   ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
+   ([#2643](https://github.com/rust-works/succinctly/issues/2643)). The sibling refusal is
+   itself the general (non-`null`/`bool`) case: jq's own `jv_identical` admits
+   `null`/`true`/`false` by value regardless of node, so the same shape on `{"a":true,"c":true}`
+   answers ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
    Fourteen rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
@@ -1036,11 +1039,14 @@ is the revert that established what the other one costs.
    is no cursor at that funnel to promote against), a navigated bind on an *owned-rooted*
    document (`input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as $y | .a | ($y.b) = 9'`,
    a `tojson|fromjson`-rebuilt root: the marker's node is an `OwnedIdentity` position, and
-   `marker_is_root` reads only a document node against a live cursor — no `OwnedRoot` twin),
-   and a `null`/`bool` marker at an
-   equal-valued sibling (`.a as $y | .c | $y |= 5` on `{"a":true,"c":true}`: jq's
-   `jv_identical` admits those by value regardless of node, the resolver's `TrackedVar` arm
-   consults the origin first — pre-existing). The library entry point `succinctly::jq::eval`
+   `marker_is_root` reads only a document node against a live cursor — no `OwnedRoot` twin).
+   A `null`/`bool` marker at an equal-valued sibling (`.a as $y | .c | $y |= 5` on
+   `{"a":true,"c":true}`) used to be refuse-only the same way — jq's `jv_identical` admits
+   those by value regardless of node, but the resolver's `TrackedVar` arm consulted the
+   origin first — closed by
+   [#3136](https://github.com/rust-works/succinctly/issues/3136), which ORs in the same
+   null/bool value-identity carve-out `register_identical` already makes, gated the same way
+   by the existing node-identity check. The library entry point `succinctly::jq::eval`
    takes the eager evaluator for a program `needs_path_context` does not route (a `path(f)`
    with an argument, a write), so through it these rows keep refusing as before; the CLI's
    route is the generic evaluator, where they answer.

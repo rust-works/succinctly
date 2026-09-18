@@ -60836,7 +60836,10 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
 /// navigated position refused at an equal-valued *sibling* where jq
 /// answers. All three values, and both write forms (`|=`, `del`), not just
 /// the `path()` read `test_navigated_bind_residuals_refuse_cleanly_3037`
-/// used to pin as refuse-only.
+/// used to pin as refuse-only. The last two rows are
+/// `resolve_as_pattern`'s own sibling gap (review): a bare-var pattern
+/// source (`$y as $z | ...`) reaches `resolves_to_register`'s identical
+/// `TrackedVar` arm, which had the same gap independently.
 #[test]
 fn test_navigated_bind_null_bool_sibling_answers_3136() -> Result<()> {
     for (input, filter, want) in [
@@ -60848,26 +60851,42 @@ fn test_navigated_bind_null_bool_sibling_answers_3136() -> Result<()> {
             r"del(.a as $y | .c | $y)",
             r#"{"a":false}"#,
         ),
+        (
+            r#"{"a":true,"c":true}"#,
+            r".a as $y | .c | $y as $z | path($z)",
+            "[]",
+        ),
+        (
+            r#"{"a":false,"c":false}"#,
+            r"del(.a as $y | .c | $y as $z | $z)",
+            r#"{"a":false}"#,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "#3136: `{filter}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), want, "#3136: `{filter}`");
     }
-    // Control: a non-null/bool equal-valued sibling still refuses -- jq's
+    // Controls: a non-null/bool equal-valued sibling still refuses -- jq's
     // own jv_identical requires actual pointer identity for those, which
-    // this fix does not (and must not) widen.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r".a as $y | .c | path($y)"],
-        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
-    )?;
-    assert_eq!(
-        code, 5,
-        "#3136 control: non-null/bool sibling must still refuse, got stdout={stdout:?} stderr={stderr:?}"
-    );
-    assert!(
-        stderr.contains("Invalid path expression"),
-        "#3136 control: stderr={stderr:?}"
-    );
+    // this fix does not (and must not) widen. One direct bind, one through
+    // a pattern source, exercising both fixed call sites' own gates.
+    for (filter, input) in [
+        (r".a as $y | .c | path($y)", r#"{"a":{"b":1},"c":{"b":1}}"#),
+        (
+            r".a as $y | .c | $y as $z | path($z)",
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3136 control: non-null/bool sibling must still refuse, `{filter}`: got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3136 control: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
     Ok(())
 }
 
