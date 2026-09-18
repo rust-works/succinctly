@@ -62397,6 +62397,19 @@ fn test_skip_pulls_count_generator_lazily_3117() -> Result<()> {
     assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
     assert!(stderr.contains("boom"), "stderr={stderr:?}");
 
+    // Laziness must not drop positions a body produced *before* it raised:
+    // with a zero count `skip` streams `expr` directly (the def's `$n == 0`
+    // branch), so `.x, .y` are real outputs when `error("boom")` hits, and
+    // a catch must still see them. Byte-identical to pre-#3117 main
+    // (verified against both binaries).
+    let (stdout, _stderr, code) = run_jq_stdin_streams(
+        r#"((try (skip(0; .x, .y, error("boom"))) catch true) | key)"#,
+        r#"{"x":1,"y":2}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout={stdout:?} stderr={_stderr:?}");
+    assert_eq!(stdout, "\"x\"\n\"y\"\n");
+
     Ok(())
 }
 
