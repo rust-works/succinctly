@@ -3571,16 +3571,19 @@ too (ADR-0024's option D) is what would close the rest.
 
 [#3009](https://github.com/rust-works/succinctly/issues/3009) stopped the CLI rebuilding an
 owned result as a `lazy::JqValue` before printing it, and a write produces an owned document and
-then prints it — so both sides of every comparison above carried that rebuild. **Whether the
-figures moved depends on the allocator, not on the change.** On the 7950X they did not: the
-200,000-int repro reads −1.0% for `.[$k] = 0` and +0.3% for `.[(0,1)] = 0` in peak RSS
-(interleaved, minimum of 9), so the numbers quoted above for that machine stand as written,
-while wall clock improved ~9% on both. On Apple silicon the same pair fell 19% and 18% (measured
-on an M5 Max, the M4 Pro being unreachable), because the rebuild's free/alloc size mismatch left
-larger holes in libmalloc's size classes than in glibc's — so the M4 Pro absolutes above are
-likely low by a similar margin and have not been re-measured. The *gap* every one of these
-numbers is quoted for is unaffected either way: both sides move together, +36% → +34% on the
-Apple measurement and unchanged on the 7950X.
+then prints it — so both sides of the `.[$k] = 0` / `.[(0,1)] = 0` comparison above carried that
+rebuild. **The M4 Pro figures are stale, and the gap they are quoted for is understated.**
+Re-measured on that same machine (interleaved, minimum of 9; the pre-change numbers reproduce
+the figures above to within 0.2 MB, which is what says the two harnesses agree): `.[$k] = 0`
+falls 46.8 MB → 35.5 MB (−24%) and `.[(0,1)] = 0` falls 60.4 MB → 55.1 MB (−9%). The two sides
+do *not* move together — the eager route sheds far more, its whole result being one owned
+document handed straight to the writer — so the gap widens from +29% to **+55%**. The argument
+this paragraph makes is strengthened, not weakened; only its arithmetic is out of date.
+
+On the 7950X the same pair moves neither side (−1.0% and +0.3%), so that machine's absolutes
+above stand as written and its gap stays at +29%. The difference is the allocator, not the
+change: the rebuild's free/alloc size mismatch left holes in libmalloc's size classes that
+glibc's did not leave. Wall clock improved on both (~6% on the M4 Pro, ~9% on the 7950X).
 
 What #2974 costs, measured on generated `users` documents (release, `cgu1+fat`, seven
 interleaved repetitions of each binary, median wall time and maximum peak RSS, outputs
