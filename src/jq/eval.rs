@@ -33527,6 +33527,63 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
     matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
 }
 
+/// Whether `expr`, given it runs to completion without raising or
+/// yielding zero outputs, is *provably* `reg` -- `resolve_as_pattern`'s
+/// first-step identity test (jq's `path_intact`) needs exactly this, which
+/// is a *stronger* property than `is_identity_passthrough`/
+/// `is_raise_free_identity_passthrough` give (#3119 review, after two
+/// rounds of live-verified false positives against those helpers reused
+/// naively here): those two only certify a shape as a *candidate* whose
+/// value gets re-checked later, at a separate use site
+/// (`substitute_bound_var_at`'s `Origin::Snapshot`/`SnapshotAt` contract,
+/// #844/#2978) -- there is no later check here, so a wrong "yes" is
+/// immediately load-bearing, not deferred.
+///
+/// Concretely, both helpers accept a `TrackedVar` purely by its `origin`
+/// kind (`Snapshot`/`SnapshotAt`), never by comparing its *frozen* value
+/// to the *current* register -- so a marker frozen at one position,
+/// referenced again after the register has moved on and wrapped in
+/// `if`/`try`/`//`, would wrongly inherit "identical to the current
+/// register" from `trackable` alone if this function just recursed
+/// through those two helpers' verdicts. Confirmed live: `. as $x | .a |
+/// (if true then $x else $x end) as {x:$q} | $q` on `{"a":{"x":1,"y":2}}`
+/// -- jq refuses (`$x` is the *root*, not `.a`); a naive
+/// `is_identity_passthrough(then_branch) && is_identity_passthrough
+/// (else_branch) => trackable` arm answered `["a","x"]` and `del` wrote
+/// through the mismatch. This function instead re-runs the bare-
+/// `TrackedVar` arm's own check (`marker.value == *reg &&
+/// frame.certifies(&marker.origin)`) at every level it recurses to, so a
+/// stale marker refuses wherever it's reached, not just at the top.
+///
+/// Mirrors `is_identity_passthrough`'s grammar otherwise, with one
+/// difference: `Alternative` is gated on the *runtime* register being
+/// truthy (`A // B` only ever equals `.` exactly when `A` actually
+/// produced the value) rather than on `is_raise_free_identity_passthrough
+/// (left)` alone, which says nothing about which side's value reached
+/// `bound` -- the same #3129 lesson applied to an immediate, non-deferred
+/// certification instead of a later one.
+fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &Frame) -> bool {
+    match unwrap_paren(expr) {
+        Expr::Identity => trackable,
+        Expr::TrackedVar(marker) => marker.value == *reg && frame.certifies(&marker.origin),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            resolves_to_register(then_branch, trackable, reg, frame)
+                && resolves_to_register(else_branch, trackable, reg, frame)
+        }
+        Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
+            resolves_to_register(expr, trackable, reg, frame)
+        }
+        Expr::Alternative(left, _) if trackable && reg.is_truthy() => {
+            resolves_to_register(left, trackable, reg, frame)
+        }
+        _ => false,
+    }
+}
+
 /// The register `path()`-tracking compares each `reduce`/`foreach` fold
 /// iteration's own navigation against — jq's `(path, value_at_path)` pair,
 /// derived empirically against jq 1.7.1 (#1440; no fold-specific machinery
@@ -34670,6 +34727,17 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
         let identical = register.is_some_and(|reg| match head {
             Expr::Identity => trackable,
             Expr::TrackedVar(marker) => marker.value == *reg && frame.certifies(&marker.origin),
+            // #3119: every other identity-passthrough-shaped head, judged
+            // by `resolves_to_register` (not `is_identity_passthrough`,
+            // whose weaker guarantee is unsound to reuse for an immediate
+            // verdict -- see that function's own doc). A shape it refuses
+            // still gets the same null/bool value-identity fallback the
+            // catch-all below applies, since a `B`/handler-derived value
+            // that happens to match the register that way coincides with
+            // jq's own `jv_identical` verdict regardless of shape.
+            Expr::If { .. } | Expr::Try { .. } | Expr::Alternative(..) => {
+                resolves_to_register(head, trackable, reg, frame) || null_bool_identical(bound, reg)
+            }
             _ => null_bool_identical(bound, reg),
         });
         // Whether a first-step refusal is jq's own verdict rather than this
@@ -99407,6 +99475,169 @@ mod tests {
                 Err(want) => match got {
                     QueryResult::Error(e) => assert_eq!(e.message, *want, "{doc} | {filter}"),
                     other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"),
+                },
+            }
+        }
+    }
+
+    /// `resolve_as_pattern`'s first-step identity test (jq's `path_intact`)
+    /// only recognized a bare `.` head as the register's own node -- every
+    /// other `is_identity_passthrough` spelling (`try . catch 1`,
+    /// `if true then . else . end`, `. // 1`) fell to the null/bool
+    /// catch-all, wrongly decided the step was not intact, and either
+    /// refused (a single pattern) or retried a `?//` chain onto the *wrong*
+    /// alternative -- which `del`/`=` then wrote through (row 3: succinctly
+    /// wrote `null`, deleting the whole document, where jq deletes one key).
+    /// Rows 1-6 are the issue's own repro table; rows 7-8 are the `if`
+    /// twin of rows 1/3, not in the issue but the same gap (`if`'s own
+    /// `Expr` variant, not just `try`/`Alternative`); row 9 is a confirmed
+    /// refuse-only divergence from `resolves_to_register`'s own extra
+    /// runtime gate (see its doc comment). The final block is a second
+    /// review round's two findings against the *first* fix -- see
+    /// `resolves_to_register`'s own doc comment for why a naive
+    /// `is_identity_passthrough`-reuse for `If`/`Try` was unsound. Every
+    /// row is confirmed live against `/usr/bin/jq` 1.7.1.
+    #[test]
+    // Several rows' filter strings are jq object-construction literals
+    // (`{a:1}`), not formatting strings; clippy cannot tell the two apart
+    // from the brace shape alone.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn test_alternative_identity_passthrough_pattern_head_is_recognized_3119() {
+        type Row = (
+            &'static str,
+            &'static str,
+            Result<&'static [&'static str], String>,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"path((try . catch 1) as {a:$v} | $v)",
+                Ok(&[r#"["a"]"#]),
+            ),
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"path((. // 1) as {a:$v} ?// $v | $v)",
+                Ok(&[r#"["a"]"#]),
+            ),
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"del((. // 1) as {a:$v} ?// $v | $v)",
+                Ok(&[r#"{"c":"s"}"#]),
+            ),
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"[path((try . catch 1) as {a:$v} ?// $v | ($v | .[]?))]",
+                Ok(&["[]"]),
+            ),
+            // Controls: the bare-`.` head was already fine.
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"[path(. as {a:$v} ?// $v | ($v | .[]?))]",
+                Ok(&["[]"]),
+            ),
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"del(. as {a:$v} ?// $v | $v)",
+                Ok(&[r#"{"c":"s"}"#]),
+            ),
+            // The `if` twin (not in the issue): both arms recognize, so the
+            // condition's own runtime answer doesn't matter.
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"path((if true then . else . end) as {a:$v} | $v)",
+                Ok(&[r#"["a"]"#]),
+            ),
+            (
+                r#"{"a":"s","c":"s"}"#,
+                r"del((if true then . else . end) as {a:$v} ?// $v | $v)",
+                Ok(&[r#"{"c":"s"}"#]),
+            ),
+            // #3119 review: `A // B`'s extra runtime gate (the register
+            // must also be truthy, not just `trackable`) is stricter than
+            // the issue's own suggested `bound == value` -- off-register
+            // (#3120's carried register, not this stage's own `value`), a
+            // truthy, non-null/bool coincidence is refused here even
+            // though it happens to be jq's own real node in this
+            // construction (jq answers `["a"]`; a value-only check can't
+            // tell a carried register's real node from a same-valued
+            // unrelated one, the exact #3129 class of bug, so this stays
+            // refuse-only rather than risk it).
+            (
+                r#"{"a":1}"#,
+                r"path(. as $x | 5 | ($x // 1) as {a:$q} ?// $z | $q)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "a" of {"a":1}"#
+                        .to_string(),
+                ),
+            ),
+            // #3119 second review round: two independently-found soundness
+            // gaps in the first fix, both now closed by
+            // `resolves_to_register`'s recursive TrackedVar re-check.
+            //
+            // 1. A recognized branch can itself contain a nested
+            //    `Alternative` -- `is_identity_passthrough` accepts it as a
+            //    candidate (its own "deliberate, safe under-approximation"
+            //    is safe only because a LATER value-equality check defers
+            //    the real verdict elsewhere, #844/#2978); this call site
+            //    has no later check, so trusting `trackable` alone for a
+            //    recognized `If`/`Try` wrongly certified whichever branch's
+            //    value actually ran, even when that value was `B`'s (not
+            //    `.` at all).
+            (
+                "null",
+                r"path((if true then (. // {a:1}) else . end) as {a:$v} | $v)",
+                Err(r#"Invalid path expression near attempt to access element "a" of {"a":1}"#
+                    .to_string()),
+            ),
+            // 2-4. A recognized branch can bottom out in a `TrackedVar`
+            //    frozen at a DIFFERENT position than the current register
+            //    -- the bare-`TrackedVar` arm re-checks `marker.value ==
+            //    *reg` itself, but the old `If`/`Try`/`Alternative` arms
+            //    granted `identical` from `trackable` alone without ever
+            //    reaching that check for a marker nested inside them.
+            (
+                r#"{"a":{"x":1,"y":2}}"#,
+                r"del(. as $x | .a | (if true then $x else $x end) as {x:$q} | $q)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "x" of {"a":{"x":1,"y":2}}"#
+                        .to_string(),
+                ),
+            ),
+            (
+                r#"{"a":{"other":1},"b":"X"}"#,
+                r"path(. as $x | .a | (try $x catch 1) as {b:$v} | $v)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "b" of {"a":{"other":1},"b":"X"}"#
+                        .to_string(),
+                ),
+            ),
+            (
+                r#"{"a":{"other":1},"b":"X"}"#,
+                r"path(. as $x | .a | ($x // 1) as {b:$v} | $v)",
+                Err(
+                    r#"Invalid path expression near attempt to access element "b" of {"a":{"other":1},"b":"X"}"#
+                        .to_string(),
+                ),
+            ),
+        ];
+
+        for (doc, filter, want) in &rows {
+            let json = doc.as_bytes();
+            let index = JsonIndex::build(json);
+            let expr = parse(filter).unwrap_or_else(|e| panic!("{filter}: {e:?}"));
+            let got = eval::<Vec<u64>, JqSemantics>(&expr, index.root(json));
+            match want {
+                Ok(want) => {
+                    let got: Vec<String> = got
+                        .collect_owned::<JqSemantics>()
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect();
+                    assert_eq!(got, *want, "{doc} | {filter}");
+                }
+                Err(want) => match got {
+                    QueryResult::Error(e) => assert_eq!(e.message, *want, "{doc} | {filter}"),
+                    other => panic!("{doc} | {filter}: expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the assertion above, only formatted if the match doesn't hit the Error arm (#3119)"
                 },
             }
         }
