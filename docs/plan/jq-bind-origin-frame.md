@@ -229,8 +229,9 @@ Three findings, in order of what they cost:
   fabrication where the bind and the rebuild both run inside `eval.rs` (the input-queue
   bridge, a fold's UPDATE, a `|=` right-hand side, `with_entries`, a `catch` handler) — no
   funnel ran there. Closed at every owned→document re-entry in `eval.rs` (`eval_each_owned`
-  and its siblings demote every `Snapshot` marker; the generic funnels take the
-  non-demoting `eval_each_owned_bridged`), plus `OwnedIdentity::exact`/`root`/`root_witness`
+  and its siblings demote every `Snapshot` marker; the generic funnels pass their cursor's
+  witness as `Reentry::Against` since #3122, and only a caller that already ran that
+  demotion passes `Reentry::Proven`), plus `OwnedIdentity::exact`/`root`/`root_witness`
   for the owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
   paragraph for the refuse-only flips.
 - **Value-mode bindings — the root case closed by
@@ -245,6 +246,23 @@ Three findings, in order of what they cost:
   a non-root register position, which needs a document-absolute bind path reachable from a
   value-mode cursor (the `Origin::At` machinery) plus `needs_path_context` routing to decide
   when to pay for it — scoped separately.
+- **Closed by [#3122](https://github.com/rust-works/succinctly/issues/3122).** The
+  re-entry contract is one type. Every owned re-entry in `eval.rs` (`eval_each_owned`,
+  `eval_owned_input`, `eval_owned_expr_fork`, `eval_owned_multi_first`,
+  `update_root_with_filter`, `each_recurse_walk`) and `eval_generic.rs`'s `eval_on_owned` takes
+  a `Reentry`: `Against(RootWitness)` to reroot the markers against a named root at the
+  re-entry (#2642's demotion and #3037's promotion, one walk), `Proven` when a funnel, an
+  enclosing re-entry or a once-per-fold/loop hoist already did. It replaced
+  the three booleans that used to encode the same fact (`trackable` at the resolver sinks,
+  `ambient` in `|=`'s root leaf and `until`/`while`, `resolver_free` in the folds) and the
+  thirteen "plain vs `_bridged`" twins, and `reroot_for_reentry`/`demote_for_reentry` --
+  #3036's fused single-walk precheck (a rewritable marker *and* a resolver-reaching node, else
+  borrowed) over `reroot_markers`' rewrite -- is the one derivation on both sides of the bridge.
+  `trackable` remains a resolver-internal register-provenance flag (it also drives path-shape
+  decisions); `Reentry::at_register` is its one conversion. The resolver holds no cursor and no
+  `RootWitness` (`Frame` is an invocation id and a path), so `Proven` is the honest encoding of
+  "the funnel that built this document already demoted for it, and the register is a navigated
+  node of it" -- not a witness the resolver could mint itself.
 - [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
   navigating inside their own jq-level definitions against a *constructed* value inside
   `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and

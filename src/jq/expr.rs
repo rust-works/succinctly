@@ -127,10 +127,14 @@ pub struct Tracked {
 ///   residual (#2889), not a new correctness gap. #3036 closed the same
 ///   hole where the bind *and* the rebuild both run inside `eval.rs` (the
 ///   input-queue bridge, a fold's UPDATE, a `|=` right-hand side): every
-///   owned-value re-entry there (`eval_each_owned` and its siblings) demotes
-///   every `Snapshot` marker, since a freshly re-indexed document cannot be
-///   a node any earlier binding was frozen from, and the funnels above take
-///   `eval_each_owned_bridged` so their own proof is kept.
+///   owned-value re-entry there (`eval_each_owned` and its siblings) takes a
+///   `Reentry` (#3122) saying what its value's root is: `Against(Owned)` for
+///   a freshly re-indexed value no earlier binding could have been frozen
+///   from, the funnel's own `RootWitness` at a funnel, `Proven` where an
+///   enclosing funnel or re-entry already demoted for this document -- one
+///   parameter and one derivation (`demote_for_reentry`) in place of the
+///   demoting/non-demoting twins, so a new re-entry has to name its root
+///   rather than pick a twin.
 /// - [`Origin::SnapshotAt`] -- a [`Origin::Snapshot`] that also knows
 ///   *where* `.` was when it was frozen (#2978). Made only inside a
 ///   resolver invocation, while the branch is trackable and the frame's
