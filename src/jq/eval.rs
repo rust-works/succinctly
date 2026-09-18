@@ -33456,6 +33456,28 @@ fn getpath_preserves_register<S: EvalSemantics>(
             .is_some_and(|(invocation, path)| !stage_frame.names(invocation, path))
 }
 
+/// Whether `expr` can produce more than one output -- a syntactic
+/// over-approximation, used by [`FoldRegister::resolve`] to decline
+/// carrying the register into a body whose branches would then see it
+/// unevenly (#3145 review). `Comma` and the iterating/recursing shapes
+/// count; so does anything this predicate cannot see inside, since the
+/// answer must be "maybe" for those.
+fn fans_out(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::Comma(_)
+                | Expr::Iterate
+                | Expr::RecursiveDescent
+                | Expr::AsPattern { .. }
+                | Expr::Reduce { .. }
+                | Expr::Foreach { .. }
+                | Expr::FuncCall { .. }
+                | Expr::NamespacedCall { .. }
+        )
+    })
+}
+
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
@@ -33793,24 +33815,36 @@ impl FoldRegister {
         // take the register from, so `try ($v | .b)` could not re-establish
         // `$v` and `try` swallowed its refusal -- `del(foreach .a as $v (.;
         // try ($v | .b); .))` echoed the document where jq writes
-        // `{"a":{}}`. Only while the register is **live** (`self.trackable`)
+        // `{"a":{}}`. Only for a body that cannot fan out (`fans_out`),
+        // only while the register is **live** (`self.trackable`)
         // and only in jq mode, exactly as the pipe-stage site gates it: an
         // untracked `FoldRegister`'s `value` is not a register at all
         // (`enter`'s own untracked arm seeds it from the ambient), and
         // handing that to a nested pipe let markers re-establish where jq
         // refuses -- three fabricated writes in 18,000 fuzzed programs,
         // none of which the sweep or the unit rows reached.
+        //
+        // The `fans_out` half is the review's finding, and the same shape
+        // one level up: a nested pipe sees the register while a *sibling*
+        // branch of the same multi-output body does not (it goes through
+        // `resolve_node`, whose non-pipe arms this frame does not reach),
+        // so an UPDATE that used to refuse wholesale could half-succeed --
+        // `(foreach .a as {a:$v} ?// {c:$v} (0; ($v[0]?, $v))) = 9` wrote
+        // `.a.c`, a key jq never names, because only the second output
+        // refused and drove a `?//` retry jq does not perform. A body with
+        // one output path cannot split that way. Widening the other
+        // direction (re-establishing in `resolve_node`'s own arms) is
+        // #2046's documented scope limit, not this fix's.
         let update_frame = if self.trackable {
             self.frame.clone()
         } else {
             self.frame.unknown()
-        }
-        .with_register(if S::TAG == EvalTag::Jq && self.trackable && !tr {
-            Some(&self.value)
-        } else {
-            None
-        });
+        };
         let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
+            // The register goes in as the explicit argument here, which
+            // `resolve_seq_sink` prefers over the frame's and every later
+            // stage overwrites from `carried_register` -- so the frame does
+            // not carry it too (that copy would never be read).
             resolve_seq::<S>(
                 exprs,
                 &input,
@@ -33821,6 +33855,13 @@ impl FoldRegister {
                 self.trackable.then_some(&self.value),
             )
         } else {
+            let update_frame = update_frame.with_register(
+                if S::TAG == EvalTag::Jq && self.trackable && !tr && !fans_out(expr) {
+                    Some(&self.value)
+                } else {
+                    None
+                },
+            );
             resolve_node::<S>(expr, &input, tr, snapshot, &update_frame, keep)
         };
         let owned = match resolved {
@@ -100016,11 +100057,6 @@ mod tests {
                 r"path(foreach .a as $v (.; if true then ($v | .b) else . end; .))",
                 r#"["a","b"]"#,
             ),
-            (
-                &br#"{"a":{"b":1}}"#[..],
-                r"path(foreach .a as $v (.; ($v | .b), 1; .))",
-                r#"["a","b"]"#,
-            ),
             // EXTRACT, not just UPDATE.
             (
                 &br#"{"a":{"b":1}}"#[..],
@@ -100042,6 +100078,17 @@ mod tests {
         ] {
             assert_eq!(outputs(doc, filter), [want], "{filter}");
         }
+        // A *fan-out* body declines the register entirely (review): a
+        // nested pipe would see it while a sibling branch of the same body
+        // does not, and that half-success fabricated a write. jq emits
+        // `["a","b"]` here and then raises; succinctly refuses outright,
+        // with no prefix -- the safe side (`fold-body-fanout-declines` in
+        // the sweep).
+        query!(br#"{"a":{"b":1}}"#, r"path(foreach .a as $v (.; ($v | .b), 1; .))",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert!(is_resolver_refusal(&e), "{}", e.message);
+            }
+        );
         // Unchanged: a fold whose INIT is untracked *after a literal stage*
         // re-seeds its register from the ambient, so the marker is not
         // recognised at all -- pre-existing (`literal-then-fold-untracked-
