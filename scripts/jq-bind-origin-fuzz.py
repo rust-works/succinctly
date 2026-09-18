@@ -109,6 +109,15 @@ SOURCES = [
     # that consume the position.
     ("(. // 1)", False), ("(try . catch 1)", False), ("(if true then . else . end)", False),
     ("(if .a then . else . end)", False), ("(. // $p)", True), ("(if true then . else $p end)", True),
+    # #2978 review: a `try` whose body can raise binds the *handler's* value
+    # (or, catch-less, nothing -- which a following `//` turns into its
+    # right operand), not `.`; the handler's value is drawn as a copy of the
+    # document's own leaves so a position-blind or value-blind rule would
+    # certify it against a real node.
+    ("(try (if error(\"e\") then . else . end) catch {\"b\":1})", False),
+    ("(try (if error(\"e\") then . else . end) catch $p)", True),
+    ("((try (if error(\"e\") then . else . end)) // {\"b\":1})", False),
+    ("(try (if .a then . else . end) catch 1)", False),
 ]
 NAV = [".a", ".c", ".x", ".x.a", ".b?", ".arr[0]?", ".arr[]?"]
 LITERAL = ["5", "null", "true", "\"z\""]
