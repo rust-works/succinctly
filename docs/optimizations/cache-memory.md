@@ -388,6 +388,16 @@ struct Counters {
 
 **Key insight from DSV optimization**: The "heavyweight" BitVec with 3-level RankDirectory was 5-9x slower than a simple cumulative array despite being theoretically optimal. Cache behavior matters more than asymptotic complexity for practical sizes.
 
+**Key insight from the JSON identity writer (#2720)**: `succinctly jq .` materialized every
+field of an object -- a 144-byte `DocumentField` per field, each value decoded up front -- before
+writing the first one, so a 2 MB object with 158,981 fields built a 22.9 MB `Vec` (grown by
+doubling, ~45 MB of realloc copies) to print 2 MB. Instruction counts undersold the cost: the
+list was half of the print's `Ir`, but streaming the fields off one key-only validation walk
+instead cut `Ir` by only 3-7% while cutting wall-clock by **29%** on a 7950X (`wide`) and 15%
+(`users`), and 5% on an M4 Pro (`users`) -- the rest was allocation and cache traffic that
+`cachegrind` does not charge. Materialize only what has to be in hand before the first byte is
+written (`-S` needs every key; a repeated key changes an earlier field's value); stream the rest.
+
 ---
 
 ## Key Lessons
