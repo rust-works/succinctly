@@ -33785,11 +33785,31 @@ impl FoldRegister {
         // accumulator itself currently sits there (the seed below carries
         // the register for exactly that case). A lost register has no
         // position to offer.
+        //
+        // #3145: the frame carries the register's *value* too, for the same
+        // reason `resolve_seq_stage` puts it on a pipe stage's frame
+        // (#3133): a pipe nested in UPDATE/EXTRACT under `try`/`if`/`,` is
+        // reached through `resolve_node_sink`, which has no `PathBranch` to
+        // take the register from, so `try ($v | .b)` could not re-establish
+        // `$v` and `try` swallowed its refusal -- `del(foreach .a as $v (.;
+        // try ($v | .b); .))` echoed the document where jq writes
+        // `{"a":{}}`. Only while the register is **live** (`self.trackable`)
+        // and only in jq mode, exactly as the pipe-stage site gates it: an
+        // untracked `FoldRegister`'s `value` is not a register at all
+        // (`enter`'s own untracked arm seeds it from the ambient), and
+        // handing that to a nested pipe let markers re-establish where jq
+        // refuses -- three fabricated writes in 18,000 fuzzed programs,
+        // none of which the sweep or the unit rows reached.
         let update_frame = if self.trackable {
             self.frame.clone()
         } else {
             self.frame.unknown()
-        };
+        }
+        .with_register(if S::TAG == EvalTag::Jq && self.trackable && !tr {
+            Some(&self.value)
+        } else {
+            None
+        });
         let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
             resolve_seq::<S>(
                 exprs,
@@ -99968,6 +99988,72 @@ mod tests {
         ] {
             assert_eq!(outputs(doc, filter), [want], "{filter}");
         }
+    }
+
+    /// #3145: a pipe nested under `try`/`if`/`,` inside a fold's
+    /// UPDATE/EXTRACT reaches `resolve_node_sink` with no `PathBranch` to
+    /// take the register from, so `try ($v | .b)` could not re-establish
+    /// `$v`, raised the resolver's own refusal, and `try` swallowed it --
+    /// `del(foreach .a as $v (.; try ($v | .b); .))` echoed the document
+    /// where jq writes `{"a":{}}` (#3133 fixed the pipe-stage half; the
+    /// fold's own `FoldRegister::resolve` frame carried no register).
+    /// Every row confirmed live against jq 1.7.1.
+    #[test]
+    fn test_fold_body_nested_pipe_keeps_the_register_3145() {
+        for (doc, filter, want) in [
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(foreach .a as $v (.; try ($v | .b); .))",
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"del(foreach .a as $v (.; try ($v | .b); .))",
+                r#"{"a":{}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(foreach .a as $v (.; if true then ($v | .b) else . end; .))",
+                r#"["a","b"]"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(foreach .a as $v (.; ($v | .b), 1; .))",
+                r#"["a","b"]"#,
+            ),
+            // EXTRACT, not just UPDATE.
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"path(.a as $y | .a | foreach range(1) as $i (0; .; try ($y | .b)))",
+                r#"["a","b"]"#,
+            ),
+            // The sibling-copy control: `$v` is the register here, `$y` is
+            // not, and jq writes nothing through the latter either.
+            (
+                &br#"{"a":{"b":1},"c":{"b":1}}"#[..],
+                r"del(foreach .c as $v (.; try ($v | .b); .))",
+                r#"{"a":{"b":1},"c":{}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1},"c":{"b":1}}"#[..],
+                r"del(.a as $y | foreach .c as $v (.; try ($y | .b); .))",
+                r#"{"a":{"b":1},"c":{"b":1}}"#,
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), [want], "{filter}");
+        }
+        // Unchanged: a fold whose INIT is untracked *after a literal stage*
+        // re-seeds its register from the ambient, so the marker is not
+        // recognised at all -- pre-existing (`literal-then-fold-untracked-
+        // init`, `carried-register-passthrough`), and with a generator
+        // source the `try` then swallows that refusal into a no-op write.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1}}"#,
+                r"del(.a as $y | .a | 5 | foreach range(1) as $i (0; .; try ($y | .b)))"
+            ),
+            [r#"{"a":{"b":1}}"#]
+        );
     }
 
     /// #2676: a fold's own destructuring pattern is tracked exactly the way

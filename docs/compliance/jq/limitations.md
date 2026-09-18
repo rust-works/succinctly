@@ -1262,12 +1262,16 @@ is the revert that established what the other one costs.
    now reaching nested pipes `... \| $x \| .b \| .c` would have navigated through it too.
    Such a bind is `Origin::Untracked` now (`identity_bind_position`); a marker source keeps
    its own origin, and a `null`/`bool` `.` loses nothing since `jv_identical` admits those by
-   value. The same register does **not** yet reach a fold's UPDATE/EXTRACT body: that route
-   (`FoldRegister::resolve`) passes its register to `resolve_seq` explicitly under a frame that
-   carries none, so `del(foreach .a as $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` still
-   echoes the document where jq writes `{"a":{}}`, as does `del(.a as $y \| .a \| 5 \| foreach
-   range(1) as $i (0; .; try ($y \| .b)))` — pre-existing, filed as
-   [#3145](https://github.com/rust-works/succinctly/issues/3145). Two refuse-only residuals,
+   value. [#3145](https://github.com/rust-works/succinctly/issues/3145) extends the same
+   carrying to a fold's UPDATE/EXTRACT body, whose own route (`FoldRegister::resolve`) passed
+   its register to `resolve_seq` explicitly under a frame that carried none: `del(foreach .a as
+   $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` echoed the document and now writes
+   `{"a":{}}`, as jq does. It does not reach a fold whose INIT is untracked *after a literal
+   stage* — that fold re-seeds its register from the ambient value, so the marker is not
+   recognised at all (the pre-existing `literal-then-fold-untracked-init` /
+   `carried-register-passthrough` class), and with a generator source the enclosing `try` then
+   swallows that refusal into a no-op write: `del(.a as $y \| .a \| 5 \| foreach range(1) as $i
+   (0; .; try ($y \| .b)))` is `{"a":{}}` in jq and echoes here. Two refuse-only residuals,
    both in the sweep: `path(.a \| try error(.) catch .)` —
    `error(.)` raises the register node itself and jq answers `["a"]`, but a payload equal to
    the register by value cannot be told from a rebuilt copy (`error({"a":1,"b":2})` refuses in
