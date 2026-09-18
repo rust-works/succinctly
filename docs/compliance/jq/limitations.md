@@ -1233,15 +1233,30 @@ is the revert that established what the other one costs.
      echoes the document in jq (the step is refused there too, and the retried `$v` body is
      `empty`) and exits 5 here. `main` echoed it by the ambient-`null` coincidence the fix
      removes.
-   - **Not refuse-only, and pre-existing:** the same no-register refusal raised *inside*
-     `try` is caught by it, exactly as jq's `try` catches its own path errors — but jq had no
-     error to catch, because `$x` *is* its register: `del(.a as $x \| .a \| 5 \| try ($x as
-     {b:$q} \| $q))` on `{"a":{"b":1}}` is `{"a":{}}` in jq and a silent no-op (exit 0,
-     document echoed) here, as on `main`. The nested pipe under `try` is where the register is
-     lost, not the pattern arm; closing it means threading the carried register through
-     `resolve_node_sink`'s `Try`/`If`/`Comma` arms into their nested pipes, which is the
-     "nested pipe carries no register" limitation this section already records for `$q[0]`
-     under `if`. Filed as [#3133](https://github.com/rust-works/succinctly/issues/3133).
+   - **Not refuse-only:** a pipe nested under `try`/`?` in the *body* carries no register,
+     so a `$w` marker there cannot re-establish, its navigation raises the resolver's own
+     refusal, and `try` catches it exactly as jq's `try` catches its own path errors — but jq
+     had no error to catch, because `$w` *is* its register. On a trackable stage this is
+     pre-existing (`del(. as {a:$w} \| try ($w \| .b))` on `{"a":{"b":1}}` is `{"a":{}}` in
+     jq and a silent no-op — exit 0, document echoed — on `main`). On an untracked stage the
+     same body used to refuse loudly only because the *walk* refused; now that the walk
+     answers, the body's discard is reached there too: `del(. as $x \| 5 \| $x as {a:$w} \|
+     try ($w \| .b))`, `del(... \| ($w \| .b)?)` and, via the bare alternative, `del(. as $x
+     \| 5 \| $x as [$w] ?// $z \| ($z \| .a)?)` (jq `{}`) all echo the document. The same
+     loss in the *source* position: `del(.a as $x \| .a \| 5 \| try ($x as {b:$q} \| $q))`
+     is `{"a":{}}` in jq and echoes here, as on `main`. The nested pipe is where the register
+     is lost, not the pattern arm; closing it means threading the carried register through
+     `resolve_node_sink`'s `Try`/`If`/`Comma` arms into their nested pipes — the "nested pipe
+     carries no register" limitation this section already records for `$q[0]` under `if`.
+     Filed as [#3133](https://github.com/rust-works/succinctly/issues/3133); the rows are
+     pinned as a characterization in
+     `test_nested_try_body_discards_the_write_characterization_3133` (`src/jq/eval.rs`) so
+     that fix flips them visibly.
+   - a later-step refusal after a marker-certified first step does not retry `?//` (review):
+     `refusal_is_exact` is decided per source (`bound != register`), and a marker that *is*
+     the register is value-equal to it, so `path(.a as $x \| .a \| 5 \| $x as {b:[$q,$r]} ?//
+     $w \| $w)` on `{"a":{"b":[1]}}` refuses at element `0` of `[1]` where jq retries onto
+     `$w` and answers `["a"]`; the same shape on a trackable stage retries and agrees.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an

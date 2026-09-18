@@ -98896,6 +98896,44 @@ mod tests {
         }
     }
 
+    /// #3133 characterization (found in #3120's review): a pipe nested under
+    /// `try`/`?` in a pattern body carries no register, so a `$w` marker
+    /// there cannot re-establish, its navigation raises the resolver's own
+    /// refusal, and `try` catches it -- where jq, whose register `$w` *is*,
+    /// writes. jq answers `{"a":{}}` (row 1-3) and `{}` (row 4); succinctly
+    /// echoes the document at exit 0. Row 1 does so on `main` too; rows 2-4
+    /// used to refuse loudly only because the untracked-stage *walk*
+    /// refused, and reach the same discard now that the walk answers. This
+    /// pins the current wrong outputs on purpose so the #3133 fix flips a
+    /// test rather than a silent row -- see `limitations.md`.
+    #[test]
+    fn test_nested_try_body_discards_the_write_characterization_3133() {
+        for (doc, filter, echoed) in [
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"del(. as {a:$w} | try ($w | .b))",
+                r#"{"a":{"b":1}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"del(. as $x | 5 | $x as {a:$w} | try ($w | .b))",
+                r#"{"a":{"b":1}}"#,
+            ),
+            (
+                &br#"{"a":{"b":1}}"#[..],
+                r"del(. as $x | 5 | $x as {a:$w} | ($w | .b)?)",
+                r#"{"a":{"b":1}}"#,
+            ),
+            (
+                &br#"{"a":1}"#[..],
+                r"del(. as $x | 5 | $x as [$w] ?// $z | ($z | .a)?)",
+                r#"{"a":1}"#,
+            ),
+        ] {
+            assert_eq!(outputs(doc, filter), [echoed], "{filter} (see #3133)");
+        }
+    }
+
     /// #2676: a fold's own destructuring pattern is tracked exactly the way
     /// a plain `. as PATTERN` bind is (#2649's walk, `PathPatternMode`), whenever the
     /// fold's SOURCE resolves through the path register. Every row here is

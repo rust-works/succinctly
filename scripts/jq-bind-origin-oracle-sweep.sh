@@ -418,6 +418,8 @@ untracked-nested-if-null-register	{"a":null}	path(.a | 5 | if true then (null as
 untracked-bare-alt-keeps-register	{"a":1}	path(. as $x | 5 | $x as [$v] ?// $z | $z)
 untracked-bare-alt-keeps-register-del	{"a":1}	del(. as $x | 5 | $x as [$v] ?// $z | $z.a)
 untracked-opaque-stage-lost-register	{"a":{"b":null}}	del(reduce 1 as $i (null; null) | . as [$v] ?// $v | empty)
+untracked-later-step-refusal-no-retry	{"a":{"b":[1]}}	path(.a as $x | .a | 5 | $x as {b:[$q,$r]} ?// $w | $w)
+untracked-later-step-refusal-trackable-twin	{"a":{"b":[1]}}	path(.a as $x | .a | $x as {b:[$q,$r]} ?// $w | $w)
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
@@ -467,6 +469,7 @@ identity-try-if-nonraising:#2978 review -- a try body holding an if is not a pas
 untracked-catch-handler-null-document:#3120 -- a catch handler runs under an untracked frame with no register in hand, since the try body's navigation may have moved it before raising, so the walk refuses; jq answers only because this document is null. The same rule fabricated a del on any other document, see untracked-catch-handler-del, so this coincidence is not kept
 untracked-nested-if-null-register:#3120 -- a nested pipe inside if/try carries no register, so with a null register behind a non-matching literal the walk cannot know jq's verdict, which is to accept here; refused before #3120 too
 untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
+untracked-later-step-refusal-no-retry:#3120 review -- refusal_is_exact is decided per source, and a marker that is the register is value-equal to it, so a later-step refusal after a certified first step is treated as a guess and does not retry; jq retries onto $w. The trackable twin retries and agrees
 REFUSE_EOF
 
 if [[ "${1:-}" == "--list-cases" ]]; then
