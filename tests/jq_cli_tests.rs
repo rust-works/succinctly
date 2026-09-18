@@ -49573,10 +49573,15 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             "[true,false][true,false]".to_string(),
             0,
         ),
-        // Must-not-change guard at the cap boundary: 256 characters is
-        // `REINDEX_LITERAL_LEN_CAP` itself and stays on the identity/cursor
-        // route (matching the cap-sized rows above); 257 is one past it and
-        // takes this route -- both agree with jq either way.
+        // End-to-end agreement at the cap boundary: 256 characters is
+        // `REINDEX_LITERAL_LEN_CAP` itself (stays on the identity/cursor
+        // route), 257 is one past it (takes the bridge route above) -- both
+        // now stream identically, so this CLI-level pair cannot by itself
+        // tell which route ran (both produce byte-identical output). The
+        // boundary itself is what `test_reindex_bridge_identity_predicate_agrees_1909`
+        // pins directly, against `reindex_bridge_is_identity`; these two
+        // rows are here for jq-agreement coverage on either side of it, not
+        // as that guard's substitute.
         (
             cap256.as_str(),
             "[limit(1; path((.a|stderr),(.b|stderr)))]".to_string(),

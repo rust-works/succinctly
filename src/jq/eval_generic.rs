@@ -9174,16 +9174,18 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 // `eval_each_owned`, not `eval_on_owned` -- `eval.rs`'s
                 // `eval_each` has its own lazy `Builtin::Path` arm (#2908),
                 // the same demand-forwarding entry point
-                // `bridge_to_each_owned_flow` above uses. `Reentry::Against(root)`,
-                // the same as that sibling call and unlike `demoted` above:
-                // `owned_builtin_expr` is the *whole* `Builtin::Path` wrapper,
-                // so `reentry.reroot`'s precheck sees the resolver-reaching
-                // node itself (the reason `demoted` reroots `path_expr`
-                // directly instead, per its own comment) and reroots exactly
-                // once, inside this call.
-                let owned_builtin_expr = Expr::Builtin(Builtin::Path(path_expr.clone()));
+                // [`bridge_to_each_owned_flow`] above uses (same contract:
+                // `Reentry::Against(root)` + a sink-wrapping closure).
+                // `expr` itself, not a rebuilt `owned_builtin_expr` -- it
+                // already *is* `Builtin::Path(path_expr)` (this arm's own
+                // match scrutinee), so passing it directly avoids cloning
+                // the subtree `reentry.reroot` is about to walk anyway.
+                // Passing the whole wrapper (not bare `path_expr`, as
+                // `demoted` above does) is what lets the precheck see the
+                // resolver-reaching node itself -- the reason `demoted`
+                // reroots `path_expr` directly instead, per its own comment.
                 return eval_each_owned::<S>(
-                    &owned_builtin_expr,
+                    expr,
                     &owned,
                     optional,
                     Reentry::Against(root),
