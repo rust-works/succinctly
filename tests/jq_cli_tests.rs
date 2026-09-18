@@ -6297,13 +6297,23 @@ fn test_namespaced_call_to_unimported_namespace_is_a_compile_error_1473() -> Res
 /// `report_unresolved_call`'s text-search fallback normally finds the
 /// failing call's real position by searching `source` for the exact
 /// `name/arity` string `rewrite_namespaced_calls` built (`{namespace}::{name}`,
-/// no spaces) -- but real jq's own grammar allows whitespace around `::`
-/// (confirmed live: `mymod :: func` parses and compiles the same as
-/// `mymod::func`). That whitespace survives into the AST's `namespace`/`name`
-/// parts untouched, so the rebuilt `mymod::func` search string no longer
-/// matches the source's own spacing byte-for-byte, and the search comes back
-/// empty. jq's own fallback then drops the line marker and source echo
-/// entirely, printing only the bare `at <location>` form.
+/// no spaces) -- but succinctly's own parser tolerates whitespace around `::`
+/// (`Parser::parse_func_call_or_error`/`parse_namespaced_call` both
+/// `skip_ws()` around the token), so that whitespace survives into the AST's
+/// `namespace`/`name` parts untouched and the rebuilt `mymod::func` search
+/// string no longer matches the source's own spacing byte-for-byte -- the
+/// search comes back empty, and the fallback drops the line marker and
+/// source echo entirely, printing only the bare `at <location>` form.
+///
+/// **This is not jq/yq-verified behavior.** Live-checked against both
+/// oracles while writing this test: real jq 1.7.1 and real yq v4.53.3 both
+/// reject `mymod :: func` outright as a syntax error (`unexpected ':'` /
+/// `lexer: invalid input text`), never reaching a "not defined" diagnostic
+/// at all. succinctly's whitespace tolerance here is a pre-existing,
+/// undocumented divergence, unrelated to #2964's own change -- tracked as
+/// [#3116](https://github.com/rust-works/succinctly/issues/3116). This test
+/// exists only to pin `report_unresolved_call`'s own fallback behavior given
+/// that leniency, not to claim it matches either reference tool.
 #[test]
 fn test_namespaced_call_with_whitespace_around_colons_loses_its_position() -> Result<()> {
     let (output, code) = spawn_jq(&["-n", "mymod :: func"], None)?;
