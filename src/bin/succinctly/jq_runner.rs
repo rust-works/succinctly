@@ -3688,11 +3688,13 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // when either unwinds, and the other three are plain data
                 // regardless.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut on_value =
-                        |sink: &mut ErrorSink, result: JqValue<'_, Vec<u64>>| -> Result<bool> {
-                            had_output = true;
-                            // For exit_status tracking, we need to check the last value
-                            if args.exit_status {
+                    let mut on_value = |sink: &mut ErrorSink,
+                                        result: OutputItem<'_>|
+                     -> Result<bool> {
+                        had_output = true;
+                        // For exit_status tracking, we need to check the last value
+                        if args.exit_status {
+                            match &result {
                                 // `-e` is the flag that forces materialization at
                                 // all, so it is where a decode failure first
                                 // becomes observable here (#1247). Report and skip
@@ -3707,31 +3709,57 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                                 // already produces below -- a CLI-output
                                 // boundary has no business panicking for input
                                 // depth alone.
-                                match result.try_materialize() {
+                                OutputItem::Lazy(v) => match v.try_materialize() {
                                     Ok(owned) => last_output = Some(owned),
                                     Err(e) => {
                                         sink.report(DiagStyle::Jq, &e, &at);
                                         return Ok(true);
                                     }
+                                },
+                                // An owned result records its *truthiness*, not
+                                // itself (#3009). Both readers of `last_output`
+                                // only ever ask `matches!(last, Null |
+                                // Bool(false))`, which is why the M2 path
+                                // already synthesizes a `Bool` here rather than
+                                // materializing (`record_exit_status`). Cloning
+                                // the value instead would be a refcount bump in
+                                // the shipped build but a deep copy under the
+                                // `unshared-containers` holdout, i.e. a cost
+                                // that shows up only in the configuration used
+                                // to measure this change. There is no `Err`
+                                // counterpart: an owned value cannot fail to
+                                // materialize, and its depth was settled by
+                                // `to_jq_values` before it got here.
+                                OutputItem::Owned(v) => {
+                                    last_output = Some(OwnedValue::Bool(!matches!(
+                                        v,
+                                        OwnedValue::Null | OwnedValue::Bool(false)
+                                    )));
                                 }
                             }
-                            // A malformed document is a data error, not an I/O
-                            // one: it belongs in jq's diagnostic channel (exit 5)
-                            // rather than aborting the process through `anyhow`
-                            // (#1194). Stop emitting results for *this* document,
-                            // but fall through to the halt check below and carry
-                            // on with the rest of the stream (#355) -- real jq
-                            // stops at the first parse error instead, a
-                            // divergence recorded in
-                            // `docs/compliance/jq/limitations.md`.
-                            let stop = route_write_error(
-                                sink,
-                                &mut out,
-                                || at.clone(),
-                                |o| write_output_jq_value(o, &result, &output_config),
-                            )?;
-                            Ok(!stop)
-                        };
+                        }
+                        // A malformed document is a data error, not an I/O
+                        // one: it belongs in jq's diagnostic channel (exit 5)
+                        // rather than aborting the process through `anyhow`
+                        // (#1194). Stop emitting results for *this* document,
+                        // but fall through to the halt check below and carry
+                        // on with the rest of the stream (#355) -- real jq
+                        // stops at the first parse error instead, a
+                        // divergence recorded in
+                        // `docs/compliance/jq/limitations.md`.
+                        let stop = route_write_error(
+                            sink,
+                            &mut out,
+                            || at.clone(),
+                            |o| match &result {
+                                OutputItem::Lazy(v) => write_output_jq_value(o, v, &output_config),
+                                OutputItem::Owned(v) => {
+                                    write_output_owned_value(o, v, &output_config)
+                                }
+                            },
+                        )?;
+                        Ok(!stop)
+                    };
                     evaluate_bytes_streaming(
                         json_bytes,
                         &expr,
@@ -6238,9 +6266,39 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .then(|| text.to_string())
 }
 
+/// One printable result, in whichever representation the evaluator already
+/// had it in (#3009).
+///
+/// `GenericResult` arrives in two shapes: some arms carry cursors into the
+/// source document, which `JqValue` exists to print lazily, and others
+/// (`Owned`, `ManyOwned`, `Partial`, the sorted-`keys` arm) carry a finished
+/// `OwnedValue`. Those used to be converted into `JqValue` via
+/// `JqValue::try_from_owned` before printing -- a full rebuild of a tree that
+/// was already owned, freeing each source map and allocating the destination
+/// one, which since #3000's layout change lands in a different allocator bin
+/// and shows up as peak RSS. This enum lets each shape reach its own writer
+/// instead.
+///
+/// Deliberately *not* a new `JqValue::Owned` variant, which would have been
+/// the smaller diff: `JqValue` is `pub`, matched across nine files, and
+/// `src/jq/lazy.rs` alone answers ~19 questions about it through `_ =>`
+/// wildcards (`is_truthy`, `as_str`, `as_i64`, `length`, ...). Every one of
+/// those would compile clean and answer *wrongly* for an owned arm --
+/// `is_truthy`'s `_ => true` is a wrong `-e` exit code, `as_str`'s
+/// `_ => None` silently drops `-r`. A print-path optimisation must not be
+/// able to move `-r`/`-e` semantics at all. Here the compiler checks every
+/// destructure, and there are only two of them plus the sink closure.
+#[derive(Debug)]
+enum OutputItem<'a, W = Vec<u64>> {
+    /// A result that is (or contains) a cursor into the source document.
+    Lazy(JqValue<'a, W>),
+    /// A result the evaluator already materialised.
+    Owned(OwnedValue),
+}
+
 /// One M2 output, handed to the caller's writer. Named so the `&mut dyn`
 /// spelling below stays inside clippy's `type_complexity` budget.
-type JqValueSink<'a, 'w> = dyn FnMut(&mut ErrorSink, JqValue<'a, Vec<u64>>) -> Result<bool> + 'w;
+type JqValueSink<'a, 'w> = dyn FnMut(&mut ErrorSink, OutputItem<'a>) -> Result<bool> + 'w;
 
 /// Writes the newline jq puts after every top-level output value. Generic
 /// over `W: core::fmt::Write` so the same function works as
@@ -6514,23 +6572,35 @@ fn evaluate_bytes_streaming<'a>(
 ///
 /// This is similar to query_result_to_jq_values but works with the
 /// cursor-aware GenericResult type from eval_generic.
-/// Convert one materialized value for output, reporting an over-deep one as
-/// an ordinary error rather than letting it panic (#1371).
+/// Admit one already-materialized value for output, reporting an over-deep
+/// one as an ordinary error rather than letting it panic (#1371).
 ///
-/// `JqValue::from_owned` asserts past `MAX_VALUE_TREE_DEPTH` (384), which is
-/// a reasonable contract for a library caller that owns its input and a very
-/// unreasonable one here: with `def` now recursing by evaluation rather than
-/// by pre-substituted body, an ordinary recursive filter can build a value
-/// deeper than that ceiling, and a filter a user typed must not be able to
-/// abort the process (#1098). Returns no values on failure, having reported
-/// the error, exactly as every other erroring arm around it does.
+/// A depth *check*, not a conversion (#3009). It used to be
+/// `JqValue::try_from_owned`, and the rejection was a by-product of the
+/// rebuild; now the value is handed to the writer as it stands and only the
+/// depth question remains. The check has to stay at this position rather
+/// than move into the writer, because the behaviour it holds up is about
+/// output that has *not* been written yet:
+/// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+/// requires an over-deep value to print nothing at all, and a writer-side
+/// check only fires after 384 levels of `[` are already on stdout -- the
+/// #1819 shape `print_json`'s own doc comment warns about.
+///
+/// Why an over-deep value gets here in the first place: `JqValue::from_owned`
+/// asserts past `MAX_VALUE_TREE_DEPTH` (384), which is a reasonable contract
+/// for a library caller that owns its input and a very unreasonable one here
+/// -- with `def` recursing by evaluation rather than by pre-substituted body,
+/// an ordinary recursive filter can build a value deeper than that ceiling,
+/// and a filter a user typed must not be able to abort the process (#1098).
+/// Returns no values on failure, having reported the error, exactly as every
+/// other erroring arm around it does.
 fn to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     value: OwnedValue,
     at: &InputLocation,
     sink: &mut ErrorSink,
-) -> Vec<JqValue<'a, W>> {
-    match JqValue::try_from_owned(value) {
-        Ok(v) => vec![v],
+) -> Vec<OutputItem<'a, W>> {
+    match value.check_tree_depth() {
+        Ok(()) => vec![OutputItem::Owned(value)],
         Err(e) => {
             sink.report(DiagStyle::Jq, &e, at);
             Vec::new()
@@ -6543,17 +6613,17 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     cursor: JsonCursor<'a, W>,
     at: &InputLocation,
     sink: &mut ErrorSink,
-) -> Vec<JqValue<'a, W>> {
+) -> Vec<OutputItem<'a, W>> {
     match result {
         GenericResult::One(v) => match standard_json_to_jq_value(v, &cursor) {
-            Ok(jq_value) => vec![jq_value],
+            Ok(jq_value) => vec![OutputItem::Lazy(jq_value)],
             Err(e) => {
                 sink.report(DiagStyle::Jq, &e, at);
                 vec![]
             }
         },
         // OneCursor: directly use the cursor - most memory efficient for unchanged values
-        GenericResult::OneCursor(c) => vec![JqValue::Cursor(c)],
+        GenericResult::OneCursor(c) => vec![OutputItem::Lazy(JqValue::Cursor(c))],
         // Stops at the first element that fails to decode, keeping the
         // already-converted prefix -- matching how an ordinary `error`/
         // `break` mid-generator stops the rest of a stream elsewhere in this
@@ -6563,7 +6633,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             let mut out = Vec::new();
             for v in vs {
                 match standard_json_to_jq_value(v, &cursor) {
-                    Ok(jq_value) => out.push(jq_value),
+                    Ok(jq_value) => out.push(OutputItem::Lazy(jq_value)),
                     Err(e) => {
                         sink.report(DiagStyle::Jq, &e, at);
                         break;
@@ -6573,7 +6643,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             out
         }
         // ManyCursor: same lazy-cursor efficiency as OneCursor, per element.
-        GenericResult::ManyCursor(cs) => cs.into_iter().map(JqValue::Cursor).collect(),
+        GenericResult::ManyCursor(cs) => cs
+            .into_iter()
+            .map(|c| OutputItem::Lazy(JqValue::Cursor(c)))
+            .collect(),
         // Stays lazy all the way to output: a bare `keys_unsorted` never
         // materializes a `Vec<String>` — `write_json`/`print_json` stream
         // each key's raw bytes straight from `fields`. `JqValue::LazyKeysArray`
@@ -6594,7 +6667,10 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             fields,
             sorted: false,
             collapse,
-        } => vec![JqValue::LazyKeysArray { fields, collapse }],
+        } => vec![OutputItem::Lazy(JqValue::LazyKeysArray {
+            fields,
+            collapse,
+        })],
         GenericResult::LazyKeys {
             fields,
             sorted: true,
@@ -6616,7 +6692,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // Same laziness as `LazyKeys` above, for array `keys`/
         // `keys_unsorted` (#684): `write_json`/`print_json` write the
         // `[0,1,...,len-1]` digits directly, no `Vec<OwnedValue::Int>`.
-        GenericResult::LazyIndexRange(len) => vec![JqValue::LazyIndexRange(len)],
+        GenericResult::LazyIndexRange(len) => vec![OutputItem::Lazy(JqValue::LazyIndexRange(len))],
         // `JqValue` needs no new variant for a composed `map` chain (#724,
         // #725): `JqValue::Array` already stores per-element cursors (its
         // own "Phase 1 Lazy Optimization"). `drain_atomic`, not
@@ -6671,7 +6747,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
                     })
                     .collect();
                 match converted {
-                    Ok(out) => vec![JqValue::Array(out)],
+                    Ok(out) => vec![OutputItem::Lazy(JqValue::Array(out))],
                     Err(e) => {
                         sink.report(DiagStyle::Jq, &e, at);
                         vec![]
@@ -6968,18 +7044,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     } else {
         None
     };
-    let was_raw_shaped = as_str.is_some();
-    let raw_str = if config.ascii_output { None } else { as_str };
-    if let Some(s) = &raw_str {
-        reject_raw_output0_nul(s, config)?;
-    }
-    if should_write_seq_separator(config, was_raw_shaped) {
-        out.write_all(&[ASCII_RS])?;
-    }
-
-    if let Some(s) = raw_str {
-        out.write_all(s.as_bytes())?;
-        write_terminator(out, config)?;
+    if write_output_raw_prologue(out, as_str, config)? {
         return Ok(());
     }
 
@@ -7102,39 +7167,72 @@ fn should_write_seq_separator(config: &OutputConfig, is_raw_output: bool) -> boo
     config.seq && !is_raw_output
 }
 
-fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
-    // Raw-output string, if any -- resolved and NUL-checked before
-    // writing *any* byte of this record, including the `--seq` RS
-    // separator below (same reasoning as `write_output_jq_value`'s
-    // sibling fix). A single RS write below then covers both the raw and
-    // non-raw cases, rather than one copy per branch.
-    //
-    // #2662: `--ascii-output` wins over `-r`/`-j` for a *string* value, and
-    // `--seq`'s RS-suppression keys on the pre-override `-r` shape, not the
-    // post-override write -- both the same as `write_output_jq_value`'s
-    // sibling fix above, see that comment for the live jq 1.7.1
-    // confirmation and the `--seq -acr` regression it closes.
-    let as_str = if config.raw_output {
-        match value {
-            OwnedValue::String(s) => Some(s.as_str()),
-            _ => None,
-        }
-    } else {
-        None
-    };
+/// The record prologue every jq-mode writer shares: NUL rejection, the
+/// `--seq` record separator, and the `-r`/`-j`/`--raw-output0` raw-string
+/// write that short-circuits the JSON body entirely.
+///
+/// Returns `true` when the record was fully written as a raw string (the
+/// caller must not write a body or a terminator), `false` when the caller
+/// still owes a JSON body.
+///
+/// Extracted (#3009) for the reason `should_write_seq_separator` was already
+/// extracted out of the same two prologues -- "so the condition can't drift
+/// between them". Adding an owned-value writer would otherwise have made a
+/// *third* copy of an ordering that took two issues to get right, both
+/// confirmed live against jq 1.7.1 and neither obvious from reading:
+///
+/// - #1830: the NUL check runs before *any* byte of the record, including
+///   the `--seq` RS. Checking after it left a dangling, unterminated RS on
+///   stdout for a record `--raw-output0` then rejected.
+/// - #2662: `-a` beats `-r` for a string (`-acr '"café"'` prints `"café"`,
+///   quoted and escaped), so `raw_str` is `as_str` filtered by
+///   `ascii_output` -- but `--seq`'s RS suppression keys on the *pre*-override
+///   shape, because jq suppresses the RS for `--seq -acr` on a string exactly
+///   as for plain `--seq -r`. Keying it off the post-override value emits a
+///   spurious RS.
+///
+/// The `as_str` resolution itself stays at each call site: it is
+/// `JqValue::as_str()` on one and a `String` match on the others, and the
+/// lazy one wants it computed once for both uses here.
+fn write_output_raw_prologue<Out: Write>(
+    out: &mut Out,
+    as_str: Option<Cow<'_, str>>,
+    config: &OutputConfig,
+) -> Result<bool> {
+    let was_raw_shaped = as_str.is_some();
     let raw_str = if config.ascii_output { None } else { as_str };
-    if let Some(s) = raw_str {
+    if let Some(s) = &raw_str {
         reject_raw_output0_nul(s, config)?;
     }
-
-    // #1913: see `should_write_seq_separator`'s own doc comment.
-    if should_write_seq_separator(config, as_str.is_some()) {
+    if should_write_seq_separator(config, was_raw_shaped) {
         out.write_all(&[ASCII_RS])?;
     }
 
     if let Some(s) = raw_str {
         out.write_all(s.as_bytes())?;
         write_terminator(out, config)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// The `-r`/`-j`/`--raw-output0` string of an owned value, or `None` when
+/// this record is not raw-shaped. `OwnedValue`'s counterpart to
+/// `JqValue::as_str()`, which the lazy writer uses for the same purpose --
+/// but trivially total, since an owned string is already decoded and so
+/// cannot fail the way a cursor-backed one can.
+fn owned_raw_str<'v>(value: &'v OwnedValue, config: &OutputConfig) -> Option<Cow<'v, str>> {
+    if !config.raw_output {
+        return None;
+    }
+    match value {
+        OwnedValue::String(s) => Some(Cow::Borrowed(s.as_str())),
+        _ => None,
+    }
+}
+
+fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
+    if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
         return Ok(());
     }
 
@@ -7147,6 +7245,52 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     out.write_all(output.as_bytes())?;
     write_terminator(out, config)?;
 
+    Ok(())
+}
+
+/// [`write_output_jq_value`]'s twin for an already-owned result (#3009).
+///
+/// Same record shape as its sibling -- shared prologue, then a JSON body,
+/// then the terminator -- and the same fast/slow split on the flags that
+/// `print_json` has no hook for. What it does *not* do is rebuild the value
+/// as a `JqValue` first:
+///
+/// - the fast branch streams through [`print_owned_json`], whose whole
+///   contract is byte-equality with `print_json` over a rebuilt value;
+/// - the slow branch (`-S`/`-C`/`-a`) hands `format_json` the `OwnedValue`
+///   it already has. That is where the old route was worst: it converted an
+///   owned tree *into* a `JqValue` only for `try_materialize` to convert it
+///   straight back, three traversals to print one value.
+///
+/// Distinct from [`write_output`] above, which serves the eager `-n`/
+/// `--slurp`/DSV route and still formats through `format_json`
+/// unconditionally. Pointing that one at `print_owned_json` too is a
+/// separate byte-identity question -- the differential test here proves each
+/// writer equals *today's* behaviour, not that the two writers equal each
+/// other -- so it is deliberately left alone.
+fn write_output_owned_value<Out: Write>(
+    out: &mut Out,
+    value: &OwnedValue,
+    config: &OutputConfig,
+) -> Result<()> {
+    if write_output_raw_prologue(out, owned_raw_str(value, config), config)? {
+        return Ok(());
+    }
+
+    // Same static `if` over two monomorphisations as the lazy sibling, and
+    // for the same reason (#2874/#2603): this is the default `-c` route and
+    // a vtable call in its per-scalar inner loop is not worth buying.
+    if !config.sort_keys && !config.color_output && !config.ascii_output {
+        if config.convention.preserves_source_values() {
+            print_owned_json(out, value, &PreserveFormatter, config, 0)?;
+        } else {
+            print_owned_json(out, value, &JqCompatFormatter, config, 0)?;
+        }
+    } else {
+        out.write_all(format_json(value, config).as_bytes())?;
+    }
+
+    write_terminator(out, config)?;
     Ok(())
 }
 
@@ -8307,6 +8451,182 @@ where
     Ok(())
 }
 
+/// [`print_json`]'s twin for a result that is **already owned** (#3009).
+///
+/// `GenericResult::Owned`/`ManyOwned`/`Partial` and the sorted-`keys` arm all
+/// hand `jq_runner` a finished `OwnedValue`. Printing it used to mean
+/// rebuilding it as a `JqValue` first (`JqValue::try_from_owned`), which
+/// walks the tree object by object, freeing each source map and immediately
+/// allocating the destination one. Since #3000 the two enums are 32 and 40
+/// bytes, so those two chunk sizes land in different allocator bins and
+/// nothing freed fits what is asked for next -- DHAT on
+/// `wide_10mb | to_entries` measured *less* live heap at peak than the
+/// pre-#3000 base (454 MB vs 533 MB) with more RSS, the difference being
+/// holes. See ADR-0024 option G.
+///
+/// **This function's contract is byte-for-byte equality with
+/// `print_json(&JqValue::try_from_owned(v))`, not "correct JSON".** That is
+/// achievable by construction rather than by care, because
+/// `JqValue::from_owned_at_depth` (`src/jq/lazy.rs`) is a total, structure-
+/// preserving map from `OwnedValue`'s 7 variants onto 7 of `JqValue`'s: each
+/// arm below is therefore the composition of that map with `print_json`'s
+/// corresponding arm, and can be read off against it side by side.
+/// `print_owned_json_matches_print_json_3009` sweeps the pair over every
+/// output configuration rather than trusting the reading.
+///
+/// Two arms carry the whole risk, both number-shaped:
+///
+/// - `NumberLiteral`'s `NumberRepr` is **deliberately discarded** (`_`), the
+///   way `from_owned_at_depth` discards it. It is not spare information to
+///   make use of here: `stream.rs`'s own owned writer does dispatch on it,
+///   and that is exactly why it prints `null` for `1e400` where this path
+///   must print `1E+400` (pinned in `tests/jq_cli_tests.rs`). The `_` is
+///   load-bearing.
+/// - Every scalar goes through the caller's `F: LiteralFormatter` rather
+///   than any local formatting. That is what keeps a computed `infinite`
+///   printing as `1.7976931348623157e+308`: the non-finite rule lives in
+///   `format_float`'s `nonfinite_display_string` call, and re-deriving it
+///   here would be a second copy to drift.
+///
+/// No `scratch`/`array_scratch`/`known_text_pos`: those exist for
+/// `print_json`'s `Cursor` arm, and `Cursor`/`RawNumber`/`LazyKeysArray`/
+/// `LazyIndexRange` are all unreachable from an owned tree.
+///
+/// The depth `ensure!` mirrors `print_json`'s but is unreachable from the
+/// CLI: `to_jq_values` rejects an over-deep owned value through
+/// `OwnedValue::check_tree_depth` before any byte is written, which is what
+/// keeps `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+/// true (an in-writer check fires 384 levels of `[` too late). It stays as a
+/// backstop for a future caller that skips that gate, and is covered
+/// directly by `print_owned_json_depth_guard_3009`.
+fn print_owned_json<F, Out>(
+    out: &mut Out,
+    value: &OwnedValue,
+    formatter: &F,
+    config: &OutputConfig,
+    level: usize,
+) -> Result<()>
+where
+    F: LiteralFormatter,
+    Out: Write,
+{
+    anyhow::ensure!(
+        level < MAX_VALUE_TREE_DEPTH,
+        "{}",
+        succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
+    );
+    let compact = config.compact;
+    let indent = &config.indent_string;
+    let current_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level)
+    };
+    let next_indent = if compact {
+        String::new()
+    } else {
+        indent.repeat(level + 1)
+    };
+    let separator = if compact { "" } else { "\n" };
+    let space_after_colon = if compact { "" } else { " " };
+
+    match value {
+        OwnedValue::Null => out.write_all(b"null")?,
+        OwnedValue::Bool(true) => out.write_all(b"true")?,
+        OwnedValue::Bool(false) => out.write_all(b"false")?,
+        OwnedValue::Int(n) => out.write_all(formatter.format_int(*n).as_bytes())?,
+        OwnedValue::Float(f) => out.write_all(formatter.format_float(*f).as_bytes())?,
+        // The `_` on the repr is load-bearing -- see this function's doc.
+        OwnedValue::NumberLiteral(_, literal) => {
+            out.write_all(formatter.format_raw_number(literal.as_bytes()).as_bytes())?;
+        }
+        OwnedValue::String(s) => {
+            out.write_all(b"\"")?;
+            let escaped = if config.ascii_output {
+                escape_json_string_ascii(s)
+            } else {
+                escape_json_string(s)
+            };
+            out.write_all(escaped.as_bytes())?;
+            out.write_all(b"\"")?;
+        }
+        OwnedValue::Array(arr) => {
+            if arr.is_empty() {
+                out.write_all(b"[]")?;
+            } else if compact {
+                out.write_all(b"[")?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    print_owned_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(b"]")?;
+            } else {
+                out.write_all(b"[")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    print_owned_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"]")?;
+            }
+        }
+        OwnedValue::Object(obj) => {
+            if obj.is_empty() {
+                out.write_all(b"{}")?;
+            } else if compact {
+                out.write_all(b"{")?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                    }
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    print_owned_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(b"}")?;
+            } else {
+                out.write_all(b"{")?;
+                out.write_all(separator.as_bytes())?;
+                for (i, (k, v)) in obj.iter().enumerate() {
+                    if i > 0 {
+                        out.write_all(b",")?;
+                        out.write_all(separator.as_bytes())?;
+                    }
+                    out.write_all(next_indent.as_bytes())?;
+                    out.write_all(b"\"")?;
+                    let escaped = if config.ascii_output {
+                        escape_json_string_ascii(k)
+                    } else {
+                        escape_json_string(k)
+                    };
+                    out.write_all(escaped.as_bytes())?;
+                    out.write_all(b"\":")?;
+                    out.write_all(space_after_colon.as_bytes())?;
+                    print_owned_json(out, v, formatter, config, level + 1)?;
+                }
+                out.write_all(separator.as_bytes())?;
+                out.write_all(current_indent.as_bytes())?;
+                out.write_all(b"}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Format a value as JSON.
 fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
     let opts = JsonFormatOpts {
@@ -9361,6 +9681,343 @@ mod tests {
         );
     }
 
+    /// #3009 corpus: every owned value shape whose printing could plausibly
+    /// differ between the rebuild route and the direct one.
+    ///
+    /// Number spellings go through `parse_json_value` -- the `--argjson`
+    /// entry point -- rather than being hand-assembled as
+    /// `NumberLiteral(repr, text)` pairs. A hand-built pair can encode a
+    /// `(repr, text)` combination no evaluator would ever produce, which
+    /// would make the differential test below prove something about values
+    /// that cannot occur while missing ones that can. The spellings
+    /// themselves are lifted from the two suites that already pin them:
+    /// `test_argjson_accept_set_matches_jq_2052` and
+    /// `test_jq_number_spellings_every_input_path_2877`.
+    #[cfg(test)]
+    fn owned_print_corpus_3009() -> Vec<OwnedValue> {
+        let mut out = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-1),
+            OwnedValue::Int(i64::MIN),
+            OwnedValue::Int(i64::MAX),
+            // Computed floats: no spelling of their own, which is exactly
+            // how the evaluator hands a `Float` to the printer.
+            OwnedValue::Float(0.0),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(1.0),
+            OwnedValue::Float(0.1),
+            OwnedValue::Float(1e17),
+            OwnedValue::Float(1e18),
+            OwnedValue::Float(f64::MAX),
+            OwnedValue::Float(5e-324),
+            // The three the `_2877` pins care about -- and the three
+            // `stream.rs`'s owned writer gets wrong, which is why this
+            // change could not simply reuse it.
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::String(String::new()),
+            OwnedValue::String("a".to_string()),
+            OwnedValue::String("caf\u{e9}".to_string()),
+            OwnedValue::String("\u{65e5}\u{672c}".to_string()),
+            // Astral plane: a surrogate pair once `-a` escapes it.
+            OwnedValue::String("\u{1f600}".to_string()),
+            OwnedValue::String("\u{7f}".to_string()),
+            // Drives `reject_raw_output0_nul` -- both writers must refuse
+            // it identically under `--raw-output0`, not just print it the
+            // same way.
+            OwnedValue::String("a\0b".to_string()),
+            // Must stay a quoted string, never become a number.
+            OwnedValue::String("1e400".to_string()),
+            OwnedValue::String("\"\\/\u{8}\u{c}\n\r\t".to_string()),
+            OwnedValue::array_from(vec![]),
+            OwnedValue::object_from([]),
+            OwnedValue::array_from(vec![OwnedValue::Null]),
+            OwnedValue::array_from(vec![OwnedValue::array_from(vec![OwnedValue::array_from(
+                vec![],
+            )])]),
+            OwnedValue::object_from([("a".to_string(), OwnedValue::object_from([]))]),
+            // Insertion order deliberately not sorted order, so `-S` has
+            // something to reorder.
+            OwnedValue::object_from([
+                ("b".to_string(), OwnedValue::Int(1)),
+                ("a".to_string(), OwnedValue::Int(2)),
+                ("C".to_string(), OwnedValue::Int(3)),
+            ]),
+            OwnedValue::object_from([
+                ("caf\u{e9}".to_string(), OwnedValue::Int(1)),
+                ("with\"quote".to_string(), OwnedValue::Int(2)),
+                ("with\u{7f}del".to_string(), OwnedValue::Int(3)),
+            ]),
+            // Exercises the `i > 0` comma logic at both ends of a long run.
+            OwnedValue::array_from((0..100).map(OwnedValue::Int).collect::<Vec<_>>()),
+        ];
+
+        // Every C0 control on its own: the escape tables differ per control
+        // and a single wrong byte here is a silent output change.
+        for c in 0u8..0x20 {
+            out.push(OwnedValue::String((c as char).to_string()));
+        }
+
+        for spelling in [
+            "1e400",
+            "-1e400",
+            "1e400000000000",
+            "1e999",
+            "-1e999",
+            "1e-999",
+            ".5",
+            "-.5",
+            "1.e5",
+            "1.E5",
+            "007",
+            "007e5",
+            "00",
+            "0099999999999999999999999",
+            "1.500",
+            ".0",
+            "-0.0",
+            "4e4",
+            "1E+009",
+            "9223372036854775808",
+            "18446744073709551616",
+            "99999999999999999",
+            "2.7293109604053567083",
+            "1.0",
+            "123",
+        ] {
+            out.push(
+                parse_json_value(spelling)
+                    .unwrap_or_else(|e| panic!("corpus spelling {spelling} must parse: {e}")),
+            );
+        }
+
+        // One mixed tree, so the container arms are exercised over the
+        // scalars above rather than only over `Int`s.
+        let scalars = out.iter().take(24).cloned().collect::<Vec<_>>();
+        out.push(OwnedValue::object_from([
+            ("nested".to_string(), OwnedValue::array_from(scalars)),
+            (
+                "deep".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::object_from([(
+                    "k".to_string(),
+                    OwnedValue::array_from(vec![OwnedValue::Int(1)]),
+                )])]),
+            ),
+        ]));
+        out
+    }
+
+    /// #3009: every `OutputConfig` a printed record can actually be written
+    /// under.
+    ///
+    /// `compact` and `indent_string` are varied *together* rather than as an
+    /// independent product, because only four of their combinations are
+    /// reachable from `OutputConfig::from_args`: `-c` gives `("" , true)`,
+    /// and each pretty spelling gives its own indent with `compact` false.
+    /// The fifth, `--indent 0` -> `("", false)`, is deliberately excluded --
+    /// see the differential test's own doc comment.
+    #[cfg(test)]
+    fn owned_print_configs_3009() -> Vec<OutputConfig> {
+        let mut configs = Vec::new();
+        for (indent_string, compact) in [
+            (String::new(), true),
+            ("  ".to_string(), false),
+            ("    ".to_string(), false),
+            ("\t".to_string(), false),
+        ] {
+            for &(raw_flag, join_output, raw_output0) in &[
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                for &ascii_output in &[false, true] {
+                    for &color_output in &[false, true] {
+                        for &sort_keys in &[false, true] {
+                            for &seq in &[false, true] {
+                                for &convention in
+                                    &[JsonConvention::JqCompat, JsonConvention::JqPreserveInput]
+                                {
+                                    configs.push(OutputConfig {
+                                        compact,
+                                        // `from_args`' own derivation: `-j`
+                                        // and `--raw-output0` imply `-r`.
+                                        raw_output: raw_flag || join_output || raw_output0,
+                                        join_output,
+                                        raw_output0,
+                                        ascii_output,
+                                        color_output,
+                                        color_scheme: ColorScheme::default(),
+                                        sort_keys,
+                                        indent_string: indent_string.clone(),
+                                        // Flush timing only; cannot change a byte.
+                                        unbuffered: false,
+                                        seq,
+                                        convention,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        configs
+    }
+
+    /// #3009: the flag spelling of an `OutputConfig`, for a failure message.
+    ///
+    /// `OutputConfig` deliberately stays `Debug`-free in production (it holds
+    /// a `ColorScheme` that would have to grow a derive to suit a test), and
+    /// the flags as a user would have typed them localise a mismatch faster
+    /// than a struct dump would anyway.
+    #[cfg(test)]
+    fn describe_config_3009(config: &OutputConfig) -> String {
+        let mut flags = Vec::new();
+        if config.compact {
+            flags.push("-c".to_string());
+        } else {
+            flags.push(format!("--indent {:?}", config.indent_string));
+        }
+        for (on, name) in [
+            (config.raw_output, "-r"),
+            (config.join_output, "-j"),
+            (config.raw_output0, "--raw-output0"),
+            (config.ascii_output, "-a"),
+            (config.color_output, "-C"),
+            (config.sort_keys, "-S"),
+            (config.seq, "--seq"),
+        ] {
+            if on {
+                flags.push(name.to_string());
+            }
+        }
+        if config.convention.preserves_source_values() {
+            flags.push("--preserve-input".to_string());
+        }
+        flags.join(" ")
+    }
+
+    /// #3009: `write_output_owned_value` must be byte-for-byte
+    /// indistinguishable from the route it replaces -- printing the same
+    /// value after `JqValue::try_from_owned` has rebuilt it.
+    ///
+    /// This is the load-bearing test of the change. The whole justification
+    /// for skipping the rebuild is that it was pure churn, so the obligation
+    /// is *identity*, not "valid JSON": any difference at all is a
+    /// regression, whichever direction it points. `try_from_owned` therefore
+    /// stays in the crate as this test's oracle even after no CLI path calls
+    /// it for an owned result.
+    ///
+    /// It goes in at the **writer** level rather than at `print_owned_json`
+    /// vs `print_json`, because `-r`/`-j`/`--raw-output0`, `--seq`'s record
+    /// separator, the `-a`-beats-`-r` override, the NUL rejection and the
+    /// terminator all live *above* the printer -- a printer-level test would
+    /// leave every one of them unproven, and those are exactly the paths
+    /// where the two writers' inputs differ in type (`Cow` vs `&str`).
+    ///
+    /// Errors are compared too, not just bytes: `--raw-output0` on a
+    /// NUL-bearing string must fail on both routes with the same message,
+    /// and a route that "agrees" by erroring where the other succeeds is not
+    /// agreement.
+    ///
+    /// **What this test cannot police**, recorded because it is not obvious
+    /// from the assertion: the two writers now *share*
+    /// `write_output_raw_prologue`, so a fault inside it changes both sides
+    /// identically and passes here. Negative-tested -- inverting #2662's
+    /// pre-override `--seq` keying leaves all 278 bin tests green. That
+    /// ordering is guarded instead by
+    /// `test_seq_separator_keys_on_pre_ascii_override_raw_shape_2662` in
+    /// `tests/jq_cli_tests.rs`, which does catch it. This test's subject is
+    /// the *body*: everything below the prologue, where the two routes
+    /// genuinely differ.
+    ///
+    /// **`--indent 0` is excluded on purpose.** `print_json` keys compact off
+    /// `config.compact` (which is `args.compact_output` alone) while
+    /// `indent_string` is `""`, so it emits newlines with zero-width
+    /// indents; `format_json` keys it off `indent.is_empty()` and prints
+    /// compact. jq 1.7.1 agrees with `format_json` -- confirmed live, its
+    /// `--indent 0` output is compact -- so the lazy route has a
+    /// pre-existing divergence from the reference that no test covers.
+    /// Including it here would either fail for a reason #3009 did not cause
+    /// or force a stdout change into a PR whose contract is that stdout does
+    /// not change. Filed separately.
+    #[test]
+    fn write_output_owned_value_matches_rebuilt_route_3009() {
+        let corpus = owned_print_corpus_3009();
+        let configs = owned_print_configs_3009();
+        for value in &corpus {
+            let rebuilt = JqValue::<'_, Vec<u64>>::try_from_owned(value.clone())
+                .expect("corpus values are all within the depth ceiling");
+            for config in &configs {
+                let mut direct = Vec::new();
+                let direct_err = write_output_owned_value(&mut direct, value, config)
+                    .err()
+                    .map(|e| e.to_string());
+
+                let mut via_rebuild = Vec::new();
+                let rebuild_err = write_output_jq_value(&mut via_rebuild, &rebuilt, config)
+                    .err()
+                    .map(|e| e.to_string());
+
+                let flags = describe_config_3009(config);
+                assert_eq!(
+                    direct_err, rebuild_err,
+                    "error mismatch for {value:?} under `{flags}`"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&direct),
+                    String::from_utf8_lossy(&via_rebuild),
+                    "byte mismatch for {value:?} under `{flags}`"
+                );
+            }
+        }
+    }
+
+    /// #3009: `print_owned_json`'s depth `ensure!` is unreachable from the
+    /// CLI -- `to_jq_values` rejects an over-deep owned value through
+    /// `OwnedValue::check_tree_depth` before any byte is written, which is
+    /// what keeps
+    /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
+    /// true. It stays as a backstop against a future caller that skips that
+    /// gate, so it is covered here directly rather than left as an
+    /// unexercised line.
+    #[test]
+    fn print_owned_json_depth_guard_3009() {
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let mut out = Vec::new();
+        let err = print_owned_json(
+            &mut out,
+            &OwnedValue::Int(1),
+            &JqCompatFormatter,
+            &config,
+            MAX_VALUE_TREE_DEPTH,
+        )
+        .expect_err("at the ceiling the writer must refuse");
+        assert!(
+            err.to_string().contains("nesting depth exceeds limit of"),
+            "message: {err}"
+        );
+        assert!(out.is_empty(), "nothing may be written before refusing");
+    }
+
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
     /// direct construction, since no ordinary top-level jq/yq expression
     /// found during this fix's development routes a *document-sourced*
@@ -9418,7 +10075,10 @@ mod tests {
             &InputLocation::at(None, 1),
             &mut sink,
         );
-        assert!(matches!(out.as_slice(), [JqValue::RawNumber(_)]));
+        assert!(matches!(
+            out.as_slice(),
+            [OutputItem::Lazy(JqValue::RawNumber(_))]
+        ));
         assert!(sink.hit());
     }
 
@@ -9464,7 +10124,16 @@ mod tests {
             &at,
             &mut sink,
         );
-        assert!(matches!(out.as_slice(), [JqValue::Int(1), JqValue::Int(2)]));
+        // #3009: `ManyOwned` now reaches the writer as owned values rather
+        // than as rebuilt `JqValue`s -- this assertion is where that routing
+        // is visible.
+        assert!(matches!(
+            out.as_slice(),
+            [
+                OutputItem::Owned(OwnedValue::Int(1)),
+                OutputItem::Owned(OwnedValue::Int(2))
+            ]
+        ));
         assert!(!sink.hit());
 
         let mut sink = ErrorSink::default();
@@ -9492,7 +10161,10 @@ mod tests {
             &at,
             &mut sink,
         );
-        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert!(matches!(
+            out.as_slice(),
+            [OutputItem::Owned(OwnedValue::Int(1))]
+        ));
         assert!(sink.hit());
 
         let mut sink = ErrorSink::default();
@@ -9502,7 +10174,10 @@ mod tests {
             &at,
             &mut sink,
         );
-        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert!(matches!(
+            out.as_slice(),
+            [OutputItem::Owned(OwnedValue::Int(1))]
+        ));
         assert!(sink.hit());
 
         let mut sink = ErrorSink::default();
@@ -9512,7 +10187,10 @@ mod tests {
             &at,
             &mut sink,
         );
-        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert!(matches!(
+            out.as_slice(),
+            [OutputItem::Owned(OwnedValue::Int(1))]
+        ));
         assert_eq!(sink.halted(), Some(7));
     }
 
@@ -9545,7 +10223,8 @@ mod tests {
             generic_result_to_jq_values(GenericResult::ManyCursor(cursors), cursor, &at, &mut sink);
         assert_eq!(out.len(), 3);
         assert!(
-            out.iter().all(|v| matches!(v, JqValue::Cursor(_))),
+            out.iter()
+                .all(|v| matches!(v, OutputItem::Lazy(JqValue::Cursor(_)))),
             "{out:?}"
         );
         assert!(!sink.hit());
