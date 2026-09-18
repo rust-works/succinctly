@@ -60391,6 +60391,296 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
 }
 
 // ============================================================================
+// #3037: a variable bound from a navigated position, used at that same node
+// ============================================================================
+
+/// #3037: `.a as $y` binds outside any resolver (`Origin::Untracked`,
+/// #2072), so it refused everywhere -- including where the path register
+/// really is that same node. At a funnel whose live cursor *is* the
+/// marker's recorded node the marker is the invocation root, and
+/// `Origin::Snapshot`'s value rule is sound for it. Read, and every write
+/// operator; all captured live from jq 1.7.1, all refused on `main`.
+#[test]
+fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
+    for (input, filter, want) in [
+        (r#"{"a":{"b":1}}"#, r".a as $y | .a | path($y)", "[]"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y.b) = 9",
+            r#"{"b":9}"#,
+        ),
+        (r#"{"a":{"b":1}}"#, r".a as $y | .a | del($y.b)", "{}"),
+        (r#"{"a":{"b":1}}"#, r".a as $y | .a | $y |= 5", "5"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y.b) |= . + 1",
+            r#"{"b":2}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y.b) += 1",
+            r#"{"b":2}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y.b) //= 7",
+            r#"{"b":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | first(.) | path($y)",
+            "[]",
+        ),
+        (r#"{"a":{"b":1}}"#, r".[] as $y | .a | path($y)", "[]"),
+        (r#"{"a":{"b":1}}"#, r".a.b as $y | .a.b | path($y)", "[]"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | path($y.b)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | path($y | .b)",
+            r#"["b"]"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y | .b) = 9",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | .a | (.b, $y.b) = 9",
+            r#"{"b":9}"#,
+        ),
+        (r#"{"a":{"b":1}}"#, r".a as $y | .a | [path($y)]", "[[]]"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | try error($y) catch path($y)",
+            "[]",
+        ),
+        (r#"{"a":[1,2]}"#, r".a as $y | .a | path($y[0])", "[0]"),
+        (r#"{"a":[1,2]}"#, r".a as $y | .a | del($y[0])", "[2]"),
+        (r#"{"a":null}"#, r".a as $y | .a | path($y)", "[]"),
+        (
+            r#"{"a":[{"b":1},{"b":1}]}"#,
+            r".a[0] as $y | .a[0] | path($y)",
+            "[]",
+        ),
+        // Routes that bridge the whole `as` into the eager evaluator with
+        // the cursor still in hand.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"limit(1; .a as $y | .a | path($y))",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"def f: .a as $y | .a | path($y); f",
+            "[]",
+        ),
+        (r#"{"a":{"b":1}}"#, r"first(.a as $y | .a | path($y))", "[]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3037: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3037: `{filter}`");
+    }
+    Ok(())
+}
+
+/// #3037's traps, all refusals in jq 1.7.1 (exit 5, this exact stderr):
+/// the marker at an equal-valued sibling (the #1466 class), at an ancestor
+/// or descendant, after a rebuild, a multi-output source whose later
+/// element is not the register's node, and -- the fabrication this same
+/// funnel had before the fix -- a root `Snapshot` re-navigated through `$r`
+/// onto an equal-valued sibling and written through. `main` wrote `{"b":9}`
+/// / `5` for those last rows (also through `limit(1; ..)` and a `def`),
+/// because the assignment family's fallback into `eval_full` was the one
+/// funnel that never demoted a marker; `del` and `path` of the same shape
+/// refused, through the demoting funnels.
+#[test]
+// jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
+    let sib = r#"{"a":{"b":1},"c":{"b":1}}"#;
+    for (input, filter, want) in [
+        (
+            sib,
+            r".a as $y | .c | path($y)",
+            r#"Invalid path expression with result {"b":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | .c | ($y.b) = 9",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | .c | $y |= 5",
+            r#"Invalid path expression with result {"b":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | .c | del($y.b)",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | path($y)",
+            r#"Invalid path expression with result {"b":1}"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a as $y | .a.b as $z | .a | path($z)",
+            r#"Invalid path expression with result {"c":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | .a | (tojson|fromjson) | ($y.b) = 9",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r".a as $y | .a | {b:1} | ($y.b) = 9",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            r#"{"a":[{"b":1},{"b":1}]}"#,
+            r".a[1] as $y | .a[] | ($y.b) = 9",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            r#"{"a":[{"b":1},{"b":1}]}"#,
+            r".a[1] as $y | .a[] | path($y)",
+            r#"Invalid path expression with result {"b":1}"#,
+        ),
+        // The pre-fix fabrications.
+        (
+            sib,
+            r". as $r | .a | . as $x | $r | .c | ($x.b) = 9",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r". as $r | .a | . as $x | $r | .c | $x |= 5",
+            r#"Invalid path expression with result {"b":1}"#,
+        ),
+        (
+            sib,
+            r". as $r | .a | . as $x | $r | .c | ($x.b) += 1",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r"limit(1; . as $r | .a | . as $x | $r | .c | ($x.b) = 9)",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+        (
+            sib,
+            r"def f: . as $r | .a | . as $x | $r | .c | ($x.b) = 9; f",
+            r#"Invalid path expression near attempt to access element "b" of {"b":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3037: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(want),
+            "#3037: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // ... and the same `$r` re-navigation back onto the marker's *own* node
+    // still writes, so the demotion above is not over-eager.
+    for filter in [
+        r". as $r | .a | . as $x | $r | .a | ($x.b) = 9",
+        r"limit(1; . as $r | .a | . as $x | $r | .a | ($x.b) = 9)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(sib))?;
+        assert_eq!(code, 0, "#3037: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), r#"{"b":9}"#, "#3037: `{filter}`");
+    }
+    Ok(())
+}
+
+/// What #3037 leaves refusing, pinned so a later widening is deliberate.
+/// jq 1.7.1 answers every row; each is the safe direction.
+///
+/// - The positional rows: the marker certified at a non-root register
+///   position inside the invocation (`path(.a | $y)`, `(.a | ($y.b)) = 9`)
+///   needs a document-absolute bind path, the #2042 `Origin::At` machinery
+///   reached from a value-mode bind.
+/// - The embed row (`{k:.a} | .k | path($y)`) is #2889's owned-identity
+///   residual.
+/// - Routes that re-enter the eager evaluator with an *owned* accumulator
+///   (`reduce`'s UPDATE, a `catch` handler): its `eval_as` carries no node
+///   for a navigated bind (#2072 gave the generic evaluator that, not this
+///   one), and there is no cursor at the funnel to promote against.
+/// - A `null`/`bool` marker at an equal-valued sibling: jq's `jv_identical`
+///   admits those by value regardless of node, but the resolver's
+///   `TrackedVar` arm consults the origin first (pre-existing; `($y | .)
+///   = 5` already answers, since the `.` stage re-establishes by value).
+#[test]
+// jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
+    for (input, filter) in [
+        (r#"{"a":{"b":1}}"#, r".a as $y | path(.a | $y)"),
+        (r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9"),
+        (r#"{"a":{"b":1}}"#, r".a as $y | {k:.a} | .k | path($y)"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"try error(.) catch (.a as $y | .a | path($y))",
+        ),
+        (r#"{"a":true,"c":true}"#, r".a as $y | .c | $y |= 5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3037 residual: `{filter}` (jq answers; recorded refuse-only), got \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3037 residual: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq mode is untouched by #3037: real yq v4.53.3 treats `($y.b) = 9`
+/// through a variable as a no-op and prints the document unchanged
+/// (`b: 1`), at the marker's own node and at a sibling alike, where
+/// succinctly refuses loudly. The promotion is jq-only so that refusal
+/// never becomes a write yq does not perform.
+#[test]
+fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("yq").arg(r".a as $y | .a | ($y.b) = 9");
+            cmd
+        },
+        Some(b"a:\n  b: 1\n"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 1, "#3037 yq: got stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression near attempt to access element "b" of {"b":1}"#),
+        "#3037 yq: stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+// ============================================================================
 // #2978: an identity-passthrough bind (`. as $x`) inside a resolver
 // invocation carries the position `.` was frozen at, so `getpath` can
 // compose one from it

@@ -268,6 +268,41 @@ ROOT_USES = [
 ]
 ROUTE_P = 0.25
 
+# #3037: a variable bound from a *navigated* position outside any resolver
+# (`.a as $y`, `Origin::Untracked`) used where the path register really is
+# that same node -- `.a as $y | .a | ($y.b) = 9` -- or, the trap, at a
+# sibling holding an equal value (`.a as $y | .c | ...` with `.c` copied
+# from `.a`, which `doc()` makes common). Every program above binds inside
+# the resolver (`path(... as $y ...)`) or binds `.` itself, so the
+# `Untracked` marker could reach a write only through ROUTES' identity
+# bind; this family draws the bind source from `VALUE_BIND_SOURCES` and the
+# stage that follows from the same pool, so same-node, sibling and
+# equal-valued-sibling pairings all occur, then writes or reads through the
+# marker via `VALUE_BIND_USES`. A rebuild between the two must still refuse.
+VALUE_BIND_SOURCES = [".a", ".c", ".x.a", ".x.c", ".x", ".arr[0]?", ".arr[1]?", ".arr[-1]?", ".d", ".[]?"]
+VALUE_BIND_USES = [
+    "path($y)", "($y.b?) = 9", "del($y.b?)", "($y | .b?) = 9", "$y |= 5", "($y.b?) |= 5",
+    "($y.b?) += 1", "($y.b?) //= 7", "path($y.b?)", "path($y | .b?)", "path($y[0]?)",
+    "del($y[0]?)", "($y[0]?) = 9", "first(path($y))", "[path($y)]", "(path($y), path(.b?))",
+    "try error(.) catch path($y)", "($y | path(.))",
+]
+VALUE_BIND_P = 0.15
+
+def value_bind_program(rng, d):
+    src = rng.choice(VALUE_BIND_SOURCES)
+    # Mostly land on the same node again, sometimes on a sibling or an
+    # ancestor/descendant, sometimes through a passthrough or a rebuild.
+    r = rng.random()
+    if r < 0.5:
+        nav = src
+    elif r < 0.8:
+        nav = rng.choice(VALUE_BIND_SOURCES)
+    else:
+        nav = src + " | " + rng.choice(REBUILDS[:4] + PASSTHROUGH + ["first(.)", "(. // 1)"])
+    use = rng.choice(VALUE_BIND_USES)
+    body = f"{src} as $y | {nav} | {use}"
+    return rng.choice(ROUTES) % body
+
 def route_program(rng, d):
     v = "$x"
     prefix = rng.choice(["", "", ".x | "])
@@ -373,7 +408,8 @@ def main():
         for name, pool in [("PREFIX", PREFIX), ("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV),
                            ("LITERAL", LITERAL), ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES),
                            ("USES", USES), ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
-                           ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES)]:
+                           ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES),
+                           ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
@@ -388,7 +424,10 @@ def main():
         if r < ROUTE_P:
             # #3036: the document twice, so `input` reads a second copy.
             f, d = route_program(rng, dv), d + "\n" + d
-        elif r < ROUTE_P + FOLD_P:
+        elif r < ROUTE_P + VALUE_BIND_P:
+            # #3037: same ROUTES, so `input` needs its second copy too.
+            f, d = value_bind_program(rng, dv), d + "\n" + d
+        elif r < ROUTE_P + VALUE_BIND_P + FOLD_P:
             f = fold_program(rng)
         else:
             f = program(rng)
