@@ -252,8 +252,10 @@ DEFAULT_THRESHOLD = 5.0
 # each, decoded up front) before writing the first one; it validates the
 # object with one key-only walk and streams the fields, materializing only
 # for `-S` or a repeated key. Measured by this guard against the PR's own
-# merge-base: `users_identity` -7.3% x86_64 / -7.4% ARM64-Linux,
-# `wide_identity` -3.2% / -1.4% (under the default), every other row 0.0%.
+# merge-base: `users_identity` -7.2% x86_64 / -7.1% ARM64-Linux,
+# `wide_identity` -3.0% / -1.0% (under the default), every other row within
+# +0.4% (the `keys_unsorted` rows, for the `,` arm #2720's review added to
+# the key-only value-delimiter scan).
 # 12% clears the measured number with headroom; remove once `main` has moved
 # past #2720, per the rule above (alongside #3077's three).
 QUERY_THRESHOLDS = {
