@@ -30857,6 +30857,120 @@ fn test_jq_wellformed_documents_unaffected_by_1643() -> Result<()> {
     Ok(())
 }
 
+/// #2720: the identity writer materializes an object's fields only when it
+/// must -- `-S` (every key, to sort) or a key that actually repeats under a
+/// collapsing mode -- and streams every other object straight off `uncons`
+/// after one key-only validation walk. Both branches of that gate, with the
+/// duplicate-key collapse (first position, last value, at every depth) and
+/// the `-S` order pinned against jq 1.7.1, pretty and `-c`, plus the empty
+/// and single-field objects; the `--preserve-input` rows keep every
+/// occurrence (real yq's own rule, #1008), unchanged from before the gate.
+#[test]
+// `"{a:1}"` is a malformed-JSON input literal (a bareword key), not a
+// formatting string; clippy cannot tell the two apart from the brace shape.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_identity_writer_streams_or_materializes_by_gate_2720() -> Result<()> {
+    for (input, args, expected) in [
+        // A repeated key: the materialized (collapsing) branch.
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["."][..],
+            "{\n  \"b\": 3,\n  \"a\": 2\n}\n",
+        ),
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["-c", "."][..],
+            "{\"b\":3,\"a\":2}\n",
+        ),
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["-S", "."][..],
+            "{\n  \"a\": 2,\n  \"b\": 3\n}\n",
+        ),
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["-S", "-c", "."][..],
+            "{\"a\":2,\"b\":3}\n",
+        ),
+        // Repeats at more than one depth, each level deciding for itself.
+        (
+            r#"{"a":{"b":1,"b":2},"a":{"c":[{"d":1,"d":2}]}}"#,
+            &["-c", "."][..],
+            "{\"a\":{\"c\":[{\"d\":2}]}}\n",
+        ),
+        (
+            r#"{"x":1,"y":{"y":2,"y":3},"x":4}"#,
+            &["."][..],
+            "{\n  \"x\": 4,\n  \"y\": {\n    \"y\": 3\n  }\n}\n",
+        ),
+        (
+            r#"{"x":1,"y":{"y":2,"y":3},"x":4}"#,
+            &["-S", "-c", "."][..],
+            "{\"x\":4,\"y\":{\"y\":3}}\n",
+        ),
+        // No repeat: the streaming branch (and `-S` still materializes).
+        (
+            r#"{"b":1,"a":2}"#,
+            &["."][..],
+            "{\n  \"b\": 1,\n  \"a\": 2\n}\n",
+        ),
+        (
+            r#"{"b":1,"a":2}"#,
+            &["-S", "-c", "."][..],
+            "{\"a\":2,\"b\":1}\n",
+        ),
+        (r"{}", &["."][..], "{}\n"),
+        (r"{}", &["-S", "-c", "."][..], "{}\n"),
+        (r#"{"a":1}"#, &["."][..], "{\n  \"a\": 1\n}\n"),
+        (r#"{"a":1}"#, &["-S", "-c", "."][..], "{\"a\":1}\n"),
+        // `--preserve-input` never collapses (every occurrence kept), sorted
+        // or not -- a succinctly extension, unchanged by the gate.
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["--preserve-input", "."][..],
+            "{\n  \"b\": 1,\n  \"a\": 2,\n  \"b\": 3\n}\n",
+        ),
+        (
+            r#"{"b":1,"a":2,"b":3}"#,
+            &["--preserve-input", "-S", "."][..],
+            "{\n  \"a\": 2,\n  \"b\": 1,\n  \"b\": 3\n}\n",
+        ),
+        (
+            r#"{"x":1,"y":{"y":2,"y":3},"x":4}"#,
+            &["--preserve-input", "."][..],
+            "{\n  \"x\": 1,\n  \"y\": {\n    \"y\": 2,\n    \"y\": 3\n  },\n  \"x\": 4\n}\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(code, 0, "{input} {args:?}: stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} {args:?}");
+    }
+    // The streaming branch still validates the whole object before it
+    // writes `{` (#1194/#1677/#2261), so a malformed top-level member is
+    // refused with nothing on stdout, exactly as the materialized branch
+    // refuses it. (A malformed *nested* object is refused when the writer
+    // reaches it, after its parent's prefix -- the writer's pre-existing
+    // partial-output model, unchanged here.)
+    for (input, args) in [
+        (r#"{"a":1,}"#, &["."][..]),
+        (r#"{"a":1,}"#, &["-c", "."][..]),
+        (r#"{"a":1,}"#, &["-S", "."][..]),
+        (r#"{"a":1,}"#, &["--preserve-input", "."][..]),
+        (r#"{"a":1 "b":2}"#, &["."][..]),
+        (r#"{"a":1,"b"}"#, &["."][..]),
+        ("{a:1}", &["."][..]),
+        (r#"{"b":1,"a":2,"b":3,}"#, &["."][..]),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(code, 5, "{input} {args:?}: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "{input} {args:?} wrote {stdout:?}");
+    }
+    let (stdout, _, code) = run_jq_full(&["."], Some(r#"{"a":{"b":1,}}"#))?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "{\n  \"a\": ");
+    Ok(())
+}
+
 /// #1676: #1643's own deferred trailing/leading-comma gap is now caught --
 /// a `,`/`:` next to a bracket (rather than between two real children),
 /// whether after the last real child (`{"a":1,}`, `[1,2,]`) or inside an
