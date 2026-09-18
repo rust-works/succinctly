@@ -454,6 +454,10 @@ computed-identity-bind-marker-source	{"a":{"b":{"c":1}}}	path(. as $x | 5 | $x a
 computed-identity-bind-mixed-if	{"a":{"b":{"c":1}}}	path(. as $x | 5 | (if true then $x else . end) as $y | $y)
 catch-break-payload-not-register	{"a":null}	(.a | label $out | try (break $out) catch .b) = 1
 catch-break-restores-register	{"a":null}	path(.a as $y | .a | label $out | try (break $out) catch $y)
+fold-body-nested-try	{"a":{"b":1}}	del(foreach .a as $v (.; try ($v | .b); .))
+fold-body-nested-if	{"a":{"b":1}}	path(foreach .a as $v (.; if true then ($v | .b) else . end; .))
+fold-extract-nested-try	{"a":{"b":1}}	path(.a as $y | .a | foreach range(1) as $i (0; .; try ($y | .b)))
+fold-body-nested-try-sibling-control	{"a":{"b":1},"c":{"b":1}}	del(.a as $y | foreach .c as $v (.; try ($y | .b); .))
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
