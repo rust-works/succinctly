@@ -1274,6 +1274,37 @@ is the revert that established what the other one costs.
    jq), so the handler stays untracked unless the payload is `null`/`bool`; and `(if true
    then $x else . end) as $y` on an untracked stage, which binds `Untracked` because the
    condition is not evaluated where jq evaluates it and binds the marker.
+
+   **`resolve_as_pattern`'s own first-step identity test recognizes every
+   `is_identity_passthrough` spelling now** —
+   [#3119](https://github.com/rust-works/succinctly/issues/3119). It used to recognize only a
+   bare `.` head; every other spelling (`try . catch 1`, `if true then . else . end`,
+   `. // 1`) fell to the null/bool catch-all, wrongly decided the step was not intact, and
+   either refused (a single pattern) or retried a `?//` chain onto the *wrong* alternative,
+   which `del`/`=` then wrote through — `del((. // 1) as {a:$v} ?// $v \| $v)` on
+   `{"a":"s","c":"s"}` wrote `null`, deleting the whole document, where jq deletes one key.
+   Closed by `resolves_to_register`, which re-derives the bare-`TrackedVar` arm's own
+   `marker.value == *reg && frame.certifies(...)` check at every level it recurses through
+   (not `is_identity_passthrough`'s weaker, deferred-certification guarantee — see that
+   function's own doc comment) and requires the register be truthy for an `Alternative`
+   *and* `is_raise_free_identity_passthrough(left)`, closing an `If`-on-`left`-with-an-
+   empty-condition hole two review rounds found live (`del(.a \| ((if empty then . else .
+   end) // {p:100,q:200}) as {p:$x} \| $x)` on `{"a":{"p":1,"q":2},"c":"keep"}` wrote
+   `{"a":{"q":2},"c":"keep"}` without that extra guard).
+
+   **Two residual, refuse-only gaps remain**, both pinned in
+   `test_alternative_identity_passthrough_pattern_head_is_recognized_3119`:
+   - a marker frozen off the register (#3120's carried register, not `trackable`) whose
+     value happens to be truthy and value-equal to the register's own real node — jq answers
+     (`path(. as $x \| 5 \| ($x // 1) as {a:$q} ?// $z \| $q)` on `{"a":1}` is `["a"]`), but a
+     value-only check off-register cannot tell that real coincidence from an unrelated one
+     (the exact #3129 class of bug), so this stays refuse-only;
+   - an `if` whose branches don't *both* statically recognize, even when its condition is a
+     constant that always takes the recognized one — `path(.a \| (if true then . else 5 end)
+     as {b:$v} \| $v)` on `{"a":{"b":1}}` is jq's `["a","b"]`; the static rule cannot tell
+     it from a truly arbitrary condition without evaluating it, the same refuse-only cost
+     `test_identity_bind_position_traps_keep_refusing_2978`'s row 9 already pays for
+     `identity_bind_position`'s sibling mechanism.
 3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
    `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
    refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an
