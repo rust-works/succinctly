@@ -56554,16 +56554,6 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
     // the only assertions; each row is otherwise a pure jq answer, not a
     // succinctly one.
     for (input, filter) in [
-        // jq: ["a",0]
-        (
-            r#"{"a":[1,2,3]}"#,
-            "path(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
-        ),
-        // jq: {"a":[2,3]}
-        (
-            r#"{"a":[1,2,3]}"#,
-            "del(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
-        ),
         // jq: ["a"]
         (d, "path(. as {a:$q} | .a as $z | $z)"),
         // jq: ["a"]
@@ -56572,6 +56562,30 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
         assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+    }
+    // The artefact-guard pair this block once carried as "MUST stay a
+    // refusal" answers since #3133: the `if` body's nested pipe now carries
+    // the register the pattern moved to, so `$q[0]` navigates from it
+    // instead of raising the artefact the guard existed for -- jq's own
+    // `["a",0]`, and the `del` twin's `{"a":[2,3]}`, no retry involved.
+    for (input, filter, want) in [
+        (
+            r#"{"a":[1,2,3]}"#,
+            "path(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
+            r#"["a",0]"#,
+        ),
+        (
+            r#"{"a":[1,2,3]}"#,
+            "del(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
+            r#"{"a":[2,3]}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "`{filter}` (jq's answer since #3133): stderr={stderr}"
+        );
     }
     // One former refuse-only pin of this block answers since #3120: the
     // marker-headed source on an untracked stage is checked against the

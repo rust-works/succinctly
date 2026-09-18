@@ -180,7 +180,24 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         # `["a","c"]`. The second form composes back onto the register.
         "(.a | ($v as $w | .c | $w | getpath([\"c\"]) | .b?))",
         "(.a | ($v as $w | .c | $w | getpath([\"a\",\"c\"]) | .b?))",
-        "(.x | ($v as $w | .a | $w | getpath([\"x\",\"a\"]) | .b?))"]
+        "(.x | ($v as $w | .a | $w | getpath([\"x\",\"a\"]) | .b?))",
+        # #3133: the register reaches a pipe nested under `try`/`if`/`,` and
+        # a `catch` handler (jq restores it to the `try`'s entry). A marker
+        # navigating inside such a pipe used to raise the resolver's own
+        # refusal, which `try`/`?` then swallowed into a discarded write --
+        # so both halves are drawn: the marker that *is* the register
+        # (`$v` right after its own bind) and, through `SOURCES`' sibling
+        # copies, one that merely equals it. The catch shapes pair a
+        # payload that is the register (`error($v)`, `error(null)` on a
+        # null register) with one that is a rebuilt copy.
+        "try ($v | .b?)", "(try ($v | .b?) catch .)", "($v | .b?)?",
+        "(if true then ($v | .b?) else 1 end)", "(($v | .b?), 1)",
+        "try (($v | .[]?) | .b?)", "(try error($v) catch $v)",
+        "(try error($v) catch ($v | .b?))", "(try error(null) catch ($v | .b?))",
+        "(try error(1) catch $v)", "(5 | try error(1) catch $v)",
+        "(try error(.) catch .)", "(try error({b:1}) catch .b?)",
+        "(. as $q | 5 | $q as {a:$w} | try ($w | .b?))",
+        "(try (. as {a:$w} | $w | .b?) catch .)"]
 
 # #2978: an optional navigation *prefix* before the first bind, so `. as $v`
 # can be drawn below the invocation root. `program()` put every bind at the
