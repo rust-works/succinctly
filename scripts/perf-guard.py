@@ -246,11 +246,22 @@ DEFAULT_THRESHOLD = 5.0
 #
 # **Remove these three entries once `main` has moved past #2999** (the rule
 # above). Tracked by #3077.
+#
+# `users_identity` (#2720): faster on both architectures. The identity writer
+# no longer materializes every field of an object (a 144-byte `DocumentField`
+# each, decoded up front) before writing the first one; it validates the
+# object with one key-only walk and streams the fields, materializing only
+# for `-S` or a repeated key. Measured by this guard against the PR's own
+# merge-base: `users_identity` -7.3% x86_64 / -7.4% ARM64-Linux,
+# `wide_identity` -3.2% / -1.4% (under the default), every other row 0.0%.
+# 12% clears the measured number with headroom; remove once `main` has moved
+# past #2720, per the rule above (alongside #3077's three).
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_del_select": 20.0,
     "users_del_bound_select": 20.0,
     "users_yq_del_select": 12.0,
+    "users_identity": 12.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
