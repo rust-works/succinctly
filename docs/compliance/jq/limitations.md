@@ -870,7 +870,7 @@ is the revert that established what the other one costs.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the accepting-direction twin of #2642                                                                                                          |
+   | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
    | `path(.a as $y \| .a \| tojson \| fromjson \| $y)`       | `["a"]`                     | `tojson`/`fromjson` are not on `cannot_move_register`'s proven allowlist (#2041)                                                                                                                                          |
    | `path(.a as $y \| def f: $y; .a \| f)`                   | `["a"]`                     | a `def` inside `path()` resolves as an opaque leaf                                                                                                                                                                        |
    | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)`     | `["a"]`                     | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value                                                                         |
@@ -1004,6 +1004,42 @@ is the revert that established what the other one costs.
    certifies the register (`path(.a as $y | .c | $y)` must keep refusing, since jq's own
    `jv_identical` compares the register's pointer, not the bind site), not a new place to
    get the node from.
+
+   **[#3037](https://github.com/rust-works/succinctly/issues/3037), now closed for the
+   root-of-invocation rows: the accepting-direction twin of #2642.** #2072's navigated bind
+   (`.a as $y`, `Origin::Untracked`) refused everywhere, including where the path register
+   really *is* that node — `.a as $y | .a | path($y)` is `[]` in jq 1.7.1, and `($y.b) = 9`,
+   `del($y.b)`, `$y |= 5`, `+=`, `//=` all write. At every funnel that hands a cursor's value to
+   the resolver, the same node-identity proof #2642 reads in the demoting direction now runs
+   in the accepting one (`reroot_markers`, `src/jq/eval.rs`): an `Untracked` marker whose
+   recorded node *is* the funnel's own live cursor is the invocation root, and `Origin::Snapshot`'s
+   value rule is sound for it by that variant's own argument (a root can value-match only itself
+   among its proper descendants), so it is promoted to a `Snapshot` for that call — jq mode only,
+   since real yq's assignment through a variable is a no-op that prints the document unchanged,
+   where succinctly refuses loudly (a write there would diverge in the corrupting direction). A
+   marker at an equal-valued sibling (`.a as $y | .c | ($y.b) = 9`), an ancestor or descendant,
+   after a rebuild, or a multi-output source's other element (`.a[1] as $y | .a[] | …`) has a
+   different node id and stays refused, as jq does. Closing it surfaced the last unrebased
+   funnel: the assignment family (`=`, `|=`, `+=`, …) with a cursor falls through
+   `eval_generic::eval_single`'s catch-all into `eval_full` whenever the owned identity pipe
+   declines it, and that arm never demoted — so `. as $r | .a | . as $x | $r | .c | ($x.b) = 9`
+   on `{"a":{"b":1},"c":{"b":1}}` wrote `{"b":9}` (and `$x |= 5` wrote `5`; also through
+   `limit(1; …)` and a `def`) where jq refuses, while `del`/`path` of the same shape refused
+   through the demoting funnels. Rebased like every other funnel now. **Still refusing**, each
+   pinned in `test_navigated_bind_residuals_refuse_cleanly_3037` and the sweep's
+   `navigated-bind-*` refuse-only rows: the positional rows (`.a as $y | path(.a | $y)`,
+   `(.a | ($y.b)) = 9` — the marker must certify at a non-root register position, which needs
+   a document-absolute bind path, the #2042 `Origin::At` machinery reached from a value-mode
+   bind; scoped separately), the embed row (#2889), the routes that re-enter the eager
+   evaluator with an *owned* accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`,
+   a `catch` handler: `eval.rs`'s own `eval_as` carries no node for a navigated bind, and there
+   is no cursor at that funnel to promote against), and a `null`/`bool` marker at an
+   equal-valued sibling (`.a as $y | .c | $y |= 5` on `{"a":true,"c":true}`: jq's
+   `jv_identical` admits those by value regardless of node, the resolver's `TrackedVar` arm
+   consults the origin first — pre-existing). The library entry point `succinctly::jq::eval`
+   takes the eager evaluator for a program `needs_path_context` does not route (a `path(f)`
+   with an argument, a write), so through it these rows keep refusing as before; the CLI's
+   route is the generic evaluator, where they answer.
 
    [#2649](https://github.com/rust-works/succinctly/issues/2649) closed the last shape in this
    family with no resolver arm at all: a **destructuring bind**. jq compiles

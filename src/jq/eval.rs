@@ -6103,7 +6103,7 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Escaped(Control::Error(e)) => match catch {
             Some(catch_expr) => {
                 // #3036: see `try_payload_root`.
-                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                let catch_expr = reroot_markers::<S>(catch_expr, &try_payload_root(expr));
                 eval_each_owned_bridged::<S>(&catch_expr, &e.payload(), optional, &mut |o| {
                     sink(Item::Owned(o))
                 })
@@ -10310,7 +10310,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => match catch {
             // #3036: see `try_payload_root`.
             Some(catch_expr) => {
-                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                let catch_expr = reroot_markers::<S>(catch_expr, &try_payload_root(expr));
                 eval_owned_input_bridged::<W, S>(&catch_expr, &e.payload(), optional)
             }
             None => QueryResult::None,
@@ -10338,7 +10338,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let handled = match catch {
                 // #3036: see `try_payload_root`.
                 Some(catch_expr) => {
-                    let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(expr));
+                    let catch_expr = reroot_markers::<S>(catch_expr, &try_payload_root(expr));
                     eval_owned_input_bridged::<W, S>(&catch_expr, &e.payload(), optional)
                 }
                 None => QueryResult::None,
@@ -29196,44 +29196,135 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
 /// stop a rebuilt copy from being admitted, without touching `Frame`,
 /// `Origin`, or `resolve_node`'s certification rule itself.
 ///
-/// `Cow::Borrowed` on the common path (no demotable marker anywhere in
-/// `expr`, checked once via [`any_subexpr`] before paying for a rebuild) --
-/// call sites that thread this through `eval_on_owned`/`eval_each_owned`
-/// pass a genuinely arbitrary expression, most of which contain no
-/// `TrackedVar` at all, let alone one needing demotion. `Tracked::node` is
-/// kept on a demoted marker unchanged: the cursor routes (`key`/`path`/
-/// `parent`, #2072) read `node`, never `origin`, and must keep answering.
-/// A marker is memoized by `Rc` pointer (`BTreeMap`, matching
-/// `DeleteTrieBuilder::intern`'s own pointer-keyed memo, `eval.rs`) so `k`
-/// occurrences of one shared marker clone its value once, not `k` times.
+/// The walk itself is [`rewrite_markers`], shared with the one promotion
+/// this evaluator performs ([`reroot_markers`], #3037): `Cow::Borrowed`
+/// on the common path, `Tracked::node` kept verbatim, one clone per shared
+/// marker. See that function for the details.
 pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> Cow<'e, Expr> {
-    if !has_demotable_marker(expr, root) {
+    rewrite_markers(expr, &|marker| {
+        marker_needs_demotion(marker, root).then_some(Origin::Untracked)
+    })
+}
+
+/// Whether an [`Origin::Untracked`] marker's recorded node *is* `root`'s own
+/// document node (#3037) -- the same node id in the same document, the
+/// proof [`marker_needs_demotion`]'s `Node`/`Node` arm reads in the other
+/// direction. Only a live document node counts: an `Owned`-provenance
+/// binding or an `Owned`/`OwnedRoot` root cannot prove the marker *is* the
+/// root, and answering `false` costs a refusal jq also gives on the copies
+/// those model, never an acceptance.
+fn marker_is_root(marker: &Tracked, root: &RootWitness) -> bool {
+    if marker.origin != Origin::Untracked {
+        return false;
+    }
+    matches!(
+        (&marker.node, root),
+        (
+            Some(BindOrigin::Node { node, document }),
+            RootWitness::Node {
+                node: root_node,
+                document: root_document,
+            },
+        ) if node == root_node && document == root_document
+    )
+}
+
+/// [`demote_rebuilt_markers`] plus the one *promotion* this evaluator makes
+/// (#3037), for every funnel whose `root` can be a document node -- the
+/// cursor bridges, the `path`/`del`/assignment arms that hand a cursor's
+/// value to the resolver, a `catch` handler whose payload is a marker's own
+/// node, and the owned identity pipe's positioned stages. A site whose root
+/// is always [`RootWitness::Owned`] keeps calling `demote_rebuilt_markers`
+/// directly: the promotion is a no-op there and the name says what happens.
+///
+/// The promotion: an [`Origin::Untracked`] marker that [`marker_is_root`]
+/// proves *is* `root`'s own document node becomes an [`Origin::Snapshot`]
+/// copy -- the accepting-direction twin of the demotion. A variable bound
+/// from a *navigated* position outside any resolver invocation (`.a as $y`,
+/// #2072) is `Untracked`: there is no invocation to certify a path against,
+/// so it refuses everywhere. But when the value the funnel is about to hand
+/// to the owned evaluator *is* that very node -- `.a as $y | .a | path($y)`,
+/// where the cursor at the funnel is `.a`'s -- the marker is the invocation
+/// root, and `Origin::Snapshot`'s rule is sound for it by the argument its
+/// own doc comment makes: a root snapshot can value-match only itself among
+/// the root's proper descendants (a finite tree cannot contain itself). jq
+/// 1.7.1 answers `[]` there, and `($y.b) = 9`, `del($y.b)`, `$y |= 5` all
+/// write. A marker bound at a sibling (`.a as $y | .c | path($y)` on
+/// equal-valued `.a`/`.c`) has a different node id and stays `Untracked`,
+/// refusing as jq does. Never at an `Owned` re-entry or an `Owned` `catch`
+/// payload root: those carry no node to compare, and a promotion there
+/// would be exactly the value-only admission #2642 and #3036 exist to
+/// refuse. The promoted marker keeps `node`, so a later re-entry that
+/// rebuilds the document demotes it again through the ordinary `Snapshot`
+/// rule.
+///
+/// The promotion is **jq mode only**. Real yq's `.a as $y | .a | ($y.b) =
+/// 9` is a no-op that prints the document unchanged (v4.53.3, and the same
+/// for the sibling `.c`), where `succinctly yq` refuses loudly today; a
+/// promotion would turn that refusal into a *write*, the corrupting
+/// direction, with no oracle behind it. One walk, not two: a marker is
+/// either demoted or promoted, never both, since the two predicates are
+/// disjoint on `origin`.
+pub(crate) fn reroot_markers<'e, S: EvalSemantics>(
+    expr: &'e Expr,
+    root: &RootWitness,
+) -> Cow<'e, Expr> {
+    rewrite_markers(expr, &|marker| {
+        if marker_needs_demotion(marker, root) {
+            Some(Origin::Untracked)
+        } else if S::TAG == EvalTag::Jq && marker_is_root(marker, root) {
+            Some(Origin::Snapshot)
+        } else {
+            None
+        }
+    })
+}
+
+/// Rebuild `expr` with every [`Expr::TrackedVar`] marker for which `rewrite`
+/// answers `Some(origin)` replaced by a copy carrying that origin, or
+/// `Cow::Borrowed(expr)` when it answers `None` for all of them -- checked
+/// once via [`any_subexpr`] before paying for a rebuild, since the call
+/// sites that thread this through `eval_on_owned`/`eval_each_owned` pass a
+/// genuinely arbitrary expression, most of which contain no `TrackedVar` at
+/// all. `Tracked::node` is kept on a rewritten marker unchanged: the cursor
+/// routes (`key`/`path`/`parent`, #2072) read `node`, never `origin`, and
+/// must keep answering. A marker is memoized by `Rc` pointer (`BTreeMap`,
+/// matching `DeleteTrieBuilder::intern`'s own pointer-keyed memo) so `k`
+/// occurrences of one shared marker clone its value once, not `k` times.
+fn rewrite_markers<'e>(
+    expr: &'e Expr,
+    rewrite: &dyn Fn(&Tracked) -> Option<Origin>,
+) -> Cow<'e, Expr> {
+    if !any_subexpr(
+        expr,
+        &mut |e| matches!(e, Expr::TrackedVar(marker) if rewrite(marker).is_some()),
+    ) {
         return Cow::Borrowed(expr);
     }
 
-    fn demote_walk(
+    fn walk(
         expr: &Expr,
-        root: &RootWitness,
+        rewrite: &dyn Fn(&Tracked) -> Option<Origin>,
         memo: &mut BTreeMap<usize, Rc<Tracked>>,
     ) -> Expr {
         if let Expr::TrackedVar(marker) = expr {
-            if marker_needs_demotion(marker, root) {
+            if let Some(origin) = rewrite(marker) {
                 let key = Rc::as_ptr(marker) as usize;
-                let demoted = memo.entry(key).or_insert_with(|| {
+                let rewritten = memo.entry(key).or_insert_with(|| {
                     Rc::new(Tracked {
                         value: marker.value.clone(),
-                        origin: Origin::Untracked,
+                        origin,
                         node: marker.node.clone(),
                     })
                 });
-                return Expr::TrackedVar(Rc::clone(demoted));
+                return Expr::TrackedVar(Rc::clone(rewritten));
             }
             return expr.clone();
         }
         // #3036: `map_subexprs` leaves a resolved `DefCall`'s body alone --
         // right for substitution, whose scope the body already closed over,
         // but a marker substituted into that body *before* the call was
-        // resolved is exactly what a demotion has to reach (`. as $x | def
+        // resolved is exactly what a rewrite has to reach (`. as $x | def
         // f: ($x.a = 9); {a:1} | f`), and `any_subexpr` descends there, so
         // the precheck already promised it would be handled.
         if let Expr::DefCall {
@@ -29243,23 +29334,23 @@ pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> 
             bound: _,
         } = expr
         {
-            let body = demote_walk(&def.body, root, memo);
+            let body = walk(&def.body, rewrite, memo);
             return Expr::DefCall {
                 def: Rc::new(FuncDefData {
                     name: def.name.clone(),
                     params: def.params.clone(),
                     body,
                 }),
-                args: args.iter().map(|a| demote_walk(a, root, memo)).collect(),
+                args: args.iter().map(|a| walk(a, rewrite, memo)).collect(),
                 frames: *frames,
                 bound: BoundBody::default(),
             };
         }
-        map_subexprs(expr, &mut |child| demote_walk(child, root, memo))
+        map_subexprs(expr, &mut |child| walk(child, rewrite, memo))
     }
 
     let mut memo = BTreeMap::new();
-    Cow::Owned(demote_walk(expr, root, &mut memo))
+    Cow::Owned(walk(expr, rewrite, &mut memo))
 }
 
 /// Whether [`demote_rebuilt_markers`] would rebuild `expr` against `root`
@@ -97279,6 +97370,131 @@ mod tests {
             ..bare.clone()
         };
         assert!(!marker_needs_demotion(&untracked, &RootWitness::Owned));
+    }
+
+    /// #3037: `reroot_markers`' promotion is the accepting-direction twin of
+    /// its demotion. An `Untracked` marker whose recorded node *is* the
+    /// root's document node becomes a `Snapshot`; one naming another node,
+    /// one with no node, one against an `Owned`/`OwnedRoot` root, and a
+    /// marker of any other origin are left exactly as they are (borrowed
+    /// back untouched). jq mode promotes, yq mode never does, and a marker
+    /// is never both demoted and promoted.
+    #[test]
+    fn reroot_markers_only_lifts_the_roots_own_node_3037() {
+        let value = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let node = |node: usize, document: usize| BindOrigin::Node { node, document };
+        let marker = |origin: Origin, node: Option<BindOrigin>| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin,
+                node,
+            }))
+        };
+        let origin_of = |e: &Expr| match e {
+            Expr::TrackedVar(m) => m.origin.clone(),
+            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3037)"
+        };
+        let root = RootWitness::Node {
+            node: 3,
+            document: 9,
+        };
+
+        let same = marker(Origin::Untracked, Some(node(3, 9)));
+        assert!(marker_is_root(
+            match &same {
+                Expr::TrackedVar(m) => m,
+                _ => unreachable!(),
+            },
+            &root
+        ));
+        assert_eq!(
+            origin_of(&reroot_markers::<JqSemantics>(&same, &root)),
+            Origin::Snapshot
+        );
+        // yq mode: never promoted (real yq's write through a variable is a
+        // no-op, so an acceptance here would write where yq does not).
+        assert_eq!(
+            origin_of(&reroot_markers::<YqSemantics>(&same, &root)),
+            Origin::Untracked
+        );
+
+        for (label, e, expected) in [
+            (
+                "other node",
+                marker(Origin::Untracked, Some(node(4, 9))),
+                Origin::Untracked,
+            ),
+            (
+                "other document",
+                marker(Origin::Untracked, Some(node(3, 8))),
+                Origin::Untracked,
+            ),
+            (
+                "no node",
+                marker(Origin::Untracked, None),
+                Origin::Untracked,
+            ),
+            (
+                "not untracked",
+                marker(
+                    Origin::At {
+                        invocation: 1,
+                        path: BindPath(PathPrefix::root()),
+                    },
+                    Some(node(3, 9)),
+                ),
+                Origin::At {
+                    invocation: 1,
+                    path: BindPath(PathPrefix::root()),
+                },
+            ),
+        ] {
+            let rerooted = reroot_markers::<JqSemantics>(&e, &root);
+            assert!(matches!(rerooted, Cow::Borrowed(_)), "{label}");
+            assert_eq!(origin_of(&rerooted), expected, "{label}");
+        }
+        for other_root in [RootWitness::Owned, RootWitness::OwnedRoot(5)] {
+            assert!(matches!(
+                reroot_markers::<JqSemantics>(&same, &other_root),
+                Cow::Borrowed(_)
+            ));
+        }
+        // One walk, both directions: a `Snapshot` naming another node is
+        // demoted while an `Untracked` naming this one is promoted, in the
+        // same expression.
+        let both = Expr::Comma(vec![
+            marker(Origin::Snapshot, Some(node(4, 9))),
+            marker(Origin::Untracked, Some(node(3, 9))),
+        ]);
+        match reroot_markers::<JqSemantics>(&both, &root).as_ref() {
+            Expr::Comma(parts) => {
+                assert_eq!(origin_of(&parts[0]), Origin::Untracked);
+                assert_eq!(origin_of(&parts[1]), Origin::Snapshot);
+            }
+            other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3037)"
+        }
+    }
+
+    /// yq mode is untouched (#3037): real yq's assignment through a
+    /// variable is a no-op that prints the document unchanged, where
+    /// succinctly refuses loudly -- a pre-existing divergence in the safe
+    /// direction. The promotion is jq-only so it stays a refusal rather
+    /// than becoming a write yq does not perform. (The CLI-route twin is
+    /// `test_navigated_bind_yq_mode_unchanged_3037` in `jq_cli_tests.rs`;
+    /// this entry point takes the eager evaluator, which never carried a
+    /// bind's node identity in either mode.)
+    #[test]
+    fn test_yq_mode_navigated_bind_unchanged_3037() {
+        yq_query!(
+            br#"{"a":{"b":1}}"#,
+            r".a as $y | .a | ($y.b) = 9",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of {"b":1}"#
+                );
+            }
+        );
     }
 
     /// #3036: `try BODY catch HANDLER`'s handler is checked against the

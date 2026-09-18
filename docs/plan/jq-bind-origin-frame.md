@@ -233,11 +233,18 @@ Three findings, in order of what they cost:
   non-demoting `eval_each_owned_bridged`), plus `OwnedIdentity::exact`/`root`/`root_witness`
   for the owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
   paragraph for the refuse-only flips.
-- **Value-mode bindings.** `eval_as` (the non-path-tracked evaluator) still binds with no
-  path at all, so `.a as $y | path(.a | $y)` — jq `["a"]` — stays refuse-only. Closing it
-  needs document-absolute identity reachable from a value-mode cursor plus
-  `needs_path_context` routing to decide when to pay for it; it is the accepting-direction
-  twin of #2642 and belongs in the same follow-up, not here.
+- **Value-mode bindings — the root case closed by
+  [#3037](https://github.com/rust-works/succinctly/issues/3037).** A navigated bind made
+  outside any resolver (`Origin::Untracked`) used where the register *is* that node
+  (`.a as $y | .a | path($y)`, `($y.b) = 9`) is promoted to a `Snapshot` at any funnel whose
+  live cursor is the marker's recorded node (`reroot_markers`: the #2642 node-identity proof
+  run in the accepting direction, jq mode only). The same change rebased the one funnel
+  that never demoted — the assignment family's fallback into `eval_full` — which wrote
+  through a root `Snapshot` re-navigated onto an equal-valued sibling. The **positional**
+  rows (`.a as $y | path(.a | $y)` — jq `["a"]`) stay refuse-only: the marker must certify at
+  a non-root register position, which needs a document-absolute bind path reachable from a
+  value-mode cursor (the `Origin::At` machinery) plus `needs_path_context` routing to decide
+  when to pay for it — scoped separately.
 - [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
   navigating inside their own jq-level definitions against a *constructed* value inside
   `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and

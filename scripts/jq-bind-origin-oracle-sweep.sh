@@ -57,6 +57,16 @@
 # register" (`off-register-frame`) -- carried as `agree` rows: both binaries
 # must exit 5 with nothing on stdout.
 #
+# The `navigated-bind-*` and `root-snapshot-renavigated-*` rows are #3037: a
+# variable bound from a navigated position *outside* any resolver (`.a as
+# $y`, `Origin::Untracked`) used where the register really is that same node
+# -- promoted to a `Snapshot` at a funnel whose live cursor is the marker's
+# own node -- and, in the same funnel, the fabrication the assignment
+# family's fallback into `eval_full` had: a root `Snapshot` re-navigated onto
+# an equal-valued sibling through `$r` wrote through it on `main` (jq
+# refuses). The sibling/rebuilt/ambiguous rows are carried as `agree` rows:
+# both binaries must exit 5.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -309,6 +319,38 @@ in-evaluator-resolver-select-cond	{"a":1}	. as $x | path(select(($x.a = 9) | tru
 in-evaluator-resolver-computed-key	{"a":1}	. as $x | .[($x.a = 9 | "a")] = 5
 in-evaluator-update-paren-root	{"a":1}	. as $x | (.) |= ($x.a = 9)
 in-evaluator-update-second-path	{"a":1,"b":2}	. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else . end)
+navigated-bind-same-node-path	{"a":{"b":1}}	.a as $y | .a | path($y)
+navigated-bind-same-node-assign	{"a":{"b":1}}	.a as $y | .a | ($y.b) = 9
+navigated-bind-same-node-del	{"a":{"b":1}}	.a as $y | .a | del($y.b)
+navigated-bind-same-node-update	{"a":{"b":1}}	.a as $y | .a | $y |= 5
+navigated-bind-same-node-compound	{"a":{"b":1}}	.a as $y | .a | ($y.b) += 1
+navigated-bind-same-node-first	{"a":{"b":1}}	.a as $y | .a | first(.) | path($y)
+navigated-bind-same-node-iterate-source	{"a":{"b":1}}	.[] as $y | .a | path($y)
+navigated-bind-same-node-scalar	{"a":{"b":1}}	.a.b as $y | .a.b | path($y)
+navigated-bind-same-node-continues	{"a":{"b":1}}	.a as $y | .a | path($y.b)
+navigated-bind-same-node-limit	{"a":{"b":1}}	limit(1; .a as $y | .a | path($y))
+navigated-bind-same-node-def	{"a":{"b":1}}	def f: .a as $y | .a | path($y); f
+navigated-bind-same-node-array	{"a":[1,2]}	.a as $y | .a | del($y[0])
+navigated-bind-sibling-path	{"a":{"b":1},"c":{"b":1}}	.a as $y | .c | path($y)
+navigated-bind-sibling-assign	{"a":{"b":1},"c":{"b":1}}	.a as $y | .c | ($y.b) = 9
+navigated-bind-sibling-update	{"a":{"b":1},"c":{"b":1}}	.a as $y | .c | $y |= 5
+navigated-bind-sibling-del	{"a":{"b":1},"c":{"b":1}}	.a as $y | .c | del($y.b)
+navigated-bind-root-register	{"a":{"b":1}}	.a as $y | path($y)
+navigated-bind-descendant	{"a":{"b":{"c":1}}}	.a as $y | .a.b as $z | .a | path($z)
+navigated-bind-rebuilt	{"a":{"b":1},"c":{"b":1}}	.a as $y | .a | (tojson|fromjson) | ($y.b) = 9
+navigated-bind-constructed	{"a":{"b":1},"c":{"b":1}}	.a as $y | .a | {b:1} | ($y.b) = 9
+navigated-bind-ambiguous-source	{"a":[{"b":1},{"b":1}]}	.a[1] as $y | .a[] | ($y.b) = 9
+root-snapshot-renavigated-sibling-assign	{"a":{"b":1},"c":{"b":1}}	. as $r | .a | . as $x | $r | .c | ($x.b) = 9
+root-snapshot-renavigated-sibling-update	{"a":{"b":1},"c":{"b":1}}	. as $r | .a | . as $x | $r | .c | $x |= 5
+root-snapshot-renavigated-sibling-limit	{"a":{"b":1},"c":{"b":1}}	limit(1; . as $r | .a | . as $x | $r | .c | ($x.b) = 9)
+root-snapshot-renavigated-sibling-def	{"a":{"b":1},"c":{"b":1}}	def f: . as $r | .a | . as $x | $r | .c | ($x.b) = 9; f
+root-snapshot-renavigated-own-node	{"a":{"b":1},"c":{"b":1}}	. as $r | .a | . as $x | $r | .a | ($x.b) = 9
+navigated-bind-positional-path	{"a":{"b":1}}	.a as $y | path(.a | $y)
+navigated-bind-positional-assign	{"a":{"b":1}}	.a as $y | (.a | ($y.b)) = 9
+navigated-bind-embed	{"a":{"b":1}}	.a as $y | {k:.a} | .k | path($y)
+navigated-bind-reduce-update	{"a":{"b":1}}	reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)
+navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | path($y))
+navigated-bind-bool-sibling	{"a":true,"c":true}	.a as $y | .c | $y |= 5
 identity-at-root-getpath	{"a":{"b":2}}	path(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-del	{"a":{"b":2},"c":1}	del(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-assign	{"a":{"b":2}}	(. as $x | .a | $x | getpath(["a"]) | .b) = 9
@@ -350,7 +392,9 @@ CASES_EOF
 # the shell expanding it -- but keep single quotes *balanced* across the
 # block: bash still scans them while finding the end of the enclosing
 # `$( )`, and an odd count fails the whole script with "unexpected EOF
-# while looking for matching `''" (#2978 review round).
+# while looking for matching `''" (#2978 review round). Likewise never open
+# a `(` before a `#`: bash reads the `#` as a comment to end of line inside
+# the `$( )`, so the closing `)` vanishes (#3037).
 REFUSE_ONLY=$(cat <<'REFUSE_EOF'
 value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
 tojson-between:tojson/fromjson are not on cannot_move_register's proven allowlist (#2041)
@@ -383,6 +427,12 @@ in-evaluator-input-embed-object:#3036 -- same as in-evaluator-input-embed-array 
 in-evaluator-input-reduce-empty:#3036 -- same as in-evaluator-input-embed-array for a fold that returns its accumulator unchanged
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
 in-evaluator-input-catch-own-value:#3036 -- on the input-queue route the marker carries no node witness, so `try_payload_root` cannot prove the payload is its node; the generic route keeps it accepted
+navigated-bind-positional-path:#3037 residual -- the marker certified at a non-root register position inside the invocation needs a document-absolute bind path -- the Origin::At machinery of #2042, reached from a value-mode bind; scoped separately
+navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positional-path, the write twin
+navigated-bind-embed:#2889 -- the owned-embed residual ({k:.a} | .k), unchanged by #3037
+navigated-bind-reduce-update:#3037 residual -- the UPDATE of reduce re-enters the eager evaluator with an owned accumulator; its eval_as carries no node for a navigated bind (#2072 gave the generic evaluator that, not this one), and there is no cursor at the funnel to promote against
+navigated-bind-catch-handler:#3037 residual -- same as navigated-bind-reduce-update, through a catch handler
+navigated-bind-bool-sibling:pre-existing -- the jv_identical rule of jq admits a null/bool by value regardless of node, but the TrackedVar arm of the resolver consults the origin first; ($y | .) = 5 already answers since the . stage re-establishes by value
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 REFUSE_EOF

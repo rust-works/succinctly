@@ -66,7 +66,7 @@ use super::eval::{
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
     pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks,
+    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks, reroot_markers,
     resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
     stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
@@ -2830,7 +2830,10 @@ fn bridge_to_full_evaluator<S: EvalSemantics, V: DocumentValue>(
     // this call's own root first (a no-op, `Cow::Borrowed`, unless `expr`
     // actually contains one).
     let root = RootWitness::of(cursor.as_ref());
-    let expr = demote_rebuilt_markers(expr, &root);
+    // #3037: `reroot_markers`, not `demote_rebuilt_markers` -- this root is a
+    // live cursor, so an `Untracked` marker bound from this very node is
+    // promoted to a `Snapshot` for the call (jq mode; see its doc comment).
+    let expr = reroot_markers::<S>(expr, &root);
     match bridge_ambient_input::<_, S>(&expr, &value, cursor) {
         Ok(owned) => eval_on_owned::<S, V>(&expr, owned, optional),
         Err(e) if suppresses(&e, optional) => GenericResult::None,
@@ -2859,7 +2862,7 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     // #2642: same rebuilt-root demotion as `bridge_to_full_evaluator`'s own
     // sibling fix -- see its comment.
     let root = RootWitness::of(cursor.as_ref());
-    let expr = demote_rebuilt_markers(expr, &root);
+    let expr = reroot_markers::<S>(expr, &root);
     match bridge_ambient_input::<_, S>(&expr, &value, cursor) {
         Ok(owned) => drain_result_generic(eval_on_owned::<S, V>(&expr, owned, optional), sink),
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
@@ -2904,7 +2907,7 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     // #2642: same rebuilt-root demotion as `bridge_to_full_evaluator`'s own
     // fix -- see its comment.
     let root = RootWitness::of(cursor.as_ref());
-    let expr = demote_rebuilt_markers(expr, &root);
+    let expr = reroot_markers::<S>(expr, &root);
     match bridge_ambient_input::<_, S>(&expr, &value, cursor) {
         Ok(owned) => eval_each_owned_bridged::<S>(&expr, &owned, optional, &mut |v| {
             sink.push(GenericItem::Owned(v))
@@ -5265,7 +5268,7 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         // #2642: `cursor` is this call's own root -- demote any `Snapshot`
         // marker `expr` carries that isn't proven to be this document node.
         let root = RootWitness::of(Some(&cursor));
-        let expr = demote_rebuilt_markers(expr, &root);
+        let expr = reroot_markers::<S>(expr, &root);
         return eval_each_owned_collect::<S, C::Value>(&expr, &owned, false);
     }
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
@@ -5371,7 +5374,7 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         // #2642: `cursor` is this call's own root -- demote any `Snapshot`
         // marker `expr` carries that isn't proven to be this document node.
         let root = RootWitness::of(Some(&cursor));
-        let expr = demote_rebuilt_markers(expr, &root);
+        let expr = reroot_markers::<S>(expr, &root);
         return match eval_each_owned_bridged::<S>(&expr, &owned, false, &mut owned_sink) {
             Flow::Exhausted => None,
             // Kept for the same reason as the streaming branch below.
@@ -6957,7 +6960,7 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     let run_catch = |payload: &OwnedValue| -> GenericResult<V> {
         match catch {
             Some(catch_expr) => {
-                let catch_expr = demote_rebuilt_markers(catch_expr, &try_payload_root(inner));
+                let catch_expr = reroot_markers::<S>(catch_expr, &try_payload_root(inner));
                 eval_each_owned_collect::<S, V>(&catch_expr, payload, optional)
             }
             None => GenericResult::None,
@@ -8164,6 +8167,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // there too. A closed term bridges with `OwnedValue::Null`; the
             // re-serialize and re-index below then cost nothing either,
             // since they run on that `Null`.
+            // #2642 / #3036 / #3037: this is the one funnel into `eval.rs`'s
+            // resolver that neither the bridges nor the owned re-entries
+            // covered, and the assignment family (`=`, `|=`, `+=`, ...)
+            // with a cursor lands here whenever the owned identity pipe
+            // declines it. Unrebased, a `Snapshot` marker frozen at `.a`
+            // certified by value against an equal-valued sibling the
+            // pipe had since moved to: `. as $r | .a | . as $x | $r | .c |
+            // ($x.b) = 9` wrote `{"b":9}` where jq 1.7.1 refuses (`del`
+            // and `path` of the same shape already refused, through the
+            // demoting funnels). Rebase against this call's own root
+            // exactly as every other funnel does -- demoting a marker that
+            // does not name it and, in jq mode, promoting an `Untracked`
+            // one that *is* it (`.a as $y | .a | ($y.b) = 9`, #3037).
+            let root = RootWitness::of(cursor.as_ref());
+            let expr = reroot_markers::<S>(expr, &root);
+            let expr = expr.as_ref();
             let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
             let json_str = owned.to_json_for_reindex::<S>();
             let json_bytes = json_str.as_bytes();
@@ -9125,7 +9144,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             // #2642: demote any marker not proven to be `cursor`'s own node
             // before resolving, exactly as the eager arm does.
             let root = RootWitness::of(cursor.as_ref());
-            let demoted = demote_rebuilt_markers(path_expr, &root);
+            let demoted = reroot_markers::<S>(path_expr, &root);
             // #2280: `optional` suppresses a decode failure into no output.
             let owned = match to_owned_with_cursor::<_, S>(&value, cursor) {
                 Ok(v) => v,
@@ -9139,7 +9158,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                 // `to_owned_with_cursor` a second time over the whole
                 // document to rebuild exactly these values.
                 let owned_builtin_expr = Expr::Builtin(Builtin::Path(path_expr.clone()));
-                let builtin_expr = demote_rebuilt_markers(&owned_builtin_expr, &root);
+                let builtin_expr = reroot_markers::<S>(&owned_builtin_expr, &root);
                 return drain_result_generic(
                     eval_on_owned::<S, _>(&builtin_expr, owned, optional),
                     sink,
@@ -9386,7 +9405,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
-    let f = demote_rebuilt_markers(f, &root);
+    let f = reroot_markers::<S>(f, &root);
     let mut empty_rounds = 0usize;
     loop {
         let mut stopped = false;
@@ -9693,7 +9712,7 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #3036: see `try_payload_root`. Demoted ahead of both routes below.
-    let handler = demote_rebuilt_markers(handler, payload_root);
+    let handler = reroot_markers::<S>(handler, payload_root);
     let handler: &Expr = &handler;
     if let Some(c) = cursor {
         let stages = owned_identity_body_stages(handler);
@@ -22427,7 +22446,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // is a different node). Demote any marker not proven to be
             // `cursor`'s own node before either resolution route below.
             let root = RootWitness::of(cursor.as_ref());
-            let path_expr = demote_rebuilt_markers(path_expr, &root);
+            let path_expr = reroot_markers::<S>(path_expr, &root);
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
             if reindex_bridge_is_identity(&owned) {
                 return query_result_to_generic::<V, S>(crate::jq::eval::builtin_path_on_owned::<
@@ -22438,7 +22457,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 ));
             }
             let owned_builtin_expr = Expr::Builtin(builtin.clone());
-            let builtin_expr = demote_rebuilt_markers(&owned_builtin_expr, &root);
+            let builtin_expr = reroot_markers::<S>(&owned_builtin_expr, &root);
             eval_on_owned::<S, _>(&builtin_expr, owned, optional)
         }
 
@@ -22827,7 +22846,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // (e.g. `path(...)`/`del(...)` nested inside this builtin's own
             // argument), so it must be checked against this call's own root.
             let root = RootWitness::of(cursor.as_ref());
-            let expr = demote_rebuilt_markers(&Expr::Builtin(builtin.clone()), &root).into_owned();
+            let expr = reroot_markers::<S>(&Expr::Builtin(builtin.clone()), &root).into_owned();
             let owned = owned_or_suppress!(
                 bridge_ambient_input::<_, S>(&expr, &value, cursor),
                 optional
@@ -24592,7 +24611,7 @@ fn owned_identity_values<S: EvalSemantics>(
     optional: bool,
     root: &RootWitness,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    let expr = demote_rebuilt_markers(expr, root);
+    let expr = reroot_markers::<S>(expr, root);
     let mut values = Vec::new();
     let flow = eval_each_owned_bridged::<S>(&expr, value, optional, &mut |v| {
         values.push(v);
@@ -26455,7 +26474,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         | Expr::Builtin(
             Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
         ) => {
-            let stage = demote_rebuilt_markers(stage, &id.root_witness());
+            let stage = reroot_markers::<S>(stage, &id.root_witness());
             eval_each_owned_bridged::<S>(&stage, &value, optional, &mut |_| Demand::Continue)
         }
         _ => {
@@ -26526,7 +26545,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             // for the node's own unrebuilt value, and demotes everything
             // otherwise -- rather than the blanket `Owned` witness the
             // #2642 review tried and reverted here.
-            let stage_expr = demote_rebuilt_markers(stage_expr, &id.root_witness());
+            let stage_expr = reroot_markers::<S>(stage_expr, &id.root_witness());
             let stage_expr: &Expr = &stage_expr;
             let mut downstream: Option<Flow> = None;
             let mut emit = |output: OwnedValue| -> Demand {
