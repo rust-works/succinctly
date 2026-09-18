@@ -51728,9 +51728,65 @@ fn format_strftime(
         hour
     };
     const WEEKDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const WEEKDAY_FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     const MONTH_ABBR: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    const MONTH_FULL: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    // jq calls the C library's `strftime`; its name-lookup tables answer a
+    // literal `?` for an out-of-range weekday (0-6) or month (0-11 in the
+    // array, 1-12 here), confirmed live against the pinned C-locale oracle for
+    // weekday=-1/7 and month=-1/12/13 (#3159). The numeric `%w`/`%u`/`%m`
+    // specifiers deliberately do not range-check -- jq prints the raw value.
+    let weekday_abbr = |weekday: i64| -> &'static str {
+        if (0..=6).contains(&weekday) {
+            WEEKDAY_ABBR[weekday as usize]
+        } else {
+            "?"
+        }
+    };
+    let weekday_full = |weekday: i64| -> &'static str {
+        if (0..=6).contains(&weekday) {
+            WEEKDAY_FULL[weekday as usize]
+        } else {
+            "?"
+        }
+    };
+    let month_abbr = |month: i64| -> &'static str {
+        if (1..=12).contains(&month) {
+            MONTH_ABBR[(month - 1) as usize]
+        } else {
+            "?"
+        }
+    };
+    let month_full = |month: i64| -> &'static str {
+        if (1..=12).contains(&month) {
+            MONTH_FULL[(month - 1) as usize]
+        } else {
+            "?"
+        }
+    };
 
     while let Some(c) = chars.next() {
         if c == '%' {
@@ -51805,8 +51861,8 @@ fn format_strftime(
                 // rather than recursing into this same matcher.
                 Some('c') => result.push_str(&format!(
                     "{} {} {day:2} {hour:02}:{minute:02}:{second:02} {year:04}",
-                    WEEKDAY_ABBR[weekday as usize % 7],
-                    MONTH_ABBR[(month - 1) as usize % 12],
+                    weekday_abbr(weekday),
+                    month_abbr(month),
                 )),
                 Some('r') => result.push_str(&format!(
                     "{hour12:02}:{minute:02}:{second:02} {}",
@@ -51821,39 +51877,16 @@ fn format_strftime(
                     result.push_str(&format!("{}", if weekday == 0 { 7 } else { weekday }));
                 } // Monday=1
                 Some('a') => {
-                    result.push_str(WEEKDAY_ABBR[weekday as usize % 7]);
+                    result.push_str(weekday_abbr(weekday));
                 }
                 Some('A') => {
-                    let names = [
-                        "Sunday",
-                        "Monday",
-                        "Tuesday",
-                        "Wednesday",
-                        "Thursday",
-                        "Friday",
-                        "Saturday",
-                    ];
-                    result.push_str(names[weekday as usize % 7]);
+                    result.push_str(weekday_full(weekday));
                 }
                 Some('b' | 'h') => {
-                    result.push_str(MONTH_ABBR[(month - 1) as usize % 12]);
+                    result.push_str(month_abbr(month));
                 }
                 Some('B') => {
-                    let names = [
-                        "January",
-                        "February",
-                        "March",
-                        "April",
-                        "May",
-                        "June",
-                        "July",
-                        "August",
-                        "September",
-                        "October",
-                        "November",
-                        "December",
-                    ];
-                    result.push_str(names[(month - 1) as usize % 12]);
+                    result.push_str(month_full(month));
                 }
                 Some('C') => result.push_str(&format!("{:02}", year / 100)),
                 Some('D' | 'x') => {
@@ -84666,6 +84699,70 @@ mod tests {
         query!(b"1700000000", r#"gmtime | strftime("%D=%x %T=%X")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "11/14/23=11/14/23 22:13:20=22:13:20");
+            }
+        );
+    }
+
+    /// #3159: an out-of-range `weekday` (array index 6) or `month` (array
+    /// index 1) indexes the name-lookup arrays with a big-wrapping
+    /// `as usize % N`, silently producing a *different, valid-looking* day or
+    /// month name -- `[2020,0,1,0,0,0,-1,0] | strftime("%a")` printed "Mon"
+    /// where jq prints "?". jq calls the C library's `strftime`, whose name
+    /// tables fall back to a literal `?` for an out-of-range index; the
+    /// numeric `%w`/`%u`/`%m` specifiers don't range-check, matching jq's raw
+    /// value printing. Every row below confirmed against the pinned
+    /// C-locale `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn test_strftime_out_of_range_weekday_month_names_3159() {
+        // Weekday out of range: -1 (negative) and 7 (one past valid 0-6).
+        query!(b"null", r#"[2020,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "?|?|-1|-1|? Jan  1 00:00:00 2020");
+            }
+        );
+        query!(b"null", r#"[2020,0,1,0,0,0,7,0] | strftime("%a|%A|%w|%u|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "?|?|7|7|? Jan  1 00:00:00 2020");
+            }
+        );
+        // Boundary values: weekday 6 is the last valid name index.
+        query!(b"null", r#"[2020,0,1,0,0,0,6,0] | strftime("%a|%A")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Sat|Saturday");
+            }
+        );
+        // Month out of range: -1, 12, 13 (valid array months are 0-11).
+        query!(b"null", r#"[2020,-1,1,0,0,0,0,0] | strftime("%b|%h|%B|%m|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "?|?|?|00|Sun ?  1 00:00:00 2020");
+            }
+        );
+        query!(b"null", r#"[2020,12,1,0,0,0,0,0] | strftime("%b|%B|%m|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "?|?|13|Sun ?  1 00:00:00 2020");
+            }
+        );
+        query!(b"null", r#"[2020,13,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "?|?|14");
+            }
+        );
+        // Boundary value: array month 11 is the last valid name index.
+        query!(b"null", r#"[2020,11,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Dec|December|12");
+            }
+        );
+        // Both out of range at once.
+        query!(b"null", r#"[2020,-1,1,0,0,0,-1,0] | strftime("%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "? ?  1 00:00:00 2020");
+            }
+        );
+        // Regression guard: the valid range still formats as before.
+        query!(b"null", r#"[2020,0,1,0,0,0,0,0] | strftime("%a|%A|%b|%B|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Sun|Sunday|Jan|January|Sun Jan  1 00:00:00 2020");
             }
         );
     }
