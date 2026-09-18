@@ -1261,7 +1261,13 @@ is the revert that established what the other one costs.
    now reaching nested pipes `... \| $x \| .b \| .c` would have navigated through it too.
    Such a bind is `Origin::Untracked` now (`identity_bind_position`); a marker source keeps
    its own origin, and a `null`/`bool` `.` loses nothing since `jv_identical` admits those by
-   value. Two refuse-only residuals, both in the sweep: `path(.a \| try error(.) catch .)` —
+   value. The same register does **not** yet reach a fold's UPDATE/EXTRACT body: that route
+   (`FoldRegister::resolve`) passes its register to `resolve_seq` explicitly under a frame that
+   carries none, so `del(foreach .a as $v (.; try ($v \| .b); .))` on `{"a":{"b":1}}` still
+   echoes the document where jq writes `{"a":{}}`, as does `del(.a as $y \| .a \| 5 \| foreach
+   range(1) as $i (0; .; try ($y \| .b)))` — pre-existing, filed as
+   [#3145](https://github.com/rust-works/succinctly/issues/3145). Two refuse-only residuals,
+   both in the sweep: `path(.a \| try error(.) catch .)` —
    `error(.)` raises the register node itself and jq answers `["a"]`, but a payload equal to
    the register by value cannot be told from a rebuilt copy (`error({"a":1,"b":2})` refuses in
    jq), so the handler stays untracked unless the payload is `null`/`bool`; and `(if true

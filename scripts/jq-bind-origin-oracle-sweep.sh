@@ -452,6 +452,8 @@ computed-identity-bind-navigates	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as 
 computed-identity-bind-null-register	{"a":null}	path(.a | null | . as $x | $x | .b)
 computed-identity-bind-marker-source	{"a":{"b":{"c":1}}}	path(. as $x | 5 | $x as $y | $y)
 computed-identity-bind-mixed-if	{"a":{"b":{"c":1}}}	path(. as $x | 5 | (if true then $x else . end) as $y | $y)
+catch-break-payload-not-register	{"a":null}	(.a | label $out | try (break $out) catch .b) = 1
+catch-break-restores-register	{"a":null}	path(.a as $y | .a | label $out | try (break $out) catch $y)
 CASES_EOF
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
