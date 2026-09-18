@@ -1658,15 +1658,21 @@ answers `["b"]` — and classified the two residuals appended below):
   `path(.a[])`) always agreed — nothing in it is observable per element — and keeps #2061/
   #2168's no-materialization cursor walk untouched.
 
-  **Two shapes still collect**, neither introduced by that work and both tracked as
-  [#2925](https://github.com/rust-works/succinctly/issues/2925). A document the reindex bridge
-  will not round-trip identically (any `Float`, or a number literal too large to survive the
-  trip) takes the bridge, which collects — so the *document*, not the filter, selects the
-  route: `[limit(1; path((.a|stderr),(.b|stderr)))]` writes `1` on `{"a":1,"b":2}` and `12`
-  once a 300-digit literal is added. And the stop reaches the branch producer but not a
-  generator in *index* position: `[limit(1; path(.[("a"|stderr),("b"|stderr)]))]` writes `ab`
-  where jq writes `a`, which is `resolve_index_expr`'s eager key evaluation — the same function
-  #2032 sits in.
+  **Two shapes still collected after that work, neither introduced by it, both tracked and
+  now closed as [#2925](https://github.com/rust-works/succinctly/issues/2925).** A generator
+  in *index* position closed with [#2267](https://github.com/rust-works/succinctly/issues/2267):
+  `E[K]`/`E[S:T]` are native `resolve_node_sink` arms now, so a bound reaches the key and
+  bound generators too (`[limit(1; path(.[("a"|stderr),("b"|stderr)]))]` writes `a`, matching
+  jq, where it used to write `ab`). And a document the reindex bridge will not round-trip
+  identically (a number literal past `REINDEX_LITERAL_LEN_CAP`, 256 characters, or a NaN
+  spelling — a bare `Float` has been bridge-identity since #2902 and no longer selects this
+  route) now forwards demand across the bridge the same way, instead of collecting every path
+  first: `[limit(1; path((.a|stderr),(.b|stderr)))]` writes `1` whether or not a 300-digit
+  literal sits elsewhere in the document. `to_json_for_reindex`'s own respelling of an
+  over-cap literal (`1E+300` for the literal above) is a separate, still-open value-fidelity
+  gap on the same bridge — [#3025](https://github.com/rust-works/succinctly/issues/3025) —
+  unaffected by this fix, since it changes only which entry point the bridge hands the
+  document to, not what the bridge does to the document itself.
 - **`recurse(f)`/`recurse(f; cond)` past its native stack budget finishes one node's own `f`
   before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as

@@ -45999,9 +45999,15 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // consulted `optional` via `suppress_or_raise` -- this function was the
     // one place the pattern hadn't been carried over. Reachable both via the
     // public `succinctly::jq::eval::eval` library API and, via the CLI,
-    // whenever `eval_generic.rs`'s `Builtin::Path` fallback re-enters the
-    // full evaluator for a non-`reindex_bridge_is_identity` value (a `Float`
-    // anywhere in the document).
+    // whenever `eval_generic.rs`'s *eager* `eval_single` arm for
+    // `Builtin::Path` re-enters the full evaluator for a non-
+    // `reindex_bridge_is_identity` value (a number literal past
+    // `REINDEX_LITERAL_LEN_CAP`, or a NaN spelling -- a bare `Float` has
+    // been bridge-identity since #2902). The *lazy* `eval_each_generic` arm
+    // for the same builtin no longer reaches here on that route (#2925): it
+    // hands the same non-identity case to `eval_each_owned_bridged` instead,
+    // which re-enters through `eval_each`'s own lazy `Builtin::Path` arm
+    // (`each_path`), not this eager one.
     let owned = to_owned_or_suppress!(&value, optional);
     builtin_path_on_owned::<W, S>(expr, &owned, optional)
 }

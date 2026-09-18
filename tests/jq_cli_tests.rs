@@ -49338,6 +49338,20 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
 fn path_results_stream_to_their_consumer_2908() -> Result<()> {
     let abc = r#"{"a":1,"b":2,"c":3}"#;
     let probes = "(.a|stderr), (.b|stderr), (.c|stderr)";
+    // #2925: the reindex bridge's own lazy `Builtin::Path` arm, exercised on
+    // a document it will not round-trip identically (a number literal past
+    // `REINDEX_LITERAL_LEN_CAP`, #2902), so `path(f)` takes the bridge
+    // instead of the cursor walk above. Every probe below reads only a
+    // small named field (`.a`/`.b`/`.c`/`.x`), never the oversized `n`
+    // field itself -- printing *that* to stderr hits a separate, unrelated
+    // bug (the bridge respells an over-cap literal, #3025), which this row
+    // set deliberately does not exercise.
+    let abc_big = format!(r#"{{"a":1,"b":2,"c":3,"n":{}}}"#, "9".repeat(300));
+    let label_big = format!(r#"{{"a":1,"c":1,"n":{}}}"#, "9".repeat(300));
+    let prefix_big = format!(r#"{{"a":{{"b":1}},"c":1,"n":{}}}"#, "9".repeat(300));
+    let altq_big = format!(r#"{{"x":[true,false],"n":{}}}"#, "9".repeat(300));
+    let cap256 = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(256));
+    let cap257 = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(257));
     for (input, filter, want_out, want_err, want_code) in [
         // A bound outside `path()` now stops the generator inside it.
         (
@@ -49487,6 +49501,96 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             String::new(),
             0,
         ),
+        // #2925: the reindex-bridge route (a document `reindex_bridge_is_identity`
+        // rejects) now forwards demand the same way the cursor-navigable route
+        // above always did, instead of collecting every path before the bound
+        // outside `path()` ever saw one. Every row below is captured whole from
+        // jq 1.7.1 -- stdout, stderr and exit code -- on a document holding a
+        // 300-character number literal (well past `REINDEX_LITERAL_LEN_CAP`,
+        // #2902), which is what selects this route; the identical filter on the
+        // cap-sized documents above stays on this same table, matching jq.
+        (
+            abc_big.as_str(),
+            "[limit(1; path((.a|stderr), (.b|stderr), (.c|stderr)))]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            abc_big.as_str(),
+            "[first(path((.a|stderr), (.b|stderr), (.c|stderr)))]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            abc_big.as_str(),
+            "[limit(2; path((.a|stderr), (.b|stderr), (.c|stderr)))]".to_string(),
+            "[[\"a\"],[\"b\"]]\n".to_string(),
+            "12".to_string(),
+            0,
+        ),
+        // A `label`/`break` bound reaches it too, same as the cap-sized row.
+        (
+            label_big.as_str(),
+            "[label $o | path((.a|stderr),(.c|stderr)) | ., break $o]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        // #2680's prefix rule still holds on this route: a resolved sibling
+        // already emitted survives a later one erroring.
+        (
+            prefix_big.as_str(),
+            "path(.a.b, .c.d)".to_string(),
+            "[\"a\",\"b\"]\n".to_string(),
+            "jq: error (at <stdin>:0): Cannot index number with string \"d\"\n".to_string(),
+            5,
+        ),
+        (
+            prefix_big.as_str(),
+            "first(path(.a.b, .c.d))".to_string(),
+            "[\"a\",\"b\"]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            prefix_big.as_str(),
+            "[path(.a.b, .c.d)?]".to_string(),
+            "[[\"a\",\"b\"]]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        // The `?//` retry row from the table above, over a document that
+        // takes the bridge -- `.x` narrows away from the oversized `n`
+        // field before the `foreach`/`stderr` runs, so this still probes
+        // #2925's routing without also probing #3025's unrelated respelling.
+        (
+            altq_big.as_str(),
+            "[limit(1; path(.x | foreach (1 as $x ?// $y | (stderr|1)) as $v (.; .)))]"
+                .to_string(),
+            "[[\"x\"],[\"x\"]]\n".to_string(),
+            "[true,false][true,false]".to_string(),
+            0,
+        ),
+        // Must-not-change guard at the cap boundary: 256 characters is
+        // `REINDEX_LITERAL_LEN_CAP` itself and stays on the identity/cursor
+        // route (matching the cap-sized rows above); 257 is one past it and
+        // takes this route -- both agree with jq either way.
+        (
+            cap256.as_str(),
+            "[limit(1; path((.a|stderr),(.b|stderr)))]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            cap257.as_str(),
+            "[limit(1; path((.a|stderr),(.b|stderr)))]".to_string(),
+            "[[\"a\"]]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(input))?;
         assert_eq!(code, want_code, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
@@ -49494,32 +49598,6 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
         assert_eq!(stderr, want_err, "{filter}");
     }
 
-    // #2925's one remaining shape. The second one it recorded -- a generator
-    // in index position -- closed with #2267 and is in the table above now,
-    // which is why this is a single case rather than the loop it used to be.
-    //
-    // A document the reindex bridge will not round-trip identically takes
-    // the bridge, which collects -- so the *document* selects the route, not
-    // the filter. The same filter on `{"a":1,"b":2}` is in the table above,
-    // matching jq. jq 1.7.1 writes `1`; this writes `12`, and the assertions
-    // below carry both so that closing the gap trips this test rather than
-    // passing quietly.
-    let big = format!(r#"{{"a":1,"b":2,"n":{}}}"#, "9".repeat(300));
-    let filter = "[limit(1; path((.a|stderr),(.b|stderr)))]";
-    let (jq_err, our_err) = ("1", "12");
-    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&big))?;
-    assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[[\"a\"]]\n", "{filter}");
-    assert_ne!(
-        our_err, jq_err,
-        "{filter}: this row exists because the two differ -- if they no longer do, \
-         move it into the table above"
-    );
-    assert_eq!(
-        stderr, our_err,
-        "{filter}: #2925's residual changed -- if it closed, move this case into the \
-         table above with jq's own stderr ({jq_err:?})"
-    );
     Ok(())
 }
 
