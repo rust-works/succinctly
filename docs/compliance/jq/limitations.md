@@ -1233,55 +1233,71 @@ separate, pre-existing investigation from this issue's own scope.
 A destructuring pattern's own **computed key** (`{(EXPR): P}`, or an interpolated string
 `{"\(EXPR)": P}`) parses and evaluates since
 [#2677](https://github.com/rust-works/succinctly/issues/2677) — `PatternEntry.key` widened from
-a plain `String` to `ObjectKey` (the same type object construction already used), and
-`extract_pattern_bindings` (value mode)/`walk_pattern` (path mode) resolve the key expression
-against the pattern's own current node via `index_one_owned`, the same generic `.[EXPR]`
-operator used elsewhere (`nth`, `(.a\|tostring)[$k]`) — so a computed key can resolve to a
-*string* (indexing an object) or a *number* (indexing an array, with jq's own float-truncation
-and negative-index wraparound, `path(.arr as {(-1):$q}\|$q)` on an array giving `[-1]`, the raw
-key, matching `path(.arr[-1])`) exactly like `.[EXPR]` does, in both value and path position,
-using the same "Cannot index `<type>` with `<type>`" wording jq's own `INDEX` bytecode gives for
-any key, computed or literal — confirmed live in both positions, including nested computed keys
-and through `\|=`/`del()`. (PR #2873 review caught and fixed an initial version of this that
-unconditionally required a string key, wrongly rejecting a numeric key against an array.)
+a plain `String` to `ObjectKey` (the same type object construction already used), and the
+matcher resolves the key expression against the pattern's own current node via
+`index_one_owned`, the same generic `.[EXPR]` operator used elsewhere (`nth`,
+`(.a\|tostring)[$k]`) — so a computed key can resolve to a *string* (indexing an object) or a
+*number* (indexing an array, with jq's own float-truncation and negative-index wraparound,
+`path(.arr as {(-1):$q}\|$q)` on an array giving `[-1]`, the raw key, matching
+`path(.arr[-1])`; a float-spelled key keeps its spelling as a path component, `[1.7]`, exactly
+as `path(.[1.7])` does since #1088) exactly like `.[EXPR]` does, in both value and path
+position, using the same "Cannot index `<type>` with `<type>`" wording jq's own `INDEX`
+bytecode gives for any key, computed or literal — confirmed live in both positions, including
+nested computed keys and through `\|=`/`del()`. (PR #2873 review caught and fixed an initial
+version of this that unconditionally required a string key, wrongly rejecting a numeric key
+against an array.)
 
-A key expression that is itself a multi-output *generator* (`{("a","b"): $q}` — real jq fans out
-one full pattern-match, and one full run of the surrounding body, per key it yields:
-`{"a":1,"b":2} \| . as {("a","b"):$q} \| $q` is `1` then `2`) or a **zero**-output one
-(`{(empty): $q}`, where real jq legitimately binds nothing and the body never runs, `[. as
-{(empty):$q} \| $q]` is `[]`) now **fans out correctly in value position**:
-`each_pattern_alternatives`/`each_pattern_alternatives_generic` (the `?//`-alternative loops both
-evaluators route a bare, non-`?//` pattern through too) run `body` once per binding-set
-`extract_pattern_bindings` yields, applying the pre-#2677 match-failure retry rule only to the
-key generator's own trailing error/break/halt once every binding-set's body has run — including
-the two hardest interaction cases: a body error partway through a fan-out abandons the
-*remaining* key outputs and retries the next `?//` alternative, keeping whatever already ran
-(`[. as {("a","b"):$q} ?// $z \| if $q==2 then error("boom") else $q end]` on `{"a":1,"b":2}` is
-`[1,null]`), and a zero-output key still *wins* inside a `?//` chain (no fallthrough) even though
-it contributes nothing. `test_pattern_computed_key_fans_out_in_value_position_2677`
-(`tests/jq_cli_tests.rs`) pins both. A third interaction case PR #2873 review found and fixed:
-`key_control` (the key generator's own trailing control, e.g. a `Halt` its *last*, never-bound
-output raised) is computed eagerly, before any binding-set's body runs — an earlier binding-set's
-body already deciding to retry the next `?//` alternative must not silently drop a pending
-`Halt`/uncatchable `Error` that trailing control carries; both evaluators now check it first,
-with priority over any retry decision (`test_pattern_computed_key_review_fixes_2873`).
+**The matcher is jq's backtracking matcher** since
+[#2872](https://github.com/rust-works/succinctly/issues/2872): one demand-driven,
+continuation-passing walk (`walk_pattern_each`, `src/jq/eval.rs`) shared by value mode (`. as
+PATTERN` in both evaluators, the owned-identity pipe, `reduce`/`foreach`'s own pattern) and
+path mode (`path()`/`del()`/assignment targets and the path-mode folds, where each index step
+also moves the register). It follows jq's compilation (`gen_object_matcher`/`gen_array_matcher`)
+exactly: object entries in source order, array elements **right to left**, a computed key's
+outputs produced one at a time and only when something backtracks for them, a later entry's key
+re-run once per earlier binding, and the body run at the end of every completed path through
+the matcher. Consequences, every one confirmed live against jq 1.7.1 and pinned in
+`tests/jq_cli_tests.rs` (`test_pattern_computed_key_*_2872`):
 
-**Path position does not fan out yet** — `walk_pattern`/`resolve_as_pattern`/
-`try_pattern_alternatives` still collapse to a single result via
-`extract_single_pattern_binding` and refuse a multi- or zero-output computed key cleanly
-(`test_pattern_computed_key_multi_output_refuses_in_path_position_2677`), the same reasoning
-that motivated `extract_single_pattern_binding` in the first place: fanning out correctly needs
-each call site's own retry/register machinery threaded through, not just the core function.
-`reduce`/`foreach`'s own pattern (`substitute_foreach_steps`, which both folds now call
-per element) is unaffected either way — a multi-output computed key
-there still refuses in both value and path position. Tracked as follow-up
-[#2872](https://github.com/rust-works/succinctly/issues/2872), alongside `walk_pattern`'s own
-narrower gap that a `Halt`/`Break` interrupting a computed key's generator in path position (or
-in `reduce`/`foreach`'s own pattern) currently downgrades to an ordinary, catchable refusal
-rather than true uncatchable/unwind semantics — a real, but bounded, fidelity gap (still a clean
-refusal, never a wrong value), left for that same follow-up rather than the deeper
-`Result<_, EvalError>` → `Result<_, EvalEscape>` signature change `walk_pattern` would need to
-carry a real `Halt`/`Break` through path-tracking's register machinery.
+- a multi-output key fans out one full body run per output in **every** position — `[path(.
+  as {("a","b"):$q} \| $q)]` is `[["a"],["b"]]`, `(. as {("a","c"):$q} ?// {a:$q} \| $q) \|=
+  "X"` on `{"a":{"b":1},"c":2}` writes both, `reduce . as {("a","b"):$q} ?// $r (0; .+$q)` is
+  `3`, `[path(foreach .[] as {("c","d"):$q} (.; .; $q))]` walks every `(element, key)` pair
+  with its own register; a zero-output key matches nothing and still wins a `?//` chain;
+- the walk is **lazy**: `first(. as {("a", (input\|"b")):$q} \| $q)` never consumes an
+  input, `. as {("a",("K"\|stderr\|"b")):$q} \| ("B\(EXPR)"\|stderr\|empty)` writes
+  `B1KB2`, a `halt`/`error` behind a body error that retried the next `?//` alternative is
+  never reached (`. as {("a", halt_error(7)):$q} ?// $z \| if $q==1 then error("boom") else
+  ($q // $z) end` on `{"a":1}` prints `{"a":1}` and exits 0 — the eager design pinned exit 7
+  here), `[. as {("a","b"):$q, ("K"\|stderr\|"a"):$r} \| [$q,$r]]` writes `KK`, and `. as
+  [{("K1"\|stderr\|"a"):$x},{("K2"\|stderr\|"a"):$y}]` writes `K2K1`;
+- `null` no longer short-circuits a pattern: every key runs against it (`null \| .[k]` is
+  `null`), so `null \| [. as {("a","b"):$q} \| $q]` is `[null,null]` and `null \| . as
+  {(error("E")):$q} \| $q` raises `E` (the pre-#2872 short-circuit answered `null`, and its
+  doc comment's claim that jq did too was false);
+- the `?//` retry rules apply per completed match, partway through the stream: a body error or
+  `break` after k matches retries the next alternative and keeps what was already emitted; a key
+  expression's own error or `break` (raised after the matches its earlier outputs completed)
+  retries the same way, `halt` and an uncatchable error never; in a fold the next alternative
+  resumes from the state the steps already run left (`[label $o \| reduce . as {("a", break
+  $o):$q} ?// $r (0; .+1)]` is `[2]`); the resolver's own refusals in path position still never
+  retry (#2979);
+- the duplicate-name rule is one pass over visit order — a bare pattern keeps the **first**
+  occurrence, a `?//` alternative the **last** — for every container kind and nesting depth,
+  which is what jq's `bind_matcher`/preamble-slot compilation does (`{"a":[1,2],"b":3} \| . as
+  {a:[$x,$x],b:$x} \| $x` is `2`, `3` under `?//`). #1366's per-container spelling ("object
+  keeps first, array keeps last, both inverted under `?//`") was this rule as seen from index
+  order.
+
+Before #2872 value mode built the whole cartesian product of every key's outputs eagerly, and
+path position and both folds refused any key with other than exactly one output through an
+ordinary *catchable* error — which `?//` and `try` read as "this alternative did not match" and
+answered wrongly, a silently dropped write included (`(. as {("a","c"):$q} ?// {a:$q} \| $q)
+\|= "X"` gave `{"a":"X","c":2}`). The claim recorded here at the time, that every unsupported
+site "refuses cleanly, never a wrong value", was therefore false. `scripts/jq-pattern-fanout-fuzz.py`
+is the randomised differential check over the whole alphabet (generators, `empty`, `error`,
+`break`, `halt_error`, `stderr` in keys; nested patterns; `?//`; both folds; every path-mode
+consumer), validated against the pre-#2872 binary, which it flags.
 
 A related, narrower gap the fix surfaced and closed along the way: `map_subexprs`
 (`src/jq/walk.rs`) — the shared tree-rewrite primitive `install_def_calls`/`bind_def` and
