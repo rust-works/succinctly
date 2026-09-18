@@ -1411,13 +1411,27 @@ fn contains_assign(expr: &Expr) -> bool {
     contains_assign_scoped(expr, &mut DefScope::default())
 }
 
-fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool {
-    match expr {
+/// Whether `expr` is itself one of jq's five assignment-shaped operators
+/// (`=`, `|=`, `+=`-and-siblings, `//=`, and the meta form) -- the one
+/// variant list [`contains_assign_scoped`] and [`may_enter_resolver_node`]
+/// both need and previously repeated verbatim; kept here so a new
+/// assignment-shaped `Expr` variant only has to be added once.
+fn is_assignment_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
         Expr::Assign { .. }
-        | Expr::Update { .. }
-        | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. }
-        | Expr::MetaAssign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+            | Expr::MetaAssign { .. }
+    )
+}
+
+fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool {
+    if is_assignment_expr(expr) {
+        return true;
+    }
+    match expr {
         // #2855: `sort_keys(f)` is a write (delegates to `eval_update`
         // internally, `builtin_sort_keys`), so it needs the same
         // recognition `Del`/`SetPath`/`DelPaths` already get here --
@@ -1426,7 +1440,7 @@ fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool 
         // falls back to an empty `CommentTree` for the whole document,
         // losing every sibling's comments and flow style, not just the
         // path this write actually touches.
-        | Expr::Builtin(
+        Expr::Builtin(
             Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_) | Builtin::SortKeys(_),
         ) => true,
         Expr::Paren(inner) | Expr::Optional(inner) => contains_assign_scoped(inner, scope),
@@ -4701,20 +4715,39 @@ fn eval_owned_expr_fork_bridged<S: EvalSemantics>(
     ))
 }
 
-/// [`eval_owned_expr_fork`] or its bridged twin, chosen by whether `input`
-/// is the caller's own ambient value still (#3036) -- the loop shape
-/// `until`/`while` take, where the first round runs on the input and every
-/// later round on a value `update` computed.
+/// [`eval_owned_expr_fork_bridged`] over `expr` or its pre-demoted twin
+/// `demoted`, chosen by whether `input` is the caller's own ambient value
+/// still (#3036) -- the loop shape `until`/`while` take, where the first
+/// round runs on the input and every later round on a value `update`
+/// computed. `demoted` is [`demote_for_owned_reentry`] of `expr`, computed
+/// once by the caller rather than re-walked every round: `cond`/`update`
+/// are the same static expression at every step, so re-demoting them per
+/// step was a full `any_subexpr` scan per iteration, not per loop.
 fn eval_owned_expr_fork_from<S: EvalSemantics>(
     expr: &Expr,
+    demoted: &Expr,
     input: &OwnedValue,
     optional: bool,
     ambient: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    if ambient {
-        eval_owned_expr_fork_bridged::<S>(expr, input, optional)
+    let expr = if ambient { expr } else { demoted };
+    eval_owned_expr_fork_bridged::<S>(expr, input, optional)
+}
+
+/// [`eval_owned_expr_fork`] or its bridged twin, chosen by whether `value`
+/// is a node the resolver is tracking (#3036) -- [`eval_each_owned_at`]'s
+/// fork-shaped twin, for a bind source evaluated collected (by value)
+/// rather than through a sink.
+fn eval_owned_expr_fork_at<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    optional: bool,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    if trackable {
+        eval_owned_expr_fork_bridged::<S>(expr, value, optional)
     } else {
-        eval_owned_expr_fork::<S>(expr, input, optional)
+        eval_owned_expr_fork::<S>(expr, value, optional)
     }
 }
 
@@ -27340,13 +27373,12 @@ fn position_update_filter<S: EvalSemantics>(
 /// `Field` arm's own comment for why.
 /// Whether a resolved update path names the document itself (#3036): `.`,
 /// `(.)`, and what `getpath([])`/`first(., .a)` resolve to.
+///
+/// Same question [`is_effectively_identity`] already answers -- delegated
+/// rather than re-derived, so a future path-shape [`unwrap_path_component`]
+/// learns to unwrap reaches both call sites for free.
 fn is_root_path(path: &Expr) -> bool {
-    match path {
-        Expr::Identity => true,
-        Expr::Paren(inner) => is_root_path(inner),
-        Expr::Pipe(stages) => stages.iter().all(is_root_path),
-        _ => false,
-    }
+    is_effectively_identity(path)
 }
 
 /// `|=`'s own leaf: run `filter_expr` on `root` and write its first output
@@ -29038,8 +29070,9 @@ impl RootWitness {
 /// value verbatim (`error($x)`, `$x | error`, wherever they sit in the
 /// body: `.a | error($x)`, `if .a then error($x) else . end`). jq's `catch`
 /// then runs against that same `jv`, so `. as $x | try error($x) catch
-/// path($x)` is `[]` there, and the node the marker names is the payload's
-/// own. A body with no raise site of its own, one raising anything else
+/// path($x)` is `[]` there (confirmed live, jq 1.7.1), and the node the
+/// marker names is the payload's own. A body with no raise site of its own,
+/// one raising anything else
 /// (a value-equal rebuild, `error({a:1})` on `{"a":1}`), or two sites
 /// naming different nodes gets no proof and refuses -- the fabrication
 /// #2642's review left open here. A payload jq's own runtime raises (a type
@@ -29287,20 +29320,16 @@ fn demote_for_owned_reentry(expr: &Expr) -> Cow<'_, Expr> {
 /// expression. Conservative: every builtin and every call counts (a `def`
 /// body, a resolved `DefCall` and a `Shared` argument are walked too).
 fn may_enter_resolver_node(node: &Expr) -> bool {
-    matches!(
-        node,
-        Expr::Assign { .. }
-            | Expr::Update { .. }
-            | Expr::CompoundAssign { .. }
-            | Expr::AlternativeAssign { .. }
-            | Expr::MetaAssign { .. }
-            | Expr::Builtin(_)
-            | Expr::FuncCall { .. }
-            | Expr::NamespacedCall { .. }
-            | Expr::DefCall { .. }
-            | Expr::FuncDef { .. }
-            | Expr::Shared(_)
-    )
+    is_assignment_expr(node)
+        || matches!(
+            node,
+            Expr::Builtin(_)
+                | Expr::FuncCall { .. }
+                | Expr::NamespacedCall { .. }
+                | Expr::DefCall { .. }
+                | Expr::FuncDef { .. }
+                | Expr::Shared(_)
+        )
 }
 
 /// Whether resolving `expr` can bind a variable from a navigated position
@@ -34300,8 +34329,14 @@ fn walk_pattern<S: EvalSemantics>(
                         ResolvedPatternKey::Field(Cow::Borrowed(key.as_str()))
                     }
                     ObjectKey::Expr(key_expr) => {
+                        // `reg.is_input` is this walk's own `trackable`
+                        // (#3036 review): while true, `input` is still the
+                        // register's node, so `key_expr` must not have its
+                        // own markers demoted just because a computed key
+                        // resolves by value rather than through a sink --
+                        // see `eval_each_owned_at`'s "computed key" case.
                         let (mut key_values, control) =
-                            eval_owned_expr_fork::<S>(key_expr, input, false);
+                            eval_owned_expr_fork_at::<S>(key_expr, input, reg.is_input, false);
                         match (key_values.len(), control) {
                             (1, None) => match key_values.pop().unwrap() {
                                 OwnedValue::String(s) => ResolvedPatternKey::Field(Cow::Owned(s)),
@@ -34438,8 +34473,12 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
 ) -> ResolveFlow {
     // A subexp: evaluated by value, never a path witness (jq's
     // `subexp_nest > 0` -- the same rule `resolve_bind_source_witness`'s
-    // `by_value` follows).
-    let (sources, trailing) = eval_owned_expr_fork::<S>(source, value, false);
+    // `by_value` follows). `trackable` still gates demotion the same way
+    // `resolve_bind_source_sink` (the non-destructuring `as $var` twin)
+    // does (#3036 review): while `value` is the register's own node, `source`
+    // must not have its own `Snapshot` markers demoted just because this
+    // arm evaluates by value instead of through a sink.
+    let (sources, trailing) = eval_owned_expr_fork_at::<S>(source, value, trackable, false);
     let head = unwrap_paren(source);
     let all_names = pattern_alternatives_var_names(patterns);
     let last_idx = patterns.len() - 1;
@@ -36329,9 +36368,13 @@ pub(crate) fn each_recurse_walk<S: EvalSemantics>(
     root: OwnedValue,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> RecurseWalkEnd {
+    let demoted_f = demote_for_owned_reentry(f);
+    let demoted_cond = cond.map(demote_for_owned_reentry);
     let mut walk = ValueRecurseWalk::<S> {
         f,
         cond,
+        demoted_f: demoted_f.as_ref(),
+        demoted_cond: demoted_cond.as_deref(),
         sink,
         emitted: 0,
         budget: RecurseNativeBudget::start(),
@@ -36658,9 +36701,16 @@ mod recurse_native_levels_override {
 }
 
 /// [`each_recurse_walk`]'s state: what every node's visit shares.
-struct ValueRecurseWalk<'e, 's, S> {
+struct ValueRecurseWalk<'e, 'd, 's, S> {
     f: &'e Expr,
     cond: Option<&'e Expr>,
+    /// [`demote_for_owned_reentry`] of `f`/`cond`, computed once by
+    /// [`each_recurse_walk`] instead of per visited node (#3036 review):
+    /// `f`/`cond` are the same static expression at every level, so
+    /// re-walking either's AST on every native-recursion `expand`/`gate`
+    /// call was a full `any_subexpr` scan per node, not per traversal.
+    demoted_f: &'d Expr,
+    demoted_cond: Option<&'d Expr>,
     sink: &'s mut dyn FnMut(OwnedValue) -> Demand,
     /// Nodes delivered so far, against [`RECURSE_MAX_ITEMS`].
     emitted: usize,
@@ -36668,7 +36718,7 @@ struct ValueRecurseWalk<'e, 's, S> {
     _semantics: PhantomData<S>,
 }
 
-impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
+impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, '_, S> {
     /// Deliver `node`, then its whole subtree. `level` is how many native
     /// levels are already live above it (see [`RecurseNativeBudget`]).
     fn visit(&mut self, node: OwnedValue, level: u32) -> Option<RecurseAbort> {
@@ -36691,12 +36741,14 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
         let Some(_scope) = self.budget.enter_level(level) else {
             return self.expand_queued(node);
         };
-        let (f, cond) = (self.f, self.cond);
+        let (f, demoted_f, demoted_cond) = (self.f, self.demoted_f, self.demoted_cond);
         let mut abort = None;
         // #3036: level 0 is the walk's own input, unrebuilt -- `f` runs on
-        // it bridged; every deeper node is a value `f` produced.
+        // it bridged; every deeper node is a value `f` produced. `cond`
+        // gates a child `f` just produced, which is never the ambient root
+        // at any level, so it always takes the pre-demoted, bridged route.
         let mut run = |child: OwnedValue| {
-            let end = match cond {
+            let end = match demoted_cond {
                 None => self.visit(child, level + 1),
                 Some(cond) => self.gate(cond, child, level + 1),
             };
@@ -36705,7 +36757,7 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
         let flow = if level == 0 {
             eval_each_owned_bridged::<S>(f, &node, false, &mut run)
         } else {
-            eval_each_owned::<S>(f, &node, false, &mut run)
+            eval_each_owned_bridged::<S>(demoted_f, &node, false, &mut run)
         };
         native_recurse_end(abort, flow)
     }
@@ -36718,10 +36770,14 @@ impl<S: EvalSemantics> ValueRecurseWalk<'_, '_, S> {
     /// the no-`cond` path into [`Self::visit`] -- `cond` needs the same
     /// re-establishment `visit` gives its own delivery, not just the visit
     /// this gates.
+    ///
+    /// `cond` is always the caller's pre-demoted [`Self::demoted_cond`]
+    /// (#3036 review), so this runs it bridged rather than demoting again
+    /// on every gated child.
     fn gate(&mut self, cond: &Expr, child: OwnedValue, level: u32) -> Option<RecurseAbort> {
         let _scope = self.budget.scope();
         let mut abort = None;
-        let flow = eval_each_owned::<S>(cond, &child, false, &mut |verdict| {
+        let flow = eval_each_owned_bridged::<S>(cond, &child, false, &mut |verdict| {
             if verdict.is_truthy() {
                 stop_on_abort(&mut abort, self.visit(child.clone(), level))
             } else {
@@ -43684,6 +43740,10 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
+    let demoted_cond = demote_for_owned_reentry(cond);
+    let demoted_update = demote_for_owned_reentry(update);
+    let cond = LoopOperand::new(cond, &demoted_cond);
+    let update = LoopOperand::new(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = until_step::<S>(
@@ -43696,6 +43756,33 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         true,
     );
     finish_fork(outputs, result.err(), optional)
+}
+
+/// A static `until`/`while` operand (`cond`/`update`) alongside its
+/// [`demote_for_owned_reentry`] twin, computed once by `eval_until`/
+/// `eval_while` (#3036 review) instead of re-walked every step -- bundled
+/// so threading both through `until_step`/`while_step`'s recursion doesn't
+/// push either past `clippy::too_many_arguments`.
+#[derive(Clone, Copy)]
+struct LoopOperand<'e> {
+    expr: &'e Expr,
+    demoted: &'e Expr,
+}
+
+impl<'e> LoopOperand<'e> {
+    fn new(expr: &'e Expr, demoted: &'e Expr) -> Self {
+        Self { expr, demoted }
+    }
+
+    /// [`eval_owned_expr_fork_from`] over this operand.
+    fn fork<S: EvalSemantics>(
+        &self,
+        input: &OwnedValue,
+        optional: bool,
+        ambient: bool,
+    ) -> (Vec<OwnedValue>, Option<Control>) {
+        eval_owned_expr_fork_from::<S>(self.expr, self.demoted, input, optional, ambient)
+    }
 }
 
 /// Recursive step for [`eval_until`] (#534): `E(s) = if cond(s) is truthy:
@@ -43721,8 +43808,8 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// introduces for ordinary queries. Follow-up: #534 efficiency issue tracks
 /// this alongside the `WHILE_UNTIL_MAX_STEPS` cap's other rough edges.
 fn until_step<S: EvalSemantics>(
-    cond: &Expr,
-    update: &Expr,
+    cond: LoopOperand<'_>,
+    update: LoopOperand<'_>,
     mut state: OwnedValue,
     optional: bool,
     outputs: &mut Vec<OwnedValue>,
@@ -43730,6 +43817,11 @@ fn until_step<S: EvalSemantics>(
     ambient: bool,
 ) -> Result<(), Control> {
     // #3036: `state` is the caller's own input on the first round only.
+    // `cond`/`update` carry their own pre-demoted twin ([`LoopOperand`]),
+    // computed once by `eval_until` rather than re-walked every round:
+    // `cond`/`update` never change across steps, so re-demoting them per
+    // step was a full `any_subexpr` scan per iteration of what can be a
+    // many-thousand-step loop, not per loop.
     let mut ambient = ambient;
     loop {
         if *budget == 0 {
@@ -43740,15 +43832,13 @@ fn until_step<S: EvalSemantics>(
         }
         *budget -= 1;
 
-        let (cond_vals, cond_control) =
-            eval_owned_expr_fork_from::<S>(cond, &state, optional, ambient);
+        let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
 
         // Fast path: exactly one falsy `cond` output and exactly one
         // `update` output — continue the loop in place rather than
         // recursing, so this step costs no stack depth.
         if cond_control.is_none() && cond_vals.len() == 1 && !cond_vals[0].is_truthy() {
-            let (update_vals, update_control) =
-                eval_owned_expr_fork_from::<S>(update, &state, optional, ambient);
+            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;
@@ -43767,8 +43857,7 @@ fn until_step<S: EvalSemantics>(
             if cond_val.is_truthy() {
                 outputs.push(state.clone());
             } else {
-                let (update_vals, update_control) =
-                    eval_owned_expr_fork_from::<S>(update, &state, optional, ambient);
+                let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
                 for update_val in update_vals {
                     until_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
                 }
@@ -43803,6 +43892,10 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
+    let demoted_cond = demote_for_owned_reentry(cond);
+    let demoted_update = demote_for_owned_reentry(update);
+    let cond = LoopOperand::new(cond, &demoted_cond);
+    let update = LoopOperand::new(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
     let result = while_step::<S>(
@@ -43824,8 +43917,8 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// against jq: `[while(.<3; .+1,.+2)]` on `null` is `[null,1,2,2]`, matching
 /// this recursion hand-traced as a tree.
 fn while_step<S: EvalSemantics>(
-    cond: &Expr,
-    update: &Expr,
+    cond: LoopOperand<'_>,
+    update: LoopOperand<'_>,
     mut state: OwnedValue,
     optional: bool,
     outputs: &mut Vec<OwnedValue>,
@@ -43833,6 +43926,9 @@ fn while_step<S: EvalSemantics>(
     ambient: bool,
 ) -> Result<(), Control> {
     // #3036: `state` is the caller's own input on the first round only.
+    // `cond`/`update` carry their own pre-demoted twin ([`LoopOperand`]),
+    // computed once by `eval_while` rather than re-walked every round --
+    // see `until_step`.
     let mut ambient = ambient;
     loop {
         if *budget == 0 {
@@ -43848,16 +43944,14 @@ fn while_step<S: EvalSemantics>(
         }
         *budget -= 1;
 
-        let (cond_vals, cond_control) =
-            eval_owned_expr_fork_from::<S>(cond, &state, optional, ambient);
+        let (cond_vals, cond_control) = cond.fork::<S>(&state, optional, ambient);
 
         // Fast path: exactly one truthy `cond` output and exactly one
         // `update` output — continue the loop in place rather than
         // recursing, so this step costs no stack depth (see [`until_step`]).
         if cond_control.is_none() && cond_vals.len() == 1 && cond_vals[0].is_truthy() {
             outputs.push(state.clone());
-            let (update_vals, update_control) =
-                eval_owned_expr_fork_from::<S>(update, &state, optional, ambient);
+            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;
@@ -43875,8 +43969,7 @@ fn while_step<S: EvalSemantics>(
         for cond_val in &cond_vals {
             if cond_val.is_truthy() {
                 outputs.push(state.clone());
-                let (update_vals, update_control) =
-                    eval_owned_expr_fork_from::<S>(update, &state, optional, ambient);
+                let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
                 for update_val in update_vals {
                     while_step::<S>(cond, update, update_val, optional, outputs, budget, false)?;
                 }
