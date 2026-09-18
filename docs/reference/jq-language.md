@@ -142,17 +142,17 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `as $var | expr` - Variable binding
 - [x] Object/array destructuring patterns
 - [x] A computed or interpolated key in an object destructuring pattern --
-      `{(EXPR): $var}`, `{"\(EXPR)": $var}` (#2677) -- for a key expression
-      yielding exactly one string, in both value position and inside
-      `path()`/`del()`/an assignment target, including nested computed keys.
-      A key expression that is itself a multi-output *generator*
-      (`{("a","b"): $var}`, which real jq fans out into one full
-      pattern-match per key it yields, including through `?//` retry) is
-      also supported in value position (`. as PATTERN | body`); the same
-      fan-out inside `path()`/an assignment target, and inside `reduce`/
-      `foreach`'s own pattern, is not yet supported and refuses clearly
-      rather than keeping only the first output or dropping the rest --
-      see [docs/compliance/jq/limitations.md](../compliance/jq/limitations.md).
+      `{(EXPR): $var}`, `{"\(EXPR)": $var}` (#2677, #2872) -- with jq's own
+      backtracking matcher semantics everywhere a pattern can appear: value
+      position, `path()`/`del()`/an assignment target, and `reduce`/`foreach`'s
+      own pattern. A key that is a *generator* (`{("a","b"): $var}`) fans out
+      into one full pattern-match (and one body run, or one fold step) per
+      key it yields, lazily and in jq's order -- object entries in source
+      order, array elements right to left, a later entry's key re-run per
+      earlier binding -- including through `?//` retry; a zero-output key
+      matches nothing; an `error`/`break`/`halt` inside a key fires where the
+      walk reaches it. See
+      [docs/compliance/jq/limitations.md](../compliance/jq/limitations.md).
 - [x] `reduce expr as $x (init; update)`
 - [x] `foreach expr as $x (init; update)` / `foreach ... (init; update; extract)`
 - [x] A full destructuring pattern in `reduce`/`foreach`'s own `as` clause —
