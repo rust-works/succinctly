@@ -46,7 +46,7 @@ use super::document::{
     child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
     effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
     empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string,
-    key_display_string_kind, key_is_malformed, resolve_display_key, tail_gap_ok,
+    key_display_string_kind, key_hash, key_is_malformed, resolve_display_key, tail_gap_ok,
     trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
@@ -9802,6 +9802,14 @@ fn bind_origin_of_cursor<C: DocumentCursor>(c: &C) -> BindOrigin {
 
 /// The origin of a value bound inside the owned identity pipe (#2072): the
 /// identity itself, with its base cursor reduced to the id the AST can hold.
+///
+/// `chain`/`key_node`/`exact`/`root` copy straight across (kept in sync by
+/// hand with [`OwnedIdentity`]'s own fields -- a struct merge isn't
+/// available here: [`BindOrigin`] lives on `Expr`/`Tracked`, which are not
+/// generic over `V`, so `base` can't just be `id.base: Option<V::Cursor>`
+/// -- it has to reduce to the type-erased `(node_id, document_token)` pair
+/// [`identity_from_origin`] later re-resolves against whatever cursor type
+/// the caller anchors it to.
 fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>) -> BindOrigin {
     BindOrigin::Owned {
         base: id.base.map(|c| (c.node_id(), c.document_token())),
@@ -22707,21 +22715,31 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 /// ever accept -- a sibling position of a `Snapshot` marker's node can
 /// still be told apart by the value the marker is then compared to).
 fn owned_child_token(parent: u64, component: &OwnedValue) -> u64 {
-    // FNV-1a over the parent token and the component text.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ parent;
-    for byte in component.to_json().bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+    // A path component is always an array index or an object key; hash
+    // those directly instead of paying for a JSON round-trip through
+    // `to_json()`, and reuse `document.rs`'s `key_hash` (8-byte mixing plus
+    // a splitmix64 finalizer) rather than a second, slower FNV-1a loop.
+    // Any other shape (never produced by a path step today) still gets a
+    // correct, if pricier, answer via `to_json()`.
+    let component_hash = match component {
+        OwnedValue::Int(n) => key_hash(&n.to_le_bytes()),
+        OwnedValue::String(s) => key_hash(s.as_bytes()),
+        other => key_hash(other.to_json().as_bytes()),
+    };
+    parent
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(component_hash)
 }
 
 /// A fresh [`OwnedIdentity::root`] token -- a process-wide counter, the
 /// same shape `Frame`'s `NEXT_INVOCATION` uses (`eval.rs`), so it works
 /// under `no_std` too.
 fn fresh_owned_root() -> u64 {
-    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    // `AtomicUsize` rather than `AtomicU64` so targets without 64-bit
+    // atomics still build (#2042 review) -- the same rule `NEXT_INVOCATION`
+    // follows.
+    static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64
 }
 
 struct OwnedIdentity<V: DocumentValue> {
@@ -22843,7 +22861,12 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             ancestors,
             // A child of a key node is an ordinary node again.
             key_node: false,
-            exact: self.exact,
+            // `exact` only matters where `ancestors.is_empty()`
+            // (`root_witness`'s own gate), which a child never is --
+            // hardcoded rather than copied from `self` so that invariant is
+            // visible here instead of relying on the gate alone (#3036
+            // review).
+            exact: false,
             root,
         }
     }
@@ -24562,14 +24585,15 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
 /// Whether `stage` emits its input itself, not a value built from it
 /// (#3036): jq's `select`, `debug` and `stderr` return the very `jv` they
 /// were given, so a marker bound before them still names the node after
-/// them -- `.foo | . as $x | select(true) | (parent, ($x.a = 9))` writes in
-/// both jq and `main`, and so do the `select`-defined type filters
-/// (`values`, `objects`, ...). Every other `Keeps` stage (`sort`,
-/// `to_entries`, `tostring`, a write) allocates, and clears the node
-/// witness. Kept to the builtins whose jq definition is `if f then . else
-/// empty end` or a side effect returning `.`; `getpath([])`/`nth(0; .)`/`recurse(empty)`
-/// also pass through in jq but are left rebuilt here, recorded as
-/// refuse-only in `docs/compliance/jq/limitations.md`.
+/// them -- `.foo | . as $x | select(true) | ($x.a = 9)` writes `{"a":9}` in
+/// both jq (confirmed live, jq 1.7.1) and `main`, and so do the
+/// `select`-defined type filters (`values`, `objects`, ...). Every other
+/// `Keeps` stage (`sort`, `to_entries`, `tostring`, a write) allocates, and
+/// clears the node witness. Kept to the builtins whose jq definition is `if
+/// f then . else empty end` or a side effect returning `.`;
+/// `getpath([])`/`nth(0; .)`/`recurse(empty)` also pass through in jq but
+/// are left rebuilt here, recorded as refuse-only in
+/// `docs/compliance/jq/limitations.md`.
 fn stage_passes_input_through(stage: &Expr) -> bool {
     matches!(
         strip_parens(stage),
