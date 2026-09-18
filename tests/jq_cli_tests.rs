@@ -21146,7 +21146,7 @@ fn test_nested_pattern_duplicate_var_composes_per_container_1366() -> Result<()>
 }
 
 /// #1366: the issue's own `reduce` repro -- `#1201`'s `substitute_bindings`
-/// call site shares the same `extract_pattern_bindings` fix, so `reduce`
+/// call site shares the same matcher fix, so `reduce`
 /// (and by the same code path, `foreach`) must resolve this identically
 /// to plain `. as PATTERN`.
 #[test]
@@ -56549,7 +56549,7 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
 /// [`test_destructuring_moves_path_register_2649`] pins for a plain `. as
 /// PATTERN` bind, one level up: when SOURCE resolves through the path
 /// register, destructuring its own element moves the register exactly the
-/// way [`walk_pattern`] already models. Every row below was captured live
+/// way the path-mode walk (`PathPatternMode`) already models. Every row below was captured live
 /// against `/usr/bin/jq` 1.7.1 on 2026-09-13.
 #[test]
 fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
@@ -56581,7 +56581,7 @@ fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
         ),
         // A `null`/`bool`-valued fold register still lets a *computed*
         // (non-register-derived) source element's own destructuring step
-        // through -- `walk_pattern_step`'s `null`/`bool` identity exception,
+        // through -- `PathPatternMode::step`'s `null`/`bool` identity exception,
         // one level up from #2649's own plain-bind rows.
         (
             "null",
@@ -56704,16 +56704,16 @@ fn test_fold_destructuring_pattern_moves_path_register_2676() -> Result<()> {
 /// P}`) now *evaluates* -- in both value position and inside `path()`/
 /// `del()`/an assignment target -- exactly the way real jq's own `Exp`
 /// production does, for the common case: a key expression that yields
-/// exactly one string. `extract_pattern_bindings` (value mode) and
-/// `walk_pattern` (path mode) both resolve the key expression against the
+/// exactly one string. The matcher (value mode and path mode alike since
+/// #2872, `walk_pattern_each`) resolves the key expression against the
 /// pattern's own current node -- `Cannot index <type> with <type>` for a
 /// non-string key value, `Cannot index <type> with string "..."` for a
 /// non-object target, both the *same* wording jq's own `INDEX` bytecode
 /// gives, confirmed live against jq 1.7.1 for every row below (2026-09-13).
 /// A computed key that is itself a multi-output *generator*
-/// (`{("a","b"):$q}`) is not yet supported and refuses clearly instead
-/// (`test_pattern_computed_key_multi_output_refuses_cleanly_2677`, below) --
-/// real jq fans out one full pattern-match per key output there.
+/// (`{("a","b"):$q}`) fans out one full pattern-match per key output, as
+/// real jq does -- `test_pattern_computed_key_fans_out_in_value_position_2677`
+/// and the #2872 tests below.
 #[test]
 fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
     // Control: a plain literal key is completely unaffected.
@@ -56799,7 +56799,7 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
 /// correctly in **value position** -- `each_pattern_alternatives`/
 /// `each_pattern_alternatives_generic` (the two `?//`-alternative loops,
 /// value mode's own evaluators) fan out over every binding-set
-/// `extract_pattern_bindings` yields, running `body` once per one, and only
+/// the matcher yields, running `body` once per one, and only
 /// treat the key generator's own trailing error/break/halt the way a
 /// pre-#2677 match failure already was (retry the next `?//` alternative
 /// unless this is the last one). Every row below confirmed live against jq
@@ -56810,8 +56810,8 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
 /// key inside a `?//` chain still *wins* (no fallthrough to the next
 /// alternative) even though it contributes nothing.
 ///
-/// **Path position** (`walk_pattern`/`resolve_as_pattern`) does not fan out
-/// yet -- see `test_pattern_computed_key_multi_output_refuses_in_path_position_2677`.
+/// **Path position** fans out the same way since #2872 -- see
+/// `test_pattern_computed_key_fans_out_in_path_position_2872`.
 #[test]
 fn test_pattern_computed_key_fans_out_in_value_position_2677() -> Result<()> {
     for (input, filter, expected) in [
@@ -56888,43 +56888,358 @@ fn test_pattern_computed_key_review_fixes_2873() -> Result<()> {
         assert_eq!(stdout, expected, "`{filter}`");
     }
 
-    // `each_pattern_alternatives`/`each_pattern_alternatives_generic`
-    // compute `key_control` eagerly, before any binding-set's body runs --
-    // an earlier binding-set's body triggering a `?//` retry must not drop
-    // a `Halt` (or uncatchable `Error`) the key generator's own later,
-    // never-processed output already raised. Confirmed live: real jq is
-    // lazy and never reaches `halt_error(7)` at all here (retries `$z`
-    // before pulling the key generator's second output), so its own exit
-    // code (0) is not what this pins -- succinctly's eager design already
-    // executes `halt_error(7)` (its stderr dump proves that), so the
-    // process must actually halt with its exit code once that happened,
-    // not silently swallow it into an ordinary alternative fallthrough.
+    // #2872: the matcher is lazy, as jq's is -- a key generator's second
+    // output is only produced once the first's body has run, so a body
+    // error that retries the next `?//` alternative means `halt_error(7)`
+    // is never reached at all. Confirmed live against jq 1.7.1: prints
+    // `{"a":1}` (the retried `$z`) and exits 0, no halt. Until #2872 the
+    // eager design had already executed the halt before the body ran and
+    // pinned exit 7 here -- an exit jq never performs.
     let filter = ". as {(\"a\", halt_error(7)):$q} ?// $z | \
                   if $q==1 then error(\"boom\") else ($q // $z) end";
-    let (_, _, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
-    assert_eq!(code, 7, "`{filter}` must actually halt, not retry `?//`");
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":1}\n");
+    assert!(stderr.is_empty(), "the halt is never reached: {stderr}");
 
     Ok(())
 }
 
-/// #2677: path position (`walk_pattern`/`resolve_as_pattern`) does not yet
-/// fan out over a multi-output or zero-output computed key the way value
-/// position now does -- refuses clearly (a dedicated, distinctive message)
-/// rather than keeping only the first output or dropping the rest.
+/// #2872: a computed key fans out in **path position** too -- `path()`,
+/// `del()` and an assignment target run the body once per branch of the
+/// walk, each with the register that branch moved (the position the key
+/// output stepped to), exactly as value position does. Every row confirmed
+/// live against jq 1.7.1. Until #2872, path position refused any key with
+/// other than exactly one output -- through an ordinary *catchable* error,
+/// which `?//` read as "this alternative did not match" and answered
+/// wrongly: the first row was `{"a":"X","c":2}`, a silently dropped write.
 #[test]
-fn test_pattern_computed_key_multi_output_refuses_in_path_position_2677() -> Result<()> {
-    for (input, filter) in [
-        (r#"{"a":1,"b":2}"#, "path(. as {(\"a\",\"b\"):$q} | $q)"),
-        (r#"{"a":1}"#, "path(. as {(empty):$q} | $q)"),
+fn test_pattern_computed_key_fans_out_in_path_position_2872() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            r#"{"a":{"b":1},"c":2}"#,
+            "(. as {(\"a\",\"c\"):$q} ?// {a:$q} | $q) |= \"X\"",
+            "{\"a\":\"X\",\"c\":\"X\"}\n",
+        ),
+        (
+            r#"{"a":{"b":1},"c":2}"#,
+            "[path(. as {(\"a\",\"c\"):$q} ?// {a:$q} | $q)]",
+            "[[\"a\"],[\"c\"]]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(. as {(\"a\",\"b\"):$q} | $q)]",
+            "[[\"a\"],[\"b\"]]\n",
+        ),
+        (r#"{"a":1,"b":2}"#, "[path(. as {(empty):$q} | $q)]", "[]\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(. as {(empty):$q} ?// $z | $q)]",
+            "[]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "del(. as {(\"a\",\"b\"):$q} | $q)",
+            "{}\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "(. as {(\"a\",\"b\"):$q} | $q) |= .*10",
+            "{\"a\":10,\"b\":20}\n",
+        ),
+        (
+            r#"{"a":{"x":1,"y":2},"b":{"x":3,"y":4}}"#,
+            "[path(. as {(\"a\",\"b\"):{(\"x\",\"y\"):$q}} | $q)]",
+            "[[\"a\",\"x\"],[\"a\",\"y\"],[\"b\",\"x\"],[\"b\",\"y\"]]\n",
+        ),
+        (
+            r#"{"a":{"x":1,"y":2},"b":{"x":3,"y":4}}"#,
+            "(. as {(\"a\",\"b\"):{(\"x\",\"y\"):$q}} | $q) += 1",
+            "{\"a\":{\"x\":2,\"y\":3},\"b\":{\"x\":4,\"y\":5}}\n",
+        ),
+        (
+            r#"[{"x":1,"y":2}]"#,
+            "[path(. as [{(\"x\",\"y\"):$q}] | $q)]",
+            "[[0,\"x\"],[0,\"y\"]]\n",
+        ),
+        // Array elements are matched right to left in path mode too, so
+        // element 1's branches are the outer fork -- and on `null`, where
+        // a second element may still step, the register threads through
+        // every branch.
+        (
+            r"null",
+            "[path(. as [{(\"x\",\"y\"):$q},{(\"x\",\"y\"):$r}] | $r)]",
+            "[[1,\"x\",0,\"x\"],[1,\"x\",0,\"y\"],[1,\"y\",0,\"x\"],[1,\"y\",0,\"y\"]]\n",
+        ),
+        // `?//` per branch: a body error after k branches moves to the next
+        // alternative and the paths already emitted stand; the walk's own
+        // trailing error retries too; a `break` in a key retries.
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(. as {(\"a\",\"b\"):$q} ?// [$r] | $q)]",
+            "[[\"a\"],[\"b\"]]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[label $out | path(. as {(\"a\", break $out, \"b\"):$q} | $q)]",
+            "[[\"a\"]]\n",
+        ),
+        // A float-spelled computed key keeps its spelling as a path
+        // component, as `.[EXPR]` does (#1088) -- `[1]` before #2872.
+        (
+            r"[10,20,30]",
+            "def f: 1.7; path(. as {(f):$q} | $q)",
+            "[1.7]\n",
+        ),
+        // The path-mode folds: each branch is its own step with its own
+        // register.
+        (
+            r#"{"a":{"c":1,"d":2},"b":{"c":3,"d":4}}"#,
+            "[path(foreach .[] as {(\"c\",\"d\"):$q} (.; .; $q))]",
+            "[[\"a\",\"c\"],[\"a\",\"d\"],[\"b\",\"c\"],[\"b\",\"d\"]]\n",
+        ),
+        (
+            r#"{"a":{"c":1,"d":2},"b":{"c":3,"d":4}}"#,
+            "[path(limit(3; foreach .[] as {(\"c\",\"d\"):$q} (.; .; $q)))]",
+            "[[\"a\",\"c\"],[\"a\",\"d\"],[\"b\",\"c\"]]\n",
+        ),
+        (
+            r#"{"a":{"c":1,"d":2},"b":{"c":3,"d":4}}"#,
+            "del(foreach .[] as {(\"c\",\"d\"):$q} (.; .; $q))",
+            "{\"a\":{},\"b\":{}}\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
-        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
-        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
-        assert!(
-            stderr.contains("yet supported"),
-            "`{filter}` -- stderr: {stderr}"
-        );
+        assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
     }
+
+    // Refusals stay refusals, with jq's own wording where jq's own machinery
+    // raises them: an error in a key is the key's error (and *catchable*,
+    // as jq's is -- it used to surface as an uncatchable "not yet
+    // supported" refusal), a second entry stepping from the parent again
+    // is `path_intact`'s refusal, and a halt in a key halts.
+    for (input, filter, expected_stdout, expected_stderr, expected_code) in [
+        (
+            r#"{"a":1,"b":2}"#,
+            "try [path(. as {(\"a\",error(\"E\")):$q} | $q)] catch .",
+            "\"E\"\n",
+            "",
+            0,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[path(. as {$a, (\"a\",\"b\"):$q} | $q)]",
+            "",
+            "jq: error (at <stdin>:0): Invalid path expression near attempt to access element \"a\" of {\"a\":1,\"b\":2}\n",
+            5,
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "try [path(. as {(halt_error(1)):$q} | $q)] catch \"caught\"",
+            "",
+            "{\"a\":1,\"b\":2}\n",
+            1,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, expected_code, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected_stdout, "`{filter}`");
+        assert_eq!(stderr, expected_stderr, "`{filter}`");
+    }
+
+    Ok(())
+}
+
+/// #2872: the matcher is **demand-driven**, as jq's backtracking matcher is.
+/// A computed key's next output is produced only when something backtracks
+/// for it, a later entry's key runs again once per earlier binding, and
+/// array elements match right to left -- so `input` consumption, side-effect
+/// order and re-evaluation counts all match jq. The eager cartesian product
+/// #2677 shipped got every one of these wrong. Every row confirmed live
+/// against jq 1.7.1; stderr is compared exactly (the `stderr` builtin's
+/// markers are the observable order).
+#[test]
+fn test_pattern_computed_key_matcher_is_lazy_2872() -> Result<()> {
+    // A key the consumer never asks for must not run: `first` stops after
+    // the first binding's body, so `input` is never consumed.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "-n",
+            "[first(input | . as {(\"a\", (input|\"b\")):$q} | $q)], [inputs]",
+        ],
+        Some("{\"a\":1,\"b\":2} \"x\" \"y\""),
+    )?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "[1]\n[\"x\",\"y\"]\n");
+
+    for (input, filter, expected_stdout, expected_stderr) in [
+        // The body for the first key output runs before the second key
+        // output is produced.
+        (
+            r#"{"a":1,"b":2}"#,
+            ". as {(\"a\",(\"K\"|stderr|\"b\")):$q} | (\"B\\($q)\"|stderr|empty)",
+            "",
+            "B1KB2",
+        ),
+        // A later entry's key re-runs once per earlier binding.
+        (
+            r#"{"a":1,"b":2}"#,
+            "[. as {(\"a\",\"b\"):$q, (\"K\"|stderr|\"a\"):$r} | [$q,$r]]",
+            "[[1,1],[2,1]]\n",
+            "KK",
+        ),
+        // Array elements match right to left, in value mode too.
+        (
+            r#"[{"a":1},{"a":2}]"#,
+            "[. as [{(\"K1\"|stderr|\"a\"):$x},{(\"K2\"|stderr|\"a\"):$y}] | [$x,$y]]",
+            "[[1,2]]\n",
+            "K2K1",
+        ),
+        // The same laziness inside a fold: UPDATE for one key output runs
+        // before the next output is produced.
+        (
+            r#"{"a":1,"b":2}"#,
+            "[foreach . as {(\"a\",(\"K\"|stderr|\"b\")):$q} (0; .+$q; (\"E\\(.)\"|stderr|.))]",
+            "[\"E1\",\"E3\"]\n",
+            "E1KE3",
+        ),
+        // A key error is raised where the walk reaches it -- after the
+        // bodies of the outputs before it, and never under `first`.
+        (
+            r#"{"a":1,"b":2}"#,
+            "[first(foreach . as {(\"a\", error(\"E\")):$q} (0; .+$q))]",
+            "[1]\n",
+            "",
+        ),
+        // `null` no longer short-circuits: every key runs against it
+        // (`null | .[k]` is `null`), so a generator still fans out and a
+        // raising key still raises.
+        (
+            r"null",
+            "[. as {(\"a\",\"b\"):$q} | $q]",
+            "[null,null]\n",
+            "",
+        ),
+        (
+            r"null",
+            "[. as [{(\"a\",\"b\"):$q}] | $q]",
+            "[null,null]\n",
+            "",
+        ),
+        (
+            r"null",
+            "[path(. as {(\"a\",\"b\"):{c:$q}} | $q)]",
+            "[[\"a\",\"c\"],[\"b\",\"c\"]]\n",
+            "",
+        ),
+        // jq's duplicate-name rule, in visit order: a bare pattern binds
+        // the body to the first STOREV in block order, a `?//` chain's
+        // stores all land in one slot so the last executed wins -- for
+        // every container kind and nesting depth (#1366's per-container
+        // spelling was this rule seen from index order).
+        (
+            r#"{"a":[1,2],"b":3}"#,
+            "[. as {a:[$x,$x],b:$x} | $x]",
+            "[2]\n",
+            "",
+        ),
+        (
+            r#"{"a":[1,2],"b":3}"#,
+            "[. as {a:[$x,$x],b:$x} ?// $z | $x]",
+            "[3]\n",
+            "",
+        ),
+        (r"[[1,2],3]", "[. as [[$x,$x],$x] | $x]", "[3]\n", ""),
+        (r"[[1,2],3]", "[. as [[$x,$x],$x] ?// $z | $x]", "[1]\n", ""),
+        (
+            r#"{"a":[1,2],"b":3}"#,
+            "[. as {(\"a\",\"b\"):$x, a:[$x,$y]} | [$x,$y]]",
+            "[[[1,2],2],[3,2]]\n",
+            "",
+        ),
+        (
+            r#"[{"x":1,"y":2},{"x":3,"y":4}]"#,
+            "[. as [{(\"x\",\"y\"):$q},{(\"x\",\"y\"):$r}] | [$q,$r]]",
+            "[[1,3],[2,3],[1,4],[2,4]]\n",
+            "",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected_stdout, "`{filter}`");
+        assert_eq!(stderr, expected_stderr, "`{filter}`");
+    }
+
+    // A raising key on `null` raises (the pre-#2872 short-circuit answered
+    // `null`, and its doc comment claimed jq did too; it does not).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ". as {(error(\"E\")):$q} | $q"], Some("null"))?;
+    assert_eq!(code, 5, "stdout={stdout} stderr={stderr}");
+    assert_eq!(stderr, "jq: error (at <stdin>:0): E\n");
+
+    Ok(())
+}
+
+/// #2872: `reduce`/`foreach`'s own pattern fans out -- one fold step per
+/// binding set, the state threaded through, in both evaluators -- and the
+/// `?//` retry rules apply per step: a key error or `break` after k steps
+/// retries the next alternative from the state those steps left, a
+/// zero-output key is zero steps and still wins, `halt` never retries. Every
+/// row confirmed live against jq 1.7.1. Until #2872 the fold bound its
+/// pattern through a catchable "not yet supported" refusal, which `?//` and
+/// `try` read as a match failure: the first two rows answered `0` and `1`.
+#[test]
+fn test_pattern_computed_key_fans_out_in_folds_2872() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":1,"b":2}"#, "reduce . as {(\"a\",\"b\"):$q} ?// $r (0; .+$q)", "3\n"),
+        (r#"{"a":1,"b":2}"#, "reduce . as {(empty):$q} ?// $r (0; .+1)", "0\n"),
+        (r#"{"a":1,"b":2}"#, "reduce . as {(\"a\",\"b\"):$q} (0; .+$q)", "3\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[foreach . as {(\"a\",\"b\",1):$q} ?// $r (0; .+1; [$q,$r])]",
+            "[[1,null],[2,null],[null,{\"a\":1,\"b\":2}]]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[label $o | reduce . as {(\"a\", break $o):$q} ?// $r (0; .+1)]",
+            "[2]\n",
+        ),
+        (
+            r"[1,2]",
+            "[.[] | try (reduce ({\"a\":1,\"b\":2}) as {(\"a\",\"b\"):$q} (0; .+$q)) catch \"caught\"]",
+            "[3,3]\n",
+        ),
+        (r#"{"a":1,"b":2}"#, "[foreach (.,.) as {(\"a\",\"b\"):$q} (0; .+$q)]", "[1,3,4,6]\n"),
+        (r#"{"a":1,"b":2}"#, "[foreach . as {(empty):$q} (0; .+1)]", "[]\n"),
+        (r#"{"a":1,"b":2}"#, "[foreach . as {(empty):$q} ?// $r (0; .+1)]", "[]\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[foreach . as {(\"a\", error(\"E\")):$q} ?// $r (0; .+1; [., $q, $r])]",
+            "[[1,1,null],[2,null,{\"a\":1,\"b\":2}]]\n",
+        ),
+        (
+            r#"{"a":1,"b":2}"#,
+            "[reduce . as {(\"a\",\"b\"):$q} ?// $r (0; if $q==2 then error(\"x\") else .+$q end)]",
+            "[null]\n",
+        ),
+        // A numeric key indexes an array source element.
+        (r"[10,20,30]", "def one: 1; reduce . as {(one):$q} (0; .+$q)", "20\n"),
+        // The owned-identity pipe (`syq`-style stages that keep a document
+        // cursor) fans out too.
+        (r#"{"a":{"x":1,"y":2}}"#, "[.a | . as {(\"x\",\"y\"):$q} | $q]", "[1,2]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // A halt in a key halts the fold, never retried.
+    let filter = "reduce . as {(\"a\", halt_error(7)):$q} ?// $r (0; .+$q)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 7, "`{filter}`: stdout={stdout} stderr={stderr}");
+    assert_eq!(stderr, "{\"a\":1,\"b\":2}\n");
 
     Ok(())
 }
