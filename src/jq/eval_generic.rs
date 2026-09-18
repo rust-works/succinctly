@@ -17872,6 +17872,17 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                 // all 300K elements first, the exact whole-container cost
                 // this function exists to avoid (see its own doc comment
                 // above).
+                //
+                // #2641: this loop still costs the *expanded* size of a
+                // YAML-aliased element inside the sliced range -- `to_owned_cursor`
+                // copies through an alias the same way #1804's fan-out shape
+                // makes exponential, and unlike #1804's `select`/`if` walk this
+                // one cannot short-circuit at the alias, because it has to
+                // hand back the subtree's own value, not just test that it
+                // exists. Accepted as inherent to the copy model, not a bug in
+                // this arm -- see docs/compliance/yq/limitations.md's
+                // #1804/#2476/#2173 history block for the measured cost and
+                // why every other value-producing route pays the same price.
                 if let Some(elements) = v.as_array() {
                     let len = match elements.len_checked() {
                         Ok(len) => len,

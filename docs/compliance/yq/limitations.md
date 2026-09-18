@@ -257,6 +257,31 @@ on #1804's fan-out shape (`aN: &aN [*a(N-1), *a(N-1)]`) the ambient materializat
 `O(2^N)`, measured at 0.33 s / 1.31 s / 5.38 s / 22.70 s for N=18/20/22/24 and flat
 0.00 s after.
 
+**Accepted gap ([#2641](https://github.com/rust-works/succinctly/issues/2641)): a
+value-producing read of an alias-bearing node costs its expanded size, on every route.**
+#1804/#2476's `is_alias()` short-circuits are a property of *validation* walks, which only
+ever need to know a node exists, never what it contains — they do not, and cannot, transfer
+to a walk that has to build the value itself. `getpath(["items", {"start":s,"end":e}])`'s
+array-slice fast path (`getpath_walk_cursor`, `src/jq/eval_generic.rs`, added by #2604) calls
+`to_owned_cursor` once per sliced element, and `to_owned_cursor_at_depth` expands an alias
+into a copy of its target (the copy model this file's alias section describes) — on #1804's
+fan-out shape, the expanded value of `*aN` *is* `2^N` leaves, so materializing it costs
+`2^N` regardless of how directly the walk reaches it. The same cost is paid, identically, by
+every other route that materializes the same element: a literal-bound slice
+(`.items[(0+0):(1+0)]`, via `eval_slice_expr` → `slice_one_generic` → `to_owned_all`) and
+array construction (`[.items[]]`, #2575's territory). None of this is a walk bug to fix —
+only a *navigating* read (`getpath(["items", 0])`, a `length`/`select` truthiness test) stays
+flat, because it never has to copy the aliased subtree; a read that hands back the subtree's
+own value cannot avoid paying for its expanded size. Measured on the same fan-out shape,
+release binary: the in-range slice `getpath(["items",{"start":0,"end":1}])` (aliased element
+inside the range) took 0.02 s / 0.06 s / 0.24 s / 0.96 s at N=14/16/18/20 — the same `×2`-
+per-level curve as #1804's walk cost, before that walk was ever involved — while the
+out-of-range slice `getpath(["items",{"start":1,"end":3}])` and the navigated read
+`getpath(["items", 0])` both stayed at 0.00 s through N=20. Real `yq` v4.53.3 answers the
+in-range case in 0.01 s at N=20 regardless, because go-yaml keeps `*aN` as a reference and
+never expands it — closing this gap for succinctly would need an `OwnedValue` able to hold a
+shared subtree instead of a copy (the direction ADR-0017 and #1416 point at), not a walk fix.
+
 **Resolved ([#1350](https://github.com/rust-works/succinctly/issues/1350)).**
 `enforce_anchor_soundness` takes a `sort_keys` argument and has always handled it correctly
 on the DOM path; the cursor-streaming path used to never call it, reproducing the unsound
