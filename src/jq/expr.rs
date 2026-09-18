@@ -131,6 +131,20 @@ pub struct Tracked {
 ///   every `Snapshot` marker, since a freshly re-indexed document cannot be
 ///   a node any earlier binding was frozen from, and the funnels above take
 ///   `eval_each_owned_bridged` so their own proof is kept.
+/// - [`Origin::SnapshotAt`] -- a [`Origin::Snapshot`] that also knows
+///   *where* `.` was when it was frozen (#2978). Made only inside a
+///   resolver invocation, while the branch is trackable and the frame's
+///   own absolute position is provable: there, by #2042's `Frame::at`
+///   invariant, the register *is* the ambient `.`, so the bound node's
+///   position is exactly the frame's. It is certified by the very same
+///   value-equality rule as `Snapshot` -- `Frame::certifies` does not
+///   narrow it -- and is demoted wherever a `Snapshot` is (#2642's funnels
+///   and #3036's owned re-entries alike); the position is read only by the
+///   *positional* consumers (`getpath`'s result composition, the
+///   register-preservation proof), which `Snapshot` alone gave nothing to
+///   work from
+///   (`path(. as $x | .a | $x | getpath(["a"]) | .b)` refused where jq
+///   answers `["a","b"]`).
 /// - [`Origin::At`] -- the #2042 witness for a binding whose source
 ///   *navigated*, made inside a `path()`/`del()`/assignment resolution: the
 ///   resolver invocation the binding happened in, and the absolute path
@@ -152,6 +166,16 @@ pub enum Origin {
     /// Frozen from the ambient input itself; certified by value equality
     /// (the pre-#2042 rule, unchanged).
     Snapshot,
+    /// Frozen from `.` itself (an identity passthrough) at a provable
+    /// position (#2978). Certified exactly like [`Origin::Snapshot`] (value
+    /// equality); additionally proves the bound node's absolute position,
+    /// for positional readers only.
+    SnapshotAt {
+        /// The resolver invocation the binding was made in.
+        invocation: u64,
+        /// Where `.` sat, absolutely within that invocation, when frozen.
+        path: super::eval::BindPath,
+    },
     /// Frozen from a navigated position inside a resolver invocation;
     /// certified by node identity.
     At {
