@@ -497,7 +497,6 @@ navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positi
 navigated-bind-embed:#2889 -- the owned-embed residual ({k:.a} | .k), unchanged by #3037
 navigated-bind-reduce-update:#3037 residual -- the UPDATE of reduce re-enters the eager evaluator with an owned accumulator; its eval_as carries no node for a navigated bind (#2072 gave the generic evaluator that, not this one), and there is no cursor at the funnel to promote against
 navigated-bind-catch-handler:#3037 residual -- same as navigated-bind-reduce-update, through a catch handler
-navigated-bind-bool-sibling:pre-existing -- the jv_identical rule of jq admits a null/bool by value regardless of node, but the TrackedVar arm of the resolver consults the origin first; ($y | .) = 5 already answers since the . stage re-establishes by value
 navigated-bind-owned-root:#3037 residual -- a navigated bind on an owned-rooted document; the marker node is an OwnedIdentity position and marker_is_root reads only a document node against a live cursor, no OwnedRoot twin
 navigated-bind-input-root:#3037 residual -- same as navigated-bind-owned-root, on the input-queue route
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition

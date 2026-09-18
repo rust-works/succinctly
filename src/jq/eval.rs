@@ -31628,9 +31628,19 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // `Origin::Untracked` (#2072: a navigated binding wrapped only for
         // the cursor routes' sake, made outside any resolver invocation)
         // never certifies, so this refuses exactly as it did before #2072
-        // gave every `as` binding a `TrackedVar` wrapper.
+        // gave every `as` binding a `TrackedVar` wrapper -- except the one
+        // case jq's own `jv_identical` admits regardless of node identity
+        // (#3136): `null`/`true`/`false` are identical by value alone (the
+        // same carve-out `null_bool_identical` makes for `register_identical`
+        // and the pattern-walk's own first-step check), so an
+        // `Origin::Untracked` marker at an equal-valued sibling still
+        // certifies when its value is one of those three, where the
+        // node-identity rule above never can.
         Expr::TrackedVar(marker) => {
-            if trackable && marker.value == *value && frame.certifies(&marker.origin) {
+            if trackable
+                && (marker.value == *value && frame.certifies(&marker.origin)
+                    || null_bool_identical(&marker.value, value))
+            {
                 Ok(vec![PathBranch::new(
                     PathPrefix::root(),
                     Cow::Borrowed(value),

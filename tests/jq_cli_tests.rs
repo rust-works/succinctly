@@ -60792,10 +60792,6 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 ///   `tojson|fromjson`-rebuilt root): the marker's node is an
 ///   `OwnedIdentity` position, and `marker_is_root` reads only a document
 ///   node against a live cursor -- no `OwnedRoot` twin (review finding).
-/// - A `null`/`bool` marker at an equal-valued sibling: jq's `jv_identical`
-///   admits those by value regardless of node, but the resolver's
-///   `TrackedVar` arm consults the origin first (pre-existing; `($y | .)
-///   = 5` already answers, since the `.` stage re-establishes by value).
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -60813,7 +60809,6 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
             r#"{"a":{"b":1}}"#,
             r"try error(.) catch (.a as $y | .a | path($y))",
         ),
-        (r#"{"a":true,"c":true}"#, r".a as $y | .c | $y |= 5"),
         (
             r#"{"a":{"b":1}}"#,
             r"(tojson|fromjson) | .a as $y | .a | path($y)",
@@ -60830,6 +60825,49 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
             "#3037 residual: `{filter}` -- stderr: {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3136: jq's own `jv_identical` treats `null`/`true`/`false` as identical
+/// by value regardless of node (the same carve-out `null_bool_identical`
+/// already made for `register_identical` and the pattern-walk's own
+/// first-step check) -- but `resolve_node_eager`'s `Expr::TrackedVar` arm
+/// consulted node identity first, so a `null`/`bool` marker bound from a
+/// navigated position refused at an equal-valued *sibling* where jq
+/// answers. All three values, and both write forms (`|=`, `del`), not just
+/// the `path()` read `test_navigated_bind_residuals_refuse_cleanly_3037`
+/// used to pin as refuse-only.
+#[test]
+fn test_navigated_bind_null_bool_sibling_answers_3136() -> Result<()> {
+    for (input, filter, want) in [
+        (r#"{"a":true,"c":true}"#, r".a as $y | .c | path($y)", "[]"),
+        (r#"{"a":true,"c":true}"#, r".a as $y | .c | $y |= 5", "5"),
+        (r#"{"a":null,"c":null}"#, r".a as $y | .c | path($y)", "[]"),
+        (
+            r#"{"a":false,"c":false}"#,
+            r"del(.a as $y | .c | $y)",
+            r#"{"a":false}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3136: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3136: `{filter}`");
+    }
+    // Control: a non-null/bool equal-valued sibling still refuses -- jq's
+    // own jv_identical requires actual pointer identity for those, which
+    // this fix does not (and must not) widen.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r".a as $y | .c | path($y)"],
+        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+    )?;
+    assert_eq!(
+        code, 5,
+        "#3136 control: non-null/bool sibling must still refuse, got stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "#3136 control: stderr={stderr:?}"
+    );
     Ok(())
 }
 
