@@ -3302,6 +3302,14 @@ impl OwnedValue {
     /// Allocation-free, which is what makes it an acceptable stand-in: it
     /// walks the tree it was handed and builds nothing, where the conversion
     /// it replaces freed and re-allocated every container it visited.
+    ///
+    /// `#[doc(hidden)]`: `pub`, not `pub(crate)`, only because
+    /// `src/bin/succinctly/*` compiles as a separate crate from this library
+    /// and needs to reach this from `to_jq_values` (`pub(crate)` cannot
+    /// cross that boundary) -- not intended as public library API, the same
+    /// reason [`crate::jq::eval_generic::path_context_pipe_streams_cursors`]
+    /// is `#[doc(hidden)]` too.
+    #[doc(hidden)]
     pub fn check_tree_depth(&self) -> Result<(), EvalError> {
         self.check_tree_depth_at(0)
     }
