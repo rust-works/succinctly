@@ -321,14 +321,16 @@ as opposed to a trailing same-line comment) are not implemented at all.
 - [x] Parameterized functions in modules
 - [x] Transitive `include`/`import` — a module's own directives are processed too (#2865)
 
-A module's dependencies are bound into the bodies of the defs that module
-exports, not spliced into its exported chain, which is what real jq does:
-a transitively included name is visible *inside* the module and is **not**
+A module's dependencies are linked once each and reached through
+forwarding stubs wrapped into the bodies of the defs that call them, never
+spliced into the module's exported chain, which is what real jq does: a
+transitively included name is visible *inside* the module and is **not**
 re-exported to whoever included it, and it outranks a same-named sibling
 def in that module (while the module still exports its own). A def's own
 recursive call binds to itself rather than to a same-named dependency,
 per (name, arity), and a module's own defs keep the bindings they were
-written under however the def that calls them is declared. See
+written under however the def that calls them is declared. A chain of
+modules costs memory linear in its total source (#2955). See
 [jq Limitations](../compliance/jq/limitations.md#seven-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
 for the full table and the two scoping gaps that remain open.
 

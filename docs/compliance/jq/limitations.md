@@ -7353,7 +7353,7 @@ four shapes (two-module cycle, self-include, aliased spelling, `import`-side cyc
 ### Seven module-scoping rules that *are* matched, and read as bugs (#2865)
 
 Not divergences — recorded here because the next person to touch `ModuleLoader` will
-otherwise read them as ones, and because the exclusions in `visible_deps_for` have no
+otherwise read them as ones, and because the exclusions in `dep_stubs_for` have no
 other explanation. All captured live against jq 1.7.1, with `inner.jq` = `def g: 42;`:
 
 1. **A dependency outranks the module's own same-name sibling.** With the module written
@@ -7380,50 +7380,69 @@ other explanation. All captured live against jq 1.7.1, with `inner.jq` = `def g:
 7. **...including when the name is defined nowhere.** `def a: b; def h(b): a;` is
    `b/0 is not defined`, exit 3, not something `h`'s parameter can satisfy.
 
-Rule 4 is why an exported def's body is *not* wrapped in a dependency matching its own
-(name, arity), and rule 5 is why it is not wrapped in one matching any of its parameters —
-both scoped to a name the body calls *directly*, since a dependency reached only through
-another one is bound where that one was written and is not the def's own to shadow.
-Rules 6 and 7 are why a module's own defs are not wrapped into each other at all: they are
-emitted as siblings in the top-level chain, exactly as a filter's own defs are, and jq's
-lexical rule relates them there. Nesting a copy of one inside another's body puts it under
-scopes it was never written in, and rule 6's third row shows sealing cannot repair that —
-a call to a builtin is free in every pre-bound form of the copy.
-Rules 1-3 are why the wrap goes around each exported def's **body** rather than being
-spliced into the module's exported chain.
+Rule 4 is why an exported def's body gets *no* forwarding stub for a dependency matching
+its own (name, arity), and rule 5 is why it gets none for one matching any of its
+parameters — both scoped to a name the body calls *directly*, since a dependency reached
+only through another one is bound where that one was written (inside its own linked run,
+since #2955) and is not the def's own to shadow. Rules 6 and 7 are why a module's own defs
+are never nested inside each other: they are emitted as siblings in the chain they are
+exported into — a top-level run, or the module's linked run — exactly as a filter's own
+defs are, and jq's lexical rule relates them there. Nesting a copy of one inside another's
+body puts it under scopes it was never written in, and rule 6's third row shows sealing
+cannot repair that — a call to a builtin is free in every pre-bound form of the copy.
+Rules 1-3 are why the stubs go around each exported def's **body** rather than the
+dependency being spliced into the module's exported chain.
 
-One consequence worth stating, since it is the reason an exported body carries its
-module's own earlier siblings as well as its dependencies: a def handed to another module
-has to be **self-contained**. With `inner.jq` = `def g: 42; def k: g;` and `outer.jq` =
+One consequence worth stating, since it is the reason a dependency's body is resolved
+inside its own module's run and nowhere else: a def handed to another module has to keep
+its **own** bindings. With `inner.jq` = `def g: 42; def k: g;` and `outer.jq` =
 `include "inner"; def g: k;`, jq answers `42` — `k`'s `g` is `inner`'s. Leaving `k`'s `g`
-to resolve outward into wherever `k` gets spliced would instead find `outer`'s own `g`,
+to resolve outward into wherever `k` gets called would instead find `outer`'s own `g`,
 which is `k`.
 
-### Deeply chained modules compound in memory (#2955)
+### Deeply chained modules compounded in memory — closed (#2955)
 
-Binding copies the AST, so a chain of modules whose defs each call **more than one** def
-from the level below grows exponentially with depth. jq binds symbolically and shares its
-blocks, so it does not. Measured at #2865's own head (Apple M-series, release):
+Binding a module's dependencies by **copying** their bodies into every def that reached
+them compounded down a chain: each level's bodies already carried the level below, so a
+chain whose defs each call `F` defs from the level below held `F^L` copies of the bottom
+one. jq binds symbolically and shares its blocks. Closed by linking each dependency module
+**once**, as a run of its own with a hidden alias, and reaching it through forwarding stubs
+— [ADR-0023](../../adrs/adr-0023.md)'s #2955 amendment. Measured before and after (Apple
+M-series, release, `/usr/bin/time -l`, the issue's own generator, output identical to jq
+on every row):
 
-| chain                            | succinctly peak RSS | jq peak RSS |
-|----------------------------------|---------------------|-------------|
-| 6 levels x 40 defs, 1 call each  | 10 MB               | 2.5 MB      |
-| 8 levels x 6 defs, 3 calls each  | 91 MB               | 2.6 MB      |
-| 14 levels x 4 defs, 2 calls each | 361 MB              | 2.6 MB      |
+| chain                            | before | after  | jq     |
+|----------------------------------|--------|--------|--------|
+| 6 levels x 40 defs, 1 call each  | 12 MB  | 9 MB   | 2 MB   |
+| 8 levels x 6 defs, 3 calls each  | 142 MB | 34 MB  | 2 MB   |
+| 12 levels x 4 defs, 2 calls each | 162 MB | 36 MB  | 2 MB   |
+| 14 levels x 4 defs, 2 calls each | 681 MB | 112 MB | 2 MB   |
 
-The referenced-closure filter (jq's own `block_bind_referenced` rule, in
-`visible_deps_for`) flattens the one-call-each shape completely — without it the
-6 x 40 row was 359 MB rather than 10 MB — but it cannot flatten a genuinely wide closure,
-because that closure is itself exponential. Every row above produces the **correct**
-answer; this is a scalability limit of AST inlining, not a wrong result. It needs a
-*chain of modules* to appear, and a wide one: only dependencies are wrapped into a body,
-so a module with no `include`/`import` is bound exactly as cheaply as before #2865
-however many of its own defs call each other (a 24-def Fibonacci module is 9 MB, against
-`main`'s 9 MB), and a chain whose defs call one def apiece stays flat (21 levels of a
-two-def module is 9 MB; a 7-level 40-def chain is 12 MB). Tracked as
-[#2955](https://github.com/rust-works/succinctly/issues/2955), whose most promising fix is
-splicing bound bodies by handle (the `Rc`-shaded opaque sub-expression #1371 already
-introduced) instead of by clone.
+The 14-level row also went from 0.38 s to 0.03 s. The processed program is now linear in
+chain depth — `link_size_guard_2955` (`src/bin/succinctly/jq_runner.rs`) counts its nodes
+at 6, 8 and 10 levels and asserts a constant per-level delta; against the copying loader it
+read 1253 / 5093 / 20453. `test_fan_out_module_chain_stays_linear_2955`
+(`tests/jq_cli_tests.rs`) runs the issue's two shapes end to end.
+
+What remains above jq's 2 MB is the **evaluator's**, not the loader's, and it needs no
+module to appear: a `DefCall` node caches its bound body, so a call tree of `F^L` calls
+leaves `F^L` cached copies behind for the program's lifetime. The same 56 defs written in
+one file cost 58 MB, `def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(20)`
+costs 234 MB against jq's 2 MB, and `fib(21)` overflows the stack. Filed as
+[#3148](https://github.com/rust-works/succinctly/issues/3148).
+
+**One shape pays for the linking:** a wide chain of which the filter uses *everything*. With
+20 modules of 50 defs each including the one below, `include "s19"; s19_0` starts in 9 ms
+(20 ms before), but a filter naming all 50 top-level defs links all 950 dependency defs into
+the top-level chain and starts in 136 ms (32 ms before; Apple M4 Pro, idle, interleaved
+medians of 25 reps). A module-heavy loop, `[range(1e5) | f]` with `f` calling one
+dependency through a stub, is neutral within noise (+1.6%, against +3.3% drift on the same
+defs written inline).
+Each chain def is installed over the whole program below it when bound, so the chain's
+length is quadratic at startup -- the same pre-existing evaluator cost a single 3000-def
+`include` pays today (1 GB, 0.5 s; also #3148) -- where the copying loader had kept those
+bodies nested inside the defs that used them. Only the defs the filter reaches are linked, which is what
+keeps the common shapes at or below their old cost.
 
 ### A wrapped dependency sits inside the including def's scope — closed (#2962)
 
@@ -7440,21 +7459,40 @@ against jq 1.7.1, with what `succinctly jq` answered before #2962:
 | `gb` = `def g: b;`, `hb` = `include "gb"; def h(b): g; def q: h(99);`, then `q` | `b/0 is not defined`, exit 3 | `99`, exit 0 |
 | `inner3` = `def g: 42; def k: [g];`, `h3` = `include "inner3"; def h($g): [g, k]; def q: h(7);`, then `q` | `[7,[42]]` | `[7,[7]]` |
 
-**Closed** by wrapping each dependency group as a flooring run (the #2951 marker, so a
-dependency body sees nothing of the def it is wrapped into, for `$variables` as well as
-calls), and by **renaming** a dependency that shares the def's (name, arity) or a
-parameter's name, rather than excluding it. The exclusion was what produced the first and
-third rows: it kept the def's own binding for the body but stranded the other dependency
-that called the excluded one. [ADR-0023](../../adrs/adr-0023.md)'s #2962 amendment records
-the mechanism. `test_dependencies_are_bound_in_their_own_scope_2962`
-(`tests/jq_cli_tests.rs`) pins 29 rows, each byte for byte against jq 1.7.1 (stdout, stderr
-and exit code): these three, the scope leaks the floor closes (a parameter, a sibling
-origin's group, a `$`-parameter), and the cases the rename must respect (a nested def or
-parameter of the same name, a dependency's own dependency, a later same-name entry, and
-declaration order).
+**Closed** first by wrapping each dependency group as a flooring run (the #2951 marker, so
+a dependency body sees nothing of the def it is wrapped into, for `$variables` as well as
+calls) with a clashing dependency **renamed** rather than excluded, and since #2955 by not
+wrapping dependency bodies into defs at all: a dependency module is linked once, in its own
+run, and a def reaches it through forwarding stubs that carry no free name to capture. The
+exclusion was what produced the first and third rows: it kept the def's own binding for the
+body but stranded the other dependency that called the excluded one; under linking, that
+other dependency's call is answered inside its own module.
+[ADR-0023](../../adrs/adr-0023.md)'s #2962 and #2955 amendments record both mechanisms.
+`test_dependencies_are_bound_in_their_own_scope_2962` (`tests/jq_cli_tests.rs`) pins 30
+rows, each byte for byte against jq 1.7.1 (stdout, stderr and exit code): these three, the
+scope leaks the floor closes (a parameter, a sibling origin's group, a `$`-parameter), and
+the cases binding must respect (a nested def or parameter of the same name, a dependency's
+own dependency, a later same-name entry, and declaration order).
 
 A module body's unbound `$variable` is now also reported at the module's own file, line
 and source, as jq reports it and as #2991 already did for calls.
+
+### A dependency's compile error was reported once per copy — closed (#3058)
+
+A dependency reached from two defs was copied into both, and each copy's body was checked:
+`jq: 2 compile errors`, the second without a line. Since #2955 the body exists once and is
+checked once, so `include "mid"; a, b` with `mid` = `include "dep"; def a: g; def b: g;` and
+`dep` = `def g: $nosuch;` reports jq's one error. Cross-module errors also come out in jq
+1.7.1's order now — a dependency's before its includer's, the last-declared dependency's
+first, a chain's deepest first — because that is the order the linked runs are wrapped in.
+Both pinned in `tests/jq_cli_tests.rs` (`_3058`, `_2955`).
+
+**Residual:** a module that is both a top-level `include` and another module's dependency
+has two copies (its top-level run and its linked run), so a body error in it is reported
+twice when the main filter reaches *both* — `include "dep"; include "mid"; [h, bad]` with
+`dep` = `def bad: nosuch;` and `mid` = `include "dep"; def h: bad;` prints
+`jq: 2 compile errors` where jq prints one. Reaching only the linked copy (`[h, k]`) is one
+report, since an unreached body is never checked (#2740).
 
 ### Module-scope gaps that are genuinely open
 
