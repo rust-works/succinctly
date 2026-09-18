@@ -866,7 +866,8 @@ is the revert that established what the other one costs.
    ([#2643](https://github.com/rust-works/succinctly/issues/2643)). The sibling refusal is
    itself the general (non-`null`/`bool`) case: jq's own `jv_identical` admits
    `null`/`true`/`false` by value regardless of node, so the same shape on `{"a":true,"c":true}`
-   answers ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
+   answers `["c"]` on both
+   ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
    Fourteen rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
@@ -897,7 +898,10 @@ is the revert that established what the other one costs.
    `Snapshot` marker not proven to name that call's own document node to `Untracked` first, so
    `Frame::certifies`'s unconditional `Snapshot => true` never gets a chance to admit the
    rebuilt copy — refuse-only by construction, since the only transition is `Snapshot →
-   Untracked` and `Untracked` never certifies. A documented residual remains: a handful of
+   Untracked` and `Untracked` never certifies by node identity (a `null`/`bool` rebuilt copy
+   still certifies by jq's own value-identity rule, #3136 — sound, since jq's `jv_identical`
+   has no pointer identity for those three values at all, rebuilt or not). A documented
+   residual remains: a handful of
    constructions jq's own reference-counted `jv` passes an embedded node through *without
    copying it* (`{k:.} \| .k`, `. + {}`, `reduce empty as $i (.; .)`, and `path(.[0] | $x)`
    navigation *inside* a `path()` call over `[.]`) now refuse rather than silently accept a

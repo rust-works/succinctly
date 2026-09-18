@@ -29212,10 +29212,14 @@ fn marker_needs_demotion(marker: &Tracked, root: &RootWitness) -> bool {
 
 /// Rewrite every [`Expr::TrackedVar`] marker in `expr` whose
 /// [`marker_needs_demotion`] against `root` into an [`Origin::Untracked`]
-/// copy (#2642) -- a demotion, never a promotion: `Frame::certifies` already
-/// refuses `Untracked` unconditionally, so this is the only change needed to
-/// stop a rebuilt copy from being admitted, without touching `Frame`,
-/// `Origin`, or `resolve_node`'s certification rule itself.
+/// copy (#2642) -- a demotion, never a promotion: `Frame::certifies` still
+/// refuses `Untracked` by node identity unconditionally, so this is the
+/// only change needed to stop a rebuilt copy from being admitted *that
+/// way*. [`marker_identical`]'s null/bool value-identity carve-out (#3136)
+/// applies uniformly to every `Origin` including a demoted `Untracked`
+/// one -- correctly, since jq's own `jv_identical` has no pointer identity
+/// for `null`/booleans at all, rebuilt or not -- so this demotion still
+/// costs only node-identity-based acceptance, never the null/bool one.
 ///
 /// The walk itself is [`rewrite_markers`], shared with the one promotion
 /// this evaluator performs ([`reroot_markers`], #3037): `Cow::Borrowed`
@@ -33559,6 +33563,18 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
     matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
 }
 
+/// Whether `marker` certifies against `target` -- node identity
+/// (`Frame::certifies`) or, failing that, jq's `jv_identical` null/bool
+/// value-identity carve-out (#3136). Shared by `resolve_node_eager`'s and
+/// `resolves_to_register`'s otherwise-identical `Expr::TrackedVar` arms so
+/// a future refinement of this rule can't apply to one and silently miss
+/// the other, the same duplication risk [`null_bool_identical`]'s own doc
+/// comment names.
+fn marker_identical(marker: &Tracked, target: &OwnedValue, frame: &Frame) -> bool {
+    marker.value == *target
+        && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, target))
+}
+
 /// Whether `expr`, given it runs to completion without raising or
 /// yielding zero outputs, is *provably* `reg` -- `resolve_as_pattern`'s
 /// first-step identity test (jq's `path_intact`) needs exactly this, which
@@ -33583,9 +33599,9 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// `is_identity_passthrough(then_branch) && is_identity_passthrough
 /// (else_branch) => trackable` arm answered `["a","x"]` and `del` wrote
 /// through the mismatch. This function instead re-runs the bare-
-/// `TrackedVar` arm's own check (`marker.value == *reg &&
-/// frame.certifies(&marker.origin)`) at every level it recurses to, so a
-/// stale marker refuses wherever it's reached, not just at the top.
+/// `TrackedVar` arm's own check ([`marker_identical`]) at every level it
+/// recurses to, so a stale marker refuses wherever it's reached, not just
+/// at the top.
 ///
 /// Mirrors `is_identity_passthrough`'s grammar otherwise, with one
 /// difference: `Alternative` is gated on the *runtime* register being
@@ -33597,13 +33613,10 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &Frame) -> bool {
     match unwrap_paren(expr) {
         Expr::Identity => trackable,
-        // #3136: the same null/bool carve-out `resolve_node_eager`'s own
-        // `TrackedVar` arm needs -- jq's `jv_identical` admits those three
-        // values by value alone, regardless of node.
-        Expr::TrackedVar(marker) => {
-            marker.value == *reg
-                && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, reg))
-        }
+        // #3136: [`marker_identical`], shared with `resolve_node_eager`'s
+        // own `TrackedVar` arm, so a future refinement of this rule can't
+        // apply to one and silently miss the other.
+        Expr::TrackedVar(marker) => marker_identical(marker, reg, frame),
         Expr::If {
             then_branch,
             else_branch,

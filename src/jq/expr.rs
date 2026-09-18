@@ -167,7 +167,7 @@ pub struct Tracked {
 ///   cursor identity. `path(.a as $y | .c | $y)` on `{"a":{"b":1},"c":{"b":1}}`
 ///   still refuses, matching jq -- but jq's own `jv_identical` admits
 ///   `null`/`true`/`false` by value regardless of node (#3136), so the same
-///   filter on `{"a":true,"c":true}` answers `[]` on both.
+///   filter on `{"a":true,"c":true}` answers `["c"]` on both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Origin {
     /// Frozen from the ambient input itself; certified by value equality
