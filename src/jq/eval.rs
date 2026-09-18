@@ -40300,11 +40300,20 @@ pub(crate) fn as_var_refs(
 ///   `if` untracked, even when `c` happens to always pick the recognized
 ///   branch -- this predicate does not evaluate `c`.
 /// - `try A catch B`, requiring **only** `A` -- unlike `if`, `B` can be
-///   ignored rather than also required: every expression this predicate
-///   recognizes is built from primitives that cannot themselves raise, so
-///   a recognized `A` provably never reaches `B` at all
-///   (`. as $x | (try $x catch "whatever") as $y | ...` still tracks `$y`
-///   even though `"whatever"` alone would not qualify on its own).
+///   ignored rather than also required, *provided `A` cannot raise*
+///   ([`is_raise_free_identity_passthrough`]): then `B` is provably never
+///   reached (`. as $x | (try $x catch "whatever") as $y | ...` still tracks
+///   `$y` even though `"whatever"` alone would not qualify on its own). An
+///   `if` inside `A` breaks that -- its *condition* is arbitrary, so
+///   `(try (if error("e") then . else . end) catch {"b":1}) as $x` binds the
+///   handler's fresh `{"b":1}`, which is not `.` at all. Before the #2978
+///   review this arm admitted it, and a document holding an equal `{"b":1}`
+///   then certified the copy by value: `del(.a | (try (if error("e") then .
+///   else . end) catch {"b":1}) as $x | .k | $x | .b)` on
+///   `{"a":{"k":{"b":1}}}` wrote `{"a":{"k":{}}}` where jq 1.7.1 refuses.
+///   The same hole reached `A // B` through a catch-less `try` on its left
+///   (`try` yields nothing on the error, so `//` runs `B`); requiring the
+///   `try` body itself to be raise-free closes both.
 /// - `A // B`, requiring **only** `A` -- `B` only runs when `A` is
 ///   null/false/absent, which a recognized `A` (e.g. bare `.`) can
 ///   genuinely be at runtime, so this is a deliberate, safe
@@ -40312,7 +40321,10 @@ pub(crate) fn as_var_refs(
 ///   because whether `A`'s *value* ends up falsy isn't something this
 ///   static check can see. Matches the confirmed case
 ///   (`. as $x | ($x // 5) as $y | ...`, where `$x` is truthy and thus
-///   always the value actually used) without over-claiming the reverse.
+///   always the value actually used) without over-claiming the reverse. An
+///   `A` that *raises* never reaches `B` either: jq's `//` propagates an
+///   error from its left (confirmed live, `(error("e") // 1)` raises `e`),
+///   so an `if` on the left is fine here even though it is not inside `try`.
 ///
 /// Not recognized, deliberately: a plain literal/computation, even one
 /// whose *value* happens to equal `.` at runtime (confirmed live: `0 as $x
@@ -40335,8 +40347,26 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
             else_branch,
             ..
         } => is_identity_passthrough(then_branch) && is_identity_passthrough(else_branch),
-        Expr::Try { expr, .. } => is_identity_passthrough(expr),
+        Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
         Expr::Alternative(left, _) => is_identity_passthrough(left),
+        _ => false,
+    }
+}
+
+/// [`is_identity_passthrough`] restricted to the shapes that can never
+/// raise: the same grammar without `if`, whose condition is arbitrary. This
+/// is what a `try` body must satisfy for the `try` to be a passthrough of
+/// `.` -- otherwise the handler's value (or, catch-less, *nothing*, which a
+/// following `//` turns into its right operand) is what gets bound.
+fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::Identity => true,
+        Expr::TrackedVar(marker) => {
+            matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. })
+        }
+        Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
+        Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
+        // `Expr::If` lands here on purpose: its condition may raise.
         _ => false,
     }
 }
@@ -40463,12 +40493,20 @@ pub(crate) fn substitute_bound_var_from(
 ///   *same* one -- `c` is not evaluated here, so two arms at different
 ///   positions (`. as $p | .a | (if true then $p else . end) as $x`) answer
 ///   `None`, a refusal where jq answers, listed with the refuse-only rows.
-/// - `try A catch B`: `A`'s (on this grammar `A` cannot raise).
-/// - `A // B`: `A`'s. `B` runs only when `A`'s node is `null`/`false`;
-///   every position below a `null` holds `null`, which the value rule
-///   already admits regardless of position, and nothing below a `false` is
-///   reachable at all -- so a `B`-derived value never meets a register it
-///   is not value-identical to.
+/// - `try A catch B`: `A`'s, only when `A` is raise-free
+///   ([`is_raise_free_identity_passthrough`], the same gate
+///   `is_identity_passthrough` applies) -- an `if` condition inside `A` can
+///   raise, and the handler's value is then a fresh construction that has
+///   no position (#2978 review: `path(.a | (try (if error("e") then . else
+///   . end) catch {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)`
+///   composed `["a","k","b"]` for a node not in the document, where jq
+///   refuses).
+/// - `A // B`: `A`'s. `B` runs only when `A`'s node is `null`/`false`
+///   (an error on the left propagates through `//` in jq, so it binds
+///   nothing); every position below a `null` holds `null`, which the value
+///   rule already admits regardless of position, and nothing below a
+///   `false` is reachable at all -- so a `B`-derived value never meets a
+///   register it is not value-identical to.
 ///
 /// Minted in jq mode only, mirroring [`getpath_result_position`]'s single
 /// choke point: yq's positional readers are already unreachable, and a
@@ -40501,7 +40539,9 @@ fn identity_bind_position<S: EvalSemantics>(
                 let else_at = position(else_branch, trackable, frame)?;
                 (then_at == else_at).then_some(then_at)
             }
-            Expr::Try { expr, .. } => position(expr, trackable, frame),
+            Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
+                position(expr, trackable, frame)
+            }
             Expr::Alternative(left, _) => position(left, trackable, frame),
             _ => None,
         }
@@ -95303,6 +95343,69 @@ mod tests {
                     assert_eq!(e.message, expected, "{filter}");
                 }
             );
+        }
+    }
+
+    /// A `try` whose body holds an `if` is not a passthrough of `.`: the
+    /// condition is arbitrary, so the handler's value -- a fresh
+    /// construction -- is what gets bound (#2978 review). Rows 1-2 are the
+    /// review's finding, new to this branch before the fix: the fresh
+    /// `{"k":{"b":1}}` got `SnapshotAt(["a"])` and `getpath` composed
+    /// `["a","k","b"]` for a node not in the document (and `del` wrote
+    /// through it). Rows 3-4 are the same hole in the pre-existing *value*
+    /// rule -- `main` answered `["a","k","b"]` and wrote `{"a":{"k":{}}}`
+    /// for them, certifying the constructed `{"b":1}` by value against the
+    /// document's own -- closed by the same one-line gate. Rows 5-6 reach it
+    /// through `//`: a catch-less `try` yields nothing on the error, so
+    /// `//` runs its right operand. Every row raises in jq 1.7.1 with this
+    /// message.
+    ///
+    /// The last row is what the gate costs: an `if` whose condition happens
+    /// not to raise, inside a `try`. jq answers `["a","k","b"]`; the static
+    /// rule cannot tell it from the raising one, so it is refuse-only.
+    #[test]
+    fn test_raising_try_body_is_not_an_identity_passthrough_2978() {
+        let doc = br#"{"a":{"k":{"b":1}}}"#;
+        let message = r#"Invalid path expression near attempt to access element "b" of {"b":1}"#;
+        for filter in [
+            r#"path(.a | (try (if error("e") then . else . end) catch {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"del(.a | (try (if error("e") then . else . end) catch {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"path(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)"#,
+            r#"del(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)"#,
+            r#"path(.a | ((try (if error("e") then . else . end)) // {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"path(.a | ((try (if error("e") then . else . end)) // {"b":1}) as $x | .k | $x | .b)"#,
+            r#"path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)"#,
+        ] {
+            query!(doc, filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert_eq!(e.message, message, "{filter}");
+                }
+            );
+        }
+        // ... while a raise-free `try` body keeps its position, nested or not.
+        for filter in [
+            r#"path(.a | (try (try . catch 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"path(.a | (try (. // 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)"#,
+        ] {
+            assert_eq!(outputs(doc, filter), [r#"["a","k","b"]"#], "{filter}");
+        }
+        // The predicate itself, on the shapes the rows above go through.
+        for (src, want) in [
+            ("try . catch 1", true),
+            ("try (try . catch 1) catch 2", true),
+            ("try (. // 1) catch 2", true),
+            ("if true then . else . end", true),
+            ("(if true then . else . end) // 1", true),
+            ("try (if true then . else . end) catch 1", false),
+            ("try ((if true then . else . end) // 1) catch 2", false),
+            ("(try (if true then . else . end)) // 1", false),
+            (
+                "try (try (if true then . else . end) catch 1) catch 2",
+                false,
+            ),
+        ] {
+            let parsed = parse(src).unwrap();
+            assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
         }
     }
 

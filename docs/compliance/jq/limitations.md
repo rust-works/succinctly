@@ -1614,7 +1614,20 @@ answers `["b"]` — and classified the two residuals appended below):
   `identity-*` rows and `scripts/jq-bind-origin-fuzz.py`, whose alphabet gained a navigation
   prefix before the first bind (so `. as $v` is drawn below the root) and a nested rebind use.
 
+  The same review closed a hole in `is_identity_passthrough`'s own `try A catch B` arm, on
+  `main` before #2978: it took `A` to be raise-free, but an `if` inside `A` has an arbitrary
+  condition, so `(try (if error("e") then . else . end) catch {"b":1}) as $x` bound the
+  handler's fresh `{"b":1}` as a value-certified snapshot of `.` — and
+  `del(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)` on
+  `{"a":{"k":{"b":1}}}` wrote `{"a":{"k":{}}}` where jq refuses. A `try` body must now be
+  raise-free (the same grammar minus `if`) for the `try` to count as a passthrough; the same
+  gate keeps `SnapshotAt` from being minted for it.
+
   **What still refuses** after #2978, each a refusal where jq answers, never a fabricated path:
+  - a `try` whose body holds an `if` whose condition happens *not* to raise —
+    `path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)`,
+    `["a","k","b"]` in jq. The raise-free gate above is static and cannot tell it from the
+    raising twin, so the bind is a plain value;
   - an `if` bind source whose arms sit at *different* positions —
     `path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)`,
     `["a","b"]` in jq. `identity_bind_position` is static (the condition is not evaluated),

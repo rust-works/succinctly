@@ -334,13 +334,23 @@ identity-trap-off-register-frame	{"a":{"b":{"c":1}}}	path(.a | {b:{c:1}} | . as 
 identity-trap-rebuilt-copy	{"a":{"b":2}}	path(. as $x | .a | ($x | tojson | fromjson) | getpath(["a"]) | .b)
 identity-trap-alternative-below-null	{"a":null}	path(.a | (. // {"c":{"b":1}}) as $x | .c | $x | getpath(["c"]) | .b)
 identity-nested-path-invocation	{"a":{"b":2}}	path(. as $x | .a | path($x | getpath(["a"]) | .b))
+identity-trap-raising-try-getpath	{"a":{"k":{"b":1}}}	path(.a | (try (if error("e") then . else . end) catch {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)
+identity-trap-raising-try-getpath-del	{"a":{"k":{"b":1}}}	del(.a | (try (if error("e") then . else . end) catch {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)
+identity-trap-raising-try-value-rule	{"a":{"k":{"b":1}}}	path(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)
+identity-trap-raising-try-value-rule-del	{"a":{"k":{"b":1}}}	del(.a | (try (if error("e") then . else . end) catch {"b":1}) as $x | .k | $x | .b)
+identity-trap-raising-try-alternative	{"a":{"k":{"b":1}}}	path(.a | ((try (if error("e") then . else . end)) // {"b":1}) as $x | .k | $x | .b)
+identity-raise-free-try-nested	{"a":{"k":{"b":1}}}	path(.a | (try (try . catch 1) catch 2) as $x | .k | $x | getpath(["k"]) | .b)
+identity-try-if-nonraising	{"a":{"k":{"b":1}}}	path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)
 CASES_EOF
 )
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
 # reason it is deliberately left refusing. A new one is a sweep failure.
 # Quoted heredoc: a reason may quote a filter verbatim ($q, "a") without
-# the shell expanding it.
+# the shell expanding it -- but keep single quotes *balanced* across the
+# block: bash still scans them while finding the end of the enclosing
+# `$( )`, and an odd count fails the whole script with "unexpected EOF
+# while looking for matching `''" (#2978 review round).
 REFUSE_ONLY=$(cat <<'REFUSE_EOF'
 value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
 tojson-between:tojson/fromjson are not on cannot_move_register's proven allowlist (#2041)
@@ -374,6 +384,7 @@ in-evaluator-input-reduce-empty:#3036 -- same as in-evaluator-input-embed-array 
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
 in-evaluator-input-catch-own-value:#3036 -- on the input-queue route the marker carries no node witness, so `try_payload_root` cannot prove the payload is its node; the generic route keeps it accepted
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
+identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 REFUSE_EOF
 )
 
