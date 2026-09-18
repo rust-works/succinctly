@@ -57301,6 +57301,11 @@ fn test_pattern_computed_key_fans_out_in_folds_2872() -> Result<()> {
             "[label $o | path(. as {(break $o):$q} ?// {a:$q} | $q)]",
             "[[\"a\"]]\n",
         ),
+        (
+            r#"{"a":{"c":1}}"#,
+            "[label $o | path(foreach .[] as {(\"c\", break $o):$q} (.; .; $q))]",
+            "[[\"a\",\"c\"]]\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");
@@ -57327,6 +57332,11 @@ fn test_pattern_computed_key_walker_shapes_2872() -> Result<()> {
     for (input, filter, expected) in [
         (r#"{"a":{"x":1,"y":2}}"#, "[. as {a:{(\"x\",\"y\"):$q}} | $q]", "[1,2]\n"),
         (r#"{"a":1,"b":2}"#, "[. as {$a, (\"b\"):$q} | [$a,$q]]", "[[1,2]]\n"),
+        (
+            r#"{"b":{"x":1},"c":2}"#,
+            "[. as {$b: {x:$q}, (\"c\"):$r} | [$b,$q,$r]]",
+            "[[{\"x\":1},1,2]]\n",
+        ),
         (
             r#"{"b":{"x":1,"y":2}}"#,
             "[. as {$b: {(\"x\",\"y\"):$q}} | [$b,$q]]",

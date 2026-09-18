@@ -28808,6 +28808,45 @@ fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Re
     Ok(())
 }
 
+/// #2872: a computed key fans out through the owned-identity pipe too -- the
+/// route a cursor-metadata builtin (`key`) after the bind keeps the document
+/// cursor on (`eval_owned_identity_spliced`'s `AsPattern` arm) -- and that
+/// arm's stop and escape verdicts reach the caller. Destructuring `as` is a
+/// succinctly extension in yq mode (real yq v4.53.3 rejects the pattern
+/// outright, the #2065 class), so these pin succinctly's own answers.
+#[test]
+fn test_destructuring_computed_key_fans_out_on_the_owned_identity_route_2872() -> Result<()> {
+    let doc = "a:\n  x: 1\n  y: 2\n";
+    let (out, code) = run_yq_stdin(
+        ".a | . as {(\"x\",\"y\"):$q} | [key, $q]",
+        doc,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "[\"a\",1]\n[\"a\",2]\n");
+
+    // A consumer's stop after the first binding set ends the walk.
+    let (out, code) = run_yq_stdin(
+        "[limit(1; .a | . as {(\"x\",\"y\"):$q} | key)]",
+        doc,
+        &["-o", "json", "-I0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "[\"a\"]\n");
+
+    // The key's own trailing error escapes after the first binding set ran
+    // (the yq runner reports an errored evaluation without its prefix).
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a | . as {(\"x\", error(\"E\")):$q} | key",
+        doc,
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} err: {err:?}");
+    assert_eq!(out, "");
+    assert!(err.contains("Error: E"), "{err}");
+    Ok(())
+}
+
 // #723 review round: input/inputs/input_line_number are jq-only -- the
 // CLI driver behind `succinctly yq` (yq_runner.rs) never seeds their shared
 // document queue, since they need real per-document loop coordination that
