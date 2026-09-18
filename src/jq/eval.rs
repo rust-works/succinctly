@@ -6336,8 +6336,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // at all for a zero-output key, which still wins the chain.
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { .. } => {
-                unreachable!("the body sink records an outcome before answering Demand::Stop")
-                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // The matcher's own trailing control -- a pattern step's error
             // (a structural mismatch), or the key generator's own
@@ -21295,6 +21294,12 @@ pub(crate) fn index_one_owned(
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             OwnedValue::Null,
         ) => Ok(Some(OwnedValue::Null)),
+        // jq's `jv_get` reads `null` as `null` for a string, number *or
+        // object* (slice-shaped) key, and raises for any other kind -- so
+        // `null | .[{}]` and `null | .[{"start":1}]` are `null`, while
+        // `.[true]`/`.[[1]]` on `null` still raise "Cannot index null with
+        // boolean/array". Confirmed live against jq 1.7.1 (#2872 review).
+        (OwnedValue::Object(_), OwnedValue::Null) => Ok(Some(OwnedValue::Null)),
         _ if optional => Ok(None),
         _ => Err(EvalError::cannot_index(owned_type_name(target), key)),
     }
@@ -34174,10 +34179,10 @@ struct PatternBinding {
 ///
 /// - **identity before kind**: the `path_intact` refusal precedes `jv_get`,
 ///   so `path(. as {a:$q} | ($q|.[0]) as [$z] | $z)` is "near attempt to
-///   access element 0 of 1", not "Cannot index number with number". A
-///   computed key of an unindexable kind is the one exception, refused ahead
-///   of the identity check exactly as jq's `INDEX` refuses it before
-///   anything else ([`PatternKey::component`]).
+///   access element 0 of 1", not "Cannot index number with number" -- for a
+///   computed key of any kind too: `{(k):$q}` with `def k: {}` off the
+///   register is "near attempt to access element {} of ...", never "Cannot
+///   index ... with object" (#2872 review).
 /// - **`null` still steps**: each step is performed and tracked on a `null`
 ///   input, and `null`/booleans are `jv_identical` by value, so the walk
 ///   continues across entries (`{}` gives `path(. as {a:{b:$q}} | $q)` =
@@ -34215,20 +34220,25 @@ impl PatternMode for PathPatternMode<'_> {
         reg: &PatternRegister,
         first: bool,
     ) -> Result<(OwnedValue, PatternRegister), EvalError> {
-        let component = key.component(input)?;
         // jq's `path_intact`: the step's input must be the register's own
         // node. Only `null`/`true`/`false` are `jv_identical` by value,
         // which is what lets a second entry step from a `null` parent
-        // (`null | . as {a:$q, b:$r}` walks to `["a","b"]`).
+        // (`null | . as {a:$q, b:$r}` walks to `["a","b"]`). Checked ahead
+        // of the key's *kind* (`component`/`child`), as jq checks it ahead
+        // of `jv_get` for a computed key too: `{"a":[1]} | path(.a as
+        // {(k):$q} | $q)` with `def k: {}` is jq's `near attempt to access
+        // element {} of [1]`, not "Cannot index array with object".
         if !((first && reg.is_input) || null_bool_identical(input, &reg.value)) {
-            let Some(element) = navigation_element(&component) else {
-                unreachable!("a pattern step's component is always Field/Index")
-                // omni-dev: coverage tolerate-line reason="unreachable: PatternKey::component only ever builds Expr::Field/Expr::Index, and navigation_element answers Some for both (#2649)"
+            let element = match key {
+                PatternKey::Field(name) => OwnedValue::String((*name).to_string()),
+                PatternKey::Position(i) => OwnedValue::Int(*i),
+                PatternKey::Computed(value) => (*value).clone(),
             };
             return Err(EvalError::invalid_path_expression_near_access(
                 &element, input,
             ));
         }
+        let component = key.component(input)?;
         let child = key.child(input)?;
         let moved = PatternRegister {
             path: PathPrefix::extend(&reg.path, component),
@@ -34497,8 +34507,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // is `[]`, `$z` never tried).
                 Flow::Exhausted => break,
                 Flow::Stopped { .. } => {
-                    unreachable!("the sink above records an outcome before answering Demand::Stop")
-                    // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                    unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                 }
                 // The walk's own refusal (a pattern step), or the key
                 // generator's own trailing control -- given the same
@@ -41129,8 +41138,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
             // is untouched, and the alternative still wins).
             Flow::Exhausted => return (state, None),
             Flow::Stopped { .. } => {
-                unreachable!("the step sink records an outcome before answering Demand::Stop")
-                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // A pattern-match failure leaves `state` where the steps already
             // run left it (untouched when none ran, since UPDATE never ran)
@@ -43000,8 +43008,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             // Every step ran to completion (none, for a zero-output key).
             Flow::Exhausted => return (state, Flow::Exhausted),
             Flow::Stopped { .. } => {
-                unreachable!("the step sink records an outcome before answering Demand::Stop")
-                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // A pattern-match failure (a step's error), or the key
             // generator's own trailing error/break/halt after the steps its
@@ -55794,8 +55801,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Exhausted => (carried, None),
         Flow::Escaped(control) => (carried, Some(control)),
         Flow::Stopped { .. } => {
-            unreachable!("the collecting sink above never answers Demand::Stop")
-            // omni-dev: coverage tolerate-line reason="unreachable: the sink is a plain collector that always answers Demand::Continue (#2872)"
+            unreachable!("a collector never stops") // omni-dev: coverage tolerate-line reason="unreachable: the sink is a plain collector that always answers Demand::Continue (#2872)"
         }
     }
 }
@@ -55914,9 +55920,7 @@ impl PatternKey<'_> {
     /// The path component this step appends to the register (path mode):
     /// a string key is a field, a numeric key an index that keeps its own
     /// spelling exactly as `.[EXPR]` does (`numeric_path_component`, #1088),
-    /// and any other kind is [`Self::child`]'s error -- checked here, ahead
-    /// of the register's identity check, because jq's `INDEX` needs the key
-    /// value in hand before it can do anything else with it.
+    /// and any other kind is [`Self::child`]'s error.
     fn component(&self, input: &OwnedValue) -> Result<Expr, EvalError> {
         match self {
             Self::Field(key) => Ok(Expr::Field((*key).to_string())),
@@ -56315,11 +56319,21 @@ fn dedup_pattern_match<M: PatternMode>(
 where
     M::Binding: Clone,
 {
-    let repeated = bindings.iter().enumerate().any(|(i, b)| {
-        bindings[..i]
-            .iter()
-            .any(|earlier| M::name(earlier) == M::name(b))
-    });
+    // A handful of names (the usual pattern) is checked pairwise with no
+    // allocation; a wide pattern goes through a set so the check stays
+    // linear per match -- it runs once per source element (#2872 review: a
+    // 20k-entry pattern over 200 elements doubled its time on the pairwise
+    // scan alone).
+    let repeated = if bindings.len() <= 16 {
+        bindings.iter().enumerate().any(|(i, b)| {
+            bindings[..i]
+                .iter()
+                .any(|earlier| M::name(earlier) == M::name(b))
+        })
+    } else {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        bindings.iter().any(|b| !seen.insert(M::name(b)))
+    };
     if !repeated {
         return None;
     }

@@ -57034,6 +57034,17 @@ fn test_pattern_computed_key_fans_out_in_path_position_2872() -> Result<()> {
             "jq: error (at <stdin>:0): Invalid path expression near attempt to access element \"a\" of {\"a\":1,\"b\":2}\n",
             5,
         ),
+        // `path_intact` before `jv_get` for a computed key of any kind: off
+        // the register the refusal names the key value, and only on the
+        // register does its kind get checked (#2872 review; was "Cannot
+        // index array with object", the kind error first).
+        (
+            r#"{"a":[1]}"#,
+            "def k: {}; path(.a as {(k):$q} | $q)",
+            "",
+            "jq: error (at <stdin>:0): Invalid path expression near attempt to access element {} of [1]\n",
+            5,
+        ),
         (
             r#"{"a":1,"b":2}"#,
             "try [path(. as {(halt_error(1)):$q} | $q)] catch \"caught\"",
@@ -57165,6 +57176,12 @@ fn test_pattern_computed_key_matcher_is_lazy_2872() -> Result<()> {
             "[[1,3],[2,3],[1,4],[2,4]]\n",
             "",
         ),
+        // jq's `jv_get(null, k)` is `null` for a string, number *or object*
+        // key -- the #2872 review found the removed short-circuit had been
+        // masking `index_one_owned`'s missing object-key arm ("Cannot index
+        // null with object"). `null | .[{}]` still raises through the
+        // cursor-side `.[EXPR]` path, a separate pre-existing gap.
+        (r"null", "def k: {}; [. as {(k):$a} | $a]", "[null]\n", ""),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "`{filter}`: stdout={stdout} stderr={stderr}");

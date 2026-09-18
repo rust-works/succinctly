@@ -10120,8 +10120,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
         match walk {
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { .. } => {
-                unreachable!("the body sink records an outcome before answering Demand::Stop")
-                // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
+                unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
             }
             // The matcher's own trailing control -- see
             // `eval::each_pattern_alternatives`'s identical arm.
