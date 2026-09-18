@@ -62378,6 +62378,28 @@ fn test_path_context_sibling_sites_pull_their_generators_lazily_2916() -> Result
     Ok(())
 }
 
+/// #3117: `skip`'s count arm was the one `path_context_component_values`
+/// call site #2916 did not cover (it postdates that issue -- added by
+/// #2968). The first count value (`1`) already steps the body, which
+/// raises, so the second alternative's `debug("late")` must never run --
+/// matching jq's `n as $n | skip($n; body)` desugaring. The `| key` tail
+/// forces `path_context_step_generic`'s `Builtin::Skip` arm (the same
+/// routing the sibling #2916 sites assert with).
+#[test]
+fn test_skip_pulls_count_generator_lazily_3117() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"(skip((1,(debug("late")|2)); error("boom"))) | key"#,
+        "{}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(!stderr.contains("DEBUG"), "stderr={stderr:?}");
+    assert!(stderr.contains("boom"), "stderr={stderr:?}");
+
+    Ok(())
+}
+
 /// #2761: jq 1.7.1 rejects the identity seed at the terminal, but names
 /// iteration when a continuation discards that seed and asks for more.
 #[test]

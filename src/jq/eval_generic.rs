@@ -17441,24 +17441,39 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // reported after the positions already produced exactly as `limit`
         // reports its count's.
         //
-        // `n`'s generator is still the eager `path_context_component_values`
-        // here, unlike `Expr::Limit`'s own arm above -- the same
-        // eager-drain-vs-side-effect-ordering gap #2916 fixed for
-        // `Expr::If`/`Expr::Limit`, but this arm postdates that issue (added
-        // by #2968) so it was never in scope there either. Tracked
-        // separately (follow-up filed alongside #2916).
+        // #3117: `n`'s generator is pulled lazily through
+        // `path_context_component_each` (same reasoning as `Expr::Limit`'s
+        // arm just above; #2916's fix reached `If`/`Limit`'s arms but this
+        // one postdates it -- it was added by #2968 -- so it was never in
+        // scope there). A body failure stops the generator before a later
+        // count value's own side effects fire, matching jq's
+        // `n as $n | skip($n; body)` desugaring. This used to drain the
+        // whole count generator up front via the eager
+        // `path_context_component_values`.
+        //
+        // `was_read_only`: see `path_context_step_computed_index`'s own doc
+        // comment -- same defensive re-entry, same reason.
         Expr::Builtin(Builtin::Skip(n, expr)) => {
+            let was_read_only = yq_read_only_context::active();
             let produced_from = out.len();
-            let (counts, control) = path_context_component_values::<S, V>(n, pos);
-            for n_value in counts {
+            let mut walk_error: Option<Control> = None;
+            let control = path_context_component_each::<S, V>(n, pos, &mut |n_value| {
+                let _scope = was_read_only.then(yq_read_only_context::enter);
                 let drop = match classify_skip_n(n_value) {
                     Ok(n) => n,
-                    Err(e) => return Err(Control::Error(e)),
+                    Err(e) => return stop_with_escape(&mut walk_error, Control::Error(e)),
                 };
                 let mut branch = Vec::new();
-                let stepped = path_context_step_generic::<S, V>(expr, pos, &mut branch);
-                out.extend(branch.into_iter().skip(drop));
-                stepped?;
+                match path_context_step_generic::<S, V>(expr, pos, &mut branch) {
+                    Ok(()) => {
+                        out.extend(branch.into_iter().skip(drop));
+                        Demand::Continue
+                    }
+                    Err(control) => stop_with_escape(&mut walk_error, control),
+                }
+            });
+            if let Some(control) = walk_error {
+                return Err(control);
             }
             control.map_or(Ok(()), |c| {
                 Err(path_context_component_escape::<S, V>(out, produced_from, c))
