@@ -922,8 +922,9 @@ is the revert that established what the other one costs.
    every `Snapshot` marker the expression carries first, because a freshly rebuilt document
    cannot be a node any earlier binding was frozen from — the one fact a `StandardJson` can
    always establish, where a positive witness cannot (an empty container or a scalar carries
-   no cursor to recover a node id from). The generic funnels, which already prove their
-   markers against a live cursor, take the non-demoting `eval_each_owned_bridged` so the proof
+   no cursor to recover a node id from). The generic funnels hand the re-entry the witness
+   of the live cursor they bridge from (`Reentry::Against`, #3122) — only a caller that has
+   already run that same demotion for this document passes `Reentry::Proven` — so the proof
    is kept (and a re-entry whose expression holds no assignment, builtin or call skips the
    rebuild, since only a resolver invocation can read a demotion). The two classes #2642
    deliberately excluded are closed with it: the owned-identity

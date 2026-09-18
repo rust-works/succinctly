@@ -63383,3 +63383,65 @@ fn test_any_all_cond_isvalid_loops_validate_only_what_they_read_2658() -> Result
 
     Ok(())
 }
+
+/// #3122: `recurse(f)`'s level-0 run of `f` is a generic-funnel re-entry
+/// like any other, and takes the cursor's own witness (`each_recurse_generic`
+/// used to hand `f` to the walk without one). Pinned on both sides: a write
+/// through `$x` from the node `$x` was bound from answers as jq does, and
+/// one from a rebuilt copy or a different node refuses. Captured live against
+/// jq 1.7.1.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_tracked_var_recurse_level_zero_names_its_root_3122() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"a":1,"b":{"c":1}}"#,
+            ". as $x | [recurse(if .a == 1 then ($x.a = 9) else empty end)]",
+            r#"[{"a":1,"b":{"c":1}},{"a":9,"b":{"c":1}}]"#,
+        ),
+        (
+            r#"{"a":1,"b":{"c":1}}"#,
+            ". as $x | [recurse(if .a == 1 then ($x.a = 9) else empty end; .a == 1)]",
+            r#"[{"a":1,"b":{"c":1}}]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#3122: `{filter}` must stay accepted (real jq accepts it); stderr={stderr:?}"
+        );
+    }
+    for (input, filter) in [
+        (
+            r#"{"a":1,"b":{"c":1}}"#,
+            ". as $x | [.b | recurse(if .c == 1 then ($x.a = 9) else empty end)]",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | [recurse(if .a == 1 then ($x.a = 9) else empty end)]",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $x | {a:1} | [recurse(.b?; ($x.a = 9) | true)]",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $x | [.[]] | [recurse(if .[0]? == 1 then ($x.a = 9) else empty end)]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3122: `{filter}` must refuse (jq: Invalid path expression), got \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3122: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
