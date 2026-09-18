@@ -135,6 +135,20 @@ fn push_bracket(chain: &mut Vec<Expr>, bracket: Bracket) {
 /// `Pattern` tree-walker too.
 const MAX_PATTERN_DEPTH: usize = 256;
 
+/// Maximum number of computed keys (`{(EXPR): P}`, `{"\(EXPR)": P}`) in a
+/// single `Pattern` (one `?//` alternative, all nesting levels). Exceeding it
+/// returns a clean [`ParseError`]. The matcher pulls each computed key's
+/// outputs on demand, running the rest of the walk from inside that key's
+/// own generator callback (`walk_pattern_each`, #2872), so every computed key
+/// on a match path is one more native frame on the evaluation stack -- a
+/// literal key is not, however wide the pattern. A pattern with 100k
+/// computed keys overflowed the CLI's 256 MB evaluation stack; this bound
+/// keeps that hazard, reachable from query text alone, a parse error
+/// instead, with a margin of well over an order of magnitude on that stack
+/// (~2.5 KB per computed key in a release build). Recorded in
+/// `docs/compliance/jq/limitations.md`.
+const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
+
 /// Maximum recursion depth for a single `Expr` AST. Exceeding it returns a
 /// clean [`ParseError`] instead of recursing further.
 ///
@@ -469,6 +483,9 @@ struct Parser<'a> {
     jq_extensions: bool,
     /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
     pattern_depth: usize,
+    /// Computed keys seen in the `Pattern` being parsed, reset as each
+    /// top-level pattern begins; see [`MAX_PATTERN_COMPUTED_KEYS`].
+    pattern_computed_keys: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
     /// Every ordinary `Expr::FuncCall` site this parse has built, with the
@@ -842,6 +859,7 @@ impl<'a> Parser<'a> {
             mode,
             jq_extensions,
             pattern_depth: 0,
+            pattern_computed_keys: 0,
             expr_depth: 0,
             call_sites: Vec::new(),
             var_sites: Vec::new(),
@@ -3193,6 +3211,9 @@ impl<'a> Parser<'a> {
     /// - `{key: $var, ...}` - object destructuring
     /// - `[$first, $second, ...]` - array destructuring
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        if self.pattern_depth == 0 {
+            self.pattern_computed_keys = 0;
+        }
         self.pattern_depth += 1;
         let result = if self.pattern_depth > MAX_PATTERN_DEPTH {
             Err(ParseError::new(
@@ -3204,6 +3225,19 @@ impl<'a> Parser<'a> {
         };
         self.pattern_depth -= 1;
         result
+    }
+
+    /// One more computed key in the pattern being parsed; see
+    /// [`MAX_PATTERN_COMPUTED_KEYS`].
+    fn count_pattern_computed_key(&mut self) -> Result<(), ParseError> {
+        self.pattern_computed_keys += 1;
+        if self.pattern_computed_keys > MAX_PATTERN_COMPUTED_KEYS {
+            return Err(ParseError::new(
+                format!("pattern holds more than {MAX_PATTERN_COMPUTED_KEYS} computed keys"),
+                self.pos,
+            ));
+        }
+        Ok(())
     }
 
     /// The real `parse_pattern` body, entered only through the depth-checked
@@ -3301,11 +3335,15 @@ impl<'a> Parser<'a> {
                             self.next();
                             let key_expr = self.parse_expr()?;
                             self.expect(')')?;
+                            self.count_pattern_computed_key()?;
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
                             match self.parse_string_or_interpolation()? {
                                 Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
-                                interpolated => ObjectKey::Expr(Box::new(interpolated)),
+                                interpolated => {
+                                    self.count_pattern_computed_key()?;
+                                    ObjectKey::Expr(Box::new(interpolated))
+                                }
                             }
                         } else {
                             ObjectKey::Literal(self.parse_ident()?)
@@ -10537,6 +10575,48 @@ mod tests {
         let n = MAX_PATTERN_DEPTH - 1;
         let object_pattern = format!("{}$x{}", "{a: ".repeat(n), "}".repeat(n));
         assert!(parse(&format!(". as {object_pattern} | $x")).is_ok());
+    }
+
+    /// #2872: a pattern with more computed keys than
+    /// `MAX_PATTERN_COMPUTED_KEYS` is a clean parse error (every computed key
+    /// on a match path is one native frame of the demand-driven matcher);
+    /// just under the limit parses, an interpolated key counts as one, a
+    /// literal key never counts however wide the pattern, and the count is
+    /// per `?//` alternative.
+    #[test]
+    fn test_pattern_computed_key_limit_returns_parse_error_2872() {
+        let keys = |n: usize| {
+            (0..n)
+                .map(|i| format!("(\"k{i}\"):$v{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let over = keys(MAX_PATTERN_COMPUTED_KEYS + 1);
+        let err = parse(&format!(". as {{{over}}} | $v0")).unwrap_err();
+        assert!(
+            err.message.contains("computed keys"),
+            "unexpected error: {}",
+            err.message
+        );
+        let under = keys(MAX_PATTERN_COMPUTED_KEYS);
+        assert!(parse(&format!(". as {{{under}}} | $v0")).is_ok());
+        // Interpolated keys count; nesting counts; a second alternative
+        // starts its own count.
+        let interpolated = (0..=MAX_PATTERN_COMPUTED_KEYS)
+            .map(|i| format!("\"\\(\"k{i}\")\":$v{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse(&format!(". as {{{interpolated}}} | $v0")).is_err());
+        let half = keys(MAX_PATTERN_COMPUTED_KEYS / 2 + 1);
+        assert!(parse(&format!(". as {{a:{{{half}}}, b:{{{half}}}}} | $v0")).is_err());
+        assert!(parse(&format!(". as {{{half}}} ?// {{{half}}} | $v0")).is_ok());
+        // Literal keys are never counted: a pattern far wider than the cap
+        // still parses.
+        let literal = (0..MAX_PATTERN_COMPUTED_KEYS * 4)
+            .map(|i| format!("k{i}:$v{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse(&format!(". as {{{literal}}} | $v0")).is_ok());
     }
 
     /// `Parser::new` (kept for tests and future use, per its own

@@ -56026,6 +56026,15 @@ type PatternMatchSink<'s, M> =
 /// every match completed before it was offered -- jq's single-threaded
 /// generator model, in which the first failure anywhere ends the whole
 /// pipeline and keeps what already ran.
+///
+/// Only a computed key can fork, so a subtree without one has exactly one
+/// match (or a refusal) and is walked by the plain loop of
+/// [`walk_pattern_once`]; the continuation-passing recursion below is
+/// entered only for a subtree that holds a computed key, and nests once per
+/// entry that does -- never once per entry (#2872 review: the first cut
+/// nested a continuation per entry, and a 500k-entry pattern overflowed the
+/// CLI's 256 MB evaluation stack where the loop-based matcher it replaced
+/// had not).
 fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
     mode: &M,
     pattern: &Pattern,
@@ -56034,15 +56043,17 @@ fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
     out: &mut Vec<M::Binding>,
     sink: PatternMatchSink<'_, M>,
 ) -> Flow {
+    if !pattern_has_computed_key(pattern) {
+        let mark = out.len();
+        let flow = match walk_pattern_once(mode, pattern, input, reg, out) {
+            Ok(reg) => sink(reg, out),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        };
+        out.truncate(mark);
+        return flow;
+    }
     match pattern {
-        // A bare `$x` performs no step: it binds the current input and
-        // leaves the register alone.
-        Pattern::Var(name) => {
-            out.push(mode.bind(name, input, &reg));
-            let flow = sink(reg, out);
-            out.pop();
-            flow
-        }
+        Pattern::Var(_) => unreachable!("a bare variable holds no computed key"), // omni-dev: coverage tolerate-line reason="unreachable: `pattern_has_computed_key` is false for `Pattern::Var`, so the loop walker above always takes it (#2872)"
         Pattern::Object(entries) => {
             walk_object_entries::<M, S>(mode, entries, true, input, reg, out, sink)
         }
@@ -56057,9 +56068,70 @@ fn walk_pattern_each<M: PatternMode, S: EvalSemantics>(
     }
 }
 
+/// Whether `pattern` holds a computed key anywhere -- the one thing that can
+/// make a walk fork.
+fn pattern_has_computed_key(pattern: &Pattern) -> bool {
+    crate::jq::walk::any_pattern_key(pattern, &mut |_| true)
+}
+
+/// Walk a pattern that holds no computed key: exactly one match, or a
+/// refusal at the first failing step. The same visit order as the
+/// continuation-passing walk ([`walk_object_entries`]/
+/// [`walk_array_elements`]) -- object entries in source order, array
+/// elements right to left, `{$b: P}`'s bind ahead of `P`'s -- as a plain
+/// loop over each container's entries, recursing only into a nested
+/// sub-pattern (bounded by the parser's `MAX_PATTERN_DEPTH`). Bindings are
+/// pushed to `out` and left there for the caller to unwind.
+fn walk_pattern_once<M: PatternMode>(
+    mode: &M,
+    pattern: &Pattern,
+    input: &OwnedValue,
+    reg: M::Reg,
+    out: &mut Vec<M::Binding>,
+) -> Result<M::Reg, EvalError> {
+    match pattern {
+        // A bare `$x` performs no step: it binds the current input and
+        // leaves the register alone.
+        Pattern::Var(name) => {
+            out.push(mode.bind(name, input, &reg));
+            Ok(reg)
+        }
+        Pattern::Object(entries) => {
+            let mut reg = reg;
+            for (i, entry) in entries.iter().enumerate() {
+                let ObjectKey::Literal(key) = &entry.key else {
+                    unreachable!("the caller checked for computed keys") // omni-dev: coverage tolerate-line reason="unreachable: every caller gates on `pattern_has_computed_key` being false (#2872)"
+                };
+                let (child, moved) = mode.step(&PatternKey::Field(key), input, &reg, i == 0)?;
+                // `{$b: P}` binds `$b` to the matched value *before* running
+                // `P` against that same value -- one `INDEX` step in jq's
+                // compilation (#2649) -- so the bind sits ahead of `P`'s own
+                // bindings in visit order, which is what the duplicate-name
+                // rule reads.
+                if let Some(bind) = &entry.bind {
+                    out.push(mode.bind(bind, &child, &moved));
+                }
+                reg = walk_pattern_once(mode, &entry.pattern, &child, moved, out)?;
+            }
+            Ok(reg)
+        }
+        Pattern::Array(elements) => {
+            let mut reg = reg;
+            for (i, element) in elements.iter().enumerate().rev() {
+                let key = PatternKey::Position(i as i64);
+                let (child, moved) = mode.step(&key, input, &reg, i + 1 == elements.len())?;
+                reg = walk_pattern_once(mode, element, &child, moved, out)?;
+            }
+            Ok(reg)
+        }
+    }
+}
+
 /// Match `entries` in source order (`gen_object_matcher`): entry 0's key
 /// outputs are the outermost fork, and every completed sub-match continues
-/// with the rest of the entries, re-running their keys.
+/// with the rest of the entries, re-running their keys. A run of entries
+/// that cannot fork (a literal key over a computed-key-free sub-pattern) is
+/// stepped inline; the recursion nests only at an entry that can.
 fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
     mode: &M,
     entries: &[PatternEntry],
@@ -56069,15 +56141,48 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
     out: &mut Vec<M::Binding>,
     sink: PatternMatchSink<'_, M>,
 ) -> Flow {
-    let Some((entry, rest)) = entries.split_first() else {
-        return sink(reg, out);
+    let mark = out.len();
+    let mut reg = reg;
+    let mut first = first;
+    let mut idx = 0;
+    while let Some(entry) = entries.get(idx) {
+        let ObjectKey::Literal(key) = &entry.key else {
+            break;
+        };
+        if pattern_has_computed_key(&entry.pattern) {
+            break;
+        }
+        let (child, moved) = match mode.step(&PatternKey::Field(key), input, &reg, first) {
+            Ok(stepped) => stepped,
+            Err(e) => {
+                out.truncate(mark);
+                return Flow::Escaped(Control::Error(e));
+            }
+        };
+        if let Some(bind) = &entry.bind {
+            out.push(mode.bind(bind, &child, &moved));
+        }
+        reg = match walk_pattern_once(mode, &entry.pattern, &child, moved, out) {
+            Ok(reg) => reg,
+            Err(e) => {
+                out.truncate(mark);
+                return Flow::Escaped(Control::Error(e));
+            }
+        };
+        first = false;
+        idx += 1;
+    }
+    let Some((entry, rest)) = entries[idx..].split_first() else {
+        let flow = sink(reg, out);
+        out.truncate(mark);
+        return flow;
     };
     let mut per_key = |key: PatternKey<'_>, out: &mut Vec<M::Binding>| -> Flow {
         let (child, moved) = match mode.step(&key, input, &reg, first) {
             Ok(stepped) => stepped,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        let mark = out.len();
+        let inner_mark = out.len();
         // `{$b: P}` binds `$b` to the matched value *before* running `P`
         // against that same value -- one `INDEX` step in jq's compilation
         // (#2649) -- so the bind sits ahead of `P`'s own bindings in visit
@@ -56089,10 +56194,10 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
             walk_pattern_each::<M, S>(mode, &entry.pattern, &child, moved, out, &mut |reg, out| {
                 walk_object_entries::<M, S>(mode, rest, false, input, reg, out, sink)
             });
-        out.truncate(mark);
+        out.truncate(inner_mark);
         flow
     };
-    match &entry.key {
+    let flow = match &entry.key {
         ObjectKey::Literal(key) => per_key(PatternKey::Field(key), out),
         // The key expression runs against `input` -- the pattern's own
         // current node, whatever its kind: jq's `INDEX` needs the key value
@@ -56121,11 +56226,14 @@ fn walk_object_entries<M: PatternMode, S: EvalSemantics>(
                 None => key_flow,
             }
         }
-    }
+    };
+    out.truncate(mark);
+    flow
 }
 
 /// Match `elements` right to left (`gen_array_matcher`), the last element's
-/// step being the container's first.
+/// step being the container's first. A run of elements that cannot fork is
+/// stepped inline, as [`walk_object_entries`] steps its entries.
 fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
     mode: &M,
     elements: &[Pattern],
@@ -56135,15 +56243,42 @@ fn walk_array_elements<M: PatternMode, S: EvalSemantics>(
     out: &mut Vec<M::Binding>,
     sink: PatternMatchSink<'_, M>,
 ) -> Flow {
-    let Some((element, rest)) = elements.split_last() else {
-        return sink(reg, out);
+    let mark = out.len();
+    let mut reg = reg;
+    let mut first = first;
+    let mut end = elements.len();
+    while end > 0 && !pattern_has_computed_key(&elements[end - 1]) {
+        let key = PatternKey::Position(end as i64 - 1);
+        let (child, moved) = match mode.step(&key, input, &reg, first) {
+            Ok(stepped) => stepped,
+            Err(e) => {
+                out.truncate(mark);
+                return Flow::Escaped(Control::Error(e));
+            }
+        };
+        reg = match walk_pattern_once(mode, &elements[end - 1], &child, moved, out) {
+            Ok(reg) => reg,
+            Err(e) => {
+                out.truncate(mark);
+                return Flow::Escaped(Control::Error(e));
+            }
+        };
+        first = false;
+        end -= 1;
+    }
+    let Some((element, rest)) = elements[..end].split_last() else {
+        let flow = sink(reg, out);
+        out.truncate(mark);
+        return flow;
     };
     let key = PatternKey::Position(rest.len() as i64);
     let (child, moved) = match mode.step(&key, input, &reg, first) {
         Ok(stepped) => stepped,
-        Err(e) => return Flow::Escaped(Control::Error(e)),
+        Err(e) => {
+            out.truncate(mark);
+            return Flow::Escaped(Control::Error(e));
+        }
     };
-    let mark = out.len();
     let flow = walk_pattern_each::<M, S>(mode, element, &child, moved, out, &mut |reg, out| {
         walk_array_elements::<M, S>(mode, rest, false, input, reg, out, sink)
     });
