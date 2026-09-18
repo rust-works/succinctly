@@ -97399,14 +97399,13 @@ mod tests {
             document: 9,
         };
 
-        let same = marker(Origin::Untracked, Some(node(3, 9)));
-        assert!(marker_is_root(
-            match &same {
-                Expr::TrackedVar(m) => m,
-                _ => unreachable!(),
-            },
-            &root
-        ));
+        let same_marker = Rc::new(Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: Some(node(3, 9)),
+        });
+        assert!(marker_is_root(&same_marker, &root));
+        let same = Expr::TrackedVar(same_marker);
         assert_eq!(
             origin_of(&reroot_markers::<JqSemantics>(&same, &root)),
             Origin::Snapshot
