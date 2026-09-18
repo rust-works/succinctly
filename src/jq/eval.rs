@@ -40615,10 +40615,7 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
             ..
         } => is_identity_passthrough(then_branch) && is_identity_passthrough(else_branch),
         Expr::Try { expr, .. } => is_raise_free_identity_passthrough(expr),
-        // #3129: not the wider `is_identity_passthrough(left)` -- see the
-        // `A // B` bullet above. `//` runs its right side whenever its left
-        // yields nothing, not only when it raises, so `left` needs the same
-        // raise-*and*-empty-free grammar a `try` body needs.
+        // #3129: see the `A // B` bullet above.
         Expr::Alternative(left, _) => is_raise_free_identity_passthrough(left),
         _ => false,
     }
@@ -40790,7 +40787,16 @@ fn identity_bind_position<S: EvalSemantics>(
     trackable: bool,
     frame: &Frame,
 ) -> Option<Origin> {
-    if S::TAG != EvalTag::Jq {
+    // #3129 review: gated here, not left to `substitute_bound_var_at`'s own
+    // `is_identity_passthrough(bind_expr)` check, so `position`'s `If`/
+    // `Alternative` arms below -- a grammar that has drifted wider than
+    // `is_identity_passthrough`'s before (#3129 itself narrowed the latter
+    // without touching this fn) -- can never again be reached on a shape
+    // the outer predicate has already rejected. A future edit that widens
+    // one grammar without the other stays inert here by construction,
+    // instead of by a comment-documented invariant at a call site three
+    // functions away.
+    if S::TAG != EvalTag::Jq || !is_identity_passthrough(source) {
         return None;
     }
     fn position(source: &Expr, trackable: bool, frame: &Frame) -> Option<Origin> {
@@ -95662,6 +95668,10 @@ mod tests {
     /// - row 9: the `if` whose arms sit at *different* positions -- jq
     ///   answers `["a","b"]` here, so this is the one refuse-only row the
     ///   static rule costs, pinned so a later widening is deliberate.
+    /// - row 10 (#3129): the positional twin of the `A // B`-with-`if`-on-
+    ///   its-left hole -- `identity_bind_position` needs no independent gate
+    ///   for it, since it is only ever consulted once `is_identity_passthrough`
+    ///   already holds for the bind source.
     #[test]
     fn test_identity_bind_position_traps_keep_refusing_2978() {
         for (doc, filter, expected) in [
@@ -95710,6 +95720,11 @@ mod tests {
                 r#"path(. as $p | .a | (if true then $p else . end) as $x | $x | getpath(["a"]) | .b)"#,
                 r#"Invalid path expression near attempt to access element "b" of {"b":2}"#,
             ),
+            (
+                &br#"{"a":{"b":{"c":1}},"b":{"c":1}}"#[..],
+                r#"del(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)"#,
+                r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
+            ),
         ] {
             query!(doc, filter,
                 QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
@@ -95736,6 +95751,15 @@ mod tests {
     /// The last row is what the gate costs: an `if` whose condition happens
     /// not to raise, inside a `try`. jq answers `["a","k","b"]`; the static
     /// rule cannot tell it from the raising one, so it is refuse-only.
+    ///
+    /// Rows 8-11 (#3129): the same hole reached directly through `//`,
+    /// with no `try` at all -- `if`'s condition can make the whole `if`
+    /// yield **nothing**, not just raise, and `//` runs its right side on
+    /// empty exactly as it does on a catch-less `try`. Row 8 is `path`, row
+    /// 9 is `del`, row 10 is the write direction (`=`), row 11 is the
+    /// catch-less-`try` spelling of the same escape (`error(...)?`) on the
+    /// `Alternative` arm directly rather than routed through an actual
+    /// `try`/`catch`.
     #[test]
     fn test_raising_try_body_is_not_an_identity_passthrough_2978() {
         let doc = br#"{"a":{"k":{"b":1}}}"#;
@@ -95748,6 +95772,10 @@ mod tests {
             r#"path(.a | ((try (if error("e") then . else . end)) // {"k":{"b":1}}) as $x | .k | $x | getpath(["k"]) | .b)"#,
             r#"path(.a | ((try (if error("e") then . else . end)) // {"b":1}) as $x | .k | $x | .b)"#,
             r#"path(.a | (try (if true then . else . end) catch 1) as $x | .k | $x | getpath(["k"]) | .b)"#,
+            r#"path(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
+            r#"del(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
+            r#".a | ((if empty then . else . end) // {"b":1}) as $x | .k | ($x.b) = 9"#,
+            r#"path(.a | ((if error("e")? then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
         ] {
             query!(doc, filter,
                 QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
@@ -95762,6 +95790,14 @@ mod tests {
         ] {
             assert_eq!(outputs(doc, filter), [r#"["a","k","b"]"#], "{filter}");
         }
+        // #3129 control that must keep agreeing: a truthy `.` directly on
+        // `//`'s left (no `try`, no `if`) still tracks (P13 in #2978's
+        // matrix) -- this fix narrows the `if`-on-the-left case, not the
+        // base `A // B` rule itself.
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(.a | (. // 1) as $x | $x | .b)"),
+            [r#"["a","b"]"#]
+        );
         // The predicate itself, on the shapes the rows above go through.
         // #3129: `(if true then . else . end) // 1` flipped from `true` to
         // `false` -- an `if` on `//`'s left is no longer admitted at all
@@ -95785,56 +95821,6 @@ mod tests {
             let parsed = parse(src).unwrap();
             assert_eq!(is_identity_passthrough(&parsed), want, "{src}");
         }
-    }
-
-    /// #3129: `is_identity_passthrough`'s `Alternative` arm used to admit
-    /// any `A` in `A // B` that itself passed the wider grammar, including
-    /// an `if` -- but `if`'s condition is arbitrary and can make the whole
-    /// `if` yield **nothing**, not just raise, and `//` runs `B` on empty
-    /// exactly as it does when `A` raises. `B`'s value then got certified
-    /// as `Origin::Snapshot` and written through wherever an equal-valued
-    /// node existed. Every row raises in jq 1.7.1 with this message (`del`
-    /// deletes nothing, `=` writes nowhere, matching jq's refusal rather
-    /// than fabricating a path).
-    #[test]
-    fn test_alternative_left_empty_if_is_not_an_identity_passthrough_3129() {
-        let message = r#"Invalid path expression near attempt to access element "b" of {"b":1}"#;
-        let doc = br#"{"a":{"k":{"b":1}}}"#;
-        for filter in [
-            r#"path(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
-            r#"del(.a | ((if empty then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
-            r#".a | ((if empty then . else . end) // {"b":1}) as $x | .k | ($x.b) = 9"#,
-            // #2978's catch-less-`try` twin of this same escape, on the
-            // Alternative arm directly rather than through `try`.
-            r#"path(.a | ((if error("e")? then . else . end) // {"b":1}) as $x | .k | $x | .b)"#,
-        ] {
-            query!(doc, filter,
-                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
-                    assert_eq!(e.message, message, "{filter}");
-                }
-            );
-        }
-        // The positional twin (#3121's `identity_bind_position`, gated the
-        // same way since it is only consulted once `is_identity_passthrough`
-        // already holds for the bind source).
-        let doc2 = br#"{"a":{"b":{"c":1}},"b":{"c":1}}"#;
-        let filter2 = r#"del(. as $p | .a | ((if empty then . else . end) // $p) as $x | .b | $x | getpath(["b"]) | .c)"#;
-        query!(doc2, filter2,
-            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
-                assert_eq!(
-                    e.message,
-                    r#"Invalid path expression near attempt to access element "c" of {"c":1}"#,
-                    "{filter2}"
-                );
-            }
-        );
-        // Control that must keep agreeing: a truthy `.` on `//`'s left
-        // still tracks (P13 in #2978's matrix) -- this fix narrows the
-        // `if`-on-the-left case, not the base `A // B` rule itself.
-        assert_eq!(
-            outputs(br#"{"a":{"b":1}}"#, r"path(.a | (. // 1) as $x | $x | .b)"),
-            [r#"["a","b"]"#]
-        );
     }
 
     /// yq mode mints no `SnapshotAt` at all (the same single-choke-point
