@@ -351,6 +351,8 @@ navigated-bind-embed	{"a":{"b":1}}	.a as $y | {k:.a} | .k | path($y)
 navigated-bind-reduce-update	{"a":{"b":1}}	reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)
 navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | path($y))
 navigated-bind-bool-sibling	{"a":true,"c":true}	.a as $y | .c | $y |= 5
+navigated-bind-owned-root	{"a":{"b":1}}	(tojson|fromjson) | .a as $y | .a | path($y)
+navigated-bind-input-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | path($y)
 identity-at-root-getpath	{"a":{"b":2}}	path(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-del	{"a":{"b":2},"c":1}	del(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-assign	{"a":{"b":2}}	(. as $x | .a | $x | getpath(["a"]) | .b) = 9
@@ -433,6 +435,8 @@ navigated-bind-embed:#2889 -- the owned-embed residual ({k:.a} | .k), unchanged 
 navigated-bind-reduce-update:#3037 residual -- the UPDATE of reduce re-enters the eager evaluator with an owned accumulator; its eval_as carries no node for a navigated bind (#2072 gave the generic evaluator that, not this one), and there is no cursor at the funnel to promote against
 navigated-bind-catch-handler:#3037 residual -- same as navigated-bind-reduce-update, through a catch handler
 navigated-bind-bool-sibling:pre-existing -- the jv_identical rule of jq admits a null/bool by value regardless of node, but the TrackedVar arm of the resolver consults the origin first; ($y | .) = 5 already answers since the . stage re-establishes by value
+navigated-bind-owned-root:#3037 residual -- a navigated bind on an owned-rooted document; the marker node is an OwnedIdentity position and marker_is_root reads only a document node against a live cursor, no OwnedRoot twin
+navigated-bind-input-root:#3037 residual -- same as navigated-bind-owned-root, on the input-queue route
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 REFUSE_EOF

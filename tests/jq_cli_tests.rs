@@ -60631,6 +60631,10 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 ///   (`reduce`'s UPDATE, a `catch` handler): its `eval_as` carries no node
 ///   for a navigated bind (#2072 gave the generic evaluator that, not this
 ///   one), and there is no cursor at the funnel to promote against.
+/// - A navigated bind on an *owned-rooted* document (`input | …`, `-n`, a
+///   `tojson|fromjson`-rebuilt root): the marker's node is an
+///   `OwnedIdentity` position, and `marker_is_root` reads only a document
+///   node against a live cursor -- no `OwnedRoot` twin (review finding).
 /// - A `null`/`bool` marker at an equal-valued sibling: jq's `jv_identical`
 ///   admits those by value regardless of node, but the resolver's
 ///   `TrackedVar` arm consults the origin first (pre-existing; `($y | .)
@@ -60653,6 +60657,10 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
             r"try error(.) catch (.a as $y | .a | path($y))",
         ),
         (r#"{"a":true,"c":true}"#, r".a as $y | .c | $y |= 5"),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(tojson|fromjson) | .a as $y | .a | path($y)",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
