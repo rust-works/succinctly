@@ -109,6 +109,16 @@
 # owned-value re-index bridge before the read reaches it, same as a fold's
 # UPDATE that is not one of the owned fast paths -- see
 # docs/compliance/jq/limitations.md's #2889 section.
+#
+# The `owned-embed-array-multi-*`, `owned-embed-object-add` and
+# `owned-embed-array-tie-*` rows are the #2889 review: the relocating fold
+# was reached only from the generic evaluator, so it fired for the
+# single-element `[.]` alone -- every wider container collapses to
+# `GenericItem::Owned` and re-enters through `eval.rs`, which now runs the
+# fold too (as a pipe *stage*, which is how it arrives there). The tie rows
+# pin which of two equal elements each builtin keeps: `max` the last, `min`
+# the first, so the `-loser` spellings are rows where jq itself refuses and
+# both binaries must agree on exit 5.
 # The `-n 'input | ...'` rows are expressed the same way the pre-existing
 # `in-evaluator-input-*` rows are: the document twice on stdin with no `-n`,
 # so a leading bare `input` call consumes the first copy and binds the
@@ -505,6 +515,16 @@ owned-embed-array-second-copy	{"a":1}	. as $x | [.,.] | .[1] | path($x)
 owned-embed-array-add	{"a":1}	. as $x | [.] | add | path($x)
 owned-embed-array-min	{"a":1}	. as $x | [.] | min | path($x)
 owned-embed-array-max	{"a":1}	. as $x | [.] | max | path($x)
+owned-embed-array-multi-max	{"a":1}	. as $x | [.,.] | max | path($x)
+owned-embed-array-multi-min	{"a":1}	. as $x | [.,.] | min | path($x)
+owned-embed-array-multi-add-null-head	{"a":1}	. as $x | [null,.] | add | path($x)
+owned-embed-array-multi-add-null-tail	{"a":1}	. as $x | [.,null] | add | path($x)
+owned-embed-object-add	{"a":1}	. as $x | {a:.} | add | path($x)
+owned-embed-array-tie-max-last-wins	{"a":1}	. as $x | [{a:1},.] | max | path($x)
+owned-embed-array-tie-min-first-wins	{"a":1}	. as $x | [.,{a:1}] | min | path($x)
+owned-embed-array-tie-max-loser	{"a":1}	. as $x | [.,{a:1}] | max | path($x)
+owned-embed-array-tie-min-loser	{"a":1}	. as $x | [{a:1},.] | min | path($x)
+owned-embed-refuse-identity-stage-max	{"a":1}	. as $x | [.] | . | max | path($x)
 owned-embed-refuse-sort-element	{"a":1}	. as $x | [.] | sort | .[0] | path($x)
 owned-embed-refuse-unique-element	{"a":1}	. as $x | [.] | unique | .[0] | path($x)
 owned-embed-refuse-to-entries-value	{"a":1}	. as $x | {k:.} | to_entries | .[0].value | path($x)
@@ -619,6 +639,7 @@ owned-embed-refuse-scalar-number-root:#2889 -- same as owned-embed-refuse-scalar
 owned-embed-refuse-reverse-element:#2889 -- same as owned-embed-refuse-sort-element, for reverse
 owned-embed-refuse-update-noop-element:#2889 -- a `|=` writes through the assignment resolver first, which re-indexes before the trailing read reaches embed_peel_step
 owned-embed-refuse-array-slice:#2889 -- a slice is not one of embed_peel_step's Field/Index/Iterate shapes, so it re-indexes before the read
+owned-embed-refuse-identity-stage-max:#2889 review -- the single-element [.] stays a GenericItem::LazySeq, and its identity stage materializes through eval_on_owned, whose JSON round trip rebuilds the array before max ever runs; every multi-element spelling takes the Owned route and agrees
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes
