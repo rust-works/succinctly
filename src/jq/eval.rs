@@ -99022,6 +99022,52 @@ mod tests {
         );
     }
 
+    /// #2889: the embed table's `ACTIVE` flag tracks what the table
+    /// *holds*, not the order its guards happen to be released in.
+    ///
+    /// Every guard alive today is dropped LIFO, so the flag could be
+    /// derived from the popped-to length instead -- but only by accident.
+    /// Releasing the outer binding first (an inner guard moved into a
+    /// longer-lived value, a future scope that reorders the two) empties
+    /// the table at the *first* drop, and deriving from the second drop's
+    /// own length would then re-raise a flag with nothing behind it: every
+    /// later `to_owned` would pay a `RefCell` borrow and a walk of an empty
+    /// table for the rest of the thread's life. Dropping in that order
+    /// leaves the flag down.
+    #[test]
+    #[cfg(feature = "std")]
+    fn embed_table_active_follows_the_table_not_the_drop_order_2889() {
+        use crate::jq::eval_generic::{embed_table_active, embed_table_push};
+
+        let outer = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let inner = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(2))]);
+        let outer_origin = BindOrigin::Node {
+            node: 1,
+            document: 9,
+        };
+        let inner_origin = BindOrigin::Node {
+            node: 2,
+            document: 9,
+        };
+
+        assert!(!embed_table_active(), "no binding in scope yet");
+        let outer_guard =
+            embed_table_push::<JqSemantics>(Some(&outer_origin), &outer).expect("a container bind");
+        let inner_guard =
+            embed_table_push::<JqSemantics>(Some(&inner_origin), &inner).expect("a container bind");
+        assert!(embed_table_active(), "two bindings in scope");
+
+        // Out of order on purpose: the outer guard's truncate already
+        // emptied the table, so the inner one has nothing left to pop.
+        drop(outer_guard);
+        assert!(!embed_table_active(), "the outer drop emptied the table");
+        drop(inner_guard);
+        assert!(
+            !embed_table_active(),
+            "a non-LIFO drop must not re-raise the flag"
+        );
+    }
+
     /// `rewrite_markers`' own precheck (#3122 coverage review): its
     /// `any_subexpr` gate decides once, for the *whole* expression, whether
     /// to walk at all -- so a marker that itself needs no change (a

@@ -5349,8 +5349,20 @@ mod embed_table {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            TABLE.with(|t| t.borrow_mut().truncate(self.0));
-            ACTIVE.with(|a| a.set(self.0 > 0));
+            // The flag is derived from what the table actually holds after
+            // the truncate, not from `self.0 > 0` -- guards are dropped in
+            // LIFO order everywhere today, but a future non-LIFO drop
+            // (an outer guard released while an inner one lives) would
+            // otherwise leave `ACTIVE` claiming entries the table no longer
+            // has, or -- worse -- clear it while entries remain and make
+            // every lookup answer `None` for the rest of the scope. Read
+            // inside the same `TABLE.with` closure so the two can never
+            // disagree.
+            TABLE.with(|t| {
+                let mut t = t.borrow_mut();
+                t.truncate(self.0);
+                ACTIVE.with(|a| a.set(!t.is_empty()));
+            });
         }
     }
 
