@@ -1961,7 +1961,11 @@ impl OutputConfig {
         // `JqCompat`/`JqPreserveInput` are the only two conventions this
         // binary ever constructs -- caught by review as a 2.7x-4.8x
         // slowdown on ordinary input with no DEL at all.
-        self.compact
+        //
+        // `--indent 0` counts as compact here for the same reason it does in
+        // both streaming printers (#3155): its output *is* `-c`'s, so it can
+        // take the same echo.
+        (self.compact || self.indent_string.is_empty())
             && !self.color_output
             && !self.sort_keys
             && !self.ascii_output
@@ -6106,12 +6110,25 @@ fn evaluate_input_streaming(
             // call already reported to `sink` (same "report and keep going"
             // contract the eager path's own arms followed, #355).
             None => true,
-            Some(v) => match on_value(sink, v) {
-                Ok(keep_going) => keep_going,
+            // The eager route's copy of `to_jq_values`' depth gate (#3009
+            // review): every caller writes through `write_output_owned_value`,
+            // whose printer only refuses an over-deep value after 384 levels
+            // of `[` are already on stdout. Checked here, before `on_value`,
+            // so such a value prints nothing, is reported at exit 5 and the
+            // generator carries on -- the lazy route's behaviour, and not the
+            // `format_json` panic this route had before the writers merged.
+            Some(v) => match v.check_tree_depth() {
                 Err(e) => {
-                    write_err = Some(e);
-                    false
+                    sink.report(DiagStyle::Jq, &e, &at.resolve());
+                    true
                 }
+                Ok(()) => match on_value(sink, v) {
+                    Ok(keep_going) => keep_going,
+                    Err(e) => {
+                        write_err = Some(e);
+                        false
+                    }
+                },
             },
         }
     });
@@ -10033,11 +10050,14 @@ mod tests {
     }
 
     /// #3009: `print_owned_json`'s depth `ensure!` is unreachable from the
-    /// CLI -- `to_jq_values` rejects an over-deep owned value through
-    /// `OwnedValue::check_tree_depth` before any byte is written, which is
-    /// what keeps
+    /// CLI -- an over-deep owned value is rejected through
+    /// `OwnedValue::check_tree_depth` before any byte is written, by
+    /// `to_jq_values` on the lazy route (which is what keeps
     /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
-    /// true. It stays as a backstop against a future caller that skips that
+    /// true) and by `evaluate_input_streaming` on the eager
+    /// `-n`/`--slurp`/DSV route (which keeps
+    /// `test_eager_over_depth_value_reports_cleanly_3009` true -- the gate the
+    /// writer merge first shipped without). It stays as a backstop against a future caller that skips that
     /// gate, so it is covered here directly rather than left as an
     /// unexercised line.
     #[test]
