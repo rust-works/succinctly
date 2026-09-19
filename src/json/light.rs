@@ -2074,8 +2074,13 @@ fn parse_hex4(hex: &[u8]) -> Result<u16, JsonError> {
 /// from `nested_number_span`'s own greedy `[0-9.eE+-]*` run (same
 /// permissive, malformed-shape-absorbing contract this caller also
 /// needs, since a not-canonical span still has to resolve to *one* span
-/// for [`is_jq_canonical_number`] to reject), so it calls that function
+/// for `is_jq_canonical_number` to reject), so it calls that function
 /// directly rather than adding a fifth copy of the loop (#2919 review).
+/// Plain backticks, not an intra-doc link: this function is `pub` and
+/// `is_jq_canonical_number` is `pub(crate)`, which rustdoc's
+/// `private_intra_doc_links` lint rejects under CI's
+/// `RUSTDOCFLAGS=-D warnings` -- `cargo doc --no-deps --all-features` has
+/// failed on this branch since the link was added.
 pub fn number_literal_end(text: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     // A leading `+` (#2877) is peeled exactly like `-`: `+X` is `X` in
