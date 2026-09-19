@@ -10458,13 +10458,22 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Builtin::Type => {
             let type_name = match &value {
+                // #3035: `type` must not answer the internal `"error"` name
+                // for a malformed keyword token (`nullx`, `nul`, ...).
+                // Materializing routes reject the document before this is
+                // reachable, so the generic decode-failure raises; this arm
+                // carries no document text to name the fault with (an
+                // `Error` value holds none), and its categorization -- a
+                // `decode_failure` -- is what matters to `?`-suppression.
+                StandardJson::Error(_) => {
+                    return QueryResult::Error(EvalError::decode_failure("Invalid JSON text"));
+                }
                 StandardJson::Null => "null",
                 StandardJson::Bool(_) => "boolean",
                 StandardJson::Number(_) => "number",
                 StandardJson::String(_) => "string",
                 StandardJson::Array(_) => "array",
                 StandardJson::Object(_) => "object",
-                StandardJson::Error(_) => "error",
             };
             QueryResult::Owned(OwnedValue::String(type_name.into()))
         }

@@ -21633,6 +21633,22 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor)))
         }
         Builtin::Type => {
+            // #3035: a malformed keyword token (`nullx`, `truex`,
+            // `falsey`, or a truncated `nul`/`tru`/`fals`) decodes to
+            // `Error`; real jq rejects the whole document at parse time, so
+            // `type` must surface the malformed-document error rather than
+            // answer the internal `"error"` name. The document's own text
+            // lets `malformed_json_text` name the fault precisely, same as
+            // every other raise site in this file; a cursorless (owned)
+            // entry point has no text to name it with and raises the
+            // generic form instead.
+            if value.is_error() {
+                let error = cursor.as_ref().map_or_else(
+                    || EvalError::decode_failure("Invalid JSON text"),
+                    |c| EvalError::malformed_json_text(c.doc_text()),
+                );
+                return GenericResult::Error(error);
+            }
             let type_name = tagged_type_name(&value, cursor);
             GenericResult::Owned(OwnedValue::String(type_name.to_string()))
         }

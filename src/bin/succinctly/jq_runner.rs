@@ -5380,12 +5380,25 @@ fn find_matching_close(bytes: &[u8], pos: usize) -> Option<usize> {
 }
 
 /// Find the end of a literal (true, false, null) starting at `pos`.
+/// Where a `true`/`false`/`null` keyword token starting at `pos` ends, under
+/// jq 1.7.1's own reader, for the **top-level document splitter** (#3035).
+///
+/// The answer is [`succinctly::json::light::keyword_span`]'s whole-token
+/// rule: the *entire* run up to jq's literal boundary
+/// (`jq_literal_run_end` -- whitespace and `"[{,:]}`) must be exactly the
+/// keyword. Anything else -- a longer token (`null1`, `truex`, `nully`, a
+/// punctuation-suffixed `null-`, `true!`) or a truncated one (`nul`,
+/// `tru`, `fals`) -- returns `None`, so the splitter does not carve a valid
+/// `null` out of the middle of a token jq reports `Invalid literal` for, the
+/// way an alphabetic-only run used to split `null1` into `null` + `1`.
 fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
-    let mut i = pos;
-    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    Some(i)
+    let kw: &[u8] = match bytes.get(pos) {
+        Some(b't') => b"true",
+        Some(b'f') => b"false",
+        Some(b'n') => b"null",
+        _ => return None,
+    };
+    succinctly::json::light::keyword_span(bytes, pos, kw)
 }
 
 /// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
