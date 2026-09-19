@@ -1213,6 +1213,35 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         self.key_cursor.is_none()
     }
 
+    /// The cursor of the object this field list belongs to, but **only**
+    /// while the list still stands at that object's first child -- i.e.
+    /// while `StandardJson::Object(self)` really is the whole object and not
+    /// a partly-consumed tail of it (#2889).
+    ///
+    /// `JsonFields` retains a child cursor, not the container's own
+    /// ([`from_object_cursor`](Self::from_object_cursor) stores
+    /// `first_child()`), so the container is one `parent()` hop away. That
+    /// hop answers the same node for *every* child, which is exactly why the
+    /// first-child check is needed: after an
+    /// [`uncons`](Self::uncons) the value in hand is a suffix, and naming the
+    /// whole object for it would claim a node identity the value does not
+    /// have.
+    ///
+    /// `None` for an empty object (nothing retained to hop from) and for any
+    /// advanced list. Both are under-reports: a caller that needs a node
+    /// identity simply does without one, which costs an acceptance, never a
+    /// wrong answer.
+    ///
+    /// `pub(crate)`: this exists for `jq::eval`'s bind sites, which have no
+    /// cursor of their own to consult, and is not a shape for this type's
+    /// public iteration API to grow.
+    #[inline]
+    pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
+        let child = self.key_cursor?;
+        let container = child.parent()?;
+        (container.first_child()?.bp_pos == child.bp_pos).then_some(container)
+    }
+
     /// Whether this field list ends on a lone child with no sibling to pair
     /// as a value -- `{invalid}`, `{"a"}`, or the trailing `2` of
     /// `{invalid, "b":2}` (#1194).
@@ -1600,6 +1629,17 @@ impl<'a, W: AsRef<[u64]>> JsonElements<'a, W> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.element_cursor.is_none()
+    }
+
+    /// The cursor of the array this element list belongs to, but **only**
+    /// while the list still stands at that array's first element (#2889) --
+    /// [`JsonFields::whole_container_cursor`]'s twin, with the same
+    /// first-child rule, the same reasons for it, and the same `pub(crate)`.
+    #[inline]
+    pub(crate) fn whole_container_cursor(&self) -> Option<JsonCursor<'a, W>> {
+        let child = self.element_cursor?;
+        let container = child.parent()?;
+        (container.first_child()?.bp_pos == child.bp_pos).then_some(container)
     }
 
     /// Get the first element and the remaining elements.
