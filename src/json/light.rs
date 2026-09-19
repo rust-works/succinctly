@@ -2561,7 +2561,6 @@ use crate::jq::{
     nonfinite_display_string, EvalError, JqSemantics, OwnedValue, YqSemantics,
     MAX_VALUE_TREE_DEPTH,
 };
-use crate::text::utf8::decode_code_point;
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
 /// *materializing* route already raises for the same scalar, so a document
@@ -2744,6 +2743,15 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 /// value is neither scanned nor echoed; see "Why the echoed span is
 /// exactly the cursor's own value" at the end of this comment.
 ///
+/// This is *half* of the echo decision, not all of it. The other half is
+/// the `core::str::from_utf8` the caller runs over the returned span: this
+/// scan certifies "canonical **given** valid UTF-8" and leaves the UTF-8
+/// question to std's vectorised validator rather than decoding sequences
+/// itself (see [`scan_json_string_span`] for the measurement that made that
+/// the cheaper split). A test that drives only this function therefore
+/// tests only half the gate -- the differential and fuzz tests in this
+/// module drive `stream_json` itself for that reason.
+///
 /// A strict, single-pass, non-backtracking recursive-descent scanner over
 /// `value := object | array | string | number | true | false | null`, with
 /// **zero whitespace tolerated anywhere** (compact mode inserts none). It
@@ -2796,7 +2804,11 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   certified this exact span as jq's own canonical encoding of its
 ///   decoded content -- a fixed, unconditional rule, so it's an injective
 ///   map from decoded string to span, and span equality is decoded-string
-///   equality. Two tiers, mirroring `src/bin/succinctly/jq_runner.rs`'s
+///   equality. That certification is now conditional on the span being
+///   valid UTF-8 (see [`scan_json_string_span`]), which only widens where
+///   this scan *accepts*: an invalid-UTF-8 key has no decoded form to be
+///   confused about, and the caller's own `from_utf8` rejects the whole
+///   span before anything is echoed. Two tiers, mirroring `src/bin/succinctly/jq_runner.rs`'s
 ///   own `PAIRWISE_SPAN_SCAN_LIMIT`/`span_fingerprint` split (#2919
 ///   review): up to `SMALL_OBJECT_KEY_LIMIT` keys are compared pairwise
 ///   via a cheap fingerprint with no allocation at all -- most real
@@ -2959,24 +2971,38 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// - every other byte, ASCII or a UTF-8 lead/continuation byte `>= 0x80`,
 ///   is literal content.
 ///
-/// UTF-8 validity is checked *inline*, in the same loop below, rather than
-/// as a separate pass over the finished span (#2919 review: an earlier
-/// draft called `validate_utf8` on `content_start..content_end` only after
-/// the loop found the closing quote -- a second full walk of the string's
-/// bytes for the multi-byte-heavy case). That's still sound for exactly
-/// the reason the old deferred check was: none of `"`, `\`, or a
-/// control/DEL byte can ever appear as a lead or continuation byte of a
-/// UTF-8 sequence (valid or not), since every one of those bytes is
-/// `< 0x80` or exactly `0x7F`, and UTF-8 multi-byte bytes are always
-/// `>= 0x80` -- so every byte the loop below classifies as plain "literal
-/// content" is unambiguously either a one-byte ASCII character (`< 0x80`,
-/// no check needed) or the first byte of a multi-byte sequence handed to
-/// [`decode_code_point`], which decodes and bounds-checks the whole
-/// sequence in one call. `decode_code_point` shares its bounds
-/// (`code_point_bounds_violation`) with
-/// [`validate_utf8_scalar`](crate::text::utf8::validate_utf8_scalar)
-/// (#1423), so this can't silently drift from what the separate
-/// `validate_utf8` call it replaces would have decided.
+/// **UTF-8 validity is deliberately not decided here.** Every byte `>= 0x80`
+/// is advanced over one at a time, as literal content, and the single
+/// `core::str::from_utf8` `stream_json`'s echo branch already runs over the
+/// whole accepted span is what actually rules on it -- a `from_utf8`
+/// failure there falls through to the re-render, which produces the real
+/// decode diagnostic. That is why the branch cannot treat a `from_utf8`
+/// failure as an error of its own (an earlier draft did, and with the
+/// in-scanner decode gone it would have turned a document the re-render
+/// reports on into a bare formatting error).
+///
+/// This reverses #2919's reasoning, which put the decode inline precisely
+/// to avoid "a second full walk of the string's bytes". The walk is real
+/// but it is not the expensive one: measured on a 7950X, the byte-at-a-time
+/// loop calling [`decode_code_point`](crate::text::utf8::decode_code_point)
+/// cost 11.2 Ir per input byte -- 34% of
+/// the whole gate -- while `from_utf8` over the accepted span cost 0.44,
+/// because std's validator is vectorised and this loop was not. Moving the
+/// work from a scalar per-byte decode to one vectorised pass is a ~25x
+/// reduction on that term, not a duplicated cost.
+///
+/// Soundness is unchanged: none of `"`, `\`, or a control/DEL byte can ever
+/// appear as a byte of a UTF-8 sequence, valid or not (each is `< 0x80` or
+/// exactly `0x7F`, and every byte of a multi-byte sequence is `>= 0x80`), so
+/// skipping a sequence byte by byte can never walk past a closing quote, an
+/// escape, or a byte the writer would have escaped. What the scan certifies
+/// is therefore exactly "canonical **given** the span is valid UTF-8", and
+/// the caller supplies the given.
+///
+/// The library cannot simply assume it: [`JsonIndex::build`] does no UTF-8
+/// validation at all, and only the CLI substitutes invalid input ahead of
+/// indexing (`utf8_lossy_document`, `src/bin/succinctly/jq_runner.rs`), so a
+/// library caller can hand a `JsonCursor` a buffer with any byte in it.
 fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
     debug_assert_eq!(bytes.get(pos), Some(&b'"'));
     let content_start = pos + 1;
@@ -3018,17 +3044,11 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
                 }
             }
             b if b < 0x20 || b == 0x7F => return None,
-            b if b < 0x80 => i += 1,
-            _ => {
-                // A UTF-8 lead byte (`>= 0x80`) -- decode and
-                // bounds-check the whole sequence at once; an invalid one
-                // (truncated, overlong, a surrogate, past Unicode's own
-                // range, or a bare continuation byte misread as a lead)
-                // bails exactly as the separate `validate_utf8` pass this
-                // replaces would have.
-                let (_, len) = decode_code_point(&bytes[i..])?;
-                i += len;
-            }
+            // Every other byte -- ASCII, or any byte of a multi-byte UTF-8
+            // sequence -- is one byte of literal content. UTF-8 validity is
+            // deliberately *not* decided here; see this function's own doc
+            // comment.
+            _ => i += 1,
         }
     }
 }
@@ -3430,16 +3450,21 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
                         Some(end),
                         "the canonical scan and `text_range` must agree on an accepted span"
                     );
-                    // SAFETY: `canonical_compact_jq_span_end` only returns
-                    // `Some` after validating every string's content as
-                    // UTF-8, so `rest[..end]` as a whole is valid UTF-8 too.
-                    let s = core::str::from_utf8(&rest[..end]).map_err(|_| core::fmt::Error)?;
-                    return Ok(out.write_str(s)?);
+                    // The scan certifies "canonical *given* valid UTF-8"
+                    // and no longer decodes the sequences itself, so this
+                    // is the half of the decision that rules on UTF-8 --
+                    // one vectorised pass instead of the scan's old
+                    // byte-at-a-time decode. A failure is *not* an error
+                    // of this branch's: it falls through to the re-render,
+                    // which is what raises the real decode diagnostic.
+                    if let Ok(s) = core::str::from_utf8(&rest[..end]) {
+                        return Ok(out.write_str(s)?);
+                    }
                 }
             }
-            // Falls through to the general re-render path below -- either
-            // no text position was available, or the span wasn't certified
-            // canonical.
+            // Falls through to the general re-render path below -- no text
+            // position was available, the span wasn't certified canonical,
+            // or it was but turned out not to be valid UTF-8.
         }
         // #1676/#1576 review: a stray `,` in an *apparently* empty
         // container (`{,}`, `[,]`) has no child cursor for
@@ -5616,9 +5641,12 @@ mod tests {
         v
     }
 
-    /// The whole safety argument for `is_canonical_compact_jq_span`, run
+    /// The whole safety argument for `canonical_compact_jq_span_end`, run
     /// against a hand-picked corpus covering every rule in its own doc
-    /// comment, split into two groups asserted differently:
+    /// comment, split into three groups asserted differently -- and then
+    /// swept a fourth time, all three groups together, through
+    /// `stream_json`'s actual echo branch, which is the only assertion here
+    /// that covers the *whole* gate rather than one of its halves:
     ///
     /// - **Canonical** entries get the full, strong check: the checker
     ///   must accept them (`is_canonical_compact_jq_span(doc)`) *and* the
@@ -5637,6 +5665,13 @@ mod tests {
     ///   see `render_compact_jq_by_rerender`'s own doc comment -- that
     ///   would fail a round-trip assertion for reasons that have nothing
     ///   to do with `is_canonical_compact_jq_span` being wrong.
+    /// - **Invalid UTF-8** entries the predicate *accepts*, because the
+    ///   scan certifies "canonical given valid UTF-8" and the gate's own
+    ///   `from_utf8` supplies the given (#2608 follow-up; before that the
+    ///   scan decoded every multi-byte sequence itself, at 34% of the
+    ///   gate's cost, and these sat in the non-canonical group). What has
+    ///   to hold for them is a property of the gate, not of the predicate,
+    ///   so it is the cross-group sweep below that asserts it.
     // The individual-byte-literal arrays below are deliberate, not an
     // oversight clippy's `byte_char_slices` should collapse into a
     // terser `b"..."` literal -- that terser form containing literal
@@ -5726,8 +5761,6 @@ mod tests {
             escaped_lone_surrogate,
             raw_control_byte, // pre-existing renderer leniency -- see this test's own doc comment
             raw_del_byte,
-            invalid_utf8_bare_continuation,
-            invalid_utf8_truncated_lead,
             b"\"abc".to_vec(), // unterminated string -- same pre-existing leniency
             // -- duplicate keys, first/middle/last position --
             br#"{"a":1,"a":2}"#.to_vec(),
@@ -5746,6 +5779,14 @@ mod tests {
             b" 123".to_vec(),        // leading garbage before the value starts
             b"".to_vec(),            // empty input
         ];
+
+        // The third group: structurally canonical, but not valid UTF-8. The
+        // predicate accepts these (#2608 follow-up moved the UTF-8 decision
+        // out of the scan and onto the caller's single `from_utf8`), and
+        // the gate still declines them -- which is the assertion that
+        // matters, and the one the loop over all three groups makes.
+        let utf8_rejected: Vec<Vec<u8>> =
+            vec![invalid_utf8_bare_continuation, invalid_utf8_truncated_lead];
 
         for doc in &canonical {
             assert!(
@@ -5777,7 +5818,23 @@ mod tests {
         // require it to agree with the fall-through re-render for every
         // entry in *both* groups, which is the only property the echo is
         // ever allowed to have.
-        for doc in canonical.iter().chain(non_canonical.iter()) {
+        for doc in &utf8_rejected {
+            assert!(
+                is_canonical_compact_jq_span(doc),
+                "expected structurally canonical: {:?} (as text: {})",
+                doc,
+                String::from_utf8_lossy(doc)
+            );
+            assert!(
+                core::str::from_utf8(doc).is_err(),
+                "sanity: this group is the invalid-UTF-8 one: {doc:?}"
+            );
+        }
+        for doc in canonical
+            .iter()
+            .chain(non_canonical.iter())
+            .chain(utf8_rejected.iter())
+        {
             assert_eq!(
                 render_compact_jq_through_gate(doc),
                 render_compact_jq_by_rerender(doc)
@@ -5874,6 +5931,19 @@ mod tests {
     /// the renderer's own leniency) -- asserting the converse here would
     /// make this test fail on a bug this change neither introduces nor
     /// is responsible for fixing.
+    ///
+    /// Two properties, asserted separately because they are not the same
+    /// claim (#2608 follow-up). The predicate's round-trip direction is
+    /// conditioned on the document being valid UTF-8, since the scan now
+    /// certifies "canonical *given* valid UTF-8" and leaves the rest to the
+    /// gate's own `from_utf8`. The gate's own output-equals-the-re-render
+    /// property is asserted for *every* generated document, valid UTF-8 or
+    /// not -- that is the property the echo actually has to have, it
+    /// subsumes the first, and the generator's raw-byte ingredients cover
+    /// every family `from_utf8` rejects (bare continuation, truncated lead,
+    /// overlong, UTF-8-encoded surrogate, past U+10FFFF, `0xFF`). It is
+    /// also what drives the branch's `debug_assert_eq!` that the scan and
+    /// `text_range` agree on where the value ends.
     // See the corpus test's identical `#[allow]` just above for why:
     // the individual-byte-literal arrays are the deliberate, safe
     // choice here, not something clippy's suggested `b"..."` literal
@@ -5923,7 +5993,20 @@ mod tests {
 
         // Raw (possibly invalid-UTF-8) byte-level ingredients, appended
         // directly rather than through a `&str`.
-        const RAW_BYTE_INGREDIENTS: &[&[u8]] = &[&[0x80], &[0xC2], &[0xFF], &[0xE0, 0x80]];
+        // Every family `core::str::from_utf8` rejects, since #2608's scanner
+        // no longer decodes sequences itself and the gate's single
+        // `from_utf8` is now the only thing standing between an
+        // invalid-UTF-8 span and a verbatim echo.
+        const RAW_BYTE_INGREDIENTS: &[&[u8]] = &[
+            &[0x80],                   // bare continuation byte
+            &[0xC2],                   // truncated 2-byte lead
+            &[0xE0, 0xA0],             // truncated 3-byte lead
+            &[0xFF],                   // never legal anywhere in UTF-8
+            &[0xE0, 0x80],             // overlong 3-byte prefix
+            &[0xC0, 0xAF],             // overlong encoding of `/`
+            &[0xED, 0xA0, 0x80],       // UTF-8-encoded lone surrogate (D800)
+            &[0xF5, 0x80, 0x80, 0x80], // past U+10FFFF
+        ];
 
         const NUMBER_INGREDIENTS: &[&str] = &[
             "0", "1", "-1", "42", "-7", "1.0", "0.10", "-0", "12.345", "9.999", "1000", "1e2",
@@ -6023,6 +6106,7 @@ mod tests {
         }
 
         let mut mismatches = Vec::new();
+        let mut gate_mismatches = Vec::new();
         let mut canonical_count = 0usize;
         const ITERATIONS: u64 = 2000;
         for seed in 0..ITERATIONS {
@@ -6033,7 +6117,12 @@ mod tests {
             let checker_says_canonical = is_canonical_compact_jq_span(&doc);
             let rerendered = render_compact_jq_by_rerender(&doc);
             let actually_round_trips = rerendered.as_deref() == Some(doc.as_slice());
-            if checker_says_canonical {
+            // `&& is_ok()`: the scan certifies "canonical *given* valid
+            // UTF-8" and the gate's own `from_utf8` supplies the given
+            // (#2608 follow-up), so the predicate alone makes no claim
+            // about an invalid-UTF-8 document -- the gate check just below
+            // is what covers those, and covers them more strongly.
+            if checker_says_canonical && core::str::from_utf8(&doc).is_ok() {
                 canonical_count += 1;
                 // One direction only -- see this test's own doc comment
                 // for why the converse is not asserted here.
@@ -6044,13 +6133,15 @@ mod tests {
             // The whole echo *branch*, not just the predicate: it must
             // produce exactly what the fall-through re-render would, on
             // every generated document regardless of which side of the
-            // gate it lands. This is also what drives the branch's
+            // gate it lands -- including every invalid-UTF-8 one, where
+            // "the gate declines and the re-render answers" is the entire
+            // contract. This is also what drives the branch's
             // `debug_assert_eq!` that the scan's end agrees with
             // `text_range`'s over the whole sweep (#2608 follow-up).
             if render_compact_jq_through_gate(&doc)
                 != rerendered.map(|b| String::from_utf8_lossy(&b).into_owned())
             {
-                mismatches.push((seed, doc.clone()));
+                gate_mismatches.push((seed, doc.clone()));
             }
         }
 
@@ -6059,6 +6150,16 @@ mod tests {
             "{} of {ITERATIONS} generated documents were certified canonical but did not round-trip; first few: {:#?}",
             mismatches.len(),
             mismatches
+                .iter()
+                .take(5)
+                .map(|(seed, doc)| (*seed, String::from_utf8_lossy(doc).into_owned()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            gate_mismatches.is_empty(),
+            "{} of {ITERATIONS} generated documents rendered differently through `stream_json`'s echo branch than through the re-render; first few: {:#?}",
+            gate_mismatches.len(),
+            gate_mismatches
                 .iter()
                 .take(5)
                 .map(|(seed, doc)| (*seed, String::from_utf8_lossy(doc).into_owned()))
