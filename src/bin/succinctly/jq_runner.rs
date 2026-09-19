@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{
-    effective_keys, key_hash, DistinctKeyCursors, DocumentCursor, DocumentValue, IndentSpec,
-    JsonConvention,
+    effective_keys, key_hash, key_span_fingerprint, DistinctKeyCursors, DocumentCursor,
+    DocumentValue, IndentSpec, JsonConvention, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned,
@@ -2064,36 +2064,6 @@ impl<'a, W: Clone + AsRef<[u64]>> Frame<'a, W> {
     }
 }
 
-/// Above this many fields, [`spans_repeat`] sorts instead of comparing every
-/// pair.
-///
-/// Objects in real documents are small, and below the threshold the pairwise
-/// loop needs no allocation. Above it the pairwise loop is quadratic, which
-/// is not a tuning question but a correctness-of-scale one: on a 10 MB
-/// document whose root object is wide, leaving it unbounded measured 1240%
-/// slower than not collapsing at all.
-///
-/// This is the only such threshold in the tree; `src/jq/document.rs`'s
-/// duplicate probe is fingerprint-based and has no pairwise branch to bound.
-const PAIRWISE_SPAN_SCAN_LIMIT: usize = 16;
-
-/// A cheap discriminator for a key's raw span: its length plus its first and
-/// last content bytes, packed into one word.
-///
-/// Distinct fingerprints prove distinct keys, so the pairwise scan below
-/// compares words and only falls back to comparing bytes when two collide.
-/// Keys within one object almost always differ in length or in their first
-/// byte, which makes the byte comparison rare enough to disappear from the
-/// profile -- comparing the spans directly instead measured ~3% of
-/// `sjq '.'` on a 10 MB document.
-#[inline]
-fn span_fingerprint(raw: &[u8]) -> u64 {
-    let n = raw.len();
-    let first = if n > 2 { raw[1] } else { 0 };
-    let last = if n > 3 { raw[n - 2] } else { 0 };
-    ((n as u64) << 16) | ((first as u64) << 8) | last as u64
-}
-
 /// Whether any two key spans *may* be byte-identical.
 ///
 /// Small objects -- nearly every object in a real document -- take the
@@ -2120,7 +2090,7 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
     if prepared.len() <= PAIRWISE_SPAN_SCAN_LIMIT {
         let mut marks = [0u64; PAIRWISE_SPAN_SCAN_LIMIT];
         for (slot, field) in marks.iter_mut().zip(prepared) {
-            *slot = span_fingerprint(field.raw);
+            *slot = key_span_fingerprint(field.raw);
         }
         return (0..prepared.len()).any(|i| {
             ((i + 1)..prepared.len())
