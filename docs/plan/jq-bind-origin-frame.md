@@ -217,14 +217,25 @@ Three findings, in order of what they cost:
   hands an expression from the generic (cursor-based) evaluator to the owned-value evaluator
   — a `Snapshot` marker not proven to name that call's own document node is demoted to
   `Untracked` before `Frame::certifies` ever sees it. Unrelated to the frame witness itself
-  and not implemented inside `Frame`/`Origin`/`resolve_node` at all. A documented, accepted
-  residual remains: jq's own reference-counted `jv` keeps node identity through a handful of
-  constructions succinctly's `OwnedValue`-cloning model cannot represent as "the same node"
-  (`[.] | .[0]`, `{k:.} | .k`, `. + {}`, `reduce empty as $i (.; .)`) — these now refuse
-  rather than silently accept a copy, tracked as a follow-up ("owned embed map",
-  [#2889](https://github.com/rust-works/succinctly/issues/2889)). `[.] | .[0] | path($x)`
-  was recovered by [#2575](https://github.com/rust-works/succinctly/issues/2575) as a side
-  effect (`[.]`'s element is a `LazySeq` on the same cursor).
+  and not implemented inside `Frame`/`Origin`/`resolve_node` at all. A residual remained:
+  jq's own reference-counted `jv` keeps node identity through a handful of constructions
+  succinctly's `OwnedValue`-cloning model could not represent as "the same node" (`{k:.} |
+  .k`, `. + {}`/`. * {}` on an empty operand, a fold returning its accumulator unchanged,
+  `[.] | add`/`min`/`max` of one element, `[.,.] | .[1]`, `[[.]] | .[0][0]`, `{k:.} |
+  getpath(["k"])`) — these refused rather than silently accepting a copy. **Closed by
+  [#2889](https://github.com/rust-works/succinctly/issues/2889)'s "owned embed map"**: a
+  thread-local `embed_table` (`eval_generic.rs`, std-only) lets a bind site's own `Rc` be
+  reused by a later materialization of the same node, and `RootWitness::of_owned` recovers
+  a `Node` witness for an owned root that still shares that storage — jq mode only.
+  `[.] | .[0] | path($x)` was recovered earlier by
+  [#2575](https://github.com/rust-works/succinctly/issues/2575) as a side effect (`[.]`'s
+  element is a `LazySeq` on the same cursor). Residuals still refuse-only: a nested embed
+  navigated inside `path()`'s own argument, a scalar root, an element or value re-indexed by
+  `sort`/`unique`/`reverse`/`to_entries`/`getpath`/a slice/a no-op `|=`, a fold UPDATE that
+  is not one of the owned fast paths, a marker inside a fold's UPDATE naming the
+  accumulator, an embed reached through a container built from an *ancestor* of the bound
+  node (reuse is depth-0 only), `no_std` builds, and yq mode — see `limitations.md`'s #2642
+  paragraph.
 - **Closed by [#3036](https://github.com/rust-works/succinctly/issues/3036).** The same
   fabrication where the bind and the rebuild both run inside `eval.rs` (the input-queue
   bridge, a fold's UPDATE, a `|=` right-hand side, `with_entries`, a `catch` handler) — no
@@ -233,7 +244,17 @@ Three findings, in order of what they cost:
   witness as `Reentry::Against` since #3122, and only a caller that already ran that
   demotion passes `Reentry::Proven`), plus `OwnedIdentity::exact`/`root`/`root_witness`
   for the owned-identity route and `try_payload_root` for `catch`. See `limitations.md`'s #3036
-  paragraph for the refuse-only flips.
+  paragraph for the refuse-only flips. **#2889 Stage B**, now landed, recovers most of them
+  on the `-n 'input | ...'` route: `eval.rs`'s own `eval_as`/`each_as` mint a
+  `BindOrigin::Node` from a `StandardJson` bind source's cursor
+  (`substitute_bound_var_from`, `eval::standard_json_bind_origin`) instead of calling the
+  bare, node-less `substitute_bound_var` this used to have (removed, no callers left), and
+  push the same embed-table entry `each_as_generic` already does. Three residuals remain,
+  specific to this route: an empty container bind (no retained child cursor to recover a
+  node from), a further re-entry between the embed and the read that carries no witness
+  (collecting into an array, or a `getpath([])` in between), and a navigated bind with no
+  owned re-entry between the bind and the use at all (`input | .a as $y | .a | ($y.b) =
+  9`) — see `limitations.md`'s #3036 paragraph.
 - **Value-mode bindings — the root case closed by
   [#3037](https://github.com/rust-works/succinctly/issues/3037).** A navigated bind made
   outside any resolver (`Origin::Untracked`) used where the register *is* that node

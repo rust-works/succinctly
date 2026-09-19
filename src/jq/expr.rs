@@ -121,10 +121,21 @@ pub struct Tracked {
 ///   never gets a chance to admit the rebuilt copy. Refuse-only by
 ///   construction: a marker with no recorded node (or one bound from an
 ///   already-owned/synthesized value, with nothing to compare) is always
-///   demoted too, which is why a handful of shapes jq keeps the same `jv`
-///   through (`{k:.} | .k`, `. + {}`, `reduce empty as $i (.; .)`) now
-///   refuse instead of silently accepting a copy -- a documented, accepted
-///   residual (#2889), not a new correctness gap. #3036 closed the same
+///   demoted too -- which is why a handful of shapes jq keeps the same `jv`
+///   through (`{k:.} | .k`, `. + {}`, a fold returning its accumulator
+///   unchanged, `[.] | add`/`min`/`max` of one element, ...) used to refuse
+///   instead of silently accepting a copy. #2889's `embed_table`
+///   (`eval_generic`, std-only, jq mode only) now witnesses them by reusing
+///   the bind's own `Rc` for a later materialization of the same node and
+///   reading `RootWitness::of_owned` back at the funnel, on both the
+///   generic evaluator's route and (Stage B) `eval.rs`'s own
+///   `eval_as`/`each_as` bind sites. A scalar root (not `Rc`-backed), a
+///   value re-indexed before the read (`sort`/`unique`/`reverse`/
+///   `to_entries`/`getpath`/a slice), a marker inside a fold's UPDATE
+///   naming the accumulator, and a few Stage-B-only shapes on the
+///   `-n 'input | ...'` route stay documented refuse-only residuals, not
+///   new correctness gaps -- see `docs/compliance/jq/limitations.md`'s
+///   #2642 and #3036 sections. #3036 closed the same
 ///   hole where the bind *and* the rebuild both run inside `eval.rs` (the
 ///   input-queue bridge, a fold's UPDATE, a `|=` right-hand side): every
 ///   owned-value re-entry there (`eval_each_owned` and its siblings) takes a

@@ -862,7 +862,7 @@ is the revert that established what the other one costs.
    `path(.a as $y \| .a \| $y)` on `{"a":{"b":1},"c":{"b":1}}` now answers jq's `["a"]`; the
    equal-valued sibling `path(.a as $y \| .c \| $y)` still refuses — exactly the #1466 class
    the frame witness exists to keep closed, now for navigated bindings too. yq mode is
-   unchanged: `substitute_bound_var`'s widening is jq-mode only
+   unchanged: `substitute_bound_var_from`'s widening is jq-mode only
    ([#2643](https://github.com/rust-works/succinctly/issues/2643)). The sibling refusal is
    itself the general (non-`null`/`bool`) case: jq's own `jv_identical` admits
    `null`/`true`/`false` by value regardless of node, so the same shape on `{"a":true,"c":true}`
@@ -900,22 +900,72 @@ is the revert that established what the other one costs.
    rebuilt copy — refuse-only by construction, since the only transition is `Snapshot →
    Untracked` and `Untracked` never certifies by node identity (a `null`/`bool` rebuilt copy
    still certifies by jq's own value-identity rule, #3136 — sound, since jq's `jv_identical`
-   has no pointer identity for those three values at all, rebuilt or not). A documented
-   residual remains: a handful of
-   constructions jq's own reference-counted `jv` passes an embedded node through *without
-   copying it* (`{k:.} \| .k`, `. + {}`, `reduce empty as $i (.; .)`, and `path(.[0] | $x)`
-   navigation *inside* a `path()` call over `[.]`) now refuse rather than silently accept a
-   copy, since succinctly's `OwnedValue`-cloning model has no way to tell "this position embeds
-   the original node" from "this position merely happens to be value-equal" — recovering them
-   (an "owned embed map" recording which positions of a constructed value embed a document
-   node) is tracked as a follow-up, not attempted here. **[#2575](https://github.com/rust-works/succinctly/issues/2575)
+   has no pointer identity for those three values at all, rebuilt or not). A residual
+   remained here: jq's own reference-counted `jv` passes an embedded node
+   through *without copying it* — `{k:.} \| .k`, `. + {}`/`. * {}` (and `. + null`/
+   `null + .`) when the other operand is empty/`null`, a fold whose UPDATE returns its
+   accumulator unchanged, `[.] \| add\|min\|max` of one element, `[.,.] \| .[1]`,
+   `[[.]] \| .[0][0]`, and `{k:.} \| getpath(["k"])` all hand back the *same* `jv`
+   `$x` was bound from — so `path($x)`/`($x...) = ...`/`del($x...)` afterward should
+   answer exactly where jq's own `jv_identical` holds, but every one of these refused
+   rather than silently accept a copy, since succinctly's `OwnedValue`-cloning model had
+   no way to tell "this position embeds the original node" from "this position merely
+   happens to be value-equal".
+
+   **[#2889](https://github.com/rust-works/succinctly/issues/2889) closes the
+   funnel-crossing half of this residual with an "owned embed map".** A thread-local,
+   bind-scoped `embed_table` (`eval_generic::embed_table`, std-only) records, for the
+   dynamic extent of a bind's body, the `(node, document)` pair a `BindOrigin::Node`
+   bind froze its value from, keyed to the very `Rc` the bind holds. A later
+   materialization of that same document node (the array/object arms of
+   `to_owned_at_depth`/`to_owned_cursor_at_depth`) reuses that `Rc` instead of building
+   a fresh one, so `{k:.}` embedding `.` shares storage with the bind's own copy;
+   `RootWitness::of_owned` (jq mode only) then looks an owned root's storage up in the
+   table to recover a `Node` witness where the existing machinery previously always saw
+   `Owned`, and `marker_needs_demotion`'s `Node`/`Node` arm certifies it exactly as it
+   already does for a live cursor. Because the table's entry holds its own strong
+   reference, a write through *any* handle to that storage still copies first
+   (`Rc::make_mut`) — the same condition under which jq's `jv_identical($x, .)` holds,
+   since the bind's own reference is what forces jq's copy-on-write too — so the write
+   direction is exactly as sound as the read direction: `{k:.} \| .k \| ($x.a) = 9`
+   writes `{"a":9}`, and `{k:.} \| .k \| .b = 2 \| path($x)` (a write happens first,
+   breaking the sharing) still refuses. `arith_add` gained an empty-right-operand fast
+   path (return `left` untouched, mirroring jq's own `jv_array_concat`/
+   `jv_object_merge` loop over the right operand) so `. + {}`/`[.] + []` reuse the same
+   `Rc`; `arith_mul`'s existing empty-right-operand return already did. An empty
+   **left** operand (`{} + .`, `[] + .`) still builds a new container in jq and
+   correctly keeps refusing.
+
+   **Perf**: interleaved A/B on 2 MB and 10 MB `users`/`wide` corpora (identity gate, 0
+   diffs), Apple M4 Pro and AMD 7950X. The embed shapes that used to materialize a second
+   copy of the same node — `. as $x | {k:.} | .k`, `. as $x | . + {}`,
+   `.[] | . as $r | {k:.} | .k` — got 30-57% faster on both chips, since the second
+   materialization is gone; every shape with no `as` binding, and every scalar-bind shape,
+   stayed inside the control run's noise floor.
+
+   Residuals that stay refuse-only, each with why (pinned in
+   `scripts/jq-bind-origin-oracle-sweep.sh`'s `owned-embed-refuse-*` rows and exercised
+   by `scripts/jq-bind-origin-fuzz.py`'s `EMBEDS`/`REBUILDS` pools):
+
+   | Filter                                                                                                                                                                     | Why still refused                                                                                                                                                                                                                                             |
+   | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `[.] \| path(.[0] \| $x)`                                                                                                                                                  | jq answers `[0]`; navigating an embed *inside* `path()`'s own argument runs in the resolver over a re-indexed copy of a rebuilt root — a different mechanism from materializing the embed once and reading `$x` afterward                                     |
+   | `{k:.} \| .k \| path($x)` on a scalar root (`"s"`, `5`)                                                                                                                    | scalars (`OwnedValue::String`, numbers) are not `Rc`-backed, so they never enter the embed table                                                                                                                                                              |
+   | `[.] \| sort\|unique\|reverse \| .[0]`, `{k:.} \| to_entries \| .[0].value`, `{k:.} \| getpath(["k"])`, `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`) | none is one of `embed_peel_step`'s recognized shapes (`.`/`.foo`/`.[n]`/`.[]` at the front of a pipe), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value |
+   | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                              | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                           |
+   | a marker inside a fold's UPDATE naming the accumulator                                                                                                                     | `reduce_forks`/`foreach_forks`'s hoisted per-step reroot demotes UPDATE against `Owned` once by design, not upgraded here — an owned witness lookup on every fold step priced +3% (#3036)                                                                     |
+   | `.a as $y \| . as $x \| {k:.} \| .k.a \| path($y)` (an embed reached through a container built from an *ancestor* of the bound node)                                       | reuse is taken only at a materializer's own depth 0, never inside its recursion, so `.k.a`'s deeper position never asks the table — the same rule that keeps `MAX_NESTING_DEPTH` accounting exact for the shared subtree                                      |
+   | `no_std` builds                                                                                                                                                            | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                     |
+   | `succinctly yq`                                                                                                                                                            | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                             |
+
+   **[#2575](https://github.com/rust-works/succinctly/issues/2575)
    closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
    path($x)` now stays accepted, because `Expr::Array`'s generic-evaluator arm no longer
    materializes a cursor-shaped inner result into a fresh `OwnedValue` copy — `[.]`'s single
    element is a `LazySeq` pointing at the same cursor `.` came from, which is exactly the node
    identity jq's own `jv` already had. `[.] \| path(.[0] \| $x)` (the same construction, but
    with the navigation happening inside `path()`'s own argument) is a genuinely different
-   mechanism and stays refused.
+   mechanism and stays refused, per the table above.
    **[#3036](https://github.com/rust-works/succinctly/issues/3036), now closed: the same
    fabrication through the routes that never cross a funnel.** #2642's check ran only where
    an expression is handed from the generic evaluator to `eval.rs`; when the bind *and* the
@@ -964,22 +1014,49 @@ is the revert that established what the other one costs.
    a later round, a sub-path, or a second path of the same `|=` (whose root jq's `setpath`
    has already copied: `. as $x | (.b, .) |= (if type == "object" then ($x.a = 9) else .
    end)` wrote `{"a":9,"b":2}` before this, jq refuses) demotes. The refuse-only flips this
-   makes are the in-evaluator twins of the embed residual above — a stage that hands its
-   input on as an owned copy is the same node to jq and a fresh document to `eval.rs` —
-   plus two the generic evaluator already refused: on the input-queue route, `input | . as
-   $x | S | ($x.a = 9)` for S ∈ {`[.] | .[0]`, `{k:.} | .k`, `[., .] | .[0]`, `reduce empty
-   as $i (.; .)`, `reduce 1 as $i (.; .)`, `foreach 1 as $i (.; .; .)`, `getpath([])`,
-   `nth(0; .)`, `until(true; .)`, `recurse(empty)`, `ltrimstr("x")`, `debug`, `stderr`} (each
-   returns its input, which reaches the next stage as an owned copy; `first(.)`, `select`,
-   `if`, `//`, `try .`, `label`, `limit`, `. as $y | .` keep their cursor and still answer),
-   `input | reduce (.) as $x (.; ($x.a = 9))` (a fold's loop variable, demoted with the
-   accumulator's re-index, as the generic fold has done since #2642),
-   `input | . as $x | try error($x) catch path($x)` (an `eval.rs`-minted marker carries no
-   node witness for `try_payload_root` to match) all answer in jq and refuse here.
+   made were the in-evaluator twins of the embed residual above — a stage that hands its
+   input on as an owned copy is the same node to jq and a fresh document to `eval.rs`. At
+   the time #3036 landed, `eval.rs`'s own bind sites (`eval_as`/`each_as`) minted no node at
+   all — they called a bare `substitute_bound_var` with nothing for the embed table to key
+   on — so every one of these refused regardless of the embed table #2642 already had:
+   `input | . as $x | S | ($x.a = 9)` for S ∈ {`[.] | .[0]`, `{k:.} | .k`, `[., .] | .[0]`,
+   `reduce empty as $i (.; .)`, `getpath([])`, `nth(0; .)`, `until(true; .)`,
+   `ltrimstr("x")`, ...} and `input | . as $x | try error($x) catch path($x)`.
+   `input | reduce (.) as $x (.; ($x.a = 9))` — a fold's own loop variable, demoted with the
+   accumulator's re-index, as the generic fold has done since #2642 — is a different,
+   unrelated residual: the loop variable is `Snapshot` with no node at all, embed table or
+   not, so it is untouched by anything below.
    Pinned in `tests/jq_cli_tests.rs` (`*_3036`), swept by
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `in-evaluator-*` rows and fuzzed by
-   `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family. The accepting direction — recovering
-   the embed residual on either route — is [#2889](https://github.com/rust-works/succinctly/issues/2889).
+   `scripts/jq-bind-origin-fuzz.py`'s `ROUTES` family.
+
+   **[#2889](https://github.com/rust-works/succinctly/issues/2889) Stage B, now landed,
+   mints that missing node.** `eval_as`/`each_as` mint a `BindOrigin::Node` from a
+   `StandardJson` bind source's own cursor (`eval::standard_json_bind_origin`,
+   `substitute_bound_var_from` — the bare, node-less `substitute_bound_var` this used to
+   call had no other callers left once this landed, and was removed rather than kept
+   alongside it) and push the same embed-table entry `each_as_generic` does
+   (`eval::standard_json_node_cursor`/`JsonFields`/`JsonElements::whole_container_cursor`
+   recover a container's own cursor from the *child* cursor `StandardJson` actually
+   retains — the one `parent()` hop `eval_generic`'s own `V::Cursor` never needed). Every
+   row in the `S ∈ {...}` set above now answers, read and write alike, along with the
+   navigated-bind twins (`input | .a as $y | {k:.a} | .k | path($y)` and the `($y.b) = 9`
+   write) — pinned in
+   `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`. Three residuals remain,
+   all specific to this route and pinned in
+   `test_input_bridge_embed_residuals_refuse_cleanly_2889`:
+   - An **empty container** (`input | . as $x | {k:.} | .k | path($x)` on `{}` or `[]`)
+     binds no node at all: `whole_container_cursor` has no retained child cursor to hop
+     `parent()` from, so the table never gets an entry. jq answers `[]`; the generic
+     evaluator, handed a real cursor rather than one recovered after the fact, still
+     answers it — the one place the two routes still disagree, in the safe direction.
+   - A **further re-entry between the embed and the read** that carries no witness —
+     collecting the pipe into an array (`[input | . as $x | {k:.} | .k | path($x)]`) or
+     routing the embedded node through `getpath([])` first (`... | .k | getpath([]) |
+     path($x)`) — loses the table hit the bare twin of each gets.
+   - `input | .a as $y | .a | ($y.b) = 9`: the bind and the use are both plain cursor
+     navigations with no owned re-entry between them at all, so no embed lookup is ever
+     consulted (unchanged by Stage B — jq accepts, this refused identically before it too).
    And
    [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
    navigating inside their own jq-level definitions against a *constructed* value inside
@@ -1037,13 +1114,26 @@ is the revert that established what the other one costs.
    `navigated-bind-*` refuse-only rows: the positional rows (`.a as $y | path(.a | $y)`,
    `(.a | ($y.b)) = 9` — the marker must certify at a non-root register position, which needs
    a document-absolute bind path, the #2042 `Origin::At` machinery reached from a value-mode
-   bind; scoped separately), the embed row (#2889), the routes that re-enter the eager
+   bind; scoped separately), the routes that re-enter the eager
    evaluator with an *owned* accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`,
    a `catch` handler: `eval.rs`'s own `eval_as` carries no node for a navigated bind, and there
-   is no cursor at that funnel to promote against), a navigated bind on an *owned-rooted*
+   is no cursor at that funnel to promote against), and a navigated bind on an *owned-rooted*
    document (`input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as $y | .a | ($y.b) = 9'`,
    a `tojson|fromjson`-rebuilt root: the marker's node is an `OwnedIdentity` position, and
    `marker_is_root` reads only a document node against a live cursor — no `OwnedRoot` twin).
+   The embed row this list used to carry (`.a as $y | {k:.a} | .k | path($y)`, #2889) is
+   recovered by the same embed table described under #2642 above: `each_as_generic`
+   pushes an entry for a navigated bind's node exactly as it does for an identity bind's,
+   so `marker_is_root`'s existing promotion succeeds once `RootWitness::of_owned` reports
+   the funnel's owned root as that same node. Of the rows that remain refused above, the
+   `reduce`/`catch` pair is a route through `eval.rs`'s own evaluator whose bind source is
+   already an owned accumulator (`Item::Owned`), not a `StandardJson` cursor — Stage B
+   (`docs/plan/jq-bind-origin-frame.md`) mints a node only from the latter
+   (`eval::item_bind_origin`'s `Item::Borrowed` arm), so these two stay exactly as they
+   were, unrelated to whether Stage B has landed. The owned-root/input-root pair is a
+   different limitation again, and Stage B does not touch it either: the marker's node is
+   an `OwnedIdentity` position, not a document node, and `marker_is_root` promotes only
+   against a live cursor — there is no `OwnedRoot` twin of that promotion to take.
    A `null`/`bool` marker at an equal-valued sibling (`.a as $y | .c | $y |= 5` on
    `{"a":true,"c":true}`) used to be refuse-only the same way — jq's `jv_identical` admits
    those by value regardless of node, but the resolver's `TrackedVar` arm consulted the
