@@ -62161,6 +62161,184 @@ fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
     Ok(())
 }
 
+/// Coverage-directed rows for PR #3172's own review pass over #2889: shapes
+/// that reach `eval_owned_relocating_fold`'s early `return None` guard for
+/// an object with no embedded child, `peeled_children_need_no_index`/
+/// `leads_with_a_peelable_step`'s own arms, `embed_peel_step`'s two top
+/// guards (a non-`REBUILT` re-entry; fewer than two stages once leading
+/// identities are stripped), its gated and unconditional `.[]` arms (with
+/// and without an embedded child, over an array, an object, and a
+/// non-container), and `eval_each_owned`'s own direct relocating-fold
+/// answer (`Demand::Continue` and, inside `first(...)`, `Demand::Stop`).
+/// Every `want` here was captured live from `/usr/bin/jq` 1.7.1, and every
+/// row also matches this binary (asserted below) -- these are
+/// reachability rows, not divergence rows.
+///
+/// `eval_owned_relocating_fold`'s *other* early decline -- its second
+/// `match builtin { .., _ => return None }`, reached only once `items` has
+/// already been populated -- is dead code, not merely hard to reach: by
+/// that point `items` can only be non-empty when the outer `match
+/// (builtin, input)` matched `Add`/`Min`/`Max`, so `builtin` is always one
+/// of those three arms already listed above it. No test can execute an
+/// unreachable arm; it exists only because `Builtin` has more than three
+/// variants and Rust's exhaustiveness check cannot see the narrowing the
+/// first `match` already did.
+#[test]
+// jq filter literals like `{b:2}` are not formatting strings; clippy
+// cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_peel_and_fold_arms_reachable_2889() -> Result<()> {
+    for (input, filter, want) in [
+        // `eval_owned_relocating_fold`'s early decline for a container
+        // with no embedded child (an array, already covered elsewhere,
+        // and an object, which is not).
+        (
+            r#"{"a":1}"#,
+            r". as $x | [{b:2},{c:3}] | add",
+            r#"{"b":2,"c":3}"#,
+        ),
+        (r#"{"a":1}"#, r". as $x | {p:{b:2}} | add", r#"{"b":2}"#),
+        // `peeled_children_need_no_index`'s `Expr::Field`/`Expr::Index`
+        // arm (a `.[]` whose tail is a bare `.a`, over children that
+        // include an embed) and its `Expr::Pipe` arm (the tail is instead
+        // a peelable *chain*, `.a.z`, still index-free).
+        (r#"{"a":1}"#, r". as $x | [., {b:2}] | .[] | .a", "1\nnull"),
+        (
+            r#"{"a":{"z":1}}"#,
+            r". as $x | [., {b:2}] | .[] | .a.z",
+            "1\nnull",
+        ),
+        // `leads_with_a_peelable_step`'s `Pipe` arm: a `.foo` step whose
+        // next stage is itself a peelable chain (`.j.a`).
+        (r#"{"a":1}"#, r". as $x | {k:{j:.}} | .k | .j.a", "1"),
+        // `embed_peel_step`'s top guard: a `Reentry::Proven` re-entry (a
+        // fold UPDATE) declines the peel the same way a table-inactive
+        // re-entry would.
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce (1) as $i ([., {b:2}]; .[] | .a)",
+            "null",
+        ),
+        // `embed_peel_step`'s second guard: fewer than two stages left
+        // once leading `Expr::Identity`s are stripped -- reached here
+        // because `length` is a builtin `eval_owned_relocating_fold`
+        // already declined (dead-ends at the first `match`'s own
+        // catchall, not the arm above), so this is the *whole* remaining
+        // pipe by the time `embed_peel_step` sees it.
+        (r#"{"a":1}"#, r". as $x | [., {b:2}] | length", "2"),
+        // The gated `.[]` arm (`peeled_children_need_no_index` false, so
+        // the witness scan runs): an embedded child, no embedded child in
+        // an array, no embedded child in an object, and a non-container.
+        (
+            r#"{"a":1}"#,
+            r#". as $x | [., {b:2}] | .[] | try path($x) catch "no""#,
+            "[]\n\"no\"",
+        ),
+        (
+            r#"{"a":1}"#,
+            r#". as $x | [{b:2},{c:3}] | .[] | try path($x) catch "no""#,
+            "\"no\"\n\"no\"",
+        ),
+        (
+            r#"{"a":1}"#,
+            r#". as $x | {p:{b:2}} | .[] | try path($x) catch "no""#,
+            "\"no\"",
+        ),
+        // The unconditional `.[]` arm (index-free tail): array and object
+        // inputs.
+        (
+            r#"{"a":1}"#,
+            r". as $x | {p:., q:{b:2}} | .[] | .a",
+            "1\nnull",
+        ),
+        // `eval_each_owned`'s own direct relocating-fold call: a bare
+        // `min` as the whole expression (`Demand::Continue`), and the same
+        // fold wrapped by `first(...)` (`Demand::Stop`). `min`, not `max`:
+        // `.` (`{"a":1}`) sorts before `{"b":2}` (jq compares objects by
+        // key first), so `min` -- not `max` -- is the one that answers
+        // with the *embedded* element and reaches the relocating fold's
+        // own outcome gate as a hit; `max` picks the freshly-constructed
+        // `{"b":2}`, which the gate declines, falling through to the
+        // ordinary bridge instead (still correct output, just not this
+        // code path).
+        (r#"{"a":1}"#, r". as $x | [., {b:2}] | min", r#"{"a":1}"#),
+        (
+            r#"{"a":1}"#,
+            r". as $x | first([., {b:2}] | min)",
+            r#"{"a":1}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#2889: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#2889: `{filter}`");
+    }
+    Ok(())
+}
+
+/// The refusing/erroring half of
+/// [`test_owned_embed_peel_and_fold_arms_reachable_2889`]: shapes that
+/// exercise the same arms but through an error exit, each captured live
+/// from `/usr/bin/jq` 1.7.1.
+///
+/// `embed_peel_step`'s own `Expr::Field`/`Expr::Index` arm's `Err` outcome
+/// (a peeled navigation that itself raises) has no row here: no CLI shape
+/// reaches it. `eval_owned_pure` (consulted first, via
+/// `eval_each_owned_fast_path`) walks a `Field`/`Index` chain in the same
+/// left-to-right order this function does and attempts every stage that
+/// is not the expression's absolute final one, so whichever stage would
+/// error is either caught there first, or -- when it is the final stage,
+/// the one case `eval_owned_pure` declines without attempting -- has an
+/// empty `rest` once this function reaches it, which its own
+/// `rest.is_empty()` guard declines for the identical reason. See
+/// `embed_peel_step_propagates_a_navigation_error_2889` (`src/jq/eval.rs`)
+/// for that arm exercised directly instead.
+#[test]
+// jq filter literals like `{b:2}` are not formatting strings; clippy
+// cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_peel_and_fold_arms_refuse_cleanly_2889() -> Result<()> {
+    for (input, filter, want_stderr) in [
+        // The gated `.[]` arm's non-container guard: `.[]` on a scalar
+        // still raises the bridge's own diagnostic.
+        (
+            r#"{"a":1}"#,
+            r#". as $x | 5 | .[] | try path($x) catch "no""#,
+            "Cannot iterate over number (5)",
+        ),
+        // The unconditional `.[]` arm's non-container guard, same
+        // diagnostic.
+        (
+            r#"{"a":1}"#,
+            r". as $x | 5 | .[] | .a",
+            "Cannot iterate over number (5)",
+        ),
+        // `path($x)` cannot track through a relocating fold whose winner
+        // is a *freshly constructed* element rather than the embedded one
+        // -- jq's own path-tracking has no model for `add`/`min`/`max` at
+        // all, so this refuses the same way real jq does regardless of the
+        // embed table; `max` here picks the literal `{b:2}`, never
+        // registered in the table, unlike the `min` row above (which picks
+        // the embedded `.` and so *does* answer `path($x)` -- see that
+        // row's own comment).
+        (
+            r#"{"a":1}"#,
+            r". as $x | [., {b:2}] | max | path($x)",
+            "Invalid path expression with result",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2889: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(want_stderr),
+            "#2889: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // #2978: an identity-passthrough bind (`. as $x`) inside a resolver
 // invocation carries the position `.` was frozen at, so `getpath` can

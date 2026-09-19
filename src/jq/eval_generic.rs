@@ -27128,6 +27128,79 @@ mod tests {
         );
     }
 
+    /// #2889 review: `eval_single`'s own `Expr::TrackedVar` arm, `None`
+    /// branch -- a marker whose recorded node names a document `cursor`
+    /// does not belong to falls back to the frozen value rather than
+    /// resolving a live cursor.
+    ///
+    /// No CLI shape was found that reaches this exact arm: every generic-
+    /// route pipe that could carry a `TrackedVar` past a stage backed by a
+    /// *different* document token first drops through an `OwnedValue`
+    /// intermediate (`GenericItem::Owned`), and `continue_pipe_element_generic`
+    /// hands an `Owned` intermediate straight to `eval::eval_each_owned`
+    /// rather than back to this module's `eval_single` -- so the rest of
+    /// that pipe (including a bare `$x`) is evaluated by `eval.rs`'s own,
+    /// separate `Expr::TrackedVar` arm, never this one. The one CLI route
+    /// that does carry a real cross-document mismatch (`input`) is gated
+    /// the same way (`eval_using`'s `takes_input_queue_bridge`): a filter
+    /// mentioning `input`/`inputs` bridges to `eval::eval_each_owned`
+    /// *before* `eval_single` ever runs, for the same reason. `bind_origin_cursor`'s
+    /// own two checks (document token, then node id) are otherwise always
+    /// satisfied whenever a `TrackedVar` reaches this arm with `cursor:
+    /// Some` at all, since `at_node_id` resolves any node id valid in the
+    /// *same* document regardless of the anchor's own position -- confirmed
+    /// live: `. as $x | $x`, `.a as $x | $x`, and a dozen sibling shapes
+    /// piping through `getpath([])`/`nth(0;.)`/`select(true)`/`sort_by($x)`/
+    /// `map($x)`/`.[] | $x` all resolved via the `Some` arm instead.
+    ///
+    /// Exercised directly instead, mirroring `eval.rs`'s own
+    /// `of_owned_witnesses_only_the_binding_s_own_storage_2889` unit test's
+    /// approach of calling the mechanism under test with a synthetic
+    /// setup rather than hunting further for an ever-narrower CLI repro:
+    /// two independently-built `JsonIndex`es necessarily carry different
+    /// `document_token()`s (`document_token_of`'s doc comment: derived from
+    /// the index's own address), so a marker recorded against the first
+    /// and resolved against the second's cursor is exactly the mismatch
+    /// `bind_origin_cursor` exists to catch.
+    #[test]
+    fn eval_single_tracked_var_falls_back_when_document_differs_2889() {
+        let doc_a = br#"{"a":1}"#;
+        let index_a = JsonIndex::build(doc_a);
+        let cursor_a = index_a.root(doc_a);
+
+        let doc_b = br#"{"b":2}"#;
+        let index_b = JsonIndex::build(doc_b);
+        let cursor_b = index_b.root(doc_b);
+
+        // Sanity: the whole point of using two independently-built indices.
+        assert_ne!(
+            cursor_a.document_token(),
+            cursor_b.document_token(),
+            "two independently-built JsonIndex values must carry distinct tokens"
+        );
+
+        let frozen = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let marker = Rc::new(super::super::expr::Tracked {
+            value: frozen.clone(),
+            origin: super::super::expr::Origin::Snapshot,
+            node: Some(BindOrigin::Node {
+                node: cursor_a.node_id(),
+                document: cursor_a.document_token(),
+            }),
+        });
+
+        let result = eval_single::<JqSemantics, _>(
+            &Expr::TrackedVar(marker),
+            cursor_b.value(),
+            false,
+            Some(cursor_b),
+        );
+        match result {
+            GenericResult::Owned(v) => assert_eq!(v, frozen),
+            other => panic!("expected the frozen value, got {other:?}"),
+        }
+    }
+
     /// temporary JSON index is dropped, preserving the complete preorder.
     #[test]
     fn cursorless_recursive_descent_bridge_preserves_values_2661() {
