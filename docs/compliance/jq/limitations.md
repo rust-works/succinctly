@@ -904,8 +904,9 @@ is the revert that established what the other one costs.
    remained here: jq's own reference-counted `jv` passes an embedded node
    through *without copying it* — `{k:.} \| .k`, `. + {}`/`. * {}` (and `. + null`/
    `null + .`) when the other operand is empty/`null`, a fold whose UPDATE returns its
-   accumulator unchanged, `[.] \| add\|min\|max` of one element, `[.,.] \| .[1]`,
-   `[[.]] \| .[0][0]`, and `{k:.} \| getpath(["k"])` all hand back the *same* `jv`
+   accumulator unchanged, `add`/`min`/`max` over any container whose winning element is
+   that node (`[.] \| add`, `[.,.] \| max`, `[null,.] \| add`, `{a:.} \| add`),
+   `[.,.] \| .[1]`, `[[.]] \| .[0][0]`, and `{k:.} \| getpath(["k"])` all hand back the *same* `jv`
    `$x` was bound from — so `path($x)`/`($x...) = ...`/`del($x...)` afterward should
    answer exactly where jq's own `jv_identical` holds, but every one of these refused
    rather than silently accept a copy, since succinctly's `OwnedValue`-cloning model had
@@ -917,9 +918,13 @@ is the revert that established what the other one costs.
    bind-scoped `embed_table` (`eval_generic::embed_table`, std-only) records, for the
    dynamic extent of a bind's body, the `(node, document)` pair a `BindOrigin::Node`
    bind froze its value from, keyed to the very `Rc` the bind holds. A later
-   materialization of that same document node (the array/object arms of
-   `to_owned_at_depth`/`to_owned_cursor_at_depth`) reuses that `Rc` instead of building
-   a fresh one, so `{k:.}` embedding `.` shares storage with the bind's own copy;
+   materialization of that same document node reuses that `Rc` instead of building a
+   fresh one, so `{k:.}` embedding `.` shares storage with the bind's own copy. The reuse
+   is taken at the *depth-0 entry* of each converter — `to_owned_cursor`
+   (`eval_generic.rs`) and `to_owned` (`eval.rs`) — never inside
+   `to_owned_at_depth`/`to_owned_cursor_at_depth`'s own recursion: depth 0 is where every
+   embedding construction materializes its operand, and a reuse deeper in some *other*
+   node's walk would skip the `MAX_NESTING_DEPTH` accounting for the shared subtree.
    `RootWitness::of_owned` (jq mode only) then looks an owned root's storage up in the
    table to recover a `Node` witness where the existing machinery previously always saw
    `Owned`, and `marker_needs_demotion`'s `Node`/`Node` arm certifies it exactly as it
@@ -943,20 +948,43 @@ is the revert that established what the other one costs.
    materialization is gone; every shape with no `as` binding, and every scalar-bind shape,
    stayed inside the control run's noise floor.
 
+   **Code review widened the fold and narrowed the peel.** `eval_owned_relocating_fold`
+   was reached only from the generic evaluator's `eval_on_owned`, which sees a container
+   built by `[.]` and nothing wider: every array or object with more than one element
+   collapses to an owned value and re-enters through `eval.rs`'s own
+   `eval_each_owned` instead, where the fold was never consulted. It now runs from both
+   re-entries, and as a pipe *stage* (`max \| path($x)` is how it arrives there, not a
+   bare `max`), so `[.,.] \| max`, `[{a:1},.] \| max`, `[.,{a:1}] \| min`,
+   `[null,.] \| add`, `[.,null] \| add` and `{a:.} \| add` all answer — with a
+   pre-gate that declines before cloning anything unless some element already shares a
+   table entry's storage, so `[1,2,3] \| add` costs one scan and takes the bridge
+   exactly as before. Which of two *equal* elements wins is jq's own and is pinned both
+   ways: `max` keeps the last (`[{a:1},.] \| max` answers, `[.,{a:1}] \| max` refuses
+   in jq too), `min` the first. The peel gained the matching narrowing: it fires only
+   where the navigated value, or an iterated child, still shares a table entry's
+   storage — the process-wide "a bind is in scope" flag alone had re-shaped every owned
+   navigation inside any container bind's dynamic extent. Two escapes keep that from
+   costing anything: a navigation whose next stage is another navigation (a chained
+   `.k.j` reaches its embed only at the last step), and a `.[]` whose tail the peeled
+   children can answer with no index of their own — gating that shape unconditionally
+   measured +20% on a 100k-element owned array (`. as $x | [.items[]] | .[] | .a`),
+   where gating only the re-indexing tails gained ~2.5%.
+
    Residuals that stay refuse-only, each with why (pinned in
    `scripts/jq-bind-origin-oracle-sweep.sh`'s `owned-embed-refuse-*` rows and exercised
    by `scripts/jq-bind-origin-fuzz.py`'s `EMBEDS`/`REBUILDS` pools):
 
-   | Filter                                                                                                                                                                     | Why still refused                                                                                                                                                                                                                                             |
-   | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `[.] \| path(.[0] \| $x)`                                                                                                                                                  | jq answers `[0]`; navigating an embed *inside* `path()`'s own argument runs in the resolver over a re-indexed copy of a rebuilt root — a different mechanism from materializing the embed once and reading `$x` afterward                                     |
-   | `{k:.} \| .k \| path($x)` on a scalar root (`"s"`, `5`)                                                                                                                    | scalars (`OwnedValue::String`, numbers) are not `Rc`-backed, so they never enter the embed table                                                                                                                                                              |
-   | `[.] \| sort\|unique\|reverse \| .[0]`, `{k:.} \| to_entries \| .[0].value`, `{k:.} \| getpath(["k"])`, `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`) | none is one of `embed_peel_step`'s recognized shapes (`.`/`.foo`/`.[n]`/`.[]` at the front of a pipe), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value |
-   | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                              | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                           |
-   | a marker inside a fold's UPDATE naming the accumulator                                                                                                                     | `reduce_forks`/`foreach_forks`'s hoisted per-step reroot demotes UPDATE against `Owned` once by design, not upgraded here — an owned witness lookup on every fold step priced +3% (#3036)                                                                     |
-   | `.a as $y \| . as $x \| {k:.} \| .k.a \| path($y)` (an embed reached through a container built from an *ancestor* of the bound node)                                       | reuse is taken only at a materializer's own depth 0, never inside its recursion, so `.k.a`'s deeper position never asks the table — the same rule that keeps `MAX_NESTING_DEPTH` accounting exact for the shared subtree                                      |
-   | `no_std` builds                                                                                                                                                            | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                     |
-   | `succinctly yq`                                                                                                                                                            | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                             |
+   | Filter                                                                                                                                                                     | Why still refused                                                                                                                                                                                                                                                                                                                                        |
+   | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `[.] \| path(.[0] \| $x)`                                                                                                                                                  | jq answers `[0]`; navigating an embed *inside* `path()`'s own argument runs in the resolver over a re-indexed copy of a rebuilt root — a different mechanism from materializing the embed once and reading `$x` afterward                                                                                                                                |
+   | `{k:.} \| .k \| path($x)` on a scalar root (`"s"`, `5`)                                                                                                                    | scalars (`OwnedValue::String`, numbers) are not `Rc`-backed, so they never enter the embed table                                                                                                                                                                                                                                                         |
+   | `[.] \| sort\|unique\|reverse \| .[0]`, `{k:.} \| to_entries \| .[0].value`, `{k:.} \| getpath(["k"])`, `[.] \| .[0] \|= . \| .[0]`, `[1,2] \| .[0:2]` (all `\| path($x)`) | none is one of `embed_peel_step`'s recognized head stages (`.foo`/`.[n]`/`.[]`/`add`/`min`/`max`, after leading `.` stages are skipped), and a write (`\|=`) always runs through the assignment resolver first — so each re-indexes on the owned route before the read reaches the shared value                                                          |
+   | `[.] \| . \| max \| path($x)` (a `.` stage between a *one-element* array and the fold)                                                                                     | jq answers `[]`. A single-element `[.]` is the one container that stays a lazy sequence, so its identity stage is folded by the generic evaluator through `eval_on_owned`, whose JSON round trip rebuilds the array before `max` runs. Every wider spelling (`[.,.] \| . \| max`) takes the owned route, where the peel skips the `.` stage, and answers |
+   | `reduce (1) as $i (.; if true then . else 1 end) \| path($x)`                                                                                                              | the UPDATE is not one of the owned fast paths (`eval_owned_navigation`/`eval_owned_relocating_fold`), so the fold's own hoisted per-step reroot rebuilds the accumulator before `path($x)` reads it                                                                                                                                                      |
+   | a marker inside a fold's UPDATE naming the accumulator                                                                                                                     | `reduce_forks`/`foreach_forks`'s hoisted per-step reroot demotes UPDATE against `Owned` once by design, not upgraded here — an owned witness lookup on every fold step priced +3% (#3036)                                                                                                                                                                |
+   | `.a as $y \| . as $x \| {k:.} \| .k.a \| path($y)` (an embed reached through a container built from an *ancestor* of the bound node)                                       | reuse is taken only at a materializer's own depth 0, never inside its recursion, so `.k.a`'s deeper position never asks the table — the same rule that keeps `MAX_NESTING_DEPTH` accounting exact for the shared subtree                                                                                                                                 |
+   | `no_std` builds                                                                                                                                                            | `embed_table` is thread-local; without `std` it is a no-op, refuse-only like `file_index`                                                                                                                                                                                                                                                                |
+   | `succinctly yq`                                                                                                                                                            | unchanged by design — `RootWitness::of_owned` is gated on `S::TAG == EvalTag::Jq`; yq's node model is #2643's business (ADR-0018)                                                                                                                                                                                                                        |
 
    **[#2575](https://github.com/rust-works/succinctly/issues/2575)
    closed one row of this residual as a side effect, not a targeted fix**: `[.] \| .[0] \|
