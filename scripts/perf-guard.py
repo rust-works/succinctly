@@ -340,6 +340,25 @@ DEFAULT_THRESHOLD = 5.0
 # (a walk of the whole document) before falling back to the unchanged
 # re-render. 20% clears the measured number with headroom. Remove once
 # `main` has moved past #2608, per the rule above (tracked by #3170).
+#
+# `arrays_first_map_iterate` (#3035): a codegen ripple, not a work change.
+# ARM64-Linux measured this row at +5.7% against the PR's own merge-base,
+# deterministic across three full runs (111,191,225 -> 117,480,515-682 Ir);
+# x86_64 passes at the default threshold. The row
+# (`first(map(length) | .[])` over the pure-number `arrays`/2mb fixture)
+# provably executes none of #3035's changed keyword-decoding code -- the
+# fixture has no `t`/`f`/`n` values, `length` walks children via
+# `len_checked` without a value decode, and `type` isn't called -- so the
+# delta is the evaluator monomorph's inlining ripple when `value_at`/the
+# `Builtin::Type` arm gained code. Confirming the class: a follow-up commit
+# made `keyword_span` `#[inline]` and compressed the uniform +1-2% drift on
+# *every other* row (all equally keyword-unreachable) down to +0.2-0.9%,
+# while this row barely moved (117,480,515 -> 117,482,684) -- it is the
+# smallest row, so the fixed per-element ripple is its largest fraction.
+# A one-off cost that only shows against a merge-base predating the change,
+# per the rule above: 10% clears the measured +5.7% with headroom. Remove
+# once `main` has moved past #3035 (tracked by #3175); from then on the
+# merge-base includes the same code and this row reads ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_del_select": 20.0,
@@ -349,6 +368,7 @@ QUERY_THRESHOLDS = {
     "users_assign_scores": 12.0,
     "users_compact_identity": 75.0,
     "users_compact_latefail": 20.0,
+    "arrays_first_map_iterate": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
