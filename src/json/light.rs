@@ -3137,7 +3137,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
                 let mut table = KeyHashes::with_capacity(small_count + 1);
                 for &(s, e) in &small_spans[..small_count] {
                     if table.insert(key_hash(&bytes[s..e])) {
-                        return None;
+                        return None; // omni-dev: coverage tolerate-line reason="reachable only through a bare 64-bit hash collision between keys the pairwise scan already proved distinct"
                     }
                 }
                 if table.insert(key_hash(&bytes[key_start..key_end])) || table.saturated() {
