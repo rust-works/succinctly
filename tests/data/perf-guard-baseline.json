@@ -4,6 +4,8 @@
     "arrays_identity": 602470310,
     "arrays_map_iterate": 1133555398,
     "users_assign_scores": 1045072746,
+    "users_compact_identity": 73677795,
+    "users_compact_latefail": 289760321,
     "users_del_bound_select": 1090427962,
     "users_del_select": 1056828108,
     "users_identity": 268187328,
