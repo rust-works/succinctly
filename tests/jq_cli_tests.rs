@@ -61755,6 +61755,28 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
         (r#"{"a":1}"#, r". as $x | [.] | min | path($x)", r"[]"),
         (r#"{"a":1}"#, r". as $x | [.] | max | path($x)", r"[]"),
         (r"[1,2]", r". as $x | [.] | add | path($x)", r"[]"),
+        // The same three over a container with more than one element, and
+        // over an object (#2889 review). These are the rows the fold
+        // originally missed: only a single-element `[.]` stays a lazy
+        // sequence and re-enters through the generic evaluator; everything
+        // wider collapses to an owned value and re-enters through
+        // `eval.rs`, which did not consult the fold. `null` is `+`'s
+        // identity in jq, so an added `null` relocates the other operand
+        // whichever side it is on.
+        (r#"{"a":1}"#, r". as $x | [.,.] | max | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.,.] | min | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [null,.] | add | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.,null] | add | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | {a:.} | add | path($x)", r"[]"),
+        // The tie rows: two *equal* elements, only one of which is the
+        // binding's own node, so which one the builtin keeps is visible.
+        // `max` keeps the last of an equal run and `min` the first --
+        // `builtin_max`/`builtin_min` use `max_by`/`min_by`, and so does
+        // the fold. Both captured live from jq 1.7.1; the two mirrored
+        // spellings, where the *literal* wins instead, are in
+        // `test_owned_embed_fold_ties_and_identity_stage_2889`.
+        (r#"{"a":1}"#, r". as $x | [{a:1},.] | max | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.,{a:1}] | min | path($x)", r"[]"),
         // The write twins.
         (
             r#"{"a":1}"#,
@@ -61788,6 +61810,60 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
         assert_eq!(code, 0, "#2889: `{filter}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), want, "#2889: `{filter}`");
     }
+    Ok(())
+}
+
+/// The refusing half of [`test_owned_embed_keeps_node_identity_2889`]'s
+/// `add`/`min`/`max` rows (#2889 review), and the one shape still refused.
+///
+/// The first two rows are *agreement*: with two equal elements, `max` keeps
+/// the last and `min` the first, so in these spellings the winner is the
+/// object literal, not `$x`'s node -- and jq 1.7.1 refuses them too
+/// (`Invalid path expression`, captured live). They are what makes the
+/// accepting tie rows mean something: a fold that returned the wrong one of
+/// two equal elements would pass those and fail these.
+///
+/// The last row is a residual, and diverges: jq answers `[]`. A
+/// single-element `[.]` is the one container that stays a lazy sequence, so
+/// an identity stage on it is folded by the generic evaluator through
+/// `eval_on_owned`, whose JSON round trip rebuilds the array before `max`
+/// ever runs. Every wider spelling (`[.,.] | . | max`) takes the owned
+/// route, where `embed_peel_step` skips the identity stage, and agrees.
+/// Refusing is the safe direction (ADR-0018): it costs an answer, never a
+/// write through a node the binding no longer names.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
+    for (filter, why) in [
+        (
+            r". as $x | [.,{a:1}] | max | path($x)",
+            "max keeps the last of an equal run: jq refuses this too",
+        ),
+        (
+            r". as $x | [{a:1},.] | min | path($x)",
+            "min keeps the first of an equal run: jq refuses this too",
+        ),
+        (
+            r". as $x | [.] | . | max | path($x)",
+            "residual: the lazy-sequence identity stage rebuilds the array \
+             (jq answers `[]`)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "#2889: `{filter}` ({why}): stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    // The wider spelling of the residual, which does keep the identity.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r". as $x | [.,.] | . | max | path($x)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "#2889: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]");
     Ok(())
 }
 
