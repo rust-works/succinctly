@@ -23986,6 +23986,38 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
     Ok(())
 }
 
+/// #3009 review: the eager `-n`/`--slurp`/DSV route's twin of the test above.
+///
+/// Merging the owned writers put this route on `print_owned_json`, whose depth
+/// check fires only after 384 levels of `[` are on stdout -- confirmed live
+/// before the fix: `-nc '1, setpath([range(400)|0]; 1), 7'` wrote `1`, then an
+/// unterminated `[[[[...` fragment, then aborted at exit 1 and never printed
+/// `7`. Before the merge the same route panicked inside `format_json` at exit
+/// 101. Neither matches the lazy route, which reports the value, prints none
+/// of it, and carries on at exit 5.
+///
+/// `-S` is covered separately because it takes `format_json`, not the
+/// streaming printer, and is where the old panic still lived.
+#[test]
+fn test_eager_over_depth_value_reports_cleanly_3009() -> Result<()> {
+    let filter = "1, setpath([range(400)|0]; 1), 7";
+    for (args, input) in [
+        (vec!["-nc", filter], None),
+        (vec!["-nc", "-S", filter], None),
+        (vec!["-c", "--slurp", filter], Some("null")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&args, input)?;
+        assert_eq!(stdout, "1\n7\n", "{args:?} stderr: {stderr:?}");
+        assert_eq!(code, 5, "{args:?} stderr: {stderr:?}");
+        assert!(!stderr.contains("panicked"), "{args:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("jq: error") && stderr.contains("nesting depth exceeds limit of 384"),
+            "{args:?} stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2850: `-e`'s own exit-status materialize call (`jq_runner.rs`, separate
 /// from `write_output_jq_value`'s) used to leak Rust's raw panic backtrace
 /// to stderr ahead of the clean, correctly exit-5'd diagnostic the
