@@ -99193,6 +99193,80 @@ mod tests {
         );
     }
 
+    /// #2889 review: `embed_peel_step`'s `Expr::Field`/`Expr::Index` arm,
+    /// `Err` outcome -- a peeled navigation that raises is handed back
+    /// rather than swallowed, provided the step behind it is itself
+    /// peelable (`leads_with_a_peelable_step`).
+    ///
+    /// Neither this arm nor its caller's matching line in `eval_each_owned`
+    /// (`Err(e) => return Flow::Escaped(Control::Error(e))`, right after the
+    /// `embed_peel_step` call) is reachable through `eval_each_owned`'s own
+    /// entry point -- CLI-driven or a direct call alike. `eval_each_owned`
+    /// always tries `eval_owned_pure` first (via `eval_each_owned_fast_path`,
+    /// gated only on `!optional` -- and `optional: true` would suppress the
+    /// very error this arm exists to propagate, per `eval_owned_navigation`'s
+    /// own `_ if optional => Ok(None)` arm, so `optional: false` is the only
+    /// setting that can reach here at all). `eval_owned_pure`'s own `Pipe`
+    /// arm walks a chain in the *same* left-to-right order this function
+    /// does and attempts every `Field`/`Index` stage that is not the
+    /// expression's absolute final one (its `ResultPosition::Operand` vs
+    /// `::Fresh` split): whichever stage would error is therefore either
+    /// caught there first, or -- when it *is* the final stage, the one case
+    /// `eval_owned_pure` declines without attempting -- has an empty `rest`
+    /// once this function reaches it, which its own `rest.is_empty()` guard
+    /// (just above this arm) declines for the identical reason. The two
+    /// conditions coincide because both walk the identical stage list in the
+    /// identical order and ask the same question ("is anything left after
+    /// this step"), so a shape that clears one necessarily fails the other --
+    /// confirmed directly: calling `eval_each_owned` with this test's own
+    /// `expr`/`input` reports `Cannot index number with string "k"` via
+    /// `eval_each_owned_fast_path`'s own `Err` arm, never reaching
+    /// `embed_peel_step` at all. Also confirmed by exhausting the shapes
+    /// `test_owned_embed_peel_and_fold_arms_reachable_2889`/
+    /// `..._refuse_cleanly_2889` (`tests/jq_cli_tests.rs`) cover for every
+    /// other #2889 line and finding none that isolates this one.
+    ///
+    /// `embed_peel_step` itself is exercised directly instead, the same way
+    /// `of_owned_witnesses_only_the_binding_s_own_storage_2889` above calls
+    /// the embed table straight rather than through a filter: a table entry
+    /// registers first (this arm only runs while the table is active), then
+    /// `embed_peel_step` runs standalone on `5 | .k | .a` -- a scalar as the
+    /// very *input*, so its own `.k` (not a recursive child's) is what
+    /// raises, with `.a` behind it satisfying `leads_with_a_peelable_step`.
+    /// This pins the arm's own correctness even though `eval_each_owned`'s
+    /// call to it can never observe an `Err` in practice.
+    #[test]
+    #[cfg(feature = "std")]
+    fn embed_peel_step_propagates_a_navigation_error_2889() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let origin = BindOrigin::Node {
+            node: 1,
+            document: 1,
+        };
+        let _guard = embed_table_push::<JqSemantics>(Some(&origin), &value);
+
+        let expr = Expr::Pipe(vec![
+            Expr::Field("k".to_string()),
+            Expr::Field("a".to_string()),
+        ]);
+        let input = OwnedValue::Int(5);
+        let result = embed_peel_step::<JqSemantics>(&expr, &input, false, Reentry::REBUILT)
+            .expect("a Field first-step with a peelable tail must not decline");
+        match result {
+            (Err(e), rest) => {
+                assert!(
+                    e.message.contains("Cannot index number with string"),
+                    "{}",
+                    e.message
+                );
+                assert_eq!(rest, Expr::Field("a".to_string()));
+            }
+            (Ok(v), _) => panic!("expected a navigation error, got {v:?}"),
+        }
+    }
+
     /// #2889: the embed table's `ACTIVE` flag tracks what the table
     /// *holds*, not the order its guards happen to be released in.
     ///
