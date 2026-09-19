@@ -2,6 +2,37 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-09-19 — Canonical compact echo fast path documented (issue #2608)
+
+**Sources ingested:**
+- `src/json/light.rs` — `JsonCursor::stream_json`'s `// #2608:` block, `canonical_compact_jq_span_end`,
+  `scan_canonical_value`, `scan_json_string_span`, `scan_canonical_object`, and their doc comments
+  (safety argument, the `raw_bytes()`/`text_range` rescan removal, the UTF-8-decode-to-`from_utf8` split)
+- `is_canonical_compact_jq_span_agrees_with_rerender_2608`, `is_canonical_compact_jq_span_fuzz_2608`,
+  `canonical_echo_stops_at_the_value_end_2608` (`src/json/light.rs`) and
+  `test_canonical_compact_echo_declines_non_canonical_spans_2608`,
+  `test_canonical_echo_stops_at_the_root_value_2608`,
+  `test_invalid_utf8_in_string_survives_the_echo_gate_2608`,
+  `test_ascii_output_still_escapes_through_new_echo_gate_2608` (`tests/jq_cli_tests.rs`) — verified
+  each name exists before citing it
+- Callgrind and interleaved wall-clock A/B measurements supplied for this task (7950X `terminus`,
+  M4 Pro `johns-mac-mini`, 2026-09-19): gate cost per input byte across the #2919-as-reviewed,
+  `text_range`-rescan-removed, and final UTF-8-single-pass revisions; canonical/late-fail/early-fail/
+  pretty/`--preserve-input` result rows; the reverted `define_escape_scanner!` SIMD attempt on
+  `scan_json_string_span`
+
+**Pages updated:**
+- [parsing/json.md](parsing/json.md) — new "Canonical Compact Echo (`-c`, #2608)" section under
+  `## Performance`: the mechanism, the gate-cost-per-byte table across three revisions, the
+  interleaved wall-clock results table, the rejected SIMD-skip attempt, and two reported-not-built
+  follow-ups (`arrays`-shaped late failure, `wide`'s `KeyHashes::insert` tier)
+- [parsing/json-index.md](parsing/json-index.md) — new "Optimizations" section linking to the json.md
+  section
+- `CLAUDE.md` — two new key-insight bullets: an A/B row divergence factor of 3.4x in instructions
+  executed made one "+7%" figure describe two rows with opposite root causes; and the echo itself is
+  free (0.02 Ir/byte) while the gate is the real cost (32.7 Ir/byte), including a SIMD win on the gate
+  that cost 3-9% wall-clock instead
+
 ## 2026-07-20 — SVE2 validation path: skip visibility, CI wiring, QEMU script (issue #194)
 
 **Sources ingested:**

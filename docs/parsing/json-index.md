@@ -79,6 +79,15 @@ let name: &str = cursor.as_str();
 
 `JsonIndex` performs minimal validation during indexing (structural characters only). For strict RFC 8259 validation, use `--validate` flag or the `json validate` subcommand.
 
+## Optimizations
+
+- Canonical compact echo (`-c`, #2608): a strict single-pass scan certifies a node's source span
+  as byte-for-byte what the compact jq-compat re-render would produce, and `stream_json` echoes it
+  verbatim instead of walking the semi-index — removing the walk entirely on the accepting path, at
+  the cost of a scan charged to every render. See
+  [json.md#canonical-compact-echo--c-2608](json.md#canonical-compact-echo--c-2608) for the
+  measurements and the rejected SIMD follow-up.
+
 ## Depends On
 
 - [BalancedParens](../architecture/balanced-parens.md) — BP encoding with `find_close` for subtree skipping
