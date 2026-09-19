@@ -8019,6 +8019,171 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
     })
 }
 
+/// `add`/`min`/`max` over an owned container, computed here instead of
+/// through the re-index bridge -- but *only* when the answer turns out to
+/// be a document node an in-scope binding still holds (#2889).
+///
+/// All three merely *relocate* one of their inputs: jq's `add` folds
+/// `jv_plus` from `null`, and `null + x` hands `x` straight back, so
+/// `[.] | add` is the very `jv` `.` is; `min`/`max` return the winning
+/// element itself. `path($x)` after any of them answers `[]` in jq 1.7.1.
+/// The bridge cannot preserve that -- it serializes the array, re-indexes
+/// it and materializes a fresh winner -- so the fold runs natively here,
+/// over the same `Vec<OwnedValue>` and with the same `arith_add`/
+/// [`compare_values`] the bridged `builtin_add`/`builtin_min`/`builtin_max`
+/// would use, which keeps each element's `Rc` (a clone of an
+/// `Rc`-backed container is a refcount bump).
+///
+/// **Diverting is gated on the outcome, not on the shape.** The native
+/// result is taken only when the embed table recognizes it as a node's own
+/// value; anything else -- a computed number, a fold that raised, a scalar
+/// or non-container input, no binding in scope at all -- answers `None` and
+/// takes the bridge exactly as before. So this can never change *what* is
+/// produced anywhere: the only values it diverts are ones the bridge would
+/// have rebuilt from the same node, and the only difference is that they
+/// arrive still sharing that node's storage.
+///
+/// Scoped to these three builtins on purpose. `sort`/`unique`/`reverse`/
+/// `to_entries` relocate their elements in jq too, and `. as $x | [.] |
+/// sort | .[0] | path($x)` is `[]` there, but each needs its own
+/// owned-container implementation to stay bug-for-bug with the bridged
+/// one; they stay refuse-only residuals of this pass (#2889).
+pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || !super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let Expr::Builtin(builtin) = expr else {
+        return None;
+    };
+    // `add` iterates an object's values as readily as an array's elements
+    // (`builtin_add`'s own `Object` arm, #422); `min`/`max` take arrays
+    // only, and their scalar/object diagnostics stay the bridge's.
+    let items: Vec<OwnedValue> = match (builtin, input) {
+        (Builtin::Add | Builtin::Min | Builtin::Max, OwnedValue::Array(items)) => {
+            items.iter().cloned().collect()
+        }
+        (Builtin::Add, OwnedValue::Object(map)) => map.values().cloned().collect(),
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let result = match builtin {
+        // Same fold as `builtin_add`: from the first element, not from
+        // `null`, so a one-element array is that element verbatim.
+        Builtin::Add => {
+            let mut rest = items.into_iter();
+            let first = rest.next().expect("non-empty, checked above");
+            rest.try_fold(first, arith_add::<S>).ok()?
+        }
+        // `min_by`/`max_by` over `compare_values`, exactly as
+        // `builtin_min`/`builtin_max` do -- including which of two equal
+        // elements each keeps.
+        Builtin::Min => items.into_iter().min_by(compare_values::<S>)?,
+        Builtin::Max => items.into_iter().max_by(compare_values::<S>)?,
+        _ => return None,
+    };
+    // The gate: divert only what the bridge would have rebuilt from a node
+    // the table still holds.
+    if RootWitness::of_owned::<S>(&result) == RootWitness::Owned {
+        return None;
+    }
+    Some(result)
+}
+
+/// Take the leading navigation or iterate stage of an owned pipe
+/// natively, handing back its outputs and the stages still to run (#2889).
+///
+/// `{k:.} | .k | path($x)` bridges into this evaluator as one pipe over the
+/// *constructed* `{"k": ...}` object, so the root the markers are rerooted
+/// against is that wrapper -- and `$x`, which names the document node the
+/// wrapper merely embeds, is demoted and refuses. Real jq has no such step:
+/// `{k:.}` places `.`'s own `jv` in the object and `.k` hands that very
+/// `jv` back, so `path($x)` answers `[]` (jq 1.7.1, captured live). Running
+/// the navigation here, against the owned value, keeps the embed table's
+/// sharing intact through it -- [`eval_owned_navigation`] clones the child
+/// out of the container, which for an `Rc`-backed one is a refcount bump --
+/// so the next re-entry is rooted at the node itself and
+/// [`Reentry::witnessed_by`] can recognize it.
+///
+/// Deliberately narrow, because this reorders *when* a stage runs:
+///
+/// - Only while a binding is actually in the embed table
+///   (`eval_generic::embed_table_active`), which is jq mode and inside an
+///   `as` body only. Every other program keeps today's shape exactly.
+/// - Only the three shapes [`eval_owned_navigation`] answers
+///   (`.`/`.foo`/`.[n]`), which are already trusted as equivalent to the
+///   bridge -- [`eval_each_owned_fast_path`] above takes the identical
+///   route whenever one of them is the *whole* expression -- plus `.[]`
+///   over a container, whose children are handed on in document order, one
+///   re-entry each. A `.[]` on anything else declines, so every iterate
+///   diagnostic stays the bridge's.
+/// - Only from [`Reentry::Against`]. A [`Reentry::Proven`] caller proved
+///   its markers against the document `input` is the root of; navigating
+///   away from that root would carry the proof to a node it was not made
+///   for. The recursion then re-enters at [`Reentry::REBUILT`], never at
+///   the caller's own witness -- that witness names the *parent*, and
+///   demoting more than needed costs a refusal jq also gives, never a
+///   wrong write (the one-directional property `marker_needs_demotion`'s
+///   own fallthrough relies on).
+fn embed_peel_step<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Option<(Result<Vec<OwnedValue>, EvalError>, Expr)> {
+    if !matches!(reentry, Reentry::Against(_)) || !super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let Expr::Pipe(stages) = expr else {
+        return None;
+    };
+    let [first, rest @ ..] = stages.as_slice() else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    // A *chained* navigation (`.k.j`, `.[0][0]`) parses as one nested
+    // `Expr::Pipe` in head position -- see `Expr::Pipe`'s own doc comment
+    // ("Chained expressions: `.foo.bar[0]`") -- so its first step is
+    // invisible from here until the head is flattened into the outer pipe.
+    // One level per call; the recursion descends structurally and the
+    // flattened head is strictly shorter, so it terminates.
+    if let Expr::Pipe(inner) = first {
+        if inner.is_empty() {
+            return None;
+        }
+        let mut flat = inner.clone();
+        flat.extend_from_slice(rest);
+        return embed_peel_step::<S>(&Expr::Pipe(flat), input, optional, reentry);
+    }
+    let stepped: Result<Vec<OwnedValue>, EvalError> = match first {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
+            eval_owned_navigation::<S>(first, input, optional)?
+                .map(|v| v.into_iter().collect::<Vec<_>>())
+        }
+        // `.[]` over a container yields each child, in the same order the
+        // bridged iterate would, and each child arrives still sharing its
+        // storage. A non-container input keeps the bridge's own
+        // diagnostics: this declines rather than reproducing them.
+        Expr::Iterate => match input {
+            OwnedValue::Array(items) => Ok(items.iter().cloned().collect()),
+            OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let rest = match rest {
+        [only] => only.clone(),
+        many => Expr::Pipe(many.to_vec()),
+    };
+    Some((stepped, rest))
+}
+
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
 ///
 /// The sink takes `OwnedValue`, not `Item`: values produced against the
@@ -8056,9 +8221,28 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
         return flow;
     }
+    // #2889: take the front of the pipe natively before re-indexing, so a
+    // stage standing *on* an embedded node reaches the bridge as that node
+    // rather than as the container holding it.
+    if let Some((stepped, rest)) = embed_peel_step::<S>(expr, input, optional, reentry) {
+        let values = match stepped {
+            Ok(values) => values,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        for value in values {
+            match eval_each_owned::<S>(&rest, &value, optional, Reentry::REBUILT, sink) {
+                Flow::Exhausted => {}
+                other => return other,
+            }
+        }
+        return Flow::Exhausted;
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
-    let expr = reentry.reroot::<S>(expr);
+    // #2889: `input` may still *be* a bound node's own value, embedded here
+    // by a construction jq would have shared rather than copied -- ask the
+    // embed table before settling for `Owned`.
+    let expr = reentry.witnessed_by::<S>(input).reroot::<S>(expr);
     let expr = expr.as_ref();
     // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
     // `eval_owned_input`.
@@ -9157,14 +9341,30 @@ fn arith_add<S: EvalSemantics>(
             a.push_str(&b);
             Ok(OwnedValue::String(a))
         }
-        // Array concatenation
+        // Array concatenation. #2889: an *empty right* operand returns
+        // `a` untouched, because real jq's `jv_array_concat` loops over
+        // the right operand and hands `a` straight back -- so `. as $x |
+        // . + [] | path($x)` is `[]` there, the left operand still being
+        // the very same `jv`. `extend` goes through `DerefMut`, which
+        // copies a shared container (`Rc::make_mut`) and would destroy
+        // that identity for no change in value. Deliberately *not*
+        // symmetric: `[] + .` builds a new array in jq too, and
+        // `. as $x | [] + . | path($x)` refuses there, so an empty *left*
+        // must keep falling through to the copy.
         (OwnedValue::Array(mut a), OwnedValue::Array(b)) => {
-            a.extend(b);
+            if !b.is_empty() {
+                a.extend(b);
+            }
             Ok(OwnedValue::Array(a))
         }
-        // Object merge (right overwrites left)
+        // Object merge (right overwrites left) -- same empty-right rule and
+        // the same reasoning as the array arm above (#2889): jq's
+        // `jv_object_merge` iterates the right operand, so `. + {}` hands
+        // the left object back unchanged.
         (OwnedValue::Object(mut a), OwnedValue::Object(b)) => {
-            a.extend(b);
+            if !b.is_empty() {
+                a.extend(b);
+            }
             Ok(OwnedValue::Object(a))
         }
         // null + x = x -- unconditional, every type, both jq and yq (#1197
@@ -29045,6 +29245,39 @@ impl RootWitness {
             None => Self::Owned,
         }
     }
+
+    /// The witness for a re-entry whose root is an owned `value` no cursor
+    /// came with (#2889): the document node `value` still *is*, when an
+    /// in-scope `as` binding proves it by sharing that container's storage,
+    /// else [`RootWitness::Owned`] exactly as before.
+    ///
+    /// This is the funnel [`RootWitness::of`] has no cursor for. A value
+    /// that reaches an owned re-entry has been through some construction
+    /// -- `{k:.} | .k`, `. + {}`, a fold whose UPDATE returned its input --
+    /// and real jq's `jv_identical` says those *place* the node's own `jv`
+    /// rather than copy it. The embed table (#2889) reproduces that by
+    /// handing the binding's own `Rc` to each such construction; this reads
+    /// the result back. The proof is pointer identity plus the binding's
+    /// own strong reference: any write through any handle would have
+    /// copied first, so a value still sharing the entry's storage is that
+    /// node's unmodified value.
+    ///
+    /// **jq mode only**, the same gate [`reroot_rewrite`]'s promotion
+    /// takes: real yq's node model is #2643's business, and turning a
+    /// refusal there into a write with no oracle behind it is the
+    /// corrupting direction (ADR-0018 -- the mode decides). Scalars carry
+    /// no shared storage and answer `Owned`, which costs the refusal jq's
+    /// own `jv_identical`-by-value would not give -- a documented residual
+    /// of this pass, never a wrong acceptance.
+    pub(crate) fn of_owned<S: EvalSemantics>(value: &OwnedValue) -> Self {
+        if S::TAG != EvalTag::Jq {
+            return Self::Owned;
+        }
+        match super::eval_generic::embed_witness_of(value) {
+            Some((node, document)) => Self::Node { node, document },
+            None => Self::Owned,
+        }
+    }
 }
 
 /// What an owned re-entry -- a call that builds a throwaway document out of
@@ -29088,6 +29321,33 @@ impl Reentry {
             Self::Proven
         } else {
             Self::REBUILT
+        }
+    }
+
+    /// This re-entry, with an [`Reentry::REBUILT`] root refined to whatever
+    /// node `value` can still be proven to be (#2889).
+    ///
+    /// Only [`RootWitness::Owned`] is refined: a caller that already named
+    /// a node, or an owned root the identity pipe tracks by token, knows
+    /// more about its value than the embed table can add, and
+    /// [`Reentry::Proven`] has nothing left to rewrite. So this is a pure
+    /// widening of what the two owned re-entries accept -- it can only turn
+    /// a demotion into a kept marker, never the reverse.
+    ///
+    /// Applied at the two owned re-entries themselves
+    /// ([`eval_each_owned`], `eval_generic::eval_on_owned`) rather than at
+    /// each of their callers, so every [`Reentry::REBUILT`] site in both
+    /// evaluators gets it from one place. Deliberately *not* applied to the
+    /// fold and loop hoists (`reduce_forks`/`foreach_forks`,
+    /// `eval_on_many_owned`), which demote a static operand once for a
+    /// whole run rather than per step: a marker naming the accumulator
+    /// inside a fold's UPDATE stays a refuse-only residual, because
+    /// rerooting per step costs +3% (#3036).
+    #[inline]
+    pub(crate) fn witnessed_by<S: EvalSemantics>(self, value: &OwnedValue) -> Self {
+        match self {
+            Self::Against(RootWitness::Owned) => Self::Against(RootWitness::of_owned::<S>(value)),
+            other => other,
         }
     }
 

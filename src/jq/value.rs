@@ -2139,6 +2139,35 @@ macro_rules! shared_container {
                 Self::from(<$target>::with_capacity(capacity))
             }
 
+            /// Whether `self` and `other` are two handles on the *same*
+            /// storage -- the pointer identity real jq's `jv_identical`
+            /// has for arrays and objects, which the embed table (#2889)
+            /// reads to recognize a container that is still some document
+            /// node's own unmodified value.
+            ///
+            /// Sound as an identity test precisely because a write through
+            /// either handle copies first ([`DerefMut`], `Rc::make_mut`):
+            /// while the answer is `true`, neither handle has been written
+            /// through since they were split.
+            ///
+            /// Always `false` under `unshared-containers`, where a clone
+            /// already deep-copied and no two handles can share anything --
+            /// the measurement holdout therefore refuses every identity the
+            /// table would have granted, which costs acceptance, never
+            /// correctness.
+            #[inline]
+            pub fn ptr_eq(&self, other: &Self) -> bool {
+                #[cfg(not(feature = "unshared-containers"))]
+                {
+                    Rc::ptr_eq(&self.0, &other.0)
+                }
+                #[cfg(feature = "unshared-containers")]
+                {
+                    let _ = other;
+                    false
+                }
+            }
+
             /// Whether another handle currently shares this storage, i.e.
             /// whether the next write through this handle will copy it.
             ///
@@ -3108,6 +3137,29 @@ impl OwnedValue {
     /// Create an empty object.
     pub fn object() -> Self {
         Self::Object(IndexMap::new().into())
+    }
+
+    /// Whether this value and `other` are the same *container storage* --
+    /// jq's `jv_identical` for arrays and objects, which is pointer
+    /// equality there (#2889).
+    ///
+    /// `false` for every scalar pairing, and for an array against an
+    /// object: neither is refcounted storage two handles can share, so
+    /// there is no pointer identity to report. jq's own scalar identity is
+    /// by value, a rule its callers here (`marker_identical`'s null/bool
+    /// carve-out, `owned_value_eq`) already apply separately.
+    ///
+    /// The `cfg_attr` is the embed table's `no_std` degradation showing
+    /// through: there the table is a stub that reads nothing, so this has
+    /// no caller at all and would be the build's only new dead-code
+    /// warning. A `std` build keeps the lint live.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Array(a), Self::Array(b)) => a.ptr_eq(b),
+            (Self::Object(a), Self::Object(b)) => a.ptr_eq(b),
+            _ => false,
+        }
     }
 
     /// Create an object from key-value pairs.

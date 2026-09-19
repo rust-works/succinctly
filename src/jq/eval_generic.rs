@@ -631,6 +631,17 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
 pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
 ) -> Result<OwnedValue, EvalError> {
+    // #2889: an in-scope `as` binding already holds this very node's
+    // `OwnedValue`; hand back its `Rc` rather than building a value-equal
+    // twin, so jq's pointer identity for `{k:.}`/`[.]`/`. + {}` survives to
+    // whatever reads it. Taken here, at the walk's own entry point, and
+    // never inside the recursion -- see the `embed_table` module's doc
+    // comment for why depth 0 is both where every embedding construction
+    // materializes its operand and the only depth at which reuse cannot
+    // skip a `MAX_NESTING_DEPTH` check the fresh walk would have made.
+    if let Some(shared) = embed_shared_for::<S, _>(cursor) {
+        return Ok(shared);
+    }
     let result = to_owned_cursor_with::<_, S>(
         cursor,
         |depth| {
@@ -2752,9 +2763,21 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)));
     }
 
+    // #2889: `add`/`min`/`max` relocate one of their inputs rather than
+    // computing a new value, and the round trip below would rebuild that
+    // input as a copy -- costing the node identity jq keeps
+    // (`. as $x | [.] | add | path($x)` is `[]` there). This diverts only
+    // when the answer is a node an in-scope binding still holds; see
+    // `eval::eval_owned_relocating_fold`.
+    if let Some(relocated) = crate::jq::eval::eval_owned_relocating_fold::<S>(expr, &owned) {
+        return GenericResult::Owned(relocated);
+    }
+
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
-    let expr = reentry.reroot::<S>(expr);
+    // #2889: `owned` may still *be* a bound node's own value -- see
+    // `eval::Reentry::witnessed_by`.
+    let expr = reentry.witnessed_by::<S>(&owned).reroot::<S>(expr);
     let json_str = owned.to_json_for_reindex::<S>();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -5218,6 +5241,228 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
     node_origin::current()
         .and_then(|o| o.document)
         .and_then(|d| i64::try_from(d).ok())
+}
+
+/// The embed table (#2889): the `OwnedValue` each in-scope `as` binding
+/// froze, keyed by the document node it was frozen from.
+///
+/// **What it buys.** jq's `jv_identical` on an array or object is pointer
+/// equality, and `. as $x` holds a *reference* to `.`'s `jv` rather than a
+/// copy. Every construction that merely *places* that reference --
+/// `{k:.}`, `[.,.]`, `. + {}`, `. * {}`, `add` of one element, a fold whose
+/// UPDATE returns its input -- embeds the very same `jv`, so `path($x)`
+/// later answers `[]` and `($x.a) = 9` writes through (jq 1.7.1, captured
+/// live). succinctly materializes each of those constructions from the
+/// cursor afresh, so before this table the second materialization built a
+/// second `Rc` and the identity was gone before any witness could read it.
+///
+/// The table closes exactly that gap: while a bind is in scope,
+/// [`to_owned_cursor`] hands back the binding's own `Rc` for the node the
+/// bind was frozen from instead of building a twin, and
+/// [`embed_witness_of`] recognizes, later, that a value still *is* that
+/// node's.
+///
+/// **Why it is sound.**
+/// - An entry is pushed only from a bind site holding a
+///   [`BindOrigin::Node`] and the very [`OwnedValue`] the bind froze from
+///   that node ([`each_as_generic`]). It lives for the body's dynamic
+///   extent, nested inside the document's own lifetime, so `(node,
+///   document)` can never name a freed index -- `document` is the index's
+///   address (`document_token_of`), which only a *dead* index could see
+///   reused.
+/// - [`shared_for`](embed_table::shared_for) hands out that same `Rc`. An
+///   index is immutable, so it is value-identical to a fresh
+///   materialization of the same node by the same converter; only the
+///   sharing is new, never the bytes printed.
+/// - The entry's own strong reference means *any* write through *any*
+///   handle copies first (`Rc::make_mut`, `Rc::try_unwrap`). So a container
+///   that still shares storage with an entry is that node's own, unmodified
+///   value -- exactly the condition under which jq's `jv_identical($x, .)`
+///   holds. This mirrors jq itself, where the binding's own reference is
+///   what makes the refcount exceed one and forces the copy.
+/// - Scalars are not `Rc`-backed and never enter the table, so a scalar
+///   root (`"s" | . as $x | {k:.} | .k | path($x)`, `[]` in jq) stays a
+///   documented refuse-only residual.
+///
+/// **jq mode only.** Both reads are gated on `S::TAG == EvalTag::Jq`, the
+/// same gate [`eval::reroot_markers`]' promotion uses: yq's node model is
+/// #2643's business, and ADR-0018 says the mode decides. That gate also
+/// disposes of the one way sharing could change *bytes*: the two
+/// materializers differ only on YAML explicit tags and JSON-sourced number
+/// canonicalization, and jq mode drives a `JsonCursor`, whose
+/// `explicit_tag`/`canonicalize_numbers` are the trait defaults.
+///
+/// Reuse is taken at [`to_owned_cursor`]'s own depth 0 only, never inside a
+/// container walk. That is where every embedding construction materializes
+/// its operand, and it keeps the nesting-depth budget exactly the one the
+/// bind itself already passed: a reuse deeper in some *other* node's walk
+/// would skip the `MAX_NESTING_DEPTH` accounting for the shared subtree.
+///
+/// `#[cfg(feature = "std")]` only, the same `thread_local!`-with-RAII-guard
+/// shape and the same degradation as [`file_origin`]/[`path_base`]/
+/// [`node_origin`] above: a `no_std` embedding has no thread-local, so the
+/// table is always empty there and every marker stays refuse-only -- which is
+/// precisely the pre-#2889 behaviour, an under-acceptance jq also gives on
+/// the rebuilt copies this models, never a wrong write.
+#[cfg(feature = "std")]
+mod embed_table {
+    use super::OwnedValue;
+    use alloc::vec::Vec;
+    use std::cell::{Cell, RefCell};
+
+    /// One in-scope binding: the node it was frozen from, and the value.
+    struct Entry {
+        node: usize,
+        document: usize,
+        /// Always an `OwnedValue::Array`/`Object` -- [`push`]'s caller
+        /// filters, since only those two are `Rc`-backed.
+        value: OwnedValue,
+    }
+
+    thread_local! {
+        static TABLE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+        /// `!TABLE.is_empty()`, mirrored into a `Cell` so the hot
+        /// materializer's gate is a plain load rather than a `RefCell`
+        /// borrow.
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether any binding is in scope at all -- the cheap gate every read
+    /// takes first.
+    pub(crate) fn active() -> bool {
+        ACTIVE.with(Cell::get)
+    }
+
+    /// Pops the entry (and any pushed under it) when dropped, including
+    /// when the body escapes with an error, a `break` or a halt.
+    pub struct Guard(usize);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TABLE.with(|t| t.borrow_mut().truncate(self.0));
+            ACTIVE.with(|a| a.set(self.0 > 0));
+        }
+    }
+
+    /// Register `value` as the materialization of `(node, document)` for as
+    /// long as the returned guard lives.
+    pub(crate) fn push(node: usize, document: usize, value: OwnedValue) -> Guard {
+        let previous = TABLE.with(|t| {
+            let mut t = t.borrow_mut();
+            let previous = t.len();
+            t.push(Entry {
+                node,
+                document,
+                value,
+            });
+            previous
+        });
+        ACTIVE.with(|a| a.set(true));
+        Guard(previous)
+    }
+
+    /// The `Rc` an in-scope binding already holds for `(node, document)`,
+    /// or `None` when no binding names that node.
+    ///
+    /// Innermost first: a re-entered bind of the same node (`. as $x | . as
+    /// $y | ...`) shadows the outer one, and the two hold equal values
+    /// anyway.
+    pub(crate) fn shared_for(node: usize, document: usize) -> Option<OwnedValue> {
+        TABLE.with(|t| {
+            t.borrow()
+                .iter()
+                .rev()
+                .find(|e| e.node == node && e.document == document)
+                .map(|e| e.value.clone())
+        })
+    }
+
+    /// The node an in-scope binding was frozen from, if `value` still
+    /// shares that binding's container storage -- i.e. if `value` *is* that
+    /// node's own unmodified value.
+    pub(crate) fn witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
+        TABLE.with(|t| {
+            t.borrow()
+                .iter()
+                .rev()
+                .find(|e| e.value.shares_storage_with(value))
+                .map(|e| (e.node, e.document))
+        })
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod embed_table {
+    use super::OwnedValue;
+
+    pub(crate) fn active() -> bool {
+        false
+    }
+
+    /// Same shape as the `std` guard, but there is nowhere to record a
+    /// binding without a `thread_local!`, so it pops nothing.
+    pub struct Guard;
+
+    pub(crate) fn push(_node: usize, _document: usize, _value: OwnedValue) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn shared_for(_node: usize, _document: usize) -> Option<OwnedValue> {
+        None
+    }
+
+    pub(crate) fn witness_of(_value: &OwnedValue) -> Option<(usize, usize)> {
+        None
+    }
+}
+
+/// The RAII guard [`embed_table_push`] returns (#2889).
+pub(crate) type EmbedGuard = embed_table::Guard;
+
+/// Register `value` as the in-scope materialization of the document node
+/// `origin` names, for as long as the returned guard lives (#2889).
+///
+/// A no-op guard for anything the table cannot use: a non-jq mode, a
+/// binding with no node behind it, or a scalar (not `Rc`-backed, so it has
+/// no storage identity to share). See [`embed_table`] for the full rule.
+pub(crate) fn embed_table_push<S: EvalSemantics>(
+    origin: Option<&BindOrigin>,
+    value: &OwnedValue,
+) -> Option<EmbedGuard> {
+    if S::TAG != EvalTag::Jq || !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+        return None;
+    }
+    match origin {
+        Some(BindOrigin::Node { node, document }) => {
+            Some(embed_table::push(*node, *document, value.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether any `as` binding's value is currently registered in the embed
+/// table (#2889) -- the gate `eval::eval_each_owned`'s navigation peel
+/// takes, so nothing outside a binding's own body changes shape.
+pub(crate) fn embed_table_active() -> bool {
+    embed_table::active()
+}
+
+/// The document node `value` still *is*, if an in-scope binding proves it
+/// (#2889) -- `eval::RootWitness::of_owned`'s only source.
+pub(crate) fn embed_witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
+    if !embed_table::active() {
+        return None;
+    }
+    embed_table::witness_of(value)
+}
+
+/// The `Rc` an in-scope binding already holds for the node `cursor` stands
+/// at, if any (#2889). See [`embed_table`].
+fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || !embed_table::active() {
+        return None;
+    }
+    embed_table::shared_for(cursor.node_id(), cursor.document_token())
 }
 
 /// `file_index` for a node at `path`: the origin file of the top-level
@@ -9994,6 +10239,14 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
         optional,
         cursor,
         |bound_val, origin| {
+            // #2889: the binding holds this node's `OwnedValue` for the
+            // body's whole dynamic extent, exactly as jq's `. as $x` holds a
+            // reference to `.`'s `jv`. Registering it makes a later
+            // materialization of the same node hand back *this* `Rc`, so
+            // `{k:.}`/`[.]`/`. + {}` embed the value rather than a twin --
+            // see `embed_table`. The guard pops the entry however the body
+            // leaves, error and `break` included.
+            let _embed = embed_table_push::<S>(origin.as_ref(), &bound_val);
             let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
             eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink)
         },
