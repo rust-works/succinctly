@@ -1226,6 +1226,45 @@ fn recurse_levels_keep_the_read_only_operand_scope_2918() -> Result<()> {
     Ok(())
 }
 
+/// #3047: a nested operand's read-only scope (#2470) must cover its `as`
+/// body too. The body runs on the stack inside the source's sink, where the
+/// operand strategy used to force the scope off with `suspend()` -- right
+/// for an *un-nested* operand's consumer, wrong when the operand is itself
+/// nested inside an enclosing operand's scope: `((.n + 1) as $m | [...] |
+/// length) + 0` read `.zzz` as a real key and produced `1` where yq (v4.53.3)
+/// answers `0`. The sink now restores the pre-enter scope instead, so the
+/// nested consumer keeps the enclosing `true`. Rows 1-3 diverge on `main`;
+/// row 4 (plain pipe, no `as` -- the consumer is the enclosing scope's own
+/// sink) is the control and already agreed; the final row guards that an
+/// un-nested operand's *consumer* still escapes the scope (the #2470
+/// `.zzz + 1 | .yyy` shape).
+#[test]
+fn test_yq_nested_operand_as_body_keeps_enclosing_read_only_scope_3047() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r"((.n + 1) as $m | [.zzz | key] | length) + 0",
+        "n: 0\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "0", "out: {output:?}");
+
+    for filter in [
+        r"[(.n + 1) as $m | [.zzz | key] | length] + []",
+        r"[first((.n + 1) as $m | [.zzz | key] | length)] + []",
+        r"[(.n + 1) | [.zzz | key] | length] + []",
+    ] {
+        let (output, code) = run_yq_stdin(filter, "n: 0\n", &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}`: out: {output:?}");
+        assert_eq!(output.trim(), "[0]", "`{filter}`: out: {output:?}");
+    }
+
+    let (output, code) = run_yq_stdin(r"(.zzz | key) + 1", "zzz: 9\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "\"zzz1\"", "out: {output:?}");
+
+    Ok(())
+}
+
 /// #868: the same duplicate-key fix, one level of nesting deeper -- confirms
 /// `collect_paths_generic`'s `effective_fields` call applies at every
 /// recursion level, not just the root object.

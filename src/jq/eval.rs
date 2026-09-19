@@ -814,6 +814,18 @@ pub(crate) mod yq_read_only_context {
         set(false)
     }
 
+    /// Re-establish the caller's scope to `state` -- what a demand-driven
+    /// operand's *sink* runs under when that operand is itself nested inside
+    /// an enclosing operand's read-only scope (#3047): the sink inherits the
+    /// scope that was active before this operand's own [`enter`], so an `as`
+    /// body inside a nested operand still reads absent keys as empty.
+    /// Identical to [`suspend`] when `state` is `false` (the un-nested
+    /// operand case), which is why the top-level #2470 behaviour does not
+    /// move.
+    pub(crate) fn restore(state: bool) -> Guard {
+        set(state)
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE.with(|c| c.set(self.0));
@@ -834,6 +846,10 @@ pub(crate) mod yq_read_only_context {
     }
 
     pub(crate) fn suspend() -> Guard {
+        Guard
+    }
+
+    pub(crate) fn restore(_state: bool) -> Guard {
         Guard
     }
 }
@@ -8500,20 +8516,24 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Wrap an operand-enumeration strategy so the operand expression itself runs
-/// inside a [read-only context](yq_read_only_context) and its sink does not
-/// (#2470).
+/// inside a [read-only context](yq_read_only_context) and its sink runs under
+/// whatever scope was active before that (#2470).
 ///
 /// A pass-through when `rules.read_only` is `false` (jq mode, and a
 /// comparison operand in either mode), so nothing outside yq's arithmetic
-/// and `and`/`or` operands pays for -- or observes -- the scope. The
-/// `suspend` on the way into the sink is what makes `.zzz + 1 | .yyy` keep
-/// reading `.yyy` normally, and what lets the *inner* operand's own wrapped
-/// call re-enter the scope from scratch.
+/// and `and`/`or` operands pays for -- or observes -- the scope. The sink
+/// side restores the pre-enter scope rather than forcing it off: for an
+/// un-nested operand that scope is `false`, which is what makes
+/// `.zzz + 1 | .yyy` keep reading `.yyy` normally, but when the operand is
+/// itself nested inside an enclosing operand's scope the sink keeps the
+/// enclosing `true`, so the nested operand's own consumer (an `as` body,
+/// which runs on the stack inside the producing call) still reads absent
+/// keys as empty (#3047).
 ///
 /// Generic in the item type `I` rather than fixed to [`Item`] (#2180 WP2a):
 /// [`binary_fanout_each`] enumerates whole operand values, while
 /// [`boolean_fanout_each`] enumerates one truthiness `bool` per operand
-/// output, and both need the identical enter/suspend pairing. Before WP2a
+/// output, and both need the identical enter/restore pairing. Before WP2a
 /// `and`/`or` applied it by hand inside [`boolean_fanout_bools`], which is
 /// how it came to cover only the operand call and not the sink.
 fn read_only_operand_strategy<I>(
@@ -8524,9 +8544,10 @@ fn read_only_operand_strategy<I>(
         if !rules.read_only {
             return each_operand(expr, sink);
         }
+        let previous = yq_read_only_context::active();
         let _scope = yq_read_only_context::enter();
         each_operand(expr, &mut |item| {
-            let _suspended = yq_read_only_context::suspend();
+            let _restored = yq_read_only_context::restore(previous);
             sink(item)
         })
     }
