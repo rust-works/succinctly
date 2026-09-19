@@ -7776,20 +7776,31 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // that arity, not the runtime step value, decides the float path's
     // NaN-bound behavior.
     let implicit_step = step.is_none();
-    let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
+    let mut emit = |from_val: RangeNum,
+                    to_val: RangeNum,
+                    step_val: RangeNum,
+                    from_literal: Option<&OwnedValue>|
+     -> Demand {
         let (one, truncated) = match (from_val, to_val, step_val) {
             // `eval_range_values` never falls back to `eval_range_values_f64`
             // since #2219 -- an `i64` overflow now ends its loop and keeps
             // whatever was already pushed, rather than bailing; see its own
             // doc comment. `eval_range_values_f64` remains real production
             // code, reachable only via the other match arm below (any
-            // non-integer operand).
+            // non-integer operand). `from_literal` is forwarded on this arm
+            // too (#3103): an integer literal generally renders identically
+            // to its own `i64` (so `from_literal` is usually `None` here
+            // anyway), but `-0` is the one legal-JSON exception.
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                eval_range_values::<W>(f, t, st)
+                eval_range_values::<W>(f, t, st, from_literal)
             }
-            (f, t, st) => {
-                eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64(), implicit_step)
-            }
+            (f, t, st) => eval_range_values_f64::<W>(
+                f.as_f64(),
+                t.as_f64(),
+                st.as_f64(),
+                implicit_step,
+                from_literal,
+            ),
         };
         match drain_result(one, sink) {
             Flow::Exhausted if truncated => {
@@ -7810,22 +7821,32 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let from_flow = eval_each::<W, S>(from, value.clone(), optional, &mut |from_item| {
-        let from_val = match range_num(&item_to_owned::<_, S>(from_item)) {
+        let from_owned = item_to_owned::<_, S>(from_item);
+        let from_val = match range_num(&from_owned) {
             Ok(n) => n,
             Err(e) => {
                 return stop_with_escape_cell(&escape, Control::Error(e));
             }
         };
+        // The one place `from`'s own literal spelling (if any) is still on
+        // hand -- `range_num` above already degraded it to a spelling-less
+        // `RangeNum` (#3103).
+        let from_literal = range_from_literal_override(&from_owned);
 
         let Some(to_expr) = to else {
             // range(n) -- unreachable from any query today; see
-            // `eval_range`'s own doc comment on this branch.
+            // `eval_range`'s own doc comment on this branch. This `from` is
+            // always the synthesized integer `0`, never a literal, so no
+            // spelling to preserve either way.
             return match from_val {
-                RangeNum::Int(t) => emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1)),
+                RangeNum::Int(t) => {
+                    emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1), None)
+                }
                 RangeNum::Float(t) => emit(
                     RangeNum::Float(0.0),
                     RangeNum::Float(t),
                     RangeNum::Float(1.0),
+                    None,
                 ),
             };
         };
@@ -7839,7 +7860,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             match step {
-                None => emit(from_val, to_val, RangeNum::Int(1)),
+                None => emit(from_val, to_val, RangeNum::Int(1), from_literal),
                 Some(step_expr) => {
                     let step_flow =
                         eval_each::<W, S>(step_expr, value.clone(), optional, &mut |step_item| {
@@ -7849,7 +7870,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                     return stop_with_escape_cell(&escape, Control::Error(e));
                                 }
                             };
-                            emit(from_val, to_val, step_val)
+                            emit(from_val, to_val, step_val, from_literal)
                         });
                     match step_flow {
                         Flow::Exhausted => Demand::Continue,
@@ -45797,6 +45818,53 @@ pub(crate) fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
     }
 }
 
+/// The literal spelling to preserve for `range`'s first emitted value, if
+/// `value` (the already-decoded `from` operand, before [`range_num`] degrades
+/// it to a [`RangeNum`]) still carries one -- see [`range_values_f64`]'s doc
+/// comment (#3103): real jq passes `from` straight through as the first
+/// emitted value with no arithmetic performed on it yet, so a spelling that
+/// would otherwise print differently from its own canonicalization (a
+/// "whole" float like `0.0`, or an integer `-0`) survives there even though
+/// every later value (after `+ step`) gets canonicalized fresh. `None` for a
+/// plain computed `Int`/`Float` (never captured as a `NumberLiteral`, so
+/// there is no spelling to preserve).
+///
+/// The `Float` arm always returns `Some`: every float literal's own text is
+/// worth preserving on the chance it differs from a freshly-formatted
+/// `f64::Display` of the same value, and there's no cheaper test than
+/// keeping the value itself -- `range`'s float path (`range_values_f64`)
+/// already has no zero-allocation fast path to protect, since it always
+/// reconstructs a fresh `Float` for every value after the first anyway.
+///
+/// The `Int` arm is deliberately narrower, gated on `text.starts_with('-')`
+/// with `i == 0`: this is a real hot path (`range(0; n)`, `range(a; b)`,
+/// ... written with plain filter-text integer literals are the overwhelming
+/// common case, and every one of them is *also* a `NumberLiteral` -- the
+/// tokenizer captures source text for every number literal, not just
+/// floats, confirmed at `src/jq/parser.rs`'s number-literal construction
+/// site). Cloning a `NumberLiteral`'s `Box<str>` for the first element of
+/// every such range, just to reproduce a spelling that (outside `-0`) always
+/// matches the zero-allocation `OwnedValue::Int` `range_values_int` would
+/// have built anyway, would be a real regression on `range`'s dedicated
+/// integer fast path (`eval_range_values`/`range_values_int`, kept
+/// allocation-free by design per their own doc comments). An integer
+/// literal's spelling can diverge from its own canonical `i64` print in
+/// exactly one way under strict JSON/jq number grammar -- no leading zeros,
+/// no leading `+`, no underscores are legal syntax, so the only degree of
+/// freedom left is the sign of zero (`-0` parses to `i64` `0`, but prints
+/// differently) -- confirmed live against `/usr/bin/jq` 1.7.1:
+/// `[range(-0;3)]` is `[-0,1,2]`, not `[0,1,2]`. The `starts_with('-')` check
+/// is a plain byte comparison (no allocation), unlike comparing against a
+/// freshly-`to_string()`-ed `i64`, so the common (non-`-0`) case pays only
+/// that one cheap check before falling through to `None`.
+pub(crate) fn range_from_literal_override(value: &OwnedValue) -> Option<&OwnedValue> {
+    match value {
+        OwnedValue::NumberLiteral(NumberRepr::Float(_), _) => Some(value),
+        OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-') => Some(value),
+        _ => None,
+    }
+}
+
 /// Evaluate `range(n)`, `range(a;b)`, or `range(a;b;step)`.
 ///
 /// Every bound is a generator argument, and jq nests them leftmost-outermost
@@ -45992,8 +46060,9 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
     to: i64,
     step: i64,
+    first_value: Option<&OwnedValue>,
 ) -> (QueryResult<'a, W>, bool) {
-    let (values, truncated) = range_values_int(from, to, step);
+    let (values, truncated) = range_values_int(from, to, step, first_value);
     (owned_vec_to_result(values), truncated)
 }
 
@@ -46005,14 +46074,37 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
 /// two overflow proofs into a second copy is exactly the drift the
 /// `MAX_RANGE` doc comment above already warns about. One definition, two
 /// wrappers.
-pub(crate) fn range_values_int(from: i64, to: i64, step: i64) -> (Vec<OwnedValue>, bool) {
+///
+/// `first_value`, when `Some`, replaces the plain computed `OwnedValue::Int`
+/// this would otherwise push for the very first emitted element only -- the
+/// int twin of [`range_values_f64`]'s own `first_value` (#3103; see its doc
+/// comment for the full rationale). Borrowed rather than owned so a caller
+/// fanning `from` out across multiple `(to, step)` combinations clones it at
+/// most once per combination that actually pushes a value, never for one
+/// that turns out empty.
+pub(crate) fn range_values_int(
+    from: i64,
+    to: i64,
+    step: i64,
+    first_value: Option<&OwnedValue>,
+) -> (Vec<OwnedValue>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
+
+    // #3103 review: see `range_values_f64`'s identical guard for the
+    // rationale -- nothing downstream cross-checks `first_value` against
+    // `from`.
+    debug_assert!(
+        first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
+        "range's first_value override must be a NumberLiteral, got {first_value:?}"
+    );
+    let mut first_value = first_value;
+    let mut next_value = |i: i64| first_value.take().cloned().unwrap_or(OwnedValue::Int(i));
 
     if step > 0 {
         let mut i = from;
         while i < to {
-            values.push(OwnedValue::Int(i));
+            values.push(next_value(i));
             if values.len() >= MAX_RANGE {
                 // Cap hit on the push that just happened. Whether this is a
                 // *real* truncation depends on whether one more value would
@@ -46051,7 +46143,7 @@ pub(crate) fn range_values_int(from: i64, to: i64, step: i64) -> (Vec<OwnedValue
     } else if step < 0 {
         let mut i = from;
         while i > to {
-            values.push(OwnedValue::Int(i));
+            values.push(next_value(i));
             if values.len() >= MAX_RANGE {
                 truncated = i.checked_add(step).is_some_and(|next| next > to);
                 break;
@@ -46075,13 +46167,17 @@ pub(crate) fn range_values_int(from: i64, to: i64, step: i64) -> (Vec<OwnedValue
 /// Accumulates by repeated addition of `step` (jq semantics), so results carry
 /// the same floating-point drift as jq (e.g. `range(0;1;0.3)` ends at
 /// 0.8999999999999999). A zero or NaN step yields no values, matching jq.
+///
+/// `first_value` is forwarded to [`range_values_f64`] -- see its own doc
+/// comment (#3103) for what it overrides.
 fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
     from: f64,
     to: f64,
     step: f64,
     implicit_step: bool,
+    first_value: Option<&OwnedValue>,
 ) -> (QueryResult<'a, W>, bool) {
-    let (values, truncated) = range_values_f64(from, to, step, implicit_step);
+    let (values, truncated) = range_values_f64(from, to, step, implicit_step, first_value);
     (owned_vec_to_result(values), truncated)
 }
 
@@ -46107,14 +46203,49 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
 /// today; jq's 3-arg range has its own further NaN divergence on a
 /// *negative* step that this issue doesn't cover, filed separately as
 /// [#3102](https://github.com/rust-works/succinctly/issues/3102).
+///
+/// `first_value`, when `Some`, replaces the plain computed `OwnedValue::
+/// Float` this would otherwise push for the very first emitted element only
+/// -- real jq passes `from` straight through unmodified as that first value,
+/// so if it was a [`NumberLiteral`](OwnedValue::NumberLiteral) with its own
+/// source spelling (`0.0`, `3.00`, a document-sourced `2.50`, ...), that
+/// spelling survives into the output; every value after it has had `+ step`
+/// applied and is always a freshly computed `Float`, matching jq's own
+/// canonicalization there (#3103). Callers pass `None` when `from` carries no
+/// spelling to preserve (a computed float, or the `range(n)` shape whose
+/// synthesized `from` is always a plain `0`).
+///
+/// Borrowed, not owned: a fanned-out `from` (`range((0.0,0.00); 3)`) calls
+/// this once per `(to, step)` combination with the *same* `from`, and a
+/// combination that turns out empty (an already-past-`to` `from`, a zero/NaN
+/// `step`) never reaches the `values.push` below at all -- taking `&OwnedValue`
+/// and cloning only inside `next_value`, exactly once, only when a value is
+/// actually pushed, avoids cloning the literal's `Box<str>` for a
+/// combination that never uses it.
 pub(crate) fn range_values_f64(
     from: f64,
     to: f64,
     step: f64,
     implicit_step: bool,
+    first_value: Option<&OwnedValue>,
 ) -> (Vec<OwnedValue>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
+
+    // #3103 review: `first_value`, when present, must be exactly the
+    // `NumberLiteral` `range_from_literal_override` produces -- nothing
+    // downstream re-derives or cross-checks it against `from`, so a future
+    // caller passing some other variant (or a value numerically unequal to
+    // `from`) would silently splice a wrong value into a numeric range's
+    // output with no other defense.
+    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is 1.73
+    // and `Option::is_none_or` is 1.82.
+    debug_assert!(
+        first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
+        "range's first_value override must be a NumberLiteral, got {first_value:?}"
+    );
+    let mut first_value = first_value;
+    let mut next_value = |i: f64| first_value.take().cloned().unwrap_or(OwnedValue::Float(i));
 
     // Both `implicit_step` call sites (`each_range`, `each_range_generic`)
     // only ever pass a positive `RangeNum::Int(1)` step -- the 1-arg/2-arg
@@ -46146,14 +46277,14 @@ pub(crate) fn range_values_f64(
     if step > 0.0 {
         let mut i = from;
         while continue_ascending(i) && values.len() < MAX_RANGE {
-            values.push(OwnedValue::Float(i));
+            values.push(next_value(i));
             i += step;
         }
         truncated = continue_ascending(i);
     } else if step < 0.0 {
         let mut i = from;
         while i > to && values.len() < MAX_RANGE {
-            values.push(OwnedValue::Float(i));
+            values.push(next_value(i));
             i += step;
         }
         truncated = i > to;
@@ -61320,7 +61451,7 @@ mod tests {
     /// helper is used with is an all-integer `range` (the only case
     /// [`eval_range_values`] is ever invoked for).
     fn eval_range_values_i64(from: i64, to: i64, step: i64) -> (Vec<i64>, bool) {
-        let (qr, truncated) = eval_range_values::<Vec<u64>>(from, to, step);
+        let (qr, truncated) = eval_range_values::<Vec<u64>>(from, to, step, None);
         let values = match qr {
             QueryResult::None => Vec::new(),
             QueryResult::Owned(OwnedValue::Int(i)) => vec![i],
@@ -79431,7 +79562,7 @@ mod tests {
         // Neither real call site can construct this (the 1-arg/2-arg
         // grammar has no way to spell a negative step), so this pins the
         // guard directly rather than through a filter.
-        let _ = range_values_f64(0.0, 5.0, -1.0, true);
+        let _ = range_values_f64(0.0, 5.0, -1.0, true, None);
     }
 
     #[test]
@@ -91306,6 +91437,52 @@ mod tests {
         query!(b"null", "[range(0; 1; 0)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert!(arr.is_empty());
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_negative_zero_from_keeps_its_own_spelling_3103() {
+        // `-0` is the one integer spelling that diverges from its own
+        // canonical `i64` print -- confirmed live against `/usr/bin/jq`
+        // 1.7.1: `[range(-0;3)]` is `[-0,1,2]`, not `[0,1,2]`. `PartialEq`
+        // can't distinguish `NumberLiteral(Int(0), "-0")` from `Int(0)` (see
+        // `range_from_literal_override`'s own doc comment), so this checks
+        // the exact variant and its source text, not just `assert_eq!`.
+        query!(b"null", "[range(-0; 3)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                match &arr[0] {
+                    OwnedValue::NumberLiteral(NumberRepr::Int(0), text) => {
+                        assert_eq!(text.as_ref(), "-0");
+                    }
+                    other => panic!("expected NumberLiteral(Int(0), \"-0\"), got {other:?}"),
+                }
+                assert_eq!(arr[1], OwnedValue::Int(1));
+                assert_eq!(arr[2], OwnedValue::Int(2));
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_plain_int_from_stays_a_bare_int_3103() {
+        // Regression guard for the fix's own hot-path concern: an ordinary
+        // filter-text integer literal (`0`, not `-0`) must NOT get wrapped
+        // in a `NumberLiteral` just because the tokenizer captured its
+        // source text -- that would reintroduce an allocation into
+        // `range`'s zero-allocation integer fast path
+        // (`range_values_int`) for the overwhelmingly common
+        // `range(int; int)` shape. Output is unaffected either way (`0`
+        // prints as `0` regardless of variant), so only the exact variant
+        // distinguishes this, not `assert_eq!`.
+        query!(b"null", "[range(0; 3)]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                assert!(
+                    matches!(arr[0], OwnedValue::Int(0)),
+                    "range(0; 3)'s first element should stay a plain Int, not a NumberLiteral: {:?}",
+                    arr[0]
+                );
             }
         );
     }

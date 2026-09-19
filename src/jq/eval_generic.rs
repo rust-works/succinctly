@@ -65,14 +65,14 @@ use super::eval::{
     is_retryable_control, is_retryable_stop, key_arrays_eq, literal_to_owned,
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry,
-    reroot_markers, resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty,
-    select_emits, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, stop_with_downstream, stop_with_error, stop_with_escape,
-    stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str, try_payload_root,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    pattern_alternatives_var_names, prefer_pending_control, range_from_literal_override,
+    range_max_exceeded_error, range_num, range_values_f64, range_values_int, recurse_walk_flow,
+    reduce_forks, reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds,
+    resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
+    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
+    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
     yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
     yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
@@ -13424,10 +13424,27 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     // explicit step expression) select the float path's NaN-tolerant loop
     // condition in `range_values_f64`, not the runtime step value.
     let implicit_step = step.is_none();
-    let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
+    let mut emit = |from_val: RangeNum,
+                    to_val: RangeNum,
+                    step_val: RangeNum,
+                    from_literal: Option<&OwnedValue>|
+     -> Demand {
         let (values, truncated) = match (from_val, to_val, step_val) {
-            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => range_values_int(f, t, st),
-            (f, t, st) => range_values_f64(f.as_f64(), t.as_f64(), st.as_f64(), implicit_step),
+            // `from_literal` is forwarded on this arm too (#3103): an
+            // integer literal generally renders identically to its own
+            // `i64` (so `from_literal` is usually `None` here anyway), but
+            // `-0` is the one legal-JSON exception -- see `each_range`'s own
+            // note.
+            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                range_values_int(f, t, st, from_literal)
+            }
+            (f, t, st) => range_values_f64(
+                f.as_f64(),
+                t.as_f64(),
+                st.as_f64(),
+                implicit_step,
+                from_literal,
+            ),
         };
         for v in values {
             if sink.push(GenericItem::Owned(v)) == Demand::Stop {
@@ -13446,22 +13463,32 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     };
 
     let from_flow = eval_each_generic::<S, V>(from, value.clone(), optional, cursor, &mut |item| {
-        let from_val = match generic_item_into_owned::<_, S>(item)
-            .and_then(|v| range_num(&v).map_err(Control::Error))
-        {
-            Ok(n) => n,
+        let from_owned = match generic_item_into_owned::<_, S>(item) {
+            Ok(v) => v,
             Err(control) => return stop_with_escape_cell(&escape, control),
         };
+        let from_val = match range_num(&from_owned) {
+            Ok(n) => n,
+            Err(e) => return stop_with_escape_cell(&escape, Control::Error(e)),
+        };
+        // The one place `from`'s own literal spelling (if any) is still on
+        // hand -- see `each_range`'s own note (#3103).
+        let from_literal = range_from_literal_override(&from_owned);
 
         let Some(to_expr) = to else {
             // `range(n)` -- unreachable from any query today, mirroring
-            // `each_range`'s own note on this branch.
+            // `each_range`'s own note on this branch. This `from` is always
+            // the synthesized integer `0`, never a literal, so no spelling
+            // to preserve either way.
             return match from_val {
-                RangeNum::Int(t) => emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1)),
+                RangeNum::Int(t) => {
+                    emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1), None)
+                }
                 RangeNum::Float(t) => emit(
                     RangeNum::Float(0.0),
                     RangeNum::Float(t),
                     RangeNum::Float(1.0),
+                    None,
                 ),
             };
         };
@@ -13476,7 +13503,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                 };
 
                 match step {
-                    None => emit(from_val, to_val, RangeNum::Int(1)),
+                    None => emit(from_val, to_val, RangeNum::Int(1), from_literal),
                     Some(step_expr) => {
                         let step_flow = eval_each_generic::<S, V>(
                             step_expr,
@@ -13490,7 +13517,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                                     Ok(n) => n,
                                     Err(control) => return stop_with_escape_cell(&escape, control),
                                 };
-                                emit(from_val, to_val, step_val)
+                                emit(from_val, to_val, step_val, from_literal)
                             },
                         );
                         match step_flow {
