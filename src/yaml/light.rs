@@ -7004,6 +7004,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::text_position(self)
     }
 
+    /// YAML is parse-validated, so `doc_text` is for the same
+    /// `malformed_json_text`-style re-validation callers JSON uses — and is
+    /// the same borrow as [`YamlCursor::text`] (#3035).
+    #[inline]
+    fn doc_text(&self) -> &'a [u8] {
+        self.text
+    }
+
     #[inline]
     fn line(&self) -> usize {
         YamlCursor::line(self)

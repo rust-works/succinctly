@@ -2751,6 +2751,32 @@ Every other path this section fixed (`length`, `to_entries`, `keys`, `.a`,
 fully-collected `Vec` before printing anything, so a mid-walk failure there
 never leaks a partial value.
 
+### Malformed text a filter never reads is never diagnosed (#3035)
+
+The incremental model's far edge: when a filter never *reaches* the
+malformed token, succinctly has nothing to fail on, where jq's atomic
+whole-document parse fails regardless. The keyword validation itself is
+exact (#3035 -- `nullx`/`nul` decode as errors and every path that reads
+them exits 5), but a filter that answers without reading the token is
+allowed its honest answer:
+
+```
+$ echo '[nul]'     | jq  -c 'type'        # (parses nothing) exit 5
+$ echo '[nul]'     | sjq -c 'type'        # "array"            exit 0
+$ echo '{"a":[nul]}' | jq  -c 'map(type)' # (parses nothing) exit 5
+$ echo '{"a":[nul]}' | sjq -c 'map(type)' # ["array"]          exit 0
+$ echo '{"b":nul}' | jq  '.a'             # (parses nothing) exit 5
+$ echo '{"b":nul}' | sjq '.a'             # null               exit 0
+```
+
+`type` on a container does not descend into it, so the malformed child is
+never decoded; `.a` reads only the `"a"` field. The moment the filter does
+read the bad token -- `.[]|type`, `map(type)` on `[nul]`, `.b`, a bare
+`.` -- succinctly raises with exit 5, matching jq. Scoped out of #3035 as
+the same lazy-vs-atomic parse divergence the section above records for
+partial output; a whole-input pre-validate (`--validate`) still rejects
+all of these.
+
 ### PR #2291 code review: eleven more sibling paths, found by a systematic sweep
 
 Code review on the PR carrying the section above found and live-confirmed

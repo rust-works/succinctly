@@ -5224,6 +5224,160 @@ fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
     Ok(())
 }
 
+/// #3035: a keyword token is exactly `true`/`false`/`null` -- a prefix
+/// (`nullx`, `truex`, `falsey`) or a truncated one (`nul`, `tru`, `fals`)
+/// is jq's `Invalid literal` (`/usr/bin/jq 1.7.1`: exit 5 for every row
+/// below), and succinctly must not decode `null`/`true`/`false` "out of the
+/// middle" of such a token. Every row asserts exit 5 *and* empty stdout: a
+/// bite-sized literal printed before the raise is exactly the leak. The
+/// valid keywords in the second half are the controls that must stay alive.
+#[test]
+fn test_keyword_prefix_and_truncated_tokens_reject_3035() -> Result<()> {
+    for doc in [
+        "nullx", "truex", "falsey", "nul", "tru", "fals", "nully", "null1", "true_", "falsee",
+    ] {
+        let (out, err, code) = run_jq_full(&["."], Some(doc))?;
+        assert_eq!(code, 5, "top-level {doc:?} `.` must reject, out: {out:?}");
+        assert!(
+            out.is_empty(),
+            "top-level {doc:?} `.` must leak nothing, out: {out:?}"
+        );
+        assert!(
+            err.contains("Invalid JSON text"),
+            "top-level {doc:?} `.`, stderr: {err}"
+        );
+
+        let (out, _, code) = run_jq_full(&["type"], Some(doc))?;
+        assert_eq!(
+            code, 5,
+            "top-level {doc:?} `type` must reject, out: {out:?}"
+        );
+        assert!(
+            out.is_empty() || !out.contains("error"),
+            "top-level {doc:?} `type` must not answer internally, out: {out:?}"
+        );
+
+        let (out, _, code) = run_jq_full(&["-c", "."], Some(doc))?;
+        assert_eq!(
+            code, 5,
+            "top-level {doc:?} `-c .` must reject, out: {out:?}"
+        );
+        assert!(
+            out.is_empty(),
+            "top-level {doc:?} `-c .` must leak nothing, out: {out:?}"
+        );
+    }
+
+    // Controls: exact keywords still decode and answer.
+    for (doc, want) in [("null", "null"), ("true", "true"), ("false", "false")] {
+        let (out, err, code) = run_jq_full(&["-c", "."], Some(doc))?;
+        assert_eq!(code, 0, "{doc:?} control, stderr: {err}");
+        assert_eq!(out, format!("{want}\n"), "{doc:?} control");
+    }
+    let (out, err, code) = run_jq_full(&["-c", "type"], Some("true"))?;
+    assert_eq!(code, 0, "`type` on true, stderr: {err}");
+    assert_eq!(out, "\"boolean\"\n");
+    Ok(())
+}
+
+/// #3035: the same whole-token rule inside containers, on the paths the
+/// issue's tables pin -- a bare identity, a field access that reaches the
+/// malformed value, and every `type`-family filter that iterates the bad
+/// element. All 27 rows match `/usr/bin/jq 1.7.1`'s exit 5 on the same
+/// input.
+#[test]
+fn test_keyword_errors_inside_containers_3035() -> Result<()> {
+    for (doc, queries) in [
+        (
+            "[nullx]",
+            vec!["-c .", "-c map(.)", "-c map(type)", "-c .[]|type"],
+        ),
+        (
+            "[nul]",
+            vec!["-c .", "-c map(.)", "-c map(type)", "-c .[]|type"],
+        ),
+        ("[tru,false]", vec!["-c .", "-c map(.)", "-c map(type)"]),
+        ("[truex]", vec!["-c .", "-c map(type)", "-c .[]|type"]),
+        ("[nullx,\"ok\"]", vec!["-c .", "-c map(.)", "-c map(type)"]),
+        (
+            "{\"a\":nullx}",
+            vec![".a", "-c .", "-c map(.)", "-c map(type)"],
+        ),
+        ("{\"a\":nul}", vec![".a", "-c map(type)"]),
+        ("{\"a\":[nullx]}", vec![".a", "-c map(.)"]),
+    ] {
+        for q in queries {
+            let args: Vec<&str> = q.split_whitespace().collect();
+            let (out, _, code) = run_jq_full(&args, Some(doc))?;
+            assert_eq!(code, 5, "doc {doc:?} query `{q}` must reject, out: {out:?}");
+            // Streaming may have emitted a partial prefix of the container
+            // (`{"a":` for the object) before the malformed member raised --
+            // that is #2961's incremental behavior, not a leak. What must
+            // never appear is a *decoded bite* of the malformed keyword.
+            assert!(
+                !matches!(out.trim(), "null" | "true" | "false" | "nan"),
+                "doc {doc:?} query `{q}` decoded a bite of the token: {out:?}"
+            );
+        }
+    }
+
+    // Controls: the same shapes stay healthy when the keyword is exact.
+    let (out, err, code) = run_jq_full(&["-c", "."], Some("[null,true,false]"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "[null,true,false]\n");
+    let (out, err, code) = run_jq_full(&["-c", "map(type)"], Some("[null,true,false]"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "[\"null\",\"boolean\",\"boolean\"]\n");
+    let (out, err, code) = run_jq_full(&[".a"], Some("{\"a\":null,\"b\":1}"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "null\n");
+    Ok(())
+}
+
+/// #3035: the `type` builtin must raise where the malformed keyword token
+/// *is* `type`'s input -- not answer the internal `"error"` value name.
+/// Exercised across the lazy routes (`-c`, `-S`, `-a`, `-e`, `-s`) that
+/// each had the leak pre-fix.
+#[test]
+fn test_type_raises_on_malformed_keyword_instead_of_error_name_3035() -> Result<()> {
+    // Top level, `nul` is the whole input, so `type`'s input is the error
+    // value itself and every route must raise.
+    for filter in [
+        "type", "-c type", "-S type", "-a type", "-e type", "-s type",
+    ] {
+        let args: Vec<&str> = filter.split_whitespace().collect();
+        let (out, err, code) = run_jq_full(&args, Some("nul"))?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` on `nul` must raise, out: {out:?}, stderr: {err}"
+        );
+    }
+    // Nested: only the iterating forms hand `type` the element that *is* the
+    // error. (`[nul] | type` legitimately answers `"array"` without
+    // descending -- a malformed child a filter never reads is the
+    // pre-existing lazy-streaming divergence, not this bug -- but `.[]`
+    // chooses the element, so `.[]|type` reaches it exactly as `type` on
+    // the top-level `nul` does.)
+    let (out, err, code) = run_jq_full(&["-c", "map(type)"], Some("[nul]"))?;
+    assert_eq!(
+        code, 5,
+        "`map(type)` on `[nul]` must raise, out: {out:?}, stderr: {err}"
+    );
+    let (out, err, code) = run_jq_full(&["-c", ".[]|type"], Some("[nul]"))?;
+    assert_eq!(
+        code, 5,
+        "`.[]|type` on `[nul]` must raise, out: {out:?}, stderr: {err}"
+    );
+    // The same filters on healthy input still answer.
+    let (out, err, code) = run_jq_full(&["type"], Some("true"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "\"boolean\"\n");
+    let (out, err, code) = run_jq_full(&["-c", ".[]|type"], Some("[true,null]"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "\"boolean\"\n\"null\"\n");
+    Ok(())
+}
+
 /// #2103 (code review) / #2662: the decision that a filter validates only
 /// what it reads is a property of the M2 route, and the M2 route was not
 /// the only one -- `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge all

@@ -817,17 +817,18 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 start: text_pos,
             }),
             b't' | b'f' => {
-                // true or false
-                if self.text[text_pos..].starts_with(b"true") {
+                // true or false. Same whole-token rule as `keyword_span`
+                // applies: `truex`/`falsey` are not `true`/`false` (#3035).
+                if keyword_span(self.text, text_pos, b"true").is_some() {
                     StandardJson::Bool(true)
-                } else if self.text[text_pos..].starts_with(b"false") {
+                } else if keyword_span(self.text, text_pos, b"false").is_some() {
                     StandardJson::Bool(false)
                 } else {
                     StandardJson::Error("invalid boolean")
                 }
             }
             b'n' => {
-                if self.text[text_pos..].starts_with(b"null") {
+                if keyword_span(self.text, text_pos, b"null").is_some() {
                     StandardJson::Null
                 } else if special_number_end(self.text, text_pos).is_some() {
                     // `nan`, `NaN5`: decNumber's NaN shares its first byte
@@ -964,9 +965,10 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 }
                 self.text.len()
             }
-            // Boolean true
+            // Boolean true. Same whole-token rule as `keyword_span` applies
+            // (#3035): `truex` is not `true`.
             b't' => {
-                if self.text[start..].starts_with(b"true") {
+                if keyword_span(self.text, start, b"true").is_some() {
                     start + 4
                 } else {
                     return None;
@@ -974,7 +976,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             }
             // Boolean false
             b'f' => {
-                if self.text[start..].starts_with(b"false") {
+                if keyword_span(self.text, start, b"false").is_some() {
                     start + 5
                 } else {
                     return None;
@@ -983,7 +985,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             // Null -- or decNumber's NaN, which shares the first byte
             // (#2877); the `value_at` arm above explains the ordering.
             b'n' => {
-                if self.text[start..].starts_with(b"null") {
+                if keyword_span(self.text, start, b"null").is_some() {
                     start + 4
                 } else {
                     special_number_end(self.text, start)?
@@ -2372,6 +2374,30 @@ fn special_number_end(text: &[u8], start: usize) -> Option<usize> {
     crate::json::validate::jq_special_number(&text[start..end]).map(|_| end)
 }
 
+/// Whether the token starting at `start` is exactly the keyword literal `kw`
+/// (`null`/`true`/`false`), returning the run's end on success.
+///
+/// Same "the *whole* run validates" rule `special_number_end` applies, using
+/// the same jq token boundary (`jq_literal_run_end`): reading a valid prefix
+/// out of a longer token would materialize a literal where real jq reports a
+/// parse error. So `nullx`/`truex`/`falsey` -- a keyword-plus-suffix token --
+/// and `nul`/`tru`/`fals` -- a truncated one -- are both not the literal,
+/// matching jq 1.7.1's `guess_tag` (`Invalid literal` for either shape,
+/// captured live over `[true<suffix>]`). The document is rejected by value
+/// decoding instead of any bite-sized prefix being answered (#3035).
+///
+/// `pub` because the CLI's top-level document splitter
+/// (`scan_one_json_token` over `find_literal_end`) must agree on the *same*
+/// whole-token rule for bare keywords: with the old alphabetic-only run it
+/// split `null1` into `null` + `1` -- a keyword whose run genuinely includes
+/// the following digit, passed only because the split happened to break
+/// between them (#3035).
+#[must_use]
+pub fn keyword_span(text: &[u8], start: usize, kw: &[u8]) -> Option<usize> {
+    let end = jq_literal_run_end(text, start);
+    (end - start == kw.len() && &text[start..end] == kw).then_some(end)
+}
+
 /// Where the literal token starting at `start` ends under jq 1.7.1's own
 /// scanner: `jv_parse.c`'s `scan` accumulates every byte that is not
 /// whitespace, `"` or one of `[{,:]}` into one token and hands the whole
@@ -2937,13 +2963,13 @@ fn scan_canonical_value(bytes: &[u8], pos: usize, depth: usize) -> Option<usize>
 /// Matches one of `true`/`false`/`null` at `pos` exactly -- no other
 /// spelling is legal JSON, so there is no "canonical vs. not" axis here the
 /// way there is for numbers/strings, only "present or not".
+///
+/// "Exactly" is [`keyword_span`]'s whole-token rule, the same one
+/// `value_at`/`text_range` apply (#3035): a prefix `nullx` or a truncated
+/// `nul` is not the literal, or the echo branch would commit to re-rendering
+/// a span the other two scanners reject.
 fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<usize> {
-    let end = pos.checked_add(literal.len())?;
-    if bytes.get(pos..end) == Some(literal) {
-        Some(end)
-    } else {
-        None
-    }
+    keyword_span(bytes, pos, literal)
 }
 
 /// The number-token rule from `canonical_compact_jq_span_end`'s own doc
@@ -3243,6 +3269,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn text_position(&self) -> Option<usize> {
         JsonCursor::text_position(self)
+    }
+
+    /// `text` is a borrow of the same buffer the index was built from
+    /// (#3035; same reasoning as `document_token`'s own doc above).
+    #[inline]
+    fn doc_text(&self) -> &'a [u8] {
+        self.text
     }
 
     /// JSON is the one format whose semi-index treats `:`/`,` as
@@ -5882,7 +5915,6 @@ mod tests {
             // says it does.
             (&b"{\"a\":1}xyz"[..], "{\"a\":1}"),
             (&b"12xyz"[..], "12"),
-            (&b"truexyz"[..], "true"),
         ] {
             assert_eq!(
                 render_compact_jq_through_gate(doc).as_deref(),
@@ -5896,6 +5928,27 @@ mod tests {
                     .map(|b| String::from_utf8_lossy(b).into_owned()),
                 Some(want.to_string()),
                 "re-render for {:?}",
+                String::from_utf8_lossy(doc)
+            );
+        }
+
+        // A keyword's own grammar is the whole-token rule (#3035), so
+        // `truexyz` is *not* a canonical `true` followed by garbage -- jq
+        // reports `Invalid literal` for it. The echo must decline and the
+        // re-render must error, so both halves of the safety argument agree
+        // on `None`: the gate may only ever be a faster spelling of the
+        // re-render, never a looser one.
+        for doc in [&b"truexyz"[..], &b"falsezzz"[..], &b"nullx"[..]] {
+            assert_eq!(
+                render_compact_jq_through_gate(doc).as_deref(),
+                None,
+                "gate decline on malformed keyword {:?}",
+                String::from_utf8_lossy(doc)
+            );
+            assert_eq!(
+                render_compact_jq_by_rerender(doc).as_deref(),
+                None,
+                "re-render decline on malformed keyword {:?}",
                 String::from_utf8_lossy(doc)
             );
         }
@@ -8127,6 +8180,120 @@ mod tests {
         // A well-formed exponent still parses, so this isn't blanket
         // exponent-hostility.
         assert_eq!(number_literal_end(b"5e1", 0), Some(3));
+    }
+
+    /// #3035: `keyword_span` applies jq's *whole-token* rule (the run up to
+    /// jq's literal boundary must be exactly the keyword), not
+    /// longest-prefix acceptance. The boundary set is pinned by the same
+    /// live sweep that built [`jq_literal_run_end`]'s class: `[true<suffix>]`
+    /// against /usr/bin/jq 1.7.1 -- whitespace, `"`, `,`, `[`, `{`, `]`,
+    /// `}`, `:` end the token, every other byte (digits, letters, all
+    /// punctuation, NUL) continues it into one `Invalid literal` token.
+    #[test]
+    fn test_keyword_span_is_whole_token_not_prefix_3035() {
+        // Exact token, followed by a jq terminator: the run is exactly the
+        // keyword, so the span is the keyword's length.
+        for (kw, term) in [
+            (&b"true"[..], b' '),
+            (&b"true"[..], b']'),
+            (&b"true"[..], b'\n'),
+            (&b"false"[..], b','),
+            (&b"null"[..], b'}'),
+            (&b"null"[..], b':'),
+        ] {
+            let doc = [kw, &[term][..]].concat();
+            assert_eq!(
+                keyword_span(&doc, 0, kw),
+                Some(kw.len()),
+                "{:?} + terminator {:?}",
+                String::from_utf8_lossy(kw),
+                term
+            );
+        }
+        // Prefix-plus-suffix (`nullx`) and truncated (`nul`) tokens are not
+        // the literal -- jq reports `Invalid literal` for both shapes.
+        for doc in [
+            &b"nullx"[..],
+            &b"truex"[..],
+            &b"falsey"[..],
+            &b"null1"[..],
+            &b"true1"[..],
+            &b"false0"[..],
+            &b"nul"[..],
+            &b"tru"[..],
+            &b"fals"[..],
+            &b"nully"[..],
+            &b"true!"[..],
+            &b"false-"[..],
+            &b"null+1"[..],
+            &b"null.e"[..],
+        ] {
+            let kw: &[u8] = match doc[0] {
+                b't' => b"true",
+                b'f' => b"false",
+                _ => b"null",
+            };
+            assert_eq!(
+                keyword_span(doc, 0, kw),
+                None,
+                "{:?} must not resolve to the keyword",
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// #3035: the nested-keyword decoders (`value_at`, and `text_range`
+    /// through them) surface a decode error for a malformed keyword token
+    /// instead of materializing the valid prefix out of it. The error value
+    /// is how the evaluator's `type`/`map(type)`/`.[] | type` arms now raise
+    /// the malformed-document error rather than answering `"error"`; the
+    /// `None` `text_range` is what the pretty/compact writers decline.
+    #[test]
+    fn test_keyword_decoding_requires_the_whole_token_3035() {
+        for doc in [
+            &b"[nullx]"[..],
+            &b"[truex]"[..],
+            &b"[falsey]"[..],
+            &b"[nul]"[..],
+            &b"[tru]"[..],
+            &b"[fals]"[..],
+            &b"[null1]"[..],
+        ] {
+            let index = JsonIndex::build(doc);
+            let root = index.root(doc);
+            let elem = root.first_child().expect("array element cursor");
+            assert!(
+                matches!(elem.value(), StandardJson::Error(_)),
+                "{:?} must decode to an error, not a bite-sized literal",
+                String::from_utf8_lossy(doc)
+            );
+            assert_eq!(
+                elem.text_range(),
+                None,
+                "{:?} must not report a raw span",
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// #3035 (guard that decoy literals stay intact): a *valid* keyword must
+    /// still decode and report its span, and a genuine `nan` still routes to
+    /// the number path (`special_number_end`'s #2877 ordering kept `null`
+    /// first) rather than being caught by the new keyword rule.
+    #[test]
+    fn test_keyword_decoding_keeps_valid_literals_and_nan_3035() {
+        for doc in [&b"[null]"[..], &b"[true]"[..], &b"[false]"[..]] {
+            let index = JsonIndex::build(doc);
+            let root = index.root(doc);
+            let elem = root.first_child().unwrap();
+            assert!(!matches!(elem.value(), StandardJson::Error(_)));
+            assert!(elem.text_range().is_some());
+        }
+        // `nan` shares its first byte with `null`; it must stay a number.
+        let index = JsonIndex::build(b"[nan]");
+        let root = index.root(b"[nan]");
+        let elem = root.first_child().unwrap();
+        assert!(matches!(elem.value(), StandardJson::Number(_)));
     }
 
     /// `string_literal_end` rejects every raw `U+0000`-`U+001F` byte and

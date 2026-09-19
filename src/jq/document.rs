@@ -380,6 +380,15 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Get the byte position in the source text.
     fn text_position(&self) -> Option<usize>;
 
+    /// The raw source text of the document this cursor navigates.
+    ///
+    /// `EvalError::malformed_json_text`'s callers re-validate a document to
+    /// name its fault precisely, and the source text is the only thing the
+    /// validator needs (#3035) -- one definition, checked everywhere, the
+    /// same way `malformed_delimiter_error` inherits the shared
+    /// classification through a single site.
+    fn doc_text(&self) -> &[u8];
+
     /// Whether this node, already known to sit at `text_pos`, is preceded
     /// by the delimiter its position in the document requires: nothing if
     /// `expected` is `None` (a container's first child), otherwise exactly
