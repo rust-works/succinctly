@@ -331,7 +331,7 @@ DEFAULT_THRESHOLD = 5.0
 # *without* it, which is exactly what every `--baseline-binary` run does
 # on every PR/push until `main` itself carries #2608. 75% clears the
 # measured number with headroom. Remove only once `main` has moved past
-# #2608, per the rule above -- from that point on the merge-base always
+# #2608, per the rule above (tracked by #3170) -- from that point on the merge-base always
 # includes the echo path too and this row reads ~0% again like every other
 # row.
 #
@@ -339,7 +339,7 @@ DEFAULT_THRESHOLD = 5.0
 # the same way (~+13% Ir) -- the gate's own precheck cost, paid in full
 # (a walk of the whole document) before falling back to the unchanged
 # re-render. 20% clears the measured number with headroom. Remove once
-# `main` has moved past #2608, per the rule above.
+# `main` has moved past #2608, per the rule above (tracked by #3170).
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_del_select": 20.0,
@@ -560,14 +560,24 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
         # binary's writer, not this run's, keeping each `measure_all` call
         # self-consistent the same way its own fixture generation already is).
         derived_fixture_paths = {}
-        if ("users", "2mb") in fixture_paths:
-            base = fixture_paths[("users", "2mb")]
-            compact_path = os.path.join(tmp, "users_2mb_compact.json")
-            generate_compact_fixture(binary, base, compact_path)
-            derived_fixture_paths["users_compact_identity"] = compact_path
-            latefail_path = os.path.join(tmp, "users_2mb_compact_latefail.json")
-            inject_duplicate_last_member(compact_path, latefail_path)
-            derived_fixture_paths["users_compact_latefail"] = latefail_path
+        if ("users", "2mb") not in fixture_paths:
+            # Fail loudly rather than fall back to measuring `-c .` over the
+            # pretty-printed fixture: that early-fails on its first whitespace
+            # byte and never reaches the echo, so the rows would keep
+            # reporting a number for a shape they no longer measure (#2608
+            # review) -- the same blind spot the row comment above warns
+            # about.
+            sys.exit(
+                "the #2608 compact rows derive from the `users`/2mb fixture, which is no "
+                "longer in QUERIES -- re-derive them from a shape that is, or drop them"
+            )
+        base = fixture_paths[("users", "2mb")]
+        compact_path = os.path.join(tmp, "users_2mb_compact.json")
+        generate_compact_fixture(binary, base, compact_path)
+        derived_fixture_paths["users_compact_identity"] = compact_path
+        latefail_path = os.path.join(tmp, "users_2mb_compact_latefail.json")
+        inject_duplicate_last_member(compact_path, latefail_path)
+        derived_fixture_paths["users_compact_latefail"] = latefail_path
 
         measured = {}
         print(f"Measuring {label} ({binary}):")
