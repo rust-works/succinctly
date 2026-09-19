@@ -23986,7 +23986,7 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
     Ok(())
 }
 
-/// #3009 review: the eager `-n`/`--slurp`/DSV route's twin of the test above.
+/// #3155: the eager `-n`/`--slurp`/DSV route's twin of the test above.
 ///
 /// Merging the owned writers put this route on `print_owned_json`, whose depth
 /// check fires only after 384 levels of `[` are on stdout -- confirmed live
@@ -23999,7 +23999,7 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
 /// `-S` is covered separately because it takes `format_json`, not the
 /// streaming printer, and is where the old panic still lived.
 #[test]
-fn test_eager_over_depth_value_reports_cleanly_3009() -> Result<()> {
+fn test_eager_over_depth_value_reports_cleanly_3155() -> Result<()> {
     let filter = "1, setpath([range(400)|0]; 1), 7";
     for (args, input) in [
         (vec!["-nc", filter], None),
