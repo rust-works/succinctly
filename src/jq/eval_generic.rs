@@ -12684,7 +12684,9 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
 
 /// The generic-evaluator twin of `eval::read_only_operand_strategy` (#2470):
 /// wrap an operand-enumeration strategy so the operand expression runs inside
-/// a read-only context and the sink it feeds does not. Pass-through unless
+/// a read-only context and the sink it feeds runs under whatever scope was
+/// active before that (the enclosing scope, when nested -- #3047 -- whose
+/// sibling fix lives in `eval.rs`'s copy). Pass-through unless
 /// `rules.read_only`.
 fn read_only_operand_strategy_generic<V: DocumentValue>(
     rules: BinaryFanoutRules,
@@ -12694,9 +12696,10 @@ fn read_only_operand_strategy_generic<V: DocumentValue>(
         if !rules.read_only {
             return each_operand(expr, sink);
         }
+        let previous = yq_read_only_context::active();
         let _scope = yq_read_only_context::enter();
         each_operand(expr, &mut |item| {
-            let _suspended = yq_read_only_context::suspend();
+            let _restored = yq_read_only_context::restore(previous);
             sink.push(item)
         })
     }
