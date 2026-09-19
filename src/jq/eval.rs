@@ -98707,6 +98707,105 @@ mod tests {
         }
     }
 
+    /// #2889: `RootWitness::of_owned` reports the node an owned value still
+    /// *is*, and only that.
+    ///
+    /// The three outcomes the embed table has to tell apart, in the order
+    /// they matter: the binding's own value (a table hit, the node), an
+    /// equal-valued rebuild (`{a:1}` built afresh -- a miss, and the
+    /// #2642 hole this must not reopen), and the binding's value *written
+    /// through* (`{k:.} | .k | .b = 2`, where `Rc::make_mut` copied because
+    /// the entry still holds a reference -- exactly the event that makes
+    /// jq's own refcount exceed one and copy there). Plus the jq-mode gate,
+    /// and the guard's own scope.
+    ///
+    /// `unshared-containers` is the measurement holdout where a clone
+    /// deep-copies, so there is no storage to share and every row would be
+    /// `Owned`; the sharing is what this test is about, so it does not run
+    /// there.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn of_owned_witnesses_only_the_binding_s_own_storage_2889() {
+        use crate::jq::eval_generic::embed_table_push;
+
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        let origin = BindOrigin::Node {
+            node: 7,
+            document: 42,
+        };
+        let witness = RootWitness::Node {
+            node: 7,
+            document: 42,
+        };
+
+        // Nothing in scope yet.
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&value),
+            RootWitness::Owned
+        );
+
+        let guard = embed_table_push::<JqSemantics>(Some(&origin), &value);
+        assert!(guard.is_some(), "a container bind registers an entry");
+
+        // Hit: another handle on the binding's own storage, which is what
+        // `{k:.} | .k` hands the funnel.
+        let embedded = value.clone();
+        assert_eq!(RootWitness::of_owned::<JqSemantics>(&embedded), witness);
+
+        // Miss: an equal-valued rebuild is a different node (#2642).
+        let rebuilt = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert_eq!(
+            rebuilt, value,
+            "the rebuild is value-equal, and still a miss"
+        );
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&rebuilt),
+            RootWitness::Owned
+        );
+
+        // Miss: `{k:.} | .k | .b = 2` -- the write copied the container off
+        // the entry's storage before touching it.
+        let mut written = value.clone();
+        written
+            .as_object_mut()
+            .expect("an object")
+            .insert("b".to_string(), OwnedValue::Int(2));
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&written),
+            RootWitness::Owned
+        );
+
+        // yq mode never witnesses (ADR-0018: the mode decides).
+        assert_eq!(
+            RootWitness::of_owned::<YqSemantics>(&embedded),
+            RootWitness::Owned
+        );
+
+        // `Reentry::witnessed_by` refines only a `REBUILT` root; a caller
+        // that already named one, or proved its markers, is left alone.
+        assert_eq!(
+            Reentry::REBUILT.witnessed_by::<JqSemantics>(&embedded),
+            Reentry::Against(witness)
+        );
+        assert_eq!(
+            Reentry::REBUILT.witnessed_by::<JqSemantics>(&rebuilt),
+            Reentry::REBUILT
+        );
+        assert_eq!(
+            Reentry::Proven.witnessed_by::<JqSemantics>(&embedded),
+            Reentry::Proven
+        );
+        let named = Reentry::Against(RootWitness::OwnedRoot(5));
+        assert_eq!(named.witnessed_by::<JqSemantics>(&embedded), named);
+
+        // The entry is bind-scoped: dropping the guard ends the identity.
+        drop(guard);
+        assert_eq!(
+            RootWitness::of_owned::<JqSemantics>(&embedded),
+            RootWitness::Owned
+        );
+    }
+
     /// `rewrite_markers`' own precheck (#3122 coverage review): its
     /// `any_subexpr` gate decides once, for the *whole* expression, whether
     /// to walk at all -- so a marker that itself needs no change (a

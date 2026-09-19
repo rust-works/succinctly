@@ -60660,48 +60660,35 @@ fn test_tracked_var_owned_identity_sibling_gap_unaffected_2642() -> Result<()> {
     Ok(())
 }
 
-/// Known, accepted "refuse-only" residual (#2642's own follow-up, "owned
-/// embed map"): a construction that jq's own reference-counted jv passes
-/// through *without allocating a new container for the embedded node*
-/// (`{k:.} | .k`, `. + {}`) still keeps real jq's own node identity, but
-/// succinctly's `OwnedValue`-cloning model has no way to tell "this
-/// constructed value's position N is literally the same node" from
-/// "position N merely happens to be value-equal" -- so these now refuse
-/// rather than silently accepting a copy, matching this fix's own
-/// refuse-only safety property. Recovering them needs the generic evaluator
-/// to record which positions of a constructed value embed a document node
-/// (tracked in the #2642 follow-up), not attempted here.
+/// What is left of #2642's "owned embed map" residual once the embed table
+/// (#2889) closed the rest of it.
 ///
-/// #2575 closed one row of this residual as a side effect, not a targeted
-/// fix: `[.] | .[0] | path($x)` now stays accepted (moved to
-/// `test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642`), because
-/// `Expr::Array`'s generic-evaluator arm no longer materializes a
-/// cursor-shaped inner result into a fresh `OwnedValue` copy -- `[.]`'s
-/// single element is now a `LazySeq` pointing at the same cursor `.` came
-/// from, which is exactly the node identity jq's own `jv` already had.
-/// `[.] | path(.[0] | $x)` -- the same construction, but with the
-/// navigation happening *inside* `path()`'s own argument -- is a genuinely
-/// different mechanism (`path()`'s own resolver, not the generic
-/// evaluator's `Expr::Array` arm #2575 touches) and stays refused,
-/// confirmed live.
+/// The residual used to be every construction that jq's reference-counted
+/// `jv` passes through *without allocating a new container for the embedded
+/// node* (`{k:.} | .k`, `. + {}`, a fold whose UPDATE returns its input).
+/// #2889 gives those constructions the binding's own `Rc`, so they are
+/// accepted now and pinned by
+/// `test_owned_embed_keeps_node_identity_2889`. #2575 had already closed
+/// `[.] | .[0] | path($x)` as a side effect (moved to
+/// `test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642`).
+///
+/// One row stays refused, and it is a different mechanism from all of
+/// them: `[.] | path(.[0] | $x)` navigates to the embedded node *inside*
+/// `path()`'s own argument, so the marker has to be resolved against a
+/// position `path()`'s resolver walked to -- not against the value a
+/// funnel handed it, which is all `RootWitness` can witness. **jq 1.7.1
+/// answers `[0]` here, not `[]`**: the path is the one navigated inside the
+/// `path()` call, so this row is not even the same *answer* as its
+/// siblings. Captured live.
 #[test]
-// jq filter literals like `{a:1}`/`{b:2}` are not formatting strings;
-// clippy cannot tell the two apart from the brace shape alone.
-#[allow(clippy::literal_string_with_formatting_args)]
 fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
-    for filter in [
-        ". as $x | [.] | path(.[0] | $x)",
-        ". as $x | {k:.} | .k | path($x)",
-        ". as $x | . + {} | path($x)",
-        ". as $x | reduce empty as $i (.; .) | path($x)",
-    ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
-        assert_eq!(
-            code, 5,
-            "#2642: `{filter}` is a documented refuse-only residual (real jq \
-             accepts it, `[]`), got stdout={stdout:?} stderr={stderr:?}"
-        );
-    }
+    let filter = ". as $x | [.] | path(.[0] | $x)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+    assert_eq!(
+        code, 5,
+        "#2642: `{filter}` is a documented refuse-only residual (real jq \
+         answers `[0]`), got stdout={stdout:?} stderr={stderr:?}"
+    );
     Ok(())
 }
 
@@ -61343,6 +61330,9 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
 /// `Origin::Snapshot`'s value rule is sound for it. Read, and every write
 /// operator; all captured live from jq 1.7.1, all refused on `main`.
 #[test]
+// jq filter literals like `{k:.a}` are not formatting strings; clippy
+// cannot tell the two apart from the brace shape alone (as `*_2642`).
+#[allow(clippy::literal_string_with_formatting_args)]
 fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
     for (input, filter, want) in [
         (r#"{"a":{"b":1}}"#, r".a as $y | .a | path($y)", "[]"),
@@ -61374,6 +61364,15 @@ fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
             "[]",
         ),
         (r#"{"a":{"b":1}}"#, r".[] as $y | .a | path($y)", "[]"),
+        // Was #3037's own embed residual; the embed table (#2889) gives
+        // `{k:.a}` the binding's `Rc`, so `.k` reaches the funnel as `.a`'s
+        // node and `marker_is_root` promotes as it does for the bare `.a`
+        // row above. jq 1.7.1 answers `[]`.
+        (
+            r#"{"a":{"b":1}}"#,
+            r".a as $y | {k:.a} | .k | path($y)",
+            "[]",
+        ),
         (r#"{"a":{"b":1}}"#, r".a.b as $y | .a.b | path($y)", "[]"),
         (
             r#"{"a":{"b":1}}"#,
@@ -61567,8 +61566,6 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 ///   position inside the invocation (`path(.a | $y)`, `(.a | ($y.b)) = 9`)
 ///   needs a document-absolute bind path, the #2042 `Origin::At` machinery
 ///   reached from a value-mode bind.
-/// - The embed row (`{k:.a} | .k | path($y)`) is #2889's owned-identity
-///   residual.
 /// - Routes that re-enter the eager evaluator with an *owned* accumulator
 ///   (`reduce`'s UPDATE, a `catch` handler): its `eval_as` carries no node
 ///   for a navigated bind (#2072 gave the generic evaluator that, not this
@@ -61585,7 +61582,6 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
     for (input, filter) in [
         (r#"{"a":{"b":1}}"#, r".a as $y | path(.a | $y)"),
         (r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9"),
-        (r#"{"a":{"b":1}}"#, r".a as $y | {k:.a} | .k | path($y)"),
         (
             r#"{"a":{"b":1}}"#,
             r"reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)",
@@ -61697,6 +61693,249 @@ fn test_navigated_bind_yq_mode_unchanged_3037() -> Result<()> {
         stderr.contains(r#"Invalid path expression near attempt to access element "b" of {"b":1}"#),
         "#3037 yq: stderr={stderr:?}"
     );
+    Ok(())
+}
+
+// ============================================================================
+// #2889: a construction that merely *places* a bound node keeps its identity
+// ============================================================================
+
+/// Every row captured live from `/usr/bin/jq` 1.7.1, and every one refused
+/// (exit 5, `Invalid path expression`) before the embed table.
+///
+/// jq's `jv_identical` on a container is pointer equality and `. as $x`
+/// holds a reference to `.`'s own `jv`, so a construction that *places*
+/// that reference rather than copying it -- an object or array literal, an
+/// empty-right `+`/`*`, a `null` identity, a fold whose UPDATE returns its
+/// input, `add`/`min`/`max` of one element -- leaves `$x` naming the node
+/// it always named. Both halves are pinned: the `path($x)` read *and* the
+/// write (`=`, `|=`, `del`), since a write is where getting this wrong
+/// costs data rather than an answer.
+#[test]
+// jq filter literals like `{k:.}`/`{a:1}` are not formatting strings;
+// clippy cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
+    for (input, filter, want) in [
+        // Object and array literals: the node is placed, then navigated
+        // back out -- by key, by iterate, through two levels, and at a
+        // position other than the first.
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .[] | path($x)", r"[]"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | {k:{j:.}} | .k.j | path($x)",
+            r"[]",
+        ),
+        (r#"{"a":1}"#, r". as $x | [[.]] | .[0][0] | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.,.] | .[1] | path($x)", r"[]"),
+        (r"[1,2]", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        // Operators whose result *is* the left operand: jq's
+        // `jv_array_concat`/`jv_object_merge` iterate the right side, and
+        // `null + x` relocates.
+        (r#"{"a":1}"#, r". as $x | . + {} | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | . * {} | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | . + null | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | null + . | path($x)", r"[]"),
+        (r"[1,2]", r". as $x | . + [] | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.] + [] | .[0] | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [] + [.] | .[0] | path($x)", r"[]"),
+        // A fold whose UPDATE hands its accumulator straight back, with
+        // zero, one and two iterations, and both `reduce` and `foreach`.
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce empty as $i (.; .) | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce (1) as $i (.; .) | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce (1,2) as $i (.; .) | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | foreach (1) as $i (.; .) | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | foreach (1) as $i (.; .; .) | path($x)",
+            r"[]",
+        ),
+        // `add` folds `null + x`; `min`/`max` return the winning element
+        // itself. One element, so each is a pure relocation.
+        (r#"{"a":1}"#, r". as $x | [.] | add | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.] | min | path($x)", r"[]"),
+        (r#"{"a":1}"#, r". as $x | [.] | max | path($x)", r"[]"),
+        (r"[1,2]", r". as $x | [.] | add | path($x)", r"[]"),
+        // The write twins.
+        (
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | .k | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | del($x.a)", r"{}"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | . + {} | ($x.a) |= 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce empty as $i (.; .) | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | add | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | . + null | ($x.b) = 2",
+            r#"{"a":1,"b":2}"#,
+        ),
+        (r"[1,2]", r". as $x | . + [] | ($x[0]) = 9", r"[9,2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#2889: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#2889: `{filter}`");
+    }
+    Ok(())
+}
+
+/// The other direction, and the reason the embed table keys on *storage*
+/// rather than on value: a stage that genuinely rebuilds the node, or
+/// writes through a handle on it, must keep refusing exactly as it did
+/// before #2889 -- jq refuses every row here too (exit 5, `Invalid path
+/// expression`, captured live).
+///
+/// A write is what makes the two directions one mechanism: the binding's
+/// own reference is what forces `Rc::make_mut` to copy, so the moment
+/// anything writes through the embedded node the copy no longer shares the
+/// entry's storage and the witness declines -- the same event that makes
+/// jq's own refcount exceed one and copy there.
+#[test]
+// jq filter literals like `{a:1}` are not formatting strings; clippy
+// cannot tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_rebuilt_copies_still_refuse_2889() -> Result<()> {
+    for (input, filter) in [
+        // An equal-valued reconstruction is a different node.
+        (r#"{"a":1}"#, r". as $x | {a:1} | ($x.a) = 9"),
+        (r#"{"a":1}"#, r". as $x | {k:{a:1}} | .k | path($x)"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | {a:1} | path($x)"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce (1) as $i (.; {a:1}) | path($x)",
+        ),
+        (r#"{"a":1}"#, r". as $x | tojson | fromjson | path($x)"),
+        (r#"{"a":1}"#, r". as $x | [.[]] | path($x)"),
+        (r#"{"a":1}"#, r". as $x | with_entries(.) | path($x)"),
+        // A write through the embedded node copies it first.
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | .b = 2 | path($x)"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | .b = 2 | ($x.a) = 9"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | del(.a) | path($x)"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | .k | . + {} | .b = 2 | path($x)",
+        ),
+        (r#"{"a":1}"#, r". as $x | [.] | .[0] | .b = 2 | path($x)"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | reduce (1) as $i (.; .b = 2) | path($x)",
+        ),
+        (r#"{"a":1}"#, r". as $x | .a |= . | path($x)"),
+        // An *empty left* operand is a new container in jq too, so the
+        // empty-right short-circuit must stay asymmetric.
+        (r#"{"a":1}"#, r". as $x | {} + . | path($x)"),
+        (r"[1,2]", r". as $x | [] + . | path($x)"),
+        // A non-empty right operand computes a new container.
+        (r#"{"a":1}"#, r". as $x | . + {a:1} | path($x)"),
+        // Scalars are not `Rc`-backed, so they never enter the table -- a
+        // documented residual of #2889, and the safe direction (jq answers
+        // `[]` for both).
+        (r#""s""#, r". as $x | {k:.} | .k | path($x)"),
+        (r"5", r". as $x | {k:.} | .k | path($x)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2889: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#2889: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// yq mode is untouched by #2889, the same jq-only gate #3037's promotion
+/// takes: real yq's node model is #2643's business, and turning one of its
+/// refusals into a write with no oracle behind it is the corrupting
+/// direction (ADR-0018 -- the mode decides, never the input format).
+///
+/// Every row below was captured from the pre-#2889 binary and is
+/// reproduced byte for byte after it. The writes still refuse loudly; the
+/// `path()` reads -- which need `--jq-extensions`, since `path(f)` is not
+/// part of yq's own syntax (#1512) -- still answer nothing at all, which is
+/// exactly what they did before.
+#[test]
+fn test_owned_embed_yq_mode_unchanged_2889() -> Result<()> {
+    let yq = |extra: &[&str], filter: &str| -> Result<(String, String, i32)> {
+        let args: Vec<String> = extra
+            .iter()
+            .map(|a| (*a).to_string())
+            .chain(core::iter::once(filter.to_string()))
+            .collect();
+        let (output, code) = spawn_with_signal_retry(
+            || {
+                let mut cmd = Command::new(succinctly_bin());
+                cmd.arg("yq").args(&args);
+                cmd
+            },
+            Some(b"a: 1\n"),
+        )?;
+        Ok((
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            code,
+        ))
+    };
+    for filter in [
+        r". as $x | {k: .} | .k | ($x.a) = 9",
+        r". as $x | . + {} | ($x.a) |= 9",
+        r". as $x | {k: .} | .k | del($x.a)",
+    ] {
+        let (stdout, stderr, code) = yq(&[], filter)?;
+        assert_eq!(
+            code, 1,
+            "#2889 yq: `{filter}`: got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains(
+                r#"Invalid path expression near attempt to access element "a" of {"a":1}"#
+            ),
+            "#2889 yq: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    for filter in [
+        r". as $x | {k: .} | .k | path($x)",
+        r". as $x | . + {} | path($x)",
+    ] {
+        let (stdout, stderr, code) = yq(&["--jq-extensions"], filter)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 0),
+            "#2889 yq: `{filter}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 
