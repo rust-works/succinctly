@@ -159,7 +159,21 @@ pub(crate) fn for_each_warning(
         == Some(b'\n');
     let mut reader = Reader::new(bom, emit);
     reader.suppress_eof_warning = bom.malformed && ends_with_newline;
-    reader.run(indexed_stream_bytes(raw_bytes));
+    // jq refills its reader one file at a time, so each source after the
+    // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
+    // walk must reproduce (#3002). The offsets are the sources' absolute
+    // boundaries (the end of each but the last, i.e. the start of each
+    // subsequent one), matching `indexed_stream_bytes`'s undecorated
+    // numbering.
+    let mut boundaries = raw_bytes
+        .iter()
+        .scan(0usize, |end, (_, raw)| {
+            *end += raw.len();
+            Some(*end)
+        })
+        .collect::<Vec<usize>>();
+    boundaries.pop();
+    reader.run(indexed_stream_bytes(raw_bytes), &boundaries);
     // The same pass answers `--seq -s`'s EOF-location question; see
     // [`last_parse_error_offset`], which is this function with the
     // warnings thrown away.
@@ -177,11 +191,20 @@ pub(crate) fn for_each_warning(
 /// Ranges are into `bytes`, which must be the same UTF-8-normalized stream
 /// later handed to the materializer.  Diagnostics use the original bytes at
 /// their separate call site, so invalid UTF-8 retains jq's raw-byte columns.
-pub(crate) fn value_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+///
+/// `boundaries` are the absolute offsets into `bytes` at which each source
+/// after the first begins -- the cumulative lengths `build_seq_values`
+/// already records for its file remap -- so the walker can apply the
+/// malformed-BOM reset jq performs when it refills its own reader with the
+/// next file (#3002). A single already-concatenated buffer passes `&[]`.
+pub(crate) fn value_ranges(bytes: &[u8], boundaries: &[usize]) -> Vec<(usize, usize)> {
     let bom = bom_prefix_from(bytes.iter().copied());
     let mut ignore = |_: &str| {};
     let mut reader = Reader::new(bom, &mut ignore);
-    reader.run(bytes.iter().copied().enumerate().skip(bom.consumed));
+    reader.run(
+        bytes.iter().copied().enumerate().skip(bom.consumed),
+        boundaries,
+    );
     reader.values
 }
 
@@ -376,11 +399,33 @@ impl<'a> Reader<'a> {
         self.completed = None;
     }
 
-    fn run(&mut self, bytes: impl Iterator<Item = (usize, u8)>) {
+    /// Walk the stream's scanned bytes, applying the malformed-BOM
+    /// `parser_reset` jq runs at the top of every `jv_parser_next` where
+    /// this model already does (a value, a newline, an error).
+    ///
+    /// [`for_each_warning`] additionally hands over the absolute offsets at
+    /// which each source after the first begins: jq refills its reader one
+    /// *file* at a time, so a source boundary is another `jv_parser_next`,
+    /// and its reset wipes whatever survived the previous source's scan
+    /// (#3002) -- `EF BF` across two sources therefore vanishes where the
+    /// same bytes in one buffer fail (`EF BF` then `1E` cleanly starts a new
+    /// record, where `EF BF 1E` still reports `Truncated value`). Resetting
+    /// on the first scanned byte at or after the boundary covers it; a
+    /// boundary whose source yields no byte at all (an empty trailing file,
+    /// or content eaten wholesale by the BOM prefix) still cost jq that
+    /// refill, so its reset fires before the EOF branch instead.
+    fn run(&mut self, bytes: impl Iterator<Item = (usize, u8)>, boundaries: &[usize]) {
+        let mut boundary = 0;
         let mut eof_offset = 0;
         for (offset, ch) in bytes {
             self.offset = offset;
             eof_offset = offset + 1;
+            while boundary < boundaries.len() && boundaries[boundary] <= offset {
+                if self.resets_per_call {
+                    self.reset();
+                }
+                boundary += 1;
+            }
             if self.st == St::WaitingForRs {
                 if ch == b'\n' {
                     self.line += 1;
@@ -419,6 +464,17 @@ impl<'a> Reader<'a> {
                 }
             }
             self.produced_value = false;
+        }
+        // A boundary with no scanned byte at or after it (a trailing source
+        // that is empty or consumed wholesale by the BOM prefix) still cost
+        // jq the refill and its reset -- with a malformed BOM that wipes the
+        // pending token before the EOF branch can report on it, so an empty
+        // terminal source reads `EF BF` as nothing at all.
+        if self.resets_per_call {
+            while boundary < boundaries.len() {
+                self.reset();
+                boundary += 1;
+            }
         }
         self.offset = eof_offset;
         self.at_eof = true;
@@ -903,10 +959,13 @@ mod tests {
     /// a comma instead causes the same scan call to fail, so it is discarded.
     #[test]
     fn value_ranges_follow_jq_recovery_2653() {
-        assert_eq!(value_ranges(b"\x1e1 {invalid\n"), vec![(1, 2)]);
-        assert_eq!(value_ranges(b"\x1e1,2\n"), vec![(3, 4)]);
-        assert_eq!(value_ranges(b"\x1e1-2\n"), Vec::<(usize, usize)>::new());
-        assert_eq!(value_ranges(b"\x1e5-3 7\n"), vec![(5, 6)]);
+        assert_eq!(value_ranges(b"\x1e1 {invalid\n", &[]), vec![(1, 2)]);
+        assert_eq!(value_ranges(b"\x1e1,2\n", &[]), vec![(3, 4)]);
+        assert_eq!(
+            value_ranges(b"\x1e1-2\n", &[]),
+            Vec::<(usize, usize)>::new()
+        );
+        assert_eq!(value_ranges(b"\x1e5-3 7\n", &[]), vec![(5, 6)]);
     }
 
     /// Every message template, captured from `/usr/bin/jq` 1.7.1. The
@@ -1228,6 +1287,58 @@ mod tests {
                 "Invalid numeric literal at line 1, column 6 (need RS to resync)",
             ],
         );
+    }
+
+    /// #3002: the malformed-BOM `parser_reset` fires at every *source*
+    /// boundary too -- jq refills its reader one file at a time, and each
+    /// refill costs the same wipe the model already applies per value/
+    /// newline/error. A partial BOM like `EF BF` that fails mid-buffer
+    /// (`EF BF` then RS still reporting `Truncated value`) instead
+    /// vanishes when the RS byte opens the *next* source. All captured
+    /// from `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn malformed_bom_resets_at_source_boundaries_3002() {
+        // Headline: `EF BF` alone in the first source, RS opening the next
+        // -- no warning, where the same bytes in one buffer fail.
+        assert_eq!(warnings(&[b"\xef\xbf", b"\x1e"]), Vec::<String>::new());
+        // An empty trailing source still costs jq the refill and its reset.
+        assert_eq!(warnings(&[b"\xef\xbf", b""]), Vec::<String>::new());
+        // A boundary landing *inside* the still-undecided BOM prefix costs a reset
+        // too, but nothing has been scanned yet when it fires, so it's a no-op:
+        // `BF` is still scanned fresh as the first token of the stream, and the RS
+        // in the same source still truncates it -- identical to the single-buffer
+        // control below (confirmed live: jq 1.7.1 prints the same warning here).
+        assert_eq!(
+            warnings(&[b"\xef", b"\xbf\x1e"]),
+            ["Truncated value at line 1, column 2"]
+        );
+        // Control: the same bytes in one buffer still report the truncation.
+        assert_eq!(
+            warnings(&[b"\xef\xbf\x1e"]),
+            ["Truncated value at line 1, column 2"]
+        );
+        // Control: a *complete* BOM never sets `resets_per_call`, so a
+        // source boundary is not a wipe there -- matches one-file behavior.
+        assert_eq!(
+            warnings(&[b"\xef\xbb\xbf", b"\x1e]"]),
+            ["Unmatched ']' at line 1, column 2 (need RS to resync)"]
+        );
+    }
+
+    /// The same boundary reset belongs on the value walk: without it,
+    /// `EF BF`'s dangling `BF` deranges the next source's first record into
+    /// being dropped entirely -- `--seq -s '.'` over two sources `EF BF`
+    /// then `1 ` yields `[1]` in real jq and nothing in one buffer.
+    #[test]
+    fn malformed_bom_value_walk_resets_at_source_boundaries_3002() {
+        let a = b"\xef\xbf".to_vec();
+        let b = b"1 \n".to_vec();
+        let mut combined = a.clone();
+        combined.extend_from_slice(&b);
+        // Source `a`'s exclusive end is the boundary (`b` starts there).
+        assert_eq!(value_ranges(&combined, &[a.len()]), vec![(2, 3)]);
+        // Same bytes in one buffer: `BF` derails and the record is dropped.
+        assert_eq!(value_ranges(&combined, &[]), Vec::<(usize, usize)>::new());
     }
 
     /// One leading BOM is consumed without advancing the column, and only

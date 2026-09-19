@@ -5628,7 +5628,13 @@ fn build_seq_values(
     slurp: bool,
 ) -> Vec<OwnedValue> {
     let (combined, file_ends) = concat_with_file_ends(raw_inputs);
-    let parsed = parse_json_seq_with_ends(&combined);
+    // The file remap's cumulative ends double as the sequence reader's
+    // source boundaries: each is the absolute offset where the next file
+    // begins in `combined`, so a malformed BOM under which jq refills and
+    // resets at each file boundary is reproduced in the value walk too
+    // (#3002). The last entry is the stream's own end, not a boundary.
+    let parsed =
+        parse_json_seq_with_ends(&combined, &file_ends[..file_ends.len().saturating_sub(1)]);
 
     if !slurp {
         remap_ends_to_locations(
@@ -5854,8 +5860,8 @@ fn remap_ends_to_locations(
 /// failure mode -- but only for content that's actually malformed, not for
 /// a shape jq itself accepts) was a real, jq-observable divergence, not a
 /// spelling nit.
-fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
-    crate::jq_seq_reader::value_ranges(s.as_bytes())
+fn parse_json_seq_with_ends(s: &str, boundaries: &[usize]) -> Vec<(OwnedValue, usize)> {
+    crate::jq_seq_reader::value_ranges(s.as_bytes(), boundaries)
         .into_iter()
         .filter_map(|(start, end)| {
             // #2295: the sequence reader already checks the grammar, but
@@ -9399,7 +9405,7 @@ mod tests {
     /// of accepting it the way real jq does.
     #[test]
     fn test_parse_json_seq_tolerates_leading_zero_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E007e5\n")
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E007e5\n", &[])
             .into_iter()
             .map(|(v, _)| v)
             .collect();
@@ -9412,7 +9418,7 @@ mod tests {
     /// leading-zero retry.
     #[test]
     fn test_parse_json_seq_still_drops_genuine_malformed_record_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E{invalid\n\x1E5\n")
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E{invalid\n\x1E5\n", &[])
             .into_iter()
             .map(|(v, _)| v)
             .collect();
@@ -9428,7 +9434,7 @@ mod tests {
     /// primary document input already produces for it.
     #[test]
     fn test_parse_json_seq_accepts_magnitude_overflowing_number_1267() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E1e400\n")
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E1e400\n", &[])
             .into_iter()
             .map(|(v, _)| v)
             .collect();
