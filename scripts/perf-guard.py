@@ -77,7 +77,12 @@ exercised either.
 Fixtures are generated fresh each run (`succinctly json generate --seed
 <fixed>`) rather than checked in, so instruction counts stay meaningful
 without growing the repo -- generation is deterministic per pattern/seed, so
-the *content* measured is stable run to run.
+the *content* measured is stable run to run. Two rows (`users_compact_identity`
+/`users_compact_latefail`, #2608) are derived rather than generated directly:
+`measure_all` runs the binary under test over the base `users`/2mb fixture
+(`jq -c .`) to get a self-certified canonical compact fixture, then, for the
+latefail twin, applies one raw byte edit duplicating the last object's last
+member -- see `measure_all` and `inject_duplicate_last_member`.
 
 Known scope limits, deliberate for this minimum-viable-set v1 rather than
 oversights -- worth revisiting once this guard has a track record:
@@ -186,7 +191,44 @@ QUERIES = [
     # above -- `users_yq_keys_unsorted` is this matrix's only yq row and it
     # only reads.
     ("users_yq_del_select", "users", "2mb", "yq", "del(.users[] | select(.score < 100))"),
+    # #2608: compact (`-c`) rows. Every row above runs pretty-printed output
+    # (no row passes `-c`/`--tab`/`--indent`), so none of them ever reaches
+    # `stream_json`'s canonical-compact echo fast path at all -- it is gated
+    # on `indent.is_compact()` -- the same "this guard cannot see a shape it
+    # does not run" blind spot #2655's own comment above calls out for the
+    # write/path machinery. `QUERY_FLAGS` below carries the `-c` these two
+    # rows need; `measure_all` derives their fixtures from the base
+    # `users`/2mb fixture rather than generating them directly (see its own
+    # comment). `users_compact_identity` runs `-c .` over a fixture that is
+    # *already* canonical compact jq output (self-certified by round-tripping
+    # the base fixture through this run's own binary), so the whole document
+    # is echoed verbatim instead of re-rendered -- a regression here is
+    # either the echo silently ceasing to fire (same output, far more work)
+    # or the scan itself growing slower. `users_compact_latefail` is its
+    # twin: the same fixture with one byte-edited duplicate of the very last
+    # user object's last member, so the canonical scan walks the *entire*
+    # document before failing at that last object, then pays the ordinary
+    # re-render on top -- the gate's own precheck cost, worst-cased. Measured
+    # against the PR's own merge-base (`--baseline-binary`, #1582; 7950X
+    # callgrind, a 7MB `{"data":[...]}` fixture of the same record shape as
+    # the 2MB `users` fixture here): `users_compact_identity` ~-66% Ir (the
+    # walk disappears entirely), `users_compact_latefail` ~+13% Ir (full
+    # scan, then full re-render).
+    ("users_compact_identity", "users", "2mb", "jq", "."),
+    ("users_compact_latefail", "users", "2mb", "jq", "."),
 ]
+
+# Per-query extra CLI flags, inserted between the mode (`jq`/`yq`) and the
+# filter expression -- e.g. `succinctly jq -c . fixture.json`. A parallel dict
+# rather than a sixth `QUERIES` element: every existing row above stays a
+# plain 5-tuple with unchanged unpacking and unchanged behaviour (no flags),
+# and `measure_all`'s command construction stays a single obvious
+# `[binary, mode, *flags, filter_expr, fixture_path]` regardless of whether a
+# given row uses this dict at all (#2608).
+QUERY_FLAGS = {
+    "users_compact_identity": ["-c"],
+    "users_compact_latefail": ["-c"],
+}
 
 IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
 
@@ -280,6 +322,24 @@ DEFAULT_THRESHOLD = 5.0
 # entries above already cover them: #3009 moves them past the 5% default
 # too. So #3077 must not remove those two until `main` carries #3009 as
 # well, or they fail at the default -- #3161 records the coupling.
+#
+# `users_compact_identity` (#2608): faster on both architectures, measured
+# against the PR's own merge-base (~-66% Ir, see the `QUERIES` comment
+# above). Unlike the entries above, this one is not simply a one-off to
+# remove the moment it's added: the drift comes from comparing a binary
+# *with* the canonical-compact echo fast path against a merge-base
+# *without* it, which is exactly what every `--baseline-binary` run does
+# on every PR/push until `main` itself carries #2608. 75% clears the
+# measured number with headroom. Remove only once `main` has moved past
+# #2608, per the rule above -- from that point on the merge-base always
+# includes the echo path too and this row reads ~0% again like every other
+# row.
+#
+# `users_compact_latefail` (#2608): slower on both architectures, measured
+# the same way (~+13% Ir) -- the gate's own precheck cost, paid in full
+# (a walk of the whole document) before falling back to the unchanged
+# re-render. 20% clears the measured number with headroom. Remove once
+# `main` has moved past #2608, per the rule above.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_del_select": 20.0,
@@ -287,6 +347,8 @@ QUERY_THRESHOLDS = {
     "users_yq_del_select": 12.0,
     "users_identity": 12.0,
     "users_assign_scores": 12.0,
+    "users_compact_identity": 75.0,
+    "users_compact_latefail": 20.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
@@ -363,14 +425,67 @@ def generate_fixture(binary, pattern, size, seed, out_path):
         sys.exit(f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}")
 
 
-def run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path):
+def generate_compact_fixture(binary, source_path, out_path):
+    """Canonicalizes `source_path` into compact jq output by running the
+    binary under test over it (`jq -c .`), rather than assuming the
+    generator's own formatting already matches that binary's writer byte for
+    byte -- self-certifying, and deterministic given a fixed source file
+    (#2608). This is what makes `users_compact_identity` reach
+    `stream_json`'s canonical-compact echo fast path: the fast path only
+    fires when the span it's about to write is *exactly* what this same
+    write path would have produced anyway."""
+    cmd = [binary, "jq", "-c", ".", source_path]
+    with open(out_path, "wb") as out:
+        result = subprocess.run(cmd, stdout=out, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        sys.exit(
+            f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+
+
+def inject_duplicate_last_member(compact_path, out_path):
+    """Byte-edits `compact_path` (expected to end `...}]}`, i.e. a top-level
+    `{"users":[...]}` document) into `users_compact_latefail`'s twin: the
+    last user object's last member (`"score":N`, no decoding involved) is
+    duplicated immediately before that object's own closing `}` --
+    `{"...,"score":5}]}` -> `{...,"score":5,"score":5}]}`. Deliberately raw
+    bytes, not a JSON parse -- the fixture this runs on is already known-
+    canonical compact `users` output (`generate_compact_fixture`), so its
+    shape is fixed and a byte search is both simpler and cannot itself
+    perturb the very spelling `users_compact_identity`'s twin needs to stay
+    unchanged (#2608). A duplicate key is syntactically legal JSON (jq's own
+    "last value wins" semantics apply on re-render), so the result still
+    round-trips -- it is only *not certifiable as canonical*, which is the
+    point: `canonical_compact_jq_span_end`'s duplicate-key check rejects it
+    only once it reaches this last object, after walking every one before
+    it."""
+    with open(compact_path, "rb") as f:
+        data = f.read()
+    tail = b"}]}"
+    close_brace = data.rfind(tail)
+    if close_brace == -1:
+        sys.exit(
+            f"{compact_path}: expected a '{tail.decode()}' tail (top-level "
+            f"{{\"users\":[...]}} document) -- unexpected users-fixture shape"
+        )
+    comma = data.rfind(b",", 0, close_brace)
+    if comma == -1:
+        sys.exit(f"{compact_path}: no comma found before the last object's closing brace")
+    last_member = data[comma + 1:close_brace]
+    new_data = data[:close_brace] + b"," + last_member + data[close_brace:]
+    with open(out_path, "wb") as f:
+        f.write(new_data)
+
+
+def run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_path):
     with tempfile.TemporaryDirectory() as tmp:
         log = os.path.join(tmp, "cg.log")
         cg_out = os.path.join(tmp, "cg.out")
         cmd = [
             valgrind_bin, "--tool=cachegrind", f"--log-file={log}",
             f"--cachegrind-out-file={cg_out}",
-            binary, mode, filter_expr, fixture_path,
+            binary, mode, *flags, filter_expr, fixture_path,
         ]
         # `--log-file` captures valgrind's own diagnostics; the *traced*
         # binary's stderr is separate and captured too (not discarded) so a
@@ -405,9 +520,9 @@ def run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path):
         return int(m.group(1).replace(",", ""))
 
 
-def measure_query(valgrind_bin, binary, mode, filter_expr, fixture_path, reps):
+def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
     counts = [
-        run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path)
+        run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_path)
         for _ in range(reps)
     ]
     # `statistics.median` returns a float for an even-length input (the
@@ -438,12 +553,30 @@ def measure_all(binary, valgrind_bin, reps, label="binary"):
                 generate_fixture(binary, pattern, size, FIXTURE_SEED, path)
                 fixture_paths[shape] = path
 
+        # #2608: `users_compact_identity`/`users_compact_latefail` don't read
+        # a generated fixture directly -- they're derived from the base
+        # `users`/2mb one above, using this run's own `binary` (so a fixture
+        # measured against `--baseline-binary` is canonicalized by *that*
+        # binary's writer, not this run's, keeping each `measure_all` call
+        # self-consistent the same way its own fixture generation already is).
+        derived_fixture_paths = {}
+        if ("users", "2mb") in fixture_paths:
+            base = fixture_paths[("users", "2mb")]
+            compact_path = os.path.join(tmp, "users_2mb_compact.json")
+            generate_compact_fixture(binary, base, compact_path)
+            derived_fixture_paths["users_compact_identity"] = compact_path
+            latefail_path = os.path.join(tmp, "users_2mb_compact_latefail.json")
+            inject_duplicate_last_member(compact_path, latefail_path)
+            derived_fixture_paths["users_compact_latefail"] = latefail_path
+
         measured = {}
         print(f"Measuring {label} ({binary}):")
         print(f"{'query':<26} {'instructions':>16}")
         print("-" * 44)
         for query_id, pattern, size, mode, filter_expr in QUERIES:
-            ir = measure_query(valgrind_bin, binary, mode, filter_expr, fixture_paths[(pattern, size)], reps)
+            fixture_path = derived_fixture_paths.get(query_id, fixture_paths[(pattern, size)])
+            flags = QUERY_FLAGS.get(query_id, [])
+            ir = measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps)
             measured[query_id] = ir
             print(f"{query_id:<26} {ir:>16,.0f}")
             sys.stdout.flush()
