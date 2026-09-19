@@ -364,6 +364,51 @@ succinctly jq-locate file.json --offset 42 --format json
 
 ---
 
+### Canonical Compact Echo (`-c`, #2608)
+
+For a compact (`-c`), unsorted, default-convention (`JsonConvention::JqCompat`) render, the `// #2608:` block in `JsonCursor::stream_json` (`src/json/light.rs`) first tries to echo the node's source span verbatim instead of re-rendering it through `stream_json_pretty`. A span is echoed only once a strict single-pass scan, `canonical_compact_jq_span_end` (built from `scan_canonical_value`, `scan_json_string_span`, and `scan_canonical_object`), certifies that it is *exactly* what the node-by-node re-render would emit — no whitespace, every number already in jq's canonical spelling (`is_jq_canonical_number`), every string already in jq's escape table's canonical form (no `\/`, no uppercase hex or `\u00XX` escape for a codepoint that has a short-form escape or is otherwise printable, raw DEL rejected), and no repeated key in any object — and `core::str::from_utf8` then rules on the span's UTF-8 validity in one vectorised pass. Any failure of either half falls through to the unchanged re-render, so bailing is always safe: the scan doubles as the structural validation the re-render otherwise supplies (a stray comma, missing colon, or bareword has no legal token at the position the grammar expects one).
+
+The scan finds the value's own end, so the echo stops exactly at the node — the file's trailing newline, a following top-level document, and `.[]`'s next sibling are never included — and a `debug_assert_eq!` against `text_range` pins that on every accepted span through the 2,000-document fuzz sweep (`is_canonical_compact_jq_span_fuzz_2608`). `JsonIndex::build` does not itself validate UTF-8 (only the CLI's `utf8_lossy_document` substitutes invalid input before indexing), which is why the UTF-8 half must fall through rather than error. `-a`/`--ascii-output` never reaches this method at all — its callers route around `stream_json` — and `--preserve-input` keeps its own, older verbatim path (the branch immediately above the `#2608` block).
+
+Safety argument and tests: `canonical_compact_jq_span_end`'s own doc comment, plus `is_canonical_compact_jq_span_agrees_with_rerender_2608`, `is_canonical_compact_jq_span_fuzz_2608`, `canonical_echo_stops_at_the_value_end_2608` (`src/json/light.rs`) and `test_canonical_compact_echo_declines_non_canonical_spans_2608`, `test_canonical_echo_stops_at_the_root_value_2608`, `test_invalid_utf8_in_string_survives_the_echo_gate_2608`, `test_ascii_output_still_escapes_through_new_echo_gate_2608` (`tests/jq_cli_tests.rs`).
+
+**Why it pays.** Callgrind on the 7950X, `-c .` on a canonical 7,085,880-byte `{"data":[records]}` document, before this work: the re-render spends 58.5% of its instructions walking the semi-index (`text_position`/select 19.8%, BP `find_close`/`uncons` 27.2%, the duplicate-key census 10.1% — `collapsed_fields_checked` walks every object field once to census keys and the printer walks it again — gap checks 1.4%), 21.3% on index build and input read, 9.0% on per-string scanning plus `from_utf8` re-validation, 7.1% on the inlined render driver, and only 3.8% on `String` appends and copies. Any design that keeps the walk can remove at most ~7.9%. The echo removes the walk entirely: in the accepting profile, `stream_json_pretty`, `find_close`, `text_position`, `census`, and `key_hash_of` are absent.
+
+**Gate cost per input byte** (7950X, callgrind exclusive, same document):
+
+| Component                                                                             | PR #2919 as reviewed | After dropping the `text_range` rescan | Final (UTF-8 ruled on once) |
+|---------------------------------------------------------------------------------------|----------------------|----------------------------------------|-----------------------------|
+| `JsonCursor::text_range` linear rescan for the closing bracket (inside `raw_bytes()`) | 9.23                 | 0                                      | 0                           |
+| `scan_canonical_value`                                                                | 12.36                | 12.36                                  | 12.32                       |
+| `scan_json_string_span`                                                               | 11.17                | 11.17                                  | 10.54                       |
+| `core::str::from_utf8` on the accepted span                                           | 0.44                 | 0.44                                   | 0.44                        |
+| copy out                                                                              | 0.02                 | 0.02                                   | 0.02                        |
+| **total**                                                                             | **33.2**             | **24.0**                               | **23.3**                    |
+
+The echo itself is free; everything the gate costs is spent deciding whether it may echo. The first draft called `raw_bytes()`, whose `text_range` walks the whole container a second time just to find the closing bracket the scan is about to reach anyway — 28% of the gate. Moving UTF-8 validation out of the scan's string arm (it decoded every byte ≥ 0x80 through `decode_code_point`) bought only 0.63 Ir/byte on this near-ASCII corpus; the byte-at-a-time loop, not the decode, is the string arm's cost.
+
+**Results**, interleaved wall-clock vs `main` (no gate), min / median, 9 reps, control floor ±2–4% (measured 2026-09-19 on `terminus` = AMD Ryzen 9 7950X and `johns-mac-mini` = Apple M4 Pro):
+
+| Row                                                      | 7950X             | M4 Pro            |
+|----------------------------------------------------------|-------------------|-------------------|
+| `-c .` data 10 MB (canonical)                            | −68.4% / −68.3%   | −71.6% / −71.7%   |
+| `-c .data` data 10 MB                                    | −68.2% / −68.0%   | −71.3% / −71.3%   |
+| `-c .` arrays 10 MB                                      | −71.7% / −71.6%   | −73.7% / −73.7%   |
+| `-c .` wide 2 MB (one object, 136k keys)                 | −49.1% / −48.8%   | −47.9% / −48.1%   |
+| `-c .` users 2 MB                                        | −64.3% / −63.6%   | −60.1% / −60.4%   |
+| `-c .` late-fail twin (duplicate key in the last record) | **+7.7% / +7.7%** | **+8.8% / +9.5%** |
+| `-c .` early-fail twin (`1e2` in the first record)       | +0.9% / +0.5%     | +2.4% / +1.6%     |
+| pretty `.` (never reaches the gate)                      | +0.3% / +1.1%     | +0.9% / +0.9%     |
+| `-c --preserve-input .`                                  | −1.1% / −2.2%     | 0.0% / 0.0%       |
+
+The late-fail twin is the precheck-cost control CLAUDE.md's O6/#1514 lesson calls for: the whole scan is charged and the whole re-render still runs afterward. It started at +12.7% (7950X) / +13.8% (M4 Pro) with the reviewed PR, and the two changes above (dropping the `text_range` rescan, moving UTF-8 validation out of the string scan) took it to +7.7% / +8.8%; the residual gate (23.3 Ir/byte against the re-render's ~253 Ir/byte on that row) predicts +9.2%, which matches. A document that fails early — the common non-canonical case, e.g. pretty-printed input fails at its first whitespace — pays only the early-fail row's +1–2%.
+
+**Rejected: SIMD-skipping a string's plain bytes.** A jq-table `define_escape_scanner!` instantiation (`"`, `\`, `< 0x20`, DEL) plus #2963's 8-byte word probe cut `scan_json_string_span` from 10.54 to 7.02 Ir/byte (−33% on that arm, −4.8% Ir on the whole run on the 7950X), and *regressed wall-clock on both boxes*: data 10 MB +8.5%/+9.4% (M4 Pro, reproduced twice), +2.9%/+9.0% (7950X); users 2 MB +3.5–5.6% / +0.4–3.4%; the late-fail row it existed to help got worse (+1.5–3.0%); and the pretty row moved +3.0%/+4.4% on the 7950X on identical instruction counts. The strings in these fixtures are 4–12 bytes, below the width where a NEON/AVX compare→movemask→GPR round trip beats a short scalar loop (#2963), with a code-layout band on top — the two mechanisms were never separated with a holdout build. Reverted (commit `c74f11a66`, not on this branch).
+
+**Follow-ups (reported, not built):** on a numbers-only document (`arrays` 10 MB, 6,291,458 bytes) `scan_canonical_value` is 48.0 Ir/byte and 42% of the whole run, all in the inlined `nested_number_span` + `is_jq_canonical_number` — an arrays-shaped late failure would pay far more than the +7.7% above. On `wide` 2 MB the >16-key `KeyHashes::insert` tier costs 5.4 Ir/byte, 18% of the gate, while the ≤16-key pairwise fingerprint scan is invisible on record-shaped documents.
+
+---
+
 ## Optimisation Techniques Used
 
 | Technique            | Document                                                       | Application             |
