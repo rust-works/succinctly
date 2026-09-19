@@ -61243,15 +61243,25 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
     Ok(())
 }
 
-/// The agree-to-refuse flips this fix makes, each a materialized
-/// passthrough on the `eval.rs` route: the stage hands its input on as an
-/// owned copy, which is the same node to jq's `jv` and a fresh document to
-/// `eval.rs`. Every one is the in-evaluator twin of a shape already in
-/// `test_tracked_var_owned_embed_residual_refuses_cleanly_2642` (the generic
-/// evaluator has refused them since #2642), recorded in
-/// `docs/compliance/jq/limitations.md`; a row here answering `[]` again
-/// would be a genuine recovery, not a bug, so it is pinned as refuse-only
-/// rather than asserted to error forever.
+/// What is left of #3036's agree-to-refuse flips on the `eval.rs` route
+/// after #2889 Stage B: a marker used inside a fold's own UPDATE, whether it
+/// names the accumulator (`reduce (.) as $x`) or was bound outside the fold
+/// entirely (`. as $x | reduce (1) as $i`).
+///
+/// The rest of this list -- the embedding constructions (`[.] | .[0]`,
+/// `{k:.} | .k`, `reduce empty as $i (.; .)`, each `| path($x)`) and the
+/// owned-copy passthroughs (`getpath([])`, `nth(0; .)`, `until(true; .)`,
+/// `ltrimstr("x")`, `try error($x) catch path($x)`) -- is recovered and
+/// asserted to *answer* in
+/// `test_owned_embed_keeps_node_identity_on_the_input_bridge_2889`.
+///
+/// These rows stay because `reduce_forks`/`foreach_forks` demote their static
+/// operand once for a whole run rather than per step, deliberately: per-step
+/// rerooting costs +3% (#3036), so `Reentry::witnessed_by` is applied at the
+/// two owned re-entries and *not* at the fold hoists (#2889). They are recorded
+/// in `docs/compliance/jq/limitations.md`; a row here answering again would
+/// be a genuine recovery, not a bug, so it is pinned as refuse-only rather
+/// than asserted to error forever.
 #[test]
 // jq filter literals like `{k:.}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -61261,50 +61271,22 @@ fn test_tracked_var_in_evaluator_passthrough_residual_refuses_cleanly_3036() -> 
         (
             &["-n", "-c"][..],
             r#"{"a":1}"#,
-            "input | . as $x | [.] | .[0] | path($x)",
-        ),
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | . as $x | {k:.} | .k | path($x)",
-        ),
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | . as $x | reduce empty as $i (.; .) | path($x)",
-        ),
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
             "input | reduce (.) as $x (.; ($x.a = 9))",
         ),
         (
             &["-n", "-c"][..],
             r#"{"a":1}"#,
-            "input | . as $x | try error($x) catch path($x)",
-        ),
-        // A stage that returns its input as an owned copy on the `eval.rs`
-        // route: jq keeps the `jv`, succinctly cannot tell the copy from a
-        // rebuild.
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            "input | . as $x | getpath([]) | ($x.a = 9)",
+            "input | foreach (.) as $x (.; ($x.a = 9))",
         ),
         (
             &["-n", "-c"][..],
             r#"{"a":1}"#,
-            "input | . as $x | nth(0; .) | ($x.a = 9)",
+            "input | reduce (.) as $x (.; path($x))",
         ),
         (
             &["-n", "-c"][..],
             r#"{"a":1}"#,
-            "input | . as $x | until(true; .) | ($x.a = 9)",
-        ),
-        (
-            &["-n", "-c"][..],
-            r#"{"a":1}"#,
-            r#"input | . as $x | ltrimstr("x") | ($x.a = 9)"#,
+            "input | . as $x | reduce (1) as $i (.; ($x.a = 9))",
         ),
     ] {
         let mut argv: Vec<&str> = args.to_vec();
@@ -61805,6 +61787,170 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "#2889: `{filter}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), want, "#2889: `{filter}`");
+    }
+    Ok(())
+}
+
+/// #2889 Stage B: the same identities, on the `eval.rs` route.
+///
+/// A filter that mentions `input`/`inputs`/`input_line_number` is evaluated
+/// by `eval.rs` rather than the generic evaluator (the input-queue bridge,
+/// #1504), and `input`'s document arrives as a bare `OwnedValue` that an
+/// owned re-entry re-indexes into a *throwaway* document. `eval.rs`'s own
+/// bind sites minted no node for a value bound out of that document, so
+/// every marker they built was demoted at the next re-entry and each row
+/// below refused -- while the identical filter without `input` already
+/// answered (Stage A). The two routes now agree with each other and with
+/// jq 1.7.1, from which every `want` here was captured live.
+///
+/// The last two rows are the navigated-bind twin (`.a as $y`, #3037's
+/// promotion): the node named is a *child* of the re-indexed root, which is
+/// what proves the mint is the cursor's own node rather than "the root of
+/// whatever document we just built".
+#[test]
+// jq filter literals like `{k:.}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_keeps_node_identity_on_the_input_bridge_2889() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | {k:.} | .k | path($x)",
+            r"[]",
+        ),
+        (r#"{"a":1}"#, r"input | . as $x | . + {} | path($x)", r"[]"),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | reduce empty as $i (.; .) | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | [.] | .[0] | path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | {k:.} | .k | ($x.a) = 9",
+            r#"{"a":9}"#,
+        ),
+        // The navigated bind, read and written.
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a as $y | {k:.a} | .k | path($y)",
+            r"[]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"input | .a as $y | {k:.a} | .k | ($y.b) = 9",
+            r#"{"b":9}"#,
+        ),
+        // Stages that hand their input straight back rather than embedding
+        // it. These need no embed *entry* to be found by a materializer --
+        // the value never leaves the binding's own `Rc` -- only a witness at
+        // the owned re-entry that now looks (`Reentry::witnessed_by`, applied
+        // to `eval_owned_input`/`eval_owned_expr_full` by Stage B as well as
+        // to the lazy `eval_each_owned` by Stage A).
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | try error($x) catch path($x)",
+            r"[]",
+        ),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | getpath([]) | ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | nth(0; .) | ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | until(true; .) | ($x.a = 9)",
+            r#"{"a":9}"#,
+        ),
+        (
+            r#"{"a":1}"#,
+            r#"input | . as $x | ltrimstr("x") | ($x.a = 9)"#,
+            r#"{"a":9}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#2889 Stage B: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#2889 Stage B: `{filter}`");
+    }
+    Ok(())
+}
+
+/// The refusals #2889 Stage B deliberately leaves in place on the `eval.rs`
+/// route, each captured against jq 1.7.1 as an *acceptance* there -- pinned
+/// so a later change that recovers one is noticed rather than silently
+/// widening the surface, and so the ones that must never move are guarded.
+///
+/// - A marker naming a *sibling* of the written node must keep refusing:
+///   jq refuses it too (`Invalid path expression near attempt to access
+///   element "b" of {"b":1}`), and this is the row that would turn a
+///   node-identity bug into a write to the wrong place.
+/// - A cross-bridge marker -- bound before `input` runs, or used after it --
+///   refuses in jq as well, because `-n` makes `.` `null` at the bind and
+///   `input`'s own output is what the later stage sees.
+/// - `input | .a as $y | .a | ($y.b) = 9` is one jq *accepts* and this still
+///   refuses: the bind and the use are both plain cursor navigations with no
+///   owned re-entry between them, so no embed entry is ever consulted. It
+///   refused identically before Stage B.
+/// - An empty container binds no node on this route at all: `eval.rs`
+///   recovers a value's cursor by hopping `parent()` from the child its
+///   `StandardJson` retains, and `{}`/`[]` retain none. The generic
+///   evaluator, which is handed a real cursor, does answer these -- the one
+///   place the two routes still disagree, and in the safe direction.
+/// - `[... | path($x)]` and `... | getpath([]) | path($x)` put a further
+///   re-entry between the embed and the read, which carries no witness.
+#[test]
+// jq filter literals are not formatting strings.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
+    for (input, filter) in [
+        // jq refuses these two as well.
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"input | .a as $y | .c | ($y.b) = 9",
+        ),
+        (r#"{"a":1}"#, r". as $x | input | ($x.a) = 9"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | .k | input | path($x)"),
+        (r#"{"a":1}"#, r"input | . as $x | {a:1} | ($x.a) = 9"),
+        // jq accepts this one; a documented residual, unchanged by Stage B.
+        (
+            r#"{"a":{"b":1},"c":{"b":1}}"#,
+            r"input | .a as $y | .a | ($y.b) = 9",
+        ),
+        // An *empty* container has no retained child cursor for
+        // `whole_container_cursor` to hop from, so the bind names no node
+        // and the table stays empty. jq answers `[]`; the generic evaluator
+        // (which carries a real cursor rather than recovering one) answers
+        // it too, so this is the one place the two routes still differ.
+        (r"{}", r"input | . as $x | {k:.} | .k | path($x)"),
+        (r"[]", r"input | . as $x | {k:.} | .k | path($x)"),
+        // Collecting the pipe into an array, or passing the embedded node
+        // through `getpath([])` first, puts a re-entry between the embed and
+        // the read that carries no witness. jq answers both; the bare twins
+        // of both are recovered above.
+        (r#"{"a":1}"#, r"[input | . as $x | {k:.} | .k | path($x)]"),
+        (
+            r#"{"a":1}"#,
+            r"input | . as $x | {k:.} | .k | getpath([]) | path($x)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#2889 Stage B: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#2889 Stage B: `{filter}` -- stderr: {stderr:?}"
+        );
     }
     Ok(())
 }
