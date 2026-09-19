@@ -4014,7 +4014,14 @@ per-path), and the trailer. The pre-#2703 `jq: module error: parse error in modu
   function of its bison parse state, and a single `ParseError` reason cannot reproduce it:
   `1 +` and `."` are both "end of input" to our parser, but jq distinguishes them, appending
   a `QQSTRING_TEXT or …` expect-list to the latter. Reproducing it needs reading jq's C
-  parser source (`parser.y`/`scanner.l`) or a much wider oracle sweep than #2703 did.
+  parser source (`parser.y`/`scanner.l`) or a much wider oracle sweep than #2703 did. One
+  intended exception: the `$__loc__`-as-binding-name rejection (#3029) replicates jq's wording
+  for those productions exactly — `syntax error, unexpected $__loc__, expecting IDENT or
+  BINDING` for a `def` `$`-param and `… expecting BINDING or '[' or '{'` for `as`/`reduce`/
+  `foreach`/destructuring/`?//`, bare `unexpected $__loc__` for the `{$__loc__}`/`{$__loc__:
+  Pattern}` shorthand — because it is a single, closed production family whose bison messages
+  were captured live from jq 1.7.1 rather than guessed; it still omits the
+  `(Unix shell quoting issues?)` suffix, as every other error here does.
 - **The echoed line's trailing padding is the column rule, not a fixed formula.** jq's own
   `locfile_locate` `%*s` width is not formula-derived (probing `1 +`, `[1,]`, `def f: ;`,
   `1 2`, `if then`, `?` gives no consistent rule); the reporter points at the error column

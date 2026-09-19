@@ -1806,6 +1806,46 @@ impl<'a> Parser<'a> {
     /// name, the 1-based source line the `$` itself started on (only
     /// object-construction's `$__loc__` case uses it), and whether a `:`
     /// follows.
+    /// #3029: `$__loc__` cannot be used as a *binding* name in jq. It is
+    /// lexed as its own pseudo-variable token, not `'$' IDENT`, so every
+    /// binding production is a syntax error in jq 1.7.1 (confirmed live:
+    /// `def h($__loc__): 1; h(1)` → `syntax error, unexpected $__loc__,
+    /// expecting IDENT or BINDING`, `1 as $__loc__ | $__loc__` → `syntax
+    /// error, unexpected $__loc__, expecting BINDING or '[' or '{'`, and the
+    /// `{$__loc__}`/`{$__loc__: Pattern}` shorthand forms report a bare
+    /// `unexpected $__loc__` with no expecting list -- all exit 3). Real yq
+    /// v4.53.3 instead accepts it as an ordinary binding (`1 as $__loc__ |
+    /// 2` → `2`, confirmed live), so the reject is gated to jq mode.
+    ///
+    /// One definition for every binding site (a `def` `$`-param, the primary
+    /// `$var` pattern, and the object-pattern shorthand) is deliberate: the
+    /// "duplicated predicates diverge silently" lesson of #106/#2728. Sites
+    /// that take a name in *value* position (`{$__loc__}` construction, the
+    /// primary `$var` dispatch) must not go through `dollar_var_expr`'s own
+    /// competing rule un-annotated; this helper is only for binders.
+    ///
+    /// `expecting` is jq's bison lookahead list for that specific production
+    /// (`None` for the shorthand forms); `sigil_offset` is the byte position
+    /// of the `$` that started the name, so the error points at the sigil the
+    /// way jq's column does rather than at a byte already past it.
+    fn reject_loc_as_binding_name(
+        &self,
+        name: &str,
+        expecting: Option<&str>,
+        sigil_offset: usize,
+    ) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Jq && name == "__loc__" {
+            let message = match expecting {
+                Some(expecting) => {
+                    format!("syntax error, unexpected $__loc__, expecting {expecting}")
+                }
+                None => "syntax error, unexpected $__loc__".to_string(),
+            };
+            return Err(ParseError::new(message, sigil_offset));
+        }
+        Ok(())
+    }
+
     fn parse_dollar_name(&mut self) -> Result<(String, usize, bool), ParseError> {
         let line = self.current_line();
         self.next();
@@ -3249,8 +3289,14 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some('$') => {
                 // Simple variable: $var
+                let sigil_offset = self.pos;
                 self.next();
                 let name = self.parse_ident()?;
+                self.reject_loc_as_binding_name(
+                    &name,
+                    Some("BINDING or '[' or '{'"),
+                    sigil_offset,
+                )?;
                 Ok(Pattern::Var(name))
             }
             Some('{') => {
@@ -3307,7 +3353,9 @@ impl<'a> Parser<'a> {
                     // shared with `parse_object_construction`'s own `{$a}`/
                     // `{$a: expr}` lookahead (#2724) via `parse_dollar_name`.
                     if self.peek() == Some('$') {
+                        let sigil_offset = self.pos;
                         let (name, _line, has_colon) = self.parse_dollar_name()?;
+                        self.reject_loc_as_binding_name(&name, None, sigil_offset)?;
                         if has_colon {
                             self.next();
                             self.skip_ws();
@@ -3551,10 +3599,14 @@ impl<'a> Parser<'a> {
             loop {
                 // Parameters can be $var or just var
                 let is_dollar = self.peek() == Some('$');
+                let sigil_offset = self.pos;
                 if is_dollar {
                     self.next();
                 }
                 let name = self.parse_ident()?;
+                if is_dollar {
+                    self.reject_loc_as_binding_name(&name, Some("IDENT or BINDING"), sigil_offset)?;
+                }
                 params.push(if is_dollar {
                     Param::Dollar(name)
                 } else {
