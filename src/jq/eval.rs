@@ -2073,9 +2073,123 @@ fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
 /// before this fix, `StandardJson`'s own
 /// [`DocumentValue`](super::document::DocumentValue) impl making the shared
 /// helper directly usable.
+/// The document node a borrowed value *is*, when the value is a whole
+/// container this evaluator can still point a cursor at (#2889 Stage B).
+///
+/// `eval_generic` carries a `V::Cursor` alongside every borrowed value and
+/// so never has to ask; this evaluator's own item protocol
+/// ([`Item::Borrowed`], [`QueryResult::One`]) carries a [`StandardJson`]
+/// only, and a container [`StandardJson`] retains a *child* cursor rather
+/// than its own (`JsonFields`/`JsonElements` store `first_child()`). One
+/// `parent()` hop recovers the container, and
+/// [`JsonFields::whole_container_cursor`] makes that hop only while the
+/// list still stands at the first child -- a partly-consumed field or
+/// element list is a *suffix* of the container, not the container, and must
+/// not be given its node.
+///
+/// Scalars, empty containers and advanced lists answer `None`. All three
+/// are under-reports that cost an acceptance and never a wrong answer: the
+/// caller falls back to exactly the behaviour it had before #2889.
+fn standard_json_node_cursor<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+) -> Option<JsonCursor<'a, W>> {
+    match value {
+        StandardJson::Object(fields) => fields.whole_container_cursor(),
+        StandardJson::Array(elements) => elements.whole_container_cursor(),
+        _ => None,
+    }
+}
+
+/// The `Rc` an in-scope `as` binding already holds for the node `value`
+/// stands at, if any (#2889 Stage B) -- [`to_owned`]'s half of the embed
+/// table, mirroring `eval_generic::to_owned_cursor`'s.
+///
+/// The soundness rules are that module's (`eval_generic::embed_table`), not
+/// new ones: the entry holds the very `OwnedValue` some bind froze from this
+/// node, an index is immutable so the shared value is bit-for-bit what a
+/// fresh walk would have built, and the entry's own strong reference makes
+/// any later write through any handle copy first.
+///
+/// Two things are specific to taking it *here*. It is taken at [`to_owned`]'s
+/// own depth 0 and never inside [`to_owned_at_depth`]'s recursion, for the
+/// same two reasons Stage A gives: depth 0 is where every embedding
+/// construction (`{k:.}`, `[.]`, an operand of `+`) materializes its operand,
+/// and a reuse deeper in some *other* node's walk would skip the
+/// `MAX_NESTING_DEPTH` accounting for the shared subtree. And the structural
+/// checks this skips (`element_gap_ok`, `tail_gap_ok`, `ends_unpaired`,
+/// key decoding) have already run over this very node: the entry exists only
+/// because the bind materialized it through this same converter, and a bind
+/// whose materialization raised never reached the body that could ask.
+///
+/// The gate is checked before [`standard_json_node_cursor`] does any BP
+/// work, so a program with no `as` binding in scope pays one thread-local
+/// load -- the same price Stage A's `embed_shared_for` charges the generic
+/// converter.
+fn embed_shared_for_value<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || !super::eval_generic::embed_table_active() {
+        return None;
+    }
+    let cursor = standard_json_node_cursor(value)?;
+    super::eval_generic::embed_shared_for::<S, _>(&cursor)
+}
+
+/// The [`BindOrigin`] an `as` binding over `value` should carry (#2889
+/// Stage B): the document node the value *is*, when
+/// [`standard_json_node_cursor`] can name one.
+///
+/// `eval.rs`'s two bind sites ([`eval_as`], [`each_as`]) minted `None` here
+/// until Stage B, so every marker they built was demoted at the next owned
+/// re-entry (`marker_needs_demotion`'s `_ => true` arm) and
+/// `-n 'input | . as $x | {k:.} | .k | path($x)'` refused where jq answers
+/// `[]`. The node this names is usually a node of the *throwaway* document
+/// an owned re-entry built (`eval_each_owned`), which is exactly the
+/// document the body runs against and the only one the marker will ever be
+/// compared to: `document_token` is derived from the live index's address,
+/// the index outlives the whole bind body, and a token can only be reused
+/// once its index is dropped. That is the same lifetime argument
+/// `eval_generic::bind_origin_of_cursor` has relied on since #2072, where
+/// `eval_on_owned`'s rebuilt index reaches `each_as_generic` the same way.
+///
+/// **jq mode only.** A `BindOrigin::Node` is read by more than the embed
+/// table -- `marker_is_root`'s #3037 promotion and the `key`/`parent`/
+/// `line`/`column`/`file_index` cursor routes all consult it -- and yq's
+/// node model is #2643's business (ADR-0018: the mode decides). Gating the
+/// mint, not just the table push, is what keeps `succinctly yq` byte-identical.
+fn standard_json_bind_origin<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Option<BindOrigin> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    let cursor = standard_json_node_cursor(value)?;
+    Some(BindOrigin::Node {
+        node: cursor.node_id(),
+        document: cursor.document_token(),
+    })
+}
+
+/// [`standard_json_bind_origin`] for an [`Item`] that has not been
+/// materialized yet (#2889 Stage B): an already-owned item has no cursor and
+/// so no node.
+fn item_bind_origin<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
+    item: &Item<'_, W>,
+) -> Option<BindOrigin> {
+    match item {
+        Item::Borrowed(v) => standard_json_bind_origin::<S, W>(v),
+        Item::Owned(_) => None,
+    }
+}
+
 fn to_owned<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
+    // #2889 Stage B: `eval_generic::to_owned_cursor`'s reuse, on this
+    // evaluator's own converter -- see [`embed_shared_for_value`].
+    if let Some(shared) = embed_shared_for_value::<S, W>(value) {
+        return Ok(shared);
+    }
     let result = to_owned_at_depth::<S, W>(value, None, 0);
     // #2334: asserted here, at the depth-0 entry point, not inside the
     // recursive `to_owned_at_depth` -- one assert per materialization rather
@@ -6159,8 +6273,16 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    fanout_arg_each::<W, S, _>(expr, value.clone(), optional, |bound_val| {
-        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+    fanout_arg_each_with_origin::<W, S, _>(expr, value.clone(), optional, |bound_val, origin| {
+        // #2889 Stage B: the mirror of `each_as_generic`'s own push --
+        // the binding holds this node's `OwnedValue` for the body's
+        // whole dynamic extent, so registering it makes a later
+        // materialization of the same node hand back *this* `Rc` and
+        // `{k:.}`/`[.]`/`. + {}` embed the value rather than a twin.
+        // The guard pops the entry however the body leaves, error and
+        // `break` included.
+        let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &bound_val);
+        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
         eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
     })
 }
@@ -6806,6 +6928,64 @@ where
         };
         match body(owned) {
             // This argument value's own walk finished; go on to the next.
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                consumer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+        }
+    });
+
+    match escape {
+        Some(_) => resume_from_escape(escape, flow),
+        // `pending` is dropped for the reason every other lazy consumer
+        // drops it: it belongs to an eager fallback jq would never reach.
+        None if consumer_stopped => Flow::Stopped { pending: None },
+        None => flow,
+    }
+}
+
+/// [`fanout_arg_each`]'s twin for [`each_as`] alone (#2889 Stage B): the
+/// same demand-forwarding fan-out, with `body` also told the document node
+/// each bound value came from, read off the [`Item`] *before* it is
+/// materialized ([`item_bind_origin`]) because the conversion is what loses
+/// the cursor.
+///
+/// The exact shape `eval_generic::fanout_arg_each_generic_with_origin`
+/// already has, and split off for the same reason: only a bare `$var` bind
+/// has a single node worth naming, so [`each_as_pattern`] keeps fanning out
+/// through plain [`fanout_arg_each`]. Every rule of that function carries
+/// over verbatim -- `body` runs against argument value N before N+1 is
+/// evaluated, a `body` escape stops the pull there, the argument's own
+/// trailing control fires only after everything `body` already produced, and
+/// a downstream stop outranks the argument generator's verdict -- including
+/// [`Item::into_owned`]'s #2023 checked conversion, so an undecodable bound
+/// value still raises rather than silently becoming `""`.
+fn fanout_arg_each_with_origin<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+    arg_expr: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    mut body: B,
+) -> Flow
+where
+    B: FnMut(OwnedValue, Option<BindOrigin>) -> Flow,
+{
+    // Tracked out-of-band for the usual reason: the sink can only answer
+    // `Demand`, so "why did the pull stop" has to be recorded beside it.
+    let mut escape: Option<Control> = None;
+    let mut consumer_stopped = false;
+
+    let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
+        // Before `into_owned`: the cursor this reads lives on the borrowed
+        // item, and materializing it is exactly what drops it.
+        let origin = item_bind_origin::<S, W>(&item);
+        let owned = match item.into_owned::<S>() {
+            Ok(v) => v,
+            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+        };
+        match body(owned, origin) {
+            // This bound value's own walk finished; go on to the next.
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
                 consumer_stopped = true;
@@ -41412,30 +41592,26 @@ impl<'a> LazyMarker<'a> {
 /// Substitute `bound` for `$var_name` in `body`, choosing between
 /// `substitute_var`/`substitute_var_tracked` based on whether `bind_expr`
 /// (the `as`-binding's own source expression) is a statically-verified
-/// passthrough of `.` (`is_identity_passthrough`).
+/// passthrough of `.` (`is_identity_passthrough`), and recording the
+/// document node or owned-tree position the value was bound from (#2072) --
+/// `node`, read by the cursor routes (`key`/`path`/`parent`/`line`/`column`/
+/// `file_index`, YAML anchor and style marks) and, since #2889, by the embed
+/// table's own node identity. `None` where the binding site has no node to
+/// name.
 ///
-/// Shared by `eval_as` (value-position `E as $x | body`) and
-/// `resolve_node`'s `Expr::As` arm (path-position, when the whole binding
-/// sits inside `path(...)`'s own argument) -- the two independent call
-/// sites #844 fixed. Extracted so a future refinement of the gate only has
-/// to change this one place to stay in sync at both; the two arms
-/// duplicating this `if` verbatim was flagged in #844's own review as
-/// exactly the kind of two-call-site asymmetry the issue was filed to fix
-/// in the first place.
-pub(crate) fn substitute_bound_var(
-    bind_expr: &Expr,
-    body: &Expr,
-    var_name: &str,
-    bound: &OwnedValue,
-) -> Expr {
-    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None, None)
-}
-
-/// [`substitute_bound_var`] for a binding site that knows the document node
-/// or owned-tree position the value was bound from (#2072), read by the
-/// cursor routes (`key`/`path`/`parent`/`line`/`column`/`file_index`, YAML
-/// anchor and style marks) rather than by `resolve_node`. Without one this
-/// is `substitute_bound_var`.
+/// Shared by both evaluators' value-position bind sites (`eval_as`,
+/// `each_as`, `each_as_generic`, `eval_owned_identity_as`) -- the gate lives
+/// here so a future refinement of it stays in sync at all of them, which is
+/// the two-call-site asymmetry #844's own review flagged. `resolve_node`'s
+/// `Expr::As` arm (path-position, when the whole binding sits inside
+/// `path(...)`'s own argument) reaches the same core through
+/// [`substitute_bound_var_at`], which it needs for its own
+/// `identity_at`/`origin` arguments.
+///
+/// The bare, node-less spelling this used to have alongside it
+/// (`substitute_bound_var`) had no callers left once #2889 Stage B gave
+/// `eval_as`/`each_as` a node, and was removed rather than kept as a
+/// same-shaped second entry point.
 pub(crate) fn substitute_bound_var_from(
     bind_expr: &Expr,
     body: &Expr,
@@ -41903,7 +42079,22 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // bound value used to silently become `""` here instead of raising; the
     // already-converted prefix still runs through the body below before the
     // decode failure surfaces as the terminal control.
-    let (bound_values, bound_control) = stream_outputs::<_, S>(bound_result.materialize_cursor());
+    let bound_result = bound_result.materialize_cursor();
+    // #2889 Stage B: the document node each bound value stands at, read off
+    // the borrowed results *before* `stream_outputs` materializes them --
+    // `to_owned` is what drops the cursor, exactly as it is on [`each_as`]'s
+    // lazy route. Index-aligned with `bound_values` below rather than zipped
+    // into them, so the fold that produces those stays the single definition
+    // #1902/#1934 made it: an owned or partial result contributes no origins
+    // at all (there is no cursor behind one), and a `Many` whose
+    // materialization fails part-way keeps its prefix in order, so position
+    // `i` names output `i` either way.
+    let bound_origins: Vec<Option<BindOrigin>> = match &bound_result {
+        QueryResult::One(v) => vec![standard_json_bind_origin::<S, W>(v)],
+        QueryResult::Many(vs) => vs.iter().map(standard_json_bind_origin::<S, W>).collect(),
+        _ => Vec::new(),
+    };
+    let (bound_values, bound_control) = stream_outputs::<_, S>(bound_result);
 
     // For each bound value, substitute and evaluate the body. #1902/#1934:
     // [`push_owned_values`] folds an undecodable body output into
@@ -41913,8 +42104,12 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // competing signal" ordering #1832 already established elsewhere.
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
-    for bound_val in bound_values {
-        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+    for (i, bound_val) in bound_values.into_iter().enumerate() {
+        let origin = bound_origins.get(i).cloned().flatten();
+        // #2889 Stage B: same registration, same bind-scoped guard, as
+        // `each_as`/`each_as_generic` -- see `eval_generic::embed_table`.
+        let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &bound_val);
+        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
         if let Some(control) = push_owned_values::<_, S>(body_result, &mut all_results) {
@@ -43047,7 +43242,11 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     // `Snapshot` marker can name -- see `eval_each_owned`. After the fast
     // path on purpose: it never reaches a resolver, and demoting is a
     // rebuild of `expr` whenever a marker is present.
-    let expr = Reentry::REBUILT.reroot::<S>(expr);
+    // #2889: unless the embed table still recognizes `input` as some bound
+    // node's own, unmodified value -- the one thing a rebuilt copy can never
+    // be. This funnel has no caller-supplied `Reentry` to refine, so the
+    // refinement is applied to `REBUILT` itself.
+    let expr = Reentry::REBUILT.witnessed_by::<S>(input).reroot::<S>(expr);
 
     // Create a synthetic JSON from the owned value
     // For simplicity, we'll serialize and reparse
@@ -43219,7 +43418,15 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
-    eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
+    // #2889: `input` may still *be* a bound node's own value, embedded here
+    // by a construction jq would have shared rather than copied -- ask the
+    // embed table before settling for `Owned`, exactly as the lazy twin
+    // [`eval_each_owned`] does. See [`Reentry::witnessed_by`].
+    eval_owned_input_bridge::<W, S>(
+        &reentry.witnessed_by::<S>(input).reroot::<S>(expr),
+        input,
+        optional,
+    )
 }
 
 /// [`eval_owned_input`]'s bridge alone, no fast path and no demotion: build

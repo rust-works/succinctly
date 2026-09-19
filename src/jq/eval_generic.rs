@@ -5458,7 +5458,14 @@ pub(crate) fn embed_witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
 
 /// The `Rc` an in-scope binding already holds for the node `cursor` stands
 /// at, if any (#2889). See [`embed_table`].
-fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(cursor: &C) -> Option<OwnedValue> {
+///
+/// `pub(crate)` for `eval::embed_shared_for_value`, the same reuse on
+/// `eval.rs`'s own converter (#2889 Stage B) -- that evaluator has to
+/// recover the cursor from a borrowed value first, but the lookup itself,
+/// and its gate, must stay this one definition.
+pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
+    cursor: &C,
+) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq || !embed_table::active() {
         return None;
     }
