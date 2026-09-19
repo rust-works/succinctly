@@ -2224,6 +2224,71 @@ pub(crate) fn key_only_value_delimiter_ok<F: DocumentFields>(
     }
 }
 
+/// Above this many keys, a per-object duplicate-key check stops comparing
+/// every pair of key spans.
+///
+/// What it switches to instead is the caller's own business: a sort of one
+/// hash per key (`spans_repeat`, `src/bin/succinctly/jq_runner.rs`), or a
+/// real [`KeyHashes`] table (`scan_canonical_object`, `src/json/light.rs`).
+///
+/// Two independent reasons to keep a pairwise branch at all, one per side of
+/// the threshold:
+/// - **Below it**, the pairwise loop needs no allocation, and objects in real
+///   documents are almost always below it. Both alternatives allocate on
+///   their very first use -- the `Vec<u64>` the sort builds, and
+///   [`KeyHashes::insert`]'s table -- so without this branch every tiny
+///   object would pay a heap allocation for a handful of keys.
+/// - **Above it**, the pairwise loop is quadratic, which is not a tuning
+///   question but a correctness-of-scale one: on a 10 MB document whose root
+///   object is wide, leaving it unbounded measured 1240% slower than not
+///   collapsing at all.
+///
+/// One definition, shared (#2608 review). It was two -- this value and the
+/// fingerprint below were duplicated between `jq_runner.rs` and
+/// `light.rs` with a comment on each telling the reader to check the other
+/// by hand, which is exactly the "duplicated predicates diverge silently"
+/// hazard `CLAUDE.md` records from #106. The dependency only runs one way
+/// (`light.rs` is library code and cannot reference a `bin` target's
+/// private items), so the shared definition lives here, beside the
+/// [`KeyHashes`] both sites already share.
+pub const PAIRWISE_SPAN_SCAN_LIMIT: usize = 16;
+
+/// A cheap discriminator for a key's **raw quoted source span**.
+///
+/// The input is the opening `"`, the undecoded content bytes, and the
+/// closing `"`; the output packs that span's length plus its first and last
+/// content bytes into one word.
+///
+/// That input contract is the whole of it, and both callers satisfy it
+/// verbatim: `jq_runner.rs`'s `PreparedField::raw` ("the key's raw source
+/// span, quotes included") and `light.rs`'s `bytes[i..after_key]` slice of
+/// the span its own `scan_json_string_span` just accepted.
+/// Nothing is decoded, so an escaped and an unescaped spelling of the same
+/// key fingerprint differently -- which is sound because a *distinct*
+/// fingerprint is the only thing this function is ever allowed to prove
+/// (see below), never an equal one.
+///
+/// Degenerate spans fold into the length term: `""` (`n == 2`) has no
+/// content byte and both slots read `0`; `"a"` (`n == 3`) has one, so only
+/// `last` does. A span shorter than `""` cannot reach here -- both callers
+/// pass a span a string scan already closed.
+///
+/// **Distinct fingerprints prove distinct keys**, and that is the only
+/// direction either pairwise scan relies on: it compares these words first
+/// and falls back to comparing the spans themselves when two collide. Keys
+/// within one object almost always differ in length or in their first byte,
+/// which makes the byte comparison rare enough to disappear from the profile
+/// -- comparing the spans directly instead measured ~3% of `sjq '.'` on a
+/// 10 MB document.
+#[inline]
+#[must_use]
+pub fn key_span_fingerprint(quoted: &[u8]) -> u64 {
+    let n = quoted.len();
+    let first = if n > 2 { quoted[1] } else { 0 };
+    let last = if n > 3 { quoted[n - 2] } else { 0 };
+    ((n as u64) << 16) | ((first as u64) << 8) | last as u64
+}
+
 /// An open-addressed set of key hashes: "have I seen this one?" answered
 /// as a walk goes, without holding the keys.
 ///
@@ -3775,7 +3840,57 @@ pub trait DocumentElements: Sized + Copy + Clone {
 
 #[cfg(test)]
 mod key_hash_tests {
-    use super::{key_hash, KeyHashes};
+    use super::{key_hash, key_span_fingerprint, KeyHashes, PAIRWISE_SPAN_SCAN_LIMIT};
+
+    /// The one property both pairwise duplicate-key scans rely on, now
+    /// that [`key_span_fingerprint`] is one definition shared between
+    /// them rather than two hand-synchronised copies (#2608 review):
+    /// **distinct fingerprints prove distinct spans**. Only that
+    /// direction -- a collision is allowed, and each caller resolves one
+    /// by comparing the spans themselves.
+    ///
+    /// Swept over every pair drawn from a list that deliberately includes
+    /// the two degenerate spans (the empty key and a one-byte key, whose
+    /// missing content bytes read as `0`), spans equal in length but not
+    /// in content, spans equal in their first and last content bytes but
+    /// not in the middle, escaped and raw spellings of one key, and
+    /// non-ASCII content.
+    #[test]
+    fn key_span_fingerprint_separates_only_distinct_spans_2608() {
+        const SPANS: &[&[u8]] = &[
+            br#""""#,
+            br#""a""#,
+            br#""b""#,
+            br#""ab""#,
+            br#""ba""#,
+            br#""axb""#,
+            br#""ayb""#,
+            br#""a\/b""#,
+            br#""a/b""#,
+            "\"é\"".as_bytes(),
+            "\"日本\"".as_bytes(),
+        ];
+        for (i, left) in SPANS.iter().enumerate() {
+            for right in &SPANS[i..] {
+                if key_span_fingerprint(left) != key_span_fingerprint(right) {
+                    assert_ne!(left, right, "distinct fingerprints mean distinct spans");
+                }
+            }
+        }
+        // A middle-byte-only difference is the collision this scheme
+        // accepts by design -- same length, same first and last content
+        // byte. The callers' own byte comparison settles it, so pin that
+        // the fingerprint alone does not.
+        assert_eq!(
+            key_span_fingerprint(br#""axb""#),
+            key_span_fingerprint(br#""ayb""#),
+            "same length, same first and last content byte"
+        );
+        // Both pairwise scans size a fixed-length array from this
+        // constant and index it by key position, so the tier has to be
+        // wide enough to hold every span the sweep above compares.
+        assert!(SPANS.len() <= PAIRWISE_SPAN_SCAN_LIMIT);
+    }
 
     /// The set answers "already seen" exactly for repeated hashes, and
     /// `len` counts distinct ones — the two properties `census` derives

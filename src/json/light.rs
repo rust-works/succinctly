@@ -2556,8 +2556,9 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 
 use crate::jq::document::{
     collapsed_fields_checked, document_token_of, effective_fields_checked, key_hash,
-    key_is_malformed, trailing_element_gap_ok, DocumentCursor, DocumentElements, DocumentField,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention, KeyHashes,
+    key_is_malformed, key_span_fingerprint, trailing_element_gap_ok, DocumentCursor,
+    DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    KeyHashes, PAIRWISE_SPAN_SCAN_LIMIT,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -2813,9 +2814,12 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   valid UTF-8 (see [`scan_json_string_span`]), which only widens where
 ///   this scan *accepts*: an invalid-UTF-8 key has no decoded form to be
 ///   confused about, and the caller's own `from_utf8` rejects the whole
-///   span before anything is echoed. Two tiers, mirroring `src/bin/succinctly/jq_runner.rs`'s
-///   own `PAIRWISE_SPAN_SCAN_LIMIT`/`span_fingerprint` split (#2919
-///   review): up to `SMALL_OBJECT_KEY_LIMIT` keys are compared pairwise
+///   span before anything is echoed. Two tiers, on the same threshold
+///   `src/bin/succinctly/jq_runner.rs`'s own `spans_repeat` splits on
+///   (#2919 review; one shared [`PAIRWISE_SPAN_SCAN_LIMIT`] and one shared
+///   [`key_span_fingerprint`] since #2608's review, both in
+///   `src/jq/document.rs` beside the [`KeyHashes`] the two sites already
+///   shared): up to `PAIRWISE_SPAN_SCAN_LIMIT` keys are compared pairwise
 ///   via a cheap fingerprint with no allocation at all -- most real
 ///   objects never cross that threshold, and [`KeyHashes::insert`]
 ///   heap-allocates its table on its very first call, which would
@@ -3062,52 +3066,23 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
 /// `"key":value` pairs separated by exactly one `,` with no trailing
 /// comma, each key checked against [`scan_json_string_span`] and hashed
 /// (raw span, undecoded -- see `canonical_compact_jq_span_end`'s own doc
-/// comment for why that's sound) into a fresh per-object [`KeyHashes`] to
-/// bail on any repeat.
-/// Above this many keys, [`scan_canonical_object`] switches from an
-/// allocation-free pairwise key-span scan to a real [`KeyHashes`] table.
-///
-/// Mirrors `src/bin/succinctly/jq_runner.rs`'s own
-/// `PAIRWISE_SPAN_SCAN_LIMIT` (same value, same reasoning -- real objects
-/// are small, and below this a pairwise scan is free while `KeyHashes`
-/// would heap-allocate on its very first `insert`). Kept as its own
-/// constant rather than shared with that one because the dependency only
-/// runs one way -- this `src/json/light.rs` module is part of the library
-/// crate, and `jq_runner.rs` is part of the `succinctly` *binary* crate
-/// that depends on it, so a lib module cannot reference a `bin` target's
-/// private const. If one threshold changes, check whether the other
-/// should too.
-const SMALL_OBJECT_KEY_LIMIT: usize = 16;
-
-/// A cheap discriminator for a key's raw quoted span (`"`...`"`, quotes
-/// included), mirroring `jq_runner.rs`'s own `span_fingerprint`: length
-/// plus the first and last content bytes, packed into one word.
-///
-/// Distinct fingerprints prove distinct keys, so [`scan_canonical_object`]'s
-/// pairwise scan below compares these words first and only falls back to
-/// comparing the spans themselves on a collision.
-#[inline]
-fn object_key_span_fingerprint(quoted: &[u8]) -> u64 {
-    let n = quoted.len();
-    let first = if n > 2 { quoted[1] } else { 0 };
-    let last = if n > 3 { quoted[n - 2] } else { 0 };
-    ((n as u64) << 16) | ((first as u64) << 8) | last as u64
-}
-
+/// comment for why that's sound) to bail on any repeat -- pairwise below
+/// [`PAIRWISE_SPAN_SCAN_LIMIT`] keys, through a fresh per-object
+/// [`KeyHashes`] above it.
 fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize> {
     debug_assert_eq!(bytes.get(pos), Some(&b'{'));
     let mut i = pos + 1;
     if bytes.get(i) == Some(&b'}') {
         return Some(i + 1);
     }
-    // Small-object fast path (#2919 review): up to `SMALL_OBJECT_KEY_LIMIT`
+    // Small-object fast path (#2919 review): up to `PAIRWISE_SPAN_SCAN_LIMIT`
     // keys are compared pairwise via a cheap fingerprint, with no
     // allocation at all. `seen_keys` -- a real `KeyHashes` table -- only
     // comes into existence once an object turns out to have more keys
-    // than that; see `SMALL_OBJECT_KEY_LIMIT`'s own doc comment.
-    let mut small_spans: [(usize, usize); SMALL_OBJECT_KEY_LIMIT] =
-        [(0, 0); SMALL_OBJECT_KEY_LIMIT];
-    let mut small_fps: [u64; SMALL_OBJECT_KEY_LIMIT] = [0; SMALL_OBJECT_KEY_LIMIT];
+    // than that; see `PAIRWISE_SPAN_SCAN_LIMIT`'s own doc comment.
+    let mut small_spans: [(usize, usize); PAIRWISE_SPAN_SCAN_LIMIT] =
+        [(0, 0); PAIRWISE_SPAN_SCAN_LIMIT];
+    let mut small_fps: [u64; PAIRWISE_SPAN_SCAN_LIMIT] = [0; PAIRWISE_SPAN_SCAN_LIMIT];
     let mut small_count = 0usize;
     let mut seen_keys: Option<KeyHashes> = None;
     loop {
@@ -3128,7 +3103,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
                 return None;
             }
         } else {
-            let fp = object_key_span_fingerprint(&bytes[i..after_key]);
+            let fp = key_span_fingerprint(&bytes[i..after_key]);
             let repeat = (0..small_count).any(|j| {
                 let (s, e) = small_spans[j];
                 small_fps[j] == fp && bytes[s..e] == bytes[key_start..key_end]
@@ -3139,7 +3114,7 @@ fn scan_canonical_object(bytes: &[u8], pos: usize, depth: usize) -> Option<usize
                 // canonical (see this function's own doc comment).
                 return None;
             }
-            if small_count < SMALL_OBJECT_KEY_LIMIT {
+            if small_count < PAIRWISE_SPAN_SCAN_LIMIT {
                 small_fps[small_count] = fp;
                 small_spans[small_count] = (key_start, key_end);
                 small_count += 1;
