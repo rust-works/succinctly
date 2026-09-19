@@ -3270,7 +3270,8 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// - a literal byte `< 0x20` or `0x7F` appearing unescaped is rejected --
 ///   the writer always escapes these;
 /// - every other byte, ASCII or a UTF-8 lead/continuation byte `>= 0x80`,
-///   is literal content.
+///   is literal content, and is skipped over rather than inspected (see the
+///   SIMD note below).
 ///
 /// **UTF-8 validity is deliberately not decided here.** Every byte `>= 0x80`
 /// is advanced over one at a time, as literal content, and the single
@@ -3304,11 +3305,35 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 /// validation at all, and only the CLI substitutes invalid input ahead of
 /// indexing (`utf8_lossy_document`, `src/bin/succinctly/jq_runner.rs`), so a
 /// library caller can hand a `JsonCursor` a buffer with any byte in it.
+///
+/// With the decode gone, every byte in a string that is neither `"`, `\`, a
+/// control byte nor DEL needs no decision at all -- which is exactly the
+/// question [`find_jq_escape`](crate::util::simd::escape::find_jq_escape)
+/// answers, 16-32 bytes at a time, against jq's own writer table (#2608).
+/// The loop below therefore jumps from one byte that needs a decision to the
+/// next instead of walking; the arms are unchanged, because the scanner can
+/// only ever stop on one of those four. Its `PREFIX`-byte word probe is
+/// #2963's, applied for #2963's reason -- see [`next_jq_string_special`].
 fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
+    scan_json_string_span_probed::<STRING_SCALAR_PREFIX>(bytes, pos)
+}
+
+/// [`scan_json_string_span`] with the word-probe length as a parameter, so
+/// both the probed and the unprobed path are testable on every architecture
+/// -- exactly as [`string_literal_end_probed`] is, and for the same reason.
+#[inline(always)]
+fn scan_json_string_span_probed<const PREFIX: usize>(
+    bytes: &[u8],
+    pos: usize,
+) -> Option<(usize, usize, usize)> {
     debug_assert_eq!(bytes.get(pos), Some(&b'"'));
     let content_start = pos + 1;
     let mut i = content_start;
     loop {
+        // Skip everything that needs no decision. Whatever the scan stops on
+        // is one of the four bytes the match below handles, so the arms are
+        // unchanged -- only the walk between them is.
+        i = next_jq_string_special::<PREFIX>(bytes, i);
         match *bytes.get(i)? {
             b'"' => {
                 return Some((content_start, i, i + 1));
@@ -3344,14 +3369,63 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
                     _ => return None,
                 }
             }
-            b if b < 0x20 || b == 0x7F => return None,
-            // Every other byte -- ASCII, or any byte of a multi-byte UTF-8
-            // sequence -- is one byte of literal content. UTF-8 validity is
-            // deliberately *not* decided here; see this function's own doc
-            // comment.
-            _ => i += 1,
+            // `next_jq_string_special` only ever stops on `"`, `\\`, a
+            // control byte or DEL, so nothing else can reach here -- and the
+            // last two are exactly what the writer always escapes, so a raw
+            // one means the span is not canonical.
+            _ => return None,
         }
     }
+}
+
+/// The index of the first byte jq's string writer would escape (`"`, `\\`,
+/// `< 0x20`, DEL) at or after `i`, or `bytes.len()`: the twin of
+/// [`next_string_special`], differing only in that DEL is in the predicate
+/// (see [`find_jq_escape`](crate::util::simd::escape::find_jq_escape)).
+///
+/// The `PREFIX`-byte word probe is #2963's, for #2963's reason: the scanner
+/// is handed the rest of the *document*, so its own
+/// shorter-than-a-chunk-goes-scalar threshold never fires from inside a
+/// string, and on aarch64 a 16-byte NEON chunk's compare/movemask/
+/// vector-to-GPR latency loses to a couple of general-register operations on
+/// the short strings a record-shaped document is made of. `PREFIX` is
+/// [`STRING_SCALAR_PREFIX`], which is 8 on aarch64 and 0 everywhere else, so
+/// this compiles down to a bare call to the scanner on x86_64.
+#[inline(always)]
+fn next_jq_string_special<const PREFIX: usize>(bytes: &[u8], i: usize) -> usize {
+    debug_assert!(PREFIX % 8 == 0, "the probe is measured in 64-bit words");
+    if PREFIX > 0 {
+        let mut at = i;
+        while at + 8 <= bytes.len() && at < i + PREFIX {
+            // `at + 8 <= len` was just checked, so the slice is in bounds.
+            let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+            let mask = word_jq_special_mask(word);
+            if mask != 0 {
+                // The lowest set bit is exact; see `word_special_mask`.
+                return at + (mask.trailing_zeros() / 8) as usize;
+            }
+            at += 8;
+        }
+        return crate::util::simd::escape::find_jq_escape(bytes, at);
+    }
+    crate::util::simd::escape::find_jq_escape(bytes, i)
+}
+
+/// [`word_special_mask`] plus DEL: the same `haszero` term for `0x7F` that
+/// that function already uses for `"` and `\\`.
+///
+/// Built *on* `word_special_mask` rather than beside it so the three shared
+/// terms have one definition, not two that can drift (`CLAUDE.md`'s #106
+/// rule); the extra term's borrow chain starts only at a genuine `0x7F`, so
+/// the composed mask keeps the "lowest set bit is exact" property callers
+/// rely on -- the OR of two masks whose lowest true hits are each exact has
+/// an exact lowest true hit.
+#[inline(always)]
+fn word_jq_special_mask(word: u64) -> u64 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let del = word ^ (ONES * 0x7F);
+    word_special_mask(word) | (del.wrapping_sub(ONES) & !del & HIGHS)
 }
 
 /// The object-token rule: `{`, then either an immediate `}` or
@@ -8812,6 +8886,106 @@ mod tests {
         assert_eq!(word_special_mask(u64::from_le_bytes([0xFF; 8])), 0);
         assert_eq!(word_special_mask(u64::from_le_bytes([0x20; 8])), 0);
         assert_eq!(word_special_mask(u64::from_le_bytes([0x80; 8])), 0);
+    }
+
+    /// `word_jq_special_mask`'s contract, the same sweep
+    /// `test_word_special_mask_lowest_bit_is_exact_2963` runs against the
+    /// mask it is built on (#2608): every byte value at every one of the 8
+    /// positions, alone and then under a borrow-provoking neighbour, plus
+    /// the DEL byte the jq table adds -- `0x7F` is one below `0x80`, so the
+    /// `hasless` term for `< 0x20` and the new `haszero` term for DEL are
+    /// exactly the two a composed mask could get wrong together.
+    #[test]
+    fn test_word_jq_special_mask_lowest_bit_is_exact_2608() {
+        let is_special = |b: u8| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7F;
+        for pos in 0..8 {
+            for byte in 0u8..=255 {
+                let mut w = [b'a'; 8];
+                w[pos] = byte;
+                let mask = word_jq_special_mask(u64::from_le_bytes(w));
+                if is_special(byte) {
+                    assert_eq!(
+                        mask.trailing_zeros() / 8,
+                        pos as u32,
+                        "0x{byte:02X} at {pos}"
+                    );
+                } else {
+                    assert_eq!(mask, 0, "0x{byte:02X} at {pos} is not jq-special");
+                }
+                if is_special(byte) && pos < 7 {
+                    for above in [0x20u8, 0x21, 0x7F, 0x80, 0xFF, b'"', 0x00] {
+                        w[pos + 1] = above;
+                        let mask = word_jq_special_mask(u64::from_le_bytes(w));
+                        assert_eq!(
+                            mask.trailing_zeros() / 8,
+                            pos as u32,
+                            "0x{byte:02X} at {pos} with 0x{above:02X} above"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(word_jq_special_mask(u64::from_le_bytes(*b"abcdefgh")), 0);
+        assert_eq!(word_jq_special_mask(u64::from_le_bytes([0xFF; 8])), 0);
+        assert_eq!(word_jq_special_mask(u64::from_le_bytes([0x80; 8])), 0);
+        // DEL is the one byte `word_special_mask` and its jq twin disagree
+        // on -- pinned here so the pair cannot drift (`CLAUDE.md`'s #106
+        // rule), the `json`/`jq` predicate pair in `util::simd::escape`
+        // being the SIMD half of the same pinning.
+        for pos in 0..8 {
+            let mut w = [b'a'; 8];
+            w[pos] = 0x7F;
+            let word = u64::from_le_bytes(w);
+            assert_eq!(word_special_mask(word), 0, "DEL is not yq-special");
+            assert_eq!(word_jq_special_mask(word).trailing_zeros() / 8, pos as u32);
+        }
+    }
+
+    /// The word probe #2608 put in front of `scan_json_string_span`'s SIMD
+    /// scan must not change what the scan decides: every probe length is
+    /// driven on every architecture (`PREFIX` is 8 only on aarch64), over
+    /// every byte value at every offset across the probe's own edge, the
+    /// 16-byte NEON edge and the 32-byte AVX2 edge, plus buffers shorter
+    /// than the probe.
+    #[test]
+    fn test_scan_json_string_span_probe_lengths_agree_2608() {
+        for byte in 0u8..=255 {
+            for pos in 0..40usize {
+                let mut doc = vec![b'"'];
+                doc.extend(core::iter::repeat_n(b'a', 40));
+                doc.push(b'"');
+                doc[1 + pos] = byte;
+                let want = scan_json_string_span_probed::<0>(&doc, 0);
+                assert_eq!(
+                    scan_json_string_span_probed::<8>(&doc, 0),
+                    want,
+                    "probe 8 differs for byte {byte:#04x} at {pos}"
+                );
+                assert_eq!(
+                    scan_json_string_span_probed::<16>(&doc, 0),
+                    want,
+                    "probe 16 differs for byte {byte:#04x} at {pos}"
+                );
+            }
+        }
+        // Short buffers, including ones that end inside the probe window and
+        // one that is nothing but an opening quote.
+        for doc in [
+            &b"\""[..],
+            &b"\"\""[..],
+            &b"\"a\""[..],
+            &b"\"abc"[..],
+            &b"\"abcdef\""[..],
+            &b"\"abcdefgh\""[..],
+            &b"\"\\"[..],
+            &b"\"\\n\""[..],
+            "\"caf\u{e9}\"".as_bytes(),
+            "\"\u{65e5}\u{672c}\u{8a9e}\"".as_bytes(),
+        ] {
+            let want = scan_json_string_span_probed::<0>(doc, 0);
+            assert_eq!(scan_json_string_span_probed::<8>(doc, 0), want, "{doc:?}");
+            assert_eq!(scan_json_string_span_probed::<16>(doc, 0), want, "{doc:?}");
+        }
     }
 
     /// Independent scalar reference for the tests below -- the pre-#2878
