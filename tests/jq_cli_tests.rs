@@ -7283,6 +7283,59 @@ fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
     Ok(())
 }
 
+/// #3002: a malformed BOM in the first `--seq` source is wiped by the
+/// refill reset real jq performs when it opens the *next* file, so a
+/// partial BOM that fails in a single buffer (`EF BF` then RS reports
+/// `Truncated value`) silently vanishes when the RS byte opens the next
+/// source instead. Real jq prints nothing at all (oracle: `/usr/bin/jq`
+/// 1.7.1), and the `--seq -s` error location lands on the second file at
+/// line 0 -- never `<unknown>`, which the pre-#3002 spurious warning used
+/// to force.
+#[test]
+fn test_seq_partial_bom_wiped_at_source_boundary_3002() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    file_a.write_all(&[0xEF, 0xBF])?; // partial BOM: EF, then BF (BOM wants BB)
+    let mut file_b = NamedTempFile::new()?;
+    file_b.write_all(&[0x1E])?; // a single RS byte -- a clean empty record
+
+    let path_a = file_a.path().to_str().unwrap();
+    let path_b = file_b.path().to_str().unwrap();
+    let (output, code) = spawn_jq(&["--seq", "-s", "-c", "error(\"x\")", path_a, path_b], None)?;
+    assert_eq!(
+        code,
+        5,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // No spurious `Truncated value` -- the pending BF was wiped at the
+    // boundary, exactly as real jq's per-file reader refill resets it.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        format!("jq: error (at {path_b}:0): x")
+    );
+    assert_eq!(
+        output.stdout, b"",
+        "no record survived, so nothing to print"
+    );
+
+    // Control: the same bytes in a single buffer still report the
+    // truncation, and the truth loss empties the location (`<unknown>`,
+    // #1542's trailing-truncated condition).
+    let mut file_c = NamedTempFile::new()?;
+    file_c.write_all(&[0xEF, 0xBF, 0x1E])?;
+    let path_c = file_c.path().to_str().unwrap();
+    let (output, code) = spawn_jq(&["--seq", "-s", "-c", "error(\"x\")", path_c], None)?;
+    assert_eq!(code, 5);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("jq: ignoring parse error: Truncated value at line 1, column 2"),
+        "{err}"
+    );
+    assert!(err.contains("(at <unknown>): x"), "{err}");
+    assert_eq!(output.stdout, b"");
+    Ok(())
+}
+
 /// #1525: the reported column counts *raw* bytes, before invalid UTF-8 is
 /// lossily substituted (#1617) -- each substituted byte becomes a 3-byte
 /// U+FFFD, which would overcount the column by 2 per substitution if the
