@@ -98935,9 +98935,12 @@ mod tests {
     /// `unshared-containers` is the measurement holdout where a clone
     /// deep-copies, so there is no storage to share and every row would be
     /// `Owned`; the sharing is what this test is about, so it does not run
-    /// there.
+    /// there. Nor without `std`: the table needs a `thread_local!`, so the
+    /// `no_std` build compiles `embed_table`'s stub, where every lookup
+    /// answers `None` by construction (the refuse-only behaviour that
+    /// configuration is meant to have).
     #[test]
-    #[cfg(not(feature = "unshared-containers"))]
+    #[cfg(all(feature = "std", not(feature = "unshared-containers")))]
     fn of_owned_witnesses_only_the_binding_s_own_storage_2889() {
         use crate::jq::eval_generic::embed_table_push;
 
