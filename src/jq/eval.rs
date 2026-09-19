@@ -8274,6 +8274,50 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     Some(result)
 }
 
+/// Whether `value` still *is* a node an in-scope binding holds -- the
+/// payoff [`embed_peel_step`] peels for (#2889 review).
+///
+/// The same lookup [`RootWitness::of_owned`] makes, spelled as a predicate
+/// so it can be handed to `Iterator::any` over a container's children
+/// without cloning any of them.
+fn embed_peel_witnessed(value: &OwnedValue) -> bool {
+    super::eval_generic::embed_witness_of(value).is_some()
+}
+
+/// Whether a child peeled out of a `.[]` can run `rest` without building a
+/// throwaway index for itself (#2889 review) -- the shapes
+/// [`eval_owned_fast_path`] answers from the owned value directly.
+///
+/// Deliberately a *subset* of that function's own match: only its
+/// navigation arm and the single-stage `Expr::Pipe` unwrap, not
+/// [`eval_owned_pure`]'s composite shapes. Being a subset is the safe
+/// direction -- it can only make the iterate arm decline a peel that would
+/// also have been index-free, never claim one that would not.
+fn peeled_children_need_no_index(rest: &Expr) -> bool {
+    match rest {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Pipe(stages) => {
+            matches!(stages.as_slice(), [only] if peeled_children_need_no_index(only))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `expr` is a stage [`embed_peel_step`] would itself take, so a
+/// navigation landing short of an embed may still be peeled when the chain
+/// continues through it (#2889 review).
+///
+/// `Expr::Pipe` is included for the same reason [`embed_peel_step`]
+/// flattens its head: a chained `.k.j` parses as a nested pipe, so the next
+/// step can be one level down.
+fn leads_with_a_peelable_step(expr: &Expr) -> bool {
+    match expr {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Pipe(stages) => stages.first().is_some_and(leads_with_a_peelable_step),
+        _ => false,
+    }
+}
+
 /// Take the leading navigation or iterate stage of an owned pipe
 /// natively, handing back its outputs and the stages still to run (#2889).
 ///
@@ -8294,6 +8338,33 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
 /// - Only while a binding is actually in the embed table
 ///   (`eval_generic::embed_table_active`), which is jq mode and inside an
 ///   `as` body only. Every other program keeps today's shape exactly.
+/// - Only when the peel would actually reach an embed, with two escapes.
+///   The flag alone is too coarse (#2889 review): it is raised for the
+///   whole dynamic extent of *any* container bind, so gating on it alone
+///   re-shaped every owned navigation inside one. The navigated value
+///   (`.foo`/`.[n]`), or at least one child (`.[]`), must therefore still
+///   share a table entry's storage ([`RootWitness::of_owned`]'s own test).
+///
+///   The first escape is a navigation whose *next* stage is another
+///   peelable step ([`leads_with_a_peelable_step`]): a chained `.k.j`
+///   reaches its embed only at the last step, and the intermediate
+///   container it goes through is a constructed wrapper no entry holds
+///   (`{k:{j:.}} | .k.j`). It costs one owned navigation, never a fan-out.
+///
+///   The second is measured, and corrects the cost this gate was proposed
+///   to remove. A peeled child is re-entered, but *not* generally
+///   re-indexed: a tail [`eval_owned_fast_path`] answers -- a bare
+///   navigation ([`peeled_children_need_no_index`]) -- never builds an
+///   index at all, while declining hands the bridge the whole container to
+///   serialize and index. Interleaved on this evaluator's debug binary over
+///   a 100k-element owned array, gating that shape unconditionally cost
+///   +20% (`. as $x | [.items[]] | .[] | .a`, 1.24s -> 1.49s), where gating
+///   only the tails that *do* re-index gained ~2.5%
+///   (`... | .[] | {n:.a} | .n`, 1.64s -> 1.60s). So `.[]` declines only
+///   when it can neither reach an embed nor hand its children an index-free
+///   tail; the `.foo`/`.[n]` arm needs no such clause, since a single
+///   navigation serializes strictly *less* than the parent it peels from
+///   (measured neutral, 1.46s both ways).
 /// - Only the three shapes [`eval_owned_navigation`] answers
 ///   (`.`/`.foo`/`.[n]`), which are already trusted as equivalent to the
 ///   bridge -- [`eval_each_owned_fast_path`] above takes the identical
@@ -8350,12 +8421,47 @@ fn embed_peel_step<S: EvalSemantics>(
     let stepped: Result<Vec<OwnedValue>, EvalError> = match first {
         // `.` moves nothing, so there is nothing a peel could witness that
         // `witnessed_by` on the whole pipe does not already see.
-        Expr::Field(_) | Expr::Index { .. } => eval_owned_navigation::<S>(first, input, optional)?
-            .map(|v| v.into_iter().collect::<Vec<_>>()),
+        Expr::Field(_) | Expr::Index { .. } => {
+            let navigated = eval_owned_navigation::<S>(first, input, optional)?;
+            // The payoff gate. A navigation that lands on the binding's own
+            // storage is what the peel exists for; one that lands anywhere
+            // else -- or raises -- is handed back to the bridge, which
+            // produced it before #2889 and still owns its diagnostics.
+            let on_an_embed = matches!(
+                &navigated,
+                Ok(Some(value)) if embed_peel_witnessed(value)
+            );
+            if !on_an_embed && !leads_with_a_peelable_step(&rest[0]) {
+                return None;
+            }
+            navigated.map(|v| v.into_iter().collect::<Vec<_>>())
+        }
         // `.[]` over a container yields each child, in the same order the
         // bridged iterate would, and each child arrives still sharing its
         // storage. A non-container input keeps the bridge's own
         // diagnostics: this declines rather than reproducing them.
+        //
+        // The witness is checked over the children by reference, before any
+        // of them is cloned: this is the arm whose cost can be a throwaway
+        // index *per child*, so an iterate that can neither reach an embed
+        // nor keep its children index-free must cost nothing beyond the
+        // scan. See the doc comment for the measurement behind the second
+        // half of that condition.
+        Expr::Iterate if !peeled_children_need_no_index(&rest[0]) => match input {
+            OwnedValue::Array(items) => {
+                if !items.iter().any(embed_peel_witnessed) {
+                    return None;
+                }
+                Ok(items.iter().cloned().collect())
+            }
+            OwnedValue::Object(map) => {
+                if !map.values().any(embed_peel_witnessed) {
+                    return None;
+                }
+                Ok(map.values().cloned().collect())
+            }
+            _ => return None,
+        },
         Expr::Iterate => match input {
             OwnedValue::Array(items) => Ok(items.iter().cloned().collect()),
             OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
