@@ -2838,7 +2838,13 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 ///   disambiguate by comparing bytes) since either one means "cannot
 ///   certify this object's span as canonical", not "definitely not
 ///   canonical" -- `KeyHashes`'s own doc comment describes the same
-///   conservatism for its other callers.
+///   conservatism for its other callers. Both tiers, the seeding handoff
+///   between them, a duplicate placed on either side of the boundary and
+///   across it, and the saturation bail all have their own sweeps in this
+///   module's `mod tests` (`canonical_object_key_tiers_2608` and
+///   `canonical_echo_bails_when_the_key_table_saturates_2608`, #2608
+///   review) -- the corpus below them tops out at six keys, which is why
+///   the fuzz generator draws an occasional wide object too.
 ///
 /// The safety argument for this whole function is exactly the equivalence
 /// this module's own `is_canonical_compact_jq_span_agrees_with_rerender_2608`
@@ -5895,6 +5901,197 @@ mod tests {
         }
     }
 
+    /// A canonical compact object of `keys` fields, `"k0000":0` through
+    /// `"k{keys-1}":{keys-1}` in order -- except that when `duplicate` is
+    /// `Some((first, repeat))`, field `repeat` carries field `first`'s
+    /// *key* (and its own value), making the object carry exactly one
+    /// duplicate key at a chosen pair of positions.
+    ///
+    /// Every key is the same length and starts with the same byte, so
+    /// `key_span_fingerprint` separates them on their last content byte
+    /// alone and two keys ten apart collide -- which is deliberate: it is
+    /// the pairwise tier's span-comparison fallback, not its fingerprint
+    /// compare, that has to settle those, and a corpus of keys that all
+    /// differed in length would never reach it.
+    fn wide_canonical_object(keys: usize, duplicate: Option<(usize, usize)>) -> Vec<u8> {
+        let mut out = String::from("{");
+        for i in 0..keys {
+            if i > 0 {
+                out.push(',');
+            }
+            let named = match duplicate {
+                Some((first, repeat)) if i == repeat => first,
+                _ => i,
+            };
+            out.push_str(&format!("\"k{named:04}\":{i}"));
+        }
+        out.push('}');
+        out.into_bytes()
+    }
+
+    /// What jq prints for [`wide_canonical_object`]'s output: identical to
+    /// it when there is no duplicate, and otherwise the collapse -- the
+    /// repeated key keeps its *first* position and takes its *last* value,
+    /// and the later field disappears.
+    fn wide_object_expectation(keys: usize, duplicate: Option<(usize, usize)>) -> String {
+        let mut out = String::from("{");
+        let mut first_field = true;
+        for i in 0..keys {
+            if duplicate.is_some_and(|(_, repeat)| i == repeat) {
+                continue;
+            }
+            if !first_field {
+                out.push(',');
+            }
+            first_field = false;
+            let value = match duplicate {
+                Some((first, repeat)) if i == first => repeat,
+                _ => i,
+            };
+            out.push_str(&format!("\"k{i:04}\":{value}"));
+        }
+        out.push('}');
+        out
+    }
+
+    /// `scan_canonical_object`'s duplicate-key check has *two* tiers
+    /// (#2608 review): the first `PAIRWISE_SPAN_SCAN_LIMIT` keys are
+    /// compared pairwise with no allocation, and the key that overflows
+    /// that limit seeds a real [`KeyHashes`] table every later key goes
+    /// through. Nothing else in this module's tests reaches the second
+    /// tier -- the corpus above tops out at six keys and the fuzz
+    /// generator's objects are narrow -- so the seeding, the table tier
+    /// and the *cross-tier* duplicate detection went unexercised.
+    ///
+    /// Both sides of the boundary, in both directions:
+    /// - **Distinct keys**, at 17 (one past the limit, the seeding case),
+    ///   20 and 40 keys: the whole span still certifies, and the
+    ///   ground-truth re-render still reproduces it byte for byte.
+    /// - **One duplicate**, placed at every interesting pair of positions:
+    ///   `(16, 17)` is the key that *seeds* the table repeated by the
+    ///   first key to use it; `(1, 17)` and `(1, 20)` are a pairwise-tier
+    ///   key found again by the table; `(17, 18)` and `(17, 20)` are both
+    ///   halves inside the table tier. Every one must be *declined* --
+    ///   echoing a span whose object carries a duplicate key would print
+    ///   a field jq collapses away -- and the gate must then produce the
+    ///   collapse the re-render produces.
+    ///
+    /// The duplicate expectations are spelled out rather than compared
+    /// only against the re-render: `assert_eq!(gate, rerender)` alone
+    /// would pass just as happily if *both* wrongly echoed the duplicate.
+    #[test]
+    fn canonical_object_key_tiers_2608() {
+        for keys in [17usize, 20, 40] {
+            let doc = wide_canonical_object(keys, None);
+            assert!(
+                is_canonical_compact_jq_span(&doc),
+                "expected canonical at {keys} keys: {}",
+                String::from_utf8_lossy(&doc)
+            );
+            assert_eq!(
+                render_compact_jq_by_rerender(&doc).as_deref(),
+                Some(doc.as_slice()),
+                "expected round-trip at {keys} keys"
+            );
+            assert_eq!(
+                render_compact_jq_through_gate(&doc),
+                Some(wide_object_expectation(keys, None)),
+                "gate echo at {keys} keys"
+            );
+        }
+
+        for (keys, first, repeat) in [
+            (20usize, 16usize, 17usize),
+            (20, 1, 17),
+            (24, 1, 20),
+            (20, 17, 18),
+            (24, 17, 20),
+        ] {
+            let duplicate = Some((first, repeat));
+            let doc = wide_canonical_object(keys, duplicate);
+            assert!(
+                !is_canonical_compact_jq_span(&doc),
+                "a duplicate key at ({first}, {repeat}) of {keys} must not certify: {}",
+                String::from_utf8_lossy(&doc)
+            );
+            let want = wide_object_expectation(keys, duplicate);
+            assert_eq!(
+                render_compact_jq_through_gate(&doc),
+                Some(want.clone()),
+                "gate must re-render the collapse at ({first}, {repeat}) of {keys}"
+            );
+            assert_eq!(
+                render_compact_jq_by_rerender(&doc)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned()),
+                Some(want),
+                "re-render at ({first}, {repeat}) of {keys}"
+            );
+        }
+    }
+
+    /// The table tier's third exit, after "seen this key" and "the span
+    /// ended": [`KeyHashes`] stops growing at its own ceiling, and
+    /// `scan_canonical_object` checks `saturated()` after every `insert`
+    /// so it bails there instead of certifying the rest of a very wide
+    /// object against a table that can no longer record anything (#2608
+    /// review).
+    ///
+    /// The width is not negotiable -- `KeyHashes::MAX_SLOTS * 3 / 4`
+    /// exactly, the point `src/jq/document.rs`'s own
+    /// `key_hashes_stops_growing_at_the_ceiling_1588` pins -- so this
+    /// document is ~9 MB and this is deliberately the only test here that
+    /// builds one. It is also why the assertions are cheap: the scan must
+    /// decline, and the gate must still print the document, because the
+    /// re-render of a canonical span *is* that span. Nothing about the
+    /// output changes; only which branch produced it.
+    #[test]
+    fn canonical_echo_bails_when_the_key_table_saturates_2608() {
+        // `KeyHashes::MAX_SLOTS` (`1 << 20`) * 3/4: the key count at which
+        // `insert` would next have doubled a table already at its ceiling,
+        // so `saturated()` first answers `true`. Private to `document.rs`,
+        // hence spelled out here rather than imported.
+        const SATURATES_AT: usize = 786_432;
+
+        let mut doc = String::with_capacity(SATURATES_AT * 13);
+        doc.push('{');
+        // Where the last field's separating comma sits, so the same build
+        // yields the one-key-narrower document below without a second
+        // nine-megabyte pass.
+        let mut before_last_field = 0usize;
+        for i in 0..SATURATES_AT {
+            if i > 0 {
+                doc.push(',');
+            }
+            if i == SATURATES_AT - 1 {
+                before_last_field = doc.len() - 1;
+            }
+            doc.push_str(&format!("\"k{i:06}\":0"));
+        }
+        doc.push('}');
+        let doc = doc.into_bytes();
+
+        assert!(
+            !is_canonical_compact_jq_span(&doc),
+            "a saturating object must bail rather than certify"
+        );
+        // One key short of saturation the same object certifies, which is
+        // what makes the assertion above a statement about the ceiling
+        // and not about width in general.
+        let mut narrower = doc[..before_last_field].to_vec();
+        narrower.push(b'}');
+        assert!(
+            is_canonical_compact_jq_span(&narrower),
+            "one key below the ceiling still certifies"
+        );
+        drop(narrower);
+
+        assert_eq!(
+            render_compact_jq_through_gate(&doc),
+            Some(String::from_utf8_lossy(&doc).into_owned()),
+            "the re-render of a canonical span is the span"
+        );
+    }
+
     /// Same load-bearing direction as the corpus test above --
     /// `is_canonical_compact_jq_span(doc) == true ==>` `doc` round-trips
     /// through the re-render unchanged -- swept over multi-byte-UTF-8-and-
@@ -5988,6 +6185,16 @@ mod tests {
             &[0xF5, 0x80, 0x80, 0x80], // past U+10FFFF
         ];
 
+        /// How many of `STRING_INGREDIENTS`'s entries, from the front,
+        /// are canonical string *content* -- the list above is ordered
+        /// canonical-first on purpose, and the sweep below pins that
+        /// boundary rather than trusting it. `gen_canonical_string` draws
+        /// from this prefix so that a wide object can actually certify.
+        const CANONICAL_STRINGS: usize = 17;
+
+        /// The same, for `NUMBER_INGREDIENTS` below.
+        const CANONICAL_NUMBERS: usize = 11;
+
         const NUMBER_INGREDIENTS: &[&str] = &[
             "0", "1", "-1", "42", "-7", "1.0", "0.10", "-0", "12.345", "9.999", "1000", "1e2",
             "1E5", "007", "+7", "1.", "01.5", "-",
@@ -6017,7 +6224,12 @@ mod tests {
             out.extend_from_slice(n.as_bytes());
         }
 
-        fn gen_value(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+        /// `wide` counts the objects this call tree drew wider than
+        /// `PAIRWISE_SPAN_SCAN_LIMIT`, so the sweep below can assert it
+        /// actually reached `scan_canonical_object`'s table tier instead
+        /// of taking it on trust (`CLAUDE.md`: a fuzz route's weight is
+        /// part of the claim).
+        fn gen_value(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>, wide: &mut usize) {
             if depth == 0 || rng.random_bool(0.35) {
                 match rng.random_range(0..6) {
                     0 => gen_string(rng, out),
@@ -6030,27 +6242,92 @@ mod tests {
                 return;
             }
             if rng.random_bool(0.5) {
-                gen_object(rng, depth, out);
+                gen_object(rng, depth, out, wide);
             } else {
-                gen_array(rng, depth, out);
+                gen_array(rng, depth, out, wide);
             }
         }
 
-        fn gen_array(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+        fn gen_array(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>, wide: &mut usize) {
             out.push(b'[');
             let n = rng.random_range(0..4);
             for i in 0..n {
                 if i > 0 {
                     out.push(b',');
                 }
-                gen_value(rng, depth - 1, out);
+                gen_value(rng, depth - 1, out, wide);
             }
             out.push(b']');
         }
 
-        fn gen_object(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>) {
+        /// One canonical string, drawn from the canonical prefix of
+        /// `STRING_INGREDIENTS` and opened with a fixed-width `f000`
+        /// stamp so that two calls with different `stamp`s are never
+        /// byte-equal by accident (#2608 review).
+        ///
+        /// No ingredient begins with a digit, so the stamp cannot be
+        /// absorbed into a neighbour's content and distinct stamps always
+        /// give distinct spans. That matters for the keys of a wide
+        /// object: a quarter of the draws here are the empty content, so
+        /// an unstamped 20-key object would almost always repeat a key
+        /// and decline, turning the second-tier *accept* sweep vacuous.
+        fn gen_canonical_string(rng: &mut ChaCha8Rng, stamp: usize, out: &mut Vec<u8>) {
+            out.push(b'"');
+            out.extend_from_slice(format!("f{stamp:03}").as_bytes());
+            let picks = rng.random_range(0..4);
+            for _ in 0..picks {
+                out.extend_from_slice(STRING_INGREDIENTS[rng.random_range(0..CANONICAL_STRINGS)]);
+            }
+            out.push(b'"');
+        }
+
+        /// One canonical scalar value, deliberately never a container:
+        /// the point of the wide-object arm below is the key tiers, and
+        /// recursing at that width would multiply the document size at
+        /// every level of nesting.
+        fn gen_canonical_scalar(rng: &mut ChaCha8Rng, out: &mut Vec<u8>) {
+            match rng.random_range(0..5) {
+                0 => gen_canonical_string(rng, 0, out),
+                1 => out.extend_from_slice(b"true"),
+                2 => out.extend_from_slice(b"false"),
+                3 => out.extend_from_slice(b"null"),
+                _ => out.extend_from_slice(
+                    NUMBER_INGREDIENTS[rng.random_range(0..CANONICAL_NUMBERS)].as_bytes(),
+                ),
+            }
+        }
+
+        fn gen_object(rng: &mut ChaCha8Rng, depth: u32, out: &mut Vec<u8>, wide: &mut usize) {
             out.push(b'{');
-            let n = rng.random_range(0..4);
+            // Mostly narrow, but one object in seven is wider than
+            // `PAIRWISE_SPAN_SCAN_LIMIT` (#2608 review). Without this the
+            // generator never left `scan_canonical_object`'s pairwise
+            // tier, so neither the `KeyHashes` seeding nor the table tier
+            // -- nor a duplicate straddling the boundary, which the
+            // `dup_key` draw below now reaches on its own -- was ever
+            // swept here. Kept rare, and drawn just past the limit rather
+            // than far past it, because the document grows multiplicatively
+            // with the width at every level of nesting.
+            let widened = rng.random_bool(0.15);
+            if widened {
+                *wide += 1;
+            }
+            let n = if widened {
+                rng.random_range(17..24)
+            } else {
+                rng.random_range(0..4)
+            };
+            // **Width alone does not reach the second tier.** The scan
+            // stops at the first key or value it cannot certify, and a
+            // field drawn from the full ingredient lists is canonical only
+            // about 60% of the time -- so a 20-field object built that way
+            // survives to its 17th key roughly once in 30,000, and neither
+            // the `KeyHashes` seeding nor the table ever runs. Most wide
+            // objects therefore draw canonical-only content; the rest are
+            // left alone so the decline path is swept at width too. (The
+            // `CLAUDE.md` rule that a fuzz route's weight is part of the
+            // claim: the assertions at the end of this test pin both.)
+            let canonical_content = widened && rng.random_bool(0.8);
             // Occasionally force a repeated key, deliberately -- the
             // duplicate-key rule needs positive coverage from the
             // generator too, not just the hand-picked corpus. `key_0`
@@ -6074,25 +6351,58 @@ mod tests {
                     out.extend_from_slice(&key_0);
                 } else {
                     let key_start = out.len();
-                    gen_string(rng, out);
+                    if canonical_content {
+                        gen_canonical_string(rng, i, out);
+                    } else {
+                        gen_string(rng, out);
+                    }
                     if i == 0 {
                         key_0 = out[key_start..].to_vec();
                     }
                 }
                 out.push(b':');
-                gen_value(rng, depth - 1, out);
+                if canonical_content {
+                    gen_canonical_scalar(rng, out);
+                } else {
+                    gen_value(rng, depth - 1, out, wide);
+                }
             }
             out.push(b'}');
+        }
+
+        // The canonical-prefix boundary both `CANONICAL_*` constants name,
+        // pinned rather than assumed: reorder either ingredient list and
+        // this fails here instead of silently making every wide object
+        // decline again (and the whole second-tier sweep vacuous).
+        for (k, ingredient) in STRING_INGREDIENTS.iter().enumerate() {
+            assert_eq!(
+                is_canonical_compact_jq_span(&json_string_token(ingredient)),
+                k < CANONICAL_STRINGS,
+                "string ingredient {k} is on the wrong side of CANONICAL_STRINGS: {ingredient:?}"
+            );
+        }
+        for (k, ingredient) in NUMBER_INGREDIENTS.iter().enumerate() {
+            assert_eq!(
+                is_canonical_compact_jq_span(ingredient.as_bytes()),
+                k < CANONICAL_NUMBERS,
+                "number ingredient {k} is on the wrong side of CANONICAL_NUMBERS: {ingredient}"
+            );
         }
 
         let mut mismatches = Vec::new();
         let mut gate_mismatches = Vec::new();
         let mut canonical_count = 0usize;
+        let mut wide_documents = 0usize;
+        let mut canonical_wide_documents = 0usize;
         const ITERATIONS: u64 = 2000;
         for seed in 0..ITERATIONS {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             let mut doc = Vec::new();
-            gen_value(&mut rng, 3, &mut doc);
+            let mut wide = 0usize;
+            gen_value(&mut rng, 3, &mut doc, &mut wide);
+            if wide > 0 {
+                wide_documents += 1;
+            }
 
             let checker_says_canonical = is_canonical_compact_jq_span(&doc);
             let rerendered = render_compact_jq_by_rerender(&doc);
@@ -6104,6 +6414,9 @@ mod tests {
             // is what covers those, and covers them more strongly.
             if checker_says_canonical && core::str::from_utf8(&doc).is_ok() {
                 canonical_count += 1;
+                if wide > 0 {
+                    canonical_wide_documents += 1;
+                }
                 // One direction only -- see this test's own doc comment
                 // for why the converse is not asserted here.
                 if !actually_round_trips {
@@ -6151,6 +6464,19 @@ mod tests {
         assert!(
             canonical_count > ITERATIONS as usize / 20,
             "generator produced too few canonical documents to be a meaningful sweep: {canonical_count}/{ITERATIONS}"
+        );
+        // The same sanity check for the *second* key tier, which the
+        // narrow generator never reached (#2608 review): a document has to
+        // carry an object wider than `PAIRWISE_SPAN_SCAN_LIMIT` before the
+        // `KeyHashes` seeding and table paths run at all, and a document
+        // that is also *certified* before either path can have said yes.
+        assert!(
+            wide_documents > ITERATIONS as usize / 20,
+            "generator produced too few wide objects to exercise the table tier: {wide_documents}/{ITERATIONS}"
+        );
+        assert!(
+            canonical_wide_documents > ITERATIONS as usize / 100,
+            "too few generated documents both carried a wide object and were certified canonical -- the table tier's *accept* path is the one a decline can never exercise: {canonical_wide_documents}/{ITERATIONS}"
         );
     }
 
