@@ -285,18 +285,20 @@ fn report_module_load_error(e: &ModuleLoadError) {
     }
 }
 
-/// A [`build_context`] failure that jq treats as a *usage* error --
-/// `--argjson`/`--slurpfile`/`--rawfile` given a bad value, an unreadable
-/// file, or malformed JSON -- as opposed to some other, unrelated
-/// `anyhow::Error` `build_context` might still propagate (#3051).
+/// A [`build_context`] (or [`get_filter`]) failure that jq treats as a
+/// *usage* error -- `--argjson`/`--jsonargs` given a bad value,
+/// `--slurpfile`/`--rawfile` given an unreadable file or malformed JSON,
+/// `-f`/`--from-file` given an unreadable filter file -- as opposed to some
+/// other, unrelated `anyhow::Error` the two might still propagate (#3051,
+/// #3096, #3098).
 ///
 /// Distinguished the same way [`ModuleLoadError`] is: an opaque
 /// `anyhow::Error` routed through `main`'s own top-level `?` prints a
 /// generic two-part `Error: .../Caused by:` block and exits 1, where jq
-/// prints one line prefixed `jq:` (plus, for `--argjson`, a usage-hint
-/// trailer) and exits 2 (`USAGE_ERROR`) -- confirmed live against jq 1.7.1
-/// for all three flags. `message` is pre-formatted by each call site below
-/// so [`report_usage_error`] only has to print it.
+/// prints one line prefixed `jq:` (plus, for `--argjson`/`--jsonargs`, a
+/// usage-hint trailer) and exits 2 (`USAGE_ERROR`) -- each `message` below
+/// confirmed live against jq 1.7.1. `message` is pre-formatted by each call
+/// site below so [`report_usage_error`] only has to print it.
 enum BuildContextError {
     Usage(String),
     Other(anyhow::Error),
@@ -3084,8 +3086,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         Err(BuildContextError::Other(e)) => return Err(e),
     };
 
-    // Get the filter expression
-    let filter_str = get_filter(&args)?;
+    // Get the filter expression. An unreadable `-f`/`--from-file` file is
+    // jq's own usage error (exit 2), so it gets the same two-arm treatment
+    // as the build_context failure above -- mirror that match, don't drift
+    // from it (#3098).
+    let filter_str = match get_filter(&args) {
+        Ok(filter_str) => filter_str,
+        Err(BuildContextError::Usage(message)) => {
+            report_usage_error(&message);
+            return Ok(exit_codes::USAGE_ERROR);
+        }
+        Err(BuildContextError::Other(e)) => return Err(e),
+    };
 
     // The main filter is parsed *twice* (#2395 -- see the re-parse below), and
     // the second result is the one that runs, so a drift between the two in
@@ -3351,10 +3363,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
                 vec![read_stdin_bytes()?]
             } else {
-                files
+                match files
                     .iter()
                     .map(|path| read_file_bytes(path))
-                    .collect::<Result<Vec<_>>>()?
+                    .collect::<std::result::Result<Vec<_>, InputFileOpenError>>()
+                {
+                    Ok(raw) => raw,
+                    Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
+                }
             };
 
             for (file_idx, raw) in raw_inputs.into_iter().enumerate() {
@@ -3484,10 +3500,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
             vec![read_stdin_bytes()?]
         } else {
-            files
+            match files
                 .iter()
                 .map(|path| read_file_bytes(path))
-                .collect::<Result<Vec<_>>>()?
+                .collect::<std::result::Result<Vec<_>, InputFileOpenError>>()
+            {
+                Ok(raw) => raw,
+                Err(unopenable) => return Ok(report_unopenable_input(&unopenable)),
+            }
         };
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
@@ -3852,6 +3872,13 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // position to name. A non-slurped stream keeps its clean prefix
                 // and reports its parse error after it instead (#2961).
                 Ok(Err(e)) => {
+                    // A main input `get_inputs` couldn't open is jq's own
+                    // exit-2 usage error, not a data error (#3098) -- checked
+                    // before the `MalformedJsonError` branch below, which
+                    // drains the `anyhow` channel by consuming `e`.
+                    if let Some(unopenable) = e.downcast_ref::<InputFileOpenError>() {
+                        return Ok(report_unopenable_input(unopenable));
+                    }
                     let err = e.downcast::<MalformedJsonError>()?.to_eval_error();
                     let files = get_input_files(&args);
                     let file = files.first().map(|p| p.to_string_lossy().to_string());
@@ -4154,14 +4181,21 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
         context.positional.push(OwnedValue::String(arg.clone()));
     }
 
-    // Process --jsonargs: values become JSON positional args. Left on the
-    // generic `anyhow` exit-1 path -- real jq also treats a bad --jsonargs
-    // value as a usage error (exit 2), but that's #3051's own scope only for
-    // --argjson/--slurpfile/--rawfile; tracked as a follow-up rather than
-    // folded in here.
+    // Process --jsonargs: values become JSON positional args. A bad value is
+    // jq's own usage error (exit 2), same wording as --argjson above (#3096):
+    // both flags' failures route through `parse_json_value`, so the two
+    // share the identical `invalid JSON text passed to --<flag>` message and
+    // usage-hint trailer -- confirmed live against jq 1.7.1.
     for arg in &args.jsonargs {
-        let json_value =
-            parse_json_value(arg).with_context(|| format!("Invalid JSON for --jsonargs: {arg}"))?;
+        // jq's own wording doesn't name the offending value or position.
+        let json_value = parse_json_value(arg).map_err(|_| {
+            BuildContextError::Usage(
+                "invalid JSON text passed to --jsonargs\n\
+                 Use jq --help for help with command-line options,\n\
+                 or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
+                    .to_string(),
+            )
+        })?;
         context.positional.push(json_value);
     }
 
@@ -4186,11 +4220,25 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 }
 
 /// Get the filter expression from arguments.
-fn get_filter(args: &JqCommand) -> Result<String> {
+///
+/// An unreadable `-f`/`--from-file` filter file is jq's *own* usage error
+/// (exit 2, `jq: Could not open <path>: <detail>`), not a generic `anyhow`
+/// exit-1 failure (#3098) -- and its wording deliberately lacks both the
+/// `error:` prefix and the `file` noun the main input file's own
+/// `jq: error: Could not open file ...` uses (confirmed live against jq
+/// 1.7.1), so it flows through [`BuildContextError::Usage`] like
+/// [`build_context`]'s flag errors rather than sharing the main-input
+/// wording.
+fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
     if let Some(ref path) = args.from_file {
-        // Filter comes from file
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read filter file: {}", path.display()))?;
+        // Filter comes from file.
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            BuildContextError::Usage(format!(
+                "Could not open {}: {}",
+                path.display(),
+                strerror_only(&e)
+            ))
+        })?;
         Ok(contents.trim().to_string())
     } else if let Some(ref filter) = args.filter {
         Ok(filter.clone())
@@ -4301,7 +4349,12 @@ fn get_inputs(
         for (idx, path) in files.iter().enumerate() {
             match read_file_bytes(path) {
                 Ok(b) => inputs.push((Some(idx), b)),
-                Err(e) => return Ok(Err(e)),
+                // A main input `read_file_bytes` couldn't open is jq's own
+                // exit-2 usage error (#3098); the caller downcasts it back
+                // out of the `anyhow` channel here. `e.into()` converts the
+                // concrete [`InputFileOpenError`] into the `anyhow::Error`
+                // this `Result<Inputs, _>` carries.
+                Err(e) => return Ok(Err(anyhow::Error::from(e))),
             }
         }
         inputs
@@ -5034,8 +5087,63 @@ fn read_stdin_bytes() -> Result<Vec<u8>> {
 }
 
 /// Read a file to bytes.
-fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))
+///
+/// A file `std::fs::read` cannot open is an [`InputFileOpenError`], not a
+/// generic `anyhow` failure: jq reports a main input it cannot open with its
+/// own one-line diagnostic at exit 2, so the call sites convert it back
+/// (via [`report_unopenable_input`], or `get_inputs`' caller's downcast)
+/// rather than letting it escape as `Error: .../Caused by:` at exit 1
+/// (#3098).
+fn read_file_bytes(path: &Path) -> std::result::Result<Vec<u8>, InputFileOpenError> {
+    std::fs::read(path).map_err(|e| InputFileOpenError::new(path, strerror_only(&e)))
+}
+
+/// A main input file [`read_file_bytes`] couldn't open (#3098).
+///
+/// jq reports an unreadable main input with `jq: error: Could not open file
+/// <path>: <detail>` at exit 2 (`USAGE_ERROR`) -- not the generic exit-1
+/// `Error: .../Caused by:` block -- confirmed live against jq 1.7.1 for
+/// both a plain `jq '.' file` invocation and `jq 'inputs' file`. Modeled on
+/// [`MalformedJsonError`]: a concrete `std::error::Error` the `anyhow`
+/// channels in `run_jq`/`get_inputs` carry so the call sites can `downcast`
+/// it back into jq's own diagnostic shape. The `error:` prefix (present
+/// here, absent from `-f`'s own "Could not open" wording -- see
+/// [`get_filter`]) lives in `Display`, so the same string paints the whole
+/// [`report_usage_error`] line.
+#[derive(Debug)]
+pub struct InputFileOpenError {
+    path: PathBuf,
+    detail: String,
+}
+
+impl InputFileOpenError {
+    fn new(path: &Path, detail: String) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            detail,
+        }
+    }
+}
+
+impl std::fmt::Display for InputFileOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "error: Could not open file {}: {}",
+            self.path.display(),
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for InputFileOpenError {}
+
+/// Report an [`InputFileOpenError`] the way jq does and answer with the exit
+/// code jq takes for it: `jq: error: Could not open file <path>: <detail>`,
+/// exit 2 (`USAGE_ERROR`) (#3098).
+fn report_unopenable_input(e: &InputFileOpenError) -> i32 {
+    report_usage_error(&e.to_string());
+    exit_codes::USAGE_ERROR
 }
 
 /// Incremental version of [`line_at`] for a caller visiting a monotonically

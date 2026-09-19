@@ -795,22 +795,78 @@ fn test_bad_argjson_slurpfile_rawfile_exit_2_not_1_3051() -> Result<()> {
     Ok(())
 }
 
-/// `--jsonargs` shares `parse_json_value` with `--argjson` (#2052) and has
-/// the identical exit-1-through-anyhow bug #3051 fixes for the other three
-/// flags -- confirmed live that jq exits 2 here too -- but #3051 named only
-/// `--argjson`/`--slurpfile`/`--rawfile`, so this one stays on the generic
-/// `anyhow` path deliberately, tracked as its own follow-up (#3096). Pins
-/// *today's* (still-1) exit code as a regression anchor: #3096's fix should
-/// flip this assertion, not discover it by accident.
+/// #3096: a bad `--jsonargs` value is jq's own usage error, exactly like
+/// `--argjson` (#3051): exit 2 with `invalid JSON text passed to --jsonargs`
+/// plus the same usage-hint trailer -- not the generic `anyhow` exit-1
+/// (`Error: .../Caused by:`) it used to fall through to. Wording pinned
+/// against the live pinned jq 1.7.1 (same argv0 substitution the #3051 test
+/// above already applies).
 #[test]
-fn test_bad_jsonargs_still_exits_1_pending_3096() -> Result<()> {
+fn test_bad_jsonargs_exit_2_not_1_3096() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--jsonargs", "[1,"], None)?;
-    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert!(
-        stderr.starts_with("Error: Invalid JSON for --jsonargs: [1,"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr,
+        "jq: invalid JSON text passed to --jsonargs\n\
+         Use jq --help for help with command-line options,\n\
+         or see the jq manpage, or online docs  at https://jqlang.github.io/jq\n"
     );
+    Ok(())
+}
+
+/// #3098: an unreadable `-f`/`--from-file` filter file and an unreadable
+/// main input file are jq's own usage errors (exit 2) -- not the generic
+/// exit-1 `anyhow` route (`Error: .../Caused by:`) each used to take. The
+/// two wordings differ from each other (no `error:` prefix or `file` noun
+/// for `-f`; both present for the main input) and from `--slurpfile`/
+/// `--rawfile`'s own `Bad JSON in --X ...` wrapper (#3051), so each is
+/// pinned byte-for-byte against the live pinned jq 1.7.1 separately --
+/// both exit codes and both message shapes confirmed live.
+#[test]
+fn test_bad_from_file_and_main_input_exit_2_not_1_3098() -> Result<()> {
+    // -f/--from-file: missing filter file, exit 2.
+    let (stdout, stderr, code) = run_jq_full(&["-f", "/nonexistent"], Some("{}"))?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: Could not open /nonexistent: No such file or directory\n"
+    );
+
+    // Main input file, plain `.` filter -- the lazy (raw-bytes) path.
+    let (stdout, stderr, code) = run_jq_full(&[".", "/nonexistent"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error: Could not open file /nonexistent: No such file or directory\n"
+    );
+
+    // Main input file through the `inputs` builtin -- the materializing
+    // path, which routes the read through `get_inputs` rather than the
+    // lazy path's raw-bytes collect, so it exercises the downcast back out
+    // of the `anyhow` channel.
+    let (stdout, stderr, code) = run_jq_full(&["inputs", "/nonexistent"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error: Could not open file /nonexistent: No such file or directory\n"
+    );
+
+    // DSV input mode (--input-dsv) routes its main-input read through the
+    // same exit-2 path. jq itself has no DSV mode, so there is no oracle
+    // for this one -- the wording is succinctly's own, asserted only so a
+    // future refactor can't silently route it back to exit 1.
+    let (stdout, stderr, code) = run_jq_full(&["--input-dsv", ",", ".", "/nonexistent"], None)?;
+    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error: Could not open file /nonexistent: No such file or directory\n"
+    );
+
     Ok(())
 }
 
@@ -30553,20 +30609,32 @@ fn test_jq_malformed_object_raises_off_the_lazy_path_1194() -> Result<()> {
         assert!(!out.contains("{}"), "{args:?}: out: {out:?}");
     }
 
-    // A genuine I/O failure still takes the `anyhow` path and exits 1 --
-    // the downcast must separate the two, not swallow everything.
+    // A genuine I/O failure is still not a document error, even off the
+    // lazy path: #3098 routes a missing main input file to jq's own exit-2
+    // usage diagnostic (`jq: error: Could not open file ...`) instead of
+    // the `anyhow` exit-1 it used to take -- and never to the
+    // malformed-document exit 5. The downcast in the *materializing*
+    // branch must keep all three channels separate; asserting each spelling
+    // so a future change can't re-swallow one into another.
     //
     // `-s` is load-bearing, not decoration: the downcast being tested lives
     // in the *materializing* branch of `run_jq`, and a bare `-c .` leaves
-    // `can_use_lazy_path` true, so it never reaches that branch at all and
-    // exits 1 from a different place entirely. Both spellings are asserted
-    // so the coincidence cannot be mistaken for coverage again.
+    // `can_use_lazy_path` true, so the lazy spelling below exits 2 from a
+    // different place entirely. Both spellings are asserted so the
+    // coincidence cannot be mistaken for coverage again.
     for args in [
         &["-c", ".", "/nonexistent-file-1194"][..],
         &["-c", "-s", ".", "/nonexistent-file-1194"][..],
     ] {
         let (_out, stderr, code) = run_jq_full(args, None)?;
-        assert_eq!(code, 1, "{args:?}: a missing file is not a document error");
+        assert_eq!(
+            code, 2,
+            "{args:?}: a missing main input is jq's exit-2 usage error (#3098)"
+        );
+        assert!(
+            stderr.contains("jq: error: Could not open file /nonexistent-file-1194"),
+            "{args:?} must report the open failure in jq's channel: {stderr:?}"
+        );
         assert!(
             !stderr.contains("Invalid JSON text"),
             "{args:?} must not be reported as a malformed document: {stderr:?}"

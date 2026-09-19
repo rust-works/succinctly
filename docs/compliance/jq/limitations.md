@@ -7592,13 +7592,25 @@ that never reads `$x`). Not the scope of this issue either: it is a pre-existing
 this crate's whole `--rawfile`/`--slurpfile` pipeline being built on `String`, not something
 #3051 introduces or narrows.
 
-`--jsonargs` has the identical exit-1 bug (confirmed live: jq exits 2 for a bad `--jsonargs`
-value too) but is left unfixed here, filed as
-[#3096](https://github.com/rust-works/succinctly/issues/3096) instead of folded into this
-issue's own narrower scope. `-f`/`--from-file` and the main input file have the same bug too,
-filed as [#3098](https://github.com/rust-works/succinctly/issues/3098) — jq's own wording
-differs between those two and from `--slurpfile`/`--rawfile`'s wrapper here, so neither reuses
-this fix's message shape directly.
+`--jsonargs`, `-f`/`--from-file`, and the main input file had the same exit-1 bug (confirmed
+live: jq exits 2 for a bad `--jsonargs` value, an unreadable filter file, and an unreadable
+main input file) and are now fixed too. [#3096](https://github.com/rust-works/succinctly/issues/3096)
+routes a bad `--jsonargs` value through the exact `--argjson` wording above (same
+`invalid JSON text passed to --<flag>` line and usage-hint trailer); [#3098](https://github.com/rust-works/succinctly/issues/3098)
+gives `-f` its own `jq: Could not open <path>: <detail>` shape and the main input file its
+own `jq: error: Could not open file <path>: <detail>` shape. All five wordings confirmed live
+against jq 1.7.1 — the main input-file one deliberately differs from `-f`'s (no `error:`
+prefix or `file` noun there) and from `--slurpfile`/`--rawfile`'s wrapper above, so none of
+their message shapes was reusable for it.
+
+Two jq behaviors around an unreadable main input remain unmatched here, both pre-existing and
+orthogonal to the exit-code class above: jq reports *every* file it cannot open (one `jq: error:
+Could not open file ...` line per missing file) and keeps processing the files that did open,
+where succinctly stops at the first failure — `sjq -c . missing valid` prints the one error and
+exits 2 with no output, where `jq -c . missing valid` at the same exit code still prints the
+filtered content of `valid` after its error line. Under `-s` the same gap lets `jq` slurp the
+readable files into output (`[]` when none opened) while still exiting 2; succinctly emits no
+output. Both are unfiled follow-ups to the exit-code change, not part of its scope.
 
 ## Provenance
 
