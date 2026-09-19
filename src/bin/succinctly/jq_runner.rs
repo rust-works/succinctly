@@ -7264,7 +7264,7 @@ fn owned_raw_str<'v>(value: &'v OwnedValue, config: &OutputConfig) -> Option<Cow
 ///
 /// Also serves the eager `-n`/`--slurp`/DSV-input route (formerly a separate
 /// `write_output`, which formatted through `format_json` unconditionally for
-/// every config, including plain `-c`): `write_output_owned_value_matches_old_write_output_3009`
+/// every config, including plain `-c`): `write_output_owned_value_matches_old_write_output_3155`
 /// proves the fast branch is byte-identical to that route's old
 /// always-`format_json` output before this function took over its call
 /// sites, the same discipline as the differential test against
@@ -9996,7 +9996,7 @@ mod tests {
         }
     }
 
-    /// #3009 follow-up: `write_output_owned_value` now also serves the
+    /// #3155: `write_output_owned_value` now also serves the
     /// `-n`/`--slurp`/DSV-input route that used to be a separate
     /// `write_output`, which formatted through `format_json` unconditionally
     /// for every config and never took `print_owned_json`'s fast path. This
@@ -10007,7 +10007,7 @@ mod tests {
     /// terminator) as the oracle since the function itself no longer exists
     /// to call directly.
     #[test]
-    fn write_output_owned_value_matches_old_write_output_3009() {
+    fn write_output_owned_value_matches_old_write_output_3155() {
         fn old_write_output<Out: Write>(
             out: &mut Out,
             value: &OwnedValue,
@@ -10056,7 +10056,7 @@ mod tests {
     /// `test_partial_result_over_depth_value_reports_cleanly_not_panic_1371`
     /// true) and by `evaluate_input_streaming` on the eager
     /// `-n`/`--slurp`/DSV route (which keeps
-    /// `test_eager_over_depth_value_reports_cleanly_3009` true -- the gate the
+    /// `test_eager_over_depth_value_reports_cleanly_3155` true -- the gate the
     /// writer merge first shipped without). It stays as a backstop against a future caller that skips that
     /// gate, so it is covered here directly rather than left as an
     /// unexercised line.
