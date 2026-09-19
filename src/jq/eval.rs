@@ -766,10 +766,13 @@ pub(crate) fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Option<Cow
 /// as `eval_generic`'s `path_context_route`/`with_file_origin`: the sites
 /// that consult it are many recursion levels below the sites that establish
 /// it, and this codebase has no evaluation-environment parameter for it to
-/// ride on. [`yq_read_only_context::suspend`] is the other half of that:
+/// ride on. [`yq_read_only_context::restore`] is the other half of that:
 /// operand evaluation here is demand-driven, so the *consumer* of an
 /// operand's outputs runs on the stack inside the producing call and must
-/// not inherit the scope.
+/// run under the scope that was active before the operand's own entry --
+/// `false` for an un-nested operand (`.zzz + 1 | .yyy` reads `.yyy`
+/// normally), but the enclosing `true` when the operand is itself nested
+/// inside another operand's scope (#3047).
 ///
 /// `#[cfg(feature = "std")]` only, same limitation as its two siblings named
 /// above: a `no_std` embedding has no `thread_local!`, so the scope is never
