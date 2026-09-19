@@ -123,6 +123,20 @@ NAV = [".a", ".c", ".x", ".x.a", ".b?", ".arr[0]?", ".arr[]?"]
 LITERAL = ["5", "null", "true", "\"z\""]
 PASSTHROUGH = ["select(true)", "if true then . else 1 end", "try . catch 1", "(label $out | .)", ". as $q | ."]
 MOVES = ["([.a] | first)", "{k: .a}", "[.a]", "(tojson | fromjson)", "([1] | first)"]
+# #2889: identity-preserving stages jq keeps the *same* `jv` through --
+# embedding `.` into a container and extracting it back out (an object/array
+# member, a fold accumulator that returns its input, `add`/`min`/`max` of
+# one element, an empty-operand `+`/`*`, a `getpath` readback). Drawn
+# alongside PASSTHROUGH wherever it sits between a bind and its use, so a
+# generated program can interleave embed stages with the plain passthroughs
+# instead of only ever emitting one kind between `. as $x`/`SRC as $y` and
+# the eventual `$x`/`$y` reference.
+EMBEDS = [
+    "({k:.} | .k)", "(. + {})", "([.] | add)", "(reduce empty as $i (.; .))",
+    "([.,.] | .[1])", "({k:{j:.}} | .k.j)", "([.] | min)", "(. * {})",
+    "(. + null)", "(null + .)", "([] + [.] | .[0])", "([[.]] | .[0][0])",
+    "({k:.} | getpath([\"k\"]))",
+]
 USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "($v | .b?)",
         "$v[0:1]?", "(.a[0:1]? | $v)", "(.arr[-1]? | $v)", "recurse(if . == $v and type == \"object\" then $v.b? else empty end)",
         "$v as $w | $w", "reduce (1) as $i (.; $v)", "reduce (1) as $i (.a; $v)", "reduce (1) as $i (.a; 5 | $v)",
@@ -277,6 +291,14 @@ REBUILDS = [
     "(try . catch 1)", "(label $l | .)", "reduce empty as $i (.; .)", "([.] | first)",
     "limit(1; .)", "(. + null)", "(to_entries | from_entries)", "(with_entries(.))",
     "({a: .a, c: .c, d: .d, x: .x})", "(.x | {a: .a, c: .c})",
+    # #2889: these ROUTES-family stages must keep refusing even though the
+    # bare-embed twin some of them shadow (`{k: .} | .k`, `. + {}`, `. +
+    # null`, `reduce empty as $i (.; .)` -- already above) is recovered by
+    # the generic evaluator's own embed table; every route this pool feeds
+    # (`input`, a fold's UPDATE, a `|=` RHS, `with_entries`, a `catch`
+    # handler) runs through `eval.rs`'s owned-value evaluator instead, which
+    # stays refuse-only until Stage B (docs/plan/jq-bind-origin-frame.md).
+    "({} + .)", "(. + {a:1})", "([.[]])", "map(.)", "({k:{a:1}} | .k)",
 ]
 # Writes and reads through the root marker; every key is present in `doc`.
 ROOT_USES = [
@@ -315,7 +337,7 @@ def value_bind_program(rng, d):
     elif r < 0.8:
         nav = rng.choice(VALUE_BIND_SOURCES)
     else:
-        nav = src + " | " + rng.choice(REBUILDS[:4] + PASSTHROUGH + ["first(.)", "(. // 1)"])
+        nav = src + " | " + rng.choice(REBUILDS[:4] + PASSTHROUGH + EMBEDS + ["first(.)", "(. // 1)"])
     use = rng.choice(VALUE_BIND_USES)
     body = f"{src} as $y | {nav} | {use}"
     return rng.choice(ROUTES) % body
@@ -346,7 +368,7 @@ def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
     if r < 0.55: return rng.choice(LITERAL)
-    if r < 0.7: return rng.choice(PASSTHROUGH)
+    if r < 0.7: return rng.choice(PASSTHROUGH + EMBEDS)
     if r < 0.8: return rng.choice(MOVES)
     return rng.choice(USES).replace("$v", v)
 
@@ -429,6 +451,7 @@ def main():
     if a.self_test:
         for name, pool in [("PREFIX", PREFIX), ("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV),
                            ("LITERAL", LITERAL), ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES),
+                           ("EMBEDS", EMBEDS),
                            ("USES", USES), ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
                            ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES),
                            ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES)]:
