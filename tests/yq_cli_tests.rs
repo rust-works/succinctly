@@ -34611,7 +34611,30 @@ fn test_yq_namespaced_call_whitespace_around_colons_is_a_syntax_error() -> Resul
     Ok(())
 }
 
-/// #1909: `Builtin::Path` and the `Expr::Pipe` path-context arm now call
+/// #3029: real yq v4.53.3 diverges from real jq on both pseudo-variables'
+/// binding behavior, and the shared parser's jq-mode-only checks keep
+/// succinctly yq on yq's side of each:
+///
+/// - `$__loc__` as a binding name is a *syntax error* in jq but an ordinary
+///   binding in yq (`1 as $__loc__ | 2` → `2`, confirmed live), so the
+///   parser's reject is jq-mode-only and succinctly yq keeps accepting it.
+/// - `$ENV` shadows like any other `as`-binding in yq (`1 as $ENV | $ENV` →
+///   `1`, confirmed live), which the resolve-side rewrite (shared, and not
+///   gated) now reproduces; the unbound `$ENV` row is a pre-existing
+///   divergence outside this issue's scope (real yq answers empty, succinctly
+///   answers the environment object).
+#[test]
+fn test_yq_loc_and_env_matches_real_yq_3029() -> Result<()> {
+    let (out, code) = run_yq_stdin("1 as $__loc__ | 2", "a: 1\n", &["-n"])?;
+    assert_eq!(code, 0, "stdout: {out}");
+    assert_eq!(out.trim(), "2");
+
+    let (out, code) = run_yq_stdin("1 as $ENV | $ENV", "a: 1\n", &["-n"])?;
+    assert_eq!(code, 0, "stdout: {out}");
+    assert_eq!(out.trim(), "1");
+
+    Ok(())
+}
 /// `eval.rs`'s `builtin_path_on_owned`/the deleted eager path-context evaluator
 /// directly instead of routing through `eval_on_owned`'s serialize +
 /// re-index bridge. That bridge is also where `to_json_for_reindex`'s

@@ -1826,8 +1826,28 @@ fn check(
         | Expr::Not
         | Expr::Format(_)
         | Expr::TrackedVar(_)
-        | Expr::Loc { .. }
-        | Expr::Env => {}
+        | Expr::Loc { .. } => {}
+
+        // #3029: `$ENV` is an ordinary, shadowable binding in jq (and in
+        // real yq -- both oracles answer `1` for `1 as $ENV | $ENV`,
+        // confirmed live). The parser lowers *every* `$ENV` reference to
+        // `Expr::Env` at parse time with no knowledge of enclosing bindings
+        // (`dollar_var_expr` in `parser.rs`), so that decision is deferred
+        // to here, the one scope-aware walk over the freshly parsed tree:
+        // when the name `ENV` is bound in the lexical `var_scope`, the
+        // reference becomes a plain `Expr::Var("ENV")`, which both
+        // evaluators already resolve against the runtime scope -- no
+        // evaluation rule needs its own shadowing case. An unbound
+        // reference keeps `Expr::Env` and reads the environment object.
+        // The lexical `def f: $ENV; 1 as $ENV | f` row stays on the
+        // environment because a `def` body is descended at its own textual
+        // scope (`var_scope` is truncated before `then`), so the body's
+        // `$ENV` never sees the later `as` binding.
+        Expr::Env => {
+            if in_var_scope(var_scope, "ENV").hit.is_some() {
+                *expr = Expr::Var("ENV".to_string());
+            }
+        }
 
         // #2964: real jq rejects `break $name` at *compile* time (exit 3)
         // when there is no lexically enclosing `label $name`, reporting

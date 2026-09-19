@@ -2307,7 +2307,132 @@ fn test_loc_top_level_2688() -> Result<()> {
     Ok(())
 }
 
-/// #2774: `$__loc__` inside a def sourced from an `include`d module reports
+/// #3029: `$__loc__` is a distinct pseudo-variable token in jq's own lexer,
+/// not `'$' IDENT`, so it cannot be used as a *binding* name at any binding
+/// site -- `def` `$`-params, `as`, `reduce`/`foreach`, array/object
+/// destructuring, and `?//` alternatives are all syntax errors (exit 3) in
+/// jq 1.7.1. succinctly used to accept every one of them (ignoring the
+/// binding and still answering `$__loc__` with the location). The message
+/// wording now matches jq's (the `(Unix shell quoting issues?)` suffix and
+/// the column padding remain part of the generic syntax-error divergence
+/// recorded in `docs/compliance/jq/limitations.md`); the `expecting` list
+/// differs per production exactly as jq's bison states report it, and the
+/// `{$name}` shorthand forms have none at all. Every row below was
+/// cross-checked live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_loc_is_not_a_binding_name_3029() -> Result<()> {
+    for (filter, expecting) in [
+        (
+            "def h($__loc__): 1; h(1)",
+            "syntax error, unexpected $__loc__, expecting IDENT or BINDING",
+        ),
+        (
+            "1 as $__loc__ | $__loc__",
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+        (
+            "reduce 1 as $__loc__ (0; .)",
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+        (
+            "foreach 1 as $__loc__ (0; .)",
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+        (
+            "[1] as [$__loc__] | 2",
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+        (
+            r#"{"a":1} as {"a": $__loc__} | 2"#,
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+        (
+            "1 as $x ?// $__loc__ | 2",
+            "syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'",
+        ),
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 3, "{filter:?}: stderr: {stderr:?}");
+        assert!(
+            stderr.contains(&format!("jq: error: {expecting} at <top-level>, line 1:\n")),
+            "{filter:?}: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter:?}: stderr: {stderr:?}"
+        );
+    }
+
+    // The `{$name}`/`{$name: Pattern}` shorthand reports a bare
+    // `unexpected $__loc__` with no expecting list.
+    for filter in [
+        r#"{"a":1} as {$__loc__} | 2"#,
+        r#"{"a":1} as {$__loc__: .x} | 2"#,
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-n", filter], None)?;
+        assert_eq!(code, 3, "{filter:?}: stderr: {stderr:?}");
+        assert!(
+            stderr
+                .contains("jq: error: syntax error, unexpected $__loc__ at <top-level>, line 1:\n"),
+            "{filter:?}: stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter:?}: stderr: {stderr:?}"
+        );
+    }
+
+    // A *bare* `__loc__` parameter stays an ordinary identifier (`def
+    // h(__loc__): 1; h(1)` answers `1` in both jq and succinctly).
+    let (stdout, code) = run_jq_null("def h(__loc__): 1; h(1)", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
+    Ok(())
+}
+
+/// #3029: `$ENV` is an ordinary, shadowable binding in jq -- an inner
+/// `as $ENV` / `def f($ENV)` wins lexically over the environment. succinctly
+/// used to answer the environment object for every `$ENV` reference because
+/// `dollar_var_expr` lowers them all to `Expr::Env` at parse time; the
+/// lexical rewrite now lives in resolve's scope walk. Every row below was
+/// cross-checked live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_bound_env_shadows_the_environment_3029() -> Result<()> {
+    for (filter, expected) in [
+        ("1 as $ENV | $ENV", "1"),
+        ("def h($ENV): $ENV; h(1)", "1"),
+        ("1 as $ENV | 1 as $ENV | $ENV", "1"),
+        ("reduce 1 as $ENV (2; $ENV)", "1"),
+        ("foreach 1 as $ENV (2; $ENV) | .", "1"),
+        (r#"{"a":1} as {"a": $ENV} | $ENV"#, "1"),
+        ("[1] as [$ENV] | $ENV", "1"),
+    ] {
+        let (stdout, code) = run_jq_null(filter, &["-c"])?;
+        assert_eq!(code, 0, "{filter:?}: stdout: {stdout:?}");
+        assert_eq!(stdout.trim(), expected, "{filter:?}");
+    }
+
+    // Indexing a bound (non-environment) `$ENV` fails like any other bound
+    // number, not by silently going through the environment table.
+    let (_, stderr, code) = run_jq_full(&["-nc", "1 as $ENV | $ENV.x"], None)?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Cannot index number with string \"x\""),
+        "stderr: {stderr:?}"
+    );
+
+    // Lexical scope: a `def`'s body keeps the environment at its own textual
+    // position; the lazy `1 as $ENV | f` call cannot see the later binding.
+    let (env_out, _) = run_jq_null("$ENV", &["-c"])?;
+    let (def_env_out, code) = run_jq_null("def f: $ENV; 1 as $ENV | f", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        def_env_out.trim(),
+        env_out.trim(),
+        "the def-body `$ENV` must still answer the environment object"
+    );
+    Ok(())
+}
 /// that module's own canonical (symlink-resolved) file path, not
 /// `"<top-level>"`. Line stays module-relative -- already correct before
 /// this fix, since each module is parsed on its own -- so a multi-line def
