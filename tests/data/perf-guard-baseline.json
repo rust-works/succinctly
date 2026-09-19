@@ -16,19 +16,21 @@
     "wide_keys_unsorted": 288016177
   },
   "x86_64": {
-    "arrays_first_map_iterate": 125137212,
-    "arrays_identity": 681945875,
-    "arrays_map_iterate": 1182882059,
-    "users_assign_scores": 1158563767,
-    "users_del_bound_select": 1203672368,
-    "users_del_select": 1172170233,
-    "users_identity": 330666183,
-    "users_keys_unsorted": 65968142,
-    "users_path_walk": 318278801,
-    "users_yq_del_select": 3128344506,
-    "users_yq_keys_unsorted": 82728369,
-    "wide_escaped_keys_unsorted": 375206419,
-    "wide_identity": 565637300,
-    "wide_keys_unsorted": 348290533
+    "arrays_first_map_iterate": 125318532,
+    "arrays_identity": 682127785,
+    "arrays_map_iterate": 1173384577,
+    "users_assign_scores": 1158565165,
+    "users_compact_identity": 99549523,
+    "users_compact_latefail": 354410760,
+    "users_del_bound_select": 1203790670,
+    "users_del_select": 1172275879,
+    "users_identity": 330724594,
+    "users_keys_unsorted": 66026299,
+    "users_path_walk": 318374179,
+    "users_yq_del_select": 3128603446,
+    "users_yq_keys_unsorted": 82786118,
+    "wide_escaped_keys_unsorted": 375297886,
+    "wide_identity": 565737737,
+    "wide_keys_unsorted": 348390380
   }
 }
