@@ -3763,16 +3763,24 @@ Two deliberate remainders:
   a `%*s` whose width follows the failing node's start column for a simple undefined name but
   points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
   trailing whitespace either way.
-- **`succinctly` tolerates whitespace around `::` in a namespaced call
-  (`mymod :: func`); both reference tools reject it outright as a syntax
-  error.** `Parser::parse_func_call_or_error`/`parse_namespaced_call`
-  (`src/jq/parser.rs`) both `skip_ws()` around the `::` token; jq 1.7.1 and
-  yq v4.53.3 both treat it as a single non-whitespace-separated token
-  (confirmed live: `unexpected ':'` / `lexer: invalid input text`, neither
-  ever reaching a "not defined" diagnostic). Not a deliberate ADR-0018
-  extension — an undetected pre-existing leniency, found incidentally while
-  adding `report_unresolved_call` coverage for #2964. Tracked as
-  [#3116](https://github.com/rust-works/succinctly/issues/3116).
+- **Closed: whitespace around `::` in a namespaced call (`mymod :: func`) is
+  now a syntax error, matching both reference tools.**
+  [#3116](https://github.com/rust-works/succinctly/issues/3116) removed the
+  `skip_ws()` calls `Parser::parse_func_call_or_error` and
+  `parse_namespaced_call` (`src/jq/parser.rs`) applied around the `::` token:
+  the token is now checked immediately after the namespace identifier, and the
+  function name must follow the `::` immediately — with jq's whitespace
+  tolerance before `(` (`map (.*2)`, `f (1)`) preserved on both sides. jq
+  1.7.1 and yq v4.53.3 both treat `::` as a single non-whitespace-separated
+  token (confirmed live: `unexpected ':'` / `lexer: invalid input text`,
+  neither ever reaching a "not defined" diagnostic). Verified byte-for-byte
+  against jq: `mymod::func` and `mymod::func (1)` keep jq's exact
+  `.../N is not defined at <top-level>, line 1:` with source echo, and
+  `mymod :: func`, `mymod:: func`, `mymod ::func`, `mymod  ::  func` all exit
+  3 with `jq: 1 compile error`; yq mode exits 1 with a parse error. The
+  adjacent form's yq-mode acceptance (`module not loaded`, #1473) is a
+  pre-existing extension — yq keeps jq's whole language surface including the
+  module system — and is unaffected.
 
 Every builtin the pinned jq defines is implemented since #3042 (the libm family) and #3046
 (`JOIN`, `format`, `input_filename`, ...). The roster captured from the pinned oracle

@@ -6349,38 +6349,57 @@ fn test_namespaced_call_to_unimported_namespace_is_a_compile_error_1473() -> Res
     Ok(())
 }
 
-/// `report_unresolved_call`'s text-search fallback normally finds the
-/// failing call's real position by searching `source` for the exact
-/// `name/arity` string `rewrite_namespaced_calls` built (`{namespace}::{name}`,
-/// no spaces) -- but succinctly's own parser tolerates whitespace around `::`
-/// (`Parser::parse_func_call_or_error`/`parse_namespaced_call` both
-/// `skip_ws()` around the token), so that whitespace survives into the AST's
-/// `namespace`/`name` parts untouched and the rebuilt `mymod::func` search
-/// string no longer matches the source's own spacing byte-for-byte -- the
-/// search comes back empty, and the fallback drops the line marker and
-/// source echo entirely, printing only the bare `at <location>` form.
-///
-/// **This is not jq/yq-verified behavior.** Live-checked against both
-/// oracles while writing this test: real jq 1.7.1 and real yq v4.53.3 both
-/// reject `mymod :: func` outright as a syntax error (`unexpected ':'` /
-/// `lexer: invalid input text`), never reaching a "not defined" diagnostic
-/// at all. succinctly's whitespace tolerance here is a pre-existing,
-/// undocumented divergence, unrelated to #2964's own change -- tracked as
-/// [#3116](https://github.com/rust-works/succinctly/issues/3116). This test
-/// exists only to pin `report_unresolved_call`'s own fallback behavior given
-/// that leniency, not to claim it matches either reference tool.
+/// Both reference tools require `::` in a namespaced call to be strictly
+/// adjacent to the namespace identifier and the function name; any whitespace
+/// around the token is a syntax error, never a namespaced call (confirmed
+/// live: jq 1.7.1 raises `syntax error, unexpected ':'` and yq v4.53.3
+/// `lexer: invalid input text`). Since #3116, `Parser::parse_func_call_or_error`
+/// checks for `::` before `skip_ws()`, and `parse_namespaced_call` parses the
+/// function name with no `skip_ws()` after the token, so these four shapes are
+/// all compile errors (exit 3) — they never reach an unresolved-call
+/// diagnostic. This replaces the test that used to pin the bare `at <top-level>`
+/// diagnostic the leniency produced (a behavior neither reference tool emits).
 #[test]
-fn test_namespaced_call_with_whitespace_around_colons_loses_its_position() -> Result<()> {
-    let (output, code) = spawn_jq(&["-n", "mymod :: func"], None)?;
+fn test_namespaced_call_whitespace_around_colons_is_a_syntax_error() -> Result<()> {
+    for filter in [
+        "mymod :: func",
+        "mymod  ::  func",
+        "mymod:: func",
+        "mymod ::func",
+    ] {
+        let (output, code) = spawn_jq(&["-n", filter], None)?;
+        let stderr = String::from_utf8(output.stderr)?;
 
+        assert_eq!(code, 3, "{filter:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter:?}: stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("is not defined"),
+            "{filter:?} must be a syntax error, not an unresolved call: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// The adjacent form (`mymod::func`) keeps byte-for-byte jq parity: it still
+/// parses as a namespaced call, and `report_unresolved_call`'s text-search
+/// fallback (the call-site table never records a namespaced call —
+/// `parse_namespaced_call` has no `call_sites.push`) finds the source's own
+/// `mymod::func` exactly, so line marker and source echo both survive.
+#[test]
+fn test_namespaced_call_adjacent_reports_jq_parity_diagnostic() -> Result<()> {
+    let (output, code) = spawn_jq(&["-n", "mymod::func"], None)?;
     let stderr = String::from_utf8(output.stderr)?;
 
     assert_eq!(code, 3, "stderr: {stderr}");
-    assert!(
-        stderr.contains("jq: error: mymod::func/0 is not defined at <top-level>\n"),
-        "stderr: {stderr}"
+    assert_eq!(
+        stderr,
+        "jq: error: mymod::func/0 is not defined at <top-level>, line 1:\n\
+         mymod::func\n\
+         jq: 1 compile error\n"
     );
-    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
 }
 

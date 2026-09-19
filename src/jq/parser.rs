@@ -3623,14 +3623,19 @@ impl<'a> Parser<'a> {
     fn parse_func_call_or_error(&mut self) -> Result<Expr, ParseError> {
         let start_pos = self.pos;
         let name = self.parse_ident()?;
-        self.skip_ws();
 
-        // Check for namespaced call (module::func)
+        // Check for namespaced call (module::func). Both oracles require `::`
+        // to be strictly adjacent to the namespace identifier and the function
+        // name (`mymod::func`); whitespace around the token is a syntax error
+        // (`unexpected ':'` in jq, `lexer: invalid input text` in yq), never a
+        // namespaced call. So the check happens before `skip_ws()` (#3116).
         if self.peek_str(2) == "::" {
             return self.parse_namespaced_call(name);
         }
+        self.skip_ws();
 
-        // Check for function arguments
+        // Check for function arguments. Whitespace before `(` is allowed by
+        // both oracles (`map (.*2)`, `f (1)` are calls), unlike `::` above.
         let args = if self.peek() == Some('(') {
             self.next();
             self.skip_ws();
@@ -7722,9 +7727,10 @@ impl<'a> Parser<'a> {
         // Consume '::'
         self.next();
         self.next();
-        self.skip_ws();
 
-        // Parse function name
+        // Parse function name. Both oracles require it to immediately follow
+        // the `::` (`mymod::func`); `mymod:: func` is a syntax error, hence no
+        // `skip_ws()` between the token and the identifier here (#3116).
         let name = self.parse_ident()?;
         self.skip_ws();
 

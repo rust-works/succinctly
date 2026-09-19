@@ -34580,6 +34580,37 @@ fn test_yq_namespaced_call_arguments_are_still_resolved_1473() -> Result<()> {
     Ok(())
 }
 
+/// #3116: real yq v4.53.3 rejects whitespace around the `::` in a namespaced
+/// call outright (`1:1: lexer: invalid input text`), and now that the
+/// white-space-tolerant `skip_ws()` calls are gone from the shared
+/// `Parser::parse_func_call_or_error`/`parse_namespaced_call`, succinctly yq
+/// rejects it as a parse error too — before any "module not loaded"
+/// resolution can run. Pinned against succinctly's own wording (a
+/// pre-existing, separate divergence from real yq's wording, same as the
+/// #2110/#2237 tests above).
+#[test]
+fn test_yq_namespaced_call_whitespace_around_colons_is_a_syntax_error() -> Result<()> {
+    for (filter, fragment) in [
+        ("mymod :: func", "unexpected character ':'"),
+        ("mymod:: func", "expected identifier, found ' '"),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert!(
+            stderr.contains("parse error") && stderr.contains(fragment),
+            "{filter:?} stderr: {stderr}"
+        );
+        assert_eq!(code, 1, "{filter:?} stderr: {stderr}");
+    }
+
+    // The adjacent form keeps working (yq mode supports the module system as
+    // an extension, docs/reference/yq-language.md) with its pre-existing
+    // "module not loaded" answer (#1473).
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("mymod::func", "a: 1\n", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(stderr.contains("not loaded"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// #1909: `Builtin::Path` and the `Expr::Pipe` path-context arm now call
 /// `eval.rs`'s `builtin_path_on_owned`/the deleted eager path-context evaluator
 /// directly instead of routing through `eval_on_owned`'s serialize +
