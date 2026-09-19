@@ -640,15 +640,17 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // materializes its operand and the only depth at which reuse cannot
     // skip a `MAX_NESTING_DEPTH` check the fresh walk would have made.
     //
-    // `is_container` first: only an array or object can be in the table, and
-    // the BP bit test is cheaper than the thread-local load behind
-    // `embed_shared_for`, which a scalar-heavy walk (`to_entries` over a
-    // wide object materializes one scalar per field here) would otherwise
-    // pay once per value -- measured +3.8-4.7% on a 7950X before this gate.
-    if cursor.is_container() {
-        if let Some(shared) = embed_shared_for::<S, _>(cursor) {
-            return Ok(shared);
-        }
+    // Gate order matters, and was measured both ways (#2889 A/B): the
+    // thread-local `active()` load inside `embed_shared_for` is ~1 ns and
+    // false on every path outside a jq-mode `as` body, so it goes first;
+    // `is_container` needs the cursor's text position (a rank/select lookup,
+    // tens of ns) and comes second, so a scalar-heavy walk with a binding in
+    // scope (`to_entries` over a wide object materializes one scalar per
+    // field here) skips the table lookup without every per-item bind
+    // (`.[] | .score as $y`, a fold's own `$u`) paying the position lookup
+    // when no table is active -- the other order cost 3-6% on an M4 Pro.
+    if let Some(shared) = embed_shared_for::<S, _>(cursor) {
+        return Ok(shared);
     }
     let result = to_owned_cursor_with::<_, S>(
         cursor,
@@ -5474,7 +5476,9 @@ pub(crate) fn embed_witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
 pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
 ) -> Option<OwnedValue> {
-    if S::TAG != EvalTag::Jq || !embed_table::active() {
+    // `active()` before `is_container()`: see `to_owned_cursor`'s call site
+    // for the measured reason the cheap thread-local load must come first.
+    if S::TAG != EvalTag::Jq || !embed_table::active() || !cursor.is_container() {
         return None;
     }
     embed_table::shared_for(cursor.node_id(), cursor.document_token())
