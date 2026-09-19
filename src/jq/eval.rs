@@ -6905,14 +6905,22 @@ fn each_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Only [`ArgFanout::All`] is modelled: every yq gate is deliberately eager
 /// (see [`fanout_arg`]'s own doc comment). `nth` is jq-only, and `skip`
 /// uses full fan-out in both modes as a jq extension.
-fn fanout_arg_each<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+///
+/// `WITH_ORIGIN` is the only thing [`fanout_arg_each`] and
+/// [`fanout_arg_each_with_origin`] differ in, so they share this one body
+/// rather than two verbatim copies (#2889 review). It is a const parameter,
+/// not a runtime flag: [`item_bind_origin`] resolves a container's cursor,
+/// and the plain fan-out -- whose arguments are the `n` of `nth`/`limit`/
+/// `skip`, plus [`each_as_pattern`]'s bound stream -- must keep paying
+/// nothing for a node it never reads.
+fn fanout_arg_each_inner<W: Clone + AsRef<[u64]>, S: EvalSemantics, B, const WITH_ORIGIN: bool>(
     arg_expr: &Expr,
     value: StandardJson<'_, W>,
     optional: bool,
     mut body: B,
 ) -> Flow
 where
-    B: FnMut(OwnedValue) -> Flow,
+    B: FnMut(OwnedValue, Option<BindOrigin>) -> Flow,
 {
     // Tracked out-of-band for the usual reason: the sink can only answer
     // `Demand`, so "why did the pull stop" has to be recorded beside it.
@@ -6920,13 +6928,20 @@ where
     let mut consumer_stopped = false;
 
     let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
+        // Before `into_owned`: the cursor this reads lives on the borrowed
+        // item, and materializing it is exactly what drops it.
+        let origin = if WITH_ORIGIN {
+            item_bind_origin::<S, W>(&item)
+        } else {
+            None
+        };
         // #2023's rule, same as `fanout_arg`'s own lazy sink: an undecodable
         // argument value raises rather than silently becoming `""`.
         let owned = match item.into_owned::<S>() {
             Ok(v) => v,
             Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
-        match body(owned) {
+        match body(owned, origin) {
             // This argument value's own walk finished; go on to the next.
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
@@ -6946,6 +6961,21 @@ where
     }
 }
 
+/// [`fanout_arg_each_inner`] for a `body` that has no use for the document
+/// node each argument value came from -- every caller but [`each_as`]. See
+/// that function for the rules this fan-out keeps.
+fn fanout_arg_each<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+    arg_expr: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    mut body: B,
+) -> Flow
+where
+    B: FnMut(OwnedValue) -> Flow,
+{
+    fanout_arg_each_inner::<W, S, _, false>(arg_expr, value, optional, |owned, _| body(owned))
+}
+
 /// [`fanout_arg_each`]'s twin for [`each_as`] alone (#2889 Stage B): the
 /// same demand-forwarding fan-out, with `body` also told the document node
 /// each bound value came from, read off the [`Item`] *before* it is
@@ -6955,9 +6985,9 @@ where
 /// The exact shape `eval_generic::fanout_arg_each_generic_with_origin`
 /// already has, and split off for the same reason: only a bare `$var` bind
 /// has a single node worth naming, so [`each_as_pattern`] keeps fanning out
-/// through plain [`fanout_arg_each`]. Every rule of that function carries
-/// over verbatim -- `body` runs against argument value N before N+1 is
-/// evaluated, a `body` escape stops the pull there, the argument's own
+/// through plain [`fanout_arg_each`]. Every rule of [`fanout_arg_each_inner`]
+/// carries over verbatim -- `body` runs against argument value N before N+1
+/// is evaluated, a `body` escape stops the pull there, the argument's own
 /// trailing control fires only after everything `body` already produced, and
 /// a downstream stop outranks the argument generator's verdict -- including
 /// [`Item::into_owned`]'s #2023 checked conversion, so an undecodable bound
@@ -6966,42 +6996,12 @@ fn fanout_arg_each_with_origin<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
     arg_expr: &Expr,
     value: StandardJson<'_, W>,
     optional: bool,
-    mut body: B,
+    body: B,
 ) -> Flow
 where
     B: FnMut(OwnedValue, Option<BindOrigin>) -> Flow,
 {
-    // Tracked out-of-band for the usual reason: the sink can only answer
-    // `Demand`, so "why did the pull stop" has to be recorded beside it.
-    let mut escape: Option<Control> = None;
-    let mut consumer_stopped = false;
-
-    let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
-        // Before `into_owned`: the cursor this reads lives on the borrowed
-        // item, and materializing it is exactly what drops it.
-        let origin = item_bind_origin::<S, W>(&item);
-        let owned = match item.into_owned::<S>() {
-            Ok(v) => v,
-            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
-        };
-        match body(owned, origin) {
-            // This bound value's own walk finished; go on to the next.
-            Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => {
-                consumer_stopped = true;
-                Demand::Stop
-            }
-            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
-        }
-    });
-
-    match escape {
-        Some(_) => resume_from_escape(escape, flow),
-        // `pending` is dropped for the reason every other lazy consumer
-        // drops it: it belongs to an eager fallback jq would never reach.
-        None if consumer_stopped => Flow::Stopped { pending: None },
-        None => flow,
-    }
+    fanout_arg_each_inner::<W, S, _, true>(arg_expr, value, optional, body)
 }
 
 /// Demand-forwarding twin of [`builtin_nth_stream`]/[`eval_nth_expr`]
