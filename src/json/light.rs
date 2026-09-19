@@ -2378,7 +2378,8 @@ fn special_number_end(text: &[u8], start: usize) -> Option<usize> {
 /// (`null`/`true`/`false`), returning the run's end on success.
 ///
 /// Same "the *whole* run validates" rule `special_number_end` applies, using
-/// the same jq token boundary (`jq_literal_run_end`): reading a valid prefix
+/// the same jq token boundary (`jq_literal_boundary`, the shared definition);
+/// reading a valid prefix
 /// out of a longer token would materialize a literal where real jq reports a
 /// parse error. So `nullx`/`truex`/`falsey` -- a keyword-plus-suffix token --
 /// and `nul`/`tru`/`fals` -- a truncated one -- are both not the literal,
@@ -2392,10 +2393,42 @@ fn special_number_end(text: &[u8], start: usize) -> Option<usize> {
 /// split `null1` into `null` + `1` -- a keyword whose run genuinely includes
 /// the following digit, passed only because the split happened to break
 /// between them (#3035).
+///
+/// `#[inline]`: this replaced an inlined `starts_with` in `value_at`'s
+/// keyword arms, whose cost is charged to every decoded value's fast path.
+/// Left as an out-of-line call it inflated `value_at` enough to perturb its
+/// own inlining into its many callers, a crate-wide codegen ripple the
+/// instruction-count guard caught (a uniform +1-2% Ir on rows that never
+/// reach this code, ARM64-only). Inlining keeps the valid-literal arm the
+/// same handful of compares it was before.
+#[inline]
 #[must_use]
 pub fn keyword_span(text: &[u8], start: usize, kw: &[u8]) -> Option<usize> {
-    let end = jq_literal_run_end(text, start);
-    (end - start == kw.len() && &text[start..end] == kw).then_some(end)
+    // Check the fixed-width window first, then only the one boundary byte
+    // that decides whether a longer run (`nullx`) or a truncated one
+    // (`nul` at EOF) is a keyword. The old form scanned the whole
+    // `jq_literal_run_end` run even when the first `kw.len()` bytes already
+    // failed, which is wasted work on `nul`/`nullx` and on valid literals
+    // followed by a whitespace run; this reads at most `kw.len() + 1` bytes.
+    let end = start.checked_add(kw.len())?;
+    if text.get(start..end) != Some(kw) {
+        return None;
+    }
+    match text.get(end) {
+        None => Some(end),
+        Some(&b) if jq_literal_boundary(b) => Some(end),
+        Some(_) => None,
+    }
+}
+
+/// Whether `byte` ends a jq literal token: whitespace or one of
+/// `"` `[` `{` `,` `:` `]` `}` (`jv_parse.c`'s `scan`). One definition,
+/// shared by [`jq_literal_run_end`] and [`keyword_span`] so the splitter's
+/// token boundary and the decoder's whole-token rule cannot drift apart
+/// (#106, #3035).
+#[inline]
+fn jq_literal_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}')
 }
 
 /// Where the literal token starting at `start` ends under jq 1.7.1's own
@@ -2405,10 +2438,7 @@ pub fn keyword_span(text: &[u8], start: usize, kw: &[u8]) -> Option<usize> {
 /// `nan(1)` and `nanx` are each one token that then fails to validate.
 fn jq_literal_run_end(text: &[u8], start: usize) -> usize {
     let mut end = start;
-    while end < text.len()
-        && !text[end].is_ascii_whitespace()
-        && !matches!(text[end], b'"' | b'[' | b'{' | b',' | b':' | b']' | b'}')
-    {
+    while end < text.len() && !jq_literal_boundary(text[end]) {
         end += 1;
     }
     end
