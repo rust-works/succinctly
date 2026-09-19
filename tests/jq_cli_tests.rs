@@ -7604,6 +7604,81 @@ fn test_range_zero_step_empty() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// range()'s first float element keeps `from`'s own literal spelling (#3103)
+// =============================================================================
+//
+// Real jq passes `from` straight through as `range`'s first emitted value
+// with no arithmetic performed on it yet, so a literal spelling that would
+// otherwise print differently from its plain-float canonicalization (`0.0`,
+// `3.00`, ...) survives there -- every later value has had `+ step` applied
+// and is always canonicalized. Confirmed live against `/usr/bin/jq` 1.7.1.
+
+#[test]
+fn test_range_first_element_keeps_whole_float_literal_spelling_3103() -> Result<()> {
+    // The issue's own repro: jq 1.7.1 gives `[0.0,1,2]`, not `[0,1,2]`.
+    let (output, code) = run_jq_null("[range(0.0; 3.0)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0.0,1,2]");
+    Ok(())
+}
+
+#[test]
+fn test_range_first_element_keeps_differently_padded_literal_spelling_3103() -> Result<()> {
+    // A differently-spelled whole float (`3.00`, not `3.0`) -- jq 1.7.1
+    // gives `[3.00,4,5]`.
+    let (output, code) = run_jq_null("[range(3.00; 6)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[3.00,4,5]");
+    Ok(())
+}
+
+#[test]
+fn test_range_first_element_spelling_preserved_even_when_not_whole_3103() -> Result<()> {
+    // `1.50` isn't a "whole" float, so its own canonical spelling (`1.5`)
+    // would already match if computed fresh -- but this still exercises the
+    // same literal-passthrough path, and jq 1.7.1 keeps the padded `1.50`
+    // spelling for the first value regardless (`[1.50,2.5,3.5]`).
+    let (output, code) = run_jq_null("[range(1.50; 4.5)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1.50,2.5,3.5]");
+    Ok(())
+}
+
+#[test]
+fn test_range_fanned_out_from_keeps_each_own_literal_spelling_3103() -> Result<()> {
+    // A `from` generator with two differently-spelled values: each of its
+    // subranges keeps its own spelling for its own first element, not just
+    // the first subrange overall. jq 1.7.1: `[0.0,1,2,0.00,1,2]`.
+    let (output, code) = run_jq_null("[range((0.0, 0.00); 3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0.0,1,2,0.00,1,2]");
+    Ok(())
+}
+
+#[test]
+fn test_range_document_sourced_from_keeps_its_own_literal_spelling_3103() -> Result<()> {
+    // Not limited to filter-text literals: a document-sourced `from` that
+    // passes through unmodified keeps its own spelling too. jq 1.7.1:
+    // `{"x":2.50}|[range(.x;5)]` => `[2.50,3.5,4.5]`.
+    let (output, code) = run_jq_stdin("[range(.x; 5)]", r#"{"x": 2.50}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[2.50,3.5,4.5]");
+    Ok(())
+}
+
+#[test]
+fn test_range_int_from_keeps_negative_zero_literal_spelling_3103() -> Result<()> {
+    // `-0` is the one integer spelling that diverges from its own canonical
+    // `i64` print (no leading zeros/`+`/underscores are legal JSON/jq number
+    // syntax otherwise, so this is the sole int-side case #3103 also covers).
+    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`.
+    let (output, code) = run_jq_null("[range(-0; 3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[-0,1,2]");
+    Ok(())
+}
+
 // Collecting an iterator pipe `[.[] | f]` must gather one output per element,
 // matching `map(f)` and jq — not yield `[]` (issue #295). Expected outputs
 // ground-truthed against jq-1.7.1.

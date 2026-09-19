@@ -1312,6 +1312,38 @@ fn test_yq_range_multi_output_bound_fanout_and_laziness_1556() -> Result<()> {
     Ok(())
 }
 
+/// #3103: real jq passes `range`'s `from` operand straight through as the
+/// first emitted value, so a literal spelling that would otherwise print
+/// differently from its plain-float canonicalization (`0.0`) survives there;
+/// every later value has had `+ step` applied and is canonicalized. `range`
+/// has no real-yq equivalent to check against (real yq's lexer rejects it
+/// outright), so this instead pins internal consistency: normal stdin input
+/// here routes through `each_range_generic` (`eval_generic.rs`), the
+/// document-input evaluator -- a distinct code path from the `-n`/
+/// `--input-format json` route `each_range` (`eval.rs`) covers, both fixed by
+/// the same shared `range_values_f64` change. Also covers a document-sourced
+/// `from` (`.x`), not just a filter-text literal.
+#[test]
+fn test_yq_range_first_element_keeps_from_literal_spelling_3103() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "[range(0.0; 3.0)]",
+        "null\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[0.0,1.0,2.0]");
+
+    let (output, code) = run_yq_stdin(
+        "[range(.x; 5)]",
+        "x: 2.50\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[2.50,3.5,4.5]");
+
+    Ok(())
+}
+
 /// #1594: `debug` reaches this same shared `<S: EvalSemantics>` builtin in
 /// yq mode too (gated behind `--jq-extensions`, real yq has no `debug` at
 /// all). Not oracle-verified -- no real-yq equivalent -- but pins that the
