@@ -2736,10 +2736,13 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
     }
 }
 
-/// True iff `bytes` is *exactly* the byte-for-byte compact, unsorted-keys,
-/// jq-number-convention JSON that `stream_json_pretty` would itself produce
-/// for the value these bytes encode -- i.e. safe to echo verbatim instead of
-/// re-rendering (#2608).
+/// Scans the *first* JSON value in `bytes` and returns the position just
+/// past it iff that value's span is *exactly* the byte-for-byte compact,
+/// unsorted-keys, jq-number-convention JSON that `stream_json_pretty`
+/// would itself produce for the value those bytes encode -- i.e. safe to
+/// echo verbatim instead of re-rendering (#2608). Whatever follows that
+/// value is neither scanned nor echoed; see "Why the echoed span is
+/// exactly the cursor's own value" at the end of this comment.
 ///
 /// A strict, single-pass, non-backtracking recursive-descent scanner over
 /// `value := object | array | string | number | true | false | null`, with
@@ -2828,9 +2831,53 @@ fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
 /// converse isn't asserted -- swept over a hand-picked corpus plus a
 /// differential/fuzz corpus that deliberately includes non-ASCII and
 /// edge-byte content per `CLAUDE.md`'s fuzz-alphabet rule.
+///
+/// This is the form `stream_json`'s echo branch uses, and the reason it can
+/// skip [`JsonCursor::raw_bytes`] entirely (#2608 follow-up). `raw_bytes`
+/// resolves the node's end through [`JsonCursor::text_range`], which for a
+/// container is a *linear rescan of the whole container* looking for the
+/// matching bracket -- measured at 9.2 Ir per input byte on a 7950X, 28% of
+/// the gate's total cost, and entirely wasted work because the scan below
+/// finds that same end on its way through. The caller therefore takes only
+/// the node's O(1) start ([`JsonCursor::text_position`], a sequential
+/// select) and lets this function report the end.
+///
+/// **Why the echoed span is exactly the cursor's own value**, not a prefix
+/// of it and not a byte more:
+/// - It starts where the cursor starts, so the two spans share a start.
+/// - This scanner parses exactly *one* complete value by the strict JSON
+///   grammar and stops at its last byte; it never consumes a following
+///   sibling, a second top-level document, the file's trailing newline, or
+///   any trailing garbage, because none of those can continue a value that
+///   the grammar has already closed (a `}`/`]`/closing `"` ends its token
+///   outright, and a number/literal token ends at the first byte outside its
+///   own character class).
+/// - It can only *accept* a span the writer would echo byte for byte, which
+///   in particular means no whitespace anywhere inside it -- so the only way
+///   the semi-index's own tokenization could disagree about where this value
+///   ends is on a spelling this scanner has already rejected. The semi-index
+///   accepts a strict superset of the tokens here (lenient numbers like
+///   `1.2.3`, `NaN`/`Infinity` words, unterminated strings, `\`-escapes this
+///   scanner declines); on the strict, whitespace-free, canonical subset the
+///   two agree, which the `debug_assert_eq!` in `stream_json`'s echo branch
+///   checks against [`JsonCursor::text_range`] on every accepted span in
+///   every debug build and test run.
+#[must_use]
+pub(crate) fn canonical_compact_jq_span_end(bytes: &[u8]) -> Option<usize> {
+    scan_canonical_value(bytes, 0, 0)
+}
+
+/// The whole-buffer form of [`canonical_compact_jq_span_end`]: true iff
+/// that scan both accepts and consumes *all* of `bytes`. The accept
+/// language the differential tests in this module's own `mod tests` are
+/// written against, and the spelling the rest of this file's comments
+/// use when they talk about "canonical" -- `stream_json`'s echo branch
+/// itself wants the end position, not the predicate, so this exists for
+/// the tests alone (#2608 follow-up).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_canonical_compact_jq_span(bytes: &[u8]) -> bool {
-    matches!(scan_canonical_value(bytes, 0, 0), Some(end) if end == bytes.len())
+    canonical_compact_jq_span_end(bytes) == Some(bytes.len())
 }
 
 /// Scans one JSON value starting at `bytes[pos]`, returning the position
@@ -2872,7 +2919,7 @@ fn scan_canonical_literal(bytes: &[u8], pos: usize, literal: &[u8]) -> Option<us
     }
 }
 
-/// The number-token rule from `is_canonical_compact_jq_span`'s own doc
+/// The number-token rule from `canonical_compact_jq_span_end`'s own doc
 /// comment: the maximal `[-+.eE0-9]*` run is jq's own canonical spelling
 /// iff [`is_jq_canonical_number`] says so. The span itself comes from
 /// [`nested_number_span`] (#2919 review) rather than a second,
@@ -2903,7 +2950,7 @@ fn scan_canonical_number(bytes: &[u8], pos: usize) -> Option<usize> {
 ///   that *does* have a short form (`0x08`/`0x09`/`0x0A`/`0x0C`/`0x0D`) is
 ///   rejected here even though it decodes into the control range, because
 ///   the writer would have emitted the short form instead -- see
-///   `is_canonical_compact_jq_span`'s own doc comment for why the
+///   `canonical_compact_jq_span_end`'s own doc comment for why the
 ///   accept-set is narrower than "any control code fits". Anything else
 ///   after a backslash (uppercase hex, a surrogate half, any printable
 ///   codepoint, any other letter) is rejected;
@@ -2989,7 +3036,7 @@ fn scan_json_string_span(bytes: &[u8], pos: usize) -> Option<(usize, usize, usiz
 /// The object-token rule: `{`, then either an immediate `}` or
 /// `"key":value` pairs separated by exactly one `,` with no trailing
 /// comma, each key checked against [`scan_json_string_span`] and hashed
-/// (raw span, undecoded -- see `is_canonical_compact_jq_span`'s own doc
+/// (raw span, undecoded -- see `canonical_compact_jq_span_end`'s own doc
 /// comment for why that's sound) into a fresh per-object [`KeyHashes`] to
 /// bail on any repeat.
 /// Above this many keys, [`scan_canonical_object`] switches from an
@@ -3359,23 +3406,39 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // (not `uses_jq_escape_table()`, which is also true for
         // `JqPreserveInput` -- already handled and returned above) is what
         // keeps this from ever firing for a preserve-input render, and it's
-        // also -- see `is_canonical_compact_jq_span`'s own doc comment for
+        // also -- see `canonical_compact_jq_span_end`'s own doc comment for
         // the full argument -- what keeps `-a`/`--ascii-output` from ever
         // reaching it: `stream_json` has no ascii parameter at all, and
         // every caller that wants ascii-escaped output routes around this
         // method entirely rather than calling it with `JqCompat`.
         if indent.is_compact() && !sort_keys && numbers == JsonConvention::JqCompat {
-            if let Some(bytes) = self.raw_bytes() {
-                if is_canonical_compact_jq_span(bytes) {
-                    // SAFETY: `is_canonical_compact_jq_span` only returns
-                    // `true` after validating every string's content as
-                    // UTF-8, so `bytes` as a whole is valid UTF-8 too.
-                    let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+            // Only the node's *start* is taken from the cursor. The end
+            // comes out of the scan itself -- see
+            // `canonical_compact_jq_span_end`'s own doc comment for why that
+            // span is exactly this node's, and for the 28%-of-the-gate
+            // `text_range` rescan this avoids (`raw_bytes`, which the first
+            // draft called here, walks the whole container a second time
+            // just to find the closing bracket the scan is about to reach
+            // anyway).
+            if let Some(rest) = self
+                .text_position()
+                .and_then(|start| self.text.get(start..))
+            {
+                if let Some(end) = canonical_compact_jq_span_end(rest) {
+                    debug_assert_eq!(
+                        self.text_range().map(|(start, stop)| stop - start),
+                        Some(end),
+                        "the canonical scan and `text_range` must agree on an accepted span"
+                    );
+                    // SAFETY: `canonical_compact_jq_span_end` only returns
+                    // `Some` after validating every string's content as
+                    // UTF-8, so `rest[..end]` as a whole is valid UTF-8 too.
+                    let s = core::str::from_utf8(&rest[..end]).map_err(|_| core::fmt::Error)?;
                     return Ok(out.write_str(s)?);
                 }
             }
             // Falls through to the general re-render path below -- either
-            // no raw span was available, or the span wasn't certified
+            // no text position was available, or the span wasn't certified
             // canonical.
         }
         // #1676/#1576 review: a stray `,` in an *apparently* empty
@@ -5707,6 +5770,92 @@ mod tests {
                 String::from_utf8_lossy(doc)
             );
         }
+        // Acceptance is a decision of `stream_json`'s echo branch, not of
+        // the predicate alone -- it also resolves the node's start, lets
+        // the scan report the end, and runs `from_utf8` over the result
+        // (#2608 follow-up). Drive that branch over the same corpus and
+        // require it to agree with the fall-through re-render for every
+        // entry in *both* groups, which is the only property the echo is
+        // ever allowed to have.
+        for doc in canonical.iter().chain(non_canonical.iter()) {
+            assert_eq!(
+                render_compact_jq_through_gate(doc),
+                render_compact_jq_by_rerender(doc)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned()),
+                "gate vs re-render: {:?} (as text: {})",
+                doc,
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// The render `stream_json`'s own #2608 echo branch produces for the
+    /// document's root value -- i.e. the gate exactly as the CLI reaches
+    /// it (compact, unsorted, `JqCompat`), scan and `from_utf8` included --
+    /// or `None` when it fails. The companion to
+    /// `render_compact_jq_by_rerender` above, which deliberately calls the
+    /// *fall-through* path instead so the two can be compared.
+    fn render_compact_jq_through_gate(doc: &[u8]) -> Option<String> {
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        let mut out = String::new();
+        root.stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::JqCompat,
+        )
+        .ok()?;
+        Some(out)
+    }
+
+    /// The echo branch no longer asks the cursor for its raw span; it takes
+    /// the node's start and lets the canonical scan report the end
+    /// (`canonical_compact_jq_span_end`, #2608 follow-up). That makes
+    /// "stops exactly at the value's last byte" a property of the *scanner*
+    /// rather than of `text_range`, so it needs its own pin: every document
+    /// below has something after the root value that must not be echoed --
+    /// the trailing newline every real file ends with, a second top-level
+    /// document (`jq` reads a stream, not one value), and outright garbage.
+    ///
+    /// Asserted two ways: against the literal expected bytes, and against
+    /// the unchanged re-render path, which is the behaviour the echo is
+    /// only ever allowed to be a faster spelling of.
+    #[test]
+    fn canonical_echo_stops_at_the_value_end_2608() {
+        for (doc, want) in [
+            (&b"{\"a\":1}\n"[..], "{\"a\":1}"),
+            (&b"[1,2,3]\n\n"[..], "[1,2,3]"),
+            (&b"\"hi\"\n"[..], "\"hi\""),
+            (&b"12\n"[..], "12"),
+            (&b"true\n"[..], "true"),
+            (&b"null\n"[..], "null"),
+            // A second top-level value: `jq` treats the input as a stream,
+            // and this cursor is the *first* value in it.
+            (&b"{\"a\":1} {\"b\":2}"[..], "{\"a\":1}"),
+            (&b"[1] [2]"[..], "[1]"),
+            (&b"1 2"[..], "1"),
+            // Trailing garbage: the token still ends where its own grammar
+            // says it does.
+            (&b"{\"a\":1}xyz"[..], "{\"a\":1}"),
+            (&b"12xyz"[..], "12"),
+            (&b"truexyz"[..], "true"),
+        ] {
+            assert_eq!(
+                render_compact_jq_through_gate(doc).as_deref(),
+                Some(want),
+                "gate echo for {:?}",
+                String::from_utf8_lossy(doc)
+            );
+            assert_eq!(
+                render_compact_jq_by_rerender(doc)
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                Some(want.to_string()),
+                "re-render for {:?}",
+                String::from_utf8_lossy(doc)
+            );
+        }
     }
 
     /// Same load-bearing direction as the corpus test above --
@@ -5882,8 +6031,8 @@ mod tests {
             gen_value(&mut rng, 3, &mut doc);
 
             let checker_says_canonical = is_canonical_compact_jq_span(&doc);
-            let actually_round_trips =
-                render_compact_jq_by_rerender(&doc).as_deref() == Some(doc.as_slice());
+            let rerendered = render_compact_jq_by_rerender(&doc);
+            let actually_round_trips = rerendered.as_deref() == Some(doc.as_slice());
             if checker_says_canonical {
                 canonical_count += 1;
                 // One direction only -- see this test's own doc comment
@@ -5891,6 +6040,17 @@ mod tests {
                 if !actually_round_trips {
                     mismatches.push((seed, doc.clone()));
                 }
+            }
+            // The whole echo *branch*, not just the predicate: it must
+            // produce exactly what the fall-through re-render would, on
+            // every generated document regardless of which side of the
+            // gate it lands. This is also what drives the branch's
+            // `debug_assert_eq!` that the scan's end agrees with
+            // `text_range`'s over the whole sweep (#2608 follow-up).
+            if render_compact_jq_through_gate(&doc)
+                != rerendered.map(|b| String::from_utf8_lossy(&b).into_owned())
+            {
+                mismatches.push((seed, doc.clone()));
             }
         }
 
