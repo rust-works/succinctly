@@ -639,8 +639,16 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     // comment for why depth 0 is both where every embedding construction
     // materializes its operand and the only depth at which reuse cannot
     // skip a `MAX_NESTING_DEPTH` check the fresh walk would have made.
-    if let Some(shared) = embed_shared_for::<S, _>(cursor) {
-        return Ok(shared);
+    //
+    // `is_container` first: only an array or object can be in the table, and
+    // the BP bit test is cheaper than the thread-local load behind
+    // `embed_shared_for`, which a scalar-heavy walk (`to_entries` over a
+    // wide object materializes one scalar per field here) would otherwise
+    // pay once per value -- measured +3.8-4.7% on a 7950X before this gate.
+    if cursor.is_container() {
+        if let Some(shared) = embed_shared_for::<S, _>(cursor) {
+            return Ok(shared);
+        }
     }
     let result = to_owned_cursor_with::<_, S>(
         cursor,
