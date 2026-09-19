@@ -64160,6 +64160,101 @@ fn test_canonical_compact_echo_declines_non_canonical_spans_2608() -> Result<()>
     Ok(())
 }
 
+/// #2608's echo branch stopped asking the cursor for its raw span: it takes
+/// the node's start and lets the canonical scan report the end, so "the echo
+/// stops at the root value's last byte" became a property of the *scanner*.
+/// Every document here has something after that value which must not be
+/// echoed -- the trailing newline a real file ends with, a second top-level
+/// document (`jq` reads a stream), and trailing garbage. Every expectation
+/// was captured live from the pre-#2608 binary (`b1e1a90df`, no gate at
+/// all) and cross-checked against `/usr/bin/jq` 1.7.1, which agrees on all
+/// but the two `Invalid JSON text` shapes -- there succinctly's splitter
+/// already diverged from jq's parser long before #2608 (jq reports a
+/// numeric-literal parse error, and on `12xyz` prints nothing at all), and
+/// this test pins succinctly's own unchanged behaviour.
+#[test]
+fn test_canonical_echo_stops_at_the_root_value_2608() -> Result<()> {
+    for (input, want_out, want_code) in [
+        ("{\"a\":1}\n", "{\"a\":1}\n", 0),
+        ("[1,2,3]\n\n", "[1,2,3]\n", 0),
+        ("12\n", "12\n", 0),
+        ("true\n", "true\n", 0),
+        // A stream of two top-level values: each is echoed on its own, and
+        // the first echo must not swallow the second.
+        ("{\"a\":1} {\"b\":2}", "{\"a\":1}\n{\"b\":2}\n", 0),
+        ("[1] [2]", "[1]\n[2]\n", 0),
+        ("1 2", "1\n2\n", 0),
+        // Trailing garbage: the value is still echoed, then the document is
+        // rejected -- exit 5, exactly as before the gate existed.
+        ("{\"a\":1}xyz", "{\"a\":1}\n", 5),
+        ("12xyz", "12\n", 5),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(stdout, want_out, "stdout for {input:?}");
+        assert_eq!(code, want_code, "exit code for {input:?}");
+    }
+    Ok(())
+}
+
+/// #2608's scanner no longer decodes UTF-8 itself; a byte `>= 0x80` is one
+/// byte of literal string content and the single `core::str::from_utf8` over
+/// the accepted span is what rules on validity, falling *through* to the
+/// re-render when it fails rather than raising an error of its own.
+///
+/// The CLI cannot actually hand the gate invalid UTF-8 -- `utf8_lossy_document`
+/// (`src/bin/succinctly/jq_runner.rs`) substitutes U+FFFD before indexing,
+/// which is jq's own behaviour -- so what this pins is that the substitution
+/// still lands byte-for-byte where it did, through a gate that now has no
+/// opinion about UTF-8 of its own. Every expectation is captured live from
+/// `/usr/bin/jq` 1.7.1 (and agrees with the pre-#2608 binary): note that the
+/// overlong `C0 AF` yields *two* replacement characters while the
+/// surrogate encoding `ED A0 80` yields one, which is exactly the kind of
+/// detail a hand-written expectation gets wrong.
+///
+/// The library-side contract -- gate output identical to the re-render's for
+/// a buffer that really is invalid UTF-8, since `JsonIndex::build` does no
+/// validation -- is covered by `src/json/light.rs`'s own differential and
+/// fuzz tests, which drive `stream_json` directly.
+#[test]
+fn test_invalid_utf8_in_string_survives_the_echo_gate_2608() -> Result<()> {
+    const FFFD: &str = "\u{fffd}";
+    for (label, input, want) in [
+        ("bare 0xFF", &b"\"a\xffb\""[..], format!("\"a{FFFD}b\"\n")),
+        (
+            "lone continuation",
+            &b"\"a\x80b\""[..],
+            format!("\"a{FFFD}b\"\n"),
+        ),
+        (
+            "overlong C0 AF",
+            &b"\"a\xc0\xafb\""[..],
+            format!("\"a{FFFD}{FFFD}b\"\n"),
+        ),
+        (
+            "surrogate ED A0 80",
+            &b"\"a\xed\xa0\x80b\""[..],
+            format!("\"a{FFFD}b\"\n"),
+        ),
+        ("truncated C2", &b"\"a\xc2\""[..], format!("\"a{FFFD}\"\n")),
+        // Invalid UTF-8 as an object *key*, where the scan's duplicate-key
+        // check reads the raw span rather than a decoded string.
+        (
+            "invalid key",
+            &b"{\"a\xffb\":1}"[..],
+            format!("{{\"a{FFFD}b\":1}}\n"),
+        ),
+    ] {
+        let (output, code) = spawn_jq(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "exit code for {label}");
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            want,
+            "stdout for {label}"
+        );
+    }
+    Ok(())
+}
+
 /// #2608's own explicit warning: `-a`/`--ascii-output` must never reach the
 /// new echo path, because the checker's notion of "canonical" is pinned to
 /// [`write_json_body_jq`](succinctly::jq::escape::write_json_body_jq) (raw
