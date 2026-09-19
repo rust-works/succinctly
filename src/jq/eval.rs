@@ -8135,7 +8135,13 @@ fn embed_peel_step<S: EvalSemantics>(
     optional: bool,
     reentry: Reentry,
 ) -> Option<(Result<Vec<OwnedValue>, EvalError>, Expr)> {
-    if !matches!(reentry, Reentry::Against(_)) || !super::eval_generic::embed_table_active() {
+    // Only where the caller brought no proof at all: a re-entry that
+    // arrived `Against(Node)`/`Against(OwnedRoot)` already names its root,
+    // and peeling would trade that proof for the weaker `witnessed_by`
+    // derivation on the child (#2889 review). `REBUILT` is every site
+    // this issue recovers (`continue_pipe_element_generic`/
+    // `fold_pipe_stages_sink`'s `Owned` arms).
+    if reentry != Reentry::REBUILT || !super::eval_generic::embed_table_active() {
         return None;
     }
     let Expr::Pipe(stages) = expr else {
@@ -8162,10 +8168,10 @@ fn embed_peel_step<S: EvalSemantics>(
         return embed_peel_step::<S>(&Expr::Pipe(flat), input, optional, reentry);
     }
     let stepped: Result<Vec<OwnedValue>, EvalError> = match first {
-        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
-            eval_owned_navigation::<S>(first, input, optional)?
-                .map(|v| v.into_iter().collect::<Vec<_>>())
-        }
+        // `.` moves nothing, so there is nothing a peel could witness that
+        // `witnessed_by` on the whole pipe does not already see.
+        Expr::Field(_) | Expr::Index { .. } => eval_owned_navigation::<S>(first, input, optional)?
+            .map(|v| v.into_iter().collect::<Vec<_>>()),
         // `.[]` over a container yields each child, in the same order the
         // bridged iterate would, and each child arrives still sharing its
         // storage. A non-container input keeps the bridge's own
