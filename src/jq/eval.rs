@@ -8223,6 +8223,14 @@ fn eval_each_owned_fast_path<S: EvalSemantics>(
 /// have rebuilt from the same node, and the only difference is that they
 /// arrive still sharing that node's storage.
 ///
+/// Called from *both* owned re-entries: `eval_generic::eval_on_owned` and
+/// [`eval_each_owned`] (#2889 review). Only the generic one had it at
+/// first, which reached exactly one shape -- the single-element `[.]` that
+/// stays a `GenericItem::LazySeq`. Every other container collapses to
+/// `GenericItem::Owned` and takes `eval.rs`'s sink-based re-entry instead,
+/// so `[.,.] | max`, `[null,.] | add` and `{a:.} | add` all bridged and
+/// refused where jq answers `[]`.
+///
 /// Scoped to these three builtins on purpose. `sort`/`unique`/`reverse`/
 /// `to_entries` relocate their elements in jq too, and `. as $x | [.] |
 /// sort | .[0] | path($x)` is `[]` there, but each needs its own
@@ -8235,22 +8243,49 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq || !super::eval_generic::embed_table_active() {
         return None;
     }
+    // `fold_pipe_stages_sink` wraps even a single remaining stage in an
+    // `Expr::Pipe` before handing it to `eval_each_owned` (#2543), so a
+    // solitary `max` arrives here as `Expr::Pipe([max])`. Unwrapped for the
+    // same reason `eval_owned_fast_path` unwraps it; a pipe with an actual
+    // tail is [`embed_peel_step`]'s business, not this function's.
+    let expr = match expr {
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [only] => only,
+            _ => return None,
+        },
+        other => other,
+    };
     let Expr::Builtin(builtin) = expr else {
         return None;
     };
     // `add` iterates an object's values as readily as an array's elements
     // (`builtin_add`'s own `Object` arm, #422); `min`/`max` take arrays
     // only, and their scalar/object diagnostics stay the bridge's.
+    //
+    // The [`embed_witnessed`] scan is the pre-gate (#2889 review): the
+    // outcome gate at the bottom is what makes this sound, but it can only
+    // be read after the fold has run, and the fold needs the elements
+    // cloned out first. No element sharing a table entry's storage means no
+    // fold over them can answer one either -- `add` returns an operand or a
+    // computed value, `min`/`max` return an element -- so the common
+    // `[1,2,3] | add` declines here, before a single clone. It also
+    // subsumes the empty-container check: an `any` over no elements is
+    // false.
     let items: Vec<OwnedValue> = match (builtin, input) {
         (Builtin::Add | Builtin::Min | Builtin::Max, OwnedValue::Array(items)) => {
+            if !items.iter().any(embed_witnessed) {
+                return None;
+            }
             items.iter().cloned().collect()
         }
-        (Builtin::Add, OwnedValue::Object(map)) => map.values().cloned().collect(),
+        (Builtin::Add, OwnedValue::Object(map)) => {
+            if !map.values().any(embed_witnessed) {
+                return None;
+            }
+            map.values().cloned().collect()
+        }
         _ => return None,
     };
-    if items.is_empty() {
-        return None;
-    }
     let result = match builtin {
         // Same fold as `builtin_add`: from the first element, not from
         // `null`, so a one-element array is that element verbatim.
@@ -8275,12 +8310,13 @@ pub(crate) fn eval_owned_relocating_fold<S: EvalSemantics>(
 }
 
 /// Whether `value` still *is* a node an in-scope binding holds -- the
-/// payoff [`embed_peel_step`] peels for (#2889 review).
+/// payoff both [`embed_peel_step`] and [`eval_owned_relocating_fold`] work
+/// for (#2889 review).
 ///
 /// The same lookup [`RootWitness::of_owned`] makes, spelled as a predicate
 /// so it can be handed to `Iterator::any` over a container's children
 /// without cloning any of them.
-fn embed_peel_witnessed(value: &OwnedValue) -> bool {
+fn embed_witnessed(value: &OwnedValue) -> bool {
     super::eval_generic::embed_witness_of(value).is_some()
 }
 
@@ -8398,7 +8434,15 @@ fn embed_peel_step<S: EvalSemantics>(
     let Expr::Pipe(stages) = expr else {
         return None;
     };
-    let [first, rest @ ..] = stages.as_slice() else {
+    // `. | X` is `X` -- an identity stage yields its input, once, and can
+    // neither move nor raise -- so skipping leading ones here is what lets
+    // the stage *behind* them be peeled at all (`[.] | . | max`, where the
+    // bridge otherwise rebuilt the array before `max` ever ran).
+    let mut remaining = stages.as_slice();
+    while let [Expr::Identity, tail @ ..] = remaining {
+        remaining = tail;
+    }
+    let [first, rest @ ..] = remaining else {
         return None;
     };
     if rest.is_empty() {
@@ -8429,7 +8473,7 @@ fn embed_peel_step<S: EvalSemantics>(
             // produced it before #2889 and still owns its diagnostics.
             let on_an_embed = matches!(
                 &navigated,
-                Ok(Some(value)) if embed_peel_witnessed(value)
+                Ok(Some(value)) if embed_witnessed(value)
             );
             if !on_an_embed && !leads_with_a_peelable_step(&rest[0]) {
                 return None;
@@ -8449,13 +8493,13 @@ fn embed_peel_step<S: EvalSemantics>(
         // half of that condition.
         Expr::Iterate if !peeled_children_need_no_index(&rest[0]) => match input {
             OwnedValue::Array(items) => {
-                if !items.iter().any(embed_peel_witnessed) {
+                if !items.iter().any(embed_witnessed) {
                     return None;
                 }
                 Ok(items.iter().cloned().collect())
             }
             OwnedValue::Object(map) => {
-                if !map.values().any(embed_peel_witnessed) {
+                if !map.values().any(embed_witnessed) {
                     return None;
                 }
                 Ok(map.values().cloned().collect())
@@ -8467,6 +8511,15 @@ fn embed_peel_step<S: EvalSemantics>(
             OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
             _ => return None,
         },
+        // `add`/`min`/`max` as a pipe *stage*, not as the whole expression:
+        // the same relocation `eval_generic::eval_on_owned` takes, which
+        // only ever saw the whole-expression spelling. Its own outcome gate
+        // is the payoff test here -- strictly stronger than the witness
+        // scans above, since it asks whether the *answer* is an embed --
+        // so this arm needs none of its own.
+        Expr::Builtin(Builtin::Add | Builtin::Min | Builtin::Max) => {
+            Ok(vec![eval_owned_relocating_fold::<S>(first, input)?])
+        }
         _ => return None,
     };
     let rest = match rest {
@@ -8512,6 +8565,18 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
 ) -> Flow {
     if let Some(flow) = eval_each_owned_fast_path::<S>(expr, input, optional, sink) {
         return flow;
+    }
+    // #2889: `add`/`min`/`max` hand back one of their inputs rather than
+    // computing a new value, and the round trip below would rebuild that
+    // input as a copy. Before the peel, which cannot help here -- the fold
+    // is the whole expression, not the front of a pipe. See
+    // [`eval_owned_relocating_fold`] for the outcome gate that keeps this
+    // from changing *what* is produced.
+    if let Some(relocated) = eval_owned_relocating_fold::<S>(expr, input) {
+        return match sink(relocated) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
     }
     // #2889: take the front of the pipe natively before re-indexing, so a
     // stage standing *on* an embedded node reaches the bridge as that node
