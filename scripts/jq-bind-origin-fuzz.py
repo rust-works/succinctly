@@ -442,6 +442,11 @@ def main():
                          "changed code is reachable only from a fold, so a stock run draws too "
                          "few to see its rare shapes -- #3145's review found a fabricated write "
                          "at --fold-p 1.0 that 18,000 stock programs had missed")
+    ap.add_argument("--value-bind-p", type=float, default=None,
+                    help="probability a program is a value-bind program (default VALUE_BIND_P, "
+                         "scaled like the other routes when --fold-p is set). #3135's door opens "
+                         "only for a navigated bind used by a resolver on an owned-rooted route, "
+                         "so a stock run draws few of them -- run at 1.0 to weight the sweep onto it")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
@@ -462,7 +467,8 @@ def main():
     # routes keep their own shares of what is left.
     fold_p = FOLD_P if a.fold_p is None else a.fold_p
     route_p = ROUTE_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
-    value_bind_p = VALUE_BIND_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
+    value_bind_p = (VALUE_BIND_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
+                    if a.value_bind_p is None else a.value_bind_p)
     kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "both-reject",
              "fabricate-baseline", "mismatch-baseline", "timeout"]
     counts = {k: 0 for k in kinds}

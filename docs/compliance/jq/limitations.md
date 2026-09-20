@@ -1145,11 +1145,7 @@ is the revert that established what the other one costs.
    bind; scoped separately), the routes that re-enter the eager
    evaluator with an *owned* accumulator (`reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)`,
    a `catch` handler: `eval.rs`'s own `eval_as` carries no node for a navigated bind, and there
-   is no cursor at that funnel to promote against), and a navigated bind on an *owned-rooted*
-   document (`input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as $y | .a | ($y.b) = 9'`,
-   a `tojson|fromjson`-rebuilt root: the marker's node is an `OwnedIdentity` position, and
-   `marker_is_root` reads only a document node against a live cursor — no `OwnedRoot` twin).
-   The embed row this list used to carry (`.a as $y | {k:.a} | .k | path($y)`, #2889) is
+   is no cursor at that funnel to promote against). The embed row this list used to carry (`.a as $y | {k:.a} | .k | path($y)`, #2889) is
    recovered by the same embed table described under #2642 above: `each_as_generic`
    pushes an entry for a navigated bind's node exactly as it does for an identity bind's,
    so `marker_is_root`'s existing promotion succeeds once `RootWitness::of_owned` reports
@@ -1158,10 +1154,22 @@ is the revert that established what the other one costs.
    already an owned accumulator (`Item::Owned`), not a `StandardJson` cursor — Stage B
    (`docs/plan/jq-bind-origin-frame.md`) mints a node only from the latter
    (`eval::item_bind_origin`'s `Item::Borrowed` arm), so these two stay exactly as they
-   were, unrelated to whether Stage B has landed. The owned-root/input-root pair is a
-   different limitation again, and Stage B does not touch it either: the marker's node is
-   an `OwnedIdentity` position, not a document node, and `marker_is_root` promotes only
-   against a live cursor — there is no `OwnedRoot` twin of that promotion to take.
+   were, unrelated to whether Stage B has landed. A navigated bind on an *owned-rooted*
+   document (`input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as $y | .a | ($y.b) = 9'`,
+   a `tojson|fromjson`-rebuilt root) was a different limitation again, which neither Stage B
+   nor the embed table touched — the marker's node is an `OwnedIdentity` position, not a
+   document node — until [#3135](https://github.com/rust-works/succinctly/issues/3135): such a
+   pipe left the generic evaluator as an owned value and crossed into `eval.rs` under
+   `Reentry::REBUILT`, whose own `eval_as` cannot certify a navigated bind at a register, so
+   nothing promoted it. It now runs on the owned identity pipe
+   (`eval_generic::owned_identity_bind_door`, opened by every owned re-entry that is still
+   `REBUILT` after `Reentry::witnessed_by` — an embed-table hit keeps its node proof instead —
+   when a navigated `as` is followed by a resolver that reads its variable; jq mode only),
+   whose position tokens name the bind's node, and `marker_is_root` reads them against the
+   funnel's `OwnedRoot` witness exactly as `marker_needs_demotion` already did in the demoting
+   direction. A sibling, a rebuild or a construction between the bind and the use derives a
+   different token and keeps refusing, as jq does; the sweep's `owned-root-*` rows pin both
+   directions.
    A `null`/`bool` marker at an equal-valued sibling (`.a as $y | .c | $y |= 5` on
    `{"a":true,"c":true}`) used to be refuse-only the same way — jq's `jv_identical` admits
    those by value regardless of node, but the resolver's `TrackedVar` arm consulted the

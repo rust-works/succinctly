@@ -61,23 +61,24 @@ use super::eval::{
     entries_to_object, eval_each_owned, eval_full as full_eval, finish_fork_flow,
     finish_fork_from_flow, finish_short_circuit, fold_escaped_generator_prefix, foreach_forks,
     format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_dollar_safe_chain_key, is_pure_chain_link,
-    is_retryable_control, is_retryable_stop, key_arrays_eq, literal_to_owned,
-    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
-    pattern_alternatives_var_names, prefer_pending_control, range_from_literal_override,
-    range_max_exceeded_error, range_num, range_values_f64, range_values_int, recurse_walk_flow,
-    reduce_forks, reroot_for_reentry, reroot_markers, resolve_computed_slice_bounds,
-    resume_from_escape, reverse_length_is_empty, select_emits, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read_computed, stop_with_downstream,
-    stop_with_error, stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix,
-    streams_unbounded, substitute_bound_var_from, substitute_vars, suppresses, tonumber_from_str,
-    try_payload_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
-    Reentry, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    index_one_owned as index_owned_by_key, is_assignment_expr, is_dollar_safe_chain_key,
+    is_identity_passthrough, is_pure_chain_link, is_retryable_control, is_retryable_stop,
+    key_arrays_eq, literal_to_owned, mark_nonretryable_escape, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned, owned_bound_to_i64,
+    owned_to_expr, owned_to_string, pattern_alternatives_var_names, prefer_pending_control,
+    range_from_literal_override, range_max_exceeded_error, range_num, range_values_f64,
+    range_values_int, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
+    resolve_computed_slice_bounds, resume_from_escape, reverse_length_is_empty, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppresses, tonumber_from_str, try_payload_root, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
+    YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -2782,12 +2783,24 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     if let Some(relocated) = crate::jq::eval::eval_owned_relocating_fold::<S>(expr, &owned) {
         return GenericResult::Owned(relocated);
     }
+    // #2889: `owned` may still *be* a bound node's own value -- see
+    // `eval::Reentry::witnessed_by`.
+    let reentry = reentry.witnessed_by::<S>(&owned);
+    // #3135: a navigated bind whose variable a resolver then reads runs on
+    // the owned identity pipe, which can name the bind's node; after the
+    // embed table, so a witnessed node keeps its proof.
+    if let Some((values, control)) =
+        owned_identity_bind_door_collect::<S>(expr, &owned, optional, reentry)
+    {
+        return match control {
+            Some(control) => partial_generic(values, control),
+            None => owned_vec_to_generic_result(values),
+        };
+    }
 
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
-    // #2889: `owned` may still *be* a bound node's own value -- see
-    // `eval::Reentry::witnessed_by`.
-    let expr = reentry.witnessed_by::<S>(&owned).reroot::<S>(expr);
+    let expr = reentry.reroot::<S>(expr);
     let json_str = owned.to_json_for_reindex::<S>();
     let json_bytes = json_str.as_bytes();
     let index = JsonIndex::build(json_bytes);
@@ -6969,6 +6982,181 @@ fn try_owned_format_or_tostring_bypass<S: EvalSemantics, V: DocumentValue>(
         )),
         _ => Err(o),
     }
+}
+
+/// Whether an owned item's remaining pipe holds a *navigated* `as` bind
+/// (`.a as $y`, not an identity passthrough) whose body then reads or
+/// writes through that variable inside a resolver invocation (`path($y)`,
+/// `del($y.b)`, `($y.b) = 9`, `$y |= 5`, ...), and the owned identity pipe
+/// can run every stage of it (#3135).
+///
+/// Such a pipe used to cross into `eval.rs` under [`Reentry::REBUILT`],
+/// where `eval_as` substitutes a navigated bind as a plain
+/// literal: `input | .a as $y | .a | path($y)`, `jq -n '{a:{b:1}} | .a as
+/// $y | .a | ($y.b) = 9'` and `(tojson|fromjson) | .a as $y | .a | path($y)`
+/// all refused where jq 1.7.1 answers `[]` / writes `{"b":9}`. The owned
+/// identity pipe records the bind's position as an `OwnedIdentity::root`
+/// token (`bind_origin_of_identity`), hands the same token to the funnel
+/// when a later `.a` stands at that position again
+/// (`OwnedIdentity::root_witness`), and `eval::marker_is_root` then
+/// promotes the marker exactly as it does for a live cursor -- while a
+/// sibling, a rebuild or a construction between the two derives a
+/// different token and keeps refusing, as jq does.
+///
+/// Deliberately narrow, since declining is today's behaviour and always
+/// safe:
+///
+/// - the resolver-starting node has to *mention the bound variable* (an
+///   `input | .a as $y | ($y | length)` keeps its route), and it is one of
+///   the assignment operators or the path builtins that resolve an argument
+///   -- not `eval::may_enter_resolver_node`'s "every builtin and every
+///   call", which is the right over-approximation for a rewrite precheck
+///   and the wrong one for a route change;
+/// - every stage between the bind and that use is navigation the identity
+///   pipe steps itself (`.a`, `.[0]`, `.[]`, or a `first(.)`-style
+///   passthrough over such), so the use stands at a position the bind's
+///   token can name. A construction (`{k:.a} | .k`) or a rebuild
+///   (`tojson|fromjson`) in between keeps the `eval.rs` route: the former
+///   is the embed table's case (#2889, which witnesses the embedded node's
+///   own storage and answers `input | .a as $y | {k:.a} | .k | path($y)`
+///   where a fresh detached token here would refuse), and the latter is a
+///   refusal jq shares.
+///
+/// Gated on jq mode in [`owned_identity_bind_door`], for the reason
+/// `eval::reroot_markers` gives: real yq's write through a variable is a
+/// no-op that prints the document unchanged, where `succinctly yq` refuses,
+/// and a promotion there would be the corrupting direction.
+fn owned_identity_bind_door_applies(stages: &[Expr]) -> bool {
+    let binds_for_resolver = stages.iter().any(|stage| {
+        crate::jq::walk::any_subexpr(stage, &mut |e| match e {
+            Expr::As { expr, var, body } => {
+                !is_identity_passthrough(expr)
+                    && bind_body_reaches_resolver_by_navigation(body, var)
+            }
+            _ => false,
+        })
+    });
+    binds_for_resolver && owned_identity_pipe_supported(stages)
+}
+
+/// Whether the first stage of `body` that reads `$var` inside a resolver
+/// ([`resolver_reads_var`]) is preceded only by node-preserving navigation
+/// ([`door_stage_keeps_node`]) -- the second clause of
+/// [`owned_identity_bind_door_applies`]. A body with no such stage at its
+/// top level declines.
+fn bind_body_reaches_resolver_by_navigation(body: &Expr, var: &str) -> bool {
+    for stage in owned_identity_body_stages(body) {
+        if resolver_reads_var(stage, var) {
+            return true;
+        }
+        if !door_stage_keeps_node(stage) {
+            return false;
+        }
+    }
+    false
+}
+
+/// A stage that leaves the pipe standing on a node the bind's token can
+/// name: the navigation [`owned_identity_nav_supported`] steps, or a
+/// `first`/`last`/`?` passthrough whose body is only such stages.
+fn door_stage_keeps_node(stage: &Expr) -> bool {
+    match strip_parens(stage) {
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) | Expr::Optional(inner) => {
+            owned_identity_body_stages(inner)
+                .iter()
+                .all(door_stage_keeps_node)
+        }
+        Expr::Pipe(inner) => inner.iter().all(door_stage_keeps_node),
+        other => owned_identity_nav_supported(other),
+    }
+}
+
+/// Whether `body` holds an assignment or a path-resolving builtin whose
+/// own subtree mentions `$var` -- the half of
+/// [`owned_identity_bind_door_applies`] that keeps the door shut for a
+/// bind the resolver never sees.
+fn resolver_reads_var(body: &Expr, var: &str) -> bool {
+    crate::jq::walk::any_subexpr(body, &mut |e| {
+        (is_assignment_expr(e)
+            || matches!(
+                e,
+                Expr::Builtin(Builtin::Path(_) | Builtin::Del(_) | Builtin::PathsFilter(_))
+            ))
+            && crate::jq::walk::any_subexpr(e, &mut |v| matches!(v, Expr::Var(name) if name == var))
+    })
+}
+
+/// The door itself, for the owned re-entries that hand a computed value's
+/// remaining pipe to `eval.rs` under [`Reentry::REBUILT`]
+/// (`eval::eval_each_owned`, `eval::eval_owned_input`, [`eval_on_owned`]):
+/// `Some(flow)` when [`owned_identity_bind_door_applies`] opens it and the
+/// pipe ran here instead, `None` to let the re-entry proceed as before
+/// (#3135). Only under `REBUILT`: that witness demotes every marker `expr`
+/// carries, and the identity pipe's own funnels do the same against the
+/// fresh token a detached root gets, so the two agree on every marker that
+/// arrives from outside -- a `Proven` or positioned `Against` re-entry has
+/// already been rerooted against a root the pipe does not know, and must
+/// not be rewritten a second time.
+///
+/// The item is a computed value with no position of its own, so it enters
+/// `detached`: the tokens are relative, and the pipe's own `child`/
+/// `rebuilt`/`Detaches` rules tell the bind's node from a sibling or a copy
+/// exactly as they do for an `input` that entered through
+/// `identity_from_first`. The pipe needs a document type to name cursors
+/// by, and a detached root never holds one, so the JSON type stands in.
+pub(crate) fn owned_identity_bind_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if S::TAG != EvalTag::Jq || reentry != Reentry::REBUILT {
+        return None;
+    }
+    let stages = owned_identity_body_stages(expr);
+    if !owned_identity_bind_door_applies(stages) {
+        return None;
+    }
+    type Doc = crate::json::light::StandardJson<'static, Vec<u64>>;
+    let mut escaped: Option<Control> = None;
+    let mut forward = |item: GenericItem<Doc>| -> Demand {
+        match owned_identity_materialize::<Doc, S>(item) {
+            Ok(o) => sink(o),
+            Err(control) => stop_with_escape(&mut escaped, control),
+        }
+    };
+    let flow = eval_owned_identity_pipe::<S, Doc>(
+        stages,
+        Cow::Borrowed(input),
+        OwnedIdentity::detached(),
+        optional,
+        &mut forward,
+    );
+    Some(match escaped {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    })
+}
+
+/// [`owned_identity_bind_door`] for the eager re-entries: every output
+/// collected, with the escape that ended the pipe, if any.
+pub(crate) fn owned_identity_bind_door_collect<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Option<(Vec<OwnedValue>, Option<Control>)> {
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    let flow = owned_identity_bind_door::<S>(expr, input, optional, reentry, &mut |v| {
+        collected.push(v);
+        Demand::Continue
+    })?;
+    let control = match flow {
+        Flow::Escaped(control) => Some(control),
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+    };
+    Some((collected, control))
 }
 
 fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
