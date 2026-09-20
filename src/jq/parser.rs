@@ -2085,13 +2085,7 @@ impl<'a> Parser<'a> {
             } else if self.peek() == Some(':') {
                 self.next();
                 self.skip_ws();
-                // jq's `ExpD`, not `Exp`: the `,` here separates entries, so a
-                // value must stop at it or `{a: 1, b: 2}` reads `1, b` as one
-                // value. Use `(...)` to fan a value out: `{a: (1,2)}`.
-                // In yq mode this position also carries the `and`/`or` level,
-                // which yq ranks above `:` and `,` -- see
-                // `parse_pipe_no_comma_with_booleans` (#2506).
-                self.parse_pipe_no_comma_with_booleans()?
+                self.parse_object_value()?
             } else {
                 // Shorthand: key must be literal identifier
                 match &key {
@@ -2147,6 +2141,95 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Expr::Object(entries))
+    }
+
+    /// The value of an object-construction entry.
+    ///
+    /// This position is jq's `ExpD`, not `Exp`. The `,` boundary is only one
+    /// half of what that means here:
+    ///
+    /// - the `,` separates entries, so a value must stop at it or `{a: 1,
+    ///   b: 2}` reads `1, b` as one value (#462);
+    /// - the `Exp`-level constructs jq 1.7.1 rejects *at compile time* in
+    ///   this position -- a bare `if`/`reduce`/`foreach`/`try`/`label`/`def`,
+    ///   an `as`-binding, a binary operator (`1+2`), or a generic trailing
+    ///   `?` (`error("x")?`) -- must be refused too, or `{a: if true then 1
+    ///   else 2 end}` quiet-accepts what real jq errors on ("unexpected if").
+    ///   Confirmed live against jq 1.7.1: bare `if` is exit 3 while
+    ///   `{a: (if true then 1 else 2 end)}` is fine.
+    ///
+    /// The restriction is jq-mode only. Real yq parses the same position as a
+    /// full expression, and its own precedence ranks `and`/`or` above `:` and
+    /// `,` -- see `parse_pipe_no_comma_with_booleans` (#2506).
+    fn parse_object_value(&mut self) -> Result<Expr, ParseError> {
+        match self.mode {
+            ParserMode::Jq => self.parse_expd_value(),
+            ParserMode::Yq => self.parse_pipe_no_comma_with_booleans(),
+        }
+    }
+
+    /// jq's `ExpD` production (`parser.y`: `ExpD: ExpD '|' ExpD | '-' ExpD |
+    /// Term`) for an object-construction value: a `Term` (with unary negation
+    /// folded in at `parse_primary`) and `|`-chains of those, stopping at the
+    /// entry-separating `,`.
+    fn parse_expd_value(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_expd_term()?;
+        self.skip_ws();
+
+        if self.peek() != Some('|') {
+            return Ok(first);
+        }
+
+        let mut exprs = vec![first];
+
+        while self.peek() == Some('|') {
+            self.next();
+            self.skip_ws();
+            exprs.push(self.parse_expd_term()?);
+            self.skip_ws();
+        }
+
+        Ok(Expr::pipe(exprs))
+    }
+
+    /// One `ExpD` operand (`'-' ExpD | Term`).
+    ///
+    /// Unary minus needs no special handling of its own here: the `-` arm of
+    /// `parse_primary` already folds `-1` into the negative-literal token
+    /// (#1035/#3044) when a digit follows and otherwise builds
+    /// [`Expr::Negate`], propagating its operand's term-status either way
+    /// (#3038) -- so `-.foo` parses, `-if true then 1 else 2 end` leaves the
+    /// flag `false` and is rejected below, and negative-literal fidelity is
+    /// the same as for the identical text spelled outside an object.
+    ///
+    /// What this function adds on top of `parse_primary` is the jq `Term`
+    /// *test*, since `parse_primary` is deliberately shared with the full
+    /// `Exp` grammar and accepts more than a `Term`:
+    ///
+    /// - a bare `if`/`reduce`/`foreach`, and any generic trailing `EXPR?`
+    ///   demotion, are recorded as non-Terms by `last_primary_is_term`
+    ///   (#3038), rejected here on that flag;
+    /// - `try`/`label`/`def` are also `Exp`-level in jq's grammar even
+    ///   though they can leave the flag `true` (their operands/bodies are
+    ///   Terms), so they are rejected by [`Expr`] variant. `break $x`,
+    ///   `..`, `.foo?`, `1[0]`, `(if ... end)`, `@fmt`, and every other real
+    ///   `Term` shape is unaffected.
+    fn parse_expd_term(&mut self) -> Result<Expr, ParseError> {
+        let term = self.parse_primary()?;
+        self.skip_ws();
+
+        if !self.last_primary_is_term
+            || matches!(
+                term,
+                Expr::Try { .. } | Expr::Label { .. } | Expr::FuncDef { .. }
+            )
+        {
+            return Err(ParseError::new(
+                "object value after ':' must be a term (parenthesize a full expression)",
+                self.pos,
+            ));
+        }
+        Ok(term)
     }
 
     /// Parse a primary expression (atoms and parenthesized expressions), then
@@ -8663,6 +8746,80 @@ mod tests {
         };
         assert_eq!(entries.len(), 2);
         assert!(matches!(entries[0].value, Expr::Pipe(_)));
+    }
+
+    /// #3105: an object-construction value is jq's `ExpD`, not `Exp` -- a
+    /// `Term` (with unary negation and `|` chains) and *nothing else*. Every
+    /// accepted/rejected row below is confirmed live against jq 1.7.1.
+    #[test]
+    fn test_object_value_is_expd_not_exp_3105() {
+        // Rejected by real jq: a bare `Exp`-construct in value position.
+        for value in [
+            "if true then 1 else 2 end",
+            "reduce (1,2) as $i (0;.+$i)",
+            "foreach (1,2) as $i (0;.+$i;.)",
+            "if true then 1 else 2 end | .",
+            "reduce (1,2) as $i (0;.+$i) | .",
+            "if true then 1 else 2 end | if true then 3 else 4 end",
+            "try .",
+            "try . catch .",
+            "label $x | 1",
+            "def f: 1; 2",
+            "1 as $x | $x",
+            "1+2",
+            "1 - 2",
+            "1 * 2",
+            "1 / 2",
+            "1 % 2",
+            "1 == 2",
+            "1 and 2",
+            "1 or 2",
+            "1 ?// 2",
+            // A generic trailing `?` demotes any `Exp`, even a Term-shaped
+            // call -- `.foo?` (the postfix form) is a Term and stays legal,
+            // covered in the accepted set below.
+            r#"error("x")?"#,
+            "1?",
+            "(1)?",
+            // Unary minus over a non-Term propagates the rejection.
+            "-if true then 1 else 2 end",
+        ] {
+            let filter = format!("{{a: {value}}}");
+            assert!(
+                parse(&filter).is_err(),
+                "`{filter}` must be a parse error (jq 1.7.1 rejects it): {filter}"
+            );
+        }
+
+        // Accepted by real jq: genuine Terms, pipe chains, and full `Exp`s
+        // restored by parens/collection syntax.
+        for value in [
+            "(if true then 1 else 2 end)",
+            "(reduce (1,2) as $i (0;.+$i))",
+            "(1+2)",
+            "(label $x | 1)",
+            "1 | 2",
+            "-1",
+            "-.foo",
+            ".",
+            ".foo?",
+            ".[0]?",
+            "..",
+            "1[0]",
+            "[1,2]",
+            "[if true then 1 else 2 end]",
+            "$x",
+            "$x[]",
+            "@base64",
+            "foo(1)",
+            "break $x",
+        ] {
+            let filter = format!("{{a: {value}}}");
+            assert!(
+                parse(&filter).is_ok(),
+                "`{filter}` must parse (jq 1.7.1 accepts it)"
+            );
+        }
     }
 
     /// The bodies that jq spells as a full `Exp` accept a bare comma. Before

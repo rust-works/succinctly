@@ -18373,6 +18373,68 @@ fn test_reduce_foreach_if_before_as_is_a_compile_error_3038() -> Result<()> {
     Ok(())
 }
 
+/// #3105: an object-construction value is jq's `ExpD`, not `Exp` -- a
+/// `Term` (or unary `-` of one, or a `|`-chain of those) and *nothing
+/// else*. Real jq 1.7.1 rejects a bare `if`/`reduce`/`foreach`/`try`/
+/// `label`/`def`, an `as`-binding, a binary operator, or a generic
+/// trailing `?` in this position with exit 3; succinctly previously
+/// accepted every one of them. Every row confirmed live against jq 1.7.1.
+#[test]
+fn test_object_construction_value_is_expd_not_exp_3105() -> Result<()> {
+    for filter in [
+        "{a: if true then 1 else 2 end}",
+        "{a: reduce (1,2) as $i (0;.+$i)}",
+        "{a: foreach (1,2) as $i (0;.+$i;.)}",
+        "{a: if true then 1 else 2 end | .}",
+        "{a: try .}",
+        "{a: try . catch .}",
+        "{a: label $x | 1}",
+        "{a: def f: 1; 2}",
+        "{a: 1 as $x | $x}",
+        "{a: 1+2}",
+        "{a: 1 - 2}",
+        "{a: 1 ?// 2}",
+        r#"{a: error("x")?}"#,
+        "{a: 1?}",
+        "{a: -if true then 1 else 2 end}",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` should be a compile error (exit 3) -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout, "", "`{filter}`: stdout: {stdout:?}");
+    }
+
+    // Controls: every one of these is accepted by real jq too, and must
+    // keep working -- the parenthesized/collection forms are genuine
+    // `Term`s, and the rest are plain Terms/pipes/negations.
+    for (filter, want) in [
+        ("{a: (if true then 1 else 2 end)}", "{\"a\":1}"),
+        ("{a: (reduce (1,2) as $i (0;.+$i))}", "{\"a\":3}"),
+        ("{a: (1+2)}", "{\"a\":3}"),
+        ("{a: 1 | 2}", "{\"a\":2}"),
+        ("{a: -1, b: -2}", "{\"a\":-1,\"b\":-2}"),
+        ("{a: .}", "{\"a\":null}"),
+        ("{a: .foo?}", "{\"a\":null}"),
+        ("{a: ..}", "{\"a\":null}"),
+        ("{a: [1,2]}", "{\"a\":[1,2]}"),
+        ("{a: [if true then 1 else 2 end]}", "{\"a\":[1]}"),
+        ("{a: @base64}", "{\"a\":\"bnVsbA==\"}"),
+        ("{a: {b: (if true then 1 else 2 end)}}", "{\"a\":{\"b\":1}}"),
+        ("{a: 1, b: 2}", "{\"a\":1,\"b\":2}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
+        assert_eq!(
+            code, 0,
+            "`{filter}` must be accepted -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
+
 /// #2245 (found in review of this fix's own first draft): within one `s`
 /// iteration, `end`'s own trailing escape was checked *before* `target`'s,
 /// so when both escaped in the same iteration the lower-priority `end`
