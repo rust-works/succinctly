@@ -982,12 +982,32 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
                     expecting_key = false;
                 }
                 ':' => {
+                    // #3110: real jq wraps the key/value `:` in the *object*
+                    // color, same as `{`/`}` -- confirmed live against jq
+                    // 1.7.1 with both the default scheme and a custom
+                    // `JQ_COLORS` where objects differ from arrays. The
+                    // colon can only appear inside an object, so there is no
+                    // array-adjacent case to branch on.
+                    result.push_str(&scheme.object);
                     result.push(c);
+                    result.push_str(&scheme.reset);
                     // After colon, we're expecting a value, not a key
                     expecting_key = false;
                 }
                 ',' => {
+                    // #3110: real jq colors the comma with its *enclosing
+                    // container* -- array color inside `[...]`, object color
+                    // inside `{...}` (confirmed live against jq 1.7.1 with a
+                    // custom `JQ_COLORS`, default colors share `1;39` so the
+                    // distinction only shows with a custom spec).
+                    let color = if depth_stack.last() == Some(&'{') {
+                        &scheme.object
+                    } else {
+                        &scheme.array
+                    };
+                    result.push_str(color);
                     result.push(c);
+                    result.push_str(&scheme.reset);
                     // After comma in object context, next string is a key
                     if depth_stack.last() == Some(&'{') {
                         expecting_key = true;
@@ -1756,6 +1776,65 @@ mod tests {
         assert!(
             out.contains("\x1b[0;32m\"a\\\"b\"\x1b[0m"),
             "escaped string: {out:?}"
+        );
+    }
+
+    /// #3110: the `:` takes the object color and the `,` its enclosing
+    /// container's color (array vs object), exactly as jq colors them.
+    /// Uses a custom scheme where objects (`1;37`) and arrays (`1;36`)
+    /// differ, so the two container colors are distinguishable -- with the
+    /// default scheme both are `1;39` and a wrong assignment would be
+    /// invisible. All rows byte-confirmed against jq 1.7.1 under the same
+    /// `JQ_COLORS`.
+    #[test]
+    fn test_colorize_json_wraps_separators_3110() {
+        let scheme = ColorScheme::from_spec("1;31:1;32:1;33:1;34:1;35:1;36:1;37:1;30").unwrap();
+
+        // Object: `{`, `}`, `:` and the `,` all take the object color.
+        assert_eq!(
+            colorize_json(r#"{"a":1,"b":2}"#, &scheme),
+            concat!(
+                "\x1b[1;37m{\x1b[0m",
+                "\x1b[1;30m\"a\"\x1b[0m",
+                "\x1b[1;37m:\x1b[0m",
+                "\x1b[1;34m1\x1b[0m",
+                "\x1b[1;37m,\x1b[0m",
+                "\x1b[1;30m\"b\"\x1b[0m",
+                "\x1b[1;37m:\x1b[0m",
+                "\x1b[1;34m2\x1b[0m",
+                "\x1b[1;37m}\x1b[0m",
+            )
+        );
+
+        // Array: `[`, `]` and the `,`s all take the array color.
+        assert_eq!(
+            colorize_json("[1,2,3]", &scheme),
+            concat!(
+                "\x1b[1;36m[\x1b[0m",
+                "\x1b[1;34m1\x1b[0m",
+                "\x1b[1;36m,\x1b[0m",
+                "\x1b[1;34m2\x1b[0m",
+                "\x1b[1;36m,\x1b[0m",
+                "\x1b[1;34m3\x1b[0m",
+                "\x1b[1;36m]\x1b[0m",
+            )
+        );
+
+        // Nested: inside an object that lives in an array, the `:` and `{`
+        // keep the object color while the *array's* own `,` is array-colored.
+        assert_eq!(
+            colorize_json(r#"[{"a":1},2]"#, &scheme),
+            concat!(
+                "\x1b[1;36m[\x1b[0m",
+                "\x1b[1;37m{\x1b[0m",
+                "\x1b[1;30m\"a\"\x1b[0m",
+                "\x1b[1;37m:\x1b[0m",
+                "\x1b[1;34m1\x1b[0m",
+                "\x1b[1;37m}\x1b[0m",
+                "\x1b[1;36m,\x1b[0m",
+                "\x1b[1;34m2\x1b[0m",
+                "\x1b[1;36m]\x1b[0m",
+            )
         );
     }
 

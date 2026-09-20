@@ -9121,7 +9121,7 @@ fn test_duplicate_mapping_key_survives_color_json_output() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m1\u{1b}[0m,\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
+        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
     );
 
     Ok(())
@@ -9150,7 +9150,7 @@ fn test_duplicate_mapping_key_survives_color_compact() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         json,
-        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m,\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
+        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
     );
 
     Ok(())
@@ -9194,7 +9194,7 @@ fn test_color_output_survives_iteration_with_duplicate_keys_json() -> Result<()>
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m1\u{1b}[0m,\n  \u{1b}[1;34m\"a\"\u{1b}[0m: \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"b\"\u{1b}[0m: \u{1b}[0;39m3\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
+        "\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\n  \u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \u{1b}[0;39m2\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n\u{1b}[1;39m{\u{1b}[0m\n  \u{1b}[1;34m\"b\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m \u{1b}[0;39m3\u{1b}[0m\n\u{1b}[1;39m}\u{1b}[0m\n"
     );
 
     Ok(())
@@ -9290,7 +9290,7 @@ fn test_duplicate_mapping_key_survives_slurp_json_color() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m,\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
+        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m,\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
     );
 
     Ok(())
@@ -9325,7 +9325,7 @@ fn test_null_input_color_output_json() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
+        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m\u{1b}[1;39m:\u{1b}[0m\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
     );
     Ok(())
 }

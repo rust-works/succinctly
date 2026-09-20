@@ -7838,6 +7838,16 @@ To move to a newer jq, bump `JQ_VERSION`, install that version, run
 `./scripts/sync-jq-error-messages.sh` and `./scripts/sync-jq-golden.sh`, and review the
 diff.
 
+## ANSI color bytes: succinctly emits one SGR per token, jq emits redundant repeats (#3110)
+
+`-C` output wraps the same tokens in the same colors as real jq -- including, since #3110,
+the `:` in the object color and the `,` in its enclosing container's color (verified live
+against jq 1.7.1 with a custom `JQ_COLORS` that distinguishes object/array colors). The one
+byte-level difference is that jq redundantly emits the SGR a second time immediately before
+a closing delimiter (`\x1b[1;39m\x1b[1;39m}` for `}`/`]`), a quirk of its
+color-of-every-token-with-conditional-reset writer; succinctly emits each SGR once. Renders
+are identical.
+
 ## Depends On
 
 - [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to
