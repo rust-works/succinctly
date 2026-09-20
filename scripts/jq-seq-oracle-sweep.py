@@ -25,22 +25,33 @@ unreachable rather than filtering them out afterwards:
   mid-value, which is what exercises the `at EOF` templates, and a lone
   record has no interior RS byte for the stream to end early on.
 
-Both artifacts are properties of jq's 4096-byte `fgets` buffer, not of its
-parser, and neither survives into a newline-terminated stream:
+One artifact remains, a property of jq's 4096-byte `fgets` buffer rather
+than its parser, and it does not survive into a newline-terminated stream:
 
-1. A trailing unterminated RS-record after an earlier newline is dropped
-   unread below the buffer boundary and parsed above it.
-2. A record yielding no value makes `jv_parser_next` return
-   invalid-with-no-message, which jq's input loop reads as end-of-input --
-   but only when it lands in the buffer that hit EOF.
-3. `jq_util_input_read_more` measures the chunk with `strlen`, so a NUL
-   byte truncates the input -- but only in a chunk holding no newline.
+* `jq_util_input_read_more` measures the chunk with `strlen`, so a NUL
+  byte truncates the input -- but only in a chunk holding no newline.
 
-`--expect-artifacts` re-enables the shapes that trip them, for confirming
-they are still the only divergences.
+`--expect-artifacts` re-enables the shape that trips it, for confirming it
+is still the only divergence.
+
+**History.** Two more artifacts of that same `fgets` buffer used to live
+here -- a trailing unterminated RS-record after an earlier newline being
+dropped unread below the buffer boundary and parsed above it, and a record
+yielding no value silently ending the *whole* stream when it was the first
+thing scanned from jq's own final buffer. Both are real jq's own
+non-slurp end-of-stream rule (`jq_util_input_next_input`, `src/util.c`),
+not two separate corner cases, and #2998 modeled it: the corpus no longer
+excludes either shape.
 
 Expected result: `0 stderr mismatches, 0 stdout supersets`; exits non-zero
-otherwise.
+otherwise. **One separately-filed, pre-existing bug can still surface** at low
+probability (a handful of cases per 4,000): #3195, `value_ranges` misreading a
+substituted U+FFFD as a malformed BOM when invalid UTF-8 opens the document,
+fabricating an extra value. Confirmed present on `main` before #2998 too, via
+a throwaway comparison binary -- unrelated to what this script targets (the
+mismatch never touches `stop_at`/`for_each_warning`'s raw-byte walk at all).
+A superset whose input does *not* start with an invalid UTF-8 lead byte is a
+new, unattributed failure and should be investigated as such.
 
 Usage:
   cargo build --release --features cli
@@ -142,42 +153,21 @@ def malformed_bom(data):
     return data[:1] == b"\xef" and not data.startswith(b"\xef\xbb\xbf")
 
 
-def stops_early(data):
-    """Whether jq's input loop ends the stream before reading it all.
-
-    An RS closing a record that yields no value makes `jv_parser_next`
-    return invalid-with-no-message, which the loop reads as end-of-input --
-    but only in the call that performed the final read. With no newline the
-    whole input is one buffer, so that reduces to "the first record yields
-    nothing".
-
-    After a malformed BOM the first record is the content *before* the
-    first RS, since the parser is no longer waiting for one -- which is why
-    `\xef\x1e...` stops immediately where `\x1e...` would not."""
-    if b"\n" in data or RS not in data:
-        return False
-    if malformed_bom(data):
-        consumed = 2 if data.startswith(b"\xef\xbb") else 1
-        first = data[consumed:].split(RS)[0]
-    elif data.count(RS) < 2:
-        return False
-    else:
-        first = data.split(RS)[1]
-    return first.strip(b" \t\r") in (b"", b'"')
-
-
 def artifact(data):
+    """Whether `data` trips the one `fgets`-line-reader artifact #2998
+    left unmodeled. jq's own end-of-stream rule (an RS closing a record
+    that yields no value ends the *entire* stream, silently, iff that
+    record is the first thing jq's own `fgets`-chunked final buffer
+    scans) is matched now, so the two shapes that used to trip it --
+    both properties of that same buffer boundary, not of the parser --
+    are no longer here; see the module docstring's history note."""
     if b"\x00" in data and b"\n" not in data.split(b"\x00", 1)[0]:
-        return True  # strlen truncation, artifact 3
+        return True  # strlen truncation -- the one artifact left, #3+
     if RS not in data:
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.
         return not malformed_bom(data)
-    if stops_early(data):
-        return True
-    if b"\n" not in data:
-        return False
-    return not data.rsplit(RS, 1)[1].endswith(b"\n") and len(data) < 4096
+    return False
 
 
 def random_cases(count, seed, allow_artifacts):

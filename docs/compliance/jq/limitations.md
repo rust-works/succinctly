@@ -4948,26 +4948,82 @@ $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints 2
 ```
 
 Verified by `scripts/jq-seq-oracle-sweep.py`, which compares stderr, stdout and exit code
-jointly: **0 stderr mismatches and 0 stdout supersets** over 3,062 generated streams per
-seed.
+jointly: **0 stderr mismatches and 0 stdout supersets** over 4,068 generated streams per
+seed (one separately-filed, pre-existing bug can still surface at low probability --
+[#3195](https://github.com/rust-works/succinctly/issues/3195), `value_ranges` misreading a
+substituted U+FFFD as a malformed BOM when invalid UTF-8 opens the document; unrelated to
+anything on this page, since it never touches the `--seq` reader's own control flow at all).
 
-Two `--seq` divergences that remain are artifacts of jq's 4096-byte `fgets` *line reader*
-rather than its parser, and neither is reachable from a newline-terminated stream:
+One `--seq` divergence remains, an artifact of jq's 4096-byte `fgets` *line reader* rather
+than its parser, and unreachable from a newline-free chunk:
 
-1. A trailing unterminated RS-record after an earlier newline is dropped unread below the
-   buffer boundary and parsed above it (`printf '\x1e1\n\x1e{bad'` is silent, the same input
-   with 4,100 bytes of padding warns) — the value-side half of this is the same artifact
-   already described below.
-2. A record yielding no value makes jq's `jv_parser_next` return invalid-with-no-message,
-   which its input loop reads as end-of-input and stops the whole stream — but only when it
-   lands in the buffer that hit EOF. `printf '\x1e\x1e"a"'` prints nothing in real jq;
-   `printf '\x1e\x1e{"a":1}\n'` prints the object.
-3. `jq_util_input_read_more` measures each chunk with `strlen`, so a NUL byte truncates the
-   input — again only in a chunk holding no newline. `printf '\x1eA+\x008e'` reports at
-   column 3 in real jq (which stopped at the NUL) and column 6 here.
+* `jq_util_input_read_more` measures each chunk with `strlen`, so a NUL byte truncates the
+  input — only in a chunk holding no newline. `printf '\x1eA+\x008e'` reports at column 3
+  in real jq (which stopped at the NUL) and column 6 here.
 
-Running the sweep with `--expect-artifacts` puts these shapes back: 28 of 3,063 streams
-diverge, and every one is attributable to those artifacts — none unexplained.
+Running the sweep with `--expect-artifacts` puts this shape back -- attributable, and the
+only one left. The `--seq` reader's own non-slurp end-of-stream rule, described just below,
+no longer needs that flag: the corpus generates it unconditionally now that it is modeled.
+
+### jq's stream can end silently, mid-buffer, with nothing to explain it (#2998)
+
+Two shapes that used to be recorded here as unattributed "`fgets` line-reader artifacts"
+turned out to be the *same* rule, once traced into jq's own C source rather than inferred
+from output alone: real jq's non-slurp `--seq` driver
+(`jq_util_input_next_input`, `src/util.c`) tracks "was the buffer I'm holding just
+refilled" in a local variable, reset on every call. `jv_parser_next` returns a
+message-less invalid — no value, no error — exactly once: when an RS byte arrives with
+nothing pending (an empty record). If that is the *first* thing scanned from the specific
+call that just performed the terminal `fgets` refill, the driver's loop condition reads it
+as "no more input" and exits **without ever setting `p->eof`** — so nothing after that RS
+is scanned, and there is no `at EOF` diagnostic for whatever was abandoned. Any later call
+reusing the same (already-final) buffer has no fresh refill to reset that local variable,
+so it keeps looping internally instead, absorbing any number of further empty records
+without dropping anything:
+
+```
+$ printf '\x1e\x1etrue'     | jq --seq -c '.'   # (nothing at all, exit 0)
+$ printf '\x1e1\n\x1etrue'  | jq --seq -c '.'   # 1        -- the earlier record already
+                                                #             leaves the parser in the same
+                                                #             state an empty one would
+$ printf '\x1e1 \x1etrue'   | jq --seq -c '.'   # 1, true  -- one buffer, no newline: the
+                                                #             first event is a *value*, so
+                                                #             the rest parses normally
+```
+
+Real jq's own `fgets` chunks at a newline *or* after 4095 bytes, whichever comes first, so
+the drop is observable by padding alone: `\x1e1\n\x1e` + 4093 spaces + `\x1etrue` keeps
+`true`, and one byte more of padding drops it. `succinctly jq` now matches all of this,
+modeled in [`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs)'s
+`final_buffer_start`/`stop_at` and threaded through
+[`value_ranges`](../../../src/bin/succinctly/jq_seq_reader.rs) as a value-count cap rather
+than a byte offset (the value walk runs over the UTF-8-*substituted* stream, which can
+differ in length from jq's own raw bytes, but never in how many structural events it
+scans, since substitution only ever replaces already-invalid bytes and never touches,
+removes, or introduces an ASCII one). `-s` is unaffected (`has_more` keeps its own loop
+going) -- the warning this same drop would otherwise suppress still fires there:
+
+```
+$ printf '\x1e\x1etrue' | jq --seq -s -c '.'
+jq: ignoring parse error: Unfinished string at EOF at line 2, column 6
+[1]
+```
+
+This is also what an earlier draft of this page recorded, without the mechanism, as "a
+separate, pre-existing rule" on multi-record streams -- the trigger it named ("once jq's
+reader has seen one newline, a later record must itself be newline-terminated to be
+emitted") was an *effect* of this same driver rule, not an independent one:
+
+```
+$ printf '\x1e"a"\x1e"b"'     | jq --seq -c '.'   # "a" and "b" -- one buffer, no newline
+$ printf '\x1e"a"\n\x1e"b"'   | jq --seq -c '.'   # "a" only    -- second RS is the first
+                                                  #                event of the final buffer
+$ printf '\x1e"a"\n\x1e"b"\n' | jq --seq -c '.'   # "a" and "b" -- trailing newline empties
+                                                  #                the final buffer entirely
+```
+
+All three now match (`succinctly jq` reproduces every row above, including `-s`); before
+#2998 `succinctly jq` also printed `"b"` on the middle row.
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
@@ -4991,23 +5047,9 @@ randomized corpus. A fabricated value is a correctness failure even where an unr
 line-reader artifact still leaves succinctly with extra output.
 
 That is a statement about malformed-record handling, not a guarantee about `--seq` as a
-whole. On multi-record streams a *separate, pre-existing* rule still diverges in the other
-direction, and it is **not** simply "the trailing record lacks a newline" -- a first draft of
-this note said that, and the oracle contradicts it:
-
-```
-$ printf '\x1e"a"\x1e"b"'    | jq --seq -c '.'   # "a" and "b"  -- no newline anywhere, both kept
-$ printf '\x1e"a"\n\x1e"b"'  | jq --seq -c '.'   # "a" only     -- a newline earlier changes it
-$ printf '\x1e"a"\n\x1e"b"\n'| jq --seq -c '.'   # "a" and "b"
-```
-
-The trigger is a newline appearing *earlier in the stream*: once jq's reader has seen one, a
-later record must itself be newline-terminated to be emitted. succinctly keeps it either way
-(`printf '\x1e0007\n\x1e[]'` is `7` in jq, `7` and `[]` here) -- identical on `main`, so not
-introduced by this work. The malformed-suffix path no longer shares that divergence: it is
-driven by [`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs), with
-[`scripts/jq-seq-oracle-sweep.py`](../../../scripts/jq-seq-oracle-sweep.py) guarding against
-stdout supersets.
+whole -- see "jq's stream can end silently, mid-buffer, with nothing to explain it" above
+for the multi-record, non-slurp rule that also bears on stdout's contents (#2998), now
+matched rather than diverging.
 
 A second, narrower gap `succinctly jq --seq` also deliberately stays silent on: `-n`
 combined with a filter that forces a real read (`input`/`inputs`) turns the identical

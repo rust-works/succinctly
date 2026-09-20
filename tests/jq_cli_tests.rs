@@ -45553,6 +45553,155 @@ fn test_seq_record_with_multiple_values_emits_all_1723() -> Result<()> {
     Ok(())
 }
 
+/// #2998: real jq's non-slurp `--seq` driver (`jq_util_input_next_input`,
+/// `src/util.c`) can end the *entire* stream silently at the first empty
+/// record of jq's own final `fgets` buffer -- no value, no diagnostic,
+/// exit 0. Every row confirmed live against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_seq_non_slurp_end_of_stream_rule_2998() -> Result<()> {
+    for (input, expected_stdout, expected_stderr, why) in [
+        ("\x1e\x1etrue", "", "", "issue's own headline repro"),
+        ("\x1e\x1e\"s\"", "", "", "string, not just a scalar keyword"),
+        ("\x1e\x1e5", "", "", "number"),
+        ("\x1e \x1e{}", "", "", "whitespace-only leading record"),
+        ("\x1e\n\x1etrue", "", "", "newline-only leading record"),
+        (
+            "\x1e\x1etru",
+            "",
+            "",
+            "drop also suppresses the would-be `at EOF` warning",
+        ),
+        (
+            "\x1e1\n\x1etrue",
+            "1\n",
+            "",
+            "an earlier record's own value leaves the same state an empty one would",
+        ),
+        (
+            "\x1e1\n\x1e\x1e\"abc",
+            "1\n",
+            "",
+            "suppresses a later warning in the same buffer too",
+        ),
+        (
+            "\x1e1 \x1etrue",
+            "1\ntrue\n",
+            "",
+            "one buffer, no newline: first event is a value, not empty",
+        ),
+        (
+            "\x1e1\x1e2 \x1etrue",
+            "2\ntrue\n",
+            "jq: ignoring parse error: Potentially truncated top-level numeric value at line 1, column 3\n",
+            "first event is an error, not empty -- rest of the buffer parses normally",
+        ),
+        // Controls: a trailing newline empties the final buffer entirely,
+        // so nothing can be dropped regardless of what came before.
+        ("\x1e\x1etrue\n", "true\n", "", "trailing newline (control)"),
+        (
+            "\x1e\x1etrue\n\x1e5\n",
+            "true\n5\n",
+            "",
+            "trailing newline, two records (control)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected_stdout, "input {input:?} -- {why}");
+        assert_eq!(stderr, expected_stderr, "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?} -- {why}");
+    }
+    Ok(())
+}
+
+/// #2998's rule is non-slurp only: real jq's `-s` keeps `has_more` looping
+/// past the same empty record, so the value survives and the warning the
+/// non-slurp rule would have suppressed fires normally.
+#[test]
+fn test_seq_slurp_unaffected_by_non_slurp_end_of_stream_rule_2998() -> Result<()> {
+    // The headline repro itself has nothing left to warn about once kept
+    // (`true` parses cleanly) -- an input whose dropped tail is genuinely
+    // malformed shows the warning surviving under `-s` where non-slurp
+    // would have suppressed it.
+    let (stdout, stderr, code) =
+        run_jq_full(&["--seq", "-s", "-c", "."], Some("\x1e1\n\x1e\x1e\"abc"))?;
+    let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+    assert_eq!(stripped, "[1]\n");
+    assert_eq!(
+        stderr,
+        "jq: ignoring parse error: Unfinished string at EOF at line 2, column 6\n"
+    );
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+/// #2998 also applies under `-n` forcing a real read via `inputs` -- the
+/// value side (`build_seq_values`) runs regardless of `-n`, even though
+/// `seq_no_rs_byte_warning`'s own warnings are separately suppressed there
+/// (#1525's unrelated gap, documented in
+/// `docs/compliance/jq/limitations.md`).
+#[test]
+fn test_seq_null_input_forced_read_hits_end_of_stream_rule_2998() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["--seq", "-n", "-c", "[inputs]"], Some("\x1e\x1etrue"))?;
+    let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+    assert_eq!(stripped, "[]\n");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+/// Multi-file: only the *last* file's own final buffer can trigger the
+/// drop. An earlier file's newline-free tail is `is_partial` and joins the
+/// next file instead (#3002); an empty last file has no final buffer to
+/// drop from at all.
+#[test]
+fn test_seq_end_of_stream_rule_only_applies_to_the_last_file_2998() -> Result<()> {
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["--seq", "-c", "."], &["\x1e\x1etrue", "\x1e5\n"])?;
+    let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+    assert_eq!(stripped, "5\n", "{stderr}");
+    assert_eq!(
+        stderr,
+        "jq: ignoring parse error: Truncated value at line 1, column 7\n"
+    );
+    assert_eq!(code, 0);
+
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["--seq", "-c", "."], &["\x1e\x1etrue", ""])?;
+    let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+    assert_eq!(stripped, "true\n", "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+/// Real jq's own `fgets` chunks at a newline *or* after 4095 bytes,
+/// whichever comes first -- so the drop is observable by padding alone.
+/// `\x1e1\n\x1e` + N spaces + `\x1etrue`'s tail (from the second RS) is
+/// `N + 6` bytes; N=4093 keeps `true`, N=4094 drops it, and the same
+/// one-byte flip recurs at the next chunk (8188/8189).
+#[test]
+fn test_seq_end_of_stream_rule_4095_byte_fgets_boundary_2998() -> Result<()> {
+    for (spaces, keeps_true) in [
+        (4093, true),
+        (4094, false),
+        (4095, false),
+        (8188, true),
+        (8189, false),
+    ] {
+        let mut input = String::from("\x1e1\n\x1e");
+        input.push_str(&" ".repeat(spaces));
+        input.push_str("\x1etrue");
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(&input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        let expected = if keeps_true { "1\ntrue\n" } else { "1\n" };
+        assert_eq!(stripped, expected, "spaces={spaces}: {stderr}");
+        assert_eq!(code, 0, "spaces={spaces}");
+    }
+    Ok(())
+}
+
 /// #1723: adding multi-value support must not resurrect a value real jq
 /// abandons.
 ///
