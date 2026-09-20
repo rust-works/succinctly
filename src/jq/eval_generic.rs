@@ -2783,6 +2783,19 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     if let Some(relocated) = crate::jq::eval::eval_owned_relocating_fold::<S>(expr, &owned) {
         return GenericResult::Owned(relocated);
     }
+    // #3177: a `path(f)`-headed stage resolves over `owned` itself, so an
+    // embed *inside* `path()`'s own argument is navigated to as the node it
+    // is (`. as $x | [.] | path(.[0] | $x)` is `[0]` in jq). `false`, not
+    // `optional`: the `full_eval` route this replaces never took one (see
+    // the note below). See `eval::owned_path_door`.
+    if let Some((values, control)) =
+        crate::jq::eval::owned_path_door_collect::<S>(expr, &owned, false, reentry)
+    {
+        return match control {
+            Some(control) => partial_generic(values, control),
+            None => owned_vec_to_generic_result(values),
+        };
+    }
     // #2889: `owned` may still *be* a bound node's own value -- see
     // `eval::Reentry::witnessed_by`.
     let reentry = reentry.witnessed_by::<S>(&owned);
@@ -6327,6 +6340,22 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     // this covers every other integer index and `last`, checked ahead of
     // the main match so those two arms don't have to repeat the guard.
     if seq.instructions.is_none() && matches!(seq.source, LazySource::Cursors { .. }) {
+        // #3177: `. | X` is `X`, so an identity stage hands the sequence on
+        // untouched. Only here, under this block's guard, and not as a
+        // general arm below: the `_` arm is a *materialization barrier*,
+        // and with a `map(f)` on the sequence, `[.[]] | map(f) | . | first`
+        // materializes at the `.` and raises on a failing second element
+        // exactly as jq's eager `map` does, where the lazy `first` arm
+        // below would not (#725/#2174's documented divergence, which must
+        // not spread to a new spelling). With no instructions over a cursor
+        // source no element can error, so the passthrough is vacuous -- and
+        // it is what keeps `[.] | . | max | path($x)`'s one-element array
+        // out of the `eval_on_owned` round trip that rebuilt it before
+        // `max` ever ran (jq answers `[]`; the wider `[.,.] | . | max`
+        // already did, via `eval::embed_peel_step`'s own identity skip).
+        if matches!(unwrap_paren(expr), Expr::Identity) {
+            return GenericResult::LazySeq(seq);
+        }
         // A nested-pipe stage whose *head* is one of the shapes below:
         // `.[0].name` parses as one `Expr::Pipe([Index{0}, Field])` handed
         // to this function as a single stage (`parse_postfix` builds a
@@ -6347,11 +6376,17 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // these (`.foo.bar`) must keep going through the same single
         // atomic `materialize_atomic` + `eval_on_owned` call it already
         // does, not a split two-step version of the identical work.
+        // `Expr::Identity` is in the list for the same reason it has the
+        // arm above (#3177): `(. | max)` and the parser-fused `. | . | max`
+        // arrive as one `Pipe` whose head is `.`, and peeling that head is
+        // the passthrough, so the stage behind it folds as if the `.` were
+        // never written.
         if let Expr::Pipe(stages) = unwrap_paren(expr) {
             if matches!(
                 stages.first().map(unwrap_paren),
                 Some(
-                    Expr::Index { key: None, .. }
+                    Expr::Identity
+                        | Expr::Index { key: None, .. }
                         | Expr::Builtin(Builtin::Last)
                         | Expr::Slice { .. }
                 )
@@ -23018,18 +23053,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // is a different node). Demote any marker not proven to be
             // `cursor`'s own node before either resolution route below.
             let root = RootWitness::of(cursor.as_ref());
-            // `reroot_markers`, not `reroot_for_reentry`: `path_expr` is the
-            // resolver's own argument, so the resolver-reaching node the
-            // precheck looks for is this builtin *around* it (#3122).
-            let path_expr = reroot_markers::<S>(path_expr, &root);
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
-            if reindex_bridge_is_identity(&owned) {
-                return query_result_to_generic::<V, S>(crate::jq::eval::builtin_path_on_owned::<
-                    Vec<u64>,
-                    S,
-                >(
-                    &path_expr, &owned, false
-                ));
+            // The reroot (`reroot_markers`, not `reroot_for_reentry` --
+            // `path_expr` is the resolver's own argument, #3122) and the
+            // `reindex_bridge_is_identity` gate both live in
+            // `path_over_owned`, shared with the owned re-entries' door
+            // (#3177) so the two routes cannot drift.
+            if let Some((values, control)) =
+                crate::jq::eval::path_over_owned_collect::<S>(path_expr, &owned, &root, false)
+            {
+                return match control {
+                    Some(control) => partial_generic(values, control),
+                    None => owned_vec_to_generic_result(values),
+                };
             }
             let owned_builtin_expr = Expr::Builtin(builtin.clone());
             eval_on_owned::<S, _>(&owned_builtin_expr, owned, optional, Reentry::Against(root))

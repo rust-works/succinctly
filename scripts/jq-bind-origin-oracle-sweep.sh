@@ -534,6 +534,27 @@ fold-body-fanout-declines	{"a":{"b":1}}	(foreach .a as {a:$v} ?// {c:$v} (0; ($v
 fold-body-fanout-declines-del	{"a":{"b":1}}	del(foreach .a as $v (.; (($v | .b?), 1); try ($v | .b?)))
 owned-embed-agree-array-element	{"a":1}	. as $x | [.] | .[0] | path($x)
 owned-embed-refuse-path-nested-embed	{"a":1}	. as $x | [.] | path(.[0] | $x)
+owned-embed-path-nested-multi-first	{"a":1}	. as $x | [.,.] | path(.[0] | $x)
+owned-embed-path-nested-multi-second	{"a":1}	. as $x | [.,.] | path(.[1] | $x)
+owned-embed-path-nested-object	{"a":1}	. as $x | {k:.} | path(.k | $x)
+owned-embed-path-nested-deep	{"a":1}	. as $x | [[.]] | path(.[0][0] | $x)
+owned-embed-path-nested-iterate	{"a":1}	. as $x | [.] | path(.[] | $x)
+owned-embed-path-nested-continue	{"a":1}	. as $x | [.] | path(.[0] | $x | .a)
+owned-embed-path-nested-identity-stage	{"a":1}	. as $x | [.] | . | path(.[0] | $x)
+owned-embed-path-nested-tail	{"a":1}	. as $x | [.,.] | path(.[] | $x) | .[0]
+owned-embed-path-nested-tail-stop	{"a":1}	. as $x | first([.,.] | path(.[] | $x) | .[0])
+owned-embed-path-nested-tail-raise	{"a":1}	. as $x | [.,.] | path(.[] | $x) | error
+owned-embed-path-nested-array-root	[1]	. as $x | [.] | path(.[0] | $x)
+owned-embed-path-nested-in-fold	{"a":1}	reduce (1) as $i (.; . as $x | [.] | path(.[0] | $x))
+owned-embed-path-nested-rebuilt-sibling	{"a":1}	. as $x | [.,{a:1}] | path(.[1] | $x)
+owned-embed-path-nested-rebuilt-copy	{"a":1}	. as $x | [{"a":1}] | path(.[0] | $x)
+owned-embed-path-nested-past-embed	{"a":1}	. as $x | [.] | path(.[0] | .a | $x)
+owned-embed-refuse-path-nested-ancestor-bind	{"a":{"b":1}}	. as $x | .a as $y | [.] | path(.[0].a | $y)
+owned-embed-refuse-path-nested-scalar	1	. as $x | [.] | path(.[0] | $x)
+owned-embed-refuse-path-nested-comma	{"a":1}	. as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))
+owned-embed-refuse-path-nested-wrapper	{"a":1}	. as $x | [.] | [limit(1; path(.[] | $x))]
+owned-embed-refuse-path-nested-del	{"a":1}	. as $x | [.] | del(.[0] | $x)
+owned-embed-refuse-path-nested-assign	{"a":1}	. as $x | [.] | (.[0] | $x) = 5
 owned-embed-object-member	{"a":1}	. as $x | {k:.} | .k | path($x)
 owned-embed-add-empty-right	{"a":1}	. as $x | . + {} | path($x)
 owned-embed-fold-empty	{"a":1}	. as $x | reduce empty as $i (.; .) | path($x)
@@ -559,6 +580,11 @@ owned-embed-array-tie-min-first-wins	{"a":1}	. as $x | [.,{a:1}] | min | path($x
 owned-embed-array-tie-max-loser	{"a":1}	. as $x | [.,{a:1}] | max | path($x)
 owned-embed-array-tie-min-loser	{"a":1}	. as $x | [{a:1},.] | min | path($x)
 owned-embed-refuse-identity-stage-max	{"a":1}	. as $x | [.] | . | max | path($x)
+owned-embed-identity-stage-twice-max	{"a":1}	. as $x | [.] | . | . | max | path($x)
+owned-embed-identity-stage-paren-max	{"a":1}	. as $x | [.] | (. | max) | path($x)
+owned-embed-identity-stage-first	{"a":1}	. as $x | [.] | . | .[0] | path($x)
+owned-embed-identity-stage-paren-first	{"a":1}	. as $x | [.] | (. | .[0]) | path($x)
+owned-embed-identity-stage-map-barrier	[1,2]	[.[]] | map(if . == 2 then error else . end) | . | first
 owned-embed-refuse-sort-element	{"a":1}	. as $x | [.] | sort | .[0] | path($x)
 owned-embed-refuse-unique-element	{"a":1}	. as $x | [.] | unique | .[0] | path($x)
 owned-embed-refuse-to-entries-value	{"a":1}	. as $x | {k:.} | to_entries | .[0].value | path($x)
@@ -646,7 +672,6 @@ select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation
 alternative-source:the witness grammar is pure navigation; a // source binds by value
 if-source:the witness grammar is pure navigation; an if source binds by value
 optional-source-spelling:a ? component never matches a plain one on either side (path spelling, not node identity)
-negative-index-spelling:a negative index is stored as written, so .[-2] never matches .[0]'s path
 full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
 marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
 slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice components differ, so the spelling never matches (open-ended twin of full-slice-is-the-array)
@@ -658,9 +683,12 @@ destructure-passthrough-stage:the destructuring door onto carried-register-passt
 in-evaluator-input-fold-source:#3036 -- the loop variable of a fold is Snapshot with no node, and UPDATE runs against the re-indexed accumulator; the generic evaluator has refused this since #2642
 navigated-bind-positional-path:#3037 residual -- the marker certified at a non-root register position inside the invocation needs a document-absolute bind path -- the Origin::At machinery of #2042, reached from a value-mode bind; scoped separately
 navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positional-path, the write twin
-navigated-bind-reduce-update:#3037 residual -- the UPDATE of reduce re-enters the eager evaluator with an owned accumulator; its eval_as carries no node for a navigated bind (#2072 gave the generic evaluator that, not this one), and there is no cursor at the funnel to promote against
-navigated-bind-catch-handler:#3037 residual -- same as navigated-bind-reduce-update, through a catch handler
-owned-embed-refuse-path-nested-embed:#2889 -- jq's `[0]` here is answered inside the resolver, over a copy `path()`'s own argument re-indexed; the embed table is never consulted on that route
+owned-embed-refuse-path-nested-ancestor-bind:#3177 -- reuse is depth-0 only (#2889): $y is a separate materialization of .a, and the .a inside $x's own storage is a different Rc, so the storage clause has nothing to match; jq answers [0,"a"]
+owned-embed-refuse-path-nested-scalar:#3177 -- a scalar element is not Rc-backed, so it has no storage to share: owned-embed-refuse-scalar-*-root at a nested position (jq compares numbers by value)
+owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wrapper is not at the head of the owned re-entry's pipe, so it still crosses the bridge; taking it natively would mean re-implementing the wrapper's driver over an owned value (#3189)
+owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
+owned-embed-refuse-path-nested-del:#3177 -- the del resolver still crosses the bridge; the storage clause answers there as soon as del/assignment are routed like path() (#3188)
+owned-embed-refuse-path-nested-assign:#3177 -- same as owned-embed-refuse-path-nested-del, for the assignment resolver
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 owned-embed-refuse-sort-element:#2889 -- sort is not one of the owned fast paths eval_owned_relocating_fold covers, so the array re-indexes before the element is read
 owned-embed-refuse-unique-element:#2889 -- same as owned-embed-refuse-sort-element, for unique
@@ -671,7 +699,6 @@ owned-embed-refuse-scalar-number-root:#2889 -- same as owned-embed-refuse-scalar
 owned-embed-refuse-reverse-element:#2889 -- same as owned-embed-refuse-sort-element, for reverse
 owned-embed-refuse-update-noop-element:#2889 -- a `|=` writes through the assignment resolver first, which re-indexes before the trailing read reaches embed_peel_step
 owned-embed-refuse-array-slice:#2889 -- a slice is not one of embed_peel_step's Field/Index/Iterate shapes, so it re-indexes before the read
-owned-embed-refuse-identity-stage-max:#2889 review -- the single-element [.] stays a GenericItem::LazySeq, and its identity stage materializes through eval_on_owned, whose JSON round trip rebuilds the array before max ever runs; every multi-element spelling takes the Owned route and agrees
 identity-if-arms-differ:#2978 -- identity_bind_position is static: an if whose arms sit at different positions ($p at [], . at ["a"]) proves neither, so the bind stays a bare Snapshot and getpath has no position to compose from; jq evaluates the condition
 identity-try-if-nonraising:#2978 review -- a try body holding an if is not a passthrough (its condition may raise and bind the value of the handler); the gate is static, so an if whose condition happens not to raise pays a refusal. The raising twin (identity-trap-raising-try-*) is the write-side fabrication this prevents
 untracked-opaque-stage-lost-register:#3120 review -- an opaque stage (reduce, a def call, first) drops the carried register, so the walk has none and refuses without retrying; jq refuses the step too and retries onto the bare alternative, whose empty body then writes nothing. main echoed the document by the ambient-null coincidence the fix removes

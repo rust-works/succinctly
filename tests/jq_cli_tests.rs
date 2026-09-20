@@ -60864,13 +60864,13 @@ fn test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642() -> Result<()> {
         // the same cursor `.` came from, rather than materializing a fresh
         // `OwnedValue` copy -- the same node identity jq's own
         // reference-counted `jv` already had, closing this one row of the
-        // "owned embed map" residual (`test_tracked_var_owned_embed_residual_refuses_cleanly_2642`'s
+        // "owned embed map" residual (`test_tracked_var_owned_embed_residual_closed_3177`'s
         // own doc comment). `path(.[0] | $x)` -- navigation *inside* the
         // same `path()` invocation the marker is referenced in -- is a
         // genuinely different mechanism (`path()`'s own resolver, not the
-        // generic evaluator's `Expr::Array` arm this fix touches) and
-        // deliberately not covered here: confirmed live to still refuse,
-        // see that same test.
+        // generic evaluator's `Expr::Array` arm this fix touches), closed
+        // later by #3177 and covered by
+        // `test_owned_embed_navigated_inside_path_argument_3177`.
         (r#"{"a":1}"#, ". as $x | [.] | .[0] | path($x)", "[]"),
     ] {
         let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
@@ -60925,22 +60925,170 @@ fn test_tracked_var_owned_identity_sibling_gap_unaffected_2642() -> Result<()> {
 /// `[.] | .[0] | path($x)` as a side effect (moved to
 /// `test_tracked_var_rebuilt_root_fix_does_not_over_demote_2642`).
 ///
-/// One row stays refused, and it is a different mechanism from all of
-/// them: `[.] | path(.[0] | $x)` navigates to the embedded node *inside*
-/// `path()`'s own argument, so the marker has to be resolved against a
-/// position `path()`'s resolver walked to -- not against the value a
-/// funnel handed it, which is all `RootWitness` can witness. **jq 1.7.1
-/// answers `[0]` here, not `[]`**: the path is the one navigated inside the
-/// `path()` call, so this row is not even the same *answer* as its
-/// siblings. Captured live.
+/// The last row, `[.] | path(.[0] | $x)`, was a different mechanism from
+/// all of them: it navigates to the embedded node *inside* `path()`'s own
+/// argument, so the marker has to be recognised at a position the resolver
+/// walked to -- not against the value a funnel handed it, which is all
+/// `RootWitness` can witness. **jq 1.7.1 answers `[0]` here, not `[]`**:
+/// the path is the one navigated inside the `path()` call, so this row was
+/// never even the same *answer* as its siblings. Closed by #3177 -- see
+/// [`test_owned_embed_navigated_inside_path_argument_3177`].
 #[test]
-fn test_tracked_var_owned_embed_residual_refuses_cleanly_2642() -> Result<()> {
+fn test_tracked_var_owned_embed_residual_closed_3177() -> Result<()> {
     let filter = ". as $x | [.] | path(.[0] | $x)";
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "#3177: `{filter}`: stderr={stderr:?}");
     assert_eq!(
-        code, 5,
-        "#2642: `{filter}` is a documented refuse-only residual (real jq \
-         answers `[0]`), got stdout={stdout:?} stderr={stderr:?}"
+        stdout.trim_end(),
+        "[0]",
+        "#3177: `{filter}` (jq 1.7.1 answers `[0]`)"
+    );
+    Ok(())
+}
+
+/// #3177: an embed navigated to *inside* `path()`'s own argument, in every
+/// owned-route spelling.
+///
+/// A container built inside a bind holds the bind's own `Rc` for the node
+/// it embeds (#2889's embed table), and jq's `jv_identical` is pointer
+/// equality, so `. as $x | [.] | path(.[0] | $x)` is `[0]` there -- the
+/// path navigated *inside* the call. The root witness can only speak for
+/// the root, and `[.]` is new; the element's identity is read where the
+/// resolver stands on it (`marker_identical`'s storage clause), which needs
+/// the owned re-entry to hand the resolver the caller's own tree rather
+/// than a re-indexed copy (`owned_path_door`). The same mechanism refused
+/// every wider spelling -- `[.,.]`, `{k:.}`, `[[.]]`, `.[]` -- since none
+/// of those is a lazy sequence, so they are pinned here alongside. Every
+/// answer captured live from jq 1.7.1.
+#[test]
+// jq filter literals like `{k:.}` are not formatting strings; clippy cannot
+// tell the two apart from the brace shape alone.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_navigated_inside_path_argument_3177() -> Result<()> {
+    for (input, filter, want) in [
+        (r#"{"a":1}"#, r". as $x | [.] | path(.[0] | $x)", "[0]"),
+        (r#"{"a":1}"#, r". as $x | [.,.] | path(.[0] | $x)", "[0]"),
+        (r#"{"a":1}"#, r". as $x | [.,.] | path(.[1] | $x)", "[1]"),
+        (r#"{"a":1}"#, r". as $x | {k:.} | path(.k | $x)", r#"["k"]"#),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [[.]] | path(.[0][0] | $x)",
+            "[0,0]",
+        ),
+        (r#"{"a":1}"#, r". as $x | [.] | path(.[] | $x)", "[0]"),
+        // The register keeps navigating once the marker certified.
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | path(.[0] | $x | .a)",
+            r#"[0,"a"]"#,
+        ),
+        // A leading identity stage is skipped by the door; a tail after
+        // `path()` re-enters per path, and a consumer's stop reaches it.
+        (r#"{"a":1}"#, r". as $x | [.] | . | path(.[0] | $x)", "[0]"),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.,.] | path(.[] | $x) | .[0]",
+            "0\n1",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | first([.,.] | path(.[] | $x) | .[0])",
+            "0",
+        ),
+        // An array root is `Rc`-backed too; a fold body binds and reads
+        // inside one re-entry.
+        ("[1]", r". as $x | [.] | path(.[0] | $x)", "[0]"),
+        (
+            r#"{"a":1}"#,
+            r"reduce (1) as $i (.; . as $x | [.] | path(.[0] | $x))",
+            "[0]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3177: `{filter}` on `{input}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3177: `{filter}` on `{input}`");
+    }
+    // Storage identity is pointer identity, never value identity: a rebuilt
+    // equal value is a different node, and jq refuses these too (captured
+    // live). These are the rows a future construction that handed back its
+    // input's `Rc` -- a `sort` of one element, a `map(.)` -- would flip, and
+    // must not.
+    for filter in [
+        r". as $x | [.,{a:1}] | path(.[1] | $x)",
+        r#". as $x | [{"a":1}] | path(.[0] | $x)"#,
+        r". as $x | [.] | path(.[0] | .a | $x)",
+        r". as $x | [.] | path($x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            code, 5,
+            "#3177: `{filter}` must stay refused (jq refuses it too): \
+             stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3177: `{filter}`: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// What #3177 leaves refused, each a mechanism of its own (see
+/// `docs/compliance/jq/limitations.md`'s #2889 residual table). Every jq
+/// 1.7.1 answer captured live; refusing is the safe direction (ADR-0018).
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
+    for (input, filter, why) in [
+        (
+            r#"{"a":{"b":1}}"#,
+            r". as $x | .a as $y | [.] | path(.[0].a | $y)",
+            "reuse is depth-0 only (#2889): `$y` is a separate materialization \
+             of `.a`, not the `.a` inside `$x`'s storage (jq `[0,\"a\"]`)",
+        ),
+        (
+            "1",
+            r". as $x | [.] | path(.[0] | $x)",
+            "a scalar is not Rc-backed, so there is no storage to share (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))",
+            "`path()` under a comma wrapper is not at the head of the owned \
+             re-entry, so it still bridges (jq `[0]` then `[0,\"a\"]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | [limit(1; path(.[] | $x))]",
+            "`path()` under an array constructor and `limit` still bridges (jq `[[0]]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | del(.[0] | $x)",
+            "the `del` resolver still crosses the bridge (jq `[]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | (.[0] | $x) = 5",
+            "the assignment resolver still crosses the bridge (jq `[5]`)",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "#3177 residual: `{filter}` ({why}): stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+    // `path(f)?` is a `try` wrapper and swallows the refusal above into no
+    // output at all, where jq prints `[0]`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r". as $x | [.] | path(.[0] | $x)?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.trim_end(), code),
+        ("", 0),
+        "#3177 residual: stderr={stderr:?}"
     );
     Ok(())
 }
@@ -61609,6 +61757,22 @@ fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
             "[]",
         ),
         (r#"{"a":{"b":1}}"#, r".a.b as $y | .a.b | path($y)", "[]"),
+        // Were #3037's owned-accumulator residuals (`reduce`'s UPDATE and a
+        // `catch` handler re-enter the eager evaluator, whose `eval_as`
+        // carries no node to promote against). #3177 certifies the marker
+        // by the storage it shares with the register instead -- the bind's
+        // `.a` and the use's `.a` are one `Rc` -- so no witness is needed.
+        // jq 1.7.1 answers both (captured live).
+        (
+            r#"{"a":{"b":1}}"#,
+            r"reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"try error(.) catch (.a as $y | .a | path($y))",
+            "[]",
+        ),
         (
             r#"{"a":{"b":1}}"#,
             r".a as $y | .a | path($y.b)",
@@ -61801,14 +61965,17 @@ fn test_navigated_bind_traps_still_refuse_3037() -> Result<()> {
 ///   position inside the invocation (`path(.a | $y)`, `(.a | ($y.b)) = 9`)
 ///   needs a document-absolute bind path, the #2042 `Origin::At` machinery
 ///   reached from a value-mode bind.
-/// - Routes that re-enter the eager evaluator with an *owned* accumulator
-///   (`reduce`'s UPDATE, a `catch` handler): its `eval_as` carries no node
-///   for a navigated bind (#2072 gave the generic evaluator that, not this
-///   one), and there is no cursor at the funnel to promote against.
 /// - A navigated bind on an *owned-rooted* document (`input | …`, `-n`, a
 ///   `tojson|fromjson`-rebuilt root): the marker's node is an
 ///   `OwnedIdentity` position, and `marker_is_root` reads only a document
 ///   node against a live cursor -- no `OwnedRoot` twin (review finding).
+///
+/// The routes that re-enter the eager evaluator with an *owned*
+/// accumulator (`reduce`'s UPDATE, a `catch` handler) used to be listed
+/// here too: their `eval_as` carries no node for a navigated bind, so no
+/// witness could promote it. #3177's storage clause needs no witness --
+/// the bind's value and the register are the same `Rc` -- so those rows
+/// moved to [`test_navigated_bind_at_its_own_node_3037`].
 #[test]
 // jq filter literals like `{b:1}`/`{k:.a}` are not formatting strings;
 // clippy cannot tell the two apart from the brace shape alone (as `*_2642`).
@@ -61817,14 +61984,6 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
     for (input, filter) in [
         (r#"{"a":{"b":1}}"#, r".a as $y | path(.a | $y)"),
         (r#"{"a":{"b":1}}"#, r".a as $y | (.a | ($y.b)) = 9"),
-        (
-            r#"{"a":{"b":1}}"#,
-            r"reduce (1) as $i (.; .a as $y | .a | ($y.b) = 9)",
-        ),
-        (
-            r#"{"a":{"b":1}}"#,
-            r"try error(.) catch (.a as $y | .a | path($y))",
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -62217,7 +62376,8 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
 }
 
 /// The refusing half of [`test_owned_embed_keeps_node_identity_2889`]'s
-/// `add`/`min`/`max` rows (#2889 review), and the one shape still refused.
+/// `add`/`min`/`max` rows (#2889 review), and the identity-stage shape
+/// that used to be refused beside them.
 ///
 /// The first two rows are *agreement*: with two equal elements, `max` keeps
 /// the last and `min` the first, so in these spellings the winner is the
@@ -62226,14 +62386,20 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
 /// accepting tie rows mean something: a fold that returned the wrong one of
 /// two equal elements would pass those and fail these.
 ///
-/// The last row is a residual, and diverges: jq answers `[]`. A
-/// single-element `[.]` is the one container that stays a lazy sequence, so
-/// an identity stage on it is folded by the generic evaluator through
-/// `eval_on_owned`, whose JSON round trip rebuilds the array before `max`
-/// ever runs. Every wider spelling (`[.,.] | . | max`) takes the owned
-/// route, where `embed_peel_step` skips the identity stage, and agrees.
-/// Refusing is the safe direction (ADR-0018): it costs an answer, never a
-/// write through a node the binding no longer names.
+/// `[.] | . | max | path($x)` was a residual (jq answers `[]`): a
+/// single-element `[.]` is the one container that stays a lazy sequence,
+/// and its identity stage was folded by the generic evaluator through
+/// `eval_on_owned`, whose JSON round trip rebuilt the array before `max`
+/// ever ran. #3177 made `fold_lazy_seq_stage` hand an instruction-free
+/// cursor sequence through a `.` stage untouched -- also inside a
+/// parenthesised pipe head and ahead of `.[0]` -- so the fold now runs on
+/// the same array the wider spellings (`[.,.] | . | max`, where
+/// `embed_peel_step` skips the stage) always saw. The barrier the
+/// passthrough must *not* remove is pinned last: with a `map(f)` on the
+/// sequence the `.` still materializes, so a failing second element raises
+/// as jq's eager `map` does, where the lazy `first` arm alone would not
+/// (#725/#2174's documented divergence, kept from spreading to a new
+/// spelling).
 #[test]
 // jq filter literals like `{a:1}` are not formatting strings; clippy cannot
 // tell the two apart from the brace shape alone.
@@ -62248,11 +62414,6 @@ fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
             r". as $x | [{a:1},.] | min | path($x)",
             "min keeps the first of an equal run: jq refuses this too",
         ),
-        (
-            r". as $x | [.] | . | max | path($x)",
-            "residual: the lazy-sequence identity stage rebuilds the array \
-             (jq answers `[]`)",
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
         assert_eq!(
@@ -62260,13 +62421,29 @@ fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
             "#2889: `{filter}` ({why}): stdout={stdout:?} stderr={stderr:?}"
         );
     }
-    // The wider spelling of the residual, which does keep the identity.
-    let (stdout, stderr, code) = run_jq_full(
-        &["-c", r". as $x | [.,.] | . | max | path($x)"],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(code, 0, "#2889: stderr={stderr:?}");
-    assert_eq!(stdout.trim_end(), "[]");
+    for filter in [
+        r". as $x | [.,.] | . | max | path($x)",
+        r". as $x | [.] | . | max | path($x)",
+        r". as $x | [.] | . | . | max | path($x)",
+        r". as $x | [.] | (. | max) | path($x)",
+        r". as $x | [.] | . | .[0] | path($x)",
+        r". as $x | [.] | (. | .[0]) | path($x)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 0, "#3177: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), "[]", "#3177: `{filter}`");
+    }
+    let barrier = r"[.[]] | map(if . == 2 then error else . end) | . | first";
+    let (stdout, stderr, code) = run_jq_full(&["-c", barrier], Some("[1,2]"))?;
+    assert_eq!(
+        code, 5,
+        "#3177: `{barrier}` must still materialize at the `.` and raise on \
+         the second element, as jq does: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("(not a string): 2"),
+        "#3177: stderr={stderr:?}"
+    );
     Ok(())
 }
 
