@@ -18397,6 +18397,9 @@ fn test_object_construction_value_is_expd_not_exp_3105() -> Result<()> {
         r#"{a: error("x")?}"#,
         "{a: 1?}",
         "{a: -if true then 1 else 2 end}",
+        "{a: -try .}",
+        "{a: -label $x | 1}",
+        "{a: -def f: 1; f}",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
         assert_eq!(
@@ -18421,6 +18424,10 @@ fn test_object_construction_value_is_expd_not_exp_3105() -> Result<()> {
         ("{a: [1,2]}", "{\"a\":[1,2]}"),
         ("{a: [if true then 1 else 2 end]}", "{\"a\":[1]}"),
         ("{a: @base64}", "{\"a\":\"bnVsbA==\"}"),
+        // Unary minus is legal over a genuine Term -- including folded
+        // negative literals -- as long as nothing Exp-level hides beneath.
+        ("{a: - -1}", "{\"a\":1}"),
+        ("{a: --1}", "{\"a\":1}"),
         ("{a: {b: (if true then 1 else 2 end)}}", "{\"a\":{\"b\":1}}"),
         ("{a: 1, b: 2}", "{\"a\":1,\"b\":2}"),
     ] {

@@ -2211,25 +2211,38 @@ impl<'a> Parser<'a> {
     ///   (#3038), rejected here on that flag;
     /// - `try`/`label`/`def` are also `Exp`-level in jq's grammar even
     ///   though they can leave the flag `true` (their operands/bodies are
-    ///   Terms), so they are rejected by [`Expr`] variant. `break $x`,
-    ///   `..`, `.foo?`, `1[0]`, `(if ... end)`, `@fmt`, and every other real
-    ///   `Term` shape is unaffected.
+    ///   Terms), so they are rejected by [`Expr`] variant. That variant test
+    ///   must survive unary `-`: `ExpD`'s own `'-' ExpD` recursion keeps
+    ///   `-try .`, `-label $x | 1`, `-def f: 1; f` inside the value grammar,
+    ///   where real jq 1.7.1 rejects each at compile time, so the check peels
+    ///   [`Expr::Negate`] layers and stops at [`Expr::Paren`] (`{a: -(try .)}`
+    ///   is a legal `Term`). Every other real `Term` shape -- `break $x`,
+    ///   `..`, `.foo?`, `1[0]`, `(if ... end)`, `@fmt`, negative literals --
+    ///   is unaffected.
     fn parse_expd_term(&mut self) -> Result<Expr, ParseError> {
         let term = self.parse_primary()?;
         self.skip_ws();
 
-        if !self.last_primary_is_term
-            || matches!(
-                term,
-                Expr::Try { .. } | Expr::Label { .. } | Expr::FuncDef { .. }
-            )
-        {
+        if !self.last_primary_is_term || Self::is_exp_level_shape(&term) {
             return Err(ParseError::new(
                 "object value after ':' must be a term (parenthesize a full expression)",
                 self.pos,
             ));
         }
         Ok(term)
+    }
+
+    /// Whether `expr` -- possibly under unary-negation layers -- is an
+    /// `Exp`-level construct that only a full expression may use.
+    fn is_exp_level_shape(expr: &Expr) -> bool {
+        let mut inner = expr;
+        while let Expr::Negate(operand) = inner {
+            inner = operand;
+        }
+        matches!(
+            inner,
+            Expr::Try { .. } | Expr::Label { .. } | Expr::FuncDef { .. }
+        )
     }
 
     /// Parse a primary expression (atoms and parenthesized expressions), then
@@ -8781,8 +8794,13 @@ mod tests {
             r#"error("x")?"#,
             "1?",
             "(1)?",
-            // Unary minus over a non-Term propagates the rejection.
+            // Unary minus over a non-Term propagates the rejection, and over
+            // `try`/`label`/`def` -- which leave the flag true -- it must
+            // still be caught by peeling the negation (jq 1.7.1: exit 3).
             "-if true then 1 else 2 end",
+            "-try .",
+            "-label $x | 1",
+            "-def f: 1; f",
         ] {
             let filter = format!("{{a: {value}}}");
             assert!(
@@ -8808,6 +8826,12 @@ mod tests {
             "1[0]",
             "[1,2]",
             "[if true then 1 else 2 end]",
+            // `-(try .)` is parse-OK in jq (then runtime-fails): the whole
+            // operand is one parenthesized `Term`, and negation of a
+            // `Term` is legal (jq 1.7.1: exit 5, not parse error).
+            "-(try .)",
+            "- -1",
+            "--1",
             "$x",
             "$x[]",
             "@base64",
