@@ -124,6 +124,18 @@
 # so a leading bare `input` call consumes the first copy and binds the
 # second -- this script has no `-n` support of its own.
 #
+# The `owned-root-*` rows are #3135, the owned-rooted twin of #3037: the same
+# navigated bind made on a document with no live cursor behind it -- the
+# input queue (`input | .a as $y`), a rebuilt root (`(tojson|fromjson) | .a
+# as $y`; `jq -n`'s constructed root takes the same route but has no input
+# column here, so it is pinned in `tests/jq_cli_tests.rs`). Such a pipe runs
+# on the owned identity pipe, whose position tokens name the bind's node, and
+# `marker_is_root` reads them against the funnel's `OwnedRoot` witness. The
+# sibling/rebuilt/constructed rows are carried as `agree` rows (both exit 5);
+# `no-resolver-use` pins that a bind the resolver never reads keeps its
+# route; `wrapped-*` pin the `first(...)`/`[...]` spellings, which reach the
+# same door through the eager re-entries.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -413,6 +425,28 @@ navigated-bind-catch-handler	{"a":{"b":1}}	try error(.) catch (.a as $y | .a | p
 navigated-bind-bool-sibling	{"a":true,"c":true}	.a as $y | .c | $y |= 5
 navigated-bind-owned-root	{"a":{"b":1}}	(tojson|fromjson) | .a as $y | .a | path($y)
 navigated-bind-input-root	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | path($y)
+owned-root-input-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) = 9
+owned-root-input-del	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | del($y.b)
+owned-root-input-update	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | $y |= 5
+owned-root-input-compound	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) += 1
+owned-root-input-alt-assign	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | ($y.b) //= 7
+owned-root-input-scalar	{"a":{"b":1}} {"a":{"b":1}}	input | .a.b as $y | .a.b | path($y)
+owned-root-input-paths	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | [paths($y)]
+owned-root-input-first-passthrough	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | first(.) | path($y)
+owned-root-input-def	{"a":{"b":1}} {"a":{"b":1}}	input | def f: .a as $y | .a | path($y); f
+owned-root-input-wrapped-first	{"a":{"b":1}} {"a":{"b":1}}	first(input | .a as $y | .a | path($y))
+owned-root-input-wrapped-array	{"a":{"b":1}} {"a":{"b":1}}	[input | .a as $y | .a | path($y)]
+owned-root-input-update-path-base	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | $y |= (. + {p: [path(.)]})
+owned-root-input-sibling-path	{"a":{"b":1},"c":{"b":1}} {"a":{"b":1},"c":{"b":1}}	input | .a as $y | .c | path($y)
+owned-root-input-sibling-assign	{"a":{"b":1},"c":{"b":1}} {"a":{"b":1},"c":{"b":1}}	input | .a as $y | .c | ($y.b) = 9
+owned-root-input-rebuilt-between	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | (tojson|fromjson) | ($y.b) = 9
+owned-root-input-constructed-between	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | .a | {b:1} | ($y.b) = 9
+owned-root-input-iterate-source	{"a":{"b":1},"c":{"b":1}} {"a":{"b":1},"c":{"b":1}}	input | .[] as $y | .a | path($y)
+owned-root-input-root-snapshot-beside	{"a":{"b":1}} {"a":{"b":1}}	input | . as $x | .a as $y | .a | path($y), path($x)
+owned-root-input-no-resolver-use	{"a":{"b":1}} {"a":{"b":1}}	input | .a as $y | ($y|length)
+owned-root-rebuilt-assign	{"a":{"b":1}}	(tojson|fromjson) | .a as $y | .a | ($y.b) = 9
+owned-root-rebuilt-below-root	{"a":{"b":{"c":1}}}	.a | (tojson|fromjson) | .b as $y | .b | path($y)
+owned-root-rebuilt-array-del	{"a":[1,2]}	(tojson|fromjson) | .a as $y | .a | del($y[0])
 identity-at-root-getpath	{"a":{"b":2}}	path(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-del	{"a":{"b":2},"c":1}	del(. as $x | .a | $x | getpath(["a"]) | .b)
 identity-at-root-getpath-assign	{"a":{"b":2}}	(. as $x | .a | $x | getpath(["a"]) | .b) = 9
@@ -626,8 +660,6 @@ navigated-bind-positional-path:#3037 residual -- the marker certified at a non-r
 navigated-bind-positional-assign:#3037 residual -- same as navigated-bind-positional-path, the write twin
 navigated-bind-reduce-update:#3037 residual -- the UPDATE of reduce re-enters the eager evaluator with an owned accumulator; its eval_as carries no node for a navigated bind (#2072 gave the generic evaluator that, not this one), and there is no cursor at the funnel to promote against
 navigated-bind-catch-handler:#3037 residual -- same as navigated-bind-reduce-update, through a catch handler
-navigated-bind-owned-root:#3037 residual -- a navigated bind on an owned-rooted document; the marker node is an OwnedIdentity position and marker_is_root reads only a document node against a live cursor, no OwnedRoot twin
-navigated-bind-input-root:#3037 residual -- same as navigated-bind-owned-root, on the input-queue route
 owned-embed-refuse-path-nested-embed:#2889 -- jq's `[0]` here is answered inside the resolver, over a copy `path()`'s own argument re-indexed; the embed table is never consulted on that route
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 owned-embed-refuse-sort-element:#2889 -- sort is not one of the owned fast paths eval_owned_relocating_fold covers, so the array re-indexes before the element is read

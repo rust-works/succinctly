@@ -61825,10 +61825,6 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
             r#"{"a":{"b":1}}"#,
             r"try error(.) catch (.a as $y | .a | path($y))",
         ),
-        (
-            r#"{"a":{"b":1}}"#,
-            r"(tojson|fromjson) | .a as $y | .a | path($y)",
-        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -61841,6 +61837,131 @@ fn test_navigated_bind_residuals_refuse_cleanly_3037() -> Result<()> {
             "#3037 residual: `{filter}` -- stderr: {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3135: the owned-rooted twin of `test_navigated_bind_at_its_own_node_3037`.
+/// A navigated bind made on a document with no live cursor behind it -- the
+/// input queue, `-n`'s constructed root, a `tojson|fromjson`-rebuilt root --
+/// used to leave the generic evaluator as an owned value and cross into
+/// `eval.rs`, whose `eval_as` binds a navigated source as a plain literal;
+/// jq 1.7.1 answers on every row here (captured live). The pipe now runs on
+/// the owned identity pipe, whose position tokens name the bind's node.
+#[test]
+fn test_navigated_bind_on_owned_root_answers_3135() -> Result<()> {
+    let two = r#"{"a":{"b":1}}
+{"a":{"b":1}}"#;
+    for (filter, want) in [
+        (r"input | .a as $y | .a | path($y)", "[]"),
+        (r"input | .a as $y | .a | ($y.b) = 9", r#"{"b":9}"#),
+        (r"input | .a as $y | .a | del($y.b)", "{}"),
+        (r"input | .a as $y | .a | $y |= 5", "5"),
+        (r"input | .a as $y | .a | ($y.b) += 1", r#"{"b":2}"#),
+        (r"input | .a as $y | .a | ($y.b) //= 7", r#"{"b":1}"#),
+        (r"input | .a.b as $y | .a.b | path($y)", "[]"),
+        (r"input | .a as $y | .a | [paths($y)]", r#"[["b"]]"#),
+        (r"input | .a as $y | .a | first(.) | path($y)", "[]"),
+        (r"input | def f: .a as $y | .a | path($y); f", "[]"),
+        // The wrapped spellings reach the same door through the eager
+        // re-entries (`eval_owned_input`, `eval_on_owned`).
+        (r"first(input | .a as $y | .a | path($y))", "[]"),
+        (r"[input | .a as $y | .a | path($y)]", "[[]]"),
+        // A `|=` filter on this route stands at the bind's position: the
+        // ambient path a succinctly `path` read sees inside it is `[]`, the
+        // detached root's own, as jq's is.
+        (
+            r"input | .a as $y | .a | $y |= (. + {p: [path(.)]})",
+            r#"{"b":1,"p":[[]]}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(two))?;
+        assert_eq!(code, 0, "#3135: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3135: `{filter}`");
+    }
+    // A rebuilt root: `fromjson`'s output is an owned value with no cursor.
+    for (input, filter, want) in [
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(tojson|fromjson) | .a as $y | .a | path($y)",
+            "[]",
+        ),
+        (
+            r#"{"a":{"b":1}}"#,
+            r"(tojson|fromjson) | .a as $y | .a | ($y.b) = 9",
+            r#"{"b":9}"#,
+        ),
+        (
+            r#"{"a":{"b":{"c":1}}}"#,
+            r".a | (tojson|fromjson) | .b as $y | .b | path($y)",
+            "[]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "#3135 rebuilt: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3135 rebuilt: `{filter}`");
+    }
+    // `-n`: the constructed root is an owned value from the first stage on.
+    for (filter, want) in [
+        (r"{a:{b:1}} | .a as $y | .a | ($y.b) = 9", r#"{"b":9}"#),
+        (r"{a:{b:1}} | .a as $y | .a | path($y)", "[]"),
+        (r"first({a:{b:1}} | .a as $y | .a | path($y))", "[]"),
+        (r"[{a:{b:1}} | .a as $y | .a | path($y)]", "[[]]"),
+        (r"{a:[1,2]} | .a as $y | .a | del($y[0])", "[2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "#3135 -n: `{filter}`: stderr={stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "#3135 -n: `{filter}`");
+    }
+    // A bind the resolver never reads keeps its route (the door stays shut).
+    let (stdout, _, code) = run_jq_full(&["-c", r"input | .a as $y | ($y|length)"], Some(two))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #3135's traps: the same shapes with the register on a sibling holding an
+/// equal value, a rebuild or a construction between the bind and the use,
+/// and a second element of an iterating source. jq 1.7.1 refuses every one
+/// (captured live), and so does succinctly -- a different `OwnedIdentity`
+/// token, not a value comparison, is what keeps them apart.
+#[test]
+fn test_navigated_bind_on_owned_root_traps_refuse_3135() -> Result<()> {
+    let two = r#"{"a":{"b":1},"c":{"b":1}}
+{"a":{"b":1},"c":{"b":1}}"#;
+    for filter in [
+        r"input | .a as $y | .c | path($y)",
+        r"input | .a as $y | .c | ($y.b) = 9",
+        r"input | .a as $y | .a | (tojson|fromjson) | ($y.b) = 9",
+        r"input | .a as $y | .a | {b: 1} | ($y.b) = 9",
+        r"input | .a as $y | .c | del($y.b)",
+        r"(tojson|fromjson) | .a as $y | .c | ($y.b) = 9",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(two))?;
+        assert_eq!(
+            code, 5,
+            "#3135 trap: `{filter}` must refuse, got stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "#3135 trap: `{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    // An iterating source binds both elements: the one at `.a` answers,
+    // the equal-valued one at `.c` refuses, in jq's order.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r"input | .[] as $y | .a | path($y)"], Some(two))?;
+    assert_eq!(code, 5, "#3135: stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]");
+    assert!(stderr.contains("Invalid path expression"));
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", r"{a:{b:1},c:{b:1}} | .a as $y | .c | path($y)"],
+        None,
+    )?;
+    assert_eq!(
+        code, 5,
+        "#3135 -n trap: stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(stderr.contains("Invalid path expression"));
     Ok(())
 }
 
@@ -61903,6 +62024,35 @@ fn test_navigated_bind_null_bool_sibling_answers_3136() -> Result<()> {
             "#3136 control: `{filter}` -- stderr: {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// yq mode is untouched by #3135 as well: the identity-pipe door is jq-only,
+/// so the owned-rooted shape keeps refusing where real yq v4.53.3 prints
+/// the document unchanged (`{"b": 1}` for this filter, a no-op write) --
+/// the same recorded divergence as `test_navigated_bind_yq_mode_unchanged_3037`.
+#[test]
+fn test_navigated_bind_on_owned_root_yq_mode_unchanged_3135() -> Result<()> {
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("yq")
+                .arg(r"(tojson|fromjson) | .a as $y | .a | ($y.b) = 9");
+            cmd
+        },
+        Some(b"a:\n  b: 1\n"),
+    )?;
+    assert_ne!(
+        code,
+        0,
+        "#3135 yq: stdout={:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Invalid path expression"),
+        "#3135 yq: stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(())
 }
 
@@ -62249,11 +62399,9 @@ fn test_input_bridge_embed_residuals_refuse_cleanly_2889() -> Result<()> {
         (r#"{"a":1}"#, r". as $x | input | ($x.a) = 9"),
         (r#"{"a":1}"#, r". as $x | {k:.} | .k | input | path($x)"),
         (r#"{"a":1}"#, r"input | . as $x | {a:1} | ($x.a) = 9"),
-        // jq accepts this one; a documented residual, unchanged by Stage B.
-        (
-            r#"{"a":{"b":1},"c":{"b":1}}"#,
-            r"input | .a as $y | .a | ($y.b) = 9",
-        ),
+        // (`input | .a as $y | .a | ($y.b) = 9`, jq-accepted and pinned here
+        // as a Stage B residual, is answered since #3135 -- see
+        // `test_navigated_bind_on_owned_root_answers_3135`.)
         // An *empty* container has no retained child cursor for
         // `whole_container_cursor` to hop from, so the bind names no node
         // and the table stays empty. jq answers `[]`; the generic evaluator

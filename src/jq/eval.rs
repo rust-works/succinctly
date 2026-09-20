@@ -1435,7 +1435,7 @@ fn contains_assign(expr: &Expr) -> bool {
 /// variant list [`contains_assign_scoped`] and [`may_enter_resolver_node`]
 /// both need and previously repeated verbatim; kept here so a new
 /// assignment-shaped `Expr` variant only has to be added once.
-fn is_assignment_expr(expr: &Expr) -> bool {
+pub(crate) fn is_assignment_expr(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Assign { .. }
@@ -8615,12 +8615,23 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
         }
         return Flow::Exhausted;
     }
-    // After the fast path on purpose: it never reaches a resolver, and
-    // demoting rebuilds `expr` whenever it holds a marker at all.
     // #2889: `input` may still *be* a bound node's own value, embedded here
     // by a construction jq would have shared rather than copied -- ask the
     // embed table before settling for `Owned`.
-    let expr = reentry.witnessed_by::<S>(input).reroot::<S>(expr);
+    let reentry = reentry.witnessed_by::<S>(input);
+    // #3135: a navigated bind whose variable a resolver then reads runs on
+    // the owned identity pipe, which can name the bind's node where this
+    // evaluator's `eval_as` cannot. After the peel and the embed table on
+    // purpose: an embedded node keeps the proof `witnessed_by` found, and
+    // only a value nothing can witness takes the door.
+    if let Some(flow) =
+        super::eval_generic::owned_identity_bind_door::<S>(expr, input, optional, reentry, sink)
+    {
+        return flow;
+    }
+    // After the fast path on purpose: it never reaches a resolver, and
+    // demoting rebuilds `expr` whenever it holds a marker at all.
+    let expr = reentry.reroot::<S>(expr);
     let expr = expr.as_ref();
     // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
     // `eval_owned_input`.
@@ -29903,26 +29914,47 @@ pub(crate) fn demote_rebuilt_markers<'e>(expr: &'e Expr, root: &RootWitness) -> 
 }
 
 /// Whether an [`Origin::Untracked`] marker's recorded node *is* `root`'s own
-/// document node (#3037) -- the same node id in the same document, the
-/// proof [`marker_needs_demotion`]'s `Node`/`Node` arm reads in the other
-/// direction. Only a live document node counts: an `Owned`-provenance
-/// binding or an `Owned`/`OwnedRoot` root cannot prove the marker *is* the
-/// root, and answering `false` costs a refusal jq also gives on the copies
-/// those model, never an acceptance.
+/// node (#3037, #3135) -- the proof [`marker_needs_demotion`] reads in the
+/// other direction, arm for arm:
+///
+/// - a document node: the same node id in the same document as a
+///   [`RootWitness::Node`] (#3037);
+/// - an owned position: the same [`OwnedIdentity::root`] token as a
+///   [`RootWitness::OwnedRoot`] (#3135). A navigated bind made inside the
+///   owned identity pipe (`input | .a as $y`, `-n`'s `{a:{b:1}} | .a as
+///   $y`, a `tojson|fromjson`-rebuilt root) records the token of the
+///   position it was bound at, and the pipe hands the same token to the
+///   funnel when a later `.a` stands there again. Token equality is not
+///   value equality: a sibling (`.c`) derives a different child token, a
+///   rebuild (`tojson|fromjson`) and a construction get fresh ones, so an
+///   equal-valued copy never matches -- exactly the proof the demoting arm
+///   already trusts to let a marker *survive*. The token is a hash
+///   (`owned_child_token`), so a collision accepts rather than refuses,
+///   the same class as that arm.
+///
+/// There is no `Owned`-bound-at-an-exact-root / `Node` twin here, although
+/// `marker_needs_demotion` has one: a `RootWitness::Node` is only ever
+/// produced for an *exact, unrebuilt* owned root, and every bind source that
+/// leaves the identity pipe standing at such a root is an identity
+/// passthrough, which [`substitute_bound_var_at`] stamps `Snapshot`, never
+/// `Untracked` -- so that arm could not fire. A [`RootWitness::Owned`] root
+/// carries no node at all and never promotes. Answering `false` costs a
+/// refusal jq also gives on the copies those model, never an acceptance.
 fn marker_is_root(marker: &Tracked, root: &RootWitness) -> bool {
     if marker.origin != Origin::Untracked {
         return false;
     }
-    matches!(
-        (&marker.node, root),
+    match (&marker.node, root) {
         (
             Some(BindOrigin::Node { node, document }),
             RootWitness::Node {
                 node: root_node,
                 document: root_document,
             },
-        ) if node == root_node && document == root_document
-    )
+        ) => node == root_node && document == root_document,
+        (Some(BindOrigin::Owned { root, .. }), RootWitness::OwnedRoot(witness)) => root == witness,
+        _ => false,
+    }
 }
 
 /// [`demote_rebuilt_markers`] plus the one *promotion* this evaluator makes
@@ -29947,12 +29979,18 @@ fn marker_is_root(marker: &Tracked, root: &RootWitness) -> bool {
 /// 1.7.1 answers `[]` there, and `($y.b) = 9`, `del($y.b)`, `$y |= 5` all
 /// write. A marker bound at a sibling (`.a as $y | .c | path($y)` on
 /// equal-valued `.a`/`.c`) has a different node id and stays `Untracked`,
-/// refusing as jq does. Never at an `Owned` re-entry or an `Owned` `catch`
-/// payload root: those carry no node to compare, and a promotion there
-/// would be exactly the value-only admission #2642 and #3036 exist to
-/// refuse. The promoted marker keeps `node`, so a later re-entry that
-/// rebuilds the document demotes it again through the ordinary `Snapshot`
-/// rule.
+/// refusing as jq does. The same proof reads off the owned identity pipe's
+/// tokens (#3135): a navigated bind made *inside* that pipe (`input | .a as
+/// $y`, `-n`'s `{a:{b:1}} | .a as $y`, a `tojson|fromjson`-rebuilt root)
+/// records the `OwnedIdentity::root` token of its position, and a funnel
+/// whose witness is a [`RootWitness::OwnedRoot`] carrying that same token
+/// stands at that same unrebuilt position -- a sibling, a rebuild or a
+/// construction between the two derives a different token. Never at a
+/// [`RootWitness::Owned`] re-entry or an `Owned` `catch` payload root: those
+/// carry nothing to compare, and a promotion there would be exactly the
+/// value-only admission #2642 and #3036 exist to refuse. The promoted marker
+/// keeps `node`, so a later re-entry that rebuilds the document demotes it
+/// again through the ordinary `Snapshot` rule.
 ///
 /// The promotion is **jq mode only**. Real yq's `.a as $y | .a | ($y.b) =
 /// 9` is a no-op that prints the document unchanged (v4.53.3, and the same
@@ -43608,17 +43646,23 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => e.into(),
         };
     }
-    // After the fast path on purpose: it never reaches a resolver, and
-    // demoting rebuilds `expr` whenever it holds a marker at all.
     // #2889: `input` may still *be* a bound node's own value, embedded here
     // by a construction jq would have shared rather than copied -- ask the
     // embed table before settling for `Owned`, exactly as the lazy twin
     // [`eval_each_owned`] does. See [`Reentry::witnessed_by`].
-    eval_owned_input_bridge::<W, S>(
-        &reentry.witnessed_by::<S>(input).reroot::<S>(expr),
-        input,
-        optional,
-    )
+    let reentry = reentry.witnessed_by::<S>(input);
+    // #3135: see `eval_each_owned`.
+    if let Some((values, control)) =
+        super::eval_generic::owned_identity_bind_door_collect::<S>(expr, input, optional, reentry)
+    {
+        return match control {
+            Some(control) => partial(values, control),
+            None => owned_vec_to_result(values),
+        };
+    }
+    // After the fast path on purpose: it never reaches a resolver, and
+    // demoting rebuilds `expr` whenever it holds a marker at all.
+    eval_owned_input_bridge::<W, S>(&reentry.reroot::<S>(expr), input, optional)
 }
 
 /// [`eval_owned_input`]'s bridge alone, no fast path and no demotion: build
@@ -99488,6 +99532,115 @@ mod tests {
             !embed_table_active(),
             "a non-LIFO drop must not re-raise the flag"
         );
+    }
+
+    /// #3135: the owned twin of the test above. A marker bound inside the
+    /// owned identity pipe records that position's `OwnedIdentity::root`
+    /// token; against a funnel whose witness is `OwnedRoot` of the *same*
+    /// token it is the root and is promoted, against any other token, an
+    /// `Owned` root or a live document node it is left alone. A `Snapshot`
+    /// marker at the same token is not promoted (it is already certified by
+    /// value), and yq mode never promotes.
+    #[test]
+    fn reroot_markers_lifts_an_owned_marker_at_its_own_root_3135() {
+        let value = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let owned = |root: u64| BindOrigin::Owned {
+            base: None,
+            chain: Vec::new(),
+            key_node: false,
+            exact: false,
+            root,
+        };
+        let marker = |origin: Origin, node: Option<BindOrigin>| {
+            Expr::TrackedVar(Rc::new(Tracked {
+                value: value.clone(),
+                origin,
+                node,
+            }))
+        };
+        let origin_of = |e: &Expr| match e {
+            Expr::TrackedVar(m) => m.origin.clone(),
+            other => panic!("expected a marker, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every expression this closure receives is built by `marker` above (#3135)"
+        };
+        let root = RootWitness::OwnedRoot(5);
+
+        let same_marker = Rc::new(Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: Some(owned(5)),
+        });
+        assert!(marker_is_root(&same_marker, &root));
+        let same = Expr::TrackedVar(same_marker);
+        assert_eq!(
+            origin_of(&reroot_markers::<JqSemantics>(&same, &root)),
+            Origin::Snapshot
+        );
+        assert_eq!(
+            origin_of(&reroot_markers::<YqSemantics>(&same, &root)),
+            Origin::Untracked
+        );
+
+        // An `Owned`-bound marker at an *exact* root position against a
+        // live-node witness: no arm, on purpose -- see `marker_is_root`.
+        let exact_root = Rc::new(Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: Some(BindOrigin::Owned {
+                base: Some((3, 9)),
+                chain: Vec::new(),
+                key_node: false,
+                exact: true,
+                root: 5,
+            }),
+        });
+        assert!(!marker_is_root(
+            &exact_root,
+            &RootWitness::Node {
+                node: 3,
+                document: 9,
+            }
+        ));
+
+        for (label, e, other_root) in [
+            (
+                "other token",
+                marker(Origin::Untracked, Some(owned(6))),
+                root,
+            ),
+            (
+                "owned root",
+                marker(Origin::Untracked, Some(owned(5))),
+                RootWitness::Owned,
+            ),
+            (
+                "live node",
+                marker(Origin::Untracked, Some(owned(5))),
+                RootWitness::Node {
+                    node: 3,
+                    document: 9,
+                },
+            ),
+            (
+                "document-node marker",
+                marker(
+                    Origin::Untracked,
+                    Some(BindOrigin::Node {
+                        node: 3,
+                        document: 9,
+                    }),
+                ),
+                root,
+            ),
+            ("no node", marker(Origin::Untracked, None), root),
+            (
+                "already a snapshot",
+                marker(Origin::Snapshot, Some(owned(5))),
+                root,
+            ),
+        ] {
+            let rerooted = reroot_markers::<JqSemantics>(&e, &other_root);
+            assert!(matches!(rerooted, Cow::Borrowed(_)), "{label}");
+        }
     }
 
     /// `rewrite_markers`' own precheck (#3122 coverage review): its
