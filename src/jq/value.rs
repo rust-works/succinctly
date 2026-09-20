@@ -17,7 +17,8 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
-#[cfg(not(feature = "unshared-containers"))]
+// Both holdouts together are the only shape with no `Rc` left in this file.
+#[cfg(not(all(feature = "unshared-containers", feature = "unshared-strings")))]
 use alloc::rc::Rc;
 use core::ops::{Deref, DerefMut};
 
@@ -2096,9 +2097,9 @@ fn try_positive_shifted_plain(
 /// Report a forced copy-on-write to [`share_stats`](super::share_stats),
 /// attributed to the wrapper method's caller. One spelling for every
 /// instrumented path, so the `cfg` gate cannot drift between them; expands
-/// to nothing in the shipped build, and is not defined at all under the
-/// `unshared-containers` holdout, where nothing is ever shared.
-#[cfg(not(feature = "unshared-containers"))]
+/// to nothing in the shipped build, and is not defined at all when both
+/// holdouts are on, the one shape with no shared path left to call it from.
+#[cfg(not(all(feature = "unshared-containers", feature = "unshared-strings")))]
 macro_rules! note_forced_copy {
     ($kind:ident) => {
         #[cfg(any(test, feature = "share-stats"))]
@@ -2721,19 +2722,21 @@ impl<'a, V: Clone> IntoIterator for &'a mut ArrayOf<V> {
 /// [`OwnedValue::string`]), and moving the `String` back out is
 /// [`into_string`](Self::into_string).
 ///
-/// `unshared-containers` holds the `String` inline (the pre-#3182 layout,
-/// 24 bytes, no sharing), the same never-triggering holdout the container
-/// wrappers have, so an A/B of the sharing can subtract code-layout bias.
+/// `unshared-strings` holds the `String` inline (the pre-#3182 layout, 24
+/// bytes, no sharing) while the containers stay shared -- the never-triggering
+/// holdout that is functionally the pre-#3182 tree and nothing else, so an A/B
+/// of *this* sharing can subtract code-layout bias (`unshared-containers`
+/// is #2999's own holdout and un-shares the containers as well).
 pub struct SharedString(SharedStringInner);
 
 /// [`SharedString`]'s inner representation: refcounted in the shipped build.
-#[cfg(not(feature = "unshared-containers"))]
+#[cfg(not(feature = "unshared-strings"))]
 type SharedStringInner = Rc<String>;
 
-/// See [`SharedStringInner`]'s shared twin -- the `unshared-containers`
+/// See [`SharedStringInner`]'s shared twin -- the `unshared-strings`
 /// measurement holdout: the `String` inline, exactly as
 /// `OwnedValue::String` held it before #3182.
-#[cfg(feature = "unshared-containers")]
+#[cfg(feature = "unshared-strings")]
 type SharedStringInner = String;
 
 /// The source spelling an [`OwnedValue::NumberLiteral`] carries (#3182).
@@ -2746,25 +2749,25 @@ type SharedStringInner = String;
 /// A plain `Rc<str>`, not a wrapper: the spelling is never mutated, so
 /// there is no copy-on-write point to instrument, and every reader already
 /// goes through `&str`.
-#[cfg(not(feature = "unshared-containers"))]
+#[cfg(not(feature = "unshared-strings"))]
 pub type LiteralText = Rc<str>;
 
-/// See [`LiteralText`]'s shared twin -- the `unshared-containers`
+/// See [`LiteralText`]'s shared twin -- the `unshared-strings`
 /// measurement holdout: the `Box<str>` `NumberLiteral` held before #3182
 /// (16 bytes either way, so the value stays 32).
-#[cfg(feature = "unshared-containers")]
+#[cfg(feature = "unshared-strings")]
 pub type LiteralText = Box<str>;
 
 /// Whether two number spellings are one storage -- jq's `jv_identical` for
-/// a number literal. Always `false` under `unshared-containers`, where
-/// nothing is shared (see [`SharedString::ptr_eq`]).
+/// a number literal. Always `false` under `unshared-strings`, where
+/// no string is shared (see [`SharedString::ptr_eq`]).
 #[inline]
 pub(crate) fn literal_text_ptr_eq(a: &LiteralText, b: &LiteralText) -> bool {
-    #[cfg(not(feature = "unshared-containers"))]
+    #[cfg(not(feature = "unshared-strings"))]
     {
         Rc::ptr_eq(a, b)
     }
-    #[cfg(feature = "unshared-containers")]
+    #[cfg(feature = "unshared-strings")]
     {
         let _ = (a, b);
         false
@@ -2785,16 +2788,16 @@ impl SharedString {
     /// first, so while this is `true` neither has been written through
     /// since they were split.
     ///
-    /// Always `false` under `unshared-containers`, where a clone already
+    /// Always `false` under `unshared-strings`, where a clone already
     /// deep-copied -- the holdout refuses every identity the table would
     /// have granted, which costs acceptance, never correctness.
     #[inline]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
+        #[cfg(not(feature = "unshared-strings"))]
         {
             Rc::ptr_eq(&self.0, &other.0)
         }
-        #[cfg(feature = "unshared-containers")]
+        #[cfg(feature = "unshared-strings")]
         {
             let _ = other;
             false
@@ -2805,11 +2808,11 @@ impl SharedString {
     /// the next write through this handle will copy it.
     #[inline]
     pub fn is_shared(&self) -> bool {
-        #[cfg(not(feature = "unshared-containers"))]
+        #[cfg(not(feature = "unshared-strings"))]
         {
             Rc::strong_count(&self.0) > 1
         }
-        #[cfg(feature = "unshared-containers")]
+        #[cfg(feature = "unshared-strings")]
         {
             false
         }
@@ -2820,7 +2823,7 @@ impl SharedString {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn into_string(self) -> String {
-        #[cfg(not(feature = "unshared-containers"))]
+        #[cfg(not(feature = "unshared-strings"))]
         {
             match Rc::try_unwrap(self.0) {
                 Ok(inner) => inner,
@@ -2830,7 +2833,7 @@ impl SharedString {
                 }
             }
         }
-        #[cfg(feature = "unshared-containers")]
+        #[cfg(feature = "unshared-strings")]
         {
             self.0
         }
@@ -2845,7 +2848,7 @@ impl Default for SharedString {
 }
 
 /// A refcount bump in the shipped shape; a deep copy under
-/// `unshared-containers`.
+/// `unshared-strings`.
 impl Clone for SharedString {
     #[inline]
     fn clone(&self) -> Self {
@@ -2915,14 +2918,14 @@ impl DerefMut for SharedString {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     fn deref_mut(&mut self) -> &mut String {
-        #[cfg(not(feature = "unshared-containers"))]
+        #[cfg(not(feature = "unshared-strings"))]
         {
             if Rc::strong_count(&self.0) > 1 {
                 note_forced_copy!(StringMakeMut);
             }
             Rc::make_mut(&mut self.0)
         }
-        #[cfg(feature = "unshared-containers")]
+        #[cfg(feature = "unshared-strings")]
         {
             &mut self.0
         }
@@ -2944,13 +2947,13 @@ impl core::borrow::Borrow<str> for SharedString {
 }
 
 impl From<String> for SharedString {
-    #[cfg(not(feature = "unshared-containers"))]
+    #[cfg(not(feature = "unshared-strings"))]
     #[inline]
     fn from(inner: String) -> Self {
         Self(Rc::new(inner))
     }
 
-    #[cfg(feature = "unshared-containers")]
+    #[cfg(feature = "unshared-strings")]
     #[inline]
     fn from(inner: String) -> Self {
         Self(inner)

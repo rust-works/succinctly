@@ -84,6 +84,14 @@ broadword-yaml = []
 # only under `--all-features`.
 unshared-containers = []
 
+# Measurement-only holdout for #3182 (ADR-0024 option D): `OwnedValue::String`
+# holds its `String` inline and `NumberLiteral` its spelling as a `Box<str>`
+# (the pre-#3182 layout) while the containers stay shared -- functionally the
+# pre-#3182 tree and nothing else, so an A/B of the string sharing can subtract
+# code-layout bias. Non-additive like `unshared-containers`; NEVER enable it in
+# a shipped build.
+unshared-strings = []
+
 # Record every copy-on-write that actually copied (#2999): a shared array or
 # object written through, or consumed by value, with the file:line that forced
 # it. Zero cost when off; the shipped build carries only the refcount check
