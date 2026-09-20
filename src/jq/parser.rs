@@ -1691,9 +1691,10 @@ impl<'a> Parser<'a> {
                 Some(OwnedValue::object_from(out))
             }
             Expr::FuncDef { name, then, .. } => {
-                let referenced = any_subexpr(then, &mut |e| {
-                    matches!(e, Expr::FuncCall { name: called, .. } if called == name)
-                });
+                let referenced = any_subexpr(
+                    then,
+                    &mut |e| matches!(e, Expr::FuncCall { name: called, .. } if called == name),
+                );
                 if referenced {
                     return None;
                 }
@@ -9035,7 +9036,10 @@ mod tests {
             ("{(5-10): $x}", "Cannot use number (-5) as object key"),
             ("{(1/2): $x}", "Cannot use number (0.5) as object key"),
             ("{(1%2): $x}", "Cannot use number (1) as object key"),
-            (r#"{("a"=="a"): $x}"#, "Cannot use boolean (true) as object key"),
+            (
+                r#"{("a"=="a"): $x}"#,
+                "Cannot use boolean (true) as object key",
+            ),
             ("{(1>0): $x}", "Cannot use boolean (true) as object key"),
             ("{(null): $x}", "Cannot use null (null) as object key"),
             ("{([1+1]): $x}", "Cannot use array ([2]) as object key"),
@@ -9043,7 +9047,10 @@ mod tests {
             ("{([{}]): $x}", "Cannot use array ([{}]) as object key"),
             ("{([]): $x}", "Cannot use array ([]) as object key"),
             ("{({}): $x}", "Cannot use object ({}) as object key"),
-            (r#"{( {"a":1} ) : $x}"#, "Cannot use object ({\"a\":1}) as object key"),
+            (
+                r#"{( {"a":1} ) : $x}"#,
+                "Cannot use object ({\"a\":1}) as object key",
+            ),
             ("{(def g: 1; 1): $x}", "Cannot use number (1) as object key"),
             ("{((1+1)): $x}", "Cannot use number (2) as object key"),
             ("{(1-(1+1)): $x}", "Cannot use number (-1) as object key"),

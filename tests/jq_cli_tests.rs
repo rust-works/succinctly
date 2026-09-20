@@ -57997,26 +57997,59 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
 fn test_pattern_const_computed_key_rejected_like_jq_3018() -> Result<()> {
     for (filter, message) in [
         (". as {(1): $x} | .", "Cannot use number (1) as object key"),
-        (". as {(1+1): $x} | .", "Cannot use number (2) as object key"),
-        (". as {(5-10): $x} | .", "Cannot use number (-5) as object key"),
-        (". as {(1/2): $x} | .", "Cannot use number (0.5) as object key"),
-        (". as {(1%2): $x} | .", "Cannot use number (1) as object key"),
+        (
+            ". as {(1+1): $x} | .",
+            "Cannot use number (2) as object key",
+        ),
+        (
+            ". as {(5-10): $x} | .",
+            "Cannot use number (-5) as object key",
+        ),
+        (
+            ". as {(1/2): $x} | .",
+            "Cannot use number (0.5) as object key",
+        ),
+        (
+            ". as {(1%2): $x} | .",
+            "Cannot use number (1) as object key",
+        ),
         (
             ". as {(\"a\"==\"a\"): $x} | .",
             "Cannot use boolean (true) as object key",
         ),
-        (". as {(null): $x} | .", "Cannot use null (null) as object key"),
-        (". as {([1+1]): $x} | .", "Cannot use array ([2]) as object key"),
+        (
+            ". as {(null): $x} | .",
+            "Cannot use null (null) as object key",
+        ),
+        (
+            ". as {([1+1]): $x} | .",
+            "Cannot use array ([2]) as object key",
+        ),
         (". as {([]): $x} | .", "Cannot use array ([]) as object key"),
-        (". as {({}): $x} | .", "Cannot use object ({}) as object key"),
+        (
+            ". as {({}): $x} | .",
+            "Cannot use object ({}) as object key",
+        ),
         (
             ". as {( {\"a\":1} ): $x} | .",
             "Cannot use object ({\"a\":1}) as object key",
         ),
-        (". as {(def g: 1; 1): $x} | .", "Cannot use number (1) as object key"),
-        (". as {([{}]): $x} | .", "Cannot use array ([{}]) as object key"),
-        (". as {((1+1)): $x} | .", "Cannot use number (2) as object key"),
-        (". as {(1-(1+1)): $x} | .", "Cannot use number (-1) as object key"),
+        (
+            ". as {(def g: 1; 1): $x} | .",
+            "Cannot use number (1) as object key",
+        ),
+        (
+            ". as {([{}]): $x} | .",
+            "Cannot use array ([{}]) as object key",
+        ),
+        (
+            ". as {((1+1)): $x} | .",
+            "Cannot use number (2) as object key",
+        ),
+        (
+            ". as {(1-(1+1)): $x} | .",
+            "Cannot use number (-1) as object key",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&[filter], Some("{}"))?;
         assert_eq!(code, 3, "{filter}: stderr={stderr}");
