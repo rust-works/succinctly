@@ -15779,6 +15779,11 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // future error class routed through `to_owned` here would otherwise
     // silently inherit the same asymmetry #2231 already fixed elsewhere.
     let owned = to_owned_or_suppress!(&value, optional);
+    // #3182: `@text` on a string hands the input back, as `tostring_owned`
+    // does -- see `eval_generic::format_result`, this arm's twin.
+    if let (FormatType::Text, OwnedValue::String(_)) = (format_type, &owned) {
+        return QueryResult::Owned(owned);
+    }
     match format_owned::<S>(format_type, &owned, optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s.into())),
         Err(e) => e.into(),
@@ -16850,7 +16855,18 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `optional`), so hardcoding a raise here was the same accidental miss
     // #2015 fixed for `IN(s)`/`IN(src;s)`.
     let owned = to_owned_or_suppress!(&value, optional);
-    QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned).into()))
+    QueryResult::Owned(tostring_owned::<S>(owned))
+}
+
+/// `tostring` of an already-owned value: a string is its own `tostring` in
+/// jq (`f_tostring` hands the input `jv` back), so the handle passes
+/// through and keeps its storage identity (#3182); anything else renders.
+/// One definition for both evaluators' arms.
+pub(crate) fn tostring_owned<S: EvalSemantics>(owned: OwnedValue) -> OwnedValue {
+    if let OwnedValue::String(_) = owned {
+        return owned;
+    }
+    OwnedValue::String(owned_to_string::<S>(&owned).into())
 }
 
 /// Builtin: tonumber - convert string to number
@@ -29871,10 +29887,12 @@ impl RootWitness {
     /// **jq mode only**, the same gate [`reroot_rewrite`]'s promotion
     /// takes: real yq's node model is #2643's business, and turning a
     /// refusal there into a write with no oracle behind it is the
-    /// corrupting direction (ADR-0018 -- the mode decides). Scalars carry
-    /// no shared storage and answer `Owned`, which costs the refusal jq's
-    /// own `jv_identical`-by-value would not give -- a documented residual
-    /// of this pass, never a wrong acceptance.
+    /// corrupting direction (ADR-0018 -- the mode decides). Since #3182 a
+    /// string or number literal shares storage like a container and is
+    /// witnessed the same way; `null`, `bool` and a computed number carry
+    /// none and answer `Owned`, which costs the refusal jq's by-value
+    /// identity for those would not give -- a documented residual, never a
+    /// wrong acceptance.
     pub(crate) fn of_owned<S: EvalSemantics>(value: &OwnedValue) -> Self {
         if S::TAG != EvalTag::Jq {
             return Self::Owned;
@@ -34518,9 +34536,12 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// | to_entries | path(.[0].value | $x)` -- the stage ahead of `path()`
 /// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
 /// the clause is false where jq's pointer equality answers `[0]`; recorded
-/// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and
-/// never match, which costs the refusal jq's by-value number identity would
-/// not give -- a documented residual, never a wrong acceptance.
+/// in `docs/compliance/jq/limitations.md`. Strings and number literals are
+/// `Rc`-backed too since #3182 and match by pointer exactly as jq's string
+/// and `NUMBER_LITERAL` `jv`s do; `null`, `bool` and a computed `Int`/
+/// `Float` carry no storage, and jq compares those by value -- the
+/// null/bool half is [`null_bool_identical`], the computed-number half
+/// stays a documented refusal, never a wrong acceptance.
 ///
 /// The resolver only ever holds the pointer on the routes that hand it the
 /// caller's own tree ([`path_over_owned`], [`owned_path_door`]); after a
@@ -104082,6 +104103,11 @@ mod share_audit_2999 {
         format!("[{}]", body.join(",")).into_bytes()
     }
 
+    fn strs(n: i64) -> Vec<u8> {
+        let body: Vec<String> = (0..n).map(|i| format!("\"s{i}\"")).collect();
+        format!("[{}]", body.join(",")).into_bytes()
+    }
+
     /// Evaluate `filter` over `json`, dropping the result inside the
     /// measurement (so a copy hiding in a drop path would be counted too --
     /// drops never copy), and assert the forced copies it made, by kind. A
@@ -104115,6 +104141,41 @@ mod share_audit_2999 {
 
     /// The eager single-path route owns its document outright: nothing is
     /// shared, so nothing is ever copied on write.
+    /// #3182: a string-building fold appends to a unique handle in place --
+    /// no copy per step is what keeps `. + $s` linear, the property that
+    /// decided `Rc<String>` over `Rc<str>` for `SharedString`. The one copy
+    /// is the first step's: the `""` INIT is the AST literal's own handle
+    /// (jq's constant pool), so the first append copies an empty string
+    /// and every later step owns the accumulator outright. The operand
+    /// order jq itself copies on (`$s + .`: the bind still holds `$s`, so
+    /// `jv_string_concat` copies it) copies exactly once per step here too.
+    #[test]
+    fn string_fold_accumulator_appends_in_place() {
+        assert_forced(
+            &strs(1000),
+            r#"reduce .[] as $s (""; . + $s)"#,
+            &[(Kind::StringMakeMut, 1)],
+        );
+        assert_forced(
+            &strs(1000),
+            r#"reduce .[] as $s (""; $s + .)"#,
+            &[(Kind::StringMakeMut, 1000)],
+        );
+    }
+
+    /// #3182: a write through a string an in-scope bind still holds copies
+    /// exactly once -- the bind's own reference is what forces it, the same
+    /// event that makes jq's refcount exceed one and copy there.
+    #[test]
+    fn write_through_a_bound_string_copies_once() {
+        assert_forced(
+            br#"{"k":"abc"}"#,
+            r#".k as $x | .k += "d" | [.k, $x]"#,
+            &[(Kind::StringMakeMut, 1)],
+        );
+        assert_forced(br#"{"k":"abc"}"#, ".k as $x | .k | [., $x]", &[]);
+    }
+
     #[test]
     fn eager_single_path_write_copies_nothing() {
         assert_forced(&ints(1000), ".[0] = 0", &[]);

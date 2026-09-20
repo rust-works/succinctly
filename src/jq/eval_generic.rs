@@ -72,13 +72,13 @@ use super::eval::{
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read_computed,
     stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
     streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_vars, suppresses, tonumber_from_str, try_payload_root, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, yq_scalar_text, BinaryFanoutRules,
-    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, Reentry, RootWitness, SliceTargetKind,
-    YqSemantics, WHILE_UNTIL_MAX_STEPS,
+    substitute_vars, suppresses, tonumber_from_str, tostring_owned, try_payload_root,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    yq_scalar_text, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum,
+    Reentry, RootWitness, SliceTargetKind, YqSemantics, WHILE_UNTIL_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -643,13 +643,14 @@ pub fn to_owned_cursor<S: EvalSemantics, C: DocumentCursor>(
     //
     // Gate order matters, and was measured both ways (#2889 A/B): the
     // thread-local `active()` load inside `embed_shared_for` is ~1 ns and
-    // false on every path outside a jq-mode `as` body, so it goes first;
-    // `is_container` needs the cursor's text position (a rank/select lookup,
-    // tens of ns) and comes second, so a scalar-heavy walk with a binding in
-    // scope (`to_entries` over a wide object materializes one scalar per
-    // field here) skips the table lookup without every per-item bind
-    // (`.[] | .score as $y`, a fold's own `$u`) paying the position lookup
-    // when no table is active -- the other order cost 3-6% on an M4 Pro.
+    // false on every path outside a jq-mode `as` body, so it goes first.
+    // #2889 also gated the lookup behind `is_container` (a rank/select
+    // text-position lookup, tens of ns) so that a scalar-heavy walk with a
+    // binding in scope (`to_entries` over a wide object materializes one
+    // scalar per field here) skipped the table; #3182 gives strings and
+    // number literals storage identity too, so the lookup now runs for
+    // every node while a bind is active -- one scan of a table holding one
+    // entry per in-scope bind, priced in that change's A/B.
     if let Some(shared) = embed_shared_for::<S, _>(cursor) {
         return Ok(shared);
     }
@@ -2726,6 +2727,11 @@ fn format_result<S: EvalSemantics, V: DocumentValue>(
     owned: &OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
+    // #3182: `@text` is `tostring`, and a string is its own `tostring` in
+    // jq -- the handle passes through and keeps its storage identity.
+    if let (FormatType::Text, OwnedValue::String(_)) = (format_type, owned) {
+        return GenericResult::Owned(owned.clone());
+    }
     match format_owned::<S>(format_type, owned, optional) {
         Ok(s) => GenericResult::Owned(OwnedValue::String(s.into())),
         Err(e) => GenericResult::Error(e),
@@ -2772,7 +2778,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // hands back as a bare `Float`, so every one of those shapes is right
     // through the bridge too, and this arm is speed-only.
     if let Expr::Builtin(Builtin::ToString) = expr {
-        return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned).into()));
+        return GenericResult::Owned(tostring_owned::<S>(owned));
     }
 
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
@@ -5317,9 +5323,13 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
 ///   value -- exactly the condition under which jq's `jv_identical($x, .)`
 ///   holds. This mirrors jq itself, where the binding's own reference is
 ///   what makes the refcount exceed one and forces the copy.
-/// - Scalars are not `Rc`-backed and never enter the table, so a scalar
-///   root (`"s" | . as $x | {k:.} | .k | path($x)`, `[]` in jq) stays a
-///   documented refuse-only residual.
+/// - Strings and number literals are `Rc`-backed since #3182 (ADR-0024's
+///   option D) and enter the table exactly as containers do, so a scalar
+///   root (`"s" | . as $x | {k:.} | .k | path($x)`, `[]` in jq) answers.
+///   `null`, `bool` and a computed `Int`/`Float` have no storage and never
+///   enter; jq compares those by value, a rule `marker_identical` applies
+///   separately (its null/bool carve-out) or leaves refused (a computed
+///   number), never a wrong acceptance.
 ///
 /// **jq mode only.** Both reads are gated on `S::TAG == EvalTag::Jq`, the
 /// same gate [`eval::reroot_markers`]' promotion uses: yq's node model is
@@ -5472,13 +5482,23 @@ pub(crate) type EmbedGuard = embed_table::Guard;
 /// `origin` names, for as long as the returned guard lives (#2889).
 ///
 /// A no-op guard for anything the table cannot use: a non-jq mode, a
-/// binding with no node behind it, or a scalar (not `Rc`-backed, so it has
-/// no storage identity to share). See [`embed_table`] for the full rule.
+/// binding with no node behind it, or a value with no storage to share --
+/// `null`, `bool`, a computed number. A string or a number literal is
+/// `Rc`-backed since #3182 and enters exactly as a container does. See
+/// [`embed_table`] for the full rule.
 pub(crate) fn embed_table_push<S: EvalSemantics>(
     origin: Option<&BindOrigin>,
     value: &OwnedValue,
 ) -> Option<EmbedGuard> {
-    if S::TAG != EvalTag::Jq || !matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
+    if S::TAG != EvalTag::Jq
+        || !matches!(
+            value,
+            OwnedValue::Array(_)
+                | OwnedValue::Object(_)
+                | OwnedValue::String(_)
+                | OwnedValue::NumberLiteral(..)
+        )
+    {
         return None;
     }
     match origin {
@@ -5515,9 +5535,11 @@ pub(crate) fn embed_witness_of(value: &OwnedValue) -> Option<(usize, usize)> {
 pub(crate) fn embed_shared_for<S: EvalSemantics, C: DocumentCursor>(
     cursor: &C,
 ) -> Option<OwnedValue> {
-    // `active()` before `is_container()`: see `to_owned_cursor`'s call site
-    // for the measured reason the cheap thread-local load must come first.
-    if S::TAG != EvalTag::Jq || !embed_table::active() || !cursor.is_container() {
+    // `active()` first: see `to_owned_cursor`'s call site for the measured
+    // reason the cheap thread-local load must come first. No kind gate since
+    // #3182: a string or number node has storage to share too, and the
+    // lookup is a scan of a table holding one entry per in-scope bind.
+    if S::TAG != EvalTag::Jq || !embed_table::active() {
         return None;
     }
     embed_table::shared_for(cursor.node_id(), cursor.document_token())
@@ -23202,7 +23224,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // reachable defensive-consistency class as the rest of this
             // lineage.
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
-            GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned).into()))
+            GenericResult::Owned(tostring_owned::<S>(owned))
         }
 
         Builtin::ToNumber => {
@@ -23212,8 +23234,16 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // (#2902, same reasoning as `to_owned_at_depth`'s own arm).
             if let Some(f) = value.bridge_computed_float() {
                 GenericResult::Owned(OwnedValue::Float(f))
-            } else if let Some(literal) = value.number_literal() {
-                GenericResult::Owned(OwnedValue::from_number_literal::<S>(&literal))
+            } else if value.number_literal().is_some() {
+                // #3182: the node's own handle, not a rebuilt spelling --
+                // jq's `f_tonumber` hands a number input back as the same
+                // `jv`, and `to_owned_with_cursor` reuses an in-scope
+                // bind's storage; its number arm builds the same
+                // `NumberLiteral` `from_number_literal` would.
+                GenericResult::Owned(owned_or_suppress!(
+                    to_owned_with_cursor::<_, S>(&value, cursor),
+                    optional
+                ))
             } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
             } else if let Some(f) = document_number_f64_generic::<S, V>(&value) {

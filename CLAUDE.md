@@ -464,7 +464,7 @@ for the full list.
 | `mmap-tests`        | Memory-mapped bitvector tests             |
 | `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
 | `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
-| `unshared-containers`| Measurement-only: the #3000 layout (boxed map, inline array `Vec`) instead of `Rc` containers (#2999 A/B holdout; never ship) |
+| `unshared-containers`| Measurement-only: the pre-sharing layout (boxed map, inline array `Vec`, inline `String`, `Box<str>` spelling) instead of `Rc` storage (#2999/#3182 A/B holdout; never ship) |
 | `share-stats`       | Record every copy-on-write that copied, with its call site (#2999 clone audit) |
 
 ## Testing Strategy

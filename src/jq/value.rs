@@ -2755,6 +2755,22 @@ pub type LiteralText = Rc<str>;
 #[cfg(feature = "unshared-containers")]
 pub type LiteralText = Box<str>;
 
+/// Whether two number spellings are one storage -- jq's `jv_identical` for
+/// a number literal. Always `false` under `unshared-containers`, where
+/// nothing is shared (see [`SharedString::ptr_eq`]).
+#[inline]
+pub(crate) fn literal_text_ptr_eq(a: &LiteralText, b: &LiteralText) -> bool {
+    #[cfg(not(feature = "unshared-containers"))]
+    {
+        Rc::ptr_eq(a, b)
+    }
+    #[cfg(feature = "unshared-containers")]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 impl SharedString {
     /// An empty string.
     #[inline]
@@ -3476,15 +3492,18 @@ impl OwnedValue {
         Self::Object(IndexMap::new().into())
     }
 
-    /// Whether this value and `other` are the same *container storage* --
-    /// jq's `jv_identical` for arrays and objects, which is pointer
-    /// equality there (#2889).
+    /// Whether this value and `other` are the same *storage* -- jq's
+    /// `jv_identical` for every allocated `jv`, which is pointer equality
+    /// there: arrays and objects (#2889), and strings and number literals
+    /// (#3182, ADR-0024's option D).
     ///
-    /// `false` for every scalar pairing, and for an array against an
-    /// object: neither is refcounted storage two handles can share, so
-    /// there is no pointer identity to report. jq's own scalar identity is
-    /// by value, a rule its callers here (`marker_identical`'s null/bool
-    /// carve-out, `owned_value_eq`) already apply separately.
+    /// `false` for `null`, `bool` and a computed `Int`/`Float`, and across
+    /// kinds: none of those is refcounted storage two handles can share,
+    /// and jq's own identity for them is by value, a rule its callers here
+    /// (`marker_identical`'s null/bool carve-out, `owned_value_eq`) apply
+    /// separately. A computed number against a literal is `false` in jq
+    /// too -- `. as $x | (.+0) | path($x)` on `5` refuses there, a
+    /// `NUMBER_LITERAL` jv and a plain double having different kind flags.
     ///
     /// Two readers: the embed table's `witness_of` (`std` only -- the
     /// table is a stub without a `thread_local!`) and the resolver's
@@ -3495,6 +3514,8 @@ impl OwnedValue {
         match (self, other) {
             (Self::Array(a), Self::Array(b)) => a.ptr_eq(b),
             (Self::Object(a), Self::Object(b)) => a.ptr_eq(b),
+            (Self::String(a), Self::String(b)) => a.ptr_eq(b),
+            (Self::NumberLiteral(_, a), Self::NumberLiteral(_, b)) => literal_text_ptr_eq(a, b),
             _ => false,
         }
     }

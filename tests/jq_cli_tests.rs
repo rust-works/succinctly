@@ -61047,11 +61047,6 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
              of `.a`, not the `.a` inside `$x`'s storage (jq `[0,\"a\"]`)",
         ),
         (
-            "1",
-            r". as $x | [.] | path(.[0] | $x)",
-            "a scalar is not Rc-backed, so there is no storage to share (jq `[0]`)",
-        ),
-        (
             r#"{"a":1}"#,
             r". as $x | [.] | (path(.[0] | $x), path(.[0] | $x | .a))",
             "`path()` under a comma wrapper is not at the head of the owned \
@@ -62341,6 +62336,41 @@ fn test_owned_embed_keeps_node_identity_2889() -> Result<()> {
         (r#"{"a":1}"#, r". as $x | [[.]] | .[0][0] | path($x)", r"[]"),
         (r#"{"a":1}"#, r". as $x | [.,.] | .[1] | path($x)", r"[]"),
         (r"[1,2]", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        // #3182 (ADR-0024's option D): a string or number literal is
+        // `Rc`-backed too, so the same placements keep a scalar's identity
+        // -- jq's string and `NUMBER_LITERAL` `jv`s are pointer-identical
+        // through them -- and so do the builtins jq hands its input back
+        // from (`tostring` on a string, `tonumber` on a number, one-element
+        // `add`). The write half is pinned too: `$x` names the root, so
+        // assigning through it replaces it. The #3177 scalar residual
+        // (`[.] | path(.[0] | $x)`) moved here from that issue's residual
+        // list. Builtins the generic evaluator bridges (`ltrimstr`, `sub`,
+        // `abs`, `[.] | sort | .[0]`) stay refuse-only -- `scalar-*-keeps-*`
+        // in the sweep's REFUSE_ONLY, and the residual table in
+        // limitations.md.
+        (r#""s""#, r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r"5", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r"1.0", r". as $x | {k:.} | .k | path($x)", r"[]"),
+        (r#""s""#, r". as $x | [.] | .[0] | path($x)", r"[]"),
+        (r#""s""#, r". as $x | {k:[.]} | .k[0] | path($x)", r"[]"),
+        (
+            r#""s""#,
+            r". as $x | {k:.} | .k as $y | .k | path($y)",
+            r"[]",
+        ),
+        (r"[5,5]", r".[0] as $x | {k:.[0]} | .k | path($x)", r"[]"),
+        (
+            r#"["s","t"]"#,
+            r".[0] as $x | [.[0]] | .[0] | path($x)",
+            r"[]",
+        ),
+        (r"1", r". as $x | [.] | path(.[0] | $x)", r"[0]"),
+        (r#""abc""#, r". as $x | tostring | path($x)", r"[]"),
+        (r#""abc""#, r". as $x | @text | path($x)", r"[]"),
+        (r"5", r". as $x | tonumber | path($x)", r"[]"),
+        (r"5", r". as $x | [.] | add | path($x)", r"[]"),
+        (r#""s""#, r". as $x | {k:.} | .k | $x = 1", r"1"),
+        (r"5", r". as $x | [.] | .[0] | ($x) |= . + 1", r"6"),
         // Operators whose result *is* the left operand: jq's
         // `jv_array_concat`/`jv_object_merge` iterate the right side, and
         // `null + x` relocates.
@@ -62751,11 +62781,26 @@ fn test_owned_embed_rebuilt_copies_still_refuse_2889() -> Result<()> {
         (r"[1,2]", r". as $x | [] + . | path($x)"),
         // A non-empty right operand computes a new container.
         (r#"{"a":1}"#, r". as $x | . + {a:1} | path($x)"),
-        // Scalars are not `Rc`-backed, so they never enter the table -- a
-        // documented residual of #2889, and the safe direction (jq answers
-        // `[]` for both).
-        (r#""s""#, r". as $x | {k:.} | .k | path($x)"),
-        (r"5", r". as $x | {k:.} | .k | path($x)"),
+        // A scalar rebuilt from its bytes is a different storage (#3182),
+        // exactly as a fresh string or number-literal `jv` is a different
+        // pointer in jq: an equal literal, an equal-valued sibling node, a
+        // computed number, two literals in one program, and every string
+        // or number builtin that allocates its result.
+        (r#""s""#, r#". as $x | {k:"s"} | .k | path($x)"#),
+        (r"5", r". as $x | {k:5} | .k | path($x)"),
+        (r"5", r". as $x | {k:(.+0)} | .k | path($x)"),
+        (r"[5,5]", r".[0] as $x | .[1] | path($x)"),
+        (r#"["s","s"]"#, r".[0] as $x | .[1] | path($x)"),
+        (r"null", r"5 as $x | 5 | path($x)"),
+        (r"null", r#""s" as $x | "s" | path($x)"#),
+        (r#""abc""#, r". as $x | ascii_downcase | path($x)"),
+        (r#""abc""#, r#". as $x | . + "" | path($x)"#),
+        (r#""abc""#, r#". as $x | ltrimstr("a") | path($x)"#),
+        (r#""abc""#, r". as $x | tojson | fromjson | path($x)"),
+        (r#""abc""#, r". as $x | .[0:] | path($x)"),
+        (r"5", r". as $x | . + 0 | path($x)"),
+        (r"5", r". as $x | floor | path($x)"),
+        (r"5", r". as $x | tostring | tonumber | path($x)"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
