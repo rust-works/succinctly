@@ -179,6 +179,16 @@ pub struct Tracked {
 ///   still refuses, matching jq -- but jq's own `jv_identical` admits
 ///   `null`/`true`/`false` by value regardless of node (#3136), so the same
 ///   filter on `{"a":true,"c":true}` answers `["c"]` on both.
+///
+/// Above all four, and reading none of them, sits jq's rule itself (#3177):
+/// when the resolver stands on the very `Rc` a marker's value holds
+/// (`OwnedValue::shares_storage_with`), the marker certifies whatever its
+/// origin -- `jv_identical` on an allocated `jv` is pointer equality, and a
+/// container built inside a bind embeds the bind's own `Rc` (#2889), so
+/// `. as $x | [.] | path(.[0] | $x)` is `[0]` on both. The resolver holds
+/// that pointer only where an owned re-entry hands it the caller's own tree
+/// (`eval::owned_path_door`); after a reindex bridge every node is a fresh
+/// copy and the four rules above decide alone. jq mode only.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Origin {
     /// Frozen from the ambient input itself; certified by value equality
@@ -205,7 +215,9 @@ pub enum Origin {
     },
     /// Frozen from a navigated position outside any resolver invocation
     /// (#2072); never certified by node identity, only by the null/bool
-    /// value-identity carve-out (#3136) every other `Origin` also gets.
+    /// value-identity carve-out (#3136) every other `Origin` also gets --
+    /// and, like every other `Origin`, by storage identity where the
+    /// resolver stands on the marker's own `Rc` (#3177, `marker_identical`).
     Untracked,
 }
 

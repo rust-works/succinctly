@@ -3149,11 +3149,11 @@ impl OwnedValue {
     /// by value, a rule its callers here (`marker_identical`'s null/bool
     /// carve-out, `owned_value_eq`) already apply separately.
     ///
-    /// The `cfg_attr` is the embed table's `no_std` degradation showing
-    /// through: there the table is a stub that reads nothing, so this has
-    /// no caller at all and would be the build's only new dead-code
-    /// warning. A `std` build keeps the lint live.
-    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    /// Two readers: the embed table's `witness_of` (`std` only -- the
+    /// table is a stub without a `thread_local!`) and the resolver's
+    /// `marker_identical` (#3177), which reads it in every build, since
+    /// pointer identity between a marker's value and the node the resolver
+    /// stands on needs no table at all.
     pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Array(a), Self::Array(b)) => a.ptr_eq(b),

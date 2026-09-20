@@ -211,7 +211,20 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "(try error(1) catch $v)", "(5 | try error(1) catch $v)",
         "(try error(.) catch .)", "(try error({b:1}) catch .b?)",
         "(. as $q | 5 | $q as {a:$w} | try ($w | .b?))",
-        "(try (. as {a:$w} | $w | .b?) catch .)"]
+        "(try (. as {a:$w} | $w | .b?) catch .)",
+        # #3177: the bound node navigated to *inside* `path()`'s own
+        # argument, at a nested position of a container the body built.
+        # Storage identity certifies it there (`marker_identical`), which
+        # the resolver can only see once the owned re-entry hands it the
+        # caller's own tree (`owned_path_door`). Drawn beside a rebuilt
+        # sibling (`[$v,{}]`, jq refuses) so a value-only rule would be
+        # caught, and with a tail after `path()` so the per-path re-entry
+        # is exercised too.
+        "([$v] | path(.[0] | $v))", "({k:$v} | path(.k | $v))",
+        "([$v,$v] | path(.[1] | $v))", "([$v,{}] | path(.[1] | $v))",
+        "([$v] | path(.[] | $v | .b?))", "([$v] | . | path(.[0] | $v))",
+        "([$v,$v] | path(.[] | $v) | .[0])", "([$v] | . | max | path($v))",
+        "([[$v]] | path(.[0][0] | $v))"]
 
 # #2978: an optional navigation *prefix* before the first bind, so `. as $v`
 # can be drawn below the invocation root. `program()` put every bind at the

@@ -8341,6 +8341,175 @@ fn embed_witnessed(value: &OwnedValue) -> bool {
     super::eval_generic::embed_witness_of(value).is_some()
 }
 
+/// `stages` with its leading `.` stages skipped: `. | X` yields its input,
+/// once, and can neither move nor raise, so what follows them is what a
+/// pre-bridge diversion has to look at ([`embed_peel_step`],
+/// [`owned_path_door`]). One definition for both, so the two cannot drift
+/// on which spellings of `.` count (#3177).
+fn skip_identity_stages(stages: &[Expr]) -> &[Expr] {
+    let mut remaining = stages;
+    while let [Expr::Identity, tail @ ..] = remaining {
+        remaining = tail;
+    }
+    remaining
+}
+
+/// `path(path_expr)` resolved over `owned` itself, with no reindex bridge
+/// (#1909, #3177): the one route by which the resolver is handed the
+/// caller's own `OwnedValue` rather than a re-materialization of it. `None`
+/// when `owned` is not an identity of the bridge
+/// (`eval_generic::reindex_bridge_is_identity`: a NaN spelling, a number
+/// literal past the reuse cap), where the caller bridges exactly as before.
+///
+/// Shared by the generic evaluator's cursor-side `Builtin::Path` arm
+/// (`root` is the cursor's own node) and the owned re-entries' door
+/// ([`owned_path_door`], `root` is whatever the embed table can still
+/// prove), so the gate and the reroot cannot drift between them -- the
+/// duplicated-predicate lesson `bridge_to_full_evaluator`'s own doc cites.
+///
+/// `reroot_markers`, not `reroot_for_reentry`: `path_expr` is the resolver's
+/// own argument, so the resolver-reaching node `reentry_can_observe` looks
+/// for is the `path` builtin *around* it (#3122). `.[0] | $x` holds none,
+/// and skipping the demotion here would let `Frame::certifies`'s
+/// unconditional `Snapshot` rule admit `. as $x | [{"a":1}] | path(.[0] |
+/// $x)` by value -- a `[0]` jq refuses, and one `del`/`|=` would then write
+/// through. The demoted marker still certifies where it should, by
+/// [`marker_identical`]'s storage clause, which reads the pointer rather
+/// than the origin.
+pub(crate) fn path_over_owned<S: EvalSemantics>(
+    path_expr: &Expr,
+    owned: &OwnedValue,
+    root: &RootWitness,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if !super::eval_generic::reindex_bridge_is_identity(owned) {
+        return None;
+    }
+    let path_expr = reroot_markers::<S>(path_expr, root);
+    Some(each_path_on_owned::<S>(&path_expr, owned, optional, sink))
+}
+
+/// [`path_over_owned`] for the eager callers: every path collected, with
+/// the escape that ended the resolution, if any.
+pub(crate) fn path_over_owned_collect<S: EvalSemantics>(
+    path_expr: &Expr,
+    owned: &OwnedValue,
+    root: &RootWitness,
+    optional: bool,
+) -> Option<(Vec<OwnedValue>, Option<Control>)> {
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    let flow = path_over_owned::<S>(path_expr, owned, root, optional, &mut |v| {
+        collected.push(v);
+        Demand::Continue
+    })?;
+    let control = match flow {
+        Flow::Escaped(control) => Some(control),
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+    };
+    Some((collected, control))
+}
+
+/// The owned re-entries' `path()` door (#3177): a `path(f)`-headed `expr`
+/// runs [`path_over_owned`] on `input` itself instead of crossing the
+/// bridge, so the resolver navigates the caller's own tree. `Some(flow)`
+/// when it ran here, `None` to let the re-entry proceed as before.
+///
+/// Why the tree matters: jq's `jv_identical` is pointer equality, and a
+/// container built inside a bind holds the bind's own `Rc` for the node it
+/// embeds (#2889's embed table), so `. as $x | [.] | path(.[0] | $x)` is
+/// `[0]` in jq, `{k:.} | path(.k | $x)` is `["k"]`, and `[.,.] | path(.[1]
+/// | $x)` is `[1]`. The root witness can only speak for the root -- `[.]`
+/// itself, which is new -- and `Origin::SnapshotAt` cannot help either:
+/// `Frame::certifies` admits it by value, never by position. The element's
+/// identity is instead read where the resolver stands on it, by
+/// [`marker_identical`]'s storage clause, which needs the resolver to be
+/// handed the tree the `Rc` lives in rather than a copy serialized through
+/// `to_json_for_reindex` and re-indexed.
+///
+/// Only from [`Reentry::REBUILT`], as [`embed_peel_step`]: a caller that
+/// arrived `Against(Node)`/`Against(OwnedRoot)` already names its root and
+/// would trade that proof for the weaker `of_owned` derivation. Not gated
+/// on the embed table or on the mode: the door replaces a serialize, index
+/// and re-materialize round trip with the same resolver over the same tree,
+/// and `reindex_bridge_is_identity` bounds what it may be handed (the
+/// storage clause itself is jq-only). A tail after `path(f)` re-enters per
+/// path under `REBUILT` -- a path is a fresh, scalar-only array -- with the
+/// downstream verdict stashed out-of-band ([`stop_with_downstream`]),
+/// since `each_path_on_owned` reports a stop as its own and would drop a
+/// tail's escape.
+///
+/// Only a `path(f)` *at the head* of the pipe, after leading `.` stages.
+/// One reached through a wrapper -- `path(f)?`, `try path(f)`, `path(f),
+/// path(g)`, `[path(f)]`, `limit(1; path(f))` -- still bridges and refuses
+/// where jq answers, because running it here would mean re-implementing
+/// the wrapper's own driver (`each_try`, `each_comma`, ...) over an owned
+/// value; recorded in `docs/compliance/jq/limitations.md`. A bind that
+/// carries no node at all (`-n '{a:1} as $x'`, `input as $x`) is
+/// substituted as a plain literal, never a marker, so there is nothing for
+/// the storage clause to compare on that route either.
+pub(crate) fn owned_path_door<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    if reentry != Reentry::REBUILT {
+        return None;
+    }
+    let stages = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.as_slice(),
+        other => core::slice::from_ref(other),
+    };
+    let [head, rest @ ..] = skip_identity_stages(stages) else {
+        return None;
+    };
+    let Expr::Builtin(Builtin::Path(path_expr)) = unwrap_paren(head) else {
+        return None;
+    };
+    let root = RootWitness::of_owned::<S>(input);
+    if rest.is_empty() {
+        return path_over_owned::<S>(path_expr, input, &root, optional, sink);
+    }
+    let rest = Expr::Pipe(rest.to_vec());
+    let mut downstream: Option<Flow> = None;
+    let upstream =
+        path_over_owned::<S>(
+            path_expr,
+            input,
+            &root,
+            optional,
+            &mut |path| match eval_each_owned::<S>(&rest, &path, optional, Reentry::REBUILT, sink) {
+                Flow::Exhausted => Demand::Continue,
+                other => stop_with_downstream(&mut downstream, other),
+            },
+        )?;
+    // Downstream decided: its verdict wins over the resolver's `Stopped`,
+    // which is only the echo of our own driver answering `Stop`.
+    Some(downstream.unwrap_or(upstream))
+}
+
+/// [`owned_path_door`] for the eager re-entries: every output collected,
+/// with the escape that ended the pipe, if any.
+pub(crate) fn owned_path_door_collect<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Option<(Vec<OwnedValue>, Option<Control>)> {
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    let flow = owned_path_door::<S>(expr, input, optional, reentry, &mut |v| {
+        collected.push(v);
+        Demand::Continue
+    })?;
+    let control = match flow {
+        Flow::Escaped(control) => Some(control),
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+    };
+    Some((collected, control))
+}
+
 /// Whether a child peeled out of a `.[]` can run `rest` without building a
 /// throwaway index for itself (#2889 review) -- the shapes
 /// [`eval_owned_fast_path`] answers from the owned value directly.
@@ -8459,11 +8628,7 @@ fn embed_peel_step<S: EvalSemantics>(
     // neither move nor raise -- so skipping leading ones here is what lets
     // the stage *behind* them be peeled at all (`[.] | . | max`, where the
     // bridge otherwise rebuilt the array before `max` ever ran).
-    let mut remaining = stages.as_slice();
-    while let [Expr::Identity, tail @ ..] = remaining {
-        remaining = tail;
-    }
-    let [first, rest @ ..] = remaining else {
+    let [first, rest @ ..] = skip_identity_stages(stages) else {
         return None;
     };
     if rest.is_empty() {
@@ -8614,6 +8779,12 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
             }
         }
         return Flow::Exhausted;
+    }
+    // #3177: a `path(f)`-headed pipe resolves over `input` itself, so an
+    // embed *inside* `path()`'s own argument is navigated to as the node it
+    // is, not as a re-indexed copy. See [`owned_path_door`].
+    if let Some(flow) = owned_path_door::<S>(expr, input, optional, reentry, sink) {
+        return flow;
     }
     // #2889: `input` may still *be* a bound node's own value, embedded here
     // by a construction jq would have shared rather than copied -- ask the
@@ -32350,7 +32521,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // shared with `resolves_to_register`'s identical arm so the two
         // can't silently diverge.
         Expr::TrackedVar(marker) => {
-            if trackable && marker_identical(marker, value, frame) {
+            if trackable && marker_identical::<S>(marker, value, frame) {
                 Ok(vec![PathBranch::new(
                     PathPrefix::root(),
                     Cow::Borrowed(value),
@@ -34269,16 +34440,51 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
     matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
 }
 
-/// Whether `marker` certifies against `target` -- node identity
-/// (`Frame::certifies`) or, failing that, jq's `jv_identical` null/bool
-/// value-identity carve-out (#3136). Shared by `resolve_node_eager`'s and
-/// `resolves_to_register`'s otherwise-identical `Expr::TrackedVar` arms so
-/// a future refinement of this rule can't apply to one and silently miss
-/// the other, the same duplication risk [`null_bool_identical`]'s own doc
-/// comment names.
-fn marker_identical(marker: &Tracked, target: &OwnedValue, frame: &Frame) -> bool {
-    marker.value == *target
-        && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, target))
+/// Whether `marker` certifies against `target` -- storage identity (jq
+/// mode, #3177), node identity (`Frame::certifies`) or, failing both, jq's
+/// `jv_identical` null/bool value-identity carve-out (#3136). Shared by
+/// `resolve_node_eager`'s and `resolves_to_register`'s otherwise-identical
+/// `Expr::TrackedVar` arms so a future refinement of this rule can't apply
+/// to one and silently miss the other, the same duplication risk
+/// [`null_bool_identical`]'s own doc comment names.
+///
+/// The storage clause *is* jq's rule rather than a witness of it: for an
+/// allocated `jv` -- every array and object -- `jv_identical` compares
+/// pointers, and [`OwnedValue::shares_storage_with`] compares the `Rc`
+/// behind the container. It is sound for the reason ADR-0024's #2889
+/// amendment gives for the embed table's entry: `marker.value` is a strong
+/// reference held for the marker's whole lifetime, so a write through any
+/// other handle copies first (`Rc::make_mut`; the by-value unwrap is
+/// `Rc::try_unwrap`, and `src/jq` has no `unsafe`), and a target that still
+/// shares the storage is that node, unmodified. It reads no origin on
+/// purpose: an [`Origin::Untracked`] marker -- a navigated bind, or a
+/// `Snapshot` demoted against a rebuilt root -- refuses by node identity
+/// because it has no invocation to certify a position in, and the pointer
+/// is exactly the proof that was missing. What it cannot do is *widen*
+/// past jq: succinctly shares an `Rc` only where jq places the same `jv`
+/// (a navigation's child, an `as` bind's value, #2889's embed reuse, an
+/// `add`/`min`/`max` that hands an input back); slices, `sort`, `unique`,
+/// `reverse`, `to_entries` and every construction rebuild, so `. as $x |
+/// [{"a":1}] | path(.[0] | $x)` and `[.,{a:1}] | path(.[1] | $x)` refuse
+/// here as they do there. Scalars are not `Rc`-backed and never match,
+/// which costs the refusal jq's by-value number identity would not give --
+/// a documented residual, never a wrong acceptance.
+///
+/// The resolver only ever holds the pointer on the routes that hand it the
+/// caller's own tree ([`path_over_owned`], [`owned_path_door`]); after a
+/// reindex bridge every node is a fresh materialization and the clause is
+/// simply false, leaving the node-identity rules to decide as before.
+///
+/// jq mode only (ADR-0018): real yq's variables hold nodes with their own
+/// paths, and there is no capture of what `path(.[0] | $x)` means there.
+fn marker_identical<S: EvalSemantics>(
+    marker: &Tracked,
+    target: &OwnedValue,
+    frame: &Frame,
+) -> bool {
+    (S::TAG == EvalTag::Jq && marker.value.shares_storage_with(target))
+        || (marker.value == *target
+            && (frame.certifies(&marker.origin) || null_bool_identical(&marker.value, target)))
 }
 
 /// Whether `expr`, given it runs to completion without raising or
@@ -34316,23 +34522,28 @@ fn marker_identical(marker: &Tracked, target: &OwnedValue, frame: &Frame) -> boo
 /// (left)` alone, which says nothing about which side's value reached
 /// `bound` -- the same #3129 lesson applied to an immediate, non-deferred
 /// certification instead of a later one.
-fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &Frame) -> bool {
+fn resolves_to_register<S: EvalSemantics>(
+    expr: &Expr,
+    trackable: bool,
+    reg: &OwnedValue,
+    frame: &Frame,
+) -> bool {
     match unwrap_paren(expr) {
         Expr::Identity => trackable,
         // #3136: [`marker_identical`], shared with `resolve_node_eager`'s
         // own `TrackedVar` arm, so a future refinement of this rule can't
         // apply to one and silently miss the other.
-        Expr::TrackedVar(marker) => marker_identical(marker, reg, frame),
+        Expr::TrackedVar(marker) => marker_identical::<S>(marker, reg, frame),
         Expr::If {
             then_branch,
             else_branch,
             ..
         } => {
-            resolves_to_register(then_branch, trackable, reg, frame)
-                && resolves_to_register(else_branch, trackable, reg, frame)
+            resolves_to_register::<S>(then_branch, trackable, reg, frame)
+                && resolves_to_register::<S>(else_branch, trackable, reg, frame)
         }
         Expr::Try { expr, .. } if is_raise_free_identity_passthrough(expr) => {
-            resolves_to_register(expr, trackable, reg, frame)
+            resolves_to_register::<S>(expr, trackable, reg, frame)
         }
         // #3119 third review round: `trackable && reg.is_truthy()` alone
         // only proves `left`, *if it produces an output*, is truthy --
@@ -34352,7 +34563,7 @@ fn resolves_to_register(expr: &Expr, trackable: bool, reg: &OwnedValue, frame: &
         Expr::Alternative(left, _)
             if trackable && reg.is_truthy() && is_raise_free_identity_passthrough(left) =>
         {
-            resolves_to_register(left, trackable, reg, frame)
+            resolves_to_register::<S>(left, trackable, reg, frame)
         }
         _ => false,
     }
@@ -35540,7 +35751,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // the loop's own per-`bound` null/bool check below -- matching this
     // arm's pre-#3119 behavior for a bare `.`/`TrackedVar` head exactly.
     let head_resolves_to_register =
-        register.is_some_and(|reg| resolves_to_register(head, trackable, reg, frame));
+        register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
     for bound in &sources {
         // A shape `resolves_to_register` refuses (including one it was
         // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
@@ -43644,6 +43855,13 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(Some(v)) => QueryResult::Owned(v),
             Ok(None) => QueryResult::None,
             Err(e) => e.into(),
+        };
+    }
+    // #3177: see `eval_each_owned`.
+    if let Some((values, control)) = owned_path_door_collect::<S>(expr, input, optional, reentry) {
+        return match control {
+            Some(control) => partial(values, control),
+            None => owned_vec_to_result(values),
         };
     }
     // #2889: `input` may still *be* a bound node's own value, embedded here
@@ -98034,6 +98252,17 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // negative-index-spelling, refuse-only until #3177: `.[-2]` is
+            // stored as written and never matches `.[0]`'s bind path, but
+            // it lands on the very element `$y` was bound from, and the
+            // resolver now certifies a marker by the storage it shares with
+            // the node under the register (`marker_identical`), which is
+            // what jq's `jv_identical` compares
+            (
+                br#"[{"b":1},{"b":1}]"#,
+                "path(.[0] as $y | .[-2] | $y)",
+                r"[[-2]]",
+            ),
             // catch-handler-var, refuse-only until #3133: jq restores the
             // register to the `try`'s entry when it catches, and the
             // handler now runs with that register in hand, so `$y` -- which
@@ -98532,12 +98761,6 @@ mod tests {
                 br#"{"a":{"b":1}}"#,
                 "path(.a? as $y | .a | $y)",
                 r#"[["a"]]"#,
-            ),
-            // negative-index-spelling
-            (
-                br#"[{"b":1},{"b":1}]"#,
-                "path(.[0] as $y | .[-2] | $y)",
-                r"[[-2]]",
             ),
             // full-slice-is-the-array (jq's `.a[0:3]` of a 3-array is `.a`)
             (
@@ -99310,6 +99533,83 @@ mod tests {
             }
             other => panic!("expected the comma back, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `rewrite_markers` rebuilds the same node kind it was given (#3037)"
         }
+    }
+
+    /// #3177: `marker_identical` certifies by storage identity -- jq's
+    /// `jv_identical` on a container -- whatever the marker's origin, and
+    /// by nothing weaker than the pointer. No embed table is needed: the
+    /// clause compares the marker's own `Rc` with the node under the
+    /// register, which is why the resolver can answer for an embed at a
+    /// nested position (`[.] | path(.[0] | $x)`) that no root witness can
+    /// name. `unshared-containers` deep-copies on clone, so there is no
+    /// storage to share and the test does not run there.
+    #[test]
+    #[cfg(not(feature = "unshared-containers"))]
+    fn marker_identical_reads_storage_identity_3177() {
+        let value = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        // A navigated bind outside any invocation: the origin that never
+        // certifies by node identity, in a frame with no provable position.
+        let marker = Tracked {
+            value: value.clone(),
+            origin: Origin::Untracked,
+            node: None,
+        };
+        let frame = Frame::enter(&Expr::Identity);
+        assert!(frame.at.is_none(), "no position to certify against");
+
+        // Hit: the node under the register is another handle on the
+        // marker's own storage -- what `[.] | .[0]` hands the resolver.
+        let embedded = value.clone();
+        assert!(marker_identical::<JqSemantics>(&marker, &embedded, &frame));
+
+        // Miss: an equal-valued rebuild is a different node.
+        let rebuilt = OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        assert_eq!(rebuilt, value, "value-equal, and still a miss");
+        assert!(!marker_identical::<JqSemantics>(&marker, &rebuilt, &frame));
+
+        // Miss: a write copied the container off the shared storage first.
+        let mut written = value.clone();
+        written
+            .as_object_mut()
+            .expect("an object")
+            .insert("b".to_string(), OwnedValue::Int(2));
+        assert!(!marker_identical::<JqSemantics>(&marker, &written, &frame));
+
+        // yq mode never reads the pointer (ADR-0018: the mode decides).
+        assert!(!marker_identical::<YqSemantics>(&marker, &embedded, &frame));
+
+        // A scalar carries no storage: value-equal is not identical here
+        // (jq's by-value number identity is a documented residual).
+        let one = Tracked {
+            value: OwnedValue::Int(1),
+            origin: Origin::Untracked,
+            node: None,
+        };
+        assert!(!marker_identical::<JqSemantics>(
+            &one,
+            &OwnedValue::Int(1),
+            &frame
+        ));
+
+        // The rules the clause sits above are untouched: null/bool by value
+        // (#3136), and a `Snapshot` by value alone.
+        let null = Tracked {
+            value: OwnedValue::Null,
+            origin: Origin::Untracked,
+            node: None,
+        };
+        assert!(marker_identical::<JqSemantics>(
+            &null,
+            &OwnedValue::Null,
+            &frame
+        ));
+        let snapshot = Tracked {
+            value: value.clone(),
+            origin: Origin::Snapshot,
+            node: None,
+        };
+        assert!(marker_identical::<JqSemantics>(&snapshot, &rebuilt, &frame));
+        assert!(marker_identical::<YqSemantics>(&snapshot, &rebuilt, &frame));
     }
 
     /// #2889: `RootWitness::of_owned` reports the node an owned value still
