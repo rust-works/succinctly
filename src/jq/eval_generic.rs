@@ -6340,21 +6340,31 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     // this covers every other integer index and `last`, checked ahead of
     // the main match so those two arms don't have to repeat the guard.
     if seq.instructions.is_none() && matches!(seq.source, LazySource::Cursors { .. }) {
-        // #3177: `. | X` is `X`, so an identity stage hands the sequence on
-        // untouched. Only here, under this block's guard, and not as a
-        // general arm below: the `_` arm is a *materialization barrier*,
-        // and with a `map(f)` on the sequence, `[.[]] | map(f) | . | first`
-        // materializes at the `.` and raises on a failing second element
-        // exactly as jq's eager `map` does, where the lazy `first` arm
-        // below would not (#725/#2174's documented divergence, which must
-        // not spread to a new spelling). With no instructions over a cursor
-        // source no element can error, so the passthrough is vacuous -- and
-        // it is what keeps `[.] | . | max | path($x)`'s one-element array
-        // out of the `eval_on_owned` round trip that rebuilt it before
-        // `max` ever ran (jq answers `[]`; the wider `[.,.] | . | max`
-        // already did, via `eval::embed_peel_step`'s own identity skip).
+        // #3177: `. | X` is `X`, so an identity stage materializes the
+        // sequence and hands the array on as it is -- *not* through the `_`
+        // arm's `eval_on_owned`, whose JSON round trip rebuilt `[.] | . |
+        // max | path($x)`'s one-element array before `max` ever ran (jq
+        // answers `[]`; the wider `[.,.] | . | max` already did, since it
+        // collapses to `Owned` and `eval::embed_peel_step` skips the `.`).
+        // With no instructions over a cursor source no element can error,
+        // so the materialization cannot fail, and the embed table's reuse
+        // (#2889) keeps the bound node's own `Rc` in the array exactly as
+        // the `_` arm's materialization did. Materialized rather than left
+        // lazy on purpose: the `.` is a *materialization barrier* in both
+        // orders. `[.[]] | map(f) | . | first` still reaches the `_` arm
+        // (instructions present), and `[.[]] | . | map(f) | first` hands
+        // `map` an owned array, so both raise on a failing second element
+        // exactly as jq's eager `map` does, where a lazy sequence's `first`
+        // would not (#725/#2174's documented divergence, which must not
+        // spread to a new spelling -- review of #3177 caught the second
+        // order doing exactly that when the `.` passed the sequence on).
         if matches!(unwrap_paren(expr), Expr::Identity) {
-            return GenericResult::LazySeq(seq);
+            return match seq.materialize_atomic::<S>() {
+                Ok(owned) => GenericResult::Owned(owned),
+                Err(Control::Error(e)) => GenericResult::Error(e),
+                Err(Control::Break(label)) => GenericResult::Break(label),
+                Err(Control::Halt(code)) => GenericResult::Halt(code),
+            };
         }
         // A nested-pipe stage whose *head* is one of the shapes below:
         // `.[0].name` parses as one `Expr::Pipe([Index{0}, Field])` handed
@@ -6378,15 +6388,43 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // does, not a split two-step version of the identical work.
         // `Expr::Identity` is in the list for the same reason it has the
         // arm above (#3177): `(. | max)` and the parser-fused `. | . | max`
-        // arrive as one `Pipe` whose head is `.`, and peeling that head is
-        // the passthrough, so the stage behind it folds as if the `.` were
-        // never written.
+        // arrive as one `Pipe` whose head is `.`; that head is handled
+        // first, below, by the same bridge-free materialization.
         if let Expr::Pipe(stages) = unwrap_paren(expr) {
+            // A `.` head (#3177): materialize, as the standalone arm above
+            // does, and run the *rest of the pipe as one expression*
+            // through `eval_each_owned` -- the funnel with the peel
+            // (`eval::embed_peel_step`) -- never stage by stage through
+            // `fold_pipe_stages`. The eager fold hands each stage to
+            // `eval_on_owned` on its own, and a bare `.[0]` there crosses
+            // the reindex bridge as a copy, so `[.] | (. | .[0]) |
+            // path($x)` refused (review of #3177) where `[.] | . | .[0] |
+            // path($x)`, folded by the demand-aware caller with the whole
+            // tail in hand, answered `[]`. Same barrier as above: `(. |
+            // map(f)) | first` hands `map` an owned array and raises.
+            if matches!(stages.first().map(unwrap_paren), Some(Expr::Identity)) {
+                let rest: &[Expr] = &stages[1..];
+                let rest_expr = match rest {
+                    [] => Expr::Identity,
+                    [only] => only.clone(),
+                    many => Expr::Pipe(many.to_vec()),
+                };
+                return match seq.materialize_atomic::<S>() {
+                    Ok(owned) => eval_each_owned_collect::<S, V>(
+                        &rest_expr,
+                        &owned,
+                        optional,
+                        Reentry::REBUILT,
+                    ),
+                    Err(Control::Error(e)) => GenericResult::Error(e),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                };
+            }
             if matches!(
                 stages.first().map(unwrap_paren),
                 Some(
-                    Expr::Identity
-                        | Expr::Index { key: None, .. }
+                    Expr::Index { key: None, .. }
                         | Expr::Builtin(Builtin::Last)
                         | Expr::Slice { .. }
                 )

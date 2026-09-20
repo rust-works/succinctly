@@ -555,6 +555,21 @@ owned-embed-refuse-path-nested-comma	{"a":1}	. as $x | [.] | (path(.[0] | $x), p
 owned-embed-refuse-path-nested-wrapper	{"a":1}	. as $x | [.] | [limit(1; path(.[] | $x))]
 owned-embed-refuse-path-nested-del	{"a":1}	. as $x | [.] | del(.[0] | $x)
 owned-embed-refuse-path-nested-assign	{"a":1}	. as $x | [.] | (.[0] | $x) = 5
+owned-embed-refuse-path-nested-as-source	{"a":1}	. as $x | [.] | path(.[0] | $x) as $p | $p
+owned-embed-refuse-path-nested-reduce-source	{"a":1}	. as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)
+owned-embed-refuse-path-nested-binary-operand	{"a":1}	. as $x | [.] | select(path(.[0] | $x) == [0])
+owned-embed-refuse-path-nested-first-body	{"a":1}	. as $x | [.] | first(path(.[] | $x) | .[0])
+owned-embed-refuse-path-nested-label-body	{"a":1}	. as $x | [.] | label $out | path(.[0] | $x) | ., break $out
+owned-embed-refuse-path-nested-after-sort	{"a":1}	. as $x | [.] | sort | path(.[0] | $x)
+owned-embed-refuse-path-nested-after-reverse	{"a":1}	. as $x | [.] | reverse | path(.[0] | $x)
+owned-embed-refuse-path-nested-after-unique	{"a":1}	. as $x | [.] | unique | path(.[0] | $x)
+owned-embed-refuse-path-nested-after-to-entries	{"a":1}	. as $x | {k:.} | to_entries | path(.[0].value | $x)
+owned-embed-refuse-path-nested-after-with-entries	{"a":1}	. as $x | {k:.} | with_entries(.) | path(.k | $x)
+owned-embed-refuse-path-nested-after-add	{"a":1}	. as $x | [[.]] | add | path(.[0] | $x)
+owned-embed-refuse-path-nested-after-update	{"a":1}	. as $x | [.] | .[0] |= . | path(.[0] | $x)
+owned-embed-path-nested-after-map	{"a":1}	. as $x | [.] | map(.) | path(.[0] | $x)
+owned-embed-path-nested-after-slice	{"a":1}	. as $x | [.] | .[0:1] | path(.[0] | $x)
+owned-embed-path-nested-getpath	{"a":1}	. as $x | [.] | path(getpath([0]) | $x)
 owned-embed-object-member	{"a":1}	. as $x | {k:.} | .k | path($x)
 owned-embed-add-empty-right	{"a":1}	. as $x | . + {} | path($x)
 owned-embed-fold-empty	{"a":1}	. as $x | reduce empty as $i (.; .) | path($x)
@@ -585,6 +600,18 @@ owned-embed-identity-stage-paren-max	{"a":1}	. as $x | [.] | (. | max) | path($x
 owned-embed-identity-stage-first	{"a":1}	. as $x | [.] | . | .[0] | path($x)
 owned-embed-identity-stage-paren-first	{"a":1}	. as $x | [.] | (. | .[0]) | path($x)
 owned-embed-identity-stage-map-barrier	[1,2]	[.[]] | map(if . == 2 then error else . end) | . | first
+owned-embed-identity-stage-map-barrier-after	[1,2]	[.[]] | . | map(if . == 2 then error else . end) | first
+owned-embed-identity-stage-map-barrier-after-index	[1,2]	[.[]] | . | map(if . == 2 then error else . end) | .[0]
+owned-embed-identity-stage-map-barrier-paren	[1,2]	[.[]] | (. | map(if . == 2 then error else . end)) | first
+owned-embed-paren-stage-index	{"a":1}	. as $x | [.,.] | (.[0]) | path($x)
+owned-embed-paren-stage-identity-index	{"a":1}	. as $x | [.,.] | (. | .[0]) | path($x)
+owned-embed-paren-stage-index-identity	{"a":1}	. as $x | [.,.] | (.[0] | .) | path($x)
+owned-embed-paren-stage-identity-max	{"a":1}	. as $x | [.,.] | (. | max) | path($x)
+owned-embed-paren-stage-max	{"a":1}	. as $x | [.,.] | (max) | path($x)
+owned-embed-paren-stage-bare-identity	{"a":1}	. as $x | [.,.] | (.) | max | path($x)
+owned-embed-paren-stage-object-member	{"a":1}	. as $x | {k:.} | (.k) | path($x)
+owned-embed-paren-stage-identity-object-member	{"a":1}	. as $x | {k:.} | (. | .k) | path($x)
+owned-embed-paren-stage-iterate	{"a":1}	. as $x | [.,.] | (.[]) | path($x)
 owned-embed-refuse-sort-element	{"a":1}	. as $x | [.] | sort | .[0] | path($x)
 owned-embed-refuse-unique-element	{"a":1}	. as $x | [.] | unique | .[0] | path($x)
 owned-embed-refuse-to-entries-value	{"a":1}	. as $x | {k:.} | to_entries | .[0].value | path($x)
@@ -689,6 +716,18 @@ owned-embed-refuse-path-nested-comma:#3177 -- path() reached through a comma wra
 owned-embed-refuse-path-nested-wrapper:#3177 -- same as owned-embed-refuse-path-nested-comma, through an array constructor and limit
 owned-embed-refuse-path-nested-del:#3177 -- the del resolver still crosses the bridge; the storage clause answers there as soon as del/assignment are routed like path() (#3188)
 owned-embed-refuse-path-nested-assign:#3177 -- same as owned-embed-refuse-path-nested-del, for the assignment resolver
+owned-embed-refuse-path-nested-as-source:#3177 review -- path() as a bind's source is not the head of the owned re-entry's pipe; the as driver owns the inner pipe, so it still bridges (#3189)
+owned-embed-refuse-path-nested-reduce-source:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a reduce source
+owned-embed-refuse-path-nested-binary-operand:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as a binary operand inside select
+owned-embed-refuse-path-nested-first-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of first
+owned-embed-refuse-path-nested-label-body:#3177 review -- same as owned-embed-refuse-path-nested-as-source, as the body of label
+owned-embed-refuse-path-nested-after-sort:#3177 review -- jq's sort moves the element's own jv into the new array (jq [0]); the sort stage ahead of path() folds through eval_on_owned's round trip first, so the resolver is handed fresh copies
+owned-embed-refuse-path-nested-after-reverse:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for reverse
+owned-embed-refuse-path-nested-after-unique:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for unique
+owned-embed-refuse-path-nested-after-to-entries:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for to_entries (jq [0,"value"])
+owned-embed-refuse-path-nested-after-with-entries:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for with_entries (jq ["k"])
+owned-embed-refuse-path-nested-after-add:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for a one-element add
+owned-embed-refuse-path-nested-after-update:#3177 review -- same as owned-embed-refuse-path-nested-after-sort, for a no-op |= (jq's setpath places the same jv)
 owned-embed-fold-if-identity:#2889 -- an `if` UPDATE returning `.` is not one of eval_owned_navigation's recognized shapes, so embed_peel_step declines and the accumulator goes through the owned re-index bridge
 owned-embed-refuse-sort-element:#2889 -- sort is not one of the owned fast paths eval_owned_relocating_fold covers, so the array re-indexes before the element is read
 owned-embed-refuse-unique-element:#2889 -- same as owned-embed-refuse-sort-element, for unique

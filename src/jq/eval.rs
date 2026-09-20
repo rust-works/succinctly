@@ -8440,11 +8440,15 @@ pub(crate) fn path_over_owned_collect<S: EvalSemantics>(
 /// tail's escape.
 ///
 /// Only a `path(f)` *at the head* of the pipe, after leading `.` stages.
-/// One reached through a wrapper -- `path(f)?`, `try path(f)`, `path(f),
-/// path(g)`, `[path(f)]`, `limit(1; path(f))` -- still bridges and refuses
-/// where jq answers, because running it here would mean re-implementing
-/// the wrapper's own driver (`each_try`, `each_comma`, ...) over an owned
-/// value; recorded in `docs/compliance/jq/limitations.md`. A bind that
+/// One in any other position -- under a wrapper (`path(f)?`, `try
+/// path(f)`, `path(f), path(g)`, `[path(f)]`, `limit(1; path(f))`,
+/// `first(path(f) | g)`, `label $out | path(f) | ...`), as a bind's source
+/// (`path(f) as $p | ...`, `reduce path(f) as $p (...)`), or as a binary
+/// operand (`select(path(f) == [0])`) -- still bridges and refuses where jq
+/// answers, because running it here would mean re-implementing the
+/// enclosing construct's own driver (`each_try`, `each_comma`, `each_as`,
+/// ...) over an owned value; recorded in
+/// `docs/compliance/jq/limitations.md` (#3189). A bind that
 /// carries no node at all (`-n '{a:1} as $x'`, `input as $x`) is
 /// substituted as a plain literal, never a marker, so there is nothing for
 /// the storage clause to compare on that route either.
@@ -8621,8 +8625,14 @@ fn embed_peel_step<S: EvalSemantics>(
     if reentry != Reentry::REBUILT || !super::eval_generic::embed_table_active() {
         return None;
     }
-    let Expr::Pipe(stages) = expr else {
-        return None;
+    // Parentheses are spelling, not structure: `(.[0])`, `(. | max)` and
+    // `(.[0] | .)` are the stages they wrap (#3177 review -- the generic
+    // evaluator hands a parenthesised stage over as one `Expr::Paren`, and
+    // matching the bare `Pipe` alone sent `[.,.] | (. | max) | path($x)`
+    // across the bridge where the unparenthesised spelling peeled).
+    let stages: &[Expr] = match unwrap_paren(expr) {
+        Expr::Pipe(stages) => stages.as_slice(),
+        other => core::slice::from_ref(other),
     };
     // `. | X` is `X` -- an identity stage yields its input, once, and can
     // neither move nor raise -- so skipping leading ones here is what lets
@@ -8631,23 +8641,38 @@ fn embed_peel_step<S: EvalSemantics>(
     let [first, rest @ ..] = skip_identity_stages(stages) else {
         return None;
     };
-    if rest.is_empty() {
-        return None;
-    }
+    let first = unwrap_paren(first);
     // A *chained* navigation (`.k.j`, `.[0][0]`) parses as one nested
     // `Expr::Pipe` in head position -- see `Expr::Pipe`'s own doc comment
     // ("Chained expressions: `.foo.bar[0]`") -- so its first step is
     // invisible from here until the head is flattened into the outer pipe.
-    // One level per call; the recursion descends structurally and the
-    // flattened head is strictly shorter, so it terminates.
-    if let Expr::Pipe(inner) = first {
-        if inner.is_empty() {
-            return None;
+    // A parenthesised head (`(. | .[0]) | path($x)`) and a parenthesised
+    // `.` (`(.) | max`) flatten the same way. One level per call; the
+    // recursion descends structurally and the flattened head is strictly
+    // shorter, so it terminates.
+    match first {
+        Expr::Pipe(inner) => {
+            if inner.is_empty() {
+                return None;
+            }
+            let mut flat = inner.clone();
+            flat.extend_from_slice(rest);
+            return embed_peel_step::<S>(&Expr::Pipe(flat), input, optional, reentry);
         }
-        let mut flat = inner.clone();
-        flat.extend_from_slice(rest);
-        return embed_peel_step::<S>(&Expr::Pipe(flat), input, optional, reentry);
+        Expr::Identity => {
+            if rest.is_empty() {
+                return None;
+            }
+            return embed_peel_step::<S>(&Expr::Pipe(rest.to_vec()), input, optional, reentry);
+        }
+        _ => {}
     }
+    // An empty `rest` is a stage that *is* the whole pipe -- `(.[0])` as
+    // one stage of the generic evaluator's fold, or the `.[0]` left once a
+    // `(. | .[0])` head is split (#3177) -- and its answer is the stepped
+    // node itself, which the bridge would otherwise hand on as a copy. It
+    // runs below with `Expr::Identity` as its tail; the payoff gates in
+    // each arm still decide whether stepping is worth taking at all.
     let stepped: Result<Vec<OwnedValue>, EvalError> = match first {
         // `.` moves nothing, so there is nothing a peel could witness that
         // `witnessed_by` on the whole pipe does not already see.
@@ -8661,7 +8686,7 @@ fn embed_peel_step<S: EvalSemantics>(
                 &navigated,
                 Ok(Some(value)) if embed_witnessed(value)
             );
-            if !on_an_embed && !leads_with_a_peelable_step(&rest[0]) {
+            if !on_an_embed && !rest.first().is_some_and(leads_with_a_peelable_step) {
                 return None;
             }
             navigated.map(|v| v.into_iter().collect::<Vec<_>>())
@@ -8677,21 +8702,27 @@ fn embed_peel_step<S: EvalSemantics>(
         // nor keep its children index-free must cost nothing beyond the
         // scan. See the doc comment for the measurement behind the second
         // half of that condition.
-        Expr::Iterate if !peeled_children_need_no_index(&rest[0]) => match input {
-            OwnedValue::Array(items) => {
-                if !items.iter().any(embed_witnessed) {
-                    return None;
+        Expr::Iterate
+            if rest
+                .first()
+                .is_some_and(|next| !peeled_children_need_no_index(next)) =>
+        {
+            match input {
+                OwnedValue::Array(items) => {
+                    if !items.iter().any(embed_witnessed) {
+                        return None;
+                    }
+                    Ok(items.iter().cloned().collect())
                 }
-                Ok(items.iter().cloned().collect())
-            }
-            OwnedValue::Object(map) => {
-                if !map.values().any(embed_witnessed) {
-                    return None;
+                OwnedValue::Object(map) => {
+                    if !map.values().any(embed_witnessed) {
+                        return None;
+                    }
+                    Ok(map.values().cloned().collect())
                 }
-                Ok(map.values().cloned().collect())
+                _ => return None,
             }
-            _ => return None,
-        },
+        }
         Expr::Iterate => match input {
             OwnedValue::Array(items) => Ok(items.iter().cloned().collect()),
             OwnedValue::Object(map) => Ok(map.values().cloned().collect()),
@@ -8709,6 +8740,7 @@ fn embed_peel_step<S: EvalSemantics>(
         _ => return None,
     };
     let rest = match rest {
+        [] => Expr::Identity,
         [only] => only.clone(),
         many => Expr::Pipe(many.to_vec()),
     };
@@ -34463,12 +34495,18 @@ fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
 /// is exactly the proof that was missing. What it cannot do is *widen*
 /// past jq: succinctly shares an `Rc` only where jq places the same `jv`
 /// (a navigation's child, an `as` bind's value, #2889's embed reuse, an
-/// `add`/`min`/`max` that hands an input back); slices, `sort`, `unique`,
-/// `reverse`, `to_entries` and every construction rebuild, so `. as $x |
-/// [{"a":1}] | path(.[0] | $x)` and `[.,{a:1}] | path(.[1] | $x)` refuse
-/// here as they do there. Scalars are not `Rc`-backed and never match,
-/// which costs the refusal jq's by-value number identity would not give --
-/// a documented residual, never a wrong acceptance.
+/// `add`/`min`/`max` that hands an input back, a `sort`/`reverse`/
+/// `unique`/`to_entries` that moves its elements into a new container),
+/// and a value built afresh shares nothing, so `. as $x | [{"a":1}] |
+/// path(.[0] | $x)` and `[.,{a:1}] | path(.[1] | $x)` refuse here as they
+/// do there. The converse is the residual direction: where succinctly
+/// bridges before the resolver runs (`[.] | sort | path(.[0] | $x)`, `{k:.}
+/// | to_entries | path(.[0].value | $x)` -- the stage ahead of `path()`
+/// crosses `eval_on_owned`'s round trip), every node is a fresh copy and
+/// the clause is false where jq's pointer equality answers `[0]`; recorded
+/// in `docs/compliance/jq/limitations.md`. Scalars are not `Rc`-backed and
+/// never match, which costs the refusal jq's by-value number identity would
+/// not give -- a documented residual, never a wrong acceptance.
 ///
 /// The resolver only ever holds the pointer on the routes that hand it the
 /// caller's own tree ([`path_over_owned`], [`owned_path_door`]); after a

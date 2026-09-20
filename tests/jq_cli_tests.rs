@@ -61072,6 +61072,73 @@ fn test_owned_embed_path_argument_residuals_3177() -> Result<()> {
             r". as $x | [.] | (.[0] | $x) = 5",
             "the assignment resolver still crosses the bridge (jq `[5]`)",
         ),
+        // The door opens only for the head of the pipe the owned re-entry
+        // is handed: a `path()` that is a bind's source, a binary operand,
+        // or the body of `first`/`label` is in no such position (#3189).
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | path(.[0] | $x) as $p | $p",
+            "`path()` as an `as` source still bridges (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | reduce path(.[0] | $x) as $p (0; 1)",
+            "`path()` as a `reduce` source still bridges (jq `1`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | select(path(.[0] | $x) == [0])",
+            "`path()` as a binary operand still bridges (jq `[{\"a\":1}]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | first(path(.[] | $x) | .[0])",
+            "`path()` as the body of `first` still bridges (jq `0`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | label $out | path(.[0] | $x) | ., break $out",
+            "`path()` as the body of `label` still bridges (jq `[0]`)",
+        ),
+        // A stage ahead of `path()` that folds through `eval_on_owned`'s
+        // round trip hands the resolver fresh copies. jq answers every one:
+        // its `sort`/`to_entries`/`add`/`setpath` move the element's own
+        // `jv` into the new container.
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | sort | path(.[0] | $x)",
+            "`sort` ahead of `path()` bridges first (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | reverse | path(.[0] | $x)",
+            "`reverse` ahead of `path()` bridges first (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | unique | path(.[0] | $x)",
+            "`unique` ahead of `path()` bridges first (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | to_entries | path(.[0].value | $x)",
+            "`to_entries` ahead of `path()` bridges first (jq `[0,\"value\"]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | {k:.} | with_entries(.) | path(.k | $x)",
+            "`with_entries` ahead of `path()` bridges first (jq `[\"k\"]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [[.]] | add | path(.[0] | $x)",
+            "a one-element `add` ahead of `path()` bridges first (jq `[0]`)",
+        ),
+        (
+            r#"{"a":1}"#,
+            r". as $x | [.] | .[0] |= . | path(.[0] | $x)",
+            "a no-op `|=` ahead of `path()` bridges first (jq `[0]`)",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(
@@ -62428,22 +62495,49 @@ fn test_owned_embed_fold_ties_and_identity_stage_2889() -> Result<()> {
         r". as $x | [.] | (. | max) | path($x)",
         r". as $x | [.] | . | .[0] | path($x)",
         r". as $x | [.] | (. | .[0]) | path($x)",
+        // A parenthesised stage on the owned route peels like the bare one
+        // (#3177 review: `embed_peel_step` matched the bare `Pipe` alone,
+        // so every one of these bridged and refused, and the fix above
+        // routed the one-element `(. | .[0])` onto the same gap).
+        r". as $x | [.,.] | (.[0]) | path($x)",
+        r". as $x | [.,.] | (. | .[0]) | path($x)",
+        r". as $x | [.,.] | (.[0] | .) | path($x)",
+        r". as $x | [.,.] | (. | max) | path($x)",
+        r". as $x | [.,.] | (max) | path($x)",
+        r". as $x | [.,.] | (.) | max | path($x)",
+        r". as $x | {k:.} | (.k) | path($x)",
+        r". as $x | {k:.} | (. | .k) | path($x)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
         assert_eq!(code, 0, "#3177: `{filter}`: stderr={stderr:?}");
         assert_eq!(stdout.trim_end(), "[]", "#3177: `{filter}`");
     }
-    let barrier = r"[.[]] | map(if . == 2 then error else . end) | . | first";
-    let (stdout, stderr, code) = run_jq_full(&["-c", barrier], Some("[1,2]"))?;
-    assert_eq!(
-        code, 5,
-        "#3177: `{barrier}` must still materialize at the `.` and raise on \
-         the second element, as jq does: stdout={stdout:?} stderr={stderr:?}"
-    );
-    assert!(
-        stderr.contains("(not a string): 2"),
-        "#3177: stderr={stderr:?}"
-    );
+    // A parenthesised iterate peels every child, each still the embed.
+    let iterate = r". as $x | [.,.] | (.[]) | path($x)";
+    let (stdout, stderr, code) = run_jq_full(&["-c", iterate], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "#3177: `{iterate}`: stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "[]\n[]", "#3177: `{iterate}`");
+    // Both orders: the `.` after the `map` reaches the `_` arm, and the `.`
+    // before it hands `map` an owned array. The review of #3177 caught the
+    // first cut passing the sequence on lazily through the second order,
+    // which answered `1` where the merge base and jq both raise.
+    for barrier in [
+        r"[.[]] | map(if . == 2 then error else . end) | . | first",
+        r"[.[]] | . | map(if . == 2 then error else . end) | first",
+        r"[.[]] | . | map(if . == 2 then error else . end) | .[0]",
+        r"[.[]] | (. | map(if . == 2 then error else . end)) | first",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", barrier], Some("[1,2]"))?;
+        assert_eq!(
+            code, 5,
+            "#3177: `{barrier}` must still materialize at the `.` and raise on \
+             the second element, as jq does: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("(not a string): 2"),
+            "#3177: `{barrier}`: stderr={stderr:?}"
+        );
+    }
     Ok(())
 }
 
