@@ -137,6 +137,23 @@ EMBEDS = [
     "(. + null)", "(null + .)", "([] + [.] | .[0])", "([[.]] | .[0][0])",
     "({k:.} | getpath([\"k\"]))",
 ]
+# #3182: a string or number literal is `Rc`-backed like a container, so the
+# same placements keep a scalar's identity -- and so do the builtins real jq
+# hands its input `jv` back from (KEEPS), while the ones that allocate their
+# result must keep refusing (FRESH). Every leaf `doc()` draws (`1`, `"s"`,
+# `true`, `null`) reaches these through NAV, and the `?` keeps a container
+# input from turning a draw into an error. Drawn beside PASSTHROUGH/EMBEDS so
+# a generated program interleaves them with the container-shaped stages.
+SCALAR_KEEPS = [
+    "tostring", "@text", "(ltrimstr(\"z\"))", "(rtrimstr(\"z\"))", "(sub(\"z\"; \"y\")?)",
+    "(tonumber?)", "(abs?)", "getpath([])", "setpath([]; .)", "([.] | add)", "([.] | first)",
+    "([.] | sort | .[0])", "([.] | unique | .[0])", "(if . then . else . end)",
+]
+SCALAR_FRESH = [
+    "(ascii_downcase?)", "(. + \"\")?", "(\"\" + .)?", "(tojson | fromjson)", "(ltrimstr(\"s\"))",
+    "(.[0:]?)", "(explode | implode)?", "(floor?)", "(. + 0)?", "(-(-.))?", "(tostring | tonumber?)",
+    "(\"\\(.)\")", "([.] | join(\"\")?)",
+]
 USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "($v | .b?)",
         "$v[0:1]?", "(.a[0:1]? | $v)", "(.arr[-1]? | $v)", "recurse(if . == $v and type == \"object\" then $v.b? else empty end)",
         "$v as $w | $w", "reduce (1) as $i (.; $v)", "reduce (1) as $i (.a; $v)", "reduce (1) as $i (.a; 5 | $v)",
@@ -381,7 +398,7 @@ def stage(rng, v):
     r = rng.random()
     if r < 0.4: return rng.choice(NAV)
     if r < 0.55: return rng.choice(LITERAL)
-    if r < 0.7: return rng.choice(PASSTHROUGH + EMBEDS)
+    if r < 0.7: return rng.choice(PASSTHROUGH + EMBEDS + SCALAR_KEEPS + SCALAR_FRESH)
     if r < 0.8: return rng.choice(MOVES)
     return rng.choice(USES).replace("$v", v)
 
