@@ -98,6 +98,14 @@ const JQ_FGETS_CHUNK: usize = 4095;
 /// ever reaches the stream's own length.
 pub(crate) fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> usize {
     let total = raw_bytes.iter().map(|(_, raw)| raw.len()).sum::<usize>();
+    final_buffer_start_from_total(raw_bytes, total)
+}
+
+/// [`final_buffer_start`], taking the stream's total byte length from the
+/// caller instead of re-summing it -- [`for_each_warning`] already has it
+/// from its own `boundaries` walk, and a second `Vec`-of-lengths reduction
+/// over the same sources on every non-slurp call was pure waste.
+fn final_buffer_start_from_total(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> usize {
     let last: &[u8] = raw_bytes.last().map_or(&[], |(_, raw)| raw.as_slice());
     let last_start = total - last.len();
 
@@ -240,19 +248,14 @@ pub(crate) fn for_each_warning(
         == Some(b'\n');
     let mut reader = Reader::new(bom, emit);
     reader.suppress_eof_warning = bom.malformed && ends_with_newline;
-    // `usize::MAX` under `-s`: no real offset in the stream ever reaches
-    // it, so the comparison in `scan`'s RS branch can never fire (#2998).
-    reader.stop_at = if slurp {
-        usize::MAX
-    } else {
-        final_buffer_start(raw_bytes)
-    };
     // jq refills its reader one file at a time, so each source after the
     // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
     // walk must reproduce (#3002). The offsets are the sources' absolute
     // boundaries (the end of each but the last, i.e. the start of each
     // subsequent one), matching `indexed_stream_bytes`'s undecorated
-    // numbering.
+    // numbering. The running total this scan ends on is also the stream's
+    // whole length, reused below instead of a second `.sum()` over the same
+    // sources -- both `stop_at` and the EOF answer need it.
     let mut boundaries = raw_bytes
         .iter()
         .scan(0usize, |end, (_, raw)| {
@@ -260,12 +263,19 @@ pub(crate) fn for_each_warning(
             Some(*end)
         })
         .collect::<Vec<usize>>();
+    let total = boundaries.last().copied().unwrap_or(0);
     boundaries.pop();
-    reader.run(indexed_stream_bytes(raw_bytes), &boundaries);
+    // `usize::MAX` under `-s`: no real offset in the stream ever reaches
+    // it, so the comparison in `scan`'s RS branch can never fire (#2998).
+    reader.stop_at = if slurp {
+        usize::MAX
+    } else {
+        final_buffer_start_from_total(raw_bytes, total)
+    };
+    reader.run(indexed_stream_bytes(raw_bytes), &boundaries, None);
     // The same pass answers `--seq -s`'s EOF-location question; see
     // [`last_parse_error_offset`], which is this function with the
     // warnings thrown away.
-    let total = raw_bytes.iter().map(|(_, raw)| raw.len()).sum();
     let last_parse_error_offset = reader.last_warning_offset.map(|offset| {
         if reader.last_warning_at_eof {
             total
@@ -315,11 +325,14 @@ pub(crate) struct SeqWarningWalk {
 /// next file (#3002). A single already-concatenated buffer passes `&[]`.
 ///
 /// `value_cap` is [`SeqWarningWalk::value_cap`], from the matching raw-byte
-/// walk over the same stream (#2998): applied as a post-hoc truncation
-/// rather than a live stop, since it is a *count*, not an offset into
-/// `bytes` -- see that field's docs for why a count is what the two walks
-/// can agree on. `None` runs this function exactly as before the drop rule
-/// existed.
+/// walk over the same stream (#2998): a *count*, not an offset into `bytes`
+/// -- see that field's docs for why a count is what the two walks can agree
+/// on. Passed to [`Reader::run`] as its own early-stop, so the value past
+/// the drop point is never parsed in the first place, not parsed and then
+/// discarded; the trailing `truncate` stays as the correctness guarantee
+/// (it is what actually enforces the cap; the early stop is purely the
+/// optimization) rather than the only enforcement. `None` runs this
+/// function exactly as before the drop rule existed.
 pub(crate) fn value_ranges(
     bytes: &[u8],
     boundaries: &[usize],
@@ -331,6 +344,7 @@ pub(crate) fn value_ranges(
     reader.run(
         bytes.iter().copied().enumerate().skip(bom.consumed),
         boundaries,
+        value_cap,
     );
     let mut values = reader.values;
     if let Some(cap) = value_cap {
@@ -582,7 +596,19 @@ impl<'a> Reader<'a> {
     /// boundary whose source yields no byte at all (an empty trailing file,
     /// or content eaten wholesale by the BOM prefix) still cost jq that
     /// refill, so its reset fires before the EOF branch instead.
-    fn run(&mut self, bytes: impl Iterator<Item = (usize, u8)>, boundaries: &[usize]) {
+    ///
+    /// `value_limit`, when given, stops the walk (skipping [`Reader::finish`]
+    /// too, exactly like the `stopped` early-return below) the moment
+    /// [`Reader::values`] reaches that length. [`value_ranges`] uses this to
+    /// avoid parsing the value #2998's drop rule is about to truncate away
+    /// anyway -- [`for_each_warning`] passes `None`, since its own diagnostics
+    /// need the whole stream scanned regardless of how many values complete.
+    fn run(
+        &mut self,
+        bytes: impl Iterator<Item = (usize, u8)>,
+        boundaries: &[usize],
+        value_limit: Option<usize>,
+    ) {
         let mut boundary = 0;
         let mut eof_offset = 0;
         for (offset, ch) in bytes {
@@ -636,6 +662,9 @@ impl<'a> Reader<'a> {
                 // jq's stream ends *here*: `p->eof` is never set on this
                 // path, so nothing past this byte is ever scanned and no
                 // `at EOF` diagnostic follows (#2998).
+                return;
+            }
+            if value_limit.is_some_and(|limit| self.values.len() >= limit) {
                 return;
             }
         }

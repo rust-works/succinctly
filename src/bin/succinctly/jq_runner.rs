@@ -4400,8 +4400,13 @@ fn get_inputs(
     // (unaffected) or when nothing is dropped; see
     // `jq_seq_reader::SeqWarningWalk::value_cap`.
     let mut seq_value_cap = None;
-    let seq_warnings_apply =
-        args.seq && !args.raw_input && args.input_dsv.is_none() && !args.null_input;
+    // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
+    // just after it, and the `build_seq_values` gate further down -- one
+    // definition rather than three hand-copies of the same shape, so a
+    // future change to it can't desynchronize them (CLAUDE.md: "Duplicated
+    // predicates diverge silently").
+    let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
+    let seq_warnings_apply = seq_stream_shape && !args.null_input;
     if seq_warnings_apply {
         // A *malformed* BOM is the one case where "no RS byte anywhere"
         // does not imply #1525's template: it costs jq a `parser_reset`
@@ -4429,7 +4434,7 @@ fn get_inputs(
                 walk.last_parse_error_offset
             }
         };
-    } else if !args.slurp && args.seq && !args.raw_input && args.input_dsv.is_none() {
+    } else if !args.slurp && seq_stream_shape {
         // The only way this function still runs `build_seq_values` with
         // `seq_warnings_apply` false is `-n` forcing a real read: DSV and
         // `-R` are excluded from both gates identically. That combination
@@ -4617,7 +4622,7 @@ fn get_inputs(
     // against), so they also keep the per-file loop -- including when
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
-    if args.seq && !args.raw_input && args.input_dsv.is_none() {
+    if seq_stream_shape {
         values = build_seq_values(&raw_inputs, &mut locations, args.slurp, seq_value_cap);
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
