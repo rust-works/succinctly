@@ -329,7 +329,7 @@ fn to_owned_checked_at_depth<S: EvalSemantics, V: DocumentValue>(
         // accessor rather than the plain `as_f64()`.
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
-        Ok(OwnedValue::String(s.into_owned()))
+        Ok(OwnedValue::String(s.into_owned().into()))
     } else if let Some(reason) = value.string_decode_error() {
         Err(EvalError::decode_failure(reason))
     } else if value.is_error() {
@@ -581,7 +581,7 @@ fn to_owned_at_depth<S: EvalSemantics, V: DocumentValue>(
         // accessor rather than the plain `as_f64()`.
         Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
-        Ok(OwnedValue::String(s.into_owned()))
+        Ok(OwnedValue::String(s.into_owned().into()))
     } else if let Some(reason) = value.string_decode_error() {
         // The case this function used to swallow. `as_str` above answered
         // `None`, but the value *is* a string token -- its bytes just don't
@@ -1944,14 +1944,14 @@ pub(crate) fn key_owned_value<V: DocumentValue, C: DocumentCursor, S: EvalSemant
         return Ok(None);
     };
     if is_fallback || !key_spelling_may_retype(&display) || key_cursor.explicit_tag().is_some() {
-        return Ok(Some(OwnedValue::String(display.into_owned())));
+        return Ok(Some(OwnedValue::String(display.into_owned().into())));
     }
     let owned = to_owned_cursor::<S, _>(key_cursor)?;
     Ok(Some(
         if key_owned_value_spells_canonically(&owned, &display) {
             owned
         } else {
-            OwnedValue::String(display.into_owned())
+            OwnedValue::String(display.into_owned().into())
         },
     ))
 }
@@ -2672,7 +2672,8 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
         StandardJson::String(s) => OwnedValue::String(
             s.as_str()
                 .map_err(|e| EvalError::decode_failure(format!("{e}")))?
-                .to_string(),
+                .to_string()
+                .into(),
         ),
         StandardJson::Array(elements) => {
             let mut items = Vec::new();
@@ -2726,7 +2727,7 @@ fn format_result<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     match format_owned::<S>(format_type, owned, optional) {
-        Ok(s) => GenericResult::Owned(OwnedValue::String(s)),
+        Ok(s) => GenericResult::Owned(OwnedValue::String(s.into())),
         Err(e) => GenericResult::Error(e),
     }
 }
@@ -2771,7 +2772,7 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // hands back as a bare `Float`, so every one of those shapes is right
     // through the bridge too, and this arm is speed-only.
     if let Expr::Builtin(Builtin::ToString) = expr {
-        return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)));
+        return GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned).into()));
     }
 
     // #2889: `add`/`min`/`max` relocate one of their inputs rather than
@@ -12061,7 +12062,7 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
             let key_str = match &key {
                 ObjectKeySlot::Literal(s) => s.clone(),
                 ObjectKeySlot::Computed(key_owned) => match key_owned {
-                    OwnedValue::String(s) => s.clone(),
+                    OwnedValue::String(s) => s.to_string(),
                     _ => match yq_object_key_stringify::<S>(key_owned) {
                         Some(s) => s,
                         None => {
@@ -15915,7 +15916,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(s) = target.as_str() {
         let len = s.chars().count();
         let range = SliceBounds::from_literals(start, end).resolve(len);
-        return GenericResult::Owned(OwnedValue::String(slice_str(&s, range)));
+        return GenericResult::Owned(OwnedValue::String(slice_str(&s, range).into()));
     }
     if optional {
         GenericResult::None
@@ -16034,7 +16035,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
-            current_path.push(OwnedValue::String(key.into_owned()));
+            current_path.push(OwnedValue::String(key.into_owned().into()));
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone().into()));
             }
@@ -16919,7 +16920,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                 return Ok(());
             }
             out.push((
-                path.extend_from(OwnedValue::String(name.clone()), node),
+                path.extend_from(OwnedValue::String(name.clone().into()), node),
                 next,
             ));
             Ok(())
@@ -17054,7 +17055,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
                             return Err(fields.malformed_member_error());
                         };
                         out.push((
-                            path.extend_from(OwnedValue::String(key.into_owned()), node),
+                            path.extend_from(OwnedValue::String(key.into_owned().into()), node),
                             PathNode::At(field.value_cursor),
                         ));
                     }
@@ -17227,7 +17228,7 @@ fn owned_nav_children<S: EvalSemantics>(
         }
         Expr::Field(name) => values
             .into_iter()
-            .map(|v| (Some(OwnedValue::String(name.clone())), v))
+            .map(|v| (Some(OwnedValue::String(name.clone().into())), v))
             .collect(),
         Expr::Index { idx, key } => {
             let mut component = index_component_value(*idx, key.as_ref());
@@ -17249,9 +17250,10 @@ fn owned_nav_children<S: EvalSemantics>(
                 OwnedValue::Array(items) => (0..items.len())
                     .map(|i| OwnedValue::Int(i as i64))
                     .collect(),
-                OwnedValue::Object(map) => {
-                    map.keys().map(|k| OwnedValue::String(k.clone())).collect()
-                }
+                OwnedValue::Object(map) => map
+                    .keys()
+                    .map(|k| OwnedValue::String(k.clone().into()))
+                    .collect(),
                 _ => Vec::new(),
             };
             // The owned evaluator yields exactly one value per member; a
@@ -17614,14 +17616,14 @@ fn path_context_item_to_owned<V: DocumentValue, S: EvalSemantics>(
                     "the walk emits OneCursorValue only for a key node \
                      `key_node_spells` proved is untagged"
                 );
-                Ok(OwnedValue::String(s.into_owned()))
+                Ok(OwnedValue::String(s.into_owned().into()))
             }
             Some(s) => {
                 let owned = to_owned_with_cursor::<_, S>(&v, Some(c))?;
                 Ok(if key_owned_value_spells_canonically(&owned, &s) {
                     owned
                 } else {
-                    OwnedValue::String(s.into_owned())
+                    OwnedValue::String(s.into_owned().into())
                 })
             }
             // Unreachable through the gate above: a non-string token,
@@ -19122,7 +19124,7 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
 /// node reuses it rather than re-deriving a second rendering rule.
 fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     Some(match component {
-        OwnedValue::String(s) => Expr::Field(s.clone()),
+        OwnedValue::String(s) => Expr::Field(s.to_string()),
         OwnedValue::Int(i) => Expr::Index { idx: *i, key: None },
         OwnedValue::Float(f) => Expr::Index {
             idx: *f as i64,
@@ -19133,7 +19135,7 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
         OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Expr::Index { idx: *i, key: None },
         OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Expr::Index {
             idx: *f as i64,
-            key: Some(NumberKey::Literal(*f, text.to_string().into_boxed_str())),
+            key: Some(NumberKey::Literal(*f, text.clone())),
         },
         OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => {
             return None
@@ -19501,7 +19503,7 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     };
 
     let (keys, key_trailing) = match &entry.key {
-        ObjectKey::Literal(name) => (vec![OwnedValue::String(name.clone())], None),
+        ObjectKey::Literal(name) => (vec![OwnedValue::String(name.clone().into())], None),
         ObjectKey::Expr(key_expr) => {
             let mut keys = Vec::new();
             let trailing = push_generic_owned_values::<_, S>(
@@ -19525,7 +19527,7 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
             // #2508 (yq mode): same rule as `eval::build_object_entries`'s
             // own arm -- see `eval::yq_object_key_stringify`'s doc comment.
             let key_str = match &key {
-                OwnedValue::String(s) => s.clone(),
+                OwnedValue::String(s) => s.to_string(),
                 _ => match yq_object_key_stringify::<S>(&key) {
                     Some(s) => s,
                     None => {
@@ -19609,7 +19611,7 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
                 let Some(key) = key_display_string(&field.key) else {
                     return Err(fields.malformed_member_error());
                 };
-                let key = OwnedValue::String(key.into_owned());
+                let key = OwnedValue::String(key.into_owned().into());
                 return Ok(Some(if is_value {
                     CursorSlot::Value {
                         key,
@@ -21870,12 +21872,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             let anchor = cursor
                 .and_then(|c| c.anchor().map(str::to_string))
                 .unwrap_or_default();
-            GenericResult::Owned(OwnedValue::String(anchor))
+            GenericResult::Owned(OwnedValue::String(anchor.into()))
         }
 
         Builtin::Style => {
             let style = cursor.map_or("", |c| c.style());
-            GenericResult::Owned(OwnedValue::String(style.to_string()))
+            GenericResult::Owned(OwnedValue::String(style.to_string().into()))
         }
 
         // The primary (first) entry keeps the strict, UTF-8-checked path
@@ -21897,9 +21899,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     joined.push('\n');
                     joined.push_str(&extra);
                 }
-                GenericResult::Owned(OwnedValue::String(joined))
+                GenericResult::Owned(OwnedValue::String(joined.into()))
             }
-            None => GenericResult::Owned(OwnedValue::String(String::new())),
+            None => GenericResult::Owned(OwnedValue::String(String::new().into())),
         },
 
         // #798: the standalone comment lines above/below this node,
@@ -21913,12 +21915,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::HeadComment => GenericResult::Owned(OwnedValue::String(
             cursor
                 .map(|c| c.head_comment().join("\n"))
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
         )),
         Builtin::FootComment => GenericResult::Owned(OwnedValue::String(
             cursor
                 .map(|c| c.foot_comment().join("\n"))
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
         )),
 
         Builtin::Select(cond) => {
@@ -22202,7 +22206,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // function, so the two stay consistent with each other (real yq's
         // own `type` is a plain alias of `tag`).
         Builtin::Type if S::TAG == EvalTag::Yq => {
-            GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor)))
+            GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor).into()))
         }
         Builtin::Type => {
             // #3035: a malformed keyword token (`nullx`, `truex`,
@@ -22222,7 +22226,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 return GenericResult::Error(error);
             }
             let type_name = tagged_type_name(&value, cursor);
-            GenericResult::Owned(OwnedValue::String(type_name.to_string()))
+            GenericResult::Owned(OwnedValue::String(type_name.to_string().into()))
         }
 
         // #2516: native cursor-aware arm, so `tag` sees the real explicit
@@ -22231,7 +22235,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // fallback below, which reindexes to JSON and loses cursor/tag
         // info entirely) is what left `tag` wrong for a custom `!mytag` in
         // the first place. See `yq_type_tag`'s own doc comment.
-        Builtin::Tag => GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor))),
+        Builtin::Tag => {
+            GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor).into()))
+        }
 
         Builtin::Length => {
             if value.is_null() {
@@ -23196,7 +23202,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // reachable defensive-consistency class as the rest of this
             // lineage.
             let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
-            GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
+            GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned).into()))
         }
 
         Builtin::ToNumber => {
@@ -25296,7 +25302,7 @@ fn owned_value_to_expr_literal(v: &OwnedValue) -> Option<Literal> {
         OwnedValue::Float(f) => Some(Literal::Float(*f)),
         OwnedValue::String(s) => Some(Literal::String(s.clone())),
         OwnedValue::NumberLiteral(repr, text) => {
-            Some(Literal::NumberLiteral(*repr, text.to_string()))
+            Some(Literal::NumberLiteral(*repr, text.to_string().into()))
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => None,
     }
@@ -25573,7 +25579,7 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
                         crate::jq::eval::compare_values::<S>(item, output)
                             == core::cmp::Ordering::Equal
                     })
-                    .map(|(k, _)| OwnedValue::String(k.clone())),
+                    .map(|(k, _)| OwnedValue::String(k.clone().into())),
                 _ => None,
             };
             component.map(|component| id.child(&parent, component))
@@ -25940,11 +25946,13 @@ fn map_family_members(
                 .enumerate()
                 .map(|(i, (k, v))| match family {
                     MapFamily::WithEntries => {
-                        let key = typed_keys
-                            .map_or_else(|| OwnedValue::String(k.clone()), |keys| keys[i].clone());
+                        let key = typed_keys.map_or_else(
+                            || OwnedValue::String(k.clone().into()),
+                            |keys| keys[i].clone(),
+                        );
                         (OwnedValue::Int(i as i64), map_family_entry(key, v.clone()))
                     }
-                    _ => (OwnedValue::String(k.clone()), v.clone()),
+                    _ => (OwnedValue::String(k.clone().into()), v.clone()),
                 })
                 .collect()
         }
@@ -27706,8 +27714,8 @@ mod tests {
         let corpus: Vec<OwnedValue> = vec![
             OwnedValue::Null,
             OwnedValue::Bool(true),
-            OwnedValue::String(String::new()),
-            OwnedValue::String("a \" b \\ c \n \u{1f600} \u{7f}".to_string()),
+            OwnedValue::String(String::new().into()),
+            OwnedValue::String("a \" b \\ c \n \u{1f600} \u{7f}".to_string().into()),
             OwnedValue::from_number_literal::<JqSemantics>("1"),
             OwnedValue::from_number_literal::<JqSemantics>("-0"),
             OwnedValue::from_number_literal::<JqSemantics>("3.5"),
@@ -27725,7 +27733,7 @@ mod tests {
             OwnedValue::Array(
                 vec![
                     OwnedValue::from_number_literal::<YqSemantics>("1"),
-                    OwnedValue::String("x".to_string()),
+                    OwnedValue::String("x".to_string().into()),
                 ]
                 .into(),
             ),
@@ -27783,7 +27791,7 @@ mod tests {
             &OwnedValue::Array(
                 vec![
                     OwnedValue::from_number_literal::<YqSemantics>("1"),
-                    OwnedValue::String("x".to_string()),
+                    OwnedValue::String("x".to_string().into()),
                 ]
                 .into(),
             ),
@@ -27801,7 +27809,10 @@ mod tests {
             &OwnedValue::Object(
                 IndexMap::from([
                     ("count".to_string(), OwnedValue::Int(3)),
-                    ("name".to_string(), OwnedValue::String("x".to_string())),
+                    (
+                        "name".to_string(),
+                        OwnedValue::String("x".to_string().into()),
+                    ),
                 ])
                 .into(),
             ),
@@ -28357,7 +28368,7 @@ mod tests {
                     Expr::Builtin(Builtin::Length),
                 ])),
                 catch: Some(Box::new(Expr::Literal(Literal::String(
-                    "caught".to_string(),
+                    "caught".to_string().into(),
                 )))),
             },
             value,
@@ -28534,7 +28545,10 @@ mod tests {
         let OwnedValue::Object(map) = owned else {
             panic!("expected an object");
         };
-        assert_eq!(map.get("a"), Some(&OwnedValue::String("x".to_string())));
+        assert_eq!(
+            map.get("a"),
+            Some(&OwnedValue::String("x".to_string().into()))
+        );
     }
     use crate::jq::parse;
     use crate::json::JsonIndex;
@@ -28625,7 +28639,7 @@ mod tests {
             OwnedValue::Object(map) => {
                 assert_eq!(
                     map.get("name"),
-                    Some(&OwnedValue::String("Alice".to_string()))
+                    Some(&OwnedValue::String("Alice".to_string().into()))
                 );
                 assert_eq!(map.get("age"), Some(&OwnedValue::Int(30)));
             }
@@ -28643,7 +28657,7 @@ mod tests {
         let result = eval(&Expr::Field("name".to_string()), value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("Alice".to_string()));
+        assert_eq!(owned, OwnedValue::String("Alice".to_string().into()));
     }
 
     #[test]
@@ -29062,7 +29076,7 @@ mod tests {
         let result = eval(&Expr::Builtin(Builtin::Type), value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("object".to_string()));
+        assert_eq!(owned, OwnedValue::String("object".to_string().into()));
     }
 
     #[test]
@@ -29081,7 +29095,7 @@ mod tests {
 
         assert_eq!(
             owned,
-            OwnedValue::String("1.7976931348623157e+308".to_string())
+            OwnedValue::String("1.7976931348623157e+308".to_string().into())
         );
     }
 
@@ -29108,7 +29122,7 @@ mod tests {
 
         assert_eq!(
             owned,
-            OwnedValue::String("1.7976931348623157e%2B308".to_string())
+            OwnedValue::String("1.7976931348623157e%2B308".to_string().into())
         );
     }
 
@@ -29128,7 +29142,7 @@ mod tests {
 
         assert_eq!(
             owned,
-            OwnedValue::String("-1.7976931348623157e%2B308".to_string())
+            OwnedValue::String("-1.7976931348623157e%2B308".to_string().into())
         );
     }
 
@@ -29159,8 +29173,8 @@ mod tests {
             OwnedValue::Array(keys) => {
                 assert_eq!(keys.len(), 2);
                 // Keys are in document order
-                assert_eq!(keys[0], OwnedValue::String("b".to_string()));
-                assert_eq!(keys[1], OwnedValue::String("a".to_string()));
+                assert_eq!(keys[0], OwnedValue::String("b".to_string().into()));
+                assert_eq!(keys[1], OwnedValue::String("a".to_string().into()));
             }
             _ => panic!("Expected array"),
         }
@@ -29211,9 +29225,9 @@ mod tests {
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("b".to_string()),
-                OwnedValue::String("a".to_string()),
-                OwnedValue::String("c".to_string()),
+                OwnedValue::String("b".to_string().into()),
+                OwnedValue::String("a".to_string().into()),
+                OwnedValue::String("c".to_string().into()),
             ]
         );
     }
@@ -29246,7 +29260,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("b".to_string())
+            OwnedValue::String("b".to_string().into())
         );
 
         let expr = crate::jq::parse("keys_unsorted | .[-1]").unwrap();
@@ -29255,7 +29269,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
 
         // Out of bounds is `null`, never an error (#307), matching plain
@@ -29283,7 +29297,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("b".to_string())
+            OwnedValue::String("b".to_string().into())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
@@ -29292,7 +29306,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
     }
 
@@ -29337,9 +29351,9 @@ mod tests {
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("B".to_string()),
-                OwnedValue::String("A".to_string()),
-                OwnedValue::String("C".to_string()),
+                OwnedValue::String("B".to_string().into()),
+                OwnedValue::String("A".to_string().into()),
+                OwnedValue::String("C".to_string().into()),
             ]
         );
 
@@ -29349,7 +29363,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("B".to_string())
+            OwnedValue::String("B".to_string().into())
         );
     }
 
@@ -29372,9 +29386,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("B".to_string()),
-                    OwnedValue::String("A".to_string()),
-                    OwnedValue::String("C".to_string()),
+                    OwnedValue::String("B".to_string().into()),
+                    OwnedValue::String("A".to_string().into()),
+                    OwnedValue::String("C".to_string().into()),
                 ]
                 .into()
             )
@@ -29392,9 +29406,9 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -29433,7 +29447,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("k9999".to_string())
+            OwnedValue::String("k9999".to_string().into())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
@@ -29442,7 +29456,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("k9999".to_string())
+            OwnedValue::String("k9999".to_string().into())
         );
     }
 
@@ -29516,9 +29530,9 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -29530,9 +29544,9 @@ mod tests {
                 .collect_owned::<JqSemantics>()
                 .unwrap(),
             vec![
-                OwnedValue::String("a".to_string()),
-                OwnedValue::String("b".to_string()),
-                OwnedValue::String("c".to_string()),
+                OwnedValue::String("a".to_string().into()),
+                OwnedValue::String("b".to_string().into()),
+                OwnedValue::String("c".to_string().into()),
             ]
         );
 
@@ -29542,7 +29556,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("a".to_string())
+            OwnedValue::String("a".to_string().into())
         );
 
         let expr = crate::jq::parse("keys | .[-1]").unwrap();
@@ -29551,7 +29565,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
 
         let expr = crate::jq::parse("keys | first").unwrap();
@@ -29560,7 +29574,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("a".to_string())
+            OwnedValue::String("a".to_string().into())
         );
 
         let expr = crate::jq::parse("keys | last").unwrap();
@@ -29569,7 +29583,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
     }
 
@@ -29594,9 +29608,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("A".to_string()),
-                    OwnedValue::String("B".to_string()),
-                    OwnedValue::String("C".to_string()),
+                    OwnedValue::String("A".to_string().into()),
+                    OwnedValue::String("B".to_string().into()),
+                    OwnedValue::String("C".to_string().into()),
                 ]
                 .into()
             )
@@ -29610,9 +29624,9 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -29655,7 +29669,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String(expected_keys[0].clone())
+            OwnedValue::String(expected_keys[0].clone().into())
         );
     }
     #[test]
@@ -30147,9 +30161,9 @@ mod tests {
                 .collect_owned::<JqSemantics>()
                 .unwrap(),
             vec![
-                OwnedValue::String("B".to_string()),
-                OwnedValue::String("A".to_string()),
-                OwnedValue::String("C".to_string()),
+                OwnedValue::String("B".to_string().into()),
+                OwnedValue::String("A".to_string().into()),
+                OwnedValue::String("C".to_string().into()),
             ]
         );
 
@@ -30159,7 +30173,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("B".to_string())
+            OwnedValue::String("B".to_string().into())
         );
 
         let expr = crate::jq::parse("map(ascii_upcase) | .[0]").unwrap();
@@ -30168,7 +30182,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("B".to_string())
+            OwnedValue::String("B".to_string().into())
         );
 
         // `.[2]`/`last` intentionally fall to `materialize_atomic` +
@@ -30180,7 +30194,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("C".to_string())
+            OwnedValue::String("C".to_string().into())
         );
 
         let expr = crate::jq::parse("map(ascii_upcase) | last").unwrap();
@@ -30189,7 +30203,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("C".to_string())
+            OwnedValue::String("C".to_string().into())
         );
     }
 
@@ -30286,7 +30300,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("z".to_string())
+            OwnedValue::String("z".to_string().into())
         );
 
         // `LazyKeys { sorted: true }` (`keys`): lexicographic order is
@@ -30307,7 +30321,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("a".to_string())
+            OwnedValue::String("a".to_string().into())
         );
     }
 
@@ -30329,9 +30343,9 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("BB".to_string()),
-                    OwnedValue::String("A".to_string()),
-                    OwnedValue::String("CCC".to_string()),
+                    OwnedValue::String("BB".to_string().into()),
+                    OwnedValue::String("A".to_string().into()),
+                    OwnedValue::String("CCC".to_string().into()),
                 ]
                 .into()
             )
@@ -30462,7 +30476,7 @@ mod tests {
         let result = eval(&expr, value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("Alice".to_string()));
+        assert_eq!(owned, OwnedValue::String("Alice".to_string().into()));
     }
 
     // ========== YAML Tests ==========
@@ -30488,7 +30502,7 @@ mod tests {
             OwnedValue::Object(map) => {
                 assert_eq!(
                     map.get("name"),
-                    Some(&OwnedValue::String("Alice".to_string()))
+                    Some(&OwnedValue::String("Alice".to_string().into()))
                 );
                 assert_eq!(map.get("age"), Some(&OwnedValue::Int(30)));
             }
@@ -30525,8 +30539,8 @@ mod tests {
         assert_eq!(
             single_field.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("string".to_string()),
-                OwnedValue::String("string".to_string()),
+                OwnedValue::String("string".to_string().into()),
+                OwnedValue::String("string".to_string().into()),
             ]
         );
 
@@ -30537,10 +30551,10 @@ mod tests {
         assert_eq!(
             iterate_fields.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("string".to_string()),
-                OwnedValue::String("number".to_string()),
-                OwnedValue::String("string".to_string()),
-                OwnedValue::String("number".to_string()),
+                OwnedValue::String("string".to_string().into()),
+                OwnedValue::String("number".to_string().into()),
+                OwnedValue::String("string".to_string().into()),
+                OwnedValue::String("number".to_string().into()),
             ]
         );
     }
@@ -30604,7 +30618,7 @@ mod tests {
         let result = eval(&Expr::Field("name".to_string()), value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("Alice".to_string()));
+        assert_eq!(owned, OwnedValue::String("Alice".to_string().into()));
     }
 
     #[test]
@@ -30635,7 +30649,10 @@ mod tests {
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
-            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert(
+                "key".to_string(),
+                OwnedValue::String("a".to_string().into()),
+            );
             entry.insert("value".to_string(), OwnedValue::Int(v));
             OwnedValue::Object(entry.into())
         };
@@ -30672,7 +30689,10 @@ mod tests {
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
         let mut entry = IndexMap::new();
-        entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+        entry.insert(
+            "key".to_string(),
+            OwnedValue::String("a".to_string().into()),
+        );
         entry.insert("value".to_string(), OwnedValue::Int(2));
         assert_eq!(
             owned,
@@ -30709,7 +30729,10 @@ mod tests {
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
-            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert(
+                "key".to_string(),
+                OwnedValue::String("a".to_string().into()),
+            );
             entry.insert("value".to_string(), OwnedValue::Int(v));
             OwnedValue::Object(entry.into())
         };
@@ -30752,7 +30775,10 @@ mod tests {
 
         let expected_entry = |v: i64| {
             let mut entry = IndexMap::new();
-            entry.insert("key".to_string(), OwnedValue::String("a".to_string()));
+            entry.insert(
+                "key".to_string(),
+                OwnedValue::String("a".to_string().into()),
+            );
             entry.insert("value".to_string(), OwnedValue::Int(v));
             OwnedValue::Object(entry.into())
         };
@@ -30777,7 +30803,7 @@ mod tests {
 
         let entry = |k: &str, v: i64| {
             let mut entry = IndexMap::new();
-            entry.insert("key".to_string(), OwnedValue::String(k.to_string()));
+            entry.insert("key".to_string(), OwnedValue::String(k.to_string().into()));
             entry.insert("value".to_string(), OwnedValue::Int(v));
             OwnedValue::Object(entry.into())
         };
@@ -30809,7 +30835,10 @@ mod tests {
         let expected_entry = |i: i64, v: &str| {
             let mut entry = IndexMap::new();
             entry.insert("key".to_string(), OwnedValue::Int(i));
-            entry.insert("value".to_string(), OwnedValue::String(v.to_string()));
+            entry.insert(
+                "value".to_string(),
+                OwnedValue::String(v.to_string().into()),
+            );
             OwnedValue::Object(entry.into())
         };
         assert_eq!(
@@ -31016,7 +31045,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String("x".to_string())
+            OwnedValue::String("x".to_string().into())
         );
     }
 
@@ -31035,7 +31064,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31054,14 +31083,14 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String("flow".to_string())
+            OwnedValue::String("flow".to_string().into())
         );
 
         let expr = crate::jq::parse(".b | style").unwrap();
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String("double".to_string())
+            OwnedValue::String("double".to_string().into())
         );
     }
 
@@ -31082,13 +31111,13 @@ mod tests {
         let result = eval(&Expr::Builtin(Builtin::Anchor), value.clone());
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
 
         let result = eval(&Expr::Builtin(Builtin::Style), value);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31110,7 +31139,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31126,7 +31155,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31169,7 +31198,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String("keep this".to_string())
+            OwnedValue::String("keep this".to_string().into())
         );
     }
 
@@ -31188,7 +31217,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31228,7 +31257,7 @@ mod tests {
         let result = eval_with_cursor(&expr, doc_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String("#keep this".to_string())
+            OwnedValue::String("#keep this".to_string().into())
         );
     }
 
@@ -31248,7 +31277,7 @@ mod tests {
         // line_comment falls back to "" even though the source has one.
         let result = eval(&Expr::Builtin(Builtin::LineComment), value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
-        assert_eq!(owned, OwnedValue::String(String::new()));
+        assert_eq!(owned, OwnedValue::String(String::new().into()));
     }
 
     #[test]
@@ -31265,7 +31294,7 @@ mod tests {
         let result = eval_with_cursor(&Expr::Builtin(Builtin::LineComment), field_cursor);
         assert_eq!(
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
-            OwnedValue::String(String::new())
+            OwnedValue::String(String::new().into())
         );
     }
 
@@ -31495,9 +31524,9 @@ mod tests {
                 .collect_owned::<JqSemantics>()
                 .unwrap(),
             vec![
-                OwnedValue::String("b".to_string()),
-                OwnedValue::String("a".to_string()),
-                OwnedValue::String("c".to_string()),
+                OwnedValue::String("b".to_string().into()),
+                OwnedValue::String("a".to_string().into()),
+                OwnedValue::String("c".to_string().into()),
             ]
         );
 
@@ -31507,7 +31536,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("b".to_string())
+            OwnedValue::String("b".to_string().into())
         );
 
         let expr = crate::jq::parse("keys_unsorted | first").unwrap();
@@ -31516,7 +31545,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("b".to_string())
+            OwnedValue::String("b".to_string().into())
         );
 
         let expr = crate::jq::parse("keys_unsorted | last").unwrap();
@@ -31525,7 +31554,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
     }
 
@@ -31562,9 +31591,9 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -31576,7 +31605,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("a".to_string())
+            OwnedValue::String("a".to_string().into())
         );
 
         let expr = crate::jq::parse("keys | last").unwrap();
@@ -31585,7 +31614,7 @@ mod tests {
                 .into_owned::<JqSemantics>()
                 .unwrap()
                 .unwrap(),
-            OwnedValue::String("c".to_string())
+            OwnedValue::String("c".to_string().into())
         );
     }
 
@@ -31770,9 +31799,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("B".to_string()),
-                    OwnedValue::String("A".to_string()),
-                    OwnedValue::String("C".to_string()),
+                    OwnedValue::String("B".to_string().into()),
+                    OwnedValue::String("A".to_string().into()),
+                    OwnedValue::String("C".to_string().into()),
                 ]
                 .into()
             )
@@ -31824,9 +31853,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("B".to_string()),
-                    OwnedValue::String("A".to_string()),
-                    OwnedValue::String("C".to_string()),
+                    OwnedValue::String("B".to_string().into()),
+                    OwnedValue::String("A".to_string().into()),
+                    OwnedValue::String("C".to_string().into()),
                 ]
                 .into()
             )
@@ -31943,7 +31972,7 @@ mod tests {
         let result = eval(&expr, value);
         let owned = result.into_owned::<JqSemantics>().unwrap().unwrap();
 
-        assert_eq!(owned, OwnedValue::String("Alice".to_string()));
+        assert_eq!(owned, OwnedValue::String("Alice".to_string().into()));
     }
 
     #[test]
@@ -32600,8 +32629,8 @@ mod tests {
             owned[9],
             Some(OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
                 ]
                 .into()
             ))
@@ -32610,8 +32639,8 @@ mod tests {
             owned[10],
             Some(OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
                 ]
                 .into()
             ))
@@ -32893,7 +32922,7 @@ mod tests {
             Expr::Iterate,
             Expr::IndexExpr {
                 target: Box::new(Expr::Identity),
-                key: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+                key: Box::new(Expr::Literal(Literal::String("a".to_string().into()))),
             },
         ]);
 
@@ -33964,7 +33993,7 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
-            vec![OwnedValue::String("el".to_string())]
+            vec![OwnedValue::String("el".to_string().into())]
         );
     }
 
@@ -34312,7 +34341,7 @@ mod tests {
         let expr = crate::jq::parse(r#"(.arr[0],.arr[1])[("bad",5)]"#).unwrap();
         match eval_with_cursor(&expr, index.root(json)) {
             GenericResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string().into())]);
                 assert!(e.is_decode_failure(), "{e:?}");
                 assert!(e.message.contains("invalid UTF-8"), "{e:?}");
             }
@@ -34357,7 +34386,7 @@ mod tests {
         let expr = crate::jq::parse(r#".arr[][("bad","missing")]"#).unwrap();
         match eval_with_cursor(&expr, index.root(json)) {
             GenericResult::Partial(vs, Control::Error(e)) => {
-                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string().into())]);
                 assert!(e.is_decode_failure(), "{e:?}");
                 assert!(e.message.contains("invalid UTF-8"), "{e:?}");
             }
@@ -34400,7 +34429,11 @@ mod tests {
             let expr = crate::jq::parse(expr_str).unwrap();
             match eval_with_cursor(&expr, index.root(json)) {
                 GenericResult::Partial(vs, Control::Error(e)) => {
-                    assert_eq!(vs, vec![OwnedValue::String("ok".to_string())], "{expr_str}");
+                    assert_eq!(
+                        vs,
+                        vec![OwnedValue::String("ok".to_string().into())],
+                        "{expr_str}"
+                    );
                     assert!(e.is_decode_failure(), "{expr_str}: {e:?}");
                 }
                 other => {
@@ -35133,11 +35166,11 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::array_from(vec![OwnedValue::String("a".to_string())]),
+                    OwnedValue::array_from(vec![OwnedValue::String("a".to_string().into())]),
                     OwnedValue::Array(
                         vec![
-                            OwnedValue::String("bb".to_string()),
-                            OwnedValue::String("c".to_string()),
+                            OwnedValue::String("bb".to_string().into()),
+                            OwnedValue::String("c".to_string().into()),
                         ]
                         .into()
                     ),
@@ -35227,11 +35260,11 @@ mod tests {
                 .unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::array_from(vec![OwnedValue::String("A".to_string())]),
+                    OwnedValue::array_from(vec![OwnedValue::String("A".to_string().into())]),
                     OwnedValue::Array(
                         vec![
-                            OwnedValue::String("BB".to_string()),
-                            OwnedValue::String("C".to_string()),
+                            OwnedValue::String("BB".to_string().into()),
+                            OwnedValue::String("C".to_string().into()),
                         ]
                         .into()
                     ),
@@ -35684,7 +35717,7 @@ mod tests {
         );
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
-            vec![OwnedValue::String("a".to_string())]
+            vec![OwnedValue::String("a".to_string().into())]
         );
     }
 
@@ -35930,9 +35963,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -35953,8 +35986,8 @@ mod tests {
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("b".to_string()),
-                OwnedValue::String("a".to_string()),
+                OwnedValue::String("b".to_string().into()),
+                OwnedValue::String("a".to_string().into()),
             ]
         );
     }
@@ -35993,9 +36026,9 @@ mod tests {
         assert_eq!(
             result.collect_owned::<JqSemantics>().unwrap(),
             vec![
-                OwnedValue::String("x".to_string()),
-                OwnedValue::String("xx".to_string()),
-                OwnedValue::String("xxx".to_string()),
+                OwnedValue::String("x".to_string().into()),
+                OwnedValue::String("xx".to_string().into()),
+                OwnedValue::String("xxx".to_string().into()),
             ]
         );
     }
@@ -36017,9 +36050,9 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("b".to_string()),
-                    OwnedValue::String("a".to_string()),
-                    OwnedValue::String("c".to_string()),
+                    OwnedValue::String("b".to_string().into()),
+                    OwnedValue::String("a".to_string().into()),
+                    OwnedValue::String("c".to_string().into()),
                 ]
                 .into()
             )
@@ -36629,8 +36662,8 @@ mod tests {
             result.into_owned::<JqSemantics>().unwrap().unwrap(),
             OwnedValue::Array(
                 vec![
-                    OwnedValue::String("hello".to_string()),
-                    OwnedValue::String("hello".to_string()),
+                    OwnedValue::String("hello".to_string().into()),
+                    OwnedValue::String("hello".to_string().into()),
                 ]
                 .into()
             )
@@ -36753,7 +36786,10 @@ mod tests {
         let result = eval_with_cursor(&crate::jq::parse("keys | .[]").unwrap(), cursor);
         match result {
             GenericResult::ManyOwned(vs) => {
-                assert_eq!(vs, vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())]);
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string().into())]
+                );
             }
             other => panic!("expected ManyOwned([..]): {other:?}"),
         }
@@ -38120,8 +38156,14 @@ mod tests {
         // A position two components deep, both of them absent, so `key`
         // and `path` resolve to different constants.
         let trail = PathContextTrail::root()
-            .extend_from(OwnedValue::String("a".to_string()), &PathNode::At(root))
-            .extend_from(OwnedValue::String("x".to_string()), &PathNode::Absent);
+            .extend_from(
+                OwnedValue::String("a".to_string().into()),
+                &PathNode::At(root),
+            )
+            .extend_from(
+                OwnedValue::String("x".to_string().into()),
+                &PathNode::Absent,
+            );
         let pos: PathContextPos<crate::json::StandardJson<'_, Vec<u64>>> = PathContextPos {
             node: PathNode::Absent,
             trail,
@@ -38225,8 +38267,8 @@ mod tests {
     /// exactly the pre-#2522 bug.
     #[test]
     fn update_target_resolution_clears_path_context_2522() {
-        let key = OwnedValue::String("b".to_string());
-        let path = vec![OwnedValue::String("a".to_string()), key.clone()];
+        let key = OwnedValue::String("b".to_string().into());
+        let path = vec![OwnedValue::String("a".to_string().into()), key.clone()];
         let ancestor = OwnedValue::Int(7);
         let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
             Ok((n <= path.len()).then(|| ancestor.clone()))
@@ -39291,7 +39333,11 @@ mod tests {
         assert_eq!(
             out,
             vec![OwnedValue::Array(
-                vec![OwnedValue::String("arr".to_string()), slice_component(0, 2),].into()
+                vec![
+                    OwnedValue::String("arr".to_string().into()),
+                    slice_component(0, 2),
+                ]
+                .into()
             )]
         );
         assert!(control.is_none(), "control: {control:?}");
@@ -39355,7 +39401,11 @@ mod tests {
         assert_eq!(
             out,
             vec![OwnedValue::Array(
-                vec![OwnedValue::String("arr".to_string()), slice_component(0, 2),].into()
+                vec![
+                    OwnedValue::String("arr".to_string().into()),
+                    slice_component(0, 2),
+                ]
+                .into()
             )],
             "dynamic-bound slice off an attached value"
         );

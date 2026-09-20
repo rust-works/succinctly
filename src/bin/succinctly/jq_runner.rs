@@ -2348,7 +2348,7 @@ impl MalformedJsonError {
         let (message, kind) = match err.value {
             EvalErrorPayload::Kind(kind) => (err.message, Some(kind)),
             EvalErrorPayload::None => (err.message, None),
-            EvalErrorPayload::Value(OwnedValue::String(text)) => (text, None), // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
+            EvalErrorPayload::Value(OwnedValue::String(text)) => (text.into_string(), None), // omni-dev: coverage tolerate-line reason="unreachable by construction: every error this wrapper receives today is a decode or nesting-depth failure the evaluator raised itself, never error(v); kept so a future one is rendered rather than dropped (#2999)"
             EvalErrorPayload::Value(value) => (value.to_json(), None), // omni-dev: coverage tolerate-line reason="see the arm above (#2999)"
         };
         Self { message, kind }
@@ -3396,7 +3396,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         .fields()
                         .map(|field| {
                             let field_str = strip_quotes_and_decode(field);
-                            OwnedValue::String(field_str)
+                            OwnedValue::String(field_str.into())
                         })
                         .collect();
 
@@ -4118,7 +4118,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
         if let [name, value] = chunk {
             context
                 .named
-                .insert(name.clone(), OwnedValue::String(value.clone()));
+                .insert(name.clone(), OwnedValue::String(value.clone().into()));
         }
     }
 
@@ -4172,13 +4172,15 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             let contents = read_arg_file("rawfile", name, file)?;
             context
                 .named
-                .insert(name.clone(), OwnedValue::String(contents));
+                .insert(name.clone(), OwnedValue::String(contents.into()));
         }
     }
 
     // Process --args: values become string positional args
     for arg in &args.args {
-        context.positional.push(OwnedValue::String(arg.clone()));
+        context
+            .positional
+            .push(OwnedValue::String(arg.clone().into()));
     }
 
     // Process --jsonargs: values become JSON positional args. A bad value is
@@ -4567,7 +4569,7 @@ fn get_inputs(
             None => InputLocation::unknown(),
         };
         return Ok(Ok((
-            vec![OwnedValue::String(combined)],
+            vec![OwnedValue::String(combined.into())],
             InputLocations::single(at),
             None,
         )));
@@ -5715,7 +5717,7 @@ fn build_raw_input_values(
     lines
         .into_iter()
         .map(|((content_start, content_end), _)| {
-            OwnedValue::String(combined[content_start..content_end].to_string())
+            OwnedValue::String(combined[content_start..content_end].to_string().into())
         })
         .collect()
 }
@@ -6098,7 +6100,7 @@ fn parse_dsv_input(s: &str, delimiter: char) -> Vec<OwnedValue> {
             .map(|field| {
                 // Strip quotes from quoted fields and decode the content
                 let field_str = strip_quotes_and_decode(field);
-                OwnedValue::String(field_str)
+                OwnedValue::String(field_str.into())
             })
             .collect();
         values.push(OwnedValue::array_from(fields));
@@ -6312,7 +6314,7 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
                 keys.sort();
             }
             Some(OwnedValue::Array(
-                keys.into_iter().map(OwnedValue::String).collect(),
+                keys.into_iter().map(OwnedValue::from).collect(),
             ))
         }
         GenericResult::LazyIndexRange(len) => Some(OwnedValue::Array(
@@ -6793,7 +6795,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             Ok(mut keys) => {
                 keys.sort();
                 to_jq_values(
-                    OwnedValue::Array(keys.into_iter().map(OwnedValue::String).collect()),
+                    OwnedValue::Array(keys.into_iter().map(OwnedValue::from).collect()),
                     at,
                     sink,
                 )
@@ -6984,7 +6986,7 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             JqValue::String(
                 s.as_str()
                     .map_err(|e| EvalError::decode_failure(format!("{e}")))?
-                    .to_string(),
+                    .into(),
             )
         }
         StandardJson::Array(elements) => {
@@ -9830,20 +9832,20 @@ mod tests {
             OwnedValue::Float(f64::INFINITY),
             OwnedValue::Float(f64::NEG_INFINITY),
             OwnedValue::Float(f64::NAN),
-            OwnedValue::String(String::new()),
-            OwnedValue::String("a".to_string()),
-            OwnedValue::String("caf\u{e9}".to_string()),
-            OwnedValue::String("\u{65e5}\u{672c}".to_string()),
+            OwnedValue::String(String::new().into()),
+            OwnedValue::String("a".to_string().into()),
+            OwnedValue::String("caf\u{e9}".to_string().into()),
+            OwnedValue::String("\u{65e5}\u{672c}".to_string().into()),
             // Astral plane: a surrogate pair once `-a` escapes it.
-            OwnedValue::String("\u{1f600}".to_string()),
-            OwnedValue::String("\u{7f}".to_string()),
+            OwnedValue::String("\u{1f600}".to_string().into()),
+            OwnedValue::String("\u{7f}".to_string().into()),
             // Drives `reject_raw_output0_nul` -- both writers must refuse
             // it identically under `--raw-output0`, not just print it the
             // same way.
-            OwnedValue::String("a\0b".to_string()),
+            OwnedValue::String("a\0b".to_string().into()),
             // Must stay a quoted string, never become a number.
-            OwnedValue::String("1e400".to_string()),
-            OwnedValue::String("\"\\/\u{8}\u{c}\n\r\t".to_string()),
+            OwnedValue::String("1e400".to_string().into()),
+            OwnedValue::String("\"\\/\u{8}\u{c}\n\r\t".to_string().into()),
             OwnedValue::array_from(vec![]),
             OwnedValue::object_from([]),
             OwnedValue::array_from(vec![OwnedValue::Null]),
@@ -9870,7 +9872,7 @@ mod tests {
         // Every C0 control on its own: the escape tables differ per control
         // and a single wrong byte here is a silent output change.
         for c in 0u8..0x20 {
-            out.push(OwnedValue::String((c as char).to_string()));
+            out.push(OwnedValue::String((c as char).to_string().into()));
         }
 
         for spelling in [

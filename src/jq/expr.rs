@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::rc::Rc;
 
-use super::value::{NumberRepr, OwnedValue};
+use super::value::{LiteralText, NumberRepr, OwnedValue, SharedString};
 
 /// A `def`'s own parameter, carrying whether it was written with a
 /// leading `$` (`def f($g): ...`) or bare (`def f(g): ...`).
@@ -2097,7 +2097,7 @@ pub enum NumberKey {
     /// [`Expr::Index`] and never reaches this type. Spelling that
     /// invariant into the field is what keeps [`Self::value`] total
     /// instead of carrying an arm nothing can reach.
-    Literal(f64, Box<str>),
+    Literal(f64, LiteralText),
 }
 
 /// The spelling a *slice* bound is reported as in a resolved path component.
@@ -2166,15 +2166,22 @@ pub enum Literal {
     /// `i64`/`f64::from_str`. `JqValue::from_literal` (`lazy.rs`)
     /// deliberately does *not* benefit -- see its own doc comment for why
     /// its laziness means reading `repr` here at all would be premature,
-    /// same shape as `OwnedValue::NumberLiteral(NumberRepr, Box<str>)`
+    /// same shape as `OwnedValue::NumberLiteral(NumberRepr, LiteralText)`
     /// already uses on the read side.
-    NumberLiteral(NumberRepr, String),
+    ///
+    /// The spelling is a [`LiteralText`] and the string literal below a
+    /// [`SharedString`] (#3182): evaluating this AST node clones the handle,
+    /// so every evaluation of *one* literal yields one storage -- jq's
+    /// constant pool, where `def f: 5; f as $x | f | path($x)` answers `[]`
+    /// because both `f`s load the same constant, while `5 as $x | 5 |
+    /// path($x)` refuses because two literals are two constants.
+    NumberLiteral(NumberRepr, LiteralText),
     /// Integer number
     Int(i64),
     /// Floating-point number
     Float(f64),
-    /// String literal
-    String(String),
+    /// String literal (see `NumberLiteral` for why it is shared)
+    String(SharedString),
 }
 
 impl Expr {
@@ -2402,7 +2409,7 @@ impl Literal {
     }
 
     /// Create a string literal.
-    pub fn string(s: impl Into<String>) -> Self {
+    pub fn string(s: impl Into<SharedString>) -> Self {
         Self::String(s.into())
     }
 
@@ -2435,7 +2442,7 @@ impl Literal {
         // magnitudes just become +/-infinity, never a parse failure).
         let repr = super::value::parse_i64_or_f64(&text)
             .expect("is_valid_number guarantees parse_i64_or_f64 succeeds");
-        Self::NumberLiteral(repr, text)
+        Self::NumberLiteral(repr, text.into())
     }
 }
 
@@ -2599,15 +2606,15 @@ mod tests {
     fn test_number_literal_carries_parsed_repr_1062() {
         assert_eq!(
             Literal::number_literal("1.500"),
-            Literal::NumberLiteral(NumberRepr::Float(1.5), "1.500".to_string())
+            Literal::NumberLiteral(NumberRepr::Float(1.5), "1.500".to_string().into())
         );
         assert_eq!(
             Literal::number_literal("42"),
-            Literal::NumberLiteral(NumberRepr::Int(42), "42".to_string())
+            Literal::NumberLiteral(NumberRepr::Int(42), "42".to_string().into())
         );
         assert_eq!(
             Literal::number_literal("1e2"),
-            Literal::NumberLiteral(NumberRepr::Float(100.0), "1e2".to_string())
+            Literal::NumberLiteral(NumberRepr::Float(100.0), "1e2".to_string().into())
         );
     }
 

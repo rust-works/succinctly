@@ -936,7 +936,7 @@ fn expected_comma_path(i: usize, j: usize, depth: usize) -> OwnedValue {
     let mut p = vec![
         OwnedValue::String("foo".into()),
         OwnedValue::Int(i as i64),
-        OwnedValue::String(format!("b{j}")),
+        OwnedValue::String(format!("b{j}").into()),
     ];
     p.extend(core::iter::repeat(OwnedValue::String("d".into())).take(depth));
     OwnedValue::array_from(p)

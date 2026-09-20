@@ -1242,7 +1242,7 @@ impl<'a> Parser<'a> {
         // identical check for document numbers, for the identical reason
         // (see its own doc comment).
         if crate::json::validate::is_valid_number(num_str.as_bytes()) {
-            Ok(Literal::NumberLiteral(repr, num_str.to_string()))
+            Ok(Literal::NumberLiteral(repr, num_str.to_string().into()))
         } else {
             Ok(match repr {
                 NumberRepr::Int(i) => Literal::int(i),
@@ -1362,7 +1362,7 @@ impl<'a> Parser<'a> {
 
         // If no interpolations, return a simple string literal
         if parts.is_empty() {
-            return Ok(Expr::Literal(Literal::String(current_literal)));
+            return Ok(Expr::Literal(Literal::String(current_literal.into())));
         }
 
         // Add final literal if any
@@ -1602,7 +1602,7 @@ impl<'a> Parser<'a> {
     fn fold_index_key(key: &Expr) -> Option<Expr> {
         match key {
             Expr::Paren(inner) => Self::fold_index_key(inner),
-            Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.clone())),
+            Expr::Literal(Literal::String(s)) => Some(Expr::Field(s.to_string())),
             Expr::Literal(Literal::Int(i)) => Some(Expr::Index { idx: *i, key: None }),
             // Every number written in filter source arrives as
             // `Literal::NumberLiteral` (#1035), so this one arm covers the
@@ -1639,7 +1639,7 @@ impl<'a> Parser<'a> {
                 {
                     Some(Expr::Index {
                         idx: f as i64,
-                        key: Some(NumberKey::Literal(f, text.as_str().into())),
+                        key: Some(NumberKey::Literal(f, text.clone())),
                     })
                 }
                 NumberRepr::Float(_) => None,
@@ -2262,7 +2262,7 @@ impl<'a> Parser<'a> {
                                 left: Box::new(Expr::Literal(Literal::Int(-1))),
                                 right: Box::new(Expr::Literal(Literal::NumberLiteral(
                                     stripped_repr,
-                                    text[1..].to_string(),
+                                    text[1..].to_string().into(),
                                 ))),
                             })
                         }
@@ -3387,7 +3387,9 @@ impl<'a> Parser<'a> {
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
                             match self.parse_string_or_interpolation()? {
-                                Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s),
+                                Expr::Literal(Literal::String(s)) => {
+                                    ObjectKey::Literal(s.into_string())
+                                }
                                 interpolated => {
                                     self.count_pattern_computed_key()?;
                                     ObjectKey::Expr(Box::new(interpolated))
@@ -8944,7 +8946,7 @@ mod tests {
             *right,
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Float(1.5),
-                "1.500".to_string()
+                "1.500".to_string().into()
             ))
         );
 
@@ -8955,7 +8957,7 @@ mod tests {
             *right,
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Float(100.0),
-                "1e2".to_string()
+                "1e2".to_string().into()
             ))
         );
     }
@@ -9014,7 +9016,7 @@ mod tests {
             split_literal("-9999999999999999999"),
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Float("9999999999999999999".parse::<f64>().unwrap()),
-                "9999999999999999999".to_string()
+                "9999999999999999999".to_string().into()
             ))
         );
 
@@ -9024,7 +9026,7 @@ mod tests {
             split_literal("-9223372036854775809"),
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Float("9223372036854775809".parse::<f64>().unwrap()),
-                "9223372036854775809".to_string()
+                "9223372036854775809".to_string().into()
             ))
         );
 
@@ -9035,7 +9037,7 @@ mod tests {
             split_literal("-9223372036854775808"),
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Float(9223372036854775808.0),
-                "9223372036854775808".to_string()
+                "9223372036854775808".to_string().into()
             ))
         );
 
@@ -9046,7 +9048,7 @@ mod tests {
             split_literal("-869389897822472004"),
             Expr::Literal(Literal::NumberLiteral(
                 NumberRepr::Int(869389897822472004),
-                "869389897822472004".to_string()
+                "869389897822472004".to_string().into()
             ))
         );
 

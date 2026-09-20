@@ -1524,7 +1524,7 @@ mod tests {
         let mut obj = IndexMap::new();
         obj.insert(
             "ké".to_string(),
-            OwnedValue::String("a\x08\u{85}é".to_string()),
+            OwnedValue::String("a\x08\u{85}é".to_string().into()),
         );
         let opts = JsonFormatOpts {
             indent: "",
@@ -1630,7 +1630,7 @@ mod tests {
     fn format_json_escape_table_follows_mode_not_preserve_2874() {
         // Backspace: jq's table has the `\b` short form, yq's spells it
         // `\u0008`.
-        let value = OwnedValue::String("a\u{8}b".to_string());
+        let value = OwnedValue::String("a\u{8}b".to_string().into());
         let opts = |convention| JsonFormatOpts {
             indent: "",
             sort_keys: false,
@@ -1714,7 +1714,7 @@ mod tests {
         let mut obj = IndexMap::new();
         obj.insert(
             "é".to_string(),
-            OwnedValue::array_from(vec![OwnedValue::String("ü".to_string())]),
+            OwnedValue::array_from(vec![OwnedValue::String("ü".to_string().into())]),
         );
         let value = OwnedValue::Object(obj.into());
         let opts = JsonFormatOpts {

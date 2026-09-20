@@ -36,7 +36,7 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(value: YamlValue<'_, W>) -> OwnedValue {
                 ".nan" | ".NaN" | ".NAN" => return OwnedValue::Float(f64::NAN),
                 _ => {}
             }
-            OwnedValue::String(str_value.into_owned())
+            OwnedValue::String(str_value.into_owned().into())
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();

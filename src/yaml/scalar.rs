@@ -201,7 +201,7 @@ impl ResolvedScalar {
                 // here instead, and needs the identical provenance record.
                 None => OwnedValue::from_document_float(f),
             },
-            Self::Str => OwnedValue::String(text.into_owned()),
+            Self::Str => OwnedValue::String(text.into_owned().into()),
         }
     }
 }

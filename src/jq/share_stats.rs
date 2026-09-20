@@ -53,6 +53,10 @@ pub enum Kind {
     ArrayUnwrap,
     /// A shared object map was consumed by value (`into_index_map`/`into_iter` cloned).
     ObjectUnwrap,
+    /// A shared string was written through (`DerefMut` -> `Rc::make_mut` cloned, #3182).
+    StringMakeMut,
+    /// A shared string was consumed by value (`into_string` cloned, #3182).
+    StringUnwrap,
 }
 
 impl Kind {
@@ -63,6 +67,8 @@ impl Kind {
             Self::ObjectMakeMut => "object make_mut",
             Self::ArrayUnwrap => "array unwrap",
             Self::ObjectUnwrap => "object unwrap",
+            Self::StringMakeMut => "string make_mut",
+            Self::StringUnwrap => "string unwrap",
         }
     }
 }
@@ -253,6 +259,8 @@ mod tests {
             Kind::ObjectMakeMut,
             Kind::ArrayUnwrap,
             Kind::ObjectUnwrap,
+            Kind::StringMakeMut,
+            Kind::StringUnwrap,
         ]
         .into_iter()
         .enumerate()
@@ -267,12 +275,14 @@ mod tests {
             );
         }
         let text = exit_report(&events);
-        assert_eq!(text.lines().count(), 4);
+        assert_eq!(text.lines().count(), 6);
         for label in [
             "array make_mut",
             "object make_mut",
             "array unwrap",
             "object unwrap",
+            "string make_mut",
+            "string unwrap",
         ] {
             assert!(text.contains(label), "{text}");
         }
