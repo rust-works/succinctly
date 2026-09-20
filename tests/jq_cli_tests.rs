@@ -6515,7 +6515,41 @@ fn test_color_output_materializes_cursor_values() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output.trim(),
-        "\x1b[1;39m[\x1b[0m\x1b[0;39m1\x1b[0m,\x1b[0;39mfalse\x1b[0m\x1b[1;39m]\x1b[0m"
+        // #3110: the `,` is wrapped in the enclosing container's color
+        // (array `1;39` here), matching real jq.
+        "\x1b[1;39m[\x1b[0m\x1b[0;39m1\x1b[0m\x1b[1;39m,\x1b[0m\x1b[0;39mfalse\x1b[0m\x1b[1;39m]\x1b[0m"
+    );
+    Ok(())
+}
+
+/// #3110: `-C -c` object output must color-wrap the `:` key/value separator
+/// in the object color, and the `,` in its enclosing container's color,
+/// as real jq does. Byte-pinned against jq 1.7.1 (this exact invocation
+/// and input); the only intentional byte difference from real jq is that
+/// succinctly emits one SGR per token where jq redundantly repeats the
+/// SGR before a closing delimiter (visually identical -- see
+/// docs/compliance/jq/limitations.md).
+#[test]
+fn test_color_compact_wraps_object_separator_3110() -> Result<()> {
+    // The issue's own example.
+    let (output, code) = run_jq_stdin(".", r#"{"a":1,"b":2}"#, &["-C", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m1\x1b[0m\
+         \x1b[1;39m,\x1b[0m\x1b[1;34m\"b\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m2\x1b[0m\
+         \x1b[1;39m}\x1b[0m"
+    );
+
+    // Nested: the `:` inside an object that lives in an array is still the
+    // object color; the enclosing `,` is the array color.
+    let (output, code) = run_jq_stdin(".", r#"[{"a":1},2]"#, &["-C", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        "\x1b[1;39m[\x1b[0m\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\
+         \x1b[0;39m1\x1b[0m\x1b[1;39m}\x1b[0m\x1b[1;39m,\x1b[0m\x1b[0;39m2\x1b[0m\
+         \x1b[1;39m]\x1b[0m"
     );
     Ok(())
 }
