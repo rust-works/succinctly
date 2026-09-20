@@ -57987,6 +57987,78 @@ fn test_pattern_computed_key_evaluates_2677() -> Result<()> {
     Ok(())
 }
 
+/// #3018: a *constant* non-string computed pattern key is refused at compile
+/// time with jq's own exit-3 shape — `. as {(1): $x} | .` used to compile
+/// and run, printing `null` for an empty object where jq 1.7.1 says
+/// `Cannot use number (1) as object key`. The folding classification mirrors
+/// jq's `constant_fold` + `check_object_key`. Every row below was captured
+/// against `/usr/bin/jq` 1.7.1 (2026-09-20).
+#[test]
+fn test_pattern_const_computed_key_rejected_like_jq_3018() -> Result<()> {
+    for (filter, message) in [
+        (". as {(1): $x} | .", "Cannot use number (1) as object key"),
+        (". as {(1+1): $x} | .", "Cannot use number (2) as object key"),
+        (". as {(5-10): $x} | .", "Cannot use number (-5) as object key"),
+        (". as {(1/2): $x} | .", "Cannot use number (0.5) as object key"),
+        (". as {(1%2): $x} | .", "Cannot use number (1) as object key"),
+        (
+            ". as {(\"a\"==\"a\"): $x} | .",
+            "Cannot use boolean (true) as object key",
+        ),
+        (". as {(null): $x} | .", "Cannot use null (null) as object key"),
+        (". as {([1+1]): $x} | .", "Cannot use array ([2]) as object key"),
+        (". as {([]): $x} | .", "Cannot use array ([]) as object key"),
+        (". as {({}): $x} | .", "Cannot use object ({}) as object key"),
+        (
+            ". as {( {\"a\":1} ): $x} | .",
+            "Cannot use object ({\"a\":1}) as object key",
+        ),
+        (". as {(def g: 1; 1): $x} | .", "Cannot use number (1) as object key"),
+        (". as {([{}]): $x} | .", "Cannot use array ([{}]) as object key"),
+        (". as {((1+1)): $x} | .", "Cannot use number (2) as object key"),
+        (". as {(1-(1+1)): $x} | .", "Cannot use number (-1) as object key"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&[filter], Some("{}"))?;
+        assert_eq!(code, 3, "{filter}: stderr={stderr}");
+        assert!(
+            stderr.contains(&format!("{message} at <top-level>, line 1:")),
+            "{filter}: stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter}: stderr={stderr}"
+        );
+        assert_eq!(stdout, "", "{filter}: stdout={stdout}");
+    }
+
+    // A string constant keys the same way a literal key does (a missing
+    // field binds null; an empty object still matches), and an expression
+    // jq leaves computed is evaluated, not refused.
+    let (stdout, stderr, code) =
+        run_jq_full(&[". as {(\"a\"+\"b\"): $x} | $x"], Some(r#"{"ab":7}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "7\n");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&[". as {(1 | tostring): $x} | $x"], Some(r#"{"1":8}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "8\n");
+
+    // Negative literals and the rest stay runtime keys (jq's `-` is always a
+    // computed negation, never a `LOADK` const): the runtime index error
+    // surfaces on an empty object instead of a compile error.
+    for filter in [". as {(-1): $x} | .", ". as {(-1-1): $x} | ."] {
+        let (_, stderr, code) = run_jq_full(&[filter], Some("{}"))?;
+        assert_eq!(code, 5, "{filter}: stderr={stderr}");
+        assert!(
+            stderr.contains("Cannot index object with number"),
+            "{filter}: stderr={stderr}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2677: a computed key that is itself a multi-output *generator*
 /// (`{("a","b"):$q}` -- real jq fans out one full pattern-match, and one
 /// full run of `body`, per key it yields) or a zero-output one
