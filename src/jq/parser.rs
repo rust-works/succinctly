@@ -33,13 +33,18 @@ use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::eval::{JqSemantics, YqSemantics};
+use super::eval::{
+    arith_combine, compare_values, yq_scalar_text_eq, EvalError, EvalSemantics, JqSemantics,
+    YqSemantics,
+};
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include, Libm1,
     Libm2, Libm3, Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry,
     ObjectKey, Param, Pattern, PatternEntry, Program, SliceBoundKey, StringPart,
 };
-use super::value::{parse_i64_or_f64_in, NumberRepr};
+use super::value::{parse_i64_or_f64_in, NumberRepr, OwnedValue};
+use super::walk::any_subexpr;
+use core::cmp::Ordering;
 
 /// Parser mode controls syntax differences between jq and yq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1589,6 +1594,131 @@ impl<'a> Parser<'a> {
                 start_key: start_key.flatten().map(SliceBoundKey::Number),
                 end_key: end_key.flatten().map(SliceBoundKey::Number),
             })
+        }
+    }
+
+    /// Resolve a pattern-key expression to a compile-time constant when jq's
+    /// own `constant_fold` would (#3018), or `None` when jq leaves the key as
+    /// a runtime expression.
+    ///
+    /// This mirrors jq 1.7.1's `constant_fold` + `block_is_const`:
+    /// - a literal (`null`, a bool, a string, or a *non-negative* number -- a
+    ///   leading `-` is jq's always-computed unary-negate *call*, never a
+    ///   `LOADK` const, so `(-1)` evaluates at runtime while `(5-10)` folds;
+    ///   the negative-literal split above is exactly why the sweet-spot `-123`
+    ///   is stored as one token and still must not fold);
+    /// - a parenthesized expression (recursed into);
+    /// - the ten `constant_fold` binops ([`Expr::Arithmetic`]'s `+ - * / %`,
+    ///   [`Expr::Compare`]) on two foldable operands, evaluated with the
+    ///   mode's own operator semantics so a folded value agrees with what
+    ///   runtime would compute. A binop that errors (zero divisor, `"a" + 1`)
+    ///   yields `None`: jq compiles those to a runtime `ERROR` instruction,
+    ///   the same observable the evaluator already produces;
+    /// - an all-const array or object literal (including `[]`/`{}`), with the
+    ///   same restriction jq's object fold has -- a computed-key entry (`Expr`
+    ///   key), even one that would itself fold to a string, makes the whole
+    ///   object non-const (`SUBEXP` key blocks are never `PUSHK_UNDER`);
+    /// - a `def` whose name no call in `then` references, folded from `then`
+    ///   -- the `block_bind_referenced` def-drop. The reference scan
+    ///   over-approximates (a mention inside a nested `def` body), and that
+    ///   direction only refuses a fold jq would have made, never a compile
+    ///   error jq wouldn't.
+    ///
+    /// A folded *string* is deliberately not used to rewrite the key: the
+    /// runtime evaluates the same expression to the same string, and
+    /// `{("a"): $x}` destructures identically either way (a missing field
+    /// binds `$x = null`, exactly like a plain string key). Only the
+    /// non-string classification is decided here, at the same gate jq's
+    /// `check_object_key` applies.
+    fn const_fold_pattern_key<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+        match expr {
+            Expr::Literal(lit) => Self::const_fold_pattern_key_literal(lit),
+            Expr::Paren(inner) => Self::const_fold_pattern_key::<S>(inner),
+            Expr::Arithmetic { op, left, right } => {
+                let (Some(l), Some(r)) = (
+                    Self::const_fold_pattern_key::<S>(left),
+                    Self::const_fold_pattern_key::<S>(right),
+                ) else {
+                    return None;
+                };
+                arith_combine::<S>(*op, l, r).ok()
+            }
+            Expr::Compare { op, left, right } => {
+                let (Some(l), Some(r)) = (
+                    Self::const_fold_pattern_key::<S>(left),
+                    Self::const_fold_pattern_key::<S>(right),
+                ) else {
+                    return None;
+                };
+                // yq mode's text-comparison rule (`yq_scalar_text_eq`) is the
+                // authority for the two ops it serves; everything else runs
+                // the same total order runtime does.
+                if let Some(equal) = yq_scalar_text_eq::<S>(*op, &l, &r) {
+                    return Some(OwnedValue::Bool(equal));
+                }
+                let ord = compare_values::<S>(&l, &r);
+                Some(OwnedValue::Bool(match op {
+                    CompareOp::Eq => ord == Ordering::Equal,
+                    CompareOp::Ne => ord != Ordering::Equal,
+                    CompareOp::Lt => ord == Ordering::Less,
+                    CompareOp::Le => ord != Ordering::Greater,
+                    CompareOp::Gt => ord == Ordering::Greater,
+                    CompareOp::Ge => ord != Ordering::Less,
+                }))
+            }
+            Expr::Array(inner) => match inner.as_ref() {
+                Expr::Comma(items) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        out.push(Self::const_fold_pattern_key::<S>(item)?);
+                    }
+                    Some(OwnedValue::array_from(out))
+                }
+                single => {
+                    let v = Self::const_fold_pattern_key::<S>(single)?;
+                    Some(OwnedValue::array_from(vec![v]))
+                }
+            },
+            Expr::Object(entries) => {
+                let mut out = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let ObjectKey::Literal(key) = &entry.key else {
+                        return None;
+                    };
+                    let value = Self::const_fold_pattern_key::<S>(&entry.value)?;
+                    out.push((key.clone(), value));
+                }
+                Some(OwnedValue::object_from(out))
+            }
+            Expr::FuncDef { name, then, .. } => {
+                let referenced = any_subexpr(then, &mut |e| {
+                    matches!(e, Expr::FuncCall { name: called, .. } if called == name)
+                });
+                if referenced {
+                    return None;
+                }
+                Self::const_fold_pattern_key::<S>(then)
+            }
+            _ => None,
+        }
+    }
+
+    /// A [`Literal`]'s const-fold: `null`, a bool, a string, or a
+    /// *non-negative* number (see the negative-literal rule in
+    /// [`Self::const_fold_pattern_key`]). `NumberLiteral` is discriminated by
+    /// its source text so `-0` stays a runtime key alongside every other
+    /// `-`-led token.
+    fn const_fold_pattern_key_literal(lit: &Literal) -> Option<OwnedValue> {
+        match lit {
+            Literal::Null => Some(OwnedValue::Null),
+            Literal::Bool(b) => Some(OwnedValue::Bool(*b)),
+            Literal::String(s) => Some(OwnedValue::String(s.clone())),
+            Literal::Int(n) if *n >= 0 => Some(OwnedValue::Int(*n)),
+            Literal::Float(f) if !f.is_sign_negative() => Some(OwnedValue::Float(*f)),
+            Literal::NumberLiteral(repr, text) if !text.starts_with('-') => {
+                Some(OwnedValue::NumberLiteral(*repr, text.clone().into()))
+            }
+            _ => None,
         }
     }
 
@@ -3380,10 +3510,36 @@ impl<'a> Parser<'a> {
                         // -- an interpolation is itself a computed key, so
                         // it shares the `Expr` arm), or a bare identifier.
                         let key = if self.peek() == Some('(') {
+                            let key_start = self.pos;
                             self.next();
                             let key_expr = self.parse_expr()?;
                             self.expect(')')?;
                             self.count_pattern_computed_key()?;
+                            // #3018: a *constant* non-string key is refused at
+                            // compile time (`Cannot use number (1) as object
+                            // key`), exactly where jq's `check_object_key`
+                            // refuses it; only computed and string keys reach
+                            // evaluation. The object-*construction* sibling
+                            // `{(1): 1}` keeps its runtime verdict (exit 5 vs
+                            // jq's 3) -- that path is yq-mode-divergent and
+                            // pinned by eval tests, so the compile-time gate is
+                            // deliberately pattern-only.
+                            let folded = match self.mode {
+                                ParserMode::Jq => {
+                                    Self::const_fold_pattern_key::<JqSemantics>(&key_expr)
+                                }
+                                ParserMode::Yq => {
+                                    Self::const_fold_pattern_key::<YqSemantics>(&key_expr)
+                                }
+                            };
+                            if let Some(value) = folded {
+                                if !matches!(value, OwnedValue::String(_)) {
+                                    return Err(ParseError::new(
+                                        EvalError::cannot_use_as_object_key(&value).message,
+                                        key_start,
+                                    ));
+                                }
+                            }
                             ObjectKey::Expr(Box::new(key_expr))
                         } else if self.peek() == Some('"') {
                             match self.parse_string_or_interpolation()? {
@@ -8857,6 +9013,71 @@ mod tests {
                 assert_eq!(entries[0].pattern, Pattern::Var("a".into()));
             }
             other => panic!("expected AsPattern, got {other:?}"),
+        }
+    }
+
+    /// #3018: a *constant* non-string computed pattern key is refused at
+    /// parse time the way jq 1.7.1's `check_object_key` refuses it — the
+    /// whole table below was captured against `/usr/bin/jq` 1.7.1 and
+    /// classified by exit path: compile-reject (exit 3, message), accept
+    /// (parses fine, awaited by runtime) or runtime (exit 5). The same fold
+    /// rules that classify a key also model jq's own `constant_fold`:
+    /// literals (non-negative numbers — a leading `-` is jq's always-computed
+    /// negation, so `(-1)`, `(-1-1)` and `(-2 * 5)` stay runtime), the ten
+    /// arithmetic/comparison binops, all-const arrays/objects including
+    /// `[]`/`{}`, and the `block_bind_referenced` def-drop.
+    #[test]
+    fn test_pattern_const_computed_key_folded_like_jq_3018() {
+        // Compile-rejected: `Cannot use <kind> (<value>) as object key`.
+        for (key, expected) in [
+            ("{(1): $x}", "Cannot use number (1) as object key"),
+            ("{(1+1): $x}", "Cannot use number (2) as object key"),
+            ("{(5-10): $x}", "Cannot use number (-5) as object key"),
+            ("{(1/2): $x}", "Cannot use number (0.5) as object key"),
+            ("{(1%2): $x}", "Cannot use number (1) as object key"),
+            (r#"{("a"=="a"): $x}"#, "Cannot use boolean (true) as object key"),
+            ("{(1>0): $x}", "Cannot use boolean (true) as object key"),
+            ("{(null): $x}", "Cannot use null (null) as object key"),
+            ("{([1+1]): $x}", "Cannot use array ([2]) as object key"),
+            ("{([1,2]): $x}", "Cannot use array ([1,2]) as object key"),
+            ("{([{}]): $x}", "Cannot use array ([{}]) as object key"),
+            ("{([]): $x}", "Cannot use array ([]) as object key"),
+            ("{({}): $x}", "Cannot use object ({}) as object key"),
+            (r#"{( {"a":1} ) : $x}"#, "Cannot use object ({\"a\":1}) as object key"),
+            ("{(def g: 1; 1): $x}", "Cannot use number (1) as object key"),
+            ("{((1+1)): $x}", "Cannot use number (2) as object key"),
+            ("{(1-(1+1)): $x}", "Cannot use number (-1) as object key"),
+        ] {
+            let src = format!(". as {key} | .");
+            let err = parse_program(&src).unwrap_err();
+            assert_eq!(err.message, expected, "for key {key}");
+        }
+
+        // jq mode and yq mode share the pattern grammar (real yq has no
+        // pattern keys at all), so both modes reject the same constants.
+        let err = parse_program_with_mode(". as {(1): $x} | .", ParserMode::Yq).unwrap_err();
+        assert_eq!(err.message, "Cannot use number (1) as object key");
+
+        // Accept (parses for runtime evaluation): string constants and
+        // genuinely computed keys -- a *string* const destructures by the
+        // same folded key, so pretending it is constant changes nothing.
+        for key in [
+            r#"{("a"+"b"): $x}"#,
+            r#"{("a" | tostring): $x}"#,
+            "{(.k): $x}",
+            "{$ENV: $x}",
+            r#"{"\(.k)": $x}"#,
+            "{(-1): $x}",
+            "{(-1-1): $x}",
+            "{(1 and 2): $x}",
+            "{(def g: 1; g): $x}",
+            "{(def g: 1; [g]): $x}",
+            "{(1, 2): $x}",
+        ] {
+            assert!(
+                parse_program(&format!(". as {key} | .")).is_ok(),
+                "expected {key} to parse for runtime evaluation"
+            );
         }
     }
 
