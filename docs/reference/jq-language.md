@@ -411,8 +411,13 @@ limitation is recorded in [jq limitations](../compliance/jq/limitations.md#skip-
 
 Object-construction values use jq's restricted `ExpD` production, where
 `,` separates entries: `{a: 1, b: 2}` is two entries; write `{a: (1,2)}` to
-fan a value out. The `reduce`/`foreach` and `until`/`while` slots accept full
-expressions too.
+fan a value out. The restriction is the full one (#3105), not just the
+comma: a value is a `Term` (plus unary `-` and `|` chains of those), so a
+bare `if`/`reduce`/`foreach`/`try`/`label`/`def`, an `as`-binding, a binary
+operator, or a generic trailing `?` (`error("x")?`) is a compile error here,
+as in real jq — parenthesize into a `Term` where a full expression is
+wanted (`{a: (if true then 1 else 2 end)}`). The `reduce`/`foreach` and
+`until`/`while` slots accept full expressions too.
 
 Two precedence divergences from jq remain:
 
