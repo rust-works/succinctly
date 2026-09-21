@@ -214,6 +214,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A destructuring pattern's computed key is now visible to every check built
+  on `any_subexpr`** (#3017). `walk::any_subexpr`'s `AsPattern`/`Reduce`/
+  `Foreach` arms skipped `patterns` entirely, under a comment claiming a
+  pattern "holds only destructuring names, never an `Expr`" -- stale since
+  #2734 gave object-pattern keys `ObjectKey::Expr`. The visible case:
+  `input` used only inside a key (`. as {(input): $x} | $x`) failed at
+  runtime with `break`, exit 5, because `uses_input_builtins` never saw the
+  call and skipped setting up the input queue, where jq 1.7.1 answers `1`.
+  `any_subexpr` now descends `patterns` via `any_pattern_key` (#2872),
+  re-entering each key with `any_subexpr` itself so a nested hit
+  (`input|tostring`) is found too, not just one at the key's own root. Two
+  local workarounds this same blind spot had accumulated -- `resolve.rs`'s
+  `collect_pattern_def_body_addrs` (#3014, for #2971) and `jq_runner.rs`'s
+  `called_func_names` pattern arm (for #2955) -- are removed now that the
+  descent they duplicated lives in `any_subexpr` itself; leaving the former
+  in place would have double-counted a `def` inside a computed key. In yq
+  mode, `count_meta_assigns` is also built on `any_subexpr`: wherever the
+  metadata-write pass already ran (the enclosing expression must
+  independently look write-shaped for `is_alias_sensitive_assign` to admit
+  it), a `line_comment`/`style`/`anchor` `=` write buried in a computed key
+  is now refused with "only supported as a top-level pipe stage" instead of
+  being silently dropped. `is_alias_sensitive_assign` itself has the same
+  computed-key blind spot on its own gate, unfixed here -- filed as #3203.
 - **`isvalid(f)` answers `false` for a generator that produced nothing, and lets an
   uncatchable error through** (#2658). `isvalid(.[])` on `[]`/`{}` answered `true`
   because an empty `.[]` came back as an empty multi-output rather than `None`,

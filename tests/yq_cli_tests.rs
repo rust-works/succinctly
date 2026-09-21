@@ -16565,6 +16565,20 @@ mod meta_assign_798 {
         for filter in [
             ".b as $x | .a line_comment = $x",
             ".b as $x | (.a style = \"double\")",
+            // #3017: a metadata write buried in a destructuring pattern's
+            // computed key. `count_meta_assigns` is built on `any_subexpr`,
+            // which used to skip `patterns` entirely, so this used to be a
+            // silent no-op (prints `1`, exit 0) rather than a refusal -- the
+            // one outcome #798's own triage ruled out. `.b = 1` on the body
+            // is load-bearing: `is_alias_sensitive_assign` decides whether
+            // this pass runs at all from the body alone (a separate,
+            // hand-rolled walk, not `any_subexpr`), so the body must already
+            // look like a write for `count_meta_assigns` to ever see the key.
+            // A body that is *not* independently write-shaped (e.g. plain
+            // `.` or `$v`) still silently drops this same write today --
+            // `is_alias_sensitive_assign` has its own, separate computed-key
+            // blind spot, filed as #3203.
+            ". as {((.a line_comment = \"x\") | .a): $v} | .b = 1",
         ] {
             let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\nb: hi\n", &[]).unwrap();
             assert_eq!(code, 1, "[{filter}] stderr: {err}");

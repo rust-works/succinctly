@@ -29425,6 +29425,80 @@ fn test_uncalled_def_inside_builtin_argument_still_compiles_2971() -> Result<()>
     Ok(())
 }
 
+/// #3017: `input` used only inside a destructuring pattern's computed key
+/// (`. as {(input): $x} | $x`) used to fail at runtime with `break` (exit 5)
+/// -- `walk::any_subexpr` skipped `patterns` entirely in its `AsPattern`/
+/// `Reduce`/`Foreach` arms, so `uses_input_builtins` never saw the `input`
+/// call and never set up the input queue. Every row's expected output is
+/// jq 1.7.1's own live output on `{"a":1}\n"a"\n`. The last row is the
+/// unchanged control: `input` outside the key already worked before this fix.
+#[test]
+fn test_input_inside_destructuring_key_seeds_the_queue_3017() -> Result<()> {
+    let input = "{\"a\":1}\n\"a\"\n";
+    for (filter, expected) in [
+        (". as {(input): $x} | $x", "1"),
+        (". as {(input|tostring): $x} | $x", "1"),
+        ("reduce . as {(input): $x} (0; . + $x)", "1"),
+        ("foreach . as {(input): $x} (0; . + $x)", "1"),
+        (". as {(\"a\"): $x} | [$x, input]", "[1,\"a\"]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #3017 review: `drive_fold_source`'s `has_navigation` gate
+/// (`any_subexpr(source, |e| matches!(e, Field|Index|Slice|Iterate))`)
+/// decides between a cheap by-value fold and the path-tracking resolver. A
+/// fold source whose only navigation (`.k`) sits inside a destructuring
+/// key now counts as "has navigation" where it didn't before, switching it
+/// onto the resolver path -- these four rows must keep producing exactly
+/// what they did before this fix (and what jq 1.7.1 produces live), input
+/// `{"k":"a","a":1}\n{"k":"a","a":2}\n{"k":"a","a":3}\n{"k":"a","a":4}\n`.
+#[test]
+fn test_fold_source_navigating_only_in_a_key_keeps_input_order_3017() -> Result<()> {
+    let input = "{\"k\":\"a\",\"a\":1}\n{\"k\":\"a\",\"a\":2}\n{\"k\":\"a\",\"a\":3}\n{\"k\":\"a\",\"a\":4}\n";
+    for (filter, expected) in [
+        // Auto-iteration runs this filter once per top-level input: the
+        // first run consumes doc1 as `.` and doc2 via `input` (2), the
+        // second consumes doc3 as `.` and doc4 via `input` (4) -- two
+        // output lines, not one.
+        (
+            "reduce (input | . as {(.k):$v} | $v) as $x (0; . + $x)",
+            "2\n4",
+        ),
+        (
+            "[foreach (inputs | . as {(.k):$v} | $v) as $x (0; . + $x)]",
+            "[2,5,9]",
+        ),
+        (
+            "reduce (inputs | . as {(.k):$v} | $v) as $x (0; . + $x)",
+            "9",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}: stderr: {stderr:?}");
+    }
+
+    // The fourth row exhausts `input` mid-pipeline: jq's own "exhausted
+    // input" `break` on stderr, exit 5, and the partial stdout it already
+    // printed.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "[reduce (input | . as {(.k):$v} | $v) as $x (0; . + $x), input]",
+        ],
+        Some(input),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[2,{\"k\":\"a\",\"a\":3}]");
+    assert!(stderr.contains("break"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1473, the severe half: forward-referencing a not-yet-defined arity
 /// from *within a def's own body* used to silently compute a value, where
 /// real jq rejects it as a compile-time forward reference (`f/2 is not

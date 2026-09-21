@@ -529,26 +529,10 @@ fn called_func_names(expr: &Expr) -> BTreeSet<String> {
             } => {
                 names.insert(format!("{namespace}::{name}"));
             }
-            // `any_subexpr` does not descend into a `Pattern` either -- its
-            // own comment that a pattern holds only destructuring names has
-            // been stale since #2677 gave object patterns computed keys. A
-            // call reached only from such a key (`. as {(kf): $v} | $v`) would
-            // otherwise be invisible, and its dependency dropped.
-            //
-            // `map_pattern_subexprs` rather than a hand-rolled walk: it is the
-            // one exhaustive definition of what a pattern contains, and a
-            // fourth copy of that is exactly what would drift. The rebuilt
-            // `Pattern` it returns is discarded.
-            Expr::Reduce { patterns, .. }
-            | Expr::Foreach { patterns, .. }
-            | Expr::AsPattern { patterns, .. } => {
-                for pattern in patterns {
-                    succinctly::jq::walk::map_pattern_subexprs(pattern, &mut |key| {
-                        names.extend(called_func_names(key));
-                        key.clone()
-                    });
-                }
-            }
+            // A destructuring pattern's computed key (`. as {(kf): $v} | $v`,
+            // #2734) no longer needs a separate walk here -- `any_subexpr`
+            // descends `patterns` itself (#3017), so a call reached only
+            // from such a key is already visited by this same traversal.
             _ => {}
         }
         false
