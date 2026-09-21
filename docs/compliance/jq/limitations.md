@@ -5067,7 +5067,12 @@ The deferred diagnostic is really the next input's parse error, so in real jq `h
 filter suppresses it entirely, and `input`/`inputs` in the filter turn it into a runtime
 error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5; `try input catch
 .` yields the message). None of that is modeled: `--seq` never queues a trailing parse error
-the way a plain JSON stream does (#2961), and the warning is always printed up front.
+the way a plain JSON stream does (#2961), and the warning is always printed up front —
+[#3201](https://github.com/rust-works/succinctly/issues/3201). Two further malformed-BOM
+gaps the same probing surfaced are pre-existing and separate: the pre-RS record's *value*
+is dropped ([#3199](https://github.com/rust-works/succinctly/issues/3199)), and jq's
+per-refill `parser_reset` is modeled at newlines only, not at the 4095-byte `fgets`
+boundary ([#3200](https://github.com/rust-works/succinctly/issues/3200)).
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
@@ -5080,7 +5085,10 @@ $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level num
                                           # -- not the abandoned-text template, despite no RS byte anywhere
 ```
 
-`succinctly jq` reproduces this on both stderr and stdout, including the pre-RS `1` jq reads.
+`succinctly jq` reproduces the stderr side of this exactly. The stdout side does not yet
+match: the pre-RS `1` jq reads is never emitted (`printf '\xef\xbb1 2' | succinctly jq
+--seq -c .` prints nothing, jq prints `1`) —
+[#3199](https://github.com/rust-works/succinctly/issues/3199).
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
 materializes `--seq` input before evaluating, so all warnings precede all values. jq's
