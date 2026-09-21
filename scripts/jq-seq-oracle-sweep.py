@@ -49,13 +49,25 @@ probability (a handful of cases per 4,000): #3195, `value_ranges` misreading a
 substituted U+FFFD as a malformed BOM when invalid UTF-8 opens the document,
 fabricating an extra value. Confirmed present on `main` before #2998 too, via
 a throwaway comparison binary -- unrelated to what this script targets (the
-mismatch never touches `stop_at`/`for_each_warning`'s raw-byte walk at all).
-A superset whose input does *not* start with an invalid UTF-8 lead byte is a
-new, unattributed failure and should be investigated as such.
+mismatch never touches `final_buffer_start`/`for_each_warning`'s raw-byte walk
+at all). A superset whose input does *not* start with an invalid UTF-8 lead
+byte is a new, unattributed failure and should be investigated as such.
+
+**`--slurp-location` mode** runs the same corpus through `--seq -s -c
+'error("x")'` instead, so the `jq: error (at ...)` line carries jq's
+EOF-location answer (#2947/#3003: `file:N` or `<unknown>`) and is compared
+along with the warnings. stderr is compared as a *sorted* multiset of lines
+there: on the #3003 shapes real jq prints the runtime error before its EOF
+warning (the warning belongs to the `next_input` call *after* the one that
+dispatched the slurped array), while succinctly prints every warning before it
+evaluates -- a recorded divergence, not what this mode tests. Random cases are
+1-24 bytes, so the one shape the reader still models approximately (a
+malformed BOM whose refill lands on jq's 4095-byte `fgets` boundary rather
+than on a newline) is unreachable here.
 
 Usage:
   cargo build --release --features cli
-  ./scripts/jq-seq-oracle-sweep.py [--seed N] [--cases N] [path-to-binary]
+  ./scripts/jq-seq-oracle-sweep.py [--seed N] [--cases N] [--slurp-location] [path-to-binary]
 """
 
 import argparse
@@ -100,6 +112,12 @@ HAND = [
     b"\xef1 2", b"\xef", b"\xef\xbb",
     b'\x1e"a"\x1e"b"', b"\x1e[1,2]}\n", b"\x1e{}}\n", b"\x1etrue,[1]",
     b"\x1e5-3 7", b"\x1e1-2\n",
+    # #3003: a value completed by the final buffer's last byte keeps `-s`'s
+    # position (the first row of each pair) where the same shape completed
+    # one byte earlier, or preceded by an error in the buffer, loses it.
+    b"\x1e1{", b"\x1e1[", b"\x1etrue{", b"\x1e1 2{", b'\x1etrue"', b'\x1e1"',
+    b'\x1e"a"{', b"\x1e{}{", b'\x1e"a"[', b"\x1e[0,]\x1e1{", b"\x1e1\x1e{",
+    b"\x1e1\n\x1e2{", b"\x1e1}\n\x1e2{", b"\x1e1{ ", b"\x1e1{\n",
 ]
 
 
@@ -125,7 +143,11 @@ def shutil_which_jq():
     return shutil.which("jq")
 
 
-def run(argv, data):
+WARNINGS_ARGS = ["--seq", "-c", "."]
+SLURP_LOCATION_ARGS = ["--seq", "-s", "-c", 'error("x")']
+
+
+def run(argv, data, mode_args):
     # stdin from a file, never a pipe: with `pipefail` a SIGPIPE'd writer
     # fabricates exit-code divergences (scripts/jq-fanout-oracle-sweep.sh
     # learned this the hard way).
@@ -135,7 +157,7 @@ def run(argv, data):
     try:
         with open(path, "rb") as stdin:
             done = subprocess.run(
-                argv + ["--seq", "-c", "."],
+                argv + mode_args,
                 stdin=stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -197,7 +219,14 @@ def main():
         action="store_true",
         help="include the line-reader-artifact shapes, to confirm they are still the only divergences",
     )
+    parser.add_argument(
+        "--slurp-location",
+        action="store_true",
+        help="run `--seq -s -c 'error(\"x\")'` instead, comparing the EOF location (#2947/#3003); "
+        "stderr is then compared order-insensitively",
+    )
     args = parser.parse_args()
+    mode_args = SLURP_LOCATION_ARGS if args.slurp_location else WARNINGS_ARGS
 
     if not os.access(args.binary, os.X_OK):
         sys.exit(
@@ -213,9 +242,14 @@ def main():
         if not args.expect_artifacts and artifact(data):
             skipped += 1
             continue
-        jq_out, jq_err, jq_code = run([jq], data)
-        our_out, our_err, our_code = run([args.binary, "jq"], data)
-        if (jq_err, jq_code) != (our_err, our_code):
+        jq_out, jq_err, jq_code = run([jq], data, mode_args)
+        our_out, our_err, our_code = run([args.binary, "jq"], data, mode_args)
+        if args.slurp_location:
+            # Order-insensitive: see the module docstring.
+            same_err = sorted(jq_err.splitlines()) == sorted(our_err.splitlines())
+        else:
+            same_err = jq_err == our_err
+        if not same_err or jq_code != our_code:
             stderr_bad.append((data, jq_err, our_err))
         # stdout may be a strict subset of jq's -- succinctly deliberately
         # drops a record jq can partially read -- but never a superset.
