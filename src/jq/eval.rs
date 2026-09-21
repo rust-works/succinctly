@@ -41532,6 +41532,26 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 if skip_untracked {
                     return Demand::Continue;
                 }
+                // #3125: the terminal-literal carve-out -- a bearer literal
+                // whose carrier null/bool is *identical* to the register is a
+                // valid empty path `[]`, the same identity rule the navigation
+                // family applies via `null_bool_identical` (the other eleven
+                // sites, #2691). `null | path(null)`, `false | path(false)`
+                // and `true | path(true)` answer `[]` in real jq 1.7.1; every
+                // other carrier (`123 | path(123)`, `"" | path("")`, `[] |
+                // path([])`) and every non-identical null/bool pairing
+                // (`null | path(false)`) still refuses here.
+                if null_bool_identical(&branch.value, input) {
+                    // emission: mirror the navigation family's identical
+                    // seed (#2691) -- the identical literal carried through
+                    // the *root* (empty) path answers `[]` in real jq 1.7.1.
+                    sink(PathBranch::new(
+                        PathPrefix::root(),
+                        Cow::Borrowed(input),
+                        true
+                    ));
+                    return Demand::Stop;
+                }
                 violation = Some(if near_iterate {
                     EvalError::invalid_path_expression_near_iterate(&branch.value).into()
                 } else {
