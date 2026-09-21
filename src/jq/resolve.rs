@@ -2457,11 +2457,16 @@ fn translate_reachable(
 /// Every `def` body's address in `expr`, in a deterministic pre-order -- the
 /// identity [`build_call_graph`] keys reachability on.
 ///
-/// Built on [`any_subexpr`], plus the two places it does not look but
+/// Built on [`any_subexpr`], plus the one place it does not look but
 /// [`check`] does: a call's `builtin_fallback` (the alternate parse a
 /// shadowed builtin name carries, which is where `select(def g: ..; g)` puts
-/// its def once `select` is also user-defined) and a destructuring pattern's
-/// computed object keys (#2734). Missing either left those defs unpaired.
+/// its def once `select` is also user-defined). A destructuring pattern's
+/// computed object keys (#2734) no longer need a separate walk here --
+/// `any_subexpr` descends `patterns` itself (#3017), so a `def` inside a key
+/// is reached the same way as everywhere else. It must not be *also* reached
+/// this way: a second, independent descent into `patterns` would push its
+/// body address twice, and `translate_reachable`'s positional zip against a
+/// cloned tree's own addresses requires exactly one per `def`.
 fn def_body_addrs(expr: &Expr) -> Vec<usize> {
     let mut addrs = Vec::new();
     collect_def_body_addrs(expr, &mut addrs);
@@ -2476,36 +2481,10 @@ fn collect_def_body_addrs(expr: &Expr, addrs: &mut Vec<usize>) {
                 builtin_fallback: Some(fallback),
                 ..
             } => collect_def_body_addrs(fallback, addrs),
-            Expr::Reduce { patterns, .. }
-            | Expr::Foreach { patterns, .. }
-            | Expr::AsPattern { patterns, .. } => {
-                for pattern in patterns {
-                    collect_pattern_def_body_addrs(pattern, addrs);
-                }
-            }
             _ => {}
         }
         false
     });
-}
-
-fn collect_pattern_def_body_addrs(pattern: &Pattern, addrs: &mut Vec<usize>) {
-    match pattern {
-        Pattern::Var(_) => {}
-        Pattern::Object(entries) => {
-            for entry in entries {
-                if let ObjectKey::Expr(key) = &entry.key {
-                    collect_def_body_addrs(key, addrs);
-                }
-                collect_pattern_def_body_addrs(&entry.pattern, addrs);
-            }
-        }
-        Pattern::Array(patterns) => {
-            for pattern in patterns {
-                collect_pattern_def_body_addrs(pattern, addrs);
-            }
-        }
-    }
 }
 
 /// [`check`] over an optional sub-expression.
@@ -2902,6 +2881,46 @@ mod tests {
             );
         }
         assert_eq!(resolve(". as {(def g: nosuchfn; \"a\"): $x} | $x"), Ok(()));
+    }
+
+    /// #3017: `collect_def_body_addrs` used to carry its own local walk into
+    /// a pattern's computed keys (`collect_pattern_def_body_addrs`, added by
+    /// #3014 for #2971's rebase specifically because `any_subexpr` didn't
+    /// look there). Now that `any_subexpr` itself descends `patterns`
+    /// (#3017), that local walk is gone -- if it had been left in place, a
+    /// `def` inside a computed key would be pushed twice: once by
+    /// `any_subexpr`'s own new descent hitting the `Expr::FuncDef` node,
+    /// once by the (now-removed) explicit pattern walk.
+    #[test]
+    fn def_body_addrs_visits_a_pattern_key_def_exactly_once_3017() {
+        for filter in [
+            ". as {((def g: 1; g)): $x} | $x",
+            "reduce .a as {((def g: 1; g)): $x} (.b; .c)",
+            "foreach .a as {((def g: 1; g)): $x} (.b; .c; .d)",
+        ] {
+            let expr = parse(filter).expect("filter must parse");
+            let addrs = def_body_addrs(&expr);
+            assert_eq!(
+                addrs.len(),
+                1,
+                "def body inside a computed key must be visited exactly once for {filter:?}: {addrs:?}"
+            );
+        }
+    }
+
+    /// The same double-push would also break [`rebase_reachable`]'s
+    /// positional zip against a cloned tree: `translate_reachable`'s
+    /// `debug_assert_eq!(from.len(), to.len())` requires `def_body_addrs`
+    /// to visit `original` and `copy` in exactly the same order and count.
+    #[test]
+    fn rebase_reachable_pairs_a_pattern_key_def_through_a_clone_3017() {
+        let expr = parse(". as {((def g: 1; g)): $x} | $x").expect("filter must parse");
+        let copy = expr.clone();
+        let from = def_body_addrs(&expr);
+        assert_eq!(from.len(), 1, "sanity: exactly one def body in the source");
+        let reachable: BTreeSet<usize> = from.iter().copied().collect();
+        let rebased = rebase_reachable(&expr, &copy, &reachable);
+        assert_eq!(rebased.len(), 1);
     }
 
     #[test]

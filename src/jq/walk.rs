@@ -1195,13 +1195,6 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             body: right,
             ..
         }
-        // `patterns` holds only destructuring names, never an `Expr`, so
-        // `Reduce`/`Foreach`/`AsPattern` need no descent into them.
-        | Expr::AsPattern {
-            expr: left,
-            body: right,
-            ..
-        }
         | Expr::FuncDef {
             body: left,
             then: right,
@@ -1256,21 +1249,54 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
                 || step.as_deref().is_some_and(|e| any_subexpr(e, pred))
         }
 
+        // A computed key (`{(expr): $x}`, #2734) holds a real `Expr` that
+        // `pred` must see, via `any_pattern_key` (#2872) -- re-entered with
+        // `any_subexpr` itself, not `pred` bare, since `any_pattern_key`
+        // only tests each key's root and a hit like `input` can be nested
+        // under it (`(input | tostring)`). Stale before #3017: this arm used
+        // to skip `patterns` on the claim that it "holds only destructuring
+        // names, never an `Expr`."
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+            ..
+        } => {
+            any_subexpr(expr, pred)
+                || any_subexpr(body, pred)
+                || patterns
+                    .iter()
+                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
+        }
+
         Expr::Reduce {
-            input, init, update, ..
-        } => any_subexpr(input, pred) || any_subexpr(init, pred) || any_subexpr(update, pred),
+            input,
+            patterns,
+            init,
+            update,
+        } => {
+            any_subexpr(input, pred)
+                || any_subexpr(init, pred)
+                || any_subexpr(update, pred)
+                || patterns
+                    .iter()
+                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
+        }
 
         Expr::Foreach {
             input,
+            patterns,
             init,
             update,
             extract,
-            ..
         } => {
             any_subexpr(input, pred)
                 || any_subexpr(init, pred)
                 || any_subexpr(update, pred)
                 || extract.as_deref().is_some_and(|e| any_subexpr(e, pred))
+                || patterns
+                    .iter()
+                    .any(|p| any_pattern_key(p, &mut |k| any_subexpr(k, pred)))
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(|e| any_subexpr(e, pred)),
@@ -1437,8 +1463,9 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
         // so, like `update`, it reaches the document only through a side
         // channel `stage_escapes_own_input` classifies (`input`,
         // `$__loc__`, a path-context builtin). #2872 closed this arm; the
-        // `AsPattern` arm below falls through to `any_subexpr`, whose own
-        // pattern-key blind spot is #3017's.
+        // `AsPattern` arm below falls through to `any_subexpr`, which now
+        // descends `patterns` itself (#3017), so no separate `patterns`
+        // check is needed there either.
         Expr::Reduce {
             input,
             patterns,
@@ -2449,6 +2476,43 @@ mod tests {
                 "computed key's own .k field was not rewritten for {filter:?}: {uppercased:?}"
             );
         }
+    }
+
+    /// #3017: `AsPattern`/`Reduce`/`Foreach` used to skip `patterns` entirely
+    /// in `any_subexpr`, under a comment claiming a pattern "holds only
+    /// destructuring names, never an `Expr`" -- stale since #2734 gave
+    /// object-pattern keys `ObjectKey::Expr`. The marker sits *nested* inside
+    /// each key (`.k | tostring`, matched via `Builtin::ToString`), not at
+    /// the key's own root, to pin that the fix re-enters each key with
+    /// `any_subexpr` itself rather than calling the bare predicate once --
+    /// `any_pattern_key` alone would miss it, since it only tests a key's
+    /// root expression.
+    #[test]
+    fn any_subexpr_descends_into_pattern_computed_keys_3017() {
+        let is_marker = |e: &Expr| matches!(e, Expr::Builtin(Builtin::ToString));
+        for filter in [
+            ". as {(.k|tostring):$q} | $q",                  // AsPattern
+            "reduce .a as {(.k|tostring):$q} (.b; .c)",      // Reduce
+            "foreach .a as {(.k|tostring):$q} (.b; .c; .d)", // Foreach
+            ". as {a:{(.k|tostring):$q}} | $q",              // nested key in Object-in-Object
+            ". as [{(.k|tostring):$q}] | $q",                // nested key in Object-in-Array
+        ] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut pred = is_marker;
+            assert!(
+                any_subexpr(&expr, &mut pred),
+                "marker inside computed key not found for {filter:?}"
+            );
+        }
+
+        // Negative control: no marker anywhere, so the descent must not
+        // manufacture a false positive.
+        let expr = parse(". as {(.k):$q} | $q").expect("filter should parse");
+        let mut pred = is_marker;
+        assert!(
+            !any_subexpr(&expr, &mut pred),
+            "false positive with no marker present"
+        );
     }
 
     /// Assignment-family arms (`Assign`/`Update`/`CompoundAssign`/
