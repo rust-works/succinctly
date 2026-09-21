@@ -364,6 +364,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and invalid-UTF-8/BOM — comparing exit code, stdout and stderr, with the
   harness first validated against a known-bad build.
 
+- **`--seq -s` keeps its EOF location when the final byte completes a value**
+  (#3003). #2947's rule counted an error detected at EOF as one detected on
+  the final buffer, and so lost the position for `\x1e1{`, `\x1e1[` and
+  `\x1etrue{` — a complete value immediately followed by an unfinished
+  container, with no trailing byte — where jq 1.7.1 names `file:0`. jq's
+  `jq_util_input_next_input` keeps "did this call perform the refill that set
+  `feof`" in a local, and under `-s` only an *error* returns early; the
+  slurped array is dispatched with the filename intact iff the call that read
+  the final buffer exits its loop instead. `jv_parser_next` returns the moment
+  `scan()` completes a top-level value, so when that is the buffer's last byte
+  the call ends before its EOF branch, and the `Unfinished JSON term at EOF`
+  is only found by the *next* call, after the filter already ran.
+
+  A number or keyword is completed by the byte after it, a string or container
+  by its own last byte — which is the whole difference between `\x1e1{`
+  (`file:0`) and `\x1e"a"{` (`<unknown>`, the `{` scanned in the same call).
+  An error anywhere in the final buffer still returns early
+  (`\x1e[0,]\x1e1{` is `<unknown>`), one in an earlier buffer does not
+  (`\x1e1}\n\x1e2{` is line 1), and an empty final buffer has no last byte:
+  `\x1e` + spaces + `1{` keeps the position at 4094 and 4096 bytes and loses
+  it at 4095, where `fgets` fills its buffer exactly. The rule now lives with
+  the reader that produces the warnings
+  (`jq_seq_reader::SeqWarningWalk::slurp_position_lost`), replacing the
+  runner's own offset comparison.
+
+  Not reproduced, and recorded in `docs/compliance/jq/limitations.md`: jq
+  prints the runtime error *before* the deferred warning on these streams,
+  since the warning belongs to the next input read (`halt` suppresses it;
+  `input` turns it into a runtime error). succinctly still prints every
+  `--seq` warning before evaluating. Verified against jq 1.7.1 on 56 pinned
+  single-stream rows, the `fgets` boundaries, 8 multi-file splits, and
+  `scripts/jq-seq-oracle-sweep.py`'s new `--slurp-location` mode (3 seeds x
+  2,083 cases, 0 mismatches; 8 on the previous binary).
+
 - **An assignment applies each write as its path resolves, stopping on the
   first failure** (#2267). jq's `=` is
   `reduce path(paths) as $p (.; setpath($p; $value))` — one path pulled, its

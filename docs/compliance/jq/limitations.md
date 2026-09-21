@@ -4995,7 +4995,7 @@ Real jq's own `fgets` chunks at a newline *or* after 4095 bytes, whichever comes
 the drop is observable by padding alone: `\x1e1\n\x1e` + 4093 spaces + `\x1etrue` keeps
 `true`, and one byte more of padding drops it. `succinctly jq` now matches all of this,
 modeled in [`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs)'s
-`final_buffer_start`/`stop_at` and threaded through
+`final_buffer_start`/`drops_at_first_empty_record` and threaded through
 [`value_ranges`](../../../src/bin/succinctly/jq_seq_reader.rs) as a value-count cap rather
 than a byte offset (the value walk runs over the UTF-8-*substituted* stream, which can
 differ in length from jq's own raw bytes, but never in how many structural events it
@@ -5025,6 +5025,55 @@ $ printf '\x1e"a"\n\x1e"b"\n' | jq --seq -c '.'   # "a" and "b" -- trailing newl
 All three now match (`succinctly jq` reproduces every row above, including `-s`); before
 #2998 `succinctly jq` also printed `"b"` on the middle row.
 
+### `--seq -s` keeps its EOF location when the final byte completes a value (#3003)
+
+The same per-call local decides whether a runtime error under `--seq -s` can still name a
+file and line. #2947 established the rule: `<unknown>` is printed only when `read_more`
+closes a stream already at `feof`, which jq is made to do by its parser returning an *error*
+from the stream's final `fgets` buffer — the one outcome that `return`s early and makes
+`main` call back in. What #2947's model missed is that the EOF branch is not always reached
+in that call: `jv_parser_next` returns the moment `scan()` completes a top-level value, and
+if that happens on the final buffer's **last byte** the buffer is fully consumed
+(`has_more == 0`), the loop exits, and the slurped array is dispatched with the filename
+intact. The `Unfinished JSON term at EOF` for whatever that byte opened is only detected by
+the *next* `next_input` call, after the filter has already run. A number or keyword is
+completed by the byte *after* it; a string or container completes on its own last byte, so
+the opener after it is scanned in the same call and the position is lost as before:
+
+```
+$ printf '\x1e1{'          | jq --seq -s -c 'error("x")'   # jq: error (at <stdin>:0): x
+$ printf '\x1etrue"'       | jq --seq -s -c 'error("x")'   # jq: error (at <stdin>:0): x
+$ printf '\x1e"a"{'        | jq --seq -s -c 'error("x")'   # jq: error (at <unknown>): x
+$ printf '\x1e1{ '         | jq --seq -s -c 'error("x")'   # jq: error (at <unknown>): x
+$ printf '\x1e[0,]\x1e1{'  | jq --seq -s -c 'error("x")'   # jq: error (at <unknown>): x  (error in the final buffer)
+$ printf '\x1e1}\n\x1e2{'  | jq --seq -s -c 'error("x")'   # jq: error (at <stdin>:1): x  (error in an earlier one)
+```
+
+`succinctly jq` now matches every row (before #3003 the first two and the last answered
+`<unknown>`), including jq's 4095-byte `fgets` boundary — `\x1e` + spaces + `1{` keeps the
+position at 4094 and 4096 bytes and loses it at 4095, where `fgets` fills its buffer exactly
+and an *empty* final buffer follows — and across files, where the final buffer is the last
+file's own last chunk (`\x1e1` in one file and `{` in the next keeps `second:0`). The rule is
+[`jq_seq_reader::SeqWarningWalk::slurp_position_lost`](../../../src/bin/succinctly/jq_seq_reader.rs),
+read off the same walk that produces the warnings; `scripts/jq-seq-oracle-sweep.py
+--slurp-location` sweeps it.
+
+One consequence is deliberately not reproduced: **the order of the two stderr lines.** Real
+jq prints the runtime error first and the `ignoring parse error` line second on these
+streams, because the warning belongs to the call *after* the one that dispatched the array;
+succinctly prints every `--seq` warning inside `get_inputs`, before evaluating anything, so
+it comes first (the same materialize-then-evaluate cause as the stdout ordering note below).
+The deferred diagnostic is really the next input's parse error, so in real jq `halt` in the
+filter suppresses it entirely, and `input`/`inputs` in the filter turn it into a runtime
+error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5; `try input catch
+.` yields the message). None of that is modeled: `--seq` never queues a trailing parse error
+the way a plain JSON stream does (#2961), and the warning is always printed up front —
+[#3201](https://github.com/rust-works/succinctly/issues/3201). Two further malformed-BOM
+gaps the same probing surfaced are pre-existing and separate: the pre-RS record's *value*
+is dropped ([#3199](https://github.com/rust-works/succinctly/issues/3199)), and jq's
+per-refill `parser_reset` is modeled at newlines only, not at the 4095-byte `fgets`
+boundary ([#3200](https://github.com/rust-works/succinctly/issues/3200)).
+
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
 match without counting them as columns, and then re-runs `parser_reset` at the top of every
@@ -5036,7 +5085,10 @@ $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level num
                                           # -- not the abandoned-text template, despite no RS byte anywhere
 ```
 
-`succinctly jq` reproduces this on both stderr and stdout, including the pre-RS `1` jq reads.
+`succinctly jq` reproduces the stderr side of this exactly. The stdout side does not yet
+match: the pre-RS `1` jq reads is never emitted (`printf '\xef\xbb1 2' | succinctly jq
+--seq -c .` prints nothing, jq prints `1`) —
+[#3199](https://github.com/rust-works/succinctly/issues/3199).
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
 materializes `--seq` input before evaluating, so all warnings precede all values. jq's

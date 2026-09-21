@@ -58,10 +58,20 @@
 //! `fgets` refill. A later call reusing the same (already-final) buffer,
 //! because an earlier call already returned something from it, has no
 //! fresh refill to reset that local, so it keeps looping internally
-//! instead and absorbs any number of further empty records. `stop_at`/
-//! `yielded_in_final_buffer`/`stopped` on [`Reader`] model exactly that:
-//! the drop point is [`final_buffer_start`], not a byte the scanner itself
-//! finds anything wrong with.
+//! instead and absorbs any number of further empty records.
+//! `final_buffer_start`/`yielded_in_final_buffer`/`stopped` on [`Reader`]
+//! model exactly that: the drop point is [`final_buffer_start`], not a byte
+//! the scanner itself finds anything wrong with.
+//!
+//! **The same local decides `--seq -s`'s error location (#2947/#3003).**
+//! Under `-s` nothing is dropped, but whether a later runtime error can
+//! name `file:line` or must say `<unknown>` is again a question about
+//! *which call* did what: the slurped array keeps its position iff the
+//! call that performed the terminal refill returns it without first
+//! returning an error -- which an error in the final buffer prevents, and
+//! which the EOF branch prevents unless the buffer's last byte completed a
+//! value and so ended the call before that branch ran. See
+//! [`SeqWarningWalk::slurp_position_lost`] for the full derivation.
 
 use crate::front_matter::UTF8_BOM;
 
@@ -89,23 +99,18 @@ const JQ_FGETS_CHUNK: usize = 4095;
 /// empty (or newline-free) trailing source from inheriting an earlier
 /// source's chunk boundary.
 ///
-/// Shared by two callers that both need "does offset X fall in jq's last
-/// buffer": [`super::jq_runner::seq_stream_trailing_record_is_dropped`]
-/// (a diagnostic's position, under `-s`) and the non-slurp end-of-stream
-/// rule below (a *value*, under non-`-s` -- #2998). Returns the stream's
-/// own total length when the final buffer is empty, so a caller comparing
-/// `offset >= final_buffer_start` correctly finds nothing: no real offset
-/// ever reaches the stream's own length.
-pub(crate) fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> usize {
-    let total = raw_bytes.iter().map(|(_, raw)| raw.len()).sum::<usize>();
-    final_buffer_start_from_total(raw_bytes, total)
-}
-
-/// [`final_buffer_start`], taking the stream's total byte length from the
-/// caller instead of re-summing it -- [`for_each_warning`] already has it
-/// from its own `boundaries` walk, and a second `Vec`-of-lengths reduction
-/// over the same sources on every non-slurp call was pure waste.
-fn final_buffer_start_from_total(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> usize {
+/// Two rules hang off "does offset X fall in jq's last buffer": `-s`'s
+/// EOF-location answer ([`SeqWarningWalk::slurp_position_lost`] -- a
+/// diagnostic's position) and the non-slurp end-of-stream rule (a *value*,
+/// #2998). Returns the stream's own total length when the final buffer is
+/// empty, so a caller comparing `offset >= final_buffer_start` correctly
+/// finds nothing: no real offset ever reaches the stream's own length --
+/// and `final_buffer_start == total` is how that emptiness is read back.
+///
+/// `total` is the stream's byte length, which [`for_each_warning`] already
+/// has from its own `boundaries` walk; a second `Vec`-of-lengths reduction
+/// over the same sources on every call was pure waste.
+fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> usize {
     let last: &[u8] = raw_bytes.last().map_or(&[], |(_, raw)| raw.as_slice());
     let last_start = total - last.len();
 
@@ -227,7 +232,9 @@ fn indexed_stream_bytes(
 /// silently once it reaches jq's own `fgets`-chunked final buffer -- see
 /// [`SeqWarningWalk::value_cap`] and [`final_buffer_start`] (#2998). `-s`
 /// keeps looping (`has_more`), so this never applies there; passing
-/// `slurp: true` disables it, matching jq's own mode split exactly.
+/// `slurp: true` disables it, matching jq's own mode split exactly. The
+/// walk's other answer, [`SeqWarningWalk::slurp_position_lost`], is
+/// computed either way and only read under `-s`.
 pub(crate) fn for_each_warning(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
@@ -255,7 +262,7 @@ pub(crate) fn for_each_warning(
     // subsequent one), matching `indexed_stream_bytes`'s undecorated
     // numbering. The running total this scan ends on is also the stream's
     // whole length, reused below instead of a second `.sum()` over the same
-    // sources -- both `stop_at` and the EOF answer need it.
+    // sources -- both `final_buffer_start` and the EOF answer need it.
     let mut boundaries = raw_bytes
         .iter()
         .scan(0usize, |end, (_, raw)| {
@@ -265,26 +272,18 @@ pub(crate) fn for_each_warning(
         .collect::<Vec<usize>>();
     let total = boundaries.last().copied().unwrap_or(0);
     boundaries.pop();
-    // `usize::MAX` under `-s`: no real offset in the stream ever reaches
-    // it, so the comparison in `scan`'s RS branch can never fire (#2998).
-    reader.stop_at = if slurp {
-        usize::MAX
-    } else {
-        final_buffer_start_from_total(raw_bytes, total)
-    };
+    let final_buffer_start = final_buffer_start(raw_bytes, total);
+    reader.final_buffer_start = final_buffer_start;
+    reader.drops_at_first_empty_record = !slurp;
     reader.run(indexed_stream_bytes(raw_bytes), &boundaries, None);
-    // The same pass answers `--seq -s`'s EOF-location question; see
-    // [`last_parse_error_offset`], which is this function with the
-    // warnings thrown away.
-    let last_parse_error_offset = reader.last_warning_offset.map(|offset| {
-        if reader.last_warning_at_eof {
-            total
-        } else {
-            offset
-        }
-    });
+    // The same pass answers `--seq -s`'s EOF-location question; see the
+    // field's docs for the rule. `final_buffer_start == total` is how
+    // [`final_buffer_start`] spells an *empty* final buffer.
+    let slurp_position_lost = reader.warned_in_final_buffer
+        || (reader.last_warning_at_eof
+            && !(reader.last_byte_yielded_value && final_buffer_start < total));
     SeqWarningWalk {
-        last_parse_error_offset,
+        slurp_position_lost,
         value_cap: reader.stopped.then_some(reader.values.len()),
     }
 }
@@ -293,8 +292,120 @@ pub(crate) fn for_each_warning(
 /// answers, bundled so a caller that needs both questions (the ordinary
 /// non-`-n` case, `jq_runner`'s own call site) pays for the walk once.
 pub(crate) struct SeqWarningWalk {
-    /// See [`last_parse_error_offset`].
-    pub(crate) last_parse_error_offset: Option<usize>,
+    /// Whether `--seq -s`'s runtime-error location is lost entirely -- real
+    /// jq answering `(at <unknown>)` where it would otherwise name a file
+    /// and line (#1542/#1550/#1568/#2947/#3003). Only meaningful under
+    /// `-s`; a non-slurp stream carries a location per value instead.
+    ///
+    /// **The mechanism, from jq 1.7.1's own `src/util.c`.** `<unknown>` is
+    /// not a property of the trailing record at all:
+    /// `jq_util_input_get_position` renders it whenever `current_filename`
+    /// is not a string, and the only thing that clears that field is
+    /// `jq_util_input_read_more` closing the stream it was already standing
+    /// on -- which it does on entry, but *only* when that stream is already
+    /// at `feof`, and then immediately re-sets the field if another file
+    /// follows. So the question reduces to: does jq call `read_more` one
+    /// more time after the input is exhausted, *before* the slurped array
+    /// is handed to the filter?
+    ///
+    /// `jq_util_input_next_input` keeps `is_last` -- "did this call perform
+    /// the refill that set `feof`" -- in a **local**, reset on every call.
+    /// Under `-s` a value never returns early (it is appended to `slurped`);
+    /// only a parser **error** does, and an early `return` makes `main` call
+    /// back in with `is_last` at 0 again, so that re-entered call is forced
+    /// through one more `read_more`, which closes the stream. The slurped
+    /// array therefore reaches the filter with the filename intact iff the
+    /// call that performed the terminal refill exits through its own
+    /// `while (!is_last || has_more)` condition -- iff it returns no error.
+    ///
+    /// **Which errors are fatal, then, is decided by jq's `fgets`
+    /// chunking**: an error detected on a chunk that still has a refill
+    /// behind it (or a next file to open) survives; only one detected while
+    /// jq is working on the stream's **final buffer** leaves nothing to
+    /// refill from. `read_more` calls `fgets(buf, sizeof(buf), f)` on a
+    /// `char buf[4096]`, so a chunk ends at a newline or after 4095 bytes,
+    /// whichever comes first (see [`final_buffer_start`]) -- and `feof` is
+    /// set only by an `fgets` that actually ran out of input, which is why
+    /// a chunk ending on a newline, or filling the buffer exactly, is
+    /// followed by one more (empty) buffer, where a truncation is finally
+    /// reported `at EOF`.
+    ///
+    /// **The EOF branch is not always reached in that call (#3003).**
+    /// `jv_parser_next` returns the moment `scan()` completes a top-level
+    /// value; if that happens on the final buffer's *last* byte, the buffer
+    /// is fully consumed (`has_more == 0`), the loop exits, and the array
+    /// is dispatched -- the `Unfinished JSON term at EOF` for whatever that
+    /// byte opened is only detected by the *next* `next_input` call, after
+    /// the filter already ran with the position intact (which is also why
+    /// real jq prints the runtime error *before* that warning). A number or
+    /// keyword is completed by the byte after it, so `\x1e1{` and
+    /// `\x1etrue"` keep `file:0`; a string or container completes on its
+    /// own last byte, so `\x1e"a"{` and `\x1e{}{` still scan the `{` in the
+    /// same call, fall into the EOF branch there, and lose it.
+    ///
+    /// Hence the rule, all of it read off the same scan that produces the
+    /// diagnostics: lost iff a mid-stream error was detected in the final
+    /// buffer, or the EOF branch reported one and that branch ran in the
+    /// terminal-refill call -- i.e. unless the final buffer is non-empty and
+    /// its last byte's scan handed a value over.
+    ///
+    /// Worked examples, all oracle-verified against jq 1.7.1 -- note that
+    /// the record text is identical within each pair, and only the bytes
+    /// *after* the failure differ:
+    ///
+    /// ```text
+    /// \x1e[0,]        error on `]` @4, final buffer starts at 0    => <unknown>
+    /// \x1e[0,]\n      error on `]` @4, final buffer starts at 6    => file:1
+    /// \x1e0\x1e       error on RS  @2, final buffer starts at 0    => <unknown>
+    /// \x1e0\x1e\n     error on RS  @2, final buffer starts at 4    => file:1
+    /// \x1e"unterm\n   error at EOF, final buffer empty             => <unknown>
+    /// \x1e1{          `{` yields 1 on the last byte; EOF error later => file:0
+    /// \x1e"a"{        `"` yields "a", `{` scanned in-call; EOF error => <unknown>
+    /// \x1e[0,]\x1e1{  error on `]` @4 in the final buffer           => <unknown>
+    /// \x1e1}\n\x1e2{  error on `}` @2, before the final buffer @4   => file:1
+    /// ```
+    ///
+    /// The buffer size is observable, not a detail: `\x1e[0,]` padded with
+    /// spaces to 4094 bytes answers `<unknown>`, and one byte more answers
+    /// `file:0`, because at 4095 `fgets` stops on the size limit rather
+    /// than on EOF, so a further (empty) buffer follows. The same boundary
+    /// cuts the other way for `\x1e` + spaces + `1{`: 4094 and 4096 bytes
+    /// keep `file:0`, 4095 loses it -- an empty final buffer has no last
+    /// byte to complete anything on.
+    ///
+    /// The `\x1e"unterm\n` row is why a newline cannot simply be read as
+    /// "recovery": it restores the position after a record jq has
+    /// *finished* rejecting, but a newline swallowed by an unterminated
+    /// string is just more string, and the failure still lands at EOF, in
+    /// the final buffer.
+    ///
+    /// Three shapes fall out of this rule rather than needing their own
+    /// cases, each oracle-verified:
+    ///
+    /// - **No RS byte anywhere.** RFC 7464 requires every record to start
+    ///   with one, so jq's reader never syncs onto anything and reports
+    ///   `Unfinished abandoned text at EOF` -- an error, in the final
+    ///   buffer, for *any* content including none at all. A lone empty
+    ///   file therefore answers `<unknown>` too.
+    /// - **An empty trailing file after real content.** It is opened,
+    ///   which re-sets `current_filename` and zeroes the line, and
+    ///   contributes no bytes to fail on -- so `a.json` holding `\x1e[0,]`
+    ///   and an empty `b.json` reports `b.json:0`, not `<unknown>`.
+    ///   Measuring the final buffer from the *last file's* start, not the
+    ///   stream's, is what gets this right.
+    /// - **A malformed record earlier in the stream**, resynced by a later
+    ///   valid record (#1542): its error is not in the final buffer, so the
+    ///   position is intact.
+    ///
+    /// Raw bytes, before the UTF-8 substitution `get_inputs` applies, for
+    /// the same reason `seq_no_rs_byte_warning` takes them: an invalid byte
+    /// becomes a 3-byte U+FFFD, which both moves every offset and changes
+    /// what the reader sees. `\x80` substitutes to `EF BF BD`, whose first
+    /// two bytes are a *malformed* BOM prefix -- which flips the reader out
+    /// of `WaitingForRs` and makes it read the replacement character as a
+    /// record. Handing it the normalized string answered `<unknown>` for
+    /// `\x80\x1e`, where jq answers line 0.
+    pub(crate) slurp_position_lost: bool,
     /// `Some(n)` when real jq's non-slurp `--seq` driver silently ends the
     /// stream after producing exactly `n` values (#2998) -- `None` under
     /// `-s`, or when nothing is dropped.
@@ -353,46 +464,20 @@ pub(crate) fn value_ranges(
     values
 }
 
-/// The byte offset jq's own parser was standing at when it last returned a
-/// parse error to its caller over this whole stream, or `None` if it never
-/// returned one.
-///
-/// This is the raw material for the `--seq -s` EOF-location question --
-/// whether real jq still has a `file:line` to point a runtime error at, or
-/// answers `<unknown>`; see
-/// [`super::jq_runner::seq_stream_trailing_record_is_dropped`], which owns
-/// the rule and the reasoning.
-///
-/// Literally [`for_each_warning`] with the warnings thrown away -- the
-/// stderr diagnostics and this question are the same walk, and the wired
-/// call site runs it once and uses the answer twice rather than paying for
-/// a second pass over the whole stream.
+/// [`SeqWarningWalk::slurp_position_lost`] on its own: literally
+/// [`for_each_warning`] with the warnings thrown away. The stderr
+/// diagnostics and this question are the same walk, and the ordinary call
+/// site runs it once and uses both answers rather than paying for a second
+/// pass over the whole stream; this is for the two `-s` call sites that
+/// print no warnings from the walk (#1525's own template, and `-n`/DSV) but
+/// still need the location.
 ///
 /// Takes the same raw, pre-UTF-8-substitution sources that function does,
-/// and for the same reason -- a substituted byte is a 3-byte U+FFFD,
-/// which moves every offset *and* can masquerade as a malformed BOM, whose
+/// and for the same reason -- a substituted byte is a 3-byte U+FFFD, which
+/// moves every offset *and* can masquerade as a malformed BOM, whose
 /// handling above changes what the reader treats as a record at all.
-/// Offsets are absolute in that raw stream (BOM bytes included in the
-/// count, though never scanned), so a caller can compare one against a
-/// position it computed itself -- a file boundary, a newline -- over the
-/// same sources.
-///
-/// An `at EOF` diagnostic is reported at the stream's length, so that
-/// "detected at real EOF" sorts after every byte -- which is exactly how
-/// the caller's comparison needs it, since EOF is by definition reached on
-/// the final buffer. That is taken from [`Reader::last_warning_at_eof`]
-/// rather than from the running offset: a stream consumed entirely as a
-/// BOM prefix scans no bytes at all, leaving the offset at 0.
-///
-/// `slurp` only matters to [`for_each_warning`]'s other question (#2998);
-/// this one -- where jq's own parser last raised an error -- is unaffected
-/// by it, but the parameter still has to be threaded through since the two
-/// answers now come from a single walk.
-pub(crate) fn last_parse_error_offset(
-    raw_bytes: &[(Option<usize>, Vec<u8>)],
-    slurp: bool,
-) -> Option<usize> {
-    for_each_warning(raw_bytes, slurp, &mut |_| {}).last_parse_error_offset
+pub(crate) fn slurp_eof_position_lost(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> bool {
+    for_each_warning(raw_bytes, true, &mut |_| {}).slurp_position_lost
 }
 
 /// The kinds jq's parser distinguishes while classifying a failure. It
@@ -487,26 +572,30 @@ struct Reader<'a> {
     /// See [`for_each_warning`]: a malformed BOM plus a newline-terminated
     /// stream means jq's own EOF report is wiped before it is written.
     suppress_eof_warning: bool,
-    /// [`Reader::offset`] as of the most recent [`Reader::warn`] call --
-    /// i.e. where jq's own parser was standing when it last returned an
-    /// error to its caller. See [`last_parse_error_offset`].
-    last_warning_offset: Option<usize>,
-    /// Whether that warning came from [`Reader::finish`], jq's EOF branch.
-    /// Tracked rather than inferred from the offset: a stream whose bytes
-    /// are *all* consumed as a BOM prefix scans nothing at all, so the
-    /// running offset never leaves 0 and cannot stand in for "at the end".
+    /// Whether the most recent [`Reader::warn`] came from [`Reader::finish`],
+    /// jq's EOF branch. `finish` warns at most once and runs last, so this
+    /// is also "did the EOF branch report anything". Tracked rather than
+    /// inferred from the offset: a stream whose bytes are *all* consumed as
+    /// a BOM prefix scans nothing at all, so the running offset never
+    /// leaves 0 and cannot stand in for "at the end".
     last_warning_at_eof: bool,
     /// Set once the byte loop is done, so [`Reader::warn`] can tell jq's
     /// EOF branch apart from a mid-stream detection.
     at_eof: bool,
-    /// Real jq's own non-slurp end-of-stream rule (#2998): the raw offset
-    /// where jq's final `fgets` buffer begins (see [`final_buffer_start`]),
-    /// or `usize::MAX` under `-s`/when the caller has nothing to enforce --
-    /// no real offset ever reaches that, so the comparison below can never
-    /// fire.
-    stop_at: usize,
+    /// The raw offset where jq's final `fgets` buffer begins (see
+    /// [`final_buffer_start`]), or `usize::MAX` when the caller has no
+    /// stream shape to enforce ([`value_ranges`]) -- no real offset ever
+    /// reaches that, so none of the comparisons below can fire. Two rules
+    /// hang off it: the non-slurp end-of-stream drop (#2998, gated by
+    /// [`Reader::drops_at_first_empty_record`]) and `-s`'s EOF-location
+    /// answer (#3003, [`SeqWarningWalk::slurp_position_lost`]).
+    final_buffer_start: usize,
+    /// Whether real jq's non-slurp end-of-stream rule (#2998) applies:
+    /// `-s` keeps its own `has_more` loop going past the event that ends a
+    /// non-slurp stream, so the drop below never fires there.
+    drops_at_first_empty_record: bool,
     /// Whether a value or a warning has already been produced at an offset
-    /// `>= stop_at`. jq's own driver (`jq_util_input_next_input`,
+    /// `>= final_buffer_start`. jq's own driver (`jq_util_input_next_input`,
     /// `src/util.c`) tracks "is this the buffer that just got refilled"
     /// (`is_last`) as a *local*, reset on every call: only the specific
     /// call that performs the terminal refill can exit silently on a
@@ -517,6 +606,18 @@ struct Reader<'a> {
     /// further empty records without dropping anything. This flag is that
     /// "already returned something from this buffer" condition.
     yielded_in_final_buffer: bool,
+    /// Whether a *mid-stream* warning (not the EOF branch's) was raised at
+    /// an offset `>= final_buffer_start`. Under `-s` that is an early
+    /// `return` out of the very `next_input` call that performed the
+    /// terminal refill, which is what costs jq its position (#2947/#3003);
+    /// see [`SeqWarningWalk::slurp_position_lost`].
+    warned_in_final_buffer: bool,
+    /// Whether scanning the stream's *last* byte handed a value to the
+    /// caller -- jq's `jv_parser_next` returning `OK` with its buffer fully
+    /// consumed, so `has_more == 0` and the EOF branch is never reached in
+    /// that call (#3003). Captured per byte inside [`Reader::run`]'s loop:
+    /// a value [`Reader::finish`] itself completes is not this.
+    last_byte_yielded_value: bool,
     /// Set once [`Reader::scan`]'s empty-record reset hits jq's drop point:
     /// [`Reader::run`] stops scanning immediately and skips [`Reader::finish`]
     /// entirely, since real jq's `p->eof` is never set on this path -- no
@@ -550,21 +651,25 @@ impl<'a> Reader<'a> {
             completed: None,
             values: Vec::new(),
             suppress_eof_warning: false,
-            last_warning_offset: None,
             last_warning_at_eof: false,
             at_eof: false,
-            stop_at: usize::MAX,
+            final_buffer_start: usize::MAX,
+            drops_at_first_empty_record: false,
             yielded_in_final_buffer: false,
+            warned_in_final_buffer: false,
+            last_byte_yielded_value: false,
             stopped: false,
             emit,
         }
     }
 
     fn warn(&mut self, body: &str) {
-        self.last_warning_offset = Some(self.offset);
         self.last_warning_at_eof = self.at_eof;
-        if self.offset >= self.stop_at {
+        if self.offset >= self.final_buffer_start {
             self.yielded_in_final_buffer = true;
+            if !self.at_eof {
+                self.warned_in_final_buffer = true;
+            }
         }
         (self.emit)(&format!("jq: ignoring parse error: {body}"));
     }
@@ -657,6 +762,11 @@ impl<'a> Reader<'a> {
                     self.reset();
                 }
             }
+            // Captured here, per byte, rather than read after the loop:
+            // `finish` re-sets `produced_value` for a value jq's EOF branch
+            // completes, which is not an `OK` return on the last byte
+            // (#3003).
+            self.last_byte_yielded_value = self.produced_value;
             self.produced_value = false;
             if self.stopped {
                 // jq's stream ends *here*: `p->eof` is never set on this
@@ -686,7 +796,7 @@ impl<'a> Reader<'a> {
 
     fn flush_completed(&mut self) {
         if let Some(range) = self.completed.take() {
-            if self.offset >= self.stop_at {
+            if self.offset >= self.final_buffer_start {
                 self.yielded_in_final_buffer = true;
             }
             self.values.push(range);
@@ -731,8 +841,11 @@ impl<'a> Reader<'a> {
             // the stream's final `fgets` buffer -- any later call reusing
             // the same buffer (because an earlier call already returned a
             // value or an error from it) simply loops and keeps parsing.
-            // #2998.
-            if self.offset >= self.stop_at && !self.yielded_in_final_buffer {
+            // #2998. `-s` has its own `has_more` loop and never stops here.
+            if self.drops_at_first_empty_record
+                && self.offset >= self.final_buffer_start
+                && !self.yielded_in_final_buffer
+            {
                 self.stopped = true;
             }
             self.reset();
@@ -1049,7 +1162,7 @@ impl<'a> Reader<'a> {
             // #1525's template. The *stderr* call site never reaches this
             // -- `for_each_warning` routes a stream with no RS byte to
             // `seq_no_rs_byte_warning` instead -- but
-            // `last_parse_error_offset` does, and depends on it: this arm
+            // `slurp_eof_position_lost` does, and depends on it: this arm
             // is what makes an RS-less stream (down to an empty one, which
             // jq abandons just the same) answer `<unknown>` rather than a
             // position. Not dead code.
@@ -1309,6 +1422,105 @@ mod tests {
             );
         });
         got
+    }
+
+    fn position_lost(sources: &[&[u8]]) -> bool {
+        let owned: Vec<(Option<usize>, Vec<u8>)> =
+            sources.iter().map(|s| (None, s.to_vec())).collect();
+        slurp_eof_position_lost(&owned)
+    }
+
+    /// `--seq -s`'s EOF-location rule, on the shapes #2947 tabulated and the
+    /// same-call exit #3003 adds. Every row is jq 1.7.1's own answer
+    /// (`(at file:N)` = kept, `(at <unknown>)` = lost); the CLI tests pin
+    /// the rendered line, this pins the walk's answer without a process
+    /// spawn.
+    #[test]
+    fn slurp_position_is_lost_exactly_when_jqs_terminal_call_returns_an_error_2947_3003() {
+        // #2947: an error in the final buffer, or at EOF, loses it; one an
+        // earlier refill can recover from does not.
+        for (stream, lost) in [
+            (&b"\x1e[0,]"[..], true),
+            (b"\x1e[0,]\n", false),
+            (b"\x1e0\x1e", true),
+            (b"\x1e0\x1e\n", false),
+            (b"\x1e\"unterm\n", true),
+            (b"\x1e1\n\x1e[0,]", true),
+            (b"\x1e1\n\x1e[0,]\n", false),
+            (b"", true),
+            (b"1\n", true),
+            (b"\xef\xbb\xbf", true),
+        ] {
+            assert_eq!(position_lost(&[stream]), lost, "{stream:?}");
+        }
+        // #3003: the final buffer's last byte completing a value ends the
+        // terminal call before its EOF branch -- unless an error in that
+        // buffer already returned early, or the buffer is empty.
+        for (stream, lost) in [
+            (&b"\x1e1{"[..], false),
+            (b"\x1e1[", false),
+            (b"\x1etrue{", false),
+            (b"\x1etrue\"", false),
+            (b"\x1e1 2{", false),
+            (b"\x1e1 \x1e2{", false),
+            (b"\x1e1\n\x1e2{", false),
+            (b"\x1e1}\n\x1e2{", false),
+            (b"\xef\xbb\xbf\x1e1{", false),
+            // Value completed before the last byte: `{` is scanned in-call.
+            (b"\x1e\"a\"{", true),
+            (b"\x1e{}{", true),
+            (b"\x1e[1]{", true),
+            (b"\x1e1 {", true),
+            // An error in the final buffer.
+            (b"\x1e[0,]\x1e1{", true),
+            (b"\x1e1\x1e{", true),
+            (b"\x1e1{\x1e", true),
+            (b"\x1e1{\"", true),
+            // The issue's own controls.
+            (b"\x1e1{ ", true),
+            (b"\x1e1{\n", true),
+            (b"\x1e1}", true),
+            (b"\x1e{", true),
+            // Nothing unfinished at all.
+            (b"\x1etrue", false),
+            (b"\x1e1{}", false),
+            (b"\x1e1{ \x1e", false),
+        ] {
+            assert_eq!(position_lost(&[stream]), lost, "{stream:?}");
+        }
+        // The final buffer must be non-empty: at exactly 4095 bytes `fgets`
+        // fills its buffer and an empty one follows.
+        let padded = |spaces: usize| {
+            let mut v = b"\x1e".to_vec();
+            v.extend(std::iter::repeat_n(b' ', spaces));
+            v.extend_from_slice(b"1{");
+            v
+        };
+        assert!(!position_lost(&[&padded(4094 - 3)]));
+        assert!(position_lost(&[&padded(4095 - 3)]));
+        assert!(!position_lost(&[&padded(4096 - 3)]));
+        assert!(position_lost(&[&padded(8190 - 3)]));
+        assert!(!position_lost(&[&padded(8191 - 3)]));
+        // Multi-file: the final buffer is the last file's; an earlier
+        // file's newline-free tail is partial and joins it.
+        assert!(!position_lost(&[b"\x1e1", b"{"]));
+        assert!(position_lost(&[b"\x1e1{", b""]));
+        assert!(position_lost(&[b"\x1e1{", b" "]));
+        assert!(position_lost(&[b"\x1e1{", b"\x1e2{"]));
+        assert!(!position_lost(&[b"\x1e1{", b"}"]));
+        assert!(!position_lost(&[b"\x1e[0,]", b""]));
+    }
+
+    /// The #3003 answer is read off the same walk as the diagnostics and
+    /// the values: keeping the position changes neither.
+    #[test]
+    fn final_byte_rule_leaves_warnings_and_values_alone_3003() {
+        assert_eq!(
+            warnings_slurp(&[b"\x1e1{"]),
+            ["Unfinished JSON term at EOF at line 1, column 3"],
+        );
+        assert_eq!(seq_value_texts(b"\x1e1{", true), vec!["1"]);
+        assert_eq!(seq_value_texts(b"\x1e1{", false), vec!["1"]);
     }
 
     /// [`final_buffer_start`]'s own boundary arithmetic: real jq's `fgets`

@@ -4391,7 +4391,7 @@ fn get_inputs(
     // question, so it runs once here and is used twice -- a second pass
     // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
     // (interleaved A/B, release, output-identity gated).
-    let mut seq_last_parse_error = None;
+    let mut seq_slurp_position_lost = false;
     // #2998: real jq's non-slurp `--seq` driver can end the *entire*
     // stream silently once it reaches jq's own `fgets`-chunked final
     // buffer -- a property of jq's raw byte chunking, not of the JSON
@@ -4413,27 +4413,30 @@ fn get_inputs(
         // that leaves the parser reading rather than waiting for an RS, so
         // the reader owns that case too (#1723).
         let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
-        seq_last_parse_error = match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
-            Some(warning) => {
-                eprintln!("{warning}");
-                // #1525's arm prints its own template instead of the
-                // reader's, but the location still needs the walk. A
-                // stream with no RS byte anywhere yields nothing, so this
-                // is the degenerate input, never the hot path -- and
-                // `seq_value_cap` stays `None`, correctly: nothing ever
-                // leaves `WAITING_FOR_RS`, so no value can exist to cap.
-                crate::jq_seq_reader::last_parse_error_offset(&raw_bytes, args.slurp)
-            }
-            None => {
-                let walk = crate::jq_seq_reader::for_each_warning(
-                    &raw_bytes,
-                    args.slurp,
-                    &mut |warning| eprintln!("{warning}"),
-                );
-                seq_value_cap = walk.value_cap;
-                walk.last_parse_error_offset
-            }
-        };
+        seq_slurp_position_lost =
+            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
+                Some(warning) => {
+                    eprintln!("{warning}");
+                    // #1525's arm prints its own template instead of the
+                    // reader's, but the location still needs the walk. A
+                    // stream with no RS byte anywhere yields nothing, so
+                    // this is the degenerate input, never the hot path --
+                    // and `seq_value_cap` stays `None`, correctly: nothing
+                    // ever leaves `WAITING_FOR_RS`, so no value can exist
+                    // to cap. Only read under `-s` below, so the walk is
+                    // skipped otherwise.
+                    args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
+                }
+                None => {
+                    let walk = crate::jq_seq_reader::for_each_warning(
+                        &raw_bytes,
+                        args.slurp,
+                        &mut |warning| eprintln!("{warning}"),
+                    );
+                    seq_value_cap = walk.value_cap;
+                    walk.slurp_position_lost
+                }
+            };
     } else if !args.slurp && seq_stream_shape {
         // The only way this function still runs `build_seq_values` with
         // `seq_warnings_apply` false is `-n` forcing a real read: DSV and
@@ -4452,12 +4455,13 @@ fn get_inputs(
     let seq_trailing_record_dropped = args.slurp && args.seq && !args.raw_input && {
         // The gates differ: `--input-dsv` and `-n` skip the warnings but
         // can still reach the location, so those pay for their own walk.
-        let last_error = if seq_warnings_apply {
-            seq_last_parse_error
+        // The rule itself lives with the reader:
+        // `jq_seq_reader::SeqWarningWalk::slurp_position_lost`.
+        if seq_warnings_apply {
+            seq_slurp_position_lost
         } else {
-            crate::jq_seq_reader::last_parse_error_offset(&raw_bytes, args.slurp)
-        };
-        seq_stream_trailing_record_is_dropped(&raw_bytes, last_error)
+            crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
+        }
     };
 
     // All reads happen first, then decoding: a later file's read error still
@@ -5632,11 +5636,11 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// runs [`parse_json_seq_with_ends`] over it exactly once -- matching real
 /// jq's own `-s` reader, which treats the entire multi-file input as one
 /// continuous RFC 7464 byte stream and doesn't stop scanning a record at a
-/// file boundary. This is what makes `seq_trailing_record_is_dropped`'s own
-/// ambiguous-bare-number-at-EOF check come out correct too: run against the
-/// *true* full stream, it can only ever see genuine end-of-input, never a
-/// false EOF at some earlier file's own end -- no separate per-file
-/// special-casing needed for that interaction.
+/// file boundary. The reader's own EOF-location rule
+/// (`jq_seq_reader::SeqWarningWalk::slurp_position_lost`) walks the same
+/// full stream for the same reason: it can only ever see genuine
+/// end-of-input, never a false EOF at some earlier file's own end -- no
+/// separate per-file special-casing needed for that interaction.
 ///
 /// `!slurp` locations still need each value's own *file* and *file-local*
 /// line, not the byte offset's raw position in the throwaway `combined`
@@ -5912,106 +5916,6 @@ fn parse_json_seq_with_ends(
                 .map(|value| (value, end))
         })
         .collect()
-}
-
-/// Whether `--seq -s`'s runtime-error location is lost entirely -- real
-/// jq answering `(at <unknown>)` where it would otherwise name a file and
-/// line (#1542/#1550/#1568/#2947).
-///
-/// **The mechanism, from jq 1.7.1's own `src/util.c`.** `<unknown>` is not
-/// a property of the trailing record at all: `jq_util_input_get_position`
-/// renders it whenever `current_filename` is not a string, and the only
-/// thing that clears that field is `jq_util_input_read_more` closing the
-/// stream it was already standing on -- which it does on entry, but *only*
-/// when that stream is already at `feof`, and then immediately re-sets the
-/// field if another file follows. So the question reduces to: does jq call
-/// `read_more` one more time after the input is exhausted?
-///
-/// It does exactly when its parser hands `jq_util_input_next_input` an
-/// **error** rather than a value or a quiet end-of-buffer, because an
-/// error is the one outcome that `return`s early, out of the read/parse
-/// loop, forcing `main` to call back in -- and that call re-enters at the
-/// top, where `jv_parser_remaining() == 0` triggers the fatal `read_more`.
-/// A value, or nothing at all, leaves through the `while (!is_last ||
-/// has_more)` condition instead, with the filename intact.
-///
-/// **Which errors are fatal to the position, then, is decided by jq's
-/// `fgets` chunking**: an error detected on a chunk that still has a
-/// refill behind it (or a next file to open) survives; only one detected
-/// while jq is working on the stream's **final buffer** leaves nothing to
-/// refill from. `read_more` calls `fgets(buf, sizeof(buf), f)` on a
-/// `char buf[4096]`, so a chunk ends at a newline or after 4095 bytes,
-/// whichever comes first (see [`jq_seq_reader::final_buffer_start`], which
-/// this function shares with the non-slurp end-of-stream rule -- #2998) --
-/// and `feof` is set only by an `fgets` that actually ran out of input,
-/// which is why a chunk ending on a newline, or filling the buffer
-/// exactly, is followed by one more (empty) buffer, where a truncation is
-/// finally reported `at EOF`.
-///
-/// Hence the whole rule, and why it is one comparison. `last_parse_error`
-/// is where jq last failed, from the reader that models jq's `scan()` loop
-/// and so already knows the *moment of detection* rather than merely what
-/// was wrong; this function works out where the final buffer starts and
-/// asks whether that moment falls inside it. The caller supplies the
-/// offset because the same walk produces jq's stderr diagnostics -- see
-/// [`jq_seq_reader::for_each_warning`] and its
-/// [`last_parse_error_offset`](jq_seq_reader::last_parse_error_offset)
-/// alias -- and is run once for both.
-///
-/// Worked examples, all oracle-verified against jq 1.7.1 -- note that the
-/// record text is identical within each pair, and only the bytes *after*
-/// the failure differ:
-///
-/// ```text
-/// \x1e[0,]        error on `]` @4, final buffer starts at 0   => <unknown>
-/// \x1e[0,]\n      error on `]` @4, final buffer starts at 6   => file:1
-/// \x1e0\x1e       error on RS  @2, final buffer starts at 0   => <unknown>
-/// \x1e0\x1e\n     error on RS  @2, final buffer starts at 4   => file:1
-/// \x1e"unterm\n   error at EOF @9, final buffer starts at 9   => <unknown>
-/// ```
-///
-/// The buffer size is observable, not a detail: `\x1e[0,]` padded with
-/// spaces to 4094 bytes answers `<unknown>`, and one byte more answers
-/// `file:0`, because at 4095 `fgets` stops on the size limit rather than
-/// on EOF, so a further (empty) buffer follows.
-///
-/// The last of those is why a newline cannot simply be read as "recovery":
-/// it restores the position after a record jq has *finished* rejecting,
-/// but a newline swallowed by an unterminated string is just more string,
-/// and the failure still lands at EOF, in the final buffer.
-///
-/// Three shapes fall out of this rule rather than needing their own cases,
-/// each oracle-verified:
-///
-/// - **No RS byte anywhere.** RFC 7464 requires every record to start with
-///   one, so jq's reader never syncs onto anything and reports
-///   `Unfinished abandoned text at EOF` -- an error, in the final buffer,
-///   for *any* content including none at all. A lone empty file therefore
-///   answers `<unknown>` too, where a stale local rule used to make
-///   emptiness an exception.
-/// - **An empty trailing file after real content.** It is opened, which
-///   re-sets `current_filename` and zeroes the line, and contributes no
-///   bytes to fail on -- so `a.json` holding `\x1e[0,]` and an empty
-///   `b.json` reports `b.json:0`, not `<unknown>`. Measuring the final
-///   buffer from the *last file's* start, not the stream's, is what gets
-///   this right.
-/// - **A malformed record earlier in the stream**, resynced by a later
-///   valid record (#1542): its error is not in the final buffer, so the
-///   position is intact.
-fn seq_stream_trailing_record_is_dropped(
-    raw_bytes: &[(Option<usize>, Vec<u8>)],
-    last_parse_error: Option<usize>,
-) -> bool {
-    // Raw bytes, before the UTF-8 substitution `get_inputs` applies, for
-    // the same reason `seq_no_rs_byte_warning` takes them: an invalid byte
-    // becomes a 3-byte U+FFFD, which both moves every offset and changes
-    // what the reader sees. `\x80` substitutes to `EF BF BD`, whose first
-    // two bytes are a *malformed* BOM prefix -- which flips the reader out
-    // of `WaitingForRs` and makes it read the replacement character as a
-    // record. Handing it the normalized string answered `<unknown>` for
-    // `\x80\x1e`, where jq answers line 0.
-    let final_buffer_start = crate::jq_seq_reader::final_buffer_start(raw_bytes);
-    last_parse_error.is_some_and(|offset| offset >= final_buffer_start)
 }
 
 /// Real jq's own stderr warning ("`jq: ignoring parse error: ...`") for a

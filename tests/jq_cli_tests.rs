@@ -37071,6 +37071,206 @@ fn test_jq_seq_slurp_eof_location_final_buffer_is_per_file_2947() -> Result<()> 
     Ok(())
 }
 
+/// The `jq: error (at ...)` line of a `--seq -s` run, wherever it falls in
+/// stderr.
+///
+/// Located rather than taken as `stderr.lines().last()` (the #2947 tests'
+/// spelling): on the streams #3003 is about, real jq prints the runtime
+/// error *before* its `ignoring parse error` line -- the EOF diagnostic is
+/// only raised by the `next_input` call after the one that dispatched the
+/// slurped array -- while succinctly prints every `--seq` warning before it
+/// evaluates anything. That ordering is a recorded divergence
+/// (`docs/compliance/jq/limitations.md`), and these tests pin the location,
+/// not either tool's order.
+fn seq_slurp_error_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("jq: error (at "))
+}
+
+/// #3003: `--seq -s` keeps its position when the final buffer's *last byte*
+/// completes a value, even though that byte also opens something that is
+/// then unfinished at EOF.
+///
+/// jq's `jq_util_input_next_input` keeps `is_last` -- "did this call
+/// perform the refill that set `feof`" -- in a local, so only the call that
+/// read the final buffer can hand the slurped array over with the filename
+/// intact, and only by exiting its loop rather than `return`ing an error.
+/// `jv_parser_next` returns the moment `scan()` completes a top-level value;
+/// on the buffer's last byte that consumes the buffer (`has_more == 0`) and
+/// ends the call before its EOF branch runs, so the `Unfinished JSON term
+/// at EOF` is only detected by the *next* call, after the filter already
+/// ran with the position. A number or keyword is completed by the byte
+/// *after* it (`\x1e1{`), a string or container by its own last byte
+/// (`\x1e"a"{` still scans the `{` in-call) -- which is the whole
+/// difference between the two halves of the table. An error anywhere in the
+/// final buffer returns early regardless, and an empty final buffer has no
+/// last byte to complete anything on.
+///
+/// Every expectation is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_slurp_eof_location_survives_value_completing_on_final_byte_3003() -> Result<()> {
+    // (why, stream, expected line -- `None` meaning `<unknown>`)
+    let cases: &[(&str, &str, Option<usize>)] = &[
+        // --- the issue's own family: position kept ---
+        ("number then `{`", "\x1e1{", Some(0)),
+        ("number then `[`", "\x1e1[", Some(0)),
+        ("keyword then `{`", "\x1etrue{", Some(0)),
+        ("null then `{`", "\x1enull{", Some(0)),
+        ("float then `{`", "\x1e1.5e3{", Some(0)),
+        // The opener can be a quote: the same `OK` return, and jq's next
+        // call reports `Unfinished string at EOF` instead.
+        ("keyword then `\"`", "\x1etrue\"", Some(0)),
+        ("number then `\"`", "\x1e1\"", Some(0)),
+        // Earlier values in the same buffer, or earlier buffers, do not
+        // change which call the last byte lands in.
+        ("two numbers then `{`", "\x1e1 2{", Some(0)),
+        ("number, RS, number then `{`", "\x1e1 \x1e2{", Some(0)),
+        ("string, RS, number then `{`", "\x1e\"a\"\x1e1{", Some(0)),
+        ("array, RS, number then `{`", "\x1e[1]\x1e2{", Some(0)),
+        ("second line", "\x1e1\n\x1e2{", Some(1)),
+        ("third line", "\x1e1\n\x1e2\n\x1e3[", Some(2)),
+        // An error in an *earlier* buffer re-enters, but that re-entered
+        // call is the one that then performs the terminal refill.
+        ("error in an earlier buffer", "\x1e1}\n\x1e2{", Some(1)),
+        // --- controls: value completed *before* the last byte, so the
+        // `{` is scanned in-call and the EOF branch runs there ---
+        ("string then `{`", "\x1e\"a\"{", None),
+        ("object then `{`", "\x1e{}{", None),
+        ("array then `{`", "\x1e[1]{", None),
+        ("array closed on line 2 then `{`", "\x1e[1,\n2]{", None),
+        ("string then `[`", "\x1e\"a\"[", None),
+        ("number, space, `{`", "\x1e1 {", None),
+        // --- controls: an error in the final buffer returns early ---
+        ("error earlier in the final buffer", "\x1e[0,]\x1e1{", None),
+        ("truncated number on RS", "\x1e1\x1e{", None),
+        ("truncated container on RS", "\x1e1{\x1e", None),
+        ("two unfinished containers", "\x1e1{\x1e2{", None),
+        ("separator error", "\x1e{\"a\":1{", None),
+        ("`{` then unterminated string", "\x1e1{\"", None),
+        // --- controls: the issue's own four ---
+        ("trailing space", "\x1e1{ ", None),
+        ("trailing newline", "\x1e1{\n", None),
+        ("nothing opened", "\x1e1}", None),
+        ("nothing completed", "\x1e{", None),
+    ];
+    for (why, stream, line) in cases {
+        let (stdout, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[stream])?;
+        assert_eq!(stdout, "", "{why}: {stderr}");
+        assert_eq!(code, 5, "{why}: {stderr}");
+        let location = line.map_or_else(
+            || "<unknown>".to_string(),
+            |line| format!("{}:{line}", paths[0]),
+        );
+        assert_eq!(
+            seq_slurp_error_line(&stderr),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "{why}: {stderr}"
+        );
+        // Keeping the position must not come from losing the diagnostic:
+        // every row above leaves something unfinished for jq to report.
+        assert!(
+            stderr.contains("jq: ignoring parse error: "),
+            "{why}: no warning in {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #3003 at jq's `fgets` boundaries and across files: the rule needs a
+/// *non-empty* final buffer whose last byte completes the value, and the
+/// final buffer is the last file's own last chunk. Every expectation is jq
+/// 1.7.1's own live output.
+#[test]
+fn test_jq_seq_slurp_eof_location_final_byte_rule_follows_fgets_chunks_3003() -> Result<()> {
+    // `\x1e` + spaces + `1{`: at 4095 and 8190 bytes `fgets` fills its
+    // buffer exactly, so an *empty* final buffer follows and the `{` is not
+    // its last byte -- one byte either side and it is.
+    for (total, line) in [
+        (4094usize, Some(0)),
+        (4095, None),
+        (4096, Some(0)),
+        (8189, Some(0)),
+        (8190, None),
+        (8191, Some(0)),
+    ] {
+        let stream = format!("\x1e{}1{{", " ".repeat(total - 3));
+        let (_, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], &[&stream])?;
+        assert_eq!(code, 5, "total {total}: {stderr}");
+        let location = line.map_or_else(
+            || "<unknown>".to_string(),
+            |line| format!("{}:{line}", paths[0]),
+        );
+        assert_eq!(
+            seq_slurp_error_line(&stderr),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "total {total}: {stderr}"
+        );
+    }
+
+    // A real BOM is consumed before scanning and changes nothing.
+    let (_, stderr, code, paths) = run_jq_over_byte_files(
+        &["--seq", "-s", "-c", r#"error("x")"#],
+        &[b"\xef\xbb\xbf\x1e1{"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert_eq!(
+        seq_slurp_error_line(&stderr),
+        Some(format!("jq: error (at {}:0): x", paths[0]).as_str()),
+        "{stderr}"
+    );
+
+    // Multi-file: `at` is `None` for `<unknown>`, else (file index, line).
+    struct Case<'a> {
+        why: &'a str,
+        files: &'a [&'a str],
+        at: Option<(usize, usize)>,
+    }
+    let case = |why, files, at| Case { why, files, at };
+    let cases: &[Case] = &[
+        // The earlier file's chunk is partial (not the last file), so the
+        // `{` that completes `1` is the *second* file's last byte.
+        case(
+            "value completed by the next file",
+            &["\x1e1", "{"],
+            Some((1, 0)),
+        ),
+        case("empty final buffer in the last file", &["\x1e1{", ""], None),
+        case("whitespace-only last file", &["\x1e1{", " "], None),
+        case("newline-only last file", &["\x1e1{", "\n"], None),
+        case(
+            "truncation on the next file's RS",
+            &["\x1e1{", "\x1e2{"],
+            None,
+        ),
+        case(
+            "newline-terminated first file",
+            &["\x1e1\n", "\x1e2{"],
+            Some((1, 0)),
+        ),
+        // Control: the next file closes the container, so nothing is
+        // unfinished and there is no warning at all.
+        case("closed by the next file", &["\x1e1{", "}"], Some((1, 0))),
+    ];
+    for Case { why, files, at } in cases {
+        let (_, stderr, code, paths) =
+            run_jq_over_files(&["--seq", "-s", "-c", r#"error("x")"#], files)?;
+        assert_eq!(code, 5, "{why}: {stderr}");
+        let location = at.map_or_else(
+            || "<unknown>".to_string(),
+            |(file, line)| format!("{}:{line}", paths[file]),
+        );
+        assert_eq!(
+            seq_slurp_error_line(&stderr),
+            Some(format!("jq: error (at {location}): x").as_str()),
+            "{why}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #1549: `input_line_number`'s own *value* (not just the `(at ...)` error
 /// marker #1542 already covers) must report real jq's own answer for "no
 /// line known yet" (`0`) for a dropped `--seq -s` trailing record, not the
