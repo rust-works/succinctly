@@ -41545,12 +41545,22 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
                     // the *root* (empty) path answers `[]` in real jq 1.7.1.
-                    sink(PathBranch::new(
+                    // Forward whatever `Demand` the real consumer answers
+                    // (exactly as the trackable-branch fallthrough below
+                    // does) instead of hardcoding `Stop`: a hardcoded
+                    // `Stop` is indistinguishable, one level up in
+                    // `resolve_as_pattern`'s `?//` handling, from this same
+                    // branch's *refusal* stop -- both surface as
+                    // `ResolveFlow::Stopped` -- so a `?//` chain read this
+                    // successful single-value emission as the alternative
+                    // having failed and wrongly retried the next one
+                    // (`null | [path(. as $z ?// [$q] | $q)]` answered
+                    // `[[],[0]]` instead of jq's `[[]]`).
+                    return sink(PathBranch::new(
                         PathPrefix::root(),
                         Cow::Borrowed(input),
-                        true
+                        true,
                     ));
-                    return Demand::Stop;
                 }
                 violation = Some(if near_iterate {
                     EvalError::invalid_path_expression_near_iterate(&branch.value).into()
