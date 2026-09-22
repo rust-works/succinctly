@@ -66495,10 +66495,10 @@ fn test_double_iterate_key_stays_cursor_backed_through_manycursor_arm_3021() -> 
 #[test]
 fn test_double_iterate_key_skips_empty_inner_collections_3021() -> Result<()> {
     for (input, expected) in [
-        (r#"[[1,2],[],[3]]"#, r#"["0","1","0"]"#),
-        (r#"[[],[1]]"#, r#"["0"]"#),
-        (r#"[[1],[]]"#, r#"["0"]"#),
-        (r#"[[],[]]"#, "[]"),
+        (r"[[1,2],[],[3]]", r#"["0","1","0"]"#),
+        (r"[[],[1]]", r#"["0"]"#),
+        (r"[[1],[]]", r#"["0"]"#),
+        (r"[[],[]]", "[]"),
         (r#"[{"a":1},{},{"b":2}]"#, r#"["a","b"]"#),
     ] {
         let filter = "[.[][] | (key | tostring)]";
