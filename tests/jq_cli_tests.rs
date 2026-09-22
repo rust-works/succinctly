@@ -66489,3 +66489,22 @@ fn test_double_iterate_key_stays_cursor_backed_through_manycursor_arm_3021() -> 
     }
     Ok(())
 }
+
+/// An empty inner iterate returns `None`. It must skip that outer element
+/// without materializing the other elements and losing their key positions.
+#[test]
+fn test_double_iterate_key_skips_empty_inner_collections_3021() -> Result<()> {
+    for (input, expected) in [
+        (r#"[[1,2],[],[3]]"#, r#"["0","1","0"]"#),
+        (r#"[[],[1]]"#, r#"["0"]"#),
+        (r#"[[1],[]]"#, r#"["0"]"#),
+        (r#"[[],[]]"#, "[]"),
+        (r#"[{"a":1},{},{"b":2}]"#, r#"["a","b"]"#),
+    ] {
+        let filter = "[.[][] | (key | tostring)]";
+        let (output, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "{input}: {output}");
+        assert_eq!(output.trim(), expected, "{input}");
+    }
+    Ok(())
+}
