@@ -41532,6 +41532,36 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 if skip_untracked {
                     return Demand::Continue;
                 }
+                // #3125: the terminal-literal carve-out -- a bearer literal
+                // whose carrier null/bool is *identical* to the register is a
+                // valid empty path `[]`, the same identity rule the navigation
+                // family applies via `null_bool_identical` (the other eleven
+                // sites, #2691). `null | path(null)`, `false | path(false)`
+                // and `true | path(true)` answer `[]` in real jq 1.7.1; every
+                // other carrier (`123 | path(123)`, `"" | path("")`, `[] |
+                // path([])`) and every non-identical null/bool pairing
+                // (`null | path(false)`) still refuses here.
+                if null_bool_identical(&branch.value, input) {
+                    // emission: mirror the navigation family's identical
+                    // seed (#2691) -- the identical literal carried through
+                    // the *root* (empty) path answers `[]` in real jq 1.7.1.
+                    // Forward whatever `Demand` the real consumer answers
+                    // (exactly as the trackable-branch fallthrough below
+                    // does) instead of hardcoding `Stop`: a hardcoded
+                    // `Stop` is indistinguishable, one level up in
+                    // `resolve_as_pattern`'s `?//` handling, from this same
+                    // branch's *refusal* stop -- both surface as
+                    // `ResolveFlow::Stopped` -- so a `?//` chain read this
+                    // successful single-value emission as the alternative
+                    // having failed and wrongly retried the next one
+                    // (`null | [path(. as $z ?// [$q] | $q)]` answered
+                    // `[[],[0]]` instead of jq's `[[]]`).
+                    return sink(PathBranch::new(
+                        PathPrefix::root(),
+                        Cow::Borrowed(input),
+                        true,
+                    ));
+                }
                 violation = Some(if near_iterate {
                     EvalError::invalid_path_expression_near_iterate(&branch.value).into()
                 } else {
