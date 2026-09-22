@@ -17118,6 +17118,177 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     Ok(Some((path.extend_from(component, node), next)))
 }
 
+/// `.[]` over one node, delivering each child position as it is found.
+///
+/// The `Field`/`Index` siblings above reach at most one position and can
+/// answer with an `Option`; iteration fans out, so it takes a callback. That
+/// is what lets the path-context walk stream `.[]` rather than hold one
+/// buffer entry per child -- the child *cursors* still come from the checked
+/// collection helpers, whose validation this does not touch.
+fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
+    node: &PathNode<V>,
+    path: &T,
+    collapse_duplicate_keys: bool,
+    emit: &mut dyn FnMut(T, PathNode<V>) -> Demand,
+) -> Result<Demand, EvalError> {
+    assert_nesting_depth(path.trail_depth());
+    match node {
+        // #2346: real yq's `.[]` over any non-container -- including a
+        // missing/null node here -- is a silent no-op (confirmed live
+        // against yq v4.53.3), matching every other `Expr::Iterate`
+        // site this issue fixed. jq keeps raising (`path(.[])` on
+        // `null` still errors there), so this stays gated on `S::TAG`
+        // -- the arm below is then only ever reached in jq mode, which
+        // is why it can keep hardcoding `EvalTag::Jq` rather than
+        // consulting `S::TAG` itself.
+        PathNode::Absent if S::TAG == EvalTag::Yq => Ok(Demand::Continue),
+        PathNode::Absent => Err(EvalError::cannot_iterate_with(
+            EvalTag::Jq,
+            &OwnedValue::Null,
+        )),
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::At(c) => {
+            let v = c.value();
+            if let Some(fields) = v.as_object() {
+                // #2594: the zero-field `{,}` `effective_fields_checked`
+                // cannot see, same as the value-side `Expr::Iterate` arm.
+                empty_fields_tail_gap_ok(&fields, Some(c))?;
+                // `effective_fields_checked` with the mode's own
+                // duplicate-key rule, plus `key_display_string` -- the
+                // same two helpers `collect_paths_generic` uses, reused
+                // rather than re-derived. Walking `all_fields()` instead
+                // emitted `[["a"],["a"]]` for `[path(.[])]` on
+                // `{"a":1,"a":2}`, where jq mode collapses to `[["a"]]`
+                // (#1385); caught by the evaluator-parity suite.
+                for field in effective_fields_checked(&fields, collapse_duplicate_keys)? {
+                    let Some(key) = key_display_string(&field.key) else {
+                        return Err(fields.malformed_member_error());
+                    };
+                    if matches!(
+                        emit(
+                            path.extend_from(OwnedValue::String(key.into_owned()), node),
+                            PathNode::At(field.value_cursor),
+                        ),
+                        Demand::Stop
+                    ) {
+                        return Ok(Demand::Stop);
+                    }
+                }
+                Ok(Demand::Continue)
+            } else if let Some(elements) = v.as_array() {
+                // #2594: and the zero-element `[,]` it still cannot see.
+                empty_elements_tail_gap_ok(&elements, Some(c))?;
+                // #2261 (systematic sweep): `collect_cursors_checked`,
+                // not the unchecked `collect_cursors` this arm used --
+                // the object arm just above already routes through the
+                // checked `effective_fields_checked`; this array
+                // sibling had drifted onto the wrong one, so
+                // `[path(.[])]` on `[1,2,3,]` silently answered
+                // `[[0],[1],[2]]` instead of raising like every other
+                // `.[]` consumer already does.
+                for (i, ec) in elements.collect_cursors_checked()?.into_iter().enumerate() {
+                    if matches!(
+                        emit(
+                            path.extend_from(OwnedValue::Int(i as i64), node),
+                            PathNode::At(ec),
+                        ),
+                        Demand::Stop
+                    ) {
+                        return Ok(Demand::Stop);
+                    }
+                }
+                Ok(Demand::Continue)
+            } else if let Some(reason) = v.string_decode_error() {
+                // #1247/#1620: an undecodable-string scalar must raise
+                // its own decode failure unconditionally, never
+                // suppressed by the yq-mode no-op below -- same
+                // priority order as `scalar_fallback`/
+                // `decode_failure_or` elsewhere in this fix.
+                //
+                // Live since #2168 (direction 2). This arm was written
+                // defensively and documented as unreachable, because
+                // every caller ran `push_generic_document_validation_
+                // error` over the whole document first and raised the
+                // identical `decode_failure` before the walk started.
+                // That pre-walk is gone; this is now the place
+                // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise,
+                // and the reason `[path(.[][])]` still rejects a
+                // document whose undecodable scalar the iteration
+                // reaches while `path(.d)` no longer rejects one it
+                // never touches. A single-level `[path(.[])]` does not
+                // reach this arm at all -- iterating an object/array
+                // only decodes keys and yields child cursors, it never
+                // decodes a child scalar's own string content.
+                Err(EvalError::decode_failure(reason))
+            } else if S::TAG == EvalTag::Yq {
+                // #2346: see this arm's `PathNode::Absent` sibling
+                // above for the full live-oracle evidence -- a
+                // genuinely-resolved non-container scalar gets the
+                // same silent no-op here.
+                Ok(Demand::Continue)
+            } else {
+                // `to_owned_cursor`, not `to_owned`: only the cursor
+                // resolves an explicit YAML tag (#747), and the
+                // materializing resolver quotes the *tagged* value back.
+                // With `to_owned` here, `a: !!str 5 | .[] | .[]` read
+                // "Cannot iterate over number (5)" where every other
+                // route says `string ("5")` -- the sibling
+                // `path_node_type_name` above already goes through the
+                // cursor for exactly this reason.
+                Err(EvalError::cannot_iterate_with(
+                    EvalTag::Jq,
+                    &to_owned_cursor::<S, _>(c)?,
+                ))
+            }
+        }
+    }
+}
+
+/// The navigational steps -- `Field`, `Index`, `Iterate`, on live, absent or
+/// owned nodes -- delivered one position at a time.
+///
+/// [`path_step_generic`] is the collecting adapter over this, for the path
+/// walkers that genuinely want a vector. The path-context walk consumes it
+/// directly, which is what removes its own per-step buffer (#3022). Both
+/// share one set of navigation rules rather than restating them.
+fn path_step_each_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
+    expr: &Expr,
+    node: &PathNode<V>,
+    path: &T,
+    collapse_duplicate_keys: bool,
+    emit: &mut dyn FnMut(T, PathNode<V>) -> Demand,
+) -> Result<Demand, EvalError> {
+    // An owned node has no cursor to navigate, so it keeps its own walk;
+    // that one is bounded by the owned value already in memory, and
+    // collecting it changes no asymptotics.
+    if let PathNode::Owned(v) = node {
+        let mut out = Vec::new();
+        path_step_owned::<S, V, T>(expr, node, v, path, &mut out)?;
+        for (trail, child) in out {
+            if matches!(emit(trail, child), Demand::Stop) {
+                return Ok(Demand::Stop);
+            }
+        }
+        return Ok(Demand::Continue);
+    }
+    match expr {
+        Expr::Field(name) => match path_field_step_generic::<S, V, T>(name, node, path)? {
+            Some((trail, child)) => Ok(emit(trail, child)),
+            None => Ok(Demand::Continue),
+        },
+        Expr::Index { idx, key } => {
+            match path_index_step_generic::<S, V, T>(*idx, key.as_ref(), node, path)? {
+                Some((trail, child)) => Ok(emit(trail, child)),
+                None => Ok(Demand::Continue),
+            }
+        }
+        Expr::Iterate => {
+            path_iterate_step_generic::<S, V, T>(node, path, collapse_duplicate_keys, emit)
+        }
+        other => unreachable!("not a navigational step: {other:?}"),
+    }
+}
+
 /// One navigation step: from `node` at `path`, produce every (path, node)
 /// position the step reaches.
 fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
@@ -17158,106 +17329,16 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             }
             Ok(())
         }
-        Expr::Iterate => match node {
-            // #2346: real yq's `.[]` over any non-container -- including a
-            // missing/null node here -- is a silent no-op (confirmed live
-            // against yq v4.53.3), matching every other `Expr::Iterate`
-            // site this issue fixed. jq keeps raising (`path(.[])` on
-            // `null` still errors there), so this stays gated on `S::TAG`
-            // -- the arm below is then only ever reached in jq mode, which
-            // is why it can keep hardcoding `EvalTag::Jq` rather than
-            // consulting `S::TAG` itself.
-            PathNode::Absent if S::TAG == EvalTag::Yq => Ok(()),
-            PathNode::Absent => Err(EvalError::cannot_iterate_with(
-                EvalTag::Jq,
-                &OwnedValue::Null,
-            )),
-            PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
-            PathNode::At(c) => {
-                let v = c.value();
-                if let Some(fields) = v.as_object() {
-                    // #2594: the zero-field `{,}` `effective_fields_checked`
-                    // cannot see, same as the value-side `Expr::Iterate` arm.
-                    empty_fields_tail_gap_ok(&fields, Some(c))?;
-                    // `effective_fields_checked` with the mode's own
-                    // duplicate-key rule, plus `key_display_string` -- the
-                    // same two helpers `collect_paths_generic` uses, reused
-                    // rather than re-derived. Walking `all_fields()` instead
-                    // emitted `[["a"],["a"]]` for `[path(.[])]` on
-                    // `{"a":1,"a":2}`, where jq mode collapses to `[["a"]]`
-                    // (#1385); caught by the evaluator-parity suite.
-                    for field in effective_fields_checked(&fields, collapse_duplicate_keys)? {
-                        let Some(key) = key_display_string(&field.key) else {
-                            return Err(fields.malformed_member_error());
-                        };
-                        out.push((
-                            path.extend_from(OwnedValue::String(key.into_owned()), node),
-                            PathNode::At(field.value_cursor),
-                        ));
-                    }
-                    Ok(())
-                } else if let Some(elements) = v.as_array() {
-                    // #2594: and the zero-element `[,]` it still cannot see.
-                    empty_elements_tail_gap_ok(&elements, Some(c))?;
-                    // #2261 (systematic sweep): `collect_cursors_checked`,
-                    // not the unchecked `collect_cursors` this arm used --
-                    // the object arm just above already routes through the
-                    // checked `effective_fields_checked`; this array
-                    // sibling had drifted onto the wrong one, so
-                    // `[path(.[])]` on `[1,2,3,]` silently answered
-                    // `[[0],[1],[2]]` instead of raising like every other
-                    // `.[]` consumer already does.
-                    for (i, ec) in elements.collect_cursors_checked()?.into_iter().enumerate() {
-                        out.push((
-                            path.extend_from(OwnedValue::Int(i as i64), node),
-                            PathNode::At(ec),
-                        ));
-                    }
-                    Ok(())
-                } else if let Some(reason) = v.string_decode_error() {
-                    // #1247/#1620: an undecodable-string scalar must raise
-                    // its own decode failure unconditionally, never
-                    // suppressed by the yq-mode no-op below -- same
-                    // priority order as `scalar_fallback`/
-                    // `decode_failure_or` elsewhere in this fix.
-                    //
-                    // Live since #2168 (direction 2). This arm was written
-                    // defensively and documented as unreachable, because
-                    // every caller ran `push_generic_document_validation_
-                    // error` over the whole document first and raised the
-                    // identical `decode_failure` before the walk started.
-                    // That pre-walk is gone; this is now the place
-                    // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise,
-                    // and the reason `[path(.[][])]` still rejects a
-                    // document whose undecodable scalar the iteration
-                    // reaches while `path(.d)` no longer rejects one it
-                    // never touches. A single-level `[path(.[])]` does not
-                    // reach this arm at all -- iterating an object/array
-                    // only decodes keys and yields child cursors, it never
-                    // decodes a child scalar's own string content.
-                    Err(EvalError::decode_failure(reason))
-                } else if S::TAG == EvalTag::Yq {
-                    // #2346: see this arm's `PathNode::Absent` sibling
-                    // above for the full live-oracle evidence -- a
-                    // genuinely-resolved non-container scalar gets the
-                    // same silent no-op here.
-                    Ok(())
-                } else {
-                    // `to_owned_cursor`, not `to_owned`: only the cursor
-                    // resolves an explicit YAML tag (#747), and the
-                    // materializing resolver quotes the *tagged* value back.
-                    // With `to_owned` here, `a: !!str 5 | .[] | .[]` read
-                    // "Cannot iterate over number (5)" where every other
-                    // route says `string ("5")` -- the sibling
-                    // `path_node_type_name` above already goes through the
-                    // cursor for exactly this reason.
-                    Err(EvalError::cannot_iterate_with(
-                        EvalTag::Jq,
-                        &to_owned_cursor::<S, _>(c)?,
-                    ))
-                }
-            }
-        },
+        Expr::Iterate => path_iterate_step_generic::<S, V, T>(
+            node,
+            path,
+            collapse_duplicate_keys,
+            &mut |trail, child| {
+                out.push((trail, child));
+                Demand::Continue
+            },
+        )
+        .map(|_| ()),
         // `Paren` is transparent, so a parenthesised pipe/comma/optional
         // reaches this function as the *head* of an outer pipe:
         // `path(((.a|.b)|.c))` steps `Pipe([.a, .b])`, `path((.a,.b)|.c)`
@@ -17910,22 +17991,32 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             //
             // The step extends the position's own trail (#2572): one link
             // per position, recording `pos.node` as the node it came from.
-            let mut heads = Vec::new();
-            let stepped =
-                path_step_generic::<S, V, _>(expr, &pos.node, &pos.trail, true, &mut heads);
-            for (trail, node) in heads {
-                debug_assert_eq!(
-                    trail.depth(),
-                    pos.trail.depth() + 1,
-                    "a navigational step appends exactly one path component"
-                );
-                out.push(PathContextPos {
-                    node,
-                    trail,
-                    at_key: false,
-                });
-            }
-            stepped.map_err(Control::Error)
+            //
+            // #3022: the wrapping is done as each position arrives, so this
+            // arm no longer keeps a `(trail, node)` buffer of its own beside
+            // the `out` it is filling.
+            let depth = pos.trail.depth();
+            path_step_each_generic::<S, V, _>(
+                expr,
+                &pos.node,
+                &pos.trail,
+                true,
+                &mut |trail, node| {
+                    debug_assert_eq!(
+                        trail.depth(),
+                        depth + 1,
+                        "a navigational step appends exactly one path component"
+                    );
+                    out.push(PathContextPos {
+                        node,
+                        trail,
+                        at_key: false,
+                    });
+                    Demand::Continue
+                },
+            )
+            .map(|_| ())
+            .map_err(Control::Error)
         }
         Expr::Comma(exprs) => {
             for e in exprs {
@@ -17933,7 +18024,11 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             }
             Ok(())
         }
-        Expr::Pipe(exprs) => path_context_step_pipe::<S, V>(exprs, pos, out),
+        Expr::Pipe(exprs) => path_context_step_pipe_each::<S, V>(exprs, pos, &mut |head| {
+            out.push(head);
+            Demand::Continue
+        })
+        .map(|_| ()),
         Expr::Builtin(Builtin::Parent) => {
             out.extend(path_context_hop(pos, 1));
             Ok(())
@@ -18230,33 +18325,6 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         other => unreachable!(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
         ),
-    }
-}
-
-/// [`path_context_step_generic`]'s `Expr::Pipe` case over a borrowed slice
-/// (#2572), the fix #2058 gave `path_walk_generic`: the remaining stages are
-/// passed on as `&[Expr]`, where rewrapping them in a fresh
-/// `Expr::Pipe(rest.to_vec())` deep-cloned every remaining stage's AST once
-/// per position the head reached.
-fn path_context_step_pipe<S: EvalSemantics, V: DocumentValue>(
-    exprs: &[Expr],
-    pos: &PathContextPos<V>,
-    out: &mut Vec<PathContextPos<V>>,
-) -> Result<(), Control> {
-    match exprs.split_first() {
-        None => {
-            out.push(pos.clone());
-            Ok(())
-        }
-        Some((first, [])) => path_context_step_generic::<S, V>(first, pos, out),
-        Some((first, rest)) => {
-            let mut heads = Vec::new();
-            let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
-            for head in heads {
-                path_context_step_pipe::<S, V>(rest, &head, out)?;
-            }
-            stepped
-        }
     }
 }
 
@@ -19370,8 +19438,9 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     if matches!(expr, Expr::Builtin(Builtin::Parent)) {
         return Ok(path_context_hop(pos, 1).map_or(Demand::Continue, sink));
     }
-    // A nested chain of zero-or-one navigational steps is one stage to the
-    // outer pipe. Stream each position through the chain.
+    // A nested chain of literal navigation is one stage to the outer pipe.
+    // Stream each position through the chain rather than materialising the
+    // chain's own final positions.
     if let Expr::Pipe(steps) = expr {
         if steps.iter().all(|step| {
             matches!(
@@ -19379,44 +19448,34 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
                 Expr::Identity
                     | Expr::Field(_)
                     | Expr::Index { .. }
+                    | Expr::Iterate
                     | Expr::Builtin(Builtin::Parent)
             )
         }) {
             return path_context_step_pipe_each::<S, V>(steps, pos, sink);
         }
     }
-    if let Expr::Field(name) = expr {
-        if !matches!(pos.node, PathNode::Owned(_)) {
-            return match path_field_step_generic::<S, V, _>(name, &pos.node, &pos.trail)
-                .map_err(Control::Error)?
-            {
-                Some((trail, node)) => Ok(sink(PathContextPos {
+    // Literal navigation -- `.k`, `.[3]`, `.[]`. Every component is fixed by
+    // the query, so none of these can be the computed component yq rolls a
+    // step back for; that is what makes them safe to deliver as they are
+    // found. An owned node keeps the collecting route below.
+    if matches!(expr, Expr::Field(_) | Expr::Index { .. } | Expr::Iterate)
+        && !matches!(pos.node, PathNode::Owned(_))
+    {
+        return path_step_each_generic::<S, V, _>(
+            expr,
+            &pos.node,
+            &pos.trail,
+            true,
+            &mut |trail, node| {
+                sink(PathContextPos {
                     node,
                     trail,
                     at_key: false,
-                })),
-                None => Ok(Demand::Continue),
-            };
-        }
-    }
-    if let Expr::Index { idx, key } = expr {
-        if !matches!(pos.node, PathNode::Owned(_)) {
-            return match path_index_step_generic::<S, V, _>(
-                *idx,
-                key.as_ref(),
-                &pos.node,
-                &pos.trail,
-            )
-            .map_err(Control::Error)?
-            {
-                Some((trail, node)) => Ok(sink(PathContextPos {
-                    node,
-                    trail,
-                    at_key: false,
-                })),
-                None => Ok(Demand::Continue),
-            };
-        }
+                })
+            },
+        )
+        .map_err(Control::Error);
     }
     path_context_step_collecting::<S, V>(expr, pos, sink)
 }
@@ -39264,7 +39323,7 @@ mod tests {
 
     #[test]
     fn path_context_literal_index_stream_preserves_negative_and_owned_rules_3022() {
-        let json = br#"[10,20]"#;
+        let json = br"[10,20]";
         let index = JsonIndex::build(json);
         let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
             .expect("root position");
@@ -39391,7 +39450,7 @@ mod tests {
         assert!(matches!(result, Ok(Demand::Continue)));
         // The ambient read-only scope is thread-local and intentionally a
         // no-op in no_std builds.
-        assert_eq!(count, if cfg!(feature = "std") { 0 } else { 1 });
+        assert_eq!(count, usize::from(!cfg!(feature = "std")));
     }
 
     #[test]

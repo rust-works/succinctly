@@ -1,4 +1,4 @@
-//! Focused control-flow probes for #3022's path-context streaming spike.
+//! Focused control-flow probes for #3022's path-context position streaming.
 //!
 //! Each expectation was checked before the streaming change against the
 //! installed jq 1.8.2 or yq v4.53.3 oracle, as indicated per test.  The yq
@@ -152,5 +152,63 @@ fn yq_computed_component_error_rolls_back_path_context_prefix() -> Result<()> {
     assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(stdout, "");
     assert!(stderr.contains("late"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// `.[]` fans out, and streaming it must still hand jq's own generator order
+/// to the consumer: every position reached before the failing element, then
+/// the error. Captured from jq 1.7.1 (`path(.[] | .a)` on
+/// `[{"a":1},2,{"a":3}]` prints `[0,"a"]` and exits 5).
+#[test]
+fn iterate_streams_its_prefix_before_a_later_element_errors_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "path(.[] | .a)", "[{\"a\":1},2,{\"a\":3}]\n")?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "[0,\"a\"]\n");
+    assert!(stderr.contains("Cannot index number"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// Array construction stays atomic over a streamed `.[]`: the same query
+/// collected into an array emits nothing at all. Captured from jq 1.7.1.
+#[test]
+fn iterate_array_construction_stays_atomic_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "[path(.[] | .a)]", "[{\"a\":1},2,{\"a\":3}]\n")?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Cannot index number"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// Demand has to reach the iteration itself, not just the stage after it:
+/// `first` is satisfied by element 0, so element 1 -- which would raise --
+/// is never stepped. Captured from jq 1.7.1 (`[0,"a"]`, exit 0).
+#[test]
+fn iterate_stops_before_stepping_the_next_element_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "first(path(.[] | .a))", "[{\"a\":1},2]\n")?;
+    assert_eq!(code, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "[0,\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The streamed iteration still goes through the mode's duplicate-key rule
+/// rather than walking raw fields (#1385). Captured from jq 1.7.1:
+/// `[path(.[])]` on `{"a":1,"a":2}` is `[["a"]]`, not `[["a"],["a"]]`.
+#[test]
+fn iterate_keeps_duplicate_key_collapse_while_streaming_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "[path(.[])]", "{\"a\":1,\"a\":2}\n")?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "[[\"a\"]]\n");
+    Ok(())
+}
+
+/// yq's three path-context builtins over a streamed `.[]`, so the fan-out
+/// route is covered in both modes. Captured from yq v4.53.3:
+/// `.[] | key` over `[{"k":1},{"k":2}]` is `0` then `1`.
+#[test]
+fn yq_iterate_streams_keys_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("yq", ".[] | key", "- k: 1\n- k: 2\n")?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "0\n1\n");
     Ok(())
 }
