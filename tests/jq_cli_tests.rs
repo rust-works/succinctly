@@ -66453,3 +66453,39 @@ fn test_ascii_output_still_escapes_through_new_echo_gate_2608() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3021: a second `Expr::Iterate` inside `[.[][] | (...)]` reaches
+/// `fold_pipe_stages`'s `ManyCursor` arm once per outer element, so each
+/// outer array's inner iterate itself returns `ManyCursor`, not
+/// `OneCursor`. The arm previously only stayed cursor-backed when *every*
+/// per-element result was a single `OneCursor`, so a `ManyCursor` result
+/// (any per-element result carrying more than one inner element) forced the
+/// whole thing through `flatten_generic_results` into `ManyOwned` before
+/// `key` could ever run -- `key` on an owned value has no cursor to read a
+/// position from, so it silently dropped every element instead of
+/// erroring, and `[.[][] | (key | tostring)]` answered `[]`. jq 1.7.1 has
+/// no `key` builtin at all (`key/0 is not defined`), so `succinctly jq`
+/// follows yq's own model here (`key` is a succinctly extension, not gated
+/// behind `--jq-extensions`, which only covers yq-mode's lexer rejections);
+/// yq v4.53.3 answers `[0,1,0]`/`["0","1","0"]` for this input, which is
+/// what these rows pin (`tests/data/yq-golden/cases/path_ctx_double_iterate_key*`
+/// hold the yq-mode oracle captures of the same filters). The last two rows
+/// are the already-passing boundary from the issue's own investigation,
+/// pinned here as a regression guard against the `ManyCursor` arm above.
+#[test]
+fn test_double_iterate_key_stays_cursor_backed_through_manycursor_arm_3021() -> Result<()> {
+    let input = "[[1,2],[3]]";
+    for (filter, expected) in [
+        ("[.[][] | (key | tostring)]", r#"["0","1","0"]"#),
+        ("[.[][] | (key | .)]", "[0,1,0]"),
+        ("[.[][] | key]", "[0,1,0]"),
+        ("[.[][] | (key)]", "[0,1,0]"),
+        ("[.[][] | key | tostring]", r#"["0","1","0"]"#),
+        ("[.[][] | (key) | tostring]", r#"["0","1","0"]"#),
+    ] {
+        let (output, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: {output}");
+        assert_eq!(output.trim(), expected, "{filter}");
+    }
+    Ok(())
+}

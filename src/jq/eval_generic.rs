@@ -5861,9 +5861,12 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // `line` after this whole inner pipe returns. Instead,
             // run the rest of the pipe (`expr` and everything after
             // it) against each cursor independently and, when every
-            // element's result is itself a single cursor (the common
-            // `.[] | .foo` / nested dot-chain shape), stay as
-            // `ManyCursor` so an enclosing pipe or `line`/`column`
+            // element's result is itself cursor-backed -- a single
+            // cursor (the common `.[] | .foo` / nested dot-chain
+            // shape) or another `ManyCursor` (a further nested
+            // iterate, e.g. `.[][] | (key | tostring)`, #3021) --
+            // stay as `ManyCursor`, flattening any nested cursor
+            // lists in order, so an enclosing pipe or `line`/`column`
             // can still resolve a position. Only degrade to
             // materialized `ManyOwned` when a result is
             // heterogeneous (multiple values, filtered out, or a
@@ -5928,21 +5931,24 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
 
-                let all_single_cursor = !per_element.is_empty()
-                    && per_element
-                        .iter()
-                        .all(|r| matches!(r, GenericResult::OneCursor(_)));
+                let all_cursor_like = !per_element.is_empty()
+                    && per_element.iter().all(|r| {
+                        matches!(
+                            r,
+                            GenericResult::OneCursor(_) | GenericResult::ManyCursor(_)
+                        )
+                    });
 
-                return if all_single_cursor {
-                    GenericResult::ManyCursor(
-                        per_element
-                            .into_iter()
-                            .map(|r| match r {
-                                GenericResult::OneCursor(c) => c,
-                                _ => unreachable!("checked all_single_cursor above"),
-                            })
-                            .collect(),
-                    )
+                return if all_cursor_like {
+                    let mut cursors = vec_with_capacity(per_element.len());
+                    for r in per_element {
+                        match r {
+                            GenericResult::OneCursor(c) => cursors.push(c),
+                            GenericResult::ManyCursor(cs) => cursors.extend(cs),
+                            _ => unreachable!("checked all_cursor_like above"),
+                        }
+                    }
+                    GenericResult::ManyCursor(cursors)
                 } else {
                     match flatten_generic_results::<_, S>(per_element) {
                         Ok(results) if results.is_empty() => GenericResult::None,
