@@ -25,7 +25,7 @@
 // for a legitimate single-length site here.
 #![warn(clippy::disallowed_methods)]
 
-use alloc::borrow::Cow;
+use alloc::borrow::{Cow, ToOwned};
 use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
@@ -16642,22 +16642,64 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 /// -- `ancestors[i]` of the flat `(path, ancestors)` pair this replaced is
 /// link `i + 1`'s `from`.
 ///
-/// Extending is one allocation and a refcount bump, where the flat pair paid
-/// a clone of both `Vec`s per position per step; `path`, `key` and `parent`
-/// read the chain instead (`to_vec` flattens it once where a whole path is
-/// emitted, `parent(n)` walks `n` links). `None` is the root, so a detached
-/// owned root allocates nothing.
-struct PathContextTrail<V: DocumentValue>(Option<Rc<PathContextLink<V>>>);
+/// The already-climbed prefix is one shared vector. New navigation steps
+/// extend it with one link each, while a hop into the prefix only shortens
+/// `visible_len`. The root and a detached owned root allocate nothing.
+enum PathContextTrail<V: DocumentValue> {
+    Root,
+    Seed {
+        steps: Rc<Vec<PathContextStep<V>>>,
+        visible_len: usize,
+    },
+    Link(Rc<PathContextLink<V>>),
+}
 
 /// One component of a [`PathContextTrail`].
-struct PathContextLink<V: DocumentValue> {
-    parent: PathContextTrail<V>,
+struct PathContextStep<V: DocumentValue> {
     component: OwnedValue,
     /// The node at `parent`'s position, which `component` was taken from.
     from: PathNode<V>,
+}
+
+struct PathContextLink<V: DocumentValue> {
+    parent: PathContextTrail<V>,
+    step: PathContextStep<V>,
     /// Components from the root to here, inclusive: the same O(1) depth
     /// [`PathTrail`] caches, for the same `assert_nesting_depth` guards.
     depth: usize,
+}
+
+/// Links from the current position toward the root, including the visible
+/// part of a shared seed after any dynamically extended links.
+struct PathContextLinks<'a, V: DocumentValue> {
+    next: Option<&'a PathContextTrail<V>>,
+    seed: Option<(&'a [PathContextStep<V>], usize)>,
+}
+
+impl<'a, V: DocumentValue> Iterator for PathContextLinks<'a, V> {
+    type Item = &'a PathContextStep<V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((steps, remaining)) = &mut self.seed {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Some(&steps[*remaining]);
+                }
+            }
+            self.seed = None;
+            match self.next.take()? {
+                PathContextTrail::Root => return None,
+                PathContextTrail::Link(link) => {
+                    self.next = Some(&link.parent);
+                    return Some(&link.step);
+                }
+                PathContextTrail::Seed { steps, visible_len } => {
+                    self.seed = Some((steps.as_slice(), *visible_len));
+                }
+            }
+        }
+    }
 }
 
 impl<V: DocumentValue> Drop for PathContextLink<V> {
@@ -16666,11 +16708,11 @@ impl<V: DocumentValue> Drop for PathContextLink<V> {
     /// is -- not only as the query -- and the derived drop would recurse once
     /// per link.
     fn drop(&mut self) {
-        let mut next = self.parent.0.take();
-        while let Some(link) = next {
+        let mut next = core::mem::replace(&mut self.parent, PathContextTrail::Root);
+        while let PathContextTrail::Link(link) = next {
             next = match Rc::try_unwrap(link) {
-                Ok(mut link) => link.parent.0.take(),
-                Err(_) => None,
+                Ok(mut link) => core::mem::replace(&mut link.parent, PathContextTrail::Root),
+                Err(_) => PathContextTrail::Root,
             };
         }
     }
@@ -16678,39 +16720,78 @@ impl<V: DocumentValue> Drop for PathContextLink<V> {
 
 impl<V: DocumentValue> Clone for PathContextTrail<V> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        match self {
+            Self::Root => Self::Root,
+            Self::Seed { steps, visible_len } => Self::Seed {
+                steps: Rc::clone(steps),
+                visible_len: *visible_len,
+            },
+            Self::Link(link) => Self::Link(Rc::clone(link)),
+        }
     }
 }
 
 impl<V: DocumentValue> PathContextTrail<V> {
     /// The empty trail: the document root, or a detached owned root.
     fn root() -> Self {
-        Self(None)
+        Self::Root
     }
 
     /// A trail from the flat shape [`cursor_path_and_ancestors`] climbs:
     /// `ancestors[i]` is the node `path[i]` was taken from.
     fn from_climb(path: Vec<OwnedValue>, ancestors: Vec<V::Cursor>) -> Self {
         debug_assert_eq!(path.len(), ancestors.len());
-        path.into_iter()
+        // A shared seed needs a backing Vec and an Rc. At one or two levels
+        // that cannot save allocations over one link per level, so keep the
+        // old representation for shallow nested roots.
+        if path.len() <= 2 {
+            return path
+                .into_iter()
+                .zip(ancestors)
+                .fold(Self::Root, |trail, (component, from)| {
+                    trail.extend_from(component, &PathNode::At(from))
+                });
+        }
+        let steps = path
+            .into_iter()
             .zip(ancestors)
-            .fold(Self::root(), |trail, (component, from)| {
-                trail.extend_from(component, &PathNode::At(from))
+            .map(|(component, from)| PathContextStep {
+                component,
+                from: PathNode::At(from),
             })
+            .collect::<Vec<_>>();
+        let visible_len = steps.len();
+        Self::Seed {
+            steps: Rc::new(steps),
+            visible_len,
+        }
     }
 
     fn depth(&self) -> usize {
-        self.0.as_ref().map_or(0, |link| link.depth)
+        match self {
+            Self::Root => 0,
+            Self::Seed { visible_len, .. } => *visible_len,
+            Self::Link(link) => link.depth,
+        }
     }
 
     /// The last component -- what `key` answers -- or `None` at the root.
     fn last_component(&self) -> Option<&OwnedValue> {
-        self.0.as_ref().map(|link| &link.component)
+        match self {
+            Self::Root => None,
+            Self::Seed { steps, visible_len } => {
+                visible_len.checked_sub(1).map(|i| &steps[i].component)
+            }
+            Self::Link(link) => Some(&link.step.component),
+        }
     }
 
     /// The links from this position up to the root, nearest first.
-    fn links(&self) -> impl Iterator<Item = &PathContextLink<V>> {
-        core::iter::successors(self.0.as_deref(), |link| link.parent.0.as_deref())
+    fn links(&self) -> PathContextLinks<'_, V> {
+        PathContextLinks {
+            next: Some(self),
+            seed: None,
+        }
     }
 
     /// The whole path, root first: the one O(depth) read, paid where a
@@ -16727,8 +16808,38 @@ impl<V: DocumentValue> PathContextTrail<V> {
     /// position's own and not on its trail ([`path_context_hop`] answers
     /// that one).
     fn hop(&self, n: usize) -> Option<(Self, PathNode<V>)> {
-        let link = self.links().nth(n.checked_sub(1)?)?;
-        Some((link.parent.clone(), link.from.clone()))
+        if n == 0 {
+            return None;
+        }
+        let mut current = self;
+        let mut remaining = n;
+        loop {
+            match current {
+                Self::Root => return None,
+                Self::Link(link) => {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return Some((link.parent.clone(), link.step.from.clone()));
+                    }
+                    current = &link.parent;
+                }
+                Self::Seed { steps, visible_len } => {
+                    if remaining > *visible_len {
+                        return None;
+                    }
+                    let parent_len = *visible_len - remaining;
+                    let parent = if parent_len == 0 {
+                        Self::Root
+                    } else {
+                        Self::Seed {
+                            steps: Rc::clone(steps),
+                            visible_len: parent_len,
+                        }
+                    };
+                    return Some((parent, steps[parent_len].from.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -16738,12 +16849,14 @@ impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
     }
 
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        Self(Some(Rc::new(PathContextLink {
+        Self::Link(Rc::new(PathContextLink {
             parent: self.clone(),
-            component,
-            from: from.clone(),
+            step: PathContextStep {
+                component,
+                from: from.clone(),
+            },
             depth: self.depth() + 1,
-        })))
+        }))
     }
 }
 
@@ -16893,6 +17006,105 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     stepped
 }
 
+/// A field has at most one result. Keeping that result in an `Option` also
+/// lets the path-context sink hand it to the next pipe stage without a
+/// per-position `Vec`.
+fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
+    name: &str,
+    node: &PathNode<V>,
+    path: &T,
+) -> Result<Option<(T, PathNode<V>)>, EvalError> {
+    assert_nesting_depth(path.trail_depth());
+    let next = match node {
+        PathNode::Absent => PathNode::Absent,
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::At(c) => {
+            let v = c.value();
+            if v.is_null() {
+                PathNode::Absent
+            } else if let Some(fields) = v.as_object() {
+                // #2594: a zero-field malformed tail is invisible to
+                // `find_cursor`, so it needs its own check.
+                empty_fields_tail_gap_ok(&fields, Some(c))?;
+                match fields.find_cursor(name)? {
+                    Some(fc) => PathNode::At(fc),
+                    None => PathNode::Absent,
+                }
+            } else if v.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
+                // #2482: yq treats scalar field lookup as no position;
+                // arrays still raise their structural error.
+                return Ok(None);
+            } else {
+                return Err(EvalError::cannot_index_with_field(
+                    path_node_type_name::<V>(node),
+                    name,
+                ));
+            }
+        }
+    };
+    // #2470: in yq read-only context a missing field emits no position;
+    // numeric indexing is intentionally unaffected by this rule.
+    if matches!(next, PathNode::Absent) && yq_absent_key_read_is_empty::<S>() {
+        return Ok(None);
+    }
+    Ok(Some((
+        path.extend_from(OwnedValue::String(name.to_owned()), node),
+        next,
+    )))
+}
+
+/// A literal numeric index reaches at most one position. Share this step
+/// between the collecting path walk and the path-context callback walk.
+fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
+    idx: i64,
+    key: Option<&NumberKey>,
+    node: &PathNode<V>,
+    path: &T,
+) -> Result<Option<(T, PathNode<V>)>, EvalError> {
+    assert_nesting_depth(path.trail_depth());
+    let mut component = index_component_value(idx, key);
+    let next = match node {
+        PathNode::Absent => PathNode::Absent,
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::At(c) => {
+            let v = c.value();
+            if v.is_null() {
+                PathNode::Absent
+            } else if let Some(elements) = v.as_array() {
+                empty_elements_tail_gap_ok(&elements, Some(c))?;
+                if idx < 0 {
+                    let len = elements.len_checked()?;
+                    let resolved = len as i64 + idx;
+                    if let Some(e) = yq_negative_index_check::<S>(idx, resolved, len) {
+                        return Err(e);
+                    }
+                    if S::TAG == EvalTag::Yq && resolved >= 0 {
+                        component = OwnedValue::Int(resolved);
+                    }
+                    elements
+                        .get_cursor(resolved as usize)
+                        .map_or(PathNode::Absent, PathNode::At)
+                } else {
+                    usize::try_from(idx)
+                        .ok()
+                        .and_then(|i| elements.get_cursor(i))
+                        .map_or(PathNode::Absent, PathNode::At)
+                }
+            } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+                PathNode::Absent
+            } else if yq_field_index_on_scalar_is_empty::<S>() {
+                return Ok(None);
+            } else {
+                return Err(EvalError::cannot_index_with_type(
+                    path_node_type_name::<V>(node),
+                    "number",
+                ));
+            }
+        }
+    };
+    Ok(Some((path.extend_from(component, node), next)))
+}
+
 /// One navigation step: from `node` at `path`, produce every (path, node)
 /// position the step reaches.
 fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
@@ -16921,155 +17133,16 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
             path_step_generic::<S, V, T>(inner, node, path, collapse_duplicate_keys, out)
         }
         Expr::Field(name) => {
-            let next = match node {
-                PathNode::Absent => PathNode::Absent,
-                PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
-                PathNode::At(c) => {
-                    let v = c.value();
-                    if v.is_null() {
-                        PathNode::Absent
-                    } else if let Some(fields) = v.as_object() {
-                        // #2594: `find_cursor` walks fields alone, so a
-                        // zero-field `{,}` simply missed and this step
-                        // reported an absent position -- `path(.a)` answered
-                        // `["a"]` where the bare `.a` raises.
-                        empty_fields_tail_gap_ok(&fields, Some(c))?;
-                        match fields.find_cursor(name)? {
-                            Some(fc) => PathNode::At(fc),
-                            None => PathNode::Absent,
-                        }
-                    } else if v.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
-                        // #2482 (yq mode, unconditional -- not gated on
-                        // read-only context like the absent-key rule below):
-                        // a scalar has no fields at all in real yq's model,
-                        // and the walk produces no position to continue
-                        // from at all, so `key`/`path` are never reached
-                        // either -- `.s.zzz | key` is empty in real yq,
-                        // same as the bare read. An array target still
-                        // raises its own structural error (`.arr.zzz`),
-                        // excluded here the same way `eval_single`'s own
-                        // `Expr::Field` arm excludes it. See
-                        // `eval::yq_field_index_on_scalar_is_empty`.
-                        return Ok(());
-                    } else {
-                        return Err(EvalError::cannot_index_with_field(
-                            path_node_type_name::<V>(node),
-                            name,
-                        ));
-                    }
-                }
-            };
-            // #2470 (yq mode, read-only context only): a key lookup that
-            // found nothing produces no position at all, so the walk has
-            // nothing to continue from and `key`/`path` are never reached --
-            // `(.zzz | key) + 1` is `1` in real yq, not `"zzz" + 1`. Only
-            // `Expr::Field` takes this: the sibling `Expr::Index` arm's own
-            // absent node stays, since real yq auto-creates through arrays
-            // even read-only (`.n[9] | key` is `9` inside an operand too).
-            if matches!(next, PathNode::Absent) && yq_absent_key_read_is_empty::<S>() {
-                return Ok(());
+            if let Some(next) = path_field_step_generic::<S, V, T>(name, node, path)? {
+                out.push(next);
             }
-            out.push((
-                path.extend_from(OwnedValue::String(name.clone()), node),
-                next,
-            ));
             Ok(())
         }
         Expr::Index { idx, key } => {
-            // The component is reported with its own source spelling
-            // (`path(.[2.0])` is `[2.0]`, not `[2]` -- #1088), carried by
-            // `key` when the literal had one. `index_component_value` is
-            // `eval.rs`'s own renderer for exactly this, shared rather than
-            // re-derived.
-            //
-            // #1401: `idx`/`key` bind straight from the arm. While this was
-            // a *pair* of variants the arm could not bind them, so it
-            // re-matched over both with an `unreachable!()` fallback -- the
-            // same shape that let a missing arm slip through twice.
-            let (idx, key) = (*idx, key.as_ref());
-            // The path component a negative index leaves behind is mode-
-            // decided (ADR-0018), captured live on `{"a":[1,2]}`: jq 1.7.1's
-            // `path(.a[-1])` is `["a",-1]`, the index as written; yq v4.53.3's
-            // `.a[-1] | path` is `["a",1]` and `.a[-1] | key` is `1`, the
-            // index resolved against the length (#2416 phase 3).
-            let mut component = index_component_value(idx, key);
-            let next = match node {
-                PathNode::Absent => PathNode::Absent,
-                PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
-                PathNode::At(c) => {
-                    let v = c.value();
-                    if v.is_null() {
-                        PathNode::Absent
-                    } else if let Some(elements) = v.as_array() {
-                        // #2594: the zero-element `[,]` no element-only walk
-                        // can see -- `path(.[0])` answered `[0]` where the
-                        // bare `.[0]` raises.
-                        empty_elements_tail_gap_ok(&elements, Some(c))?;
-                        // yq mode only (#2254): a negative index still
-                        // negative after resolving against the length raises
-                        // in real yq, and the path-context walk (#2416 phase
-                        // 2) reaches this step for `.a[-5] | key` where it
-                        // used to hand the shape back to the materializing
-                        // evaluator, which applied the same check. Same
-                        // rule, same helper as the value-side `Expr::Index`
-                        // arms; a no-op in jq mode, where an out-of-range
-                        // negative index is an ordinary absent node.
-                        if idx < 0 {
-                            let len = elements.len_checked()?;
-                            let resolved = len as i64 + idx;
-                            if let Some(e) = yq_negative_index_check::<S>(idx, resolved, len) {
-                                return Err(e);
-                            }
-                            if S::TAG == EvalTag::Yq && resolved >= 0 {
-                                component = OwnedValue::Int(resolved);
-                            }
-                            // #2568: the element the walk stands on has to be
-                            // the element the *resolved* index names, not the
-                            // index as written -- `usize::try_from(idx)` here
-                            // always failed for a negative `idx`, so the walk
-                            // stood on `PathNode::Absent` even when the
-                            // resolved position existed (`.c[-1] | [., key]`
-                            // was `[null,1]` where yq answers `[20,1]`,
-                            // mode-independent since jq's own `.c[-1]` reads
-                            // the last element too). `resolved as usize`
-                            // mirrors the value-side `Expr::Index` arm above
-                            // (this file, `resolved as usize` on `elements`):
-                            // a still-negative `resolved` in jq mode (out of
-                            // range, no raise there) wraps to a huge `usize`
-                            // that `get_cursor` simply misses, same as an
-                            // ordinary out-of-bounds read.
-                            elements
-                                .get_cursor(resolved as usize)
-                                .map_or(PathNode::Absent, PathNode::At)
-                        } else {
-                            usize::try_from(idx)
-                                .ok()
-                                .and_then(|i| elements.get_cursor(i))
-                                .map_or(PathNode::Absent, PathNode::At)
-                        }
-                    } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
-                        // #2459: yq mode only -- a numeric index on a
-                        // mapping is an absent position, same as the
-                        // `Expr::Field` arm's own missing-key case above.
-                        // `.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`.
-                        // See `eval::yq_numeric_index_on_object_is_null`.
-                        PathNode::Absent
-                    } else if yq_field_index_on_scalar_is_empty::<S>() {
-                        // #2482 (yq mode): every yq-mode `Object` case was
-                        // already absorbed by the branch above -- only a
-                        // genuine scalar reaches here. `.s[0] | key` is
-                        // empty in real yq, same as `Expr::Field`'s own
-                        // scalar arm above.
-                        return Ok(());
-                    } else {
-                        return Err(EvalError::cannot_index_with_type(
-                            path_node_type_name::<V>(node),
-                            "number",
-                        ));
-                    }
-                }
-            };
-            out.push((path.extend_from(component, node), next));
+            if let Some(next) = path_index_step_generic::<S, V, T>(*idx, key.as_ref(), node, path)?
+            {
+                out.push(next);
+            }
             Ok(())
         }
         Expr::Iterate => match node {
@@ -19246,6 +19319,129 @@ fn path_context_emitting_value<V: DocumentValue>(
     }
 }
 
+/// Deliver each position from one stage to a callback. Parentheses, commas,
+/// identity, `parent`, literal fields and indices on live or absent nodes,
+/// and nested pipes of these zero-or-one steps bypass the intermediate
+/// buffer. Owned navigation and more complex expressions retain their
+/// collecting semantics. The callback only returns demand, so its downstream
+/// error cannot be caught by this stage.
+fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
+) -> Result<Demand, Control> {
+    if let Expr::Paren(inner) = expr {
+        return path_context_step_each::<S, V>(inner, pos, sink);
+    }
+    if matches!(expr, Expr::Identity) {
+        return Ok(sink(pos.clone()));
+    }
+    // A comma emits each branch's positions in order. There is no rollback
+    // across branches, and a stopped consumer must not evaluate later ones.
+    // Each branch still handles its own component-level rollback before it
+    // delivers a position to `sink`.
+    if let Expr::Comma(branches) = expr {
+        for branch in branches {
+            if matches!(
+                path_context_step_each::<S, V>(branch, pos, sink)?,
+                Demand::Stop
+            ) {
+                return Ok(Demand::Stop);
+            }
+        }
+        return Ok(Demand::Continue);
+    }
+    if matches!(expr, Expr::Builtin(Builtin::Parent)) {
+        return Ok(path_context_hop(pos, 1).map_or(Demand::Continue, sink));
+    }
+    // A nested chain of zero-or-one navigational steps is one stage to the
+    // outer pipe. Stream each position through the chain.
+    if let Expr::Pipe(steps) = expr {
+        if steps.iter().all(|step| {
+            matches!(
+                step,
+                Expr::Identity
+                    | Expr::Field(_)
+                    | Expr::Index { .. }
+                    | Expr::Builtin(Builtin::Parent)
+            )
+        }) {
+            return path_context_step_pipe_each::<S, V>(steps, pos, sink);
+        }
+    }
+    if let Expr::Field(name) = expr {
+        if !matches!(pos.node, PathNode::Owned(_)) {
+            return match path_field_step_generic::<S, V, _>(name, &pos.node, &pos.trail)
+                .map_err(Control::Error)?
+            {
+                Some((trail, node)) => Ok(sink(PathContextPos {
+                    node,
+                    trail,
+                    at_key: false,
+                })),
+                None => Ok(Demand::Continue),
+            };
+        }
+    }
+    if let Expr::Index { idx, key } = expr {
+        if !matches!(pos.node, PathNode::Owned(_)) {
+            return match path_index_step_generic::<S, V, _>(
+                *idx,
+                key.as_ref(),
+                &pos.node,
+                &pos.trail,
+            )
+            .map_err(Control::Error)?
+            {
+                Some((trail, node)) => Ok(sink(PathContextPos {
+                    node,
+                    trail,
+                    at_key: false,
+                })),
+                None => Ok(Demand::Continue),
+            };
+        }
+    }
+    let mut heads = Vec::new();
+    let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
+    for head in heads {
+        if matches!(sink(head), Demand::Stop) {
+            return Ok(Demand::Stop);
+        }
+    }
+    stepped.map(|()| Demand::Continue)
+}
+
+/// Drive a navigational pipe without retaining all of its final positions.
+/// Each stage still decides whether it must collect its own positions before
+/// delivery (notably for yq's component rollback).
+fn path_context_step_pipe_each<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
+) -> Result<Demand, Control> {
+    match exprs.split_first() {
+        None => Ok(sink(pos.clone())),
+        Some((first, [])) => path_context_step_each::<S, V>(first, pos, sink),
+        Some((first, rest)) => {
+            let mut downstream_error = None;
+            let stepped = path_context_step_each::<S, V>(first, pos, &mut |head| {
+                match path_context_step_pipe_each::<S, V>(rest, &head, sink) {
+                    Ok(demand) => demand,
+                    Err(control) => {
+                        downstream_error = Some(control);
+                        Demand::Stop
+                    }
+                }
+            });
+            match downstream_error {
+                Some(control) => Err(control),
+                None => stepped,
+            }
+        }
+    }
+}
+
 /// Walk one emitting expression from `pos`, delivering each output to `sink`
 /// as it is produced.
 ///
@@ -19323,16 +19519,9 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 Err(e) => Err(Control::Error(e)),
             }
         }
-        _ => {
-            let mut heads = Vec::new();
-            let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
-            for head in heads {
-                if matches!(sink.push(path_context_emit_node(&head.node)), Demand::Stop) {
-                    return Ok(Demand::Stop);
-                }
-            }
-            stepped.map(|()| Demand::Continue)
-        }
+        _ => path_context_step_each::<S, V>(expr, pos, &mut |head| {
+            sink.push(path_context_emit_node(&head.node))
+        }),
     }
 }
 
@@ -19347,17 +19536,23 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
         None => Ok(sink.push(path_context_emit_node(&pos.node))),
         Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, sink),
         Some((first, rest)) => {
-            let mut heads = Vec::new();
-            let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
-            for head in heads {
-                if matches!(
-                    path_context_walk_pipe::<S, V>(rest, &head, sink)?,
-                    Demand::Stop
-                ) {
-                    return Ok(Demand::Stop);
-                }
+            let mut downstream_error = None;
+            let stepped =
+                path_context_step_each::<S, V>(
+                    first,
+                    pos,
+                    &mut |head| match path_context_walk_pipe::<S, V>(rest, &head, sink) {
+                        Ok(demand) => demand,
+                        Err(control) => {
+                            downstream_error = Some(control);
+                            Demand::Stop
+                        }
+                    },
+                );
+            match downstream_error {
+                Some(control) => Err(control),
+                None => stepped,
             }
-            stepped.map(|()| Demand::Continue)
         }
     }
 }
@@ -21011,7 +21206,7 @@ fn path_context_absent_identity<V: DocumentValue, S: EvalSemantics>(
     //
     // The links below the deepest live ancestor, root first: the first one
     // was taken from that ancestor, and the rest hang under it.
-    let mut below: Vec<&PathContextLink<V>> = Vec::new();
+    let mut below: Vec<&PathContextStep<V>> = Vec::new();
     let mut base = None;
     for link in pos.trail.links() {
         below.push(link);
@@ -21600,17 +21795,16 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
         Ok(pos) => pos,
         Err(control) => return Some(Flow::Escaped(control)),
     };
-    let mut positions: Vec<PathContextPos<V>> = Vec::new();
-    // Positions reached before an error are still evaluated -- jq's
-    // generator never un-emits an output it already produced -- and the
-    // error follows them, the same rule `path_context_step_generic` states.
-    let stepped = path_context_step_pipe::<S, V>(head, &root_pos, &mut positions);
+    // A complex stage may still collect before delivery so that yq can
+    // discard positions produced by a failing component. The pipe itself
+    // does not retain all positions while evaluating `rest`.
     // A live node keeps its cursor wherever `rest` can be evaluated from
     // one; the identity route's own real positions are the shapes where it
     // cannot (`.c | key` moves the position `rest` reads), and those
     // materialize the node instead of re-rooting the document eagerly.
     let rest_is_cursor_native = !path_context_needs_owned_position(rest);
-    for pos in &positions {
+    let mut downstream_flow = None;
+    let stepped = path_context_step_pipe_each::<S, V>(head, &root_pos, &mut |pos| {
         let flow = match &pos.node {
             PathNode::At(c) if rest_is_cursor_native => {
                 eval_each_pipe_generic::<S, V>(rest, c.value(), false, Some(*c), sink)
@@ -21636,7 +21830,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                 };
                 match route {
                     AbsentRestRoute::Constants => {
-                        match path_context_resolve_absent_stages::<S, V>(rest, pos) {
+                        match path_context_resolve_absent_stages::<S, V>(rest, &pos) {
                             // #3036: `eval_each_owned` demotes every
                             // `Snapshot` marker in `resolved` -- an absent
                             // position holds no node, and a `PathNode::Owned`
@@ -21654,7 +21848,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                         }
                     }
                     AbsentRestRoute::OwnedIdentity => {
-                        match path_context_absent_identity::<V, S>(pos) {
+                        match path_context_absent_identity::<V, S>(&pos) {
                             Ok(id) => eval_owned_identity_pipe::<S, V>(
                                 rest,
                                 Cow::Owned(owned),
@@ -21669,12 +21863,19 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
             }
         };
         match flow {
-            Flow::Exhausted => {}
-            other => return Some(other),
+            Flow::Exhausted => Demand::Continue,
+            other => {
+                downstream_flow = Some(other);
+                Demand::Stop
+            }
         }
+    });
+    if let Some(flow) = downstream_flow {
+        return Some(flow);
     }
     Some(match stepped {
-        Ok(()) => Flow::Exhausted,
+        Ok(Demand::Continue) => Flow::Exhausted,
+        Ok(Demand::Stop) => Flow::Stopped { pending: None },
         Err(control) => Flow::Escaped(control),
     })
 }
@@ -38438,20 +38639,22 @@ mod tests {
         let mut elements = Vec::new();
         path_context_step_generic::<JqSemantics, _>(&Expr::Iterate, b, &mut elements).unwrap();
         assert_eq!(elements.len(), 3);
-        let shared = b.trail.0.as_ref().expect("`.a.b` is two links deep");
+        let PathContextTrail::Link(shared) = &b.trail else {
+            panic!("`.a.b` is two links deep")
+        };
         for (i, pos) in elements.iter().enumerate() {
-            let link = pos.trail.0.as_ref().expect("an element is one link deeper");
-            let parent = link
-                .parent
-                .0
-                .as_ref()
-                .expect("the element's parent is `.a.b`");
+            let PathContextTrail::Link(link) = &pos.trail else {
+                panic!("an element is one link deeper")
+            };
+            let PathContextTrail::Link(parent) = &link.parent else {
+                panic!("the element's parent is `.a.b`")
+            };
             assert!(
                 Rc::ptr_eq(parent, shared),
                 "element {i} copied the trail instead of extending it"
             );
-            assert_eq!(link.component, OwnedValue::Int(i as i64));
-            assert!(matches!(&link.from, PathNode::At(c) if c.same_node(&at(".a.b"))));
+            assert_eq!(link.step.component, OwnedValue::Int(i as i64));
+            assert!(matches!(&link.step.from, PathNode::At(c) if c.same_node(&at(".a.b"))));
         }
         assert_eq!(Rc::strong_count(shared), 1 + elements.len());
         assert_eq!(
@@ -38479,6 +38682,137 @@ mod tests {
         );
         let stay = path_context_hop(&elements[2], 0).expect("`parent(0)` stays");
         assert_eq!(stay.trail.depth(), 3);
+    }
+
+    #[test]
+    fn path_context_nested_seed_hops_and_extends_3022() {
+        let json = br#"{"a":{"b":[0,{"c":7}]}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let at = |f: &str| match eval_with_cursor(&parse(f).unwrap(), root) {
+            GenericResult::OneCursor(c) => c,
+            other => panic!("`{f}` is not one cursor: {other:?}"),
+        };
+        // One or two climbed levels retain the original link representation:
+        // a shared seed would allocate at least as often there.
+        for filter in [".a", ".a.b"] {
+            let shallow =
+                path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(at(filter)).unwrap();
+            assert!(
+                matches!(shallow.trail, PathContextTrail::Link(_)),
+                "{filter}"
+            );
+        }
+        let seeded =
+            path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(at(".a.b[1]")).unwrap();
+        let PathContextTrail::Seed { steps, visible_len } = &seeded.trail else {
+            panic!("nested cursor should start with one shared prefix")
+        };
+        assert_eq!((*visible_len, steps.len()), (3, 3));
+        assert_eq!(seeded.trail.last_component(), Some(&OwnedValue::Int(1)));
+        assert_eq!(
+            seeded.trail.to_vec(),
+            [
+                OwnedValue::String("a".into()),
+                OwnedValue::String("b".into()),
+                OwnedValue::Int(1)
+            ]
+        );
+        assert!(matches!(
+            path_context_emitting_value(&Expr::Builtin(Builtin::Key), &seeded).unwrap(),
+            Some(GenericItem::Owned(OwnedValue::Int(1)))
+        ));
+
+        let array = path_context_hop(&seeded, 1).unwrap();
+        let PathContextTrail::Seed {
+            steps: parent_steps,
+            visible_len,
+        } = &array.trail
+        else {
+            panic!("hop should retain the seed")
+        };
+        assert!(Rc::ptr_eq(steps, parent_steps));
+        assert_eq!(*visible_len, 2);
+        assert!(matches!(array.node, PathNode::At(c) if c.same_node(&at(".a.b"))));
+        assert_eq!(
+            array.trail.last_component(),
+            Some(&OwnedValue::String("b".into()))
+        );
+        let object = path_context_hop(&seeded, 2).unwrap();
+        assert_eq!(object.trail.to_vec(), [OwnedValue::String("a".into())]);
+        assert!(matches!(object.node, PathNode::At(c) if c.same_node(&at(".a"))));
+        let top = path_context_hop(&seeded, 3).unwrap();
+        assert!(matches!(top.trail, PathContextTrail::Root));
+        assert!(matches!(top.node, PathNode::At(c) if c.same_node(&root)));
+        assert!(path_context_hop(&seeded, 4).is_none());
+
+        let mut children = Vec::new();
+        path_context_step_generic::<JqSemantics, _>(&parse(".c").unwrap(), &seeded, &mut children)
+            .unwrap();
+        let [child] = children.as_slice() else {
+            panic!("`.c` should reach one child")
+        };
+        assert!(matches!(child.trail, PathContextTrail::Link(_)));
+        assert_eq!(
+            child.trail.last_component(),
+            Some(&OwnedValue::String("c".into()))
+        );
+        assert_eq!(
+            child.trail.to_vec(),
+            [
+                OwnedValue::String("a".into()),
+                OwnedValue::String("b".into()),
+                OwnedValue::Int(1),
+                OwnedValue::String("c".into())
+            ]
+        );
+        let back = path_context_hop(child, 1).unwrap();
+        assert!(matches!(back.trail, PathContextTrail::Seed { .. }));
+        assert!(matches!(back.node, PathNode::At(c) if c.same_node(&at(".a.b[1]"))));
+        let top = path_context_hop(child, 4).unwrap();
+        assert!(matches!(top.trail, PathContextTrail::Root));
+        assert!(path_context_hop(child, 5).is_none());
+
+        let (key_cursor, _) = member_key_node(&at(".a"), "a").expect("member key node");
+        let key_pos =
+            path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(key_cursor).unwrap();
+        assert!(key_pos.at_key);
+        assert_eq!(key_pos.trail.to_vec(), [OwnedValue::String("a".into())]);
+        assert!(
+            path_context_emitting_value(&Expr::Builtin(Builtin::Key), &key_pos)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path_context_hop(&key_pos, 0).unwrap().at_key);
+        let parent = path_context_hop(&key_pos, 1).unwrap();
+        assert!(!parent.at_key);
+        assert!(matches!(parent.node, PathNode::At(c) if c.same_node(&root)));
+    }
+
+    #[test]
+    fn path_context_deep_seed_drops_without_recursion_3022() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let json = b"null";
+                let index = JsonIndex::build(json);
+                let root = index.root(json);
+                let path = (0..100_000).map(OwnedValue::Int).collect();
+                let ancestors = vec![root; 100_000];
+                let seed = PathContextTrail::<crate::json::StandardJson<'_, Vec<u64>>>::from_climb(
+                    path, ancestors,
+                );
+                assert_eq!(seed.depth(), 100_000);
+                let middle = seed.hop(50_000).unwrap().0;
+                assert_eq!(middle.depth(), 50_000);
+                let extended = middle.extend_from(OwnedValue::Int(100_000), &PathNode::At(root));
+                drop(seed);
+                drop(middle);
+                drop(extended);
+            })
+            .expect("spawn")
+            .join()
+            .expect("deep seed drops on a small stack");
     }
 
     /// #2572: a trail is as deep as the document a walk is rooted in, not
@@ -38818,6 +39152,278 @@ mod tests {
             Demand::Continue
         });
         (out, flow)
+    }
+
+    #[test]
+    fn path_context_literal_field_stream_propagates_stop_and_downstream_error_3022() {
+        let json = br#"{"a":{"b":2}}"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let expr = parse(".a | .b | key").expect("filter parses");
+        let Expr::Pipe(stages) = expr else {
+            panic!("expected pipe");
+        };
+        let mut emitted = 0;
+        let result = path_context_walk_pipe::<JqSemantics, _>(&stages, &root, &mut |_item| {
+            emitted += 1;
+            Demand::Stop
+        });
+        assert!(matches!(result, Ok(Demand::Stop)));
+        assert_eq!(emitted, 1);
+
+        // The first stage's `try` may catch its own field error. The field
+        // error in the next stage belongs to the downstream pipe instead.
+        let json = br#"{"a":1,"fallback":{"b":2}}"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let stages = [
+            parse("try .a catch .fallback").unwrap(),
+            parse(".b").unwrap(),
+            parse("key").unwrap(),
+        ];
+        let result = path_context_walk_pipe::<JqSemantics, _>(&stages, &root, &mut |_item| {
+            panic!("downstream field must raise before emitting")
+        });
+        match result {
+            Err(Control::Error(e)) => assert!(
+                e.message.contains("Cannot index number"),
+                "unexpected downstream error: {e:?}"
+            ),
+            other => panic!("expected downstream field error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_context_nested_field_pipe_streams_positions_3022() {
+        let json = br#"{"k":{"x":1}}"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let expr = parse(".k.x").expect("field chain parses");
+        assert!(matches!(expr, Expr::Pipe(_)), "expected a nested pipe");
+        let mut paths = Vec::new();
+        let result = path_context_step_each::<JqSemantics, _>(&expr, &root, &mut |pos| {
+            paths.push(pos.trail.depth());
+            Demand::Continue
+        });
+        assert!(matches!(result, Ok(Demand::Continue)));
+        assert_eq!(paths, [2]);
+    }
+
+    #[test]
+    fn path_context_nested_primitive_pipe_streams_indices_and_parent_3022() {
+        let json = br#"{"a":[10,20]}"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let expr = parse(".a | .[1] | parent | .[0]").expect("filter parses");
+        assert!(matches!(expr, Expr::Pipe(_)), "expected a nested pipe");
+        let mut reached = Vec::new();
+        let result = path_context_step_each::<JqSemantics, _>(&expr, &root, &mut |pos| {
+            reached.push((pos.trail.to_vec(), pos.node));
+            Demand::Continue
+        });
+        assert!(matches!(result, Ok(Demand::Continue)));
+        assert_eq!(reached.len(), 1);
+        assert_eq!(
+            reached[0].0,
+            [OwnedValue::String("a".into()), OwnedValue::Int(0)]
+        );
+        assert!(matches!(reached[0].1, PathNode::At(_)));
+    }
+
+    #[test]
+    fn path_context_literal_index_stream_preserves_negative_and_owned_rules_3022() {
+        let json = br#"[10,20]"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let expr = parse(".[-1]").expect("filter parses");
+        let mut jq_positions = Vec::new();
+        let jq_result = path_context_step_each::<JqSemantics, _>(&expr, &root, &mut |pos| {
+            jq_positions.push(pos);
+            Demand::Continue
+        });
+        assert!(matches!(jq_result, Ok(Demand::Continue)));
+        assert_eq!(jq_positions.len(), 1);
+        assert_eq!(
+            jq_positions[0].trail.last_component(),
+            Some(&OwnedValue::Int(-1))
+        );
+        assert!(matches!(jq_positions[0].node, PathNode::At(_)));
+
+        let mut yq_positions = Vec::new();
+        let yq_result =
+            path_context_step_each::<crate::jq::YqSemantics, _>(&expr, &root, &mut |pos| {
+                yq_positions.push(pos);
+                Demand::Continue
+            });
+        assert!(matches!(yq_result, Ok(Demand::Continue)));
+        assert_eq!(
+            yq_positions[0].trail.last_component(),
+            Some(&OwnedValue::Int(1))
+        );
+        assert!(matches!(
+            path_context_step_each::<crate::jq::YqSemantics, _>(
+                &parse(".[-3]").unwrap(),
+                &root,
+                &mut |_pos| panic!("out-of-range index must not emit"),
+            ),
+            Err(Control::Error(_))
+        ));
+
+        let owned = PathContextPos::<crate::json::StandardJson<'_, Vec<u64>>> {
+            node: PathNode::Owned(Rc::new(OwnedValue::Array(
+                vec![OwnedValue::Int(10), OwnedValue::Int(20)].into(),
+            ))),
+            trail: PathContextTrail::root(),
+            at_key: false,
+        };
+        let mut owned_positions = Vec::new();
+        let owned_result =
+            path_context_step_each::<JqSemantics, _>(&parse(".[0]").unwrap(), &owned, &mut |pos| {
+                owned_positions.push(pos);
+                Demand::Continue
+            });
+        assert!(matches!(owned_result, Ok(Demand::Continue)));
+        assert_eq!(owned_positions.len(), 1);
+        assert!(matches!(owned_positions[0].node, PathNode::Owned(_)));
+    }
+
+    #[test]
+    fn path_context_comma_stream_stops_before_later_branch_error_3022() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let root = path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(index.root(json))
+            .expect("root position");
+        let expr = parse(".a, .b[]").expect("filter parses");
+        assert!(matches!(expr, Expr::Comma(_)), "expected comma stage");
+
+        let mut stopped_after = 0;
+        let stopped = path_context_step_each::<JqSemantics, _>(&expr, &root, &mut |_pos| {
+            stopped_after += 1;
+            Demand::Stop
+        });
+        assert!(matches!(stopped, Ok(Demand::Stop)));
+        assert_eq!(stopped_after, 1);
+
+        let mut prefix = 0;
+        let exhausted = path_context_step_each::<JqSemantics, _>(&expr, &root, &mut |_pos| {
+            prefix += 1;
+            Demand::Continue
+        });
+        assert_eq!(prefix, 1, "the first branch must emit before the error");
+        match exhausted {
+            Err(Control::Error(e)) => assert!(
+                e.message.contains("Cannot iterate over number"),
+                "unexpected later-branch error: {e:?}"
+            ),
+            other => panic!("expected later-branch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_context_literal_field_stream_keeps_owned_and_absent_rules_3022() {
+        type Json = crate::json::StandardJson<'static, Vec<u64>>;
+        let owned = PathContextPos::<Json> {
+            node: PathNode::Owned(Rc::new(OwnedValue::Null)),
+            trail: PathContextTrail::root(),
+            at_key: false,
+        };
+        let mut reached = Vec::new();
+        let result = path_context_step_each::<JqSemantics, Json>(
+            &parse(".b").unwrap(),
+            &owned,
+            &mut |pos| {
+                reached.push(pos);
+                Demand::Continue
+            },
+        );
+        assert!(matches!(result, Ok(Demand::Continue)));
+        assert_eq!(reached.len(), 1);
+        assert!(matches!(reached[0].node, PathNode::Owned(_)));
+
+        let absent = PathContextPos::<Json> {
+            node: PathNode::Absent,
+            trail: PathContextTrail::root(),
+            at_key: false,
+        };
+        let _read_only = yq_read_only_context::enter();
+        let mut count = 0;
+        let result = path_context_step_each::<crate::jq::YqSemantics, Json>(
+            &parse(".b").unwrap(),
+            &absent,
+            &mut |_pos| {
+                count += 1;
+                Demand::Continue
+            },
+        );
+        assert!(matches!(result, Ok(Demand::Continue)));
+        // The ambient read-only scope is thread-local and intentionally a
+        // no-op in no_std builds.
+        assert_eq!(count, if cfg!(feature = "std") { 0 } else { 1 });
+    }
+
+    #[test]
+    fn path_context_absent_pipe_stream_preserves_prefix_error_and_stop_3022() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let expr = parse("(.a, .b[]) | select(key == \"a\")").unwrap();
+        let Expr::Pipe(stages) = expr else {
+            panic!("expected pipe");
+        };
+        assert!(path_context_absent_split(&stages).is_some());
+
+        let mut values = Vec::new();
+        let flow = try_path_context_absent_sink::<
+            JqSemantics,
+            crate::json::StandardJson<'_, Vec<u64>>,
+        >(&stages, root, &mut |item| {
+            values.push(path_context_item_to_owned::<_, JqSemantics>(item).unwrap());
+            Demand::Continue
+        })
+        .unwrap();
+        assert_eq!(values, [OwnedValue::Int(1)]);
+        assert!(matches!(flow, Flow::Escaped(Control::Error(_))));
+
+        let mut count = 0;
+        let flow = try_path_context_absent_sink::<
+            JqSemantics,
+            crate::json::StandardJson<'_, Vec<u64>>,
+        >(&stages, root, &mut |_item| {
+            count += 1;
+            Demand::Stop
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(flow, Flow::Stopped { pending: None }));
+    }
+
+    #[test]
+    fn path_context_absent_pipe_stream_keeps_yq_component_rollback_3022() {
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let expr = parse(".[(\"a\",\"b\",error(\"x\"))] | select(key == \"a\")").unwrap();
+        let Expr::Pipe(stages) = expr else {
+            panic!("expected pipe");
+        };
+        assert!(path_context_absent_split(&stages).is_some());
+
+        let mut count = 0;
+        let flow = try_path_context_absent_sink::<
+            crate::jq::YqSemantics,
+            crate::json::StandardJson<'_, Vec<u64>>,
+        >(&stages, root, &mut |_item| {
+            count += 1;
+            Demand::Continue
+        })
+        .unwrap();
+        assert_eq!(count, 0, "yq rolls back the component's prefix");
+        assert!(matches!(flow, Flow::Escaped(Control::Error(_))));
     }
 
     /// #2693: the generic evaluator's `recurse` arms, on the one route that
