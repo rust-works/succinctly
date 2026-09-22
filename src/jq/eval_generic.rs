@@ -16637,6 +16637,19 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
     }
 }
 
+/// Climbed levels below which [`PathContextTrail::from_climb`] keeps one
+/// `Rc` link per level (#3022). A shared seed costs a backing `Vec` plus its
+/// `Rc`, so it only starts saving from the third level up; a depth sweep
+/// measured the break-even at two.
+const PATH_CONTEXT_SEED_MIN_LEVELS: usize = 3;
+
+/// Whether [`path_context_step_each`] hands positions straight to the next
+/// stage (#3022). Setting this `false` sends every stage through the
+/// collecting `_` arm instead, which is the pre-#3022 behaviour with this
+/// branch's code layout -- the never-firing holdout build rule 10 of
+/// [the benchmarking guide](../../docs/guides/benchmarking.md) asks for.
+const PATH_CONTEXT_STREAM_POSITIONS: bool = true;
+
 /// The path-context walk's position trail (#2572): the components from the
 /// root to a position, each link also holding the node it was taken *from*
 /// -- `ancestors[i]` of the flat `(path, ancestors)` pair this replaced is
@@ -16744,7 +16757,7 @@ impl<V: DocumentValue> PathContextTrail<V> {
         // A shared seed needs a backing Vec and an Rc. At one or two levels
         // that cannot save allocations over one link per level, so keep the
         // old representation for shallow nested roots.
-        if path.len() <= 2 {
+        if path.len() < PATH_CONTEXT_SEED_MIN_LEVELS {
             return path
                 .into_iter()
                 .zip(ancestors)
@@ -19330,6 +19343,9 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
 ) -> Result<Demand, Control> {
+    if !PATH_CONTEXT_STREAM_POSITIONS {
+        return path_context_step_collecting::<S, V>(expr, pos, sink);
+    }
     if let Expr::Paren(inner) = expr {
         return path_context_step_each::<S, V>(inner, pos, sink);
     }
@@ -19402,6 +19418,18 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
             };
         }
     }
+    path_context_step_collecting::<S, V>(expr, pos, sink)
+}
+
+/// The collecting boundary every stage outside [`path_context_step_each`]'s
+/// streamed set still uses: gather this step's positions, then deliver them.
+/// Holding a stage's positions is what lets yq discard the ones a later
+/// component error rolls back.
+fn path_context_step_collecting<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
+) -> Result<Demand, Control> {
     let mut heads = Vec::new();
     let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
     for head in heads {
