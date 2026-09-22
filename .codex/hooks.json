@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/format-rust.sh\"",
+            "timeout": 60,
+            "statusMessage": "rustfmt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/check-skill-casing.sh\"",
+            "timeout": 30,
+            "statusMessage": "skill.md casing check"
+          }
+        ]
+      }
+    ]
+  }
+}

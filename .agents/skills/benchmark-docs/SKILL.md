@@ -1,0 +1,298 @@
+---
+name: benchmark-docs
+description: Manages benchmark documentation across multiple platforms. Use when updating benchmark results, adding performance data, or documenting jq comparison benchmarks. Triggers on terms like "benchmark", "performance", "jq comparison", "benchmark results", "update benchmarks".
+---
+
+# Benchmark Documentation Skill
+
+This skill ensures proper handling of benchmark documentation across multiple platforms (ARM/Apple Silicon and x86_64/Intel/AMD).
+
+**For comprehensive benchmarking instructions**, see [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md).
+
+This skill focuses on **documentation-specific rules** and multi-platform considerations.
+
+## A/B Measurement Rules (before/after a code change)
+
+Full method and evidence: [docs/guides/benchmarking.md § A/B Benchmarking Method](../../../docs/guides/benchmarking.md#ab-benchmarking-method).
+These seven rules each cost a wrong conclusion on #106 — the naive method reported a 16x win as
+a regression.
+
+1. **Interleave the two binaries within each repetition.** Never run all of A then all of B —
+   the second half starts thermally loaded, which made an improved binary measure up to **2x
+   slower** on every workload. This is a design fix; more reps do not help, and min/median can
+   agree with each other while both are wrong.
+2. **Process-spawn A/B needs inputs >= 1 MB.** Startup is ~4-6 ms, i.e. the whole runtime at
+   1kb/10kb/100kb — which are in `dev bench yq`'s defaults. Use `--sizes 1mb,10mb`.
+3. **Report the scaling curve across 2-3 sizes.** A speedup that grows with input size is the
+   signature of an algorithmic fix and corroborates the claimed mechanism; one ratio does not.
+4. **Gate on output identity first.** Diff both binaries over every input x query and confirm
+   they still match `jq`/`yq`. A faster binary that changed behaviour is not a win.
+5. **Measure both architectures — the effect size differs, not just the noise.** #106 was 6.1x
+   on M4 Pro and 16.4x on Zen 4 for the same commit, because cache-bound costs do not port.
+6. **Verify the box is idle, and distrust macOS load average** — it counts uninterruptible-wait
+   threads, reading 1.4 on a machine using 2.4% CPU. Sum `ps -Ao pcpu`, check for
+   `cargo|rustc|codex`, and require AC power.
+7. **A benchmark cannot measure a shape it does not generate.** "All neutral" is not evidence if
+   the suite lacks the relevant input; add the generator pattern first, then measure.
+
+**Always name the platform in the results.** Every perf table in this repo names the chip; a
+table without one is unreviewable. Benchmark on the boxes in
+[Platforms and Hardware](../../../docs/guides/benchmarking.md#platforms-and-hardware), not a
+laptop on battery.
+
+## Critical Rules
+
+**NEVER replace platform-specific benchmarks with each other.**
+
+When adding new benchmark data:
+
+1. **Keep both ARM and x86_64 benchmarks** - Never delete one platform's data when adding another
+2. **Add new platform data alongside existing data** - Create separate sections or files per platform
+3. **Name files with platform suffix** - e.g., `jq-comparison-m1.jsonl`, `jq-comparison-zen4.jsonl`
+4. **Update docs to show both** - README and docs should reference benchmarks from all platforms
+
+## Benchmark File Locations
+
+For complete inventory, see [docs/benchmarks/inventory.md](../../../docs/benchmarks/inventory.md).
+
+Key locations:
+- `data/bench/generated/` - Input files (git-ignored)
+- `data/bench/results/` - Output (git-ignored)
+- `docs/benchmarks/*.md` - Documentation (tracked)
+- `README.md` - Summary (tracked)
+
+## Updating Benchmark Documentation
+
+For complete documentation update workflow, see [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#updating-documentation).
+
+### Quick Workflow
+
+1. Build the benchmark runner: `cargo build --release --features bench-runner`
+2. Run benchmarks: `./target/release/succinctly bench run jq_bench`
+3. Review output: `data/bench/results/<timestamp>/jq-bench.md`
+4. Update documentation:
+   - `docs/benchmarks/jq.md` - Full results with all patterns/sizes
+   - `README.md` - Summary highlights only
+5. Follow platform parity rules (see below)
+
+## README Table Requirements
+
+### Platform Parity
+
+**Every benchmark table in README.md must have data for BOTH platforms:**
+- x86_64 (AMD Ryzen 9 7950X or equivalent)
+- ARM (Apple M1 Max or equivalent)
+
+If a table only shows one platform, add the missing platform's data from `docs/benchmarks/jq.md`.
+
+### Pattern Names
+
+**Never abbreviate pattern names in tables.** Use full names:
+- `pathological` not `patholog.`
+- `comprehensive` not `compreh.`
+
+### Bold Formatting in Tables
+
+When using bold for values in tables, ensure spaces are OUTSIDE the `**` markers:
+```markdown
+<!-- CORRECT -->
+|  **59.6ms** |
+
+<!-- WRONG (won't render as bold) -->
+| ** 59.6ms** |
+```
+
+See the markdown-tables skill for complete table formatting rules.
+
+## Benchmark Patterns
+
+| Pattern       | Description                    |
+|---------------|--------------------------------|
+| comprehensive | Mixed content (realistic)      |
+| users         | User records (nested objects)  |
+| nested        | Deep nesting (tests BP)        |
+| arrays        | Large arrays (tests iteration) |
+| strings       | String-heavy (tests escapes)   |
+| unicode       | Unicode strings                |
+| pathological  | Worst-case                     |
+| numbers       | Number-heavy documents         |
+| literals      | Mix of null, true, false       |
+| mixed         | Heterogeneous nested structures|
+
+## Before Running Benchmarks
+
+**CRITICAL: Always compile before benchmarking:**
+```bash
+cargo build --release --features bench-runner
+```
+
+See [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#troubleshooting) for environment setup and troubleshooting.
+
+Quick checks:
+- Build is up to date: `cargo build --release --features bench-runner`
+- CPU load is low: `uptime`
+- Test data exists: `ls data/bench/generated/`
+
+## Benchmark Commands Reference
+
+For complete command reference, see [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#how-to-run-benchmarks).
+
+**IMPORTANT: Always use the unified benchmark runner (`succinctly bench`), not `dev bench`.**
+
+### Running Benchmarks
+
+**Always build first, then run benchmarks:**
+
+```bash
+# Step 1: Build the benchmark runner (required before running benchmarks)
+cargo build --release --features bench-runner
+
+# Step 2: Generate test data (if not already present)
+./target/release/succinctly json generate-suite
+./target/release/succinctly yaml generate-suite
+
+# Step 3: Run benchmarks using the unified runner
+./target/release/succinctly bench run jq_bench      # JSON vs jq
+./target/release/succinctly bench run yq_bench      # YAML vs yq
+./target/release/succinctly bench run jq_comparison # Criterion JSON benchmarks
+./target/release/succinctly bench run yq_comparison # Criterion YAML benchmarks
+```
+
+### Listing Available Benchmarks
+
+```bash
+./target/release/succinctly bench list
+```
+
+### Running Multiple Benchmarks
+
+```bash
+# Run all JSON benchmarks
+./target/release/succinctly bench run jq_bench jq_comparison
+
+# Run all YAML benchmarks
+./target/release/succinctly bench run yq_bench yq_comparison yaml_bench
+```
+
+## Memory Collection
+
+**Memory is collected by default** for CLI benchmarks. Use `--no-memory` to skip.
+
+### Benchmark Types and Memory Support
+
+| Type | Memory Collected | How | Examples |
+|------|------------------|-----|----------|
+| **CLI** | Yes (default) | `/usr/bin/time` peak RSS | `jq_bench`, `yq_bench`, `dsv_cli` |
+| **Criterion** | No | In-process timing only | `jq_comparison`, `yaml_bench` |
+| **CrossParser** | No | In-process timing only | `json_parsers`, `yaml_parsers` |
+
+### Memory Flag Usage
+
+```bash
+# Memory collected by default
+./target/release/succinctly bench run yq_bench
+
+# Skip memory collection (faster)
+./target/release/succinctly bench run yq_bench --no-memory
+
+# All CLI benchmarks support --no-memory
+./target/release/succinctly bench run jq_bench --no-memory
+./target/release/succinctly bench run dsv_cli --no-memory
+```
+
+### Unified Runner Output
+
+When running via `succinctly bench run`, CLI benchmark results are saved to the output directory:
+
+```
+data/bench/results/<timestamp>/
+  metadata.json      # System info
+  summary.json       # Run summary
+  jq_bench.jsonl     # Raw results with peak_memory_bytes
+  jq_bench.md        # Markdown with memory columns
+  yq_bench.jsonl
+  yq_bench.md
+  stdout/
+    jq_bench.txt     # Console output
+    yq_bench.txt
+```
+
+## yq Benchmark Query Types
+
+The yq benchmark supports multiple query types to exercise different execution paths:
+
+| Query Type     | Example    | Execution Path | Description                                     |
+|----------------|------------|----------------|-------------------------------------------------|
+| `identity`     | `.`        | P9 streaming   | Full document streaming output                  |
+| `first_element`| `.[0]`     | M2 streaming   | Navigate to first array element                 |
+| `iteration`    | `.[]`      | M2 streaming   | Iterate over array elements                     |
+| `length`       | `length`   | OwnedValue     | Produces computed value (not cursor-streamable) |
+
+### Running yq Benchmarks
+
+**Always build first:** `cargo build --release --features bench-runner`
+
+```bash
+# Run yq CLI benchmark (memory is collected by default)
+./target/release/succinctly bench run yq_bench
+
+# Run specific query types
+./target/release/succinctly bench run yq_bench --queries identity
+./target/release/succinctly bench run yq_bench --queries identity,first_element
+
+# Focus on M2 streaming with the navigation pattern
+./target/release/succinctly bench run yq_bench --patterns navigation --sizes 10mb,100mb
+
+# Skip memory collection (faster, but no memory comparison)
+./target/release/succinctly bench run yq_bench --no-memory
+```
+
+### Query Type Aliases
+
+Multiple aliases are accepted for each query type:
+
+| Query Type     | Aliases                          |
+|----------------|----------------------------------|
+| `identity`     | `identity`, `.`                  |
+| `first_element`| `first_element`, `first`, `.[0]` |
+| `iteration`    | `iteration`, `iter`, `.[]`       |
+| `length`       | `length`                         |
+
+## Running bench-compare Benchmarks
+
+For complete instructions, see [docs/guides/benchmarking.md](../../../docs/guides/benchmarking.md#5-cross-parser-benchmarks).
+
+Quick steps:
+1. Generate data: `cargo run --release --features cli -- json generate-suite`
+2. Run: `cd bench-compare && cargo bench --bench json_parsers`
+3. Update documentation (see "Updating Documentation" section below)
+
+## Rust JSON Parser Comparison
+
+The `bench-compare/` subproject benchmarks succinctly against other Rust JSON parsers.
+
+### When to Use Each Parser
+
+| Use Case                          | Best Choice      | Why                                      |
+|-----------------------------------|------------------|------------------------------------------|
+| Full document traversal           | **sonic-rs**     | Fastest parse + traverse (400+ MiB/s)    |
+| Selective field access (jq-style) | **succinctly**   | Lazy evaluation skips unused data        |
+| Memory-constrained environments   | **succinctly**   | 17-45x less memory than DOM parsers      |
+| Standard DOM parsing              | **serde_json**   | Best ecosystem compatibility             |
+| SIMD-accelerated DOM              | **simd-json**    | Fast parsing, moderate memory            |
+
+### Key Learnings
+
+1. **sonic-rs is fastest for full document access** - ~670 MiB/s parse, ~420 MiB/s parse+traverse on ARM
+2. **succinctly trades speed for memory** - 46% of input size vs 8-21x for DOM parsers
+3. **succinctly wins on selective queries** - jq-style queries are 1.2-6.3x faster than `jq` because unused data isn't parsed
+4. **simd-json has highest memory overhead** - 20x input size due to tape-based representation
+
+### Performance Characteristics (ARM, Apple M1 Max)
+
+| Parser      | Parse Only | Parse+Traverse | Memory (100MB) |
+|-------------|------------|----------------|----------------|
+| sonic-rs    | 687 MiB/s  | 425 MiB/s      | 955 MB (11.9x) |
+| succinctly  | 534 MiB/s  | 283 MiB/s      | 37 MB (0.46x)  |
+| simd-json   | 182 MiB/s  | 227 MiB/s      | 1654 MB (20.7x)|
+| serde_json  | 153 MiB/s  | 139 MiB/s      | 655 MB (8.2x)  |
