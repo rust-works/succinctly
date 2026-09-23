@@ -8495,7 +8495,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // sink before its next state is retained. `eval_single` first
             // collects every whole state, which can keep thousands of
             // unchanged long literals alive for `[while(... ) | .i]`.
-            if matches!(inner.as_ref(), Expr::Label { .. } | Expr::Try { .. })
+            if (matches!(inner.as_ref(), Expr::Label { .. } | Expr::Try { .. })
+                && crate::jq::eval::contains_retrying_pattern_bind(inner))
                 || matches!(inner.as_ref(), Expr::Pipe(stages) if stages.iter().any(|stage| matches!(stage, Expr::While { .. } | Expr::Until { .. })))
             {
                 let mut items = Vec::new();

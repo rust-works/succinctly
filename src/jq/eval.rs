@@ -3403,7 +3403,9 @@ fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // A label's break (or try's error) must reach a parenthesized `?//`
     // through a live sink. Collecting its eager result first loses the
     // retry, then either drops the later comma branch or catches the error.
-    if matches!(inner, Expr::Label { .. } | Expr::Try { .. }) {
+    if matches!(inner, Expr::Label { .. } | Expr::Try { .. })
+        && contains_retrying_pattern_bind(inner)
+    {
         let mut items = Vec::new();
         let mut conversion_error = None;
         let flow = eval_each::<W, S>(inner, value, optional, &mut |item| match item
@@ -44883,6 +44885,24 @@ pub(crate) fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry
 /// consumed that stop while advancing to another alternative.
 pub(crate) fn direct_pattern_retry(expr: &Expr) -> bool {
     matches!(unwrap_paren(expr), Expr::AsPattern { patterns, .. } if patterns.len() > 1)
+}
+
+/// The eager array collector needs a live sink only when downstream control
+/// can unwind into a `?//` bind inside its label/try body. Keep unrelated
+/// generators on the eager route, where their resource caps apply.
+pub(crate) fn contains_retrying_pattern_bind(expr: &Expr) -> bool {
+    match expr {
+        Expr::AsPattern { patterns, body, .. } => {
+            patterns.len() > 1 || contains_retrying_pattern_bind(body)
+        }
+        Expr::Pipe(parts) | Expr::Comma(parts) => parts.iter().any(contains_retrying_pattern_bind),
+        Expr::Paren(inner)
+        | Expr::Array(inner)
+        | Expr::Optional(inner)
+        | Expr::Try { expr: inner, .. }
+        | Expr::Label { body: inner, .. } => contains_retrying_pattern_bind(inner),
+        _ => false,
+    }
 }
 
 pub(crate) fn pipe_retry_generation() -> u64 {
