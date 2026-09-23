@@ -17692,6 +17692,20 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// JSON at all" (`"0x10"`), which jq words differently.
 fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     let bytes = s.as_bytes();
+    if !yq_mode {
+        // #3032: use the same jq accept-set and literal-preserving decoder as
+        // --argjson. Validation must precede semi-indexing: the index alone
+        // does not check JSON grammar or guarantee one complete value.
+        crate::json::validate::validate_jq_lenient(bytes).map_err(|e| e.to_string())?;
+        let index = crate::json::JsonIndex::build(bytes);
+        // STYLE-0012: this parser has no `optional` flag; its caller handles
+        // suppression, and the validator already bounds nesting below the
+        // materializer's own limit.
+        return super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
+            .map_err(|e| e.to_string());
+    }
+
+    // yq retains its existing parser and error behavior (#2018).
     let mut pos = 0;
     let value = parse_json_value(bytes, &mut pos, yq_mode)?;
     while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {

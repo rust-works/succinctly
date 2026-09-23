@@ -43621,6 +43621,74 @@ fn test_low_surrogate_key_participates_in_duplicate_collapse_2008() {
     assert_eq!(stdout.trim(), "{\"a\u{FFFD}\":2}");
 }
 
+/// #3032: `fromjson` must use the jq input accept-set and preserve number
+/// literals, including overflow, inside containers as well as at the root.
+#[test]
+fn test_fromjson_jq_lenient_numbers_and_literal_spelling_3032() -> Result<()> {
+    for (source, expected) in [
+        ("007", "7"),
+        (".5", "0.5"),
+        ("1.e5", "1E+5"),
+        ("007.500", "7.500"),
+        ("[007,.5]", "[7,0.5]"),
+        (
+            r#"{"n":007.500,"big":1e400}"#,
+            r#"{"n":7.500,"big":1E+400}"#,
+        ),
+        ("1e400", "1E+400"),
+        ("+1", "1"),
+        ("nan", "null"),
+        ("sNaN", "null"),
+        ("Infinity", "1.7976931348623157e+308"),
+        ("  [007,.5] \n", "[7,0.5]"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson"], None)?;
+        assert_eq!(code, 0, "{source:?}: {stderr}");
+        assert_eq!(stdout.trim_end(), expected, "{source:?}");
+    }
+    Ok(())
+}
+
+/// #3032: validation still rejects malformed input, preserves the existing
+/// fromjson diagnostic and optional suppression, and does not change the
+/// `tonumber` probe for valid JSON that is not a number.
+#[test]
+fn test_fromjson_jq_lenient_rejects_invalid_text_3032() -> Result<()> {
+    for source in ["1.", "01x", "[1,]", r#""\ud800""#, "\"a\tb\""] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson"], None)?;
+        assert_eq!(code, 5, "{source:?}: {stdout:?} {stderr:?}");
+        assert!(
+            stderr.contains(&format!("(while parsing '{source}')")),
+            "{source:?}: {stderr}"
+        );
+
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson?"], None)?;
+        assert_eq!(code, 0, "{source:?}: {stderr}");
+        assert!(stdout.is_empty(), "{source:?}: {stdout:?}");
+    }
+
+    // Validation runs before the cursor walk and caps nesting below the
+    // materializer's own recursion limit.
+    let deep = format!("{}0{}", "[".repeat(129), "]".repeat(129));
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "--arg", "s", &deep, "$s | fromjson"], None)?;
+    assert_eq!(code, 5, "{stdout:?} {stderr:?}");
+    assert!(stderr.contains("while parsing"), "{stderr}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "--arg", "s", "null", "$s | try tonumber catch ."],
+        None,
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#""string (\"null\") cannot be parsed as a number""#
+    );
+    Ok(())
+}
+
 /// #2008 (code review): `fromjson`/`tonumber`'s own hand-rolled JSON string
 /// decoder (`parse_json_string_value` in `eval.rs`) is a second,
 /// independent implementation of surrogate handling from
