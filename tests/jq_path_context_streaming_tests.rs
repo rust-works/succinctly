@@ -1,0 +1,214 @@
+//! Focused control-flow probes for #3022's path-context position streaming.
+//!
+//! Each expectation was checked before the streaming change against the
+//! pinned jq 1.7.1 or yq v4.53.3 oracle, as indicated per test. The yq
+//! rows use only operators accepted by yq itself; this deliberately avoids
+//! treating succinctly's jq-extension surface as an oracle.
+
+#![cfg(feature = "cli")]
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+use anyhow::Result;
+
+fn run(mode: &str, filter: &str, input: &str) -> Result<(String, String, i32)> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    command.arg(mode);
+    if mode == "jq" {
+        command.arg("-c");
+    } else {
+        command.args(["-o=json", "-I=0"]);
+    }
+    let mut child = command
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())?;
+    let output = child.wait_with_output()?;
+    let code = output.status.code().expect("child was not signal-killed");
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        code,
+    ))
+}
+
+/// A `try` handles an error raised in its body, but a later pipeline stage is
+/// outside that body.  A push-based implementation must therefore park the
+/// downstream error rather than feed it into the earlier `try` callback.
+///
+/// Captured from jq 1.7.1. `path(.)` makes both rows enter the jq
+/// path-context route without relying on yq-only builtins.
+#[test]
+fn upstream_try_does_not_catch_a_later_path_context_error() -> Result<()> {
+    let (stdout, stderr, code) = run(
+        "jq",
+        "(try error(\"upstream\") catch \"caught\") | path(.)",
+        "null\n",
+    )?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "[]\n");
+
+    let (stdout, stderr, code) = run(
+        "jq",
+        "(try .a catch \"caught\") | .[] | path(.)",
+        "{\"a\":1}\n",
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot iterate over number"),
+        "stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+/// `first` supplies Stop after the first result, so the generator's later
+/// `error` must never be evaluated. Captured from jq 1.7.1.
+#[test]
+fn first_stops_a_path_context_generator_before_its_later_error() -> Result<()> {
+    let (stdout, stderr, code) = run(
+        "jq",
+        "first(.a[] | path(.), error(\"late\"))",
+        "{\"a\":[1,2]}\n",
+    )?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// A normal jq consumer exposes the prefix already yielded before an error.
+/// This is the companion to the Stop row above: streaming must preserve this
+/// prefix, while `first` is allowed to prevent it from continuing. Captured
+/// from jq 1.7.1.
+#[test]
+fn jq_path_context_generator_keeps_its_prefix_before_error() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "(.a[] | path(.)), error(\"late\")", "{\"a\":[1,2]}\n")?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "[]\n[]\n");
+    assert!(stderr.contains("late"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// Nested navigational fields retain the position needed by all three yq
+/// path-context builtins. Captured from yq v4.53.3.
+#[test]
+fn yq_nested_fields_keep_path_context() -> Result<()> {
+    for (filter, expected) in [
+        (".a | .b | key", "\"b\"\n"),
+        (".a | .b | path", "[\"a\",\"b\"]\n"),
+        (".a | .b | parent", "{\"b\":1}\n"),
+    ] {
+        let (stdout, stderr, code) = run("yq", filter, "a:\n  b: 1\n")?;
+        assert_eq!(code, 0, "{filter}: stderr={stderr:?}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// The issue's fan-out shape walks a nested field pipe and then hops once
+/// per element. Its answer must stay unchanged as each stage loses its
+/// temporary position buffer.
+#[test]
+fn yq_field_chain_then_parent_after_fanout() -> Result<()> {
+    let (stdout, stderr, code) = run(
+        "yq",
+        "[.[] | .k.x | parent] | length",
+        "- k: {x: 1}\n- k: {x: 2}\n",
+    )?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "2\n");
+    Ok(())
+}
+
+/// A comma stage keeps both branch order and each branch's path context.
+/// Captured from yq v4.53.3.
+#[test]
+fn yq_comma_stage_streams_positions_in_order() -> Result<()> {
+    let (stdout, stderr, code) = run("yq", "(.a, .b) | key", "a: 1\nb: 2\n")?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "\"a\"\n\"b\"\n");
+    Ok(())
+}
+
+/// yq discards a computed-index prefix when a later component errors. The
+/// trailing `path` ensures the row traverses path-context machinery as well
+/// as the computed-component rollback boundary. Captured from yq v4.53.3.
+#[test]
+fn yq_computed_component_error_rolls_back_path_context_prefix() -> Result<()> {
+    let (stdout, stderr, code) = run(
+        "yq",
+        ".arr | .[(0, error(\"late\"))] | path",
+        "arr:\n  - 1\n  - 2\n",
+    )?;
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("late"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// `.[]` fans out, and streaming it must still hand jq's own generator order
+/// to the consumer: every position reached before the failing element, then
+/// the error. Captured from jq 1.7.1 (`path(.[] | .a)` on
+/// `[{"a":1},2,{"a":3}]` prints `[0,"a"]` and exits 5).
+#[test]
+fn iterate_streams_its_prefix_before_a_later_element_errors_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "path(.[] | .a)", "[{\"a\":1},2,{\"a\":3}]\n")?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "[0,\"a\"]\n");
+    assert!(stderr.contains("Cannot index number"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// Array construction stays atomic over a streamed `.[]`: the same query
+/// collected into an array emits nothing at all. Captured from jq 1.7.1.
+#[test]
+fn iterate_array_construction_stays_atomic_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "[path(.[] | .a)]", "[{\"a\":1},2,{\"a\":3}]\n")?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Cannot index number"), "stderr={stderr:?}");
+    Ok(())
+}
+
+/// Demand has to reach the iteration itself, not just the stage after it:
+/// `first` is satisfied by element 0, so element 1 -- which would raise --
+/// is never stepped. Captured from jq 1.7.1 (`[0,"a"]`, exit 0).
+#[test]
+fn iterate_stops_before_stepping_the_next_element_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "first(path(.[] | .a))", "[{\"a\":1},2]\n")?;
+    assert_eq!(code, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "[0,\"a\"]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// The streamed iteration still goes through the mode's duplicate-key rule
+/// rather than walking raw fields (#1385). Captured from jq 1.7.1:
+/// `[path(.[])]` on `{"a":1,"a":2}` is `[["a"]]`, not `[["a"],["a"]]`.
+#[test]
+fn iterate_keeps_duplicate_key_collapse_while_streaming_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("jq", "[path(.[])]", "{\"a\":1,\"a\":2}\n")?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "[[\"a\"]]\n");
+    Ok(())
+}
+
+/// yq's three path-context builtins over a streamed `.[]`, so the fan-out
+/// route is covered in both modes. Captured from yq v4.53.3:
+/// `.[] | key` over `[{"k":1},{"k":2}]` is `0` then `1`.
+#[test]
+fn yq_iterate_streams_keys_3022() -> Result<()> {
+    let (stdout, stderr, code) = run("yq", ".[] | key", "- k: 1\n- k: 2\n")?;
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert_eq!(stdout, "0\n1\n");
+    Ok(())
+}
