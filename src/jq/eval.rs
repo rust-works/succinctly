@@ -3400,6 +3400,30 @@ fn collect_array_items<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
+    // A label's break (or try's error) must reach a parenthesized `?//`
+    // through a live sink. Collecting its eager result first loses the
+    // retry, then either drops the later comma branch or catches the error.
+    if matches!(inner, Expr::Label { .. } | Expr::Try { .. })
+        && contains_retrying_pattern_bind(inner)
+    {
+        let mut items = Vec::new();
+        let mut conversion_error = None;
+        let flow = eval_each::<W, S>(inner, value, optional, &mut |item| match item
+            .into_owned::<S>()
+        {
+            Ok(item) => {
+                items.push(item);
+                Demand::Continue
+            }
+            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+        });
+        return match resume_from_escape(conversion_error, flow) {
+            Flow::Exhausted | Flow::Stopped { .. } => Ok(items),
+            Flow::Escaped(Control::Error(error)) => Err(QueryResult::Error(error)),
+            Flow::Escaped(Control::Break(label)) => Err(QueryResult::Break(label)),
+            Flow::Escaped(Control::Halt(code)) => Err(QueryResult::Halt(code)),
+        };
+    }
     // Collect all outputs from the inner expression into an array
     let result = eval_single::<W, S>(inner, value, optional);
 
@@ -7754,6 +7778,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `eval_range_values`/`_f64` could raise on `MAX_RANGE`).
     let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
     let mut sink_stopped = false;
+    let mut sink_stopped_at = pipe_retry_generation();
 
     // One (from, to, step) combination's values, forwarded to the wrapping
     // `sink`. Reuses `eval_range_values`/`_f64` and `drain_result` verbatim
@@ -7809,6 +7834,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
                 sink_stopped = true;
+                sink_stopped_at = pipe_retry_generation();
                 Demand::Stop
             }
             // `owned_vec_to_result` never yields `Error`/`Break`/`Halt`/
@@ -7888,7 +7914,12 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     });
 
-    if sink_stopped {
+    // A bound's `?//` can retry the stop from `emit` and then exhaust;
+    // only that later attempt clears the flag for the enclosing comma.
+    let direct_retry = direct_pattern_retry(from)
+        || to.is_some_and(direct_pattern_retry)
+        || step.is_some_and(direct_pattern_retry);
+    if sink_stopped && !retry_consumed_stop(&from_flow, sink_stopped_at, direct_retry) {
         return Flow::Stopped { pending: None };
     }
     match escape.into_inner() {
@@ -7931,6 +7962,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // to stop stage 1 too -- that is the whole point of the lazy `Pipe` arm --
     // but the two cases surface differently to our own caller.
     let mut downstream: Option<Flow> = None;
+    let mut stopped_at = pipe_retry_generation();
     // Built at most once, and only if an `Owned` item actually arrives
     // (#1598). This used to be unconditional, so an all-`Borrowed` chain --
     // the common case -- allocated a `Vec` and deep-cloned every remaining
@@ -7966,20 +7998,22 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
-                other => stop_with_downstream(&mut downstream, other),
+                other => {
+                    let demand = stop_with_downstream(&mut downstream, other);
+                    stopped_at = pipe_retry_generation();
+                    demand
+                }
             }
         };
         eval_each::<W, S>(first, value, optional, &mut driver)
     };
 
-    match downstream {
-        // Downstream decided. Its verdict wins over stage 1's `Stopped`,
-        // which is only the echo of our own driver returning `Stop`.
-        Some(flow) => flow,
-        // Stage 1 ended on its own terms; every value it produced was piped
-        // through cleanly.
-        None => upstream,
-    }
+    pipe_terminal_after_retry(
+        upstream,
+        downstream,
+        stopped_at,
+        direct_pattern_retry(first),
+    )
 }
 
 /// Collect a sink's items back into a `QueryResult`, reproducing
@@ -21521,6 +21555,30 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     if exprs.is_empty() {
         return QueryResult::One(value);
+    }
+
+    // The rest of this eager fold completes stage 1 before it evaluates
+    // downstream. A parenthesized bind needs the downstream escape while
+    // its alternatives are still live, so drive this shape through the
+    // staged pipe and collect its finished outputs.
+    if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+    {
+        let mut outputs = Vec::new();
+        let mut conversion_error = None;
+        let flow = eval_each_pipe::<W, S>(exprs, value, optional, &mut |item| match item
+            .into_owned::<S>()
+        {
+            Ok(item) => {
+                outputs.push(item);
+                Demand::Continue
+            }
+            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+        });
+        return finish_fork_from_flow(
+            outputs,
+            resume_from_escape(conversion_error, flow),
+            optional,
+        );
     }
 
     let (first, rest) = exprs.split_first().unwrap();
@@ -44798,6 +44856,57 @@ mod terminal_retry {
     pub(crate) fn began_since(generation: u64) -> bool {
         current() != generation
     }
+}
+
+/// A `?//` retry can consume the verdict a pipe driver stashed when its sink
+/// stopped. `Exhausted` alone is ambiguous: `limit` also returns it when its
+/// own count stop wins. A new alternative attempt after the stash identifies
+/// the retry that absorbed the verdict.
+pub(crate) fn pipe_terminal_after_retry(
+    upstream: Flow,
+    downstream: Option<Flow>,
+    stopped_at: u64,
+    direct_retry: bool,
+) -> Flow {
+    if downstream.is_some() && retry_consumed_stop(&upstream, stopped_at, direct_retry) {
+        upstream
+    } else {
+        downstream.unwrap_or(upstream)
+    }
+}
+
+pub(crate) fn retry_consumed_stop(upstream: &Flow, stopped_at: u64, direct_retry: bool) -> bool {
+    matches!(upstream, Flow::Exhausted)
+        && (terminal_retry::current() != stopped_at || (!cfg!(feature = "std") && direct_retry))
+}
+
+/// In `no_std` there is no thread-local retry generation. A direct `?//`
+/// producer that received a sink stop and then exhausted has necessarily
+/// consumed that stop while advancing to another alternative.
+pub(crate) fn direct_pattern_retry(expr: &Expr) -> bool {
+    matches!(unwrap_paren(expr), Expr::AsPattern { patterns, .. } if patterns.len() > 1)
+}
+
+/// The eager array collector needs a live sink only when downstream control
+/// can unwind into a `?//` bind inside its label/try body. Keep unrelated
+/// generators on the eager route, where their resource caps apply.
+pub(crate) fn contains_retrying_pattern_bind(expr: &Expr) -> bool {
+    match expr {
+        Expr::AsPattern { patterns, body, .. } => {
+            patterns.len() > 1 || contains_retrying_pattern_bind(body)
+        }
+        Expr::Pipe(parts) | Expr::Comma(parts) => parts.iter().any(contains_retrying_pattern_bind),
+        Expr::Paren(inner)
+        | Expr::Array(inner)
+        | Expr::Optional(inner)
+        | Expr::Try { expr: inner, .. }
+        | Expr::Label { body: inner, .. } => contains_retrying_pattern_bind(inner),
+        _ => false,
+    }
+}
+
+pub(crate) fn pipe_retry_generation() -> u64 {
+    terminal_retry::current()
 }
 
 /// `no_std` has no `thread_local!`, so the generation never moves and the
