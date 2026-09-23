@@ -28404,6 +28404,90 @@ impl DeferredUpdateDeletes {
     }
 }
 
+#[cfg(test)]
+mod deferred_update_delete_path_tests {
+    use super::*;
+    use crate::jq::parse;
+
+    // The public update resolves many paths into individual leaves before
+    // writing. Check the native path walker too, since callers can hand it
+    // unresolved iteration, slices, and fresh array positions.
+    #[test]
+    fn native_paths_record_their_deferred_delete_components() {
+        for (input, path, expected) in [
+            (r#"{"a":[1,2],"z":3}"#, ".a[]", r#"{"a":[],"z":3}"#),
+            (r#"{"a":{"x":1,"y":2},"z":3}"#, ".a[]", r#"{"a":{},"z":3}"#),
+            (
+                r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+                ".a[].b",
+                r#"{"a":[{},{}],"z":3}"#,
+            ),
+            (
+                r#"{"a":{"x":{"b":1},"y":{"b":2}},"z":3}"#,
+                ".a[].b",
+                r#"{"a":{"x":{},"y":{}},"z":3}"#,
+            ),
+            (r#"{"a":[],"z":3}"#, ".a[2].b", r#"{"a":[],"z":3}"#),
+        ] {
+            let mut root = parse_complete_json(input, false).unwrap();
+            let mut deletes = DeferredUpdateDeletes::default();
+            update_path_with_deletes::<JqSemantics>(
+                &mut root,
+                &parse(path).unwrap(),
+                &parse("empty").unwrap(),
+                false,
+                false,
+                None,
+                Some(&mut deletes),
+            )
+            .unwrap();
+            let result = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap();
+            assert_eq!(result.to_json(), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn native_chained_slice_and_optional_paths_preserve_delete_context() {
+        for (input, path, expected) in [
+            (r#"{"a":{"b":1},"z":2}"#, ".a?.b", r#"{"a":{},"z":2}"#),
+            (r#"{"a":{"b":1},"z":2}"#, ".a | . | .b", r#"{"a":{},"z":2}"#),
+        ] {
+            let mut root = parse_complete_json(input, false).unwrap();
+            let mut steps = Vec::new();
+            push_path_components(&mut steps, &parse(path).unwrap());
+            let mut deletes = DeferredUpdateDeletes::default();
+            update_path_steps::<JqSemantics>(
+                &mut root,
+                &steps,
+                &parse("empty").unwrap(),
+                false,
+                false,
+                None,
+                Some(&mut deletes),
+            )
+            .unwrap();
+            let result = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap();
+            assert_eq!(result.to_json(), expected, "{path}");
+        }
+
+        let mut root = parse_complete_json(r#"{"a":[{"b":1},{"b":2}]}"#, false).unwrap();
+        let mut steps = Vec::new();
+        push_path_components(&mut steps, &parse(".a[0:2].b").unwrap());
+        let mut deletes = DeferredUpdateDeletes::default();
+        let error = update_path_steps::<JqSemantics>(
+            &mut root,
+            &steps,
+            &parse("empty").unwrap(),
+            false,
+            false,
+            None,
+            Some(&mut deletes),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot index array with string"));
+    }
+}
+
 fn update_delete_component(expr: &Expr) -> Option<OwnedValue> {
     match unwrap_path_component(expr).0 {
         Expr::Field(name) => Some(OwnedValue::String(name.clone())),

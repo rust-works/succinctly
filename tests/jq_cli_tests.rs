@@ -45798,6 +45798,62 @@ fn test_multi_path_empty_update_existing_behavior_3030() -> Result<()> {
     Ok(())
 }
 
+/// #3030: deferred deletions also need the path components produced by
+/// native iteration and by chained writes. Results are from /usr/bin/jq 1.7.1.
+#[test]
+fn test_multi_path_empty_update_chained_and_iterated_paths_3030() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":[1,2],"z":3}"#, "(.a[], .z) |= empty", r#"{"a":[]}"#),
+        (
+            r#"{"a":{"x":1,"y":2},"z":3}"#,
+            "(.a[], .z) |= empty",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+            "(.a[].b, .z) |= empty",
+            r#"{"a":[{},{}]}"#,
+        ),
+        (
+            r#"{"a":{"x":{"b":1},"y":{"b":2}},"z":3}"#,
+            "(.a[].b, .z) |= empty",
+            r#"{"a":{"x":{},"y":{}}}"#,
+        ),
+        (r#"{"a":[],"z":3}"#, "(.a[2].b, .z) |= empty", r#"{"a":[]}"#),
+        ("[1,2]", "(.[4].b, .[0]) |= empty", "[2]"),
+        (
+            r#"{"a":{"b":1},"z":2}"#,
+            "(.a?.b, .z) |= empty",
+            r#"{"a":{}}"#,
+        ),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-c", filter], Some(input))?,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+
+    for (input, filter, error) in [
+        (
+            r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+            "(.a[0:2].b, .z) |= empty",
+            "Cannot index array with string \"b\"",
+        ),
+        (
+            r#"{"a":"hello","z":2}"#,
+            "(.a[0:2], .z) |= empty",
+            "Cannot delete fields from string",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(code, 5, "{filter}: {stderr}");
+        assert!(stderr.contains(error), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
 /// #1653: `--unbuffered` must actually interleave stdout and stderr in real
 /// time, not merely flush a batch that was already fully evaluated.
 ///
