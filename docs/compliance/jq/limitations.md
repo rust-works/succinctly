@@ -1832,15 +1832,12 @@ answers `["b"]` — and classified the two residuals appended below):
   `E[K]`/`E[S:T]` are native `resolve_node_sink` arms now, so a bound reaches the key and
   bound generators too (`[limit(1; path(.[("a"|stderr),("b"|stderr)]))]` writes `a`, matching
   jq, where it used to write `ab`). And a document the reindex bridge will not round-trip
-  identically (a number literal past `REINDEX_LITERAL_LEN_CAP`, 256 characters, or a NaN
-  spelling — a bare `Float` has been bridge-identity since #2902 and no longer selects this
-  route) now forwards demand across the bridge the same way, instead of collecting every path
+  identically (a NaN spelling; a bare `Float` has been bridge-identity since #2902)
+  now forwards demand across the bridge the same way, instead of collecting every path
   first: `[limit(1; path((.a|stderr),(.b|stderr)))]` writes `1` whether or not a 300-digit
-  literal sits elsewhere in the document. `to_json_for_reindex`'s own respelling of an
-  over-cap literal (`1E+300` for the literal above) is a separate, still-open value-fidelity
-  gap on the same bridge — [#3025](https://github.com/rust-works/succinctly/issues/3025) —
-  unaffected by this fix, since it changes only which entry point the bridge hands the
-  document to, not what the bridge does to the document itself.
+  literal sits elsewhere in the document. #3025 removed the old 256-character
+  `NumberLiteral` limit: the bridge now retains that source text, so long literals
+  no longer select the non-identity route.
 - **`recurse(f)`/`recurse(f; cond)` past its native stack budget finishes one node's own `f`
   before descending.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
@@ -7301,35 +7298,13 @@ this is recorded now, with regression coverage in place, as an open question for
 next has reason to attempt the real per-fork re-evaluation, rather than as either a queued
 fix or a closed decision.
 
-### A caller-supplied `OwnedValue` holding a NaN or an over-cap numeric literal can still be re-spelled by a stage the owned identity route hands to the owned evaluator (spine 2416's exit)
+### Caller-supplied NaN literals still avoid the reindex bridge
 
-`jq::eval_owned_with_file_index` is the one public entry that hands the
-path-context machinery an `OwnedValue` the caller built rather than one read
-from a document, so it is the only way a NaN or a `NumberLiteral` longer than
-`REINDEX_LITERAL_LEN_CAP` (256 chars) can reach
-`eval::eval_path_context_pipe_owned`. (A bare `Float` used to be a third such
-class; #2902 gave `to_json_for_reindex` a token spelling that survives the
-reindex round trip intact, so a finite computed float is bridge-identity now
-and takes the ordinary bridge instead of this door.) That door refuses the
-reindex bridge for exactly those two remaining classes
-(`reindex_bridge_is_identity`) and runs the pipe through
-`eval_generic::eval_path_context_pipe_detached` instead, which never
-serializes -- so `.[0] | parent`, `[.[0] | parent]` and `.[0] | parent | .[1]`
-all hand the literal back exactly as the caller spelled it
-(`test_owned_door_keeps_a_value_the_reindex_would_respell_2419`,
-`src/jq/eval.rs`).
-
-A stage that route hands to the *ordinary owned evaluator* -- `.[] |
-select(key == 1)`, whose `select` runs through `eval_owned_input_reindexed`
--- still takes that evaluator's own `to_json_for_reindex` round trip, so a
-300-digit literal comes back as `1E+299` there. Until spine 2416's exit the
-eager path-context evaluator answered these shapes without any round trip;
-with it deleted, this is the residue. It is not reachable from either CLI: a
-document-read number materializes as a short `NumberLiteral`, and yq mode's
-`.nan` renders as `null`/`.nan` on both sides of the trip. Real jq has no
-`key`/`parent` at all, so there is no oracle for the shape; what changed is a
-spelling succinctly used to preserve internally. Fixing it means giving the
-owned evaluator a non-reindexing path, not this door.
+`jq::eval_owned_with_file_index` can receive a caller-built NaN literal. The
+reindex bridge cannot preserve that representation, so the owned identity
+route still handles it without serialization. #3025 removed the analogous
+long-literal exception: non-NaN number literals of any length now retain
+their text through the bridge, including stages reached from the owned route.
 
 ### `path`/`key`/`parent`/`getpath` validate only what they touch — no carve-out; recorded on its merits (#2168)
 
@@ -7436,7 +7411,7 @@ is what the collision *is*; `.,.` no longer does, since #2103 it forwards the cu
 printer without building a map (see its entry above).
 
 **One row moved away from jq, with no ADR-0018 carve-out.** A `NumberLiteral` longer than
-`REINDEX_LITERAL_LEN_CAP` disqualified a document from `getpath`'s native arm, sending the
+former 256-character reindex cap disqualified a document from `getpath`'s native arm, sending the
 call through the reindex round trip, which re-spells it. jq prints `1E-301` for a
 303-character literal and so did `getpath(["big"])`; `.big` printed all 303 characters,
 because preserving a document number's written form is deliberate

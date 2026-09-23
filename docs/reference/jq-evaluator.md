@@ -45,6 +45,23 @@ The evaluator is generic over a `Document` trait, which is implemented by both `
 | `JqSemantics`  | `sjq` (JSON) | Standard jq behavior                                |
 | `YqSemantics`  | `syq` (YAML) | Preserves YAML types (quoted strings stay strings)  |
 
+### Owned values and long number literals
+
+A document number keeps its source token in `OwnedValue::NumberLiteral`. The internal
+reindex bridge now writes that token verbatim at every length, so a filter sees the
+same decimal value whether it reads the original cursor or a materialized value.
+Computed floats retain their separate internal token, and NaN retains its sentinel.
+
+The evaluator runs a bounded set of operations directly on owned state: entries
+conversion, literal numeric updates to an existing object field, and their
+supported pipes. Other expressions still use the lossless reindex bridge. Loop
+results can be projected through the sink before array collection, so
+`[while(.i < N; .i += 1) | .i]` stores only projected integers. An array
+requesting all complete states still stores those states.
+
+See [the #3025 spike](../plan/issue-3025-spike.md) for the 200,000-digit
+cost and the [implementation results](../plan/issue-3025-results.md).
+
 ### Streaming
 
 For large outputs, the evaluator supports streaming via `StreamableValue`, writing results incrementally without buffering the entire output. The YAML identity query (`yq '.'`) uses direct cursor-to-JSON streaming (P9 optimization).
