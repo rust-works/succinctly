@@ -1,7 +1,7 @@
 //! Focused control-flow probes for #3022's path-context position streaming.
 //!
 //! Each expectation was checked before the streaming change against the
-//! installed jq 1.8.2 or yq v4.53.3 oracle, as indicated per test.  The yq
+//! pinned jq 1.7.1 or yq v4.53.3 oracle, as indicated per test. The yq
 //! rows use only operators accepted by yq itself; this deliberately avoids
 //! treating succinctly's jq-extension surface as an oracle.
 
@@ -44,7 +44,7 @@ fn run(mode: &str, filter: &str, input: &str) -> Result<(String, String, i32)> {
 /// outside that body.  A push-based implementation must therefore park the
 /// downstream error rather than feed it into the earlier `try` callback.
 ///
-/// Captured from jq 1.8.2. `path(.)` makes both rows enter the jq
+/// Captured from jq 1.7.1. `path(.)` makes both rows enter the jq
 /// path-context route without relying on yq-only builtins.
 #[test]
 fn upstream_try_does_not_catch_a_later_path_context_error() -> Result<()> {
@@ -71,7 +71,7 @@ fn upstream_try_does_not_catch_a_later_path_context_error() -> Result<()> {
 }
 
 /// `first` supplies Stop after the first result, so the generator's later
-/// `error` must never be evaluated. Captured from jq 1.8.2.
+/// `error` must never be evaluated. Captured from jq 1.7.1.
 #[test]
 fn first_stops_a_path_context_generator_before_its_later_error() -> Result<()> {
     let (stdout, stderr, code) = run(
@@ -88,7 +88,7 @@ fn first_stops_a_path_context_generator_before_its_later_error() -> Result<()> {
 /// A normal jq consumer exposes the prefix already yielded before an error.
 /// This is the companion to the Stop row above: streaming must preserve this
 /// prefix, while `first` is allowed to prevent it from continuing. Captured
-/// from jq 1.8.2.
+/// from jq 1.7.1.
 #[test]
 fn jq_path_context_generator_keeps_its_prefix_before_error() -> Result<()> {
     let (stdout, stderr, code) = run("jq", "(.a[] | path(.)), error(\"late\")", "{\"a\":[1,2]}\n")?;

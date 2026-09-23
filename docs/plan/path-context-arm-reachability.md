@@ -1456,31 +1456,181 @@ two levels, and a depth sweep put the break-even at two.
 
 **Allocation counts.** Evaluation only -- parse, index, cursor and a warm-up
 evaluation are outside the counted window (`examples/alloc_probe_3022.rs`,
-release build, `alloc`/`alloc_zeroed`/`realloc` calls). 1,000 records or leaves
-per fixture. These are counts, not timings.
+release build, `alloc`/`alloc_zeroed`/`realloc` calls). The record rows use the
+decimal 1 MB fixture: 56,173 records, 1,000,006 JSON bytes. The nested rows use
+the leaf count and depth named in the table. These are counts, not timings.
 
-| row (jq mode / JSON)                                    | base      | head      |
-|---------------------------------------------------------|-----------|-----------|
-| `[.[] \| .k.x \| parent] \| length`                     | 1,348,034 | 1,067,139 |
-| `[.[] \| .k \| select(key == "k")] \| length`           |   561,808 |   505,590 |
-| `[.[] \| .missing \| parent] \| length`                 | 1,797,418 | 1,628,869 |
-| `[.[] \| key] \| length`                                |   112,428 |   112,398 |
-| `first(.[] \| key)`                                     |    56,220 |        18 |
-| `[.[] \| .k.x] \| length` (never enters the walk)       |    56,197 |    56,197 |
-| `[paths] \| length`                                     | 2,022,080 | 2,022,080 |
-| `[path(..)] \| length`                                  | 3,594,946 | 3,594,946 |
-| `[.. \| select(type=="string") \| (key\|tostring)]`, d64 |   162,709 |    99,709 |
-| ... the same at depth 32                                 |    96,389 |    65,389 |
-| ... the same at depth 16                                 |    62,228 |    47,228 |
-| ... depth 64, 250 leaves                                 |    41,198 |    25,448 |
+| row (jq mode / JSON)                                               | base      | head      |
+|--------------------------------------------------------------------|-----------|-----------|
+| `[.[] \| .k.x \| parent] \| length`                                | 1,348,034 | 1,067,139 |
+| `[.[] \| .k \| select(key == "k")] \| length`                      |   561,808 |   505,590 |
+| `[.[] \| .missing \| parent] \| length`                            | 1,797,418 | 1,628,869 |
+| `[.[] \| key] \| length`                                           |   112,428 |   112,398 |
+| `first(.[] \| key)`                                                |    56,220 |        18 |
+| `[.[] \| .k.x] \| length` (never enters the walk)                  |    56,197 |    56,197 |
+| `[paths] \| length`                                                | 2,022,080 | 2,022,080 |
+| `[path(..)] \| length`                                             | 3,594,946 | 3,594,946 |
+| `[.. \| select(type=="string") \| (key\|tostring)] \| length`, d64 |   160,610 |    97,610 |
+| ... the same at depth 32                                           |    94,290 |    63,290 |
+| ... the same at depth 16                                           |    60,129 |    45,129 |
+| ... depth 64, 250 leaves                                           |    40,601 |    24,851 |
 
 The seeding rows are linear in `(depth - 1) x leaves` -- 63 per leaf at depth
 64, 31 at 32, 15 at 16 -- which is the per-level link term, gone. `first(.[] |
 key)` is the demand path: the iteration now stops at the first element instead
-of enumerating 1,000 of them, leaving only the checked enumeration's own
+of enumerating all 56,173 of them, leaving only the checked enumeration's own
 buffer. `[.[] | key]` barely moves because its remaining cost is the per-key
 `String`, not the buffer. The never-entering-walk row and both shared-
 navigation rows are untouched, which is the point of quoting them.
+
+**Reproduction.** `scripts/generate-path-context-3022-fixtures.py` is the
+canonical fixture definition. `mb` means decimal megabytes; JSON and YAML
+twins contain the same records. Its default output is:
+
+```text
+n1000: records=1000 json_bytes=15892 yaml_bytes=15890
+1mb: records=56173 json_bytes=1000006 yaml_bytes=1000004
+6mb: records=321638 json_bytes=6000014 yaml_bytes=6000012
+20mb: records=1055556 json_bytes=20000012 yaml_bytes=20000010
+deep-d64-n1000: bytes=11276
+deep-d32-n1000: bytes=11084
+deep-d16-n1000: bytes=10988
+deep-d64-n250: bytes=3026
+```
+
+The reported comparison is exactly base `717833c17` versus candidate
+`a422fa389`. Build both with the repository's release profile
+(`codegen-units = 1`, fat LTO), using external worktrees as required by the
+repository instructions:
+
+```bash
+REPO_WT=/path/to/current/succinctly-worktree
+BASE_WT=/path/outside/the/repository/issue-3022-base
+HEAD_WT=/path/outside/the/repository/issue-3022-head
+FIXTURE_DIR=/tmp/succinctly-3022-fixtures
+
+python3 "$REPO_WT/scripts/generate-path-context-3022-fixtures.py" "$FIXTURE_DIR"
+git -C "$REPO_WT" worktree add "$BASE_WT" --detach 717833c17
+git -C "$REPO_WT" worktree add "$HEAD_WT" --detach a422fa389
+cp "$HEAD_WT/examples/alloc_probe_3022.rs" "$BASE_WT/examples/"
+cargo build --manifest-path "$BASE_WT/Cargo.toml" --release --features cli --bin succinctly
+cargo build --manifest-path "$HEAD_WT/Cargo.toml" --release --features cli --bin succinctly
+cargo build --manifest-path "$BASE_WT/Cargo.toml" --release --example alloc_probe_3022
+cargo build --manifest-path "$HEAD_WT/Cargo.toml" --release --example alloc_probe_3022
+```
+
+The allocation table can then be regenerated verbatim with:
+
+```bash
+BASE_PROBE="$BASE_WT/target/release/examples/alloc_probe_3022"
+HEAD_PROBE="$HEAD_WT/target/release/examples/alloc_probe_3022"
+RECORD_FILE="$FIXTURE_DIR/records-1mb.json"
+RECORD_QUERIES=(
+  '[.[] | .k.x | parent] | length'
+  '[.[] | .k | select(key == "k")] | length'
+  '[.[] | .missing | parent] | length'
+  '[.[] | key] | length'
+  'first(.[] | key)'
+  '[.[] | .k.x] | length'
+  '[paths] | length'
+  '[path(..)] | length'
+)
+for query in "${RECORD_QUERIES[@]}"; do
+  "$BASE_PROBE" jq "$RECORD_FILE" "$query"
+  "$HEAD_PROBE" jq "$RECORD_FILE" "$query"
+done
+
+DEEP_QUERY='[.. | select(type=="string") | (key|tostring)] | length'
+for fixture in deep-d64-n1000 deep-d32-n1000 deep-d16-n1000 deep-d64-n250; do
+  "$BASE_PROBE" jq "$FIXTURE_DIR/$fixture.json" "$DEEP_QUERY"
+  "$HEAD_PROBE" jq "$FIXTURE_DIR/$fixture.json" "$DEEP_QUERY"
+done
+```
+
+For wall time, run both the real A/B and the base-against-itself control on an
+idle, mains-powered machine. The following invocations reproduce the 1 MB and
+6 MB matrix; `ab-cli.py` alternates base/head within each of 11 repetitions and
+refuses to time configurations whose output or exit status differs:
+
+```bash
+BASE_BIN="$BASE_WT/target/release/succinctly"
+HEAD_BIN="$HEAD_WT/target/release/succinctly"
+PROFILE='release: codegen-units=1, lto=fat'
+QUERIES=(
+  '[.[] | .k.x | parent] | length'
+  '[.[] | .k | select(key == "k")] | length'
+  '[.[] | .missing | parent]'
+  '[.[] | key] | length'
+  'first(.[] | key)'
+  '[.[] | .k.x] | length'
+  '[paths] | length'
+  '[path(..)] | length'
+)
+
+python3 "$REPO_WT/scripts/ab-cli.py" \
+  --before "$BASE_BIN" --after "$HEAD_BIN" \
+  --before-profile "$PROFILE" --after-profile "$PROFILE" \
+  --files "$FIXTURE_DIR/records-1mb.json" "$FIXTURE_DIR/records-6mb.json" \
+  --tool jq --reps 11 --queries "${QUERIES[@]}"
+python3 "$REPO_WT/scripts/ab-cli.py" \
+  --before "$BASE_BIN" --before-profile "$PROFILE" --control \
+  --files "$FIXTURE_DIR/records-1mb.json" "$FIXTURE_DIR/records-6mb.json" \
+  --tool jq --reps 11 --queries "${QUERIES[@]}"
+
+python3 "$REPO_WT/scripts/ab-cli.py" \
+  --before "$BASE_BIN" --after "$HEAD_BIN" \
+  --before-profile "$PROFILE" --after-profile "$PROFILE" \
+  --files "$FIXTURE_DIR/records-1mb.yaml" "$FIXTURE_DIR/records-6mb.yaml" \
+  --tool yq --extra-args='--jq-extensions -I0' --reps 11 \
+  --queries "${QUERIES[@]}"
+python3 "$REPO_WT/scripts/ab-cli.py" \
+  --before "$BASE_BIN" --before-profile "$PROFILE" --control \
+  --files "$FIXTURE_DIR/records-1mb.yaml" "$FIXTURE_DIR/records-6mb.yaml" \
+  --tool yq --extra-args='--jq-extensions -I0' --reps 11 \
+  --queries "${QUERIES[@]}"
+```
+
+The published wall-clock and RSS runs used an Apple M4 Pro and an AMD Ryzen 9
+7950X (the latter pinned with `taskset -c 2`). The original OS/kernel and Rust
+version strings were not retained, so a rerun must record `rustc -Vv`,
+`cargo -V`, `uname -a`, and the CPU model alongside its raw output. That
+omission does not affect the deterministic allocation counts above, but it
+limits bit-for-bit reproduction of the historical timing environment.
+
+Peak RSS used each binary and the 20 MB twin directly. On macOS use
+`/usr/bin/time -l`; on Linux use `/usr/bin/time -v` and add `taskset -c 2`
+before the binary. Repeat for base/head, the four table queries, and JSON/jq
+or YAML/yq as applicable:
+
+```bash
+/usr/bin/time -l "$HEAD_BIN" yq --jq-extensions -I0 \
+  '[.[] | .k.x | parent]' "$FIXTURE_DIR/records-20mb.yaml" >/dev/null
+/usr/bin/time -v taskset -c 2 "$HEAD_BIN" yq --jq-extensions -I0 \
+  '[.[] | .k.x | parent]' "$FIXTURE_DIR/records-20mb.yaml" >/dev/null
+```
+
+The 7950X instruction counts used Valgrind Cachegrind with cache and branch
+simulation disabled; repeat this command for both binaries, both modes, and
+each table query, then read the `Ir` total with `cg_annotate`:
+
+```bash
+valgrind --tool=cachegrind --cache-sim=no --branch-sim=no \
+  --cachegrind-out-file=/tmp/issue-3022-head.cg \
+  "$HEAD_BIN" jq -c '[.[] | .k.x | parent] | length' \
+  "$FIXTURE_DIR/records-1mb.json" >/dev/null
+cg_annotate /tmp/issue-3022-head.cg
+```
+
+Finally, semantic verification used jq 1.7.1 and yq v4.53.3, not whichever
+versions happen to be first on `PATH`. Verify those version strings, then run
+the sweep against the candidate binary; it checks the pins itself and reports
+the 6,300-case classification:
+
+```bash
+jq --version
+yq --version
+"$HEAD_WT/scripts/jq-path-context-oracle-sweep.sh" --summary "$HEAD_BIN"
+```
 
 **Wall clock.** `scripts/ab-cli.py`, base = the merge-base `717833c17`, head =
 `a422fa389`, both `codegen-units=1` + fat LTO, 11 interleaved reps, output and

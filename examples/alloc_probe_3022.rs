@@ -61,8 +61,9 @@ static ALLOCATOR: Counting = Counting;
 /// rather than a function because `DocumentValue` is crate-private, so this
 /// cannot be written generically from outside.
 ///
-/// Every row this probe times ends in `| length`, so anything but a settled
-/// result means the query is not measuring what the row claims.
+/// Every row this probe records produces a settled scalar (`length` or
+/// `first`), so anything lazy means the query is not measuring what the row
+/// claims.
 macro_rules! settle {
     ($result:expr) => {
         match $result {
