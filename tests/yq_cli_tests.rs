@@ -40558,6 +40558,7 @@ fn test_yq_null_ordering_comparisons_are_false_2483() -> Result<()> {
 fn test_yq_update_zero_output_filter_leaves_target_untouched_2484() -> Result<()> {
     let args = &["-o=json", "-I=0"];
     for (doc, filter, expected) in [
+        ("[1,2,3,4]\n", "(.[0], .[1]) |= select(false)", "[1,2,3,4]"),
         ("a: 1\n", ".a |= (1 | select(false))", "{\"a\":1}"),
         (
             "a: 1\n",
