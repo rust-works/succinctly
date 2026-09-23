@@ -27395,6 +27395,82 @@ fn run_jq_with_modules(modules: &[(&str, &str)], args: &[&str]) -> Result<(Strin
     ))
 }
 
+/// #3085: each physical error in a module is diagnosed once even when the
+/// module is instantiated under two aliases. The second case ensures that
+/// distinct sites sharing a name are not collapsed together.
+#[test]
+fn test_duplicate_module_import_reports_each_compile_error_once_3085() -> Result<()> {
+    for (body, diagnostic) in [
+        ("def f: missing;\n", "missing/0 is not defined"),
+        ("def f: $x;\n", "$x is not defined"),
+        ("def f: break $x;\n", "$*label-x is not defined"),
+    ] {
+        let (_, stderr, code) = run_jq_with_modules(
+            &[("m", body)],
+            &["-nc", r#"import "m" as a; import "m" as b; a::f, b::f"#],
+        )?;
+        assert_eq!(code, 3, "stderr: {stderr:?}");
+        assert_eq!(stderr.matches(diagnostic).count(), 1, "stderr: {stderr:?}");
+        assert!(stderr.contains("m.jq, line 1:"), "stderr: {stderr:?}");
+        assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr:?}");
+    }
+
+    let (_, stderr, code) = run_jq_with_modules(
+        &[("m", "def f: missing, missing;\n")],
+        &["-nc", r#"import "m" as a; import "m" as b; a::f, b::f"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr.matches("missing/0 is not defined").count(),
+        2,
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("jq: 2 compile errors"),
+        "stderr: {stderr:?}"
+    );
+
+    // A resolved site before the failing one consumes its position in each
+    // clone's occurrence sequence.
+    for (body, diagnostic) in [
+        ("def f: (def g: 1; g) |\n g;\n", "g/0 is not defined"),
+        ("def f: (1 as $x | $x),\n $x;\n", "$x is not defined"),
+        (
+            "def f: (label $x | break $x),\n break $x;\n",
+            "$*label-x is not defined",
+        ),
+    ] {
+        let (_, stderr, code) = run_jq_with_modules(
+            &[("m", body)],
+            &["-nc", r#"import "m" as a; import "m" as b; a::f, b::f"#],
+        )?;
+        assert_eq!(code, 3, "stderr: {stderr:?}");
+        assert_eq!(stderr.matches(diagnostic).count(), 1, "stderr: {stderr:?}");
+        assert!(stderr.contains("m.jq, line 2:"), "stderr: {stderr:?}");
+        assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr:?}");
+    }
+
+    let (_, stderr, code) = run_jq_with_modules(
+        &[("m", "def f: missing;\n")],
+        &["-nc", r#"include "m"; import "m" as a; f, a::f"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stderr.matches("missing/0 is not defined").count(), 1);
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr:?}");
+
+    let (_, stderr, code) = run_jq_with_modules(
+        &[("a", "def f: missing;\n"), ("b", "def f: missing;\n")],
+        &["-nc", r#"import "a" as a; import "b" as b; a::f, b::f"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stderr.matches("missing/0 is not defined").count(), 2);
+    assert!(
+        stderr.contains("jq: 2 compile errors"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2865: a module's own `include` is processed transitively -- the third
 /// module's defs are available to the second module's body.
 ///

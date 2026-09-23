@@ -98,8 +98,9 @@ pub struct UnresolvedCall {
     /// a call actually fails to resolve.
     pub origin: Option<u32>,
     /// How many earlier calls to this exact `(name, arity)` pair, in the
-    /// same `origin` scope -- resolved *or* unresolved -- the resolver had
-    /// already visited, in source order, before this one (#2635).
+    /// same module instance (or the top level) -- resolved *or* unresolved --
+    /// the resolver had already visited, in source order, before this one
+    /// (#2635).
     ///
     /// `jq::CallSite` (`parser.rs`) records every generic call's own source
     /// position, in the same order, regardless of whether it later resolves
@@ -139,6 +140,10 @@ pub struct UnboundVar {
     /// filter -- [`UnresolvedCall::origin`]'s twin, so a module body's
     /// unbound variable is reported against that module's file (#2962).
     pub origin: Option<u32>,
+    /// Index among same-named variable references in this source, counting
+    /// bound references too. The CLI uses it to recover a module site's
+    /// position when the module AST was cloned by multiple imports (#3085).
+    pub occurrence: usize,
 }
 
 impl core::fmt::Display for UnboundVar {
@@ -169,16 +174,15 @@ pub struct UnresolvedLabel {
     /// The label's name, without the `$` sigil — matching [`Expr::Break`]'s
     /// own storage.
     pub name: String,
-    /// Which same-named `break $name` site *within this diagnostic's own
-    /// `origin`* this belongs to (0-based, in `super::parser::collect_break_sites`'s
+    /// Which same-named `break $name` site within this module instance
+    /// this belongs to (0-based, in `super::parser::collect_break_sites`'s
     /// source order, scoped to whichever file `origin` names): when two
     /// same-named breaks differ only by lexical scope — one bound under an
     /// enclosing `label $name`, one genuinely unbound — the position
     /// recovery in `report_compile_errors` (the CLI) must cite the *failing*
     /// one, and this index is how it threads that decision through the AST,
-    /// which carries no positions. Counted per-`origin` (see that field) so a
-    /// label name repeated in more than one module, or in a module and the
-    /// main filter, does not have one file's breaks consume another's slots.
+    /// which carries no positions. Counted per module instance so cloned
+    /// imports restart at the same physical site (#3085).
     pub occurrence: usize,
     /// Which module run the failing break was written in (#2951), or `None`
     /// for the main filter — [`UnboundVar::origin`]'s twin: without this, a
@@ -1377,15 +1381,21 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
         .any(|&(n, a)| a == arity && n == name)
 }
 
-/// The two occurrence counters [`check`] threads through its walk, bundled
-/// into one argument so combining #2635's call-occurrence tracking with
-/// #2964's break-occurrence tracking does not push `check` (and its
-/// siblings) past `clippy::too_many_arguments` -- [`next_call_occurrence`]
-/// and [`check_break`] are the only two places that touch either field.
+/// Per-site occurrence counters and the active module instance, bundled into
+/// one argument so `check` and its siblings stay within the argument limit.
 #[derive(Default)]
 struct Occurrences {
-    calls: BTreeMap<(Option<u32>, String, usize), usize>,
-    breaks: BTreeMap<(Option<u32>, String), usize>,
+    calls: BTreeMap<(Option<usize>, String, usize), usize>,
+    vars: BTreeMap<(Option<usize>, String), usize>,
+    breaks: BTreeMap<(Option<usize>, String), usize>,
+    run_stack: Vec<usize>,
+    next_run_instance: usize,
+}
+
+impl Occurrences {
+    fn instance(&self) -> Option<usize> {
+        self.run_stack.last().copied()
+    }
 }
 
 /// Records one more visit to `(name, arity)` -- resolved or not -- and
@@ -1394,15 +1404,11 @@ struct Occurrences {
 /// `Expr::FuncCall` handling that represents a genuine, distinct call site
 /// (not the "restore the original parse and re-dispatch" arm, which revisits
 /// the same position rather than a new one).
-fn next_call_occurrence(
-    occurrences: &mut Occurrences,
-    origin: Option<u32>,
-    name: &str,
-    arity: usize,
-) -> usize {
+fn next_call_occurrence(occurrences: &mut Occurrences, name: &str, arity: usize) -> usize {
+    let instance = occurrences.instance();
     let count = occurrences
         .calls
-        .entry((origin, name.to_string(), arity))
+        .entry((instance, name.to_string(), arity))
         .or_insert(0);
     let index = *count;
     *count += 1;
@@ -1476,14 +1482,13 @@ fn check_break(
     errors: &mut Vec<ResolveError>,
     occurrences: &mut Occurrences,
 ) {
-    // `enclosing_run` regardless of whether this break resolves -- both a
-    // bound and an unbound break consume a slot in their own origin's
-    // counter, mirroring how every break (bound or not) occupies a slot in
-    // that origin's own `collect_break_sites` table.
+    // Both a bound and an unbound break consume a slot in this instance's
+    // counter, mirroring the source's `collect_break_sites` table.
     let origin = enclosing_run(label_scope);
+    let instance = occurrences.instance();
     let n = occurrences
         .breaks
-        .entry((origin, name.to_string()))
+        .entry((instance, name.to_string()))
         .or_insert(0);
     let occurrence = *n;
     *n += 1;
@@ -1885,11 +1890,20 @@ fn check(
         // already resolved, never present on the freshly parsed tree this
         // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
         Expr::Var(name) => {
+            let origin = enclosing_run(var_scope);
+            let instance = occurrences.instance();
+            let count = occurrences
+                .vars
+                .entry((instance, name.clone()))
+                .or_insert(0);
+            let occurrence = *count;
+            *count += 1;
             let found = in_var_scope(var_scope, name);
             if found.hit.is_none() {
                 errors.push(ResolveError::Var(UnboundVar {
                     name: name.clone(),
-                    origin: found.run.map(|(id, _)| id),
+                    origin,
+                    occurrence,
                 }));
             }
         }
@@ -2087,14 +2101,36 @@ fn check(
             // inside the module must be attributable back to it (see
             // `enclosing_run`), neither of which works unless the marker is
             // visible on `label_scope` too.
-            let is_marker = ModuleRun::parse(name).is_some();
+            let marker = ModuleRun::parse(name);
+            let is_marker = marker.is_some();
+            let mut closed_instance = None;
             if is_marker {
                 var_scope.push(name.clone());
                 label_scope.push(name.clone());
+                // A begin opens a fresh occurrence namespace even when its
+                // file shares a canonical run id with another import. An
+                // end temporarily closes it for `then`; on return the parent
+                // traversal still needs its instance on the stack.
+                match &marker {
+                    Some(RunMarker::Begin { .. }) => {
+                        let instance = occurrences.next_run_instance;
+                        occurrences.next_run_instance += 1;
+                        occurrences.run_stack.push(instance);
+                    }
+                    Some(RunMarker::End { .. }) => {
+                        closed_instance = occurrences.run_stack.pop();
+                    }
+                    None => {}
+                }
             }
             check(then, scope, var_scope, label_scope, errors, reachable, occurrences);
             var_scope.truncate(var_outer);
             if is_marker {
+                if matches!(marker, Some(RunMarker::Begin { .. })) {
+                    occurrences.run_stack.pop();
+                } else if let Some(instance) = closed_instance {
+                    occurrences.run_stack.push(instance);
+                }
                 label_scope.pop();
             }
             scope.truncate(outer);
@@ -2278,7 +2314,7 @@ fn check(
                 // occurrences -- resolved or not -- came before it in the
                 // source; see `UnresolvedCall::occurrence_index`'s own doc
                 // comment).
-                next_call_occurrence(occurrences, origin, name, arity);
+                next_call_occurrence(occurrences, name, arity);
                 // #2971: of `builtin_fallback_into_args`'s arms only the
                 // `Builtin` one clones -- the rest move their operands, which
                 // keeps every `def` body where `build_call_graph` found it.
@@ -2317,12 +2353,12 @@ fn check(
                 *expr = *fallback;
                 check(expr, scope, var_scope, label_scope, errors, reachable, occurrences);
             } else if is_jq_builtin(name, arity) {
-                next_call_occurrence(occurrences, origin, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
+                next_call_occurrence(occurrences, name, arity); // omni-dev: coverage tolerate-line reason="unreachable in practice today: this arm needs builtin_fallback==None (the name was never a shadow candidate) yet is_jq_builtin==true (a real jq builtin at this arity) -- every implemented builtin's own dedicated parse already lowers that shape to Expr::Builtin before resolve.rs ever runs, and #3042/#3046 closed the once-real 'unimplemented builtin' gap this existed for (see JQ_BUILTIN_ROSTER's own doc comment)"
                 for a in args.iter_mut() {
                     check(a, scope, var_scope, label_scope, errors, reachable, occurrences); // omni-dev: coverage tolerate-line reason="unreachable with the current roster: every `JQ_BUILTIN_ROSTER` entry of arity >= 1 already has a dedicated parser form (a `matches_keyword` special case or a `Libm1`/`Libm2`/`Libm3::ALL` entry -- confirmed by cross-referencing the full roster against both), so it is parsed straight to `Expr::Builtin` and never reaches here as a bare `FuncCall`. This arm exists for a roster name with no dedicated parse yet and a nonzero arity -- there is none today, so the loop body is reached with an empty `args` on every pinned-suite run (355 hits on the arm's own condition, 0 in the loop) and would only start executing if such a name were added (#2964)"
                 }
             } else {
-                let occurrence_index = next_call_occurrence(occurrences, origin, name, arity);
+                let occurrence_index = next_call_occurrence(occurrences, name, arity);
                 errors.push(ResolveError::Call(UnresolvedCall {
                     name: name.clone(),
                     arity,

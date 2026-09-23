@@ -2622,10 +2622,8 @@ fn report_site_error(
 /// Unlike calls, no text-search fallback: `collect_var_sites` records every
 /// `$name` a parse sees (a `$name` token has none of the retry, shadow or
 /// builtin-fallback machinery that can make the call-site table diverge from
-/// the real parse), so a miss here is never a site the table lost. It is a
-/// second report for the same site, from a second copy of a module dependency
-/// (#3058), and a text search could only land on a coincidental `$name` in a
-/// string or comment. The file-only form is the honest report for it.
+/// the real parse). A text search could land on a coincidental `$name` in a
+/// string or comment, so a missing table entry gets a file-only report.
 fn report_unbound_var(
     name: &str,
     location: &str,
@@ -2683,6 +2681,12 @@ fn report_unresolved_label(
 }
 
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
+    // A file may be instantiated by several import/include directives. The
+    // resolver visits each clone, but jq diagnoses each physical module site
+    // only once. The final component is the site's index among same-named
+    // sites in that file; kind and arity keep unrelated failures separate.
+    let mut reported_module_sites: BTreeSet<(u32, u8, String, usize, usize)> = BTreeSet::new();
+    let mut duplicates = 0;
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
     // first one's. Used only by the text-search fallback below, which only
@@ -2697,19 +2701,13 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // error path, or similar); such an error keeps today's file-name-only
     // report rather than panicking or guessing a line.
     let mut module_diagnostics: HashMap<u32, Option<(String, Vec<jq::CallSite>)>> = HashMap::new();
-    // Per-(module, name) resume counters, the module-body counterpart of
-    // `calls_consumed` above -- kept separate so a name repeated in two
-    // different modules does not share (and so prematurely exhaust) one
-    // counter.
-    let mut module_calls_consumed: HashMap<(u32, &str), usize> = HashMap::new();
     // The module-body counterpart of `call_resume_from` above, for the same
     // text-search fallback -- see the `origin` branch's own doc comment for
     // why a module needs one too.
     let mut module_call_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
-    // The variable counterparts of the three module maps above (#2962).
+    // The variable counterpart of `module_diagnostics` (#2962).
     let mut module_var_diagnostics: HashMap<u32, Option<(String, Vec<jq::VarSite>)>> =
         HashMap::new();
-    let mut module_vars_consumed: HashMap<(u32, &str), usize> = HashMap::new();
     // The label counterpart of `module_var_diagnostics` (#2964): a break
     // inside a module body needs that module's own text and its own
     // break-site table, the same route `Call`/`Var` already take, keyed by
@@ -2727,13 +2725,8 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // #2964: the same, for `break $name` sites written directly in `filter`
     // -- see `jq::collect_break_sites`. A module-body break uses
     // `module_break_diagnostics` instead, built lazily from that module's
-    // own source. Unlike calls/variables, which the resolver revisits
-    // through the same "how many of each name seen so far" logic this
-    // table's `nth` indexes with, a break's *occurrence* is carried in the
-    // diagnostic itself (`UnresolvedLabel::occurrence`) -- the resolver
-    // counts each same-named break it visits *within that diagnostic's own
-    // `origin`*, and that count is the table index, so no separate
-    // consuming cursor is needed here.
+    // own source. The resolver carries a per-instance occurrence for calls,
+    // variables, and breaks, so each clone indexes the same physical site.
     let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
     // How many variables of each name we have already reported, so a
     // repeated undefined `$name` walks its own successive sites in source
@@ -2787,19 +2780,17 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
 
                     match cached {
                         Some((source, call_sites)) => {
-                            // #2635 does not cover a module's own diagnostics:
-                            // `occurrence_index` is computed against the
-                            // fully-inlined tree (main filter + every
-                            // included module), not scoped per module the
-                            // way this module's own, independently re-parsed
-                            // `call_sites` table is -- so this keeps its
-                            // pre-existing (failures-only) counter rather
-                            // than an index that would not line up with it.
-                            let taken = module_calls_consumed
-                                .entry((*id, name.as_str()))
-                                .or_insert(0);
-                            let this_occurrence = *taken;
-                            *taken += 1;
+                            let this_occurrence = *occurrence_index;
+                            if !reported_module_sites.insert((
+                                *id,
+                                0,
+                                name.clone(),
+                                *arity,
+                                this_occurrence,
+                            )) {
+                                duplicates += 1;
+                                continue;
+                            }
                             let resume = module_call_resume_from
                                 .entry((*id, name.as_str()))
                                 .or_insert(0);
@@ -2814,6 +2805,10 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                             );
                         }
                         None => {
+                            if !reported_module_sites.insert((*id, 0, name.clone(), *arity, 0)) {
+                                duplicates += 1;
+                                continue;
+                            }
                             let name = jq::ModuleRun::display_name(name);
                             eprintln!("jq: error: {name}/{arity} is not defined at {at}");
                         }
@@ -2831,7 +2826,11 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     resume,
                 );
             }
-            jq::ResolveError::Var(jq::UnboundVar { name, origin }) => {
+            jq::ResolveError::Var(jq::UnboundVar {
+                name,
+                origin,
+                occurrence,
+            }) => {
                 // #2962: a module body's unbound variable is reported against
                 // that module's own file, as jq does -- the same route the
                 // `Call` arm's `origin` branch takes, with the module's own
@@ -2848,12 +2847,20 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     });
                     match cached {
                         Some((source, var_sites)) => {
-                            let taken = module_vars_consumed
-                                .entry((*id, name.as_str()))
-                                .or_insert(0);
-                            report_unbound_var(name, &at, source, var_sites, taken);
+                            let site_index = *occurrence;
+                            if !reported_module_sites.insert((*id, 1, name.clone(), 0, site_index))
+                            {
+                                duplicates += 1;
+                                continue;
+                            }
+                            let mut site_index = site_index;
+                            report_unbound_var(name, &at, source, var_sites, &mut site_index);
                         }
                         None => {
+                            if !reported_module_sites.insert((*id, 1, name.clone(), 0, 0)) {
+                                duplicates += 1;
+                                continue;
+                            }
                             eprintln!("jq: error: ${name} is not defined at {at}");
                         }
                     }
@@ -2894,10 +2901,20 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     });
                     match cached {
                         Some((source, break_sites)) => {
-                            report_unresolved_label(name, &at, source, break_sites, *occurrence);
+                            let site_index = *occurrence;
+                            if !reported_module_sites.insert((*id, 2, name.clone(), 0, site_index))
+                            {
+                                duplicates += 1;
+                                continue;
+                            }
+                            report_unresolved_label(name, &at, source, break_sites, site_index);
                         }
                         // omni-dev: coverage tolerate reason="unreachable in a single-process run by construction: `run_id_for` (the sole source of an `origin` id) always inserts a `run_origins` entry for the id it hands back -- from a real load's canonical path, or its own literal-path fallback on a resolve failure -- and a def body only ever gets stamped with an `origin` after its module loaded successfully, so `at` always names a file that existed and was readable moments earlier. Reaching this arm needs that same file to vanish (or become unreadable) in the narrow window between that load and this re-read, entirely outside this process's control (#2964)"
                         None => {
+                            if !reported_module_sites.insert((*id, 2, name.clone(), 0, 0)) {
+                                duplicates += 1;
+                                continue;
+                            }
                             eprintln!("jq: error: $*label-{name} is not defined at {at}");
                         } // omni-dev: coverage end
                     }
@@ -2916,7 +2933,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
         }
     }
 
-    let count = errors.len();
+    let count = errors.len() - duplicates;
     let noun = if count == 1 { "error" } else { "errors" };
     eprintln!("jq: {count} compile {noun}");
 }
