@@ -16643,13 +16643,6 @@ impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
 /// measured the break-even at two.
 const PATH_CONTEXT_SEED_MIN_LEVELS: usize = 3;
 
-/// Whether [`path_context_step_each`] hands positions straight to the next
-/// stage (#3022). Setting this `false` sends every stage through the
-/// collecting `_` arm instead, which is the pre-#3022 behaviour with this
-/// branch's code layout -- the never-firing holdout build rule 10 of
-/// [the benchmarking guide](../../docs/guides/benchmarking.md) asks for.
-const PATH_CONTEXT_STREAM_POSITIONS: bool = true;
-
 /// The path-context walk's position trail (#2572): the components from the
 /// root to a position, each link also holding the node it was taken *from*
 /// -- `ancestors[i]` of the flat `(path, ancestors)` pair this replaced is
@@ -19411,9 +19404,6 @@ fn path_context_step_each<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(PathContextPos<V>) -> Demand,
 ) -> Result<Demand, Control> {
-    if !PATH_CONTEXT_STREAM_POSITIONS {
-        return path_context_step_collecting::<S, V>(expr, pos, sink);
-    }
     if let Expr::Paren(inner) = expr {
         return path_context_step_each::<S, V>(inner, pos, sink);
     }
