@@ -17023,7 +17023,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     assert_nesting_depth(path.trail_depth());
     let next = match node {
         PathNode::Absent => PathNode::Absent,
-        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
             if v.is_null() {
@@ -17071,7 +17071,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     let mut component = index_component_value(idx, key);
     let next = match node {
         PathNode::Absent => PathNode::Absent,
-        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
             if v.is_null() {
@@ -17139,7 +17139,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
             EvalTag::Jq,
             &OwnedValue::Null,
         )),
-        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
+        PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
         PathNode::At(c) => {
             let v = c.value();
             if let Some(fields) = v.as_object() {
@@ -17155,7 +17155,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
                 // (#1385); caught by the evaluator-parity suite.
                 for field in effective_fields_checked(&fields, collapse_duplicate_keys)? {
                     let Some(key) = key_display_string(&field.key) else {
-                        return Err(fields.malformed_member_error());
+                        return Err(fields.malformed_member_error()); // omni-dev: coverage tolerate-line reason="unreachable: effective_fields_checked already rejects key_is_malformed, the same decoded_key_str Ok(None) that makes key_display_string return None (#3022)"
                     };
                     if matches!(
                         emit(
@@ -17278,7 +17278,7 @@ fn path_step_each_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
         Expr::Iterate => {
             path_iterate_step_generic::<S, V, T>(node, path, collapse_duplicate_keys, emit)
         }
-        other => unreachable!("not a navigational step: {other:?}"),
+        other => unreachable!("not a navigational step: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable: both callers match Field, Index or Iterate before dispatching here (#3022)"
     }
 }
 
@@ -21952,7 +21952,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     }
     Some(match stepped {
         Ok(Demand::Continue) => Flow::Exhausted,
-        Ok(Demand::Stop) => Flow::Stopped { pending: None },
+        Ok(Demand::Stop) => Flow::Stopped { pending: None }, // omni-dev: coverage tolerate-line reason="unreachable: the callback records downstream_flow before every Demand::Stop, and that flow is returned above (#3022)"
         Err(control) => Flow::Escaped(control),
     })
 }
@@ -38717,14 +38717,14 @@ mod tests {
         path_context_step_generic::<JqSemantics, _>(&Expr::Iterate, b, &mut elements).unwrap();
         assert_eq!(elements.len(), 3);
         let PathContextTrail::Link(shared) = &b.trail else {
-            panic!("`.a.b` is two links deep")
+            panic!("`.a.b` is two links deep") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         for (i, pos) in elements.iter().enumerate() {
             let PathContextTrail::Link(link) = &pos.trail else {
-                panic!("an element is one link deeper")
+                panic!("an element is one link deeper") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
             };
             let PathContextTrail::Link(parent) = &link.parent else {
-                panic!("the element's parent is `.a.b`")
+                panic!("the element's parent is `.a.b`") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
             };
             assert!(
                 Rc::ptr_eq(parent, shared),
@@ -38762,13 +38762,105 @@ mod tests {
     }
 
     #[test]
+    fn path_context_owned_step_adapters_preserve_prefix_and_stop_3022() {
+        type Json = crate::json::StandardJson<'static, Vec<u64>>;
+        let node = PathNode::<Json>::Owned(Rc::new(OwnedValue::Array(
+            vec![OwnedValue::Int(10), OwnedValue::Int(20)].into(),
+        )));
+        let trail = PathContextTrail::root();
+        let mut collected = Vec::new();
+        path_step_generic::<JqSemantics, Json, _>(
+            &Expr::Iterate,
+            &node,
+            &trail,
+            true,
+            &mut collected,
+        )
+        .unwrap();
+        let snapshot = |trail: PathContextTrail<Json>, node: PathNode<Json>| {
+            let value = match node {
+                PathNode::Owned(value) => (*value).clone(),
+                _ => panic!("owned navigation must return owned values"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
+            };
+            (trail.to_vec(), value)
+        };
+        let expected = vec![
+            (vec![OwnedValue::Int(0)], OwnedValue::Int(10)),
+            (vec![OwnedValue::Int(1)], OwnedValue::Int(20)),
+        ];
+        assert_eq!(
+            collected
+                .into_iter()
+                .map(|(t, n)| snapshot(t, n))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for stop in [false, true] {
+            let mut emitted = Vec::new();
+            let demand = path_step_each_generic::<JqSemantics, Json, _>(
+                &Expr::Iterate,
+                &node,
+                &trail,
+                true,
+                &mut |t, n| {
+                    emitted.push(snapshot(t, n));
+                    if stop {
+                        Demand::Stop
+                    } else {
+                        Demand::Continue
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(emitted, expected[..if stop { 1 } else { 2 }]);
+            assert_eq!(matches!(demand, Demand::Stop), stop);
+        }
+    }
+
+    #[test]
+    fn path_context_empty_pipe_preserves_position_and_demand_3022() {
+        type Json = crate::json::StandardJson<'static, Vec<u64>>;
+        let pos = PathContextPos::<Json> {
+            node: PathNode::Owned(Rc::new(OwnedValue::Int(7))),
+            trail: PathContextTrail::root(),
+            at_key: true,
+        };
+        // A zero-distance hop needs the position's own node, which is not
+        // stored in its trail. The position wrapper supplies that case.
+        assert!(pos.trail.hop(0).is_none());
+        for stop in [false, true] {
+            let mut values = Vec::new();
+            let demand = path_context_step_each::<JqSemantics, Json>(
+                &Expr::Pipe(Vec::new()),
+                &pos,
+                &mut |reached| {
+                    assert!(reached.at_key);
+                    assert_eq!(reached.trail.depth(), 0);
+                    assert!(
+                        matches!(&reached.node, PathNode::Owned(v) if **v == OwnedValue::Int(7))
+                    );
+                    values.push(reached.trail.to_vec());
+                    if stop {
+                        Demand::Stop
+                    } else {
+                        Demand::Continue
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(values, [Vec::<OwnedValue>::new()]);
+            assert_eq!(matches!(demand, Demand::Stop), stop);
+        }
+    }
+
+    #[test]
     fn path_context_nested_seed_hops_and_extends_3022() {
         let json = br#"{"a":{"b":[0,{"c":7}]}}"#;
         let index = JsonIndex::build(json);
         let root = index.root(json);
         let at = |f: &str| match eval_with_cursor(&parse(f).unwrap(), root) {
             GenericResult::OneCursor(c) => c,
-            other => panic!("`{f}` is not one cursor: {other:?}"),
+            other => panic!("`{f}` is not one cursor: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         // One or two climbed levels retain the original link representation:
         // a shared seed would allocate at least as often there.
@@ -38783,7 +38875,7 @@ mod tests {
         let seeded =
             path_context_root::<crate::json::StandardJson<'_, Vec<u64>>>(at(".a.b[1]")).unwrap();
         let PathContextTrail::Seed { steps, visible_len } = &seeded.trail else {
-            panic!("nested cursor should start with one shared prefix")
+            panic!("nested cursor should start with one shared prefix") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         assert_eq!((*visible_len, steps.len()), (3, 3));
         assert_eq!(seeded.trail.last_component(), Some(&OwnedValue::Int(1)));
@@ -38806,7 +38898,7 @@ mod tests {
             visible_len,
         } = &array.trail
         else {
-            panic!("hop should retain the seed")
+            panic!("hop should retain the seed") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         assert!(Rc::ptr_eq(steps, parent_steps));
         assert_eq!(*visible_len, 2);
@@ -38827,7 +38919,7 @@ mod tests {
         path_context_step_generic::<JqSemantics, _>(&parse(".c").unwrap(), &seeded, &mut children)
             .unwrap();
         let [child] = children.as_slice() else {
-            panic!("`.c` should reach one child")
+            panic!("`.c` should reach one child") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         assert!(matches!(child.trail, PathContextTrail::Link(_)));
         assert_eq!(
@@ -39239,7 +39331,7 @@ mod tests {
             .expect("root position");
         let expr = parse(".a | .b | key").expect("filter parses");
         let Expr::Pipe(stages) = expr else {
-            panic!("expected pipe");
+            panic!("expected pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         let mut emitted = 0;
         let result = path_context_walk_pipe::<JqSemantics, _>(&stages, &root, &mut |_item| {
@@ -39261,14 +39353,14 @@ mod tests {
             parse("key").unwrap(),
         ];
         let result = path_context_walk_pipe::<JqSemantics, _>(&stages, &root, &mut |_item| {
-            panic!("downstream field must raise before emitting")
+            panic!("downstream field must raise before emitting") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         });
         match result {
             Err(Control::Error(e)) => assert!(
                 e.message.contains("Cannot index number"),
                 "unexpected downstream error: {e:?}"
             ),
-            other => panic!("expected downstream field error, got {other:?}"),
+            other => panic!("expected downstream field error, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         }
     }
 
@@ -39346,7 +39438,7 @@ mod tests {
             path_context_step_each::<crate::jq::YqSemantics, _>(
                 &parse(".[-3]").unwrap(),
                 &root,
-                &mut |_pos| panic!("out-of-range index must not emit"),
+                &mut |_pos| panic!("out-of-range index must not emit"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
             ),
             Err(Control::Error(_))
         ));
@@ -39397,7 +39489,7 @@ mod tests {
                 e.message.contains("Cannot iterate over number"),
                 "unexpected later-branch error: {e:?}"
             ),
-            other => panic!("expected later-branch error, got {other:?}"),
+            other => panic!("expected later-branch error, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         }
     }
 
@@ -39427,20 +39519,28 @@ mod tests {
             trail: PathContextTrail::root(),
             at_key: false,
         };
-        let _read_only = yq_read_only_context::enter();
-        let mut count = 0;
-        let result = path_context_step_each::<crate::jq::YqSemantics, Json>(
-            &parse(".b").unwrap(),
-            &absent,
-            &mut |_pos| {
-                count += 1;
-                Demand::Continue
-            },
-        );
-        assert!(matches!(result, Ok(Demand::Continue)));
-        // The ambient read-only scope is thread-local and intentionally a
-        // no-op in no_std builds.
-        assert_eq!(count, usize::from(!cfg!(feature = "std")));
+        for read_only in [false, true] {
+            let _scope = read_only.then(yq_read_only_context::enter);
+            let mut reached = Vec::new();
+            let result = path_context_step_each::<crate::jq::YqSemantics, Json>(
+                &parse(".b").unwrap(),
+                &absent,
+                &mut |pos| {
+                    assert!(matches!(pos.node, PathNode::Absent));
+                    reached.push(pos.trail.to_vec());
+                    Demand::Continue
+                },
+            );
+            assert!(matches!(result, Ok(Demand::Continue)));
+            // Only a read-only scope suppresses the absent field; the
+            // scope is intentionally a no-op in no_std builds.
+            let expected = if read_only && cfg!(feature = "std") {
+                Vec::new()
+            } else {
+                vec![vec![OwnedValue::String("b".into())]]
+            };
+            assert_eq!(reached, expected);
+        }
     }
 
     #[test]
@@ -39450,7 +39550,7 @@ mod tests {
         let root = index.root(json);
         let expr = parse("(.a, .b[]) | select(key == \"a\")").unwrap();
         let Expr::Pipe(stages) = expr else {
-            panic!("expected pipe");
+            panic!("expected pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         assert!(path_context_absent_split(&stages).is_some());
 
@@ -39486,7 +39586,7 @@ mod tests {
         let root = index.root(json);
         let expr = parse(".[(\"a\",\"b\",error(\"x\"))] | select(key == \"a\")").unwrap();
         let Expr::Pipe(stages) = expr else {
-            panic!("expected pipe");
+            panic!("expected pipe"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: this panic reports a failed test invariant (#3022)"
         };
         assert!(path_context_absent_split(&stages).is_some());
 
@@ -39495,9 +39595,9 @@ mod tests {
             crate::jq::YqSemantics,
             crate::json::StandardJson<'_, Vec<u64>>,
         >(&stages, root, &mut |_item| {
-            count += 1;
-            Demand::Continue
-        })
+            count += 1; // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: yq rolls back every position before this sink, as the zero-count assertion verifies (#3022)"
+            Demand::Continue // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: yq rolls back every position before this sink, as the zero-count assertion verifies (#3022)"
+        }) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite: yq rolls back every position before this sink, as the zero-count assertion verifies (#3022)"
         .unwrap();
         assert_eq!(count, 0, "yq rolls back the component's prefix");
         assert!(matches!(flow, Flow::Escaped(Control::Error(_))));
