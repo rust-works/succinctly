@@ -53069,18 +53069,61 @@ fn parse_simple_tz_offset(tz: &str) -> Option<i64> {
     Some(offset_secs)
 }
 
-/// Bump a broken-down-time array's 0-indexed month (jq's convention) to the
-/// 1-indexed month this file's date math uses, checked against an
-/// adversarial `i64::MAX` array element (#893's panic class) — shared by
-/// `builtin_mktime` and `builtin_strftime`'s array branch, which previously
-/// each spelled the same "+1, checked" step in a different shape (a
-/// `Result`-returning `.and_then()` chain in one, a bare `Option`-returning
-/// `.checked_add(1)` in the other) for no reason tied to genuine complexity
-/// (#912).
-fn checked_month_index(month: i64) -> Result<i64, EvalError> {
-    month
-        .checked_add(1)
-        .ok_or_else(EvalError::broken_down_time_out_of_range)
+/// jq stores broken-down-time array elements in C `struct tm` integer fields.
+/// Its numeric-to-integer conversion saturates at the signed 32-bit bounds.
+/// Keep the result in `i64` for this file's checked date arithmetic (#3083).
+fn jq_tm_field(value: i64) -> i64 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+}
+
+// `tm_year` stores the year relative to 1900. jq subtracts the offset in a
+// 32-bit field, so years from i32::MIN through i32::MIN + 1899 wrap into
+// positive years when the formatter adds 1900 back (#3083).
+fn jq_tm_year(value: i64) -> i64 {
+    let tm_year = (jq_tm_field(value) as i32).wrapping_sub(1900);
+    i64::from(tm_year) + 1900
+}
+
+/// jq's month is 0-indexed in the array; C increments the 32-bit field
+/// before formatting or converting it. The increment wraps at `i32::MAX`.
+fn jq_month_index(month: i64) -> i64 {
+    (jq_tm_field(month) as i32).wrapping_add(1).into()
+}
+
+// The C time conversion normalizes the original 0-indexed month, while the
+// formatter observes its wrapping 1-indexed representation.
+fn jq_month_for_time(month: i64) -> i64 {
+    if month == i64::from(i32::MIN) {
+        i64::from(i32::MAX) + 1
+    } else {
+        month
+    }
+}
+
+/// jq's `timegm` path rejects dates normalized before 1900 from the year,
+/// month, day, hour, and minute fields, then adds the seconds field. It treats
+/// a final `-1` as its failure sentinel. `%s` prints it; `mktime` raises.
+fn jq_timegm_secs(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Result<Option<i64>, EvalError> {
+    let month = jq_month_for_time(month) - 1;
+    let year = year
+        .checked_add(month.div_euclid(12))
+        .ok_or_else(EvalError::broken_down_time_out_of_range)?;
+    let month = month.rem_euclid(12) + 1;
+    let before_second = unix_secs_from_broken_down_time(year, month, day, hour, minute, 0)?;
+    if before_second < -2_208_988_800 {
+        return Ok(None);
+    }
+    let secs = before_second
+        .checked_add(second)
+        .ok_or_else(EvalError::broken_down_time_out_of_range)?;
+    Ok((secs != -1).then_some(secs))
 }
 
 /// Builtin: mktime - convert broken-down time to Unix timestamp
@@ -53130,40 +53173,42 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     let year = match get_int(0) {
-        Ok(y) => y,
+        Ok(y) => jq_tm_year(y),
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
-    let month = match get_int(1).and_then(checked_month_index) {
-        Ok(m) => m, // jq uses 0-indexed months
+    let month = match get_int(1) {
+        Ok(m) => jq_month_index(m), // jq uses 0-indexed months
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
     let day = match get_int(2) {
-        Ok(d) => d,
+        Ok(d) => jq_tm_field(d),
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
     let hour = match get_int(3) {
-        Ok(h) => h,
+        Ok(h) => jq_tm_field(h),
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
     let minute = match get_int(4) {
-        Ok(m) => m,
+        Ok(m) => jq_tm_field(m),
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
     let second = match get_int(5) {
-        Ok(s) => s,
+        Ok(s) => jq_tm_field(s),
         Err(_) if optional => return QueryResult::None,
         Err(e) => return e.into(),
     };
 
-    let timestamp = match unix_secs_from_broken_down_time(year, month, day, hour, minute, second) {
-        Ok(t) => t,
+    let timestamp = match jq_timegm_secs(year, month, day, hour, minute, second) {
+        Ok(Some(t)) => t,
+        Ok(None) if optional => return QueryResult::None, // omni-dev: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
+        Ok(None) => return QueryResult::Error(EvalError::new("invalid gmtime representation")),
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
     };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
@@ -53182,8 +53227,8 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// Returns `Err` for any `year`/`month`/`day` combination whose arithmetic
 /// would overflow `i64` (#893) — every step uses `checked_*` instead of the
-/// original's plain operators, since a user-controlled broken-down-time
-/// array can set any of these fields to an arbitrary integer. Each
+/// original's plain operators. Array fields now saturate to C `int` bounds
+/// before reaching this helper (#3083), but other callers use it too. Each
 /// multi-step accumulation (`doy`, `doe`) is flattened into its own
 /// intermediate `let`, rather than burying a `?` mid-expression inside a
 /// parenthesized sub-group and continuing to chain outside it, so every step
@@ -53249,15 +53294,13 @@ fn yearday_for_civil(year: i64, month: i64, day: i64) -> i64 {
 /// in one place.
 ///
 /// Returns `Err` for any `year`/`month`/`day`/`hour`/`minute`/`second`
-/// combination whose arithmetic would overflow `i64` (#893 — a
-/// user-controlled `mktime`/`strftime` broken-down-time array can set any of
-/// these to an arbitrary integer, not just `year`). Every step here uses
+/// combination whose arithmetic would overflow `i64` (#893). Array inputs
+/// now saturate to C `int` bounds first (#3083). Every step here uses
 /// `checked_*` instead of a plain operator, mirroring
 /// [`broken_down_time_from_unix_secs`]'s own `checked_sub` guard on its one
-/// overflow-prone step, applied everywhere in this direction since every
-/// field independently risks the same panic (verified: extreme `year`,
-/// `month`, `day`, `hour`, `minute`, and `second` each panic a different
-/// line of the original unchecked version).
+/// overflow-prone step. Before saturation, extreme `year`, `month`, `day`,
+/// `hour`, `minute`, and `second` values each panicked a different line of
+/// the original unchecked version.
 fn unix_secs_from_broken_down_time(
     year: i64,
     month: i64,
@@ -53453,26 +53496,17 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     };
 
-                    // `checked_month_index` (jq's 0-indexed month -> this
-                    // function's 1-indexed month) overflows for an adversarial
-                    // `i64::MAX` array element (#893's panic class, reachable
-                    // here independently of `%s`/`unix_secs_from_broken_down_time`:
-                    // every format path eagerly computes `month`, not just `%s`).
-                    let month = match checked_month_index(get_int(1)) {
-                        Ok(m) => m,
-                        Err(_) if optional => return Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through this call path -- see the array-length check above (#3068)"
-                        Err(e) => return Err(QueryResult::Error(e)),
-                    };
+                    let month = jq_month_index(get_int(1));
 
                     Ok(BrokenDownTime {
-                        year: get_int(0),
+                        year: jq_tm_year(get_int(0)),
                         month,
-                        day: get_int(2),
-                        hour: get_int(3),
-                        minute: get_int(4),
-                        second: get_int(5),
-                        weekday: get_int(6),
-                        yearday: get_int(7),
+                        day: jq_tm_field(get_int(2)),
+                        hour: jq_tm_field(get_int(3)),
+                        minute: jq_tm_field(get_int(4)),
+                        second: jq_tm_field(get_int(5)),
+                        weekday: jq_tm_field(get_int(6)),
+                        yearday: jq_tm_field(get_int(7)),
                     })
                 }
                 _ if optional => Err(QueryResult::None), // omni-dev: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array-length check above (#3068)"
@@ -53538,7 +53572,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ) {
                 Ok(s) => s,
                 Err(_) if optional => return QueryResult::None,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
             };
             QueryResult::Owned(OwnedValue::String(result))
         },
@@ -53716,7 +53750,7 @@ fn format_strftime(
                 )),
                 Some('j') => result.push_str(&format!(
                     "{:03}",
-                    yearday.checked_add(1).ok_or_else(overflow)? // 1-indexed
+                    (yearday as i32).wrapping_add(1) // C `tm_yday + 1`
                 )),
                 Some('w') => result.push_str(&format!("{weekday}")),
                 Some('u') => {
@@ -53754,29 +53788,28 @@ fn format_strftime(
                 // offset (#3046 review: `TZ=EST5EDT`, `0 |
                 // strflocaltime("%s")` is `"0"` in jq 1.7.1).
                 Some('s') => result.push_str(
-                    &unix_secs_from_broken_down_time(year, month, day, hour, minute, second)?
-                        .checked_sub(zone_offset)
-                        .ok_or_else(overflow)?
-                        .to_string(),
+                    &match jq_timegm_secs(year, month, day, hour, minute, second)? {
+                        Some(secs) => secs.checked_sub(zone_offset).ok_or_else(overflow)?,
+                        None => -1,
+                    }
+                    .to_string(),
                 ),
                 Some('U') => {
-                    // Sunday-first week number: days before the year's first
-                    // Sunday are week 00.
-                    let week = yearday
-                        .checked_sub(weekday)
-                        .and_then(|v| v.checked_add(7))
-                        .ok_or_else(overflow)?
-                        .div_euclid(7);
+                    // macOS strftime uses signed `int` arithmetic here, even
+                    // for malformed `tm_wday` and `tm_yday` fields (#3083).
+                    let week = (yearday as i32)
+                        .wrapping_add(7)
+                        .wrapping_sub(weekday as i32)
+                        / 7;
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('W') => {
-                    // Monday-first week number.
-                    let weekday_mon = weekday.checked_add(6).ok_or_else(overflow)?.rem_euclid(7); // Sunday=0..Sat=6 -> Monday=0..Sun=6
-                    let week = yearday
-                        .checked_sub(weekday_mon)
-                        .and_then(|v| v.checked_add(7))
-                        .ok_or_else(overflow)?
-                        .div_euclid(7);
+                    let weekday_mon = if weekday == 0 {
+                        6
+                    } else {
+                        (weekday as i32).wrapping_sub(1)
+                    };
+                    let week = (yearday as i32).wrapping_add(7).wrapping_sub(weekday_mon) / 7;
                     result.push_str(&format!("{week:02}"));
                 }
                 Some('V') => {
@@ -53789,7 +53822,7 @@ fn format_strftime(
                 }
                 Some('g') => {
                     let (iso_year, _) = iso_week_date(year, yearday, weekday)?;
-                    result.push_str(&format!("{:02}", iso_year.rem_euclid(100)));
+                    result.push_str(&format!("{:02}", (iso_year % 100).abs()));
                 }
                 Some(other) => {
                     result.push('%');
@@ -53805,62 +53838,32 @@ fn format_strftime(
     Ok(result)
 }
 
-/// ISO 8601 week-based year and week number (`%G`/`%V`), per the
-/// "Thursday rule": a date belongs to the ISO year of the Thursday in its
-/// week, and ISO week 1 is the week containing that year's first Thursday.
-/// `weekday` is Sunday=0..Saturday=6 (jq's convention); `yearday` is
-/// 0-indexed day of year.
-///
-/// `Err` for a `year`/`yearday`/`weekday` combination whose arithmetic
-/// would overflow `i64` — these three fields come from the same
-/// user-controlled `strftime` array as the fields
-/// [`unix_secs_from_broken_down_time`] already checks; this function
-/// reaches its own independent overflow-prone arithmetic and needs the
-/// identical treatment (#911 review round).
+/// ISO week calculation used by the pinned macOS `strftime` implementation.
+/// The array fields are C `int`s, so its intermediate day arithmetic wraps
+/// at 32 bits, including for malformed weekday and yearday values (#3083).
+/// See Apple's `stdtime/FreeBSD/strftime.c`, `%V`/`%G`/`%g` cases.
 fn iso_week_date(year: i64, yearday: i64, weekday: i64) -> Result<(i64, i64), EvalError> {
-    let overflow = EvalError::broken_down_time_out_of_range;
-    let iso_weekday = if weekday == 0 { 7 } else { weekday }; // Monday=1..Sunday=7
-    let ordinal = yearday.checked_add(1).ok_or_else(overflow)?; // 1-indexed day of year
-    let week = ordinal
-        .checked_sub(iso_weekday)
-        .and_then(|v| v.checked_add(10))
-        .ok_or_else(overflow)?
-        .div_euclid(7);
-
-    if week < 1 {
-        let iso_year = year.checked_sub(1).ok_or_else(overflow)?;
-        Ok((iso_year, weeks_in_iso_year(iso_year)?))
-    } else if week > weeks_in_iso_year(year)? {
-        Ok((year.checked_add(1).ok_or_else(overflow)?, 1))
-    } else {
-        Ok((year, week))
-    }
-}
-
-/// Number of ISO 8601 weeks in a given year (52 or 53).
-///
-/// `Err` for a `year` whose arithmetic would overflow `i64` — see
-/// [`iso_week_date`]'s doc comment.
-fn weeks_in_iso_year(year: i64) -> Result<i64, EvalError> {
-    let overflow = EvalError::broken_down_time_out_of_range;
-    // Standard ISO week-date "long year" test (Wikipedia: ISO week date §
-    // Weeks per year): p(y) is Jan 1 of year y's day-of-week, computed via
-    // the Gregorian doomsday-style formula. A year has 53 weeks exactly
-    // when it starts on a Thursday (p(y) == 4) or is a leap year starting
-    // on a Wednesday (p(y-1) == 3, i.e. the *previous* year started on a
-    // Wednesday and was itself a leap year).
-    let p = |y: i64| -> Result<i64, EvalError> {
-        Ok(y.checked_add(y.div_euclid(4))
-            .and_then(|v| v.checked_sub(y.div_euclid(100)))
-            .and_then(|v| v.checked_add(y.div_euclid(400)))
-            .ok_or_else(overflow)?
-            .rem_euclid(7))
-    };
-    let year_minus_1 = year.checked_sub(1).ok_or_else(overflow)?;
-    if p(year)? == 4 || p(year_minus_1)? == 3 {
-        Ok(53)
-    } else {
-        Ok(52)
+    let mut iso_year = year;
+    let mut yday = yearday as i32;
+    let wday = weekday as i32;
+    loop {
+        let leap = iso_year % 4 == 0 && (iso_year % 100 != 0 || iso_year % 400 == 0);
+        let len = if leap { 366 } else { 365 };
+        let bot = yday.wrapping_add(11).wrapping_sub(wday) % 7 - 3;
+        let mut top = bot - (len % 7);
+        if top < -3 {
+            top += 7;
+        }
+        top += len;
+        if yday >= top {
+            return Ok((iso_year + 1, 1));
+        }
+        if yday >= bot {
+            return Ok((iso_year, i64::from(1 + yday.wrapping_sub(bot) / 7)));
+        }
+        iso_year -= 1;
+        let leap = iso_year % 4 == 0 && (iso_year % 100 != 0 || iso_year % 400 == 0);
+        yday = yday.wrapping_add(if leap { 366 } else { 365 });
     }
 }
 
@@ -86414,101 +86417,180 @@ mod tests {
     }
 
     #[test]
-    fn test_mktime_and_strftime_s_error_instead_of_panicking_on_overflow_893() {
-        // #893: unix_secs_from_broken_down_time's era/day/hour/minute/second
-        // arithmetic panicked on overflow for a user-controlled
-        // broken-down-time array element — the mirror-image bug of #869 on
-        // the opposite (broken-down-time -> seconds) conversion direction.
-        // Every field independently reachable through this exact panic
-        // before the fix (confirmed by hand, one field at a time, against
-        // the pre-fix code): year, month, day, hour, minute, and second.
-        // Deliberately a different message than #869's own tests use
-        // (`datetime_out_of_range`, the opposite conversion direction) —
-        // real jq has no equivalent error for *this* direction at all (it
-        // silently computes a wrapped/nonsensical result instead), so
-        // there's no oracle text to match; see
-        // `EvalError::broken_down_time_out_of_range`'s doc comment.
-        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
+    fn test_extreme_broken_down_fields_match_jq_3083() {
+        query!(b"null", r#"[1970,-9223372036854775808,1,0,0,0,4,0] | strftime("%Y-%m")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647"));
+        query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | todate",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647-01T00:00:00Z"));
+        query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todateiso8601",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+        query!(b"null", r#"[1970,0,-9223372036854775808,0,0,0,4,0] | strftime("%d")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648"));
 
-        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        // Extreme *negative* year: takes `era`'s negative-`y` branch (the
-        // positive cases above never do), whose own `y.checked_sub(399)`
-        // overflows for a `y` this close to `i64::MIN`.
-        query!(b"null", r"[-9223372036854775808,6,1,0,0,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r"[2020,9223372036854775807,1,0,0,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r"[2020,0,9223372036854775807,0,0,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r"[2020,0,1,9223372036854775807,0,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r"[2020,0,1,0,9223372036854775807,0,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r"[2020,0,1,0,0,9223372036854775807,0,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+        // Each pair is the exact direct-field output observed in jq 1.7.1
+        // after an input below/above the signed 32-bit range. The four
+        // values exercise both immediate boundaries and i64 extremes.
+        let fields = [
+            (0, "%Y", "2147483648", "2147483647"),
+            (1, "%m", "-2147483647", "-2147483648"),
+            (2, "%d", "-2147483648", "2147483647"),
+            (3, "%H", "-2147483648", "2147483647"),
+            (4, "%M", "-2147483648", "2147483647"),
+            (5, "%S", "-2147483648", "2147483647"),
+            (6, "%w", "-2147483648", "2147483647"),
+            (7, "%j", "-2147483647", "-2147483648"),
+        ];
+        for (idx, specifier, negative, positive) in fields {
+            for (value, expected) in [
+                (i64::MIN, negative),
+                (i64::from(i32::MIN) - 1, negative),
+                (i64::from(i32::MIN), negative),
+                (i64::from(i32::MAX), positive),
+                (i64::from(i32::MAX) + 1, positive),
+                (i64::MAX, positive),
+            ] {
+                let mut fields = [1970, 0, 1, 0, 0, 0, 4, 0];
+                fields[idx] = value;
+                let filter = format!(
+                    "[{},{},{},{},{},{},{},{}] | strftime(\"{specifier}\")",
+                    fields[0],
+                    fields[1],
+                    fields[2],
+                    fields[3],
+                    fields[4],
+                    fields[5],
+                    fields[6],
+                    fields[7]
+                );
+                query!(b"null", &filter,
+                    QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, expected, "{filter}"));
+            }
+        }
 
-        // `?` suppresses it, same as #869's precedent.
-        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime?", QueryResult::None => {});
-        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%s")?"#, QueryResult::None => {});
-
-        // Ordinary dates still round-trip correctly (regression guard).
-        query!(b"null", r"[2024,5,15,10,30,0,0,0] | mktime",
-            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
-
-        // `strftime`'s array branch computes `month` (its own `get_int(1) +
-        // 1` step) eagerly for every format string, not just `%s` — an
-        // extreme month here panicked independently of
-        // unix_secs_from_broken_down_time, before this same overflow ever
-        // reaches that function.
-        query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        // `?` suppresses the array branch's own month-overflow error too
-        // (distinct site from the `%s`-via-unix_secs_from_broken_down_time
-        // case above — both now share `checked_month_index`, #912).
-        query!(b"null", r#"[2020,9223372036854775807,1,0,0,0,0,0] | strftime("%Y")?"#,
-            QueryResult::None => {});
+        query!(b"null", r"[1970,-1,1,0,0,0,4,0] | todate",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-00-01T00:00:00Z"));
+        query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
     }
 
     #[test]
-    fn test_strftime_week_and_yearday_specifiers_error_instead_of_panicking_on_overflow_911() {
-        // #911 review round: the initial #893 fix hardened
-        // unix_secs_from_broken_down_time and the two `month + 1` sites,
-        // but format_strftime's %j/%U/%W/%V/%G/%g specifiers each do their
-        // own independent unchecked arithmetic on the same user-controlled
-        // `weekday`/`yearday`/`year` array fields (indices 6/7/0) and
-        // panicked just the same. `iso_week_date`/`weeks_in_iso_year`
-        // (backing %V/%G/%g) needed the identical treatment.
-        const MSG: &str = "mktime/strftime: broken-down time value out of representable range";
+    fn test_broken_down_year_offset_wraps_across_full_boundary_3083() {
+        // jq 1.7.1 stores year - 1900 in a signed 32-bit tm_year. The wrap
+        // applies to 1900 consecutive input years, not only i32::MIN.
+        for (year, displayed, timestamp) in [
+            (i32::MIN, "2147483648", 67_767_976_233_532_800.0),
+            (i32::MIN + 1, "2147483649", 67_767_976_265_155_200.0),
+            (i32::MIN + 1899, "2147485547", 67_768_036_160_140_800.0),
+        ] {
+            let array = format!("[{year},0,1,0,0,0,4,0]");
+            let format_filter = format!("{array} | strftime(\"%Y\")");
+            query!(b"null", &format_filter,
+                QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, displayed, "{format_filter}"));
+            let mktime_filter = format!("{array} | mktime");
+            query!(b"null", &mktime_filter,
+                QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+        }
+        query!(b"null", r#"[-2147481748,0,1,0,0,0,4,0] | strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147481748"));
+        query!(b"null", r"[-2147481748,0,1,0,0,0,4,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+    }
 
-        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[2020,0,1,0,0,0,-9223372036854775808,0] | strftime("%U")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[2020,0,1,0,0,0,9223372036854775807,0] | strftime("%W")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[2020,0,1,0,0,0,0,-9223372036854775808] | strftime("%W")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%V")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[-9223372036854775808,0,1,0,0,0,0,0] | strftime("%V")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%V")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%G")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
-        query!(b"null", r#"[9223372036854775807,0,1,0,0,0,0,0] | strftime("%g")"#,
-            QueryResult::Error(e) => assert_eq!(e.message, MSG));
+    #[test]
+    fn test_mktime_and_strftime_extreme_fields_3083() {
+        // jq 1.7.1 saturates each input field to `int`, then converts the
+        // broken-down time. A failed timegm is an error for mktime but the
+        // string "-1" for strftime's %s.
+        query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_201_996_800.0));
+        query!(b"null", r"[-9223372036854775808,0,1,0,0,0,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_233_532_800.0));
+        query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 5_647_336_530_739_200.0));
+        query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+        query!(b"null", r#"[1970,-9223372036854775808,1,0,0,0,4,0] | strftime("%s")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-1"));
+        query!(b"null", r"[1970,0,1,0,0,-1,4,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+        query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | mktime?",
+            QueryResult::None => {});
+        query!(b"null", r"[2024,5,15,10,30,0,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
 
-        // `?` suppresses it, same as every other overflow site in this file.
-        query!(b"null", r#"[2020,0,1,0,0,0,0,9223372036854775807] | strftime("%j")?"#, QueryResult::None => {});
+        let positive = [
+            67_767_976_201_996_800.0,
+            5_647_336_530_739_200.0,
+            185_542_587_014_400.0,
+            7_730_941_129_200.0,
+            128_849_018_820.0,
+            2_147_483_647.0,
+        ];
+        for (idx, expected) in positive.into_iter().enumerate() {
+            let mut fields = [1970, 0, 1, 0, 0, 0, 4, 0];
+            fields[idx] = i64::MAX;
+            let filter = format!(
+                "[{},{},{},{},{},{},{},{}] | mktime",
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                fields[6],
+                fields[7]
+            );
+            query!(b"null", &filter,
+                QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, expected, "{filter}"));
+        }
+        for idx in 1..=4 {
+            let mut fields = [1970, 0, 1, 0, 0, 0, 4, 0];
+            fields[idx] = i64::MIN;
+            let filter = format!(
+                "[{},{},{},{},{},{},{},{}] | mktime",
+                fields[0],
+                fields[1],
+                fields[2],
+                fields[3],
+                fields[4],
+                fields[5],
+                fields[6],
+                fields[7]
+            );
+            query!(b"null", &filter,
+                QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation", "{filter}"));
+        }
+        query!(b"null", r"[1970,0,1,0,0,-9223372036854775808,4,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, -2_147_483_648.0));
+        // jq checks the normalized date before adding seconds. Crossing
+        // into 1899 via seconds is accepted; crossing via minutes is not.
+        query!(b"null", r"[1900,0,1,0,0,-1,0,0] | mktime",
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, -2_208_988_801.0));
+        query!(b"null", r"[1900,0,1,0,-1,0,0,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+    }
 
-        // Ordinary dates still produce the exact same output as real jq
-        // (byte-for-byte verified against the pinned jq-1.7.1 oracle).
+    #[test]
+    fn test_strftime_extreme_week_fields_3083() {
+        // The C formatter does its week arithmetic with wrapping `int`s.
+        query!(b"null", r#"[1970,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648 -306783378 -306783377"));
+        query!(b"null", r#"[1970,0,1,0,0,0,-9223372036854775808,0] | strftime("%U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-306783377 -306783377"));
         query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
+        // Sunday is the special case in %W's Monday-first weekday remap.
+        query!(b"null", r#"[1970,0,1,0,0,0,0,0] | strftime("%W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "00"));
+    }
+
+    #[test]
+    fn test_checked_civil_date_rejects_unbounded_year_3083() {
+        let error = checked_days_from_civil(i64::MAX, 1, 1).unwrap_err();
+        assert_eq!(
+            error.message,
+            "mktime/strftime: broken-down time value out of representable range"
+        );
     }
 
     // `#[cfg(feature = "std")]`: `parse_simple_tz_offset` itself is
@@ -86677,13 +86759,11 @@ mod tests {
             }
         );
 
-        // %W's weekday-to-Monday-first remap uses rem_euclid, matching
-        // %U's div_euclid discipline rather than plain `%` (which would
-        // give a different, wrong answer for a hand-constructed array with
-        // an out-of-range weekday).
+        // jq's C formatter uses the raw out-of-range weekday in both week
+        // calculations (#3083); verified against pinned jq 1.7.1.
         query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "02 00");
+                assert_eq!(s, "02 02");
             }
         );
     }
@@ -87008,21 +87088,16 @@ mod tests {
             );
         }
 
-        // End-to-end `?` behavior over every early-exit `todate` has (a
-        // too-short array, a non-array/non-number value, a month value
-        // overflowing `checked_month_index`) -- confirmed via `eprintln!`
-        // probing that `broken_down_time_fields`'s own `optional` parameter
-        // is never `true` on any of these (the suppression these three
-        // exercise happens entirely outside builtin dispatch here, not
+        // End-to-end `?` behavior over early-exit `todate` cases (a
+        // too-short array and a non-array/non-number value) -- confirmed via
+        // `eprintln!` probing that `broken_down_time_fields`'s own `optional`
+        // parameter is never `true` on these (suppression happens entirely
+        // outside builtin dispatch here, not
         // through this function's own `if optional` arms), so this pins the
         // observable behavior without claiming to cover those arms; see
         // their own `tolerate-line` markers above for why they're dead code
         // through every path that currently calls this function.
-        for filter in [
-            "[1,2,3] | todate?",
-            "null | todate?",
-            "[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
-        ] {
+        for filter in ["[1,2,3] | todate?", "null | todate?"] {
             query!(b"null", filter, QueryResult::None => {});
         }
 
