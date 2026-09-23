@@ -1045,8 +1045,9 @@ pub trait DocumentValue: Sized + Clone {
     /// chain that falls through to `as_f64` and then records document
     /// provenance (`OwnedValue::from_document_float`) would re-bake the
     /// computed value into a decimal literal past yq's threshold -- the very
-    /// re-spelling the token exists to prevent. Only a JSON document can
-    /// hold one (the bridge re-indexes as JSON), so the default is `None`.
+    /// re-spelling the token exists to prevent. Only the bridge's own JSON
+    /// text can hold one -- the same bytes in a user document are a
+    /// malformed number, not a token (#3034) -- so the default is `None`.
     fn bridge_computed_float(&self) -> Option<f64> {
         None
     }

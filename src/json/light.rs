@@ -94,6 +94,19 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// cursors that reached the same node by different routes. YAML's
     /// `AdvancePositions` cache has that exact trap on record.
     seq_hint: Cell<SeqHint>,
+    /// Whether this index was built over the jq reindex bridge's own text
+    /// ([`JsonIndex::build_reindex`]), the only text allowed to carry the
+    /// bridge's number tokens (`NAN_SENTINEL`, `INFINITY_SENTINEL`,
+    /// `computed_float_token`, #472/#1083/#2902). Every [`JsonNumber`] a
+    /// cursor over this index hands out copies it, and
+    /// [`JsonNumber::bridge_value`] decodes a token only when it is set.
+    ///
+    /// The tokens are spelled so `str::parse` rejects them, but a document
+    /// can still contain the same bytes, and the scanners capture them as
+    /// one span either way; without this flag a document `[9e999e999]` read
+    /// as NaN (#3034). Provenance, not spelling, is what keeps the two
+    /// apart.
+    bridge_tokens: bool,
 }
 
 impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
@@ -104,6 +117,7 @@ impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
             .field("ib_rank", &self.ib_rank)
             .field("bp", &self.bp)
             .field("lines", &self.lines)
+            .field("bridge_tokens", &self.bridge_tokens)
             .finish_non_exhaustive()
     }
 }
@@ -193,7 +207,25 @@ impl JsonIndex<Vec<u64>> {
             bp: BalancedParens::new(semi.bp, bp_bit_count),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
+            bridge_tokens: false,
         }
+    }
+
+    /// [`build`](Self::build) for text the jq reindex bridge wrote
+    /// (`OwnedValue::to_json_for_reindex`/`to_json_input_bridge`), whose
+    /// number tokens stand for NaN, ±Infinity and computed floats. Only a
+    /// number read through an index built here decodes those tokens
+    /// ([`JsonNumber::bridge_value`]); the same bytes in a user document are
+    /// an ordinary malformed span (#3034).
+    ///
+    /// Not for user input. Reach it through `OwnedValue::reindexed` /
+    /// `OwnedValue::input_bridge_doc`, which pair the text with its index so
+    /// the flag cannot be forgotten.
+    #[doc(hidden)]
+    pub fn build_reindex(json: &[u8]) -> Self {
+        let mut index = Self::build(json);
+        index.bridge_tokens = true;
+        index
     }
 }
 
@@ -232,6 +264,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             bp: BalancedParens::from_words(bp, bp_len),
             lines: OnceCell::new(),
             seq_hint: Cell::new(SeqHint::NONE),
+            bridge_tokens: false,
         }
     }
 
@@ -839,6 +872,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     StandardJson::Number(JsonNumber {
                         text: self.text,
                         start: text_pos,
+                        bridge: self.index.bridge_tokens,
                     })
                 } else {
                     StandardJson::Error("invalid null")
@@ -855,6 +889,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
             c if c == b'-' || c == b'.' || c.is_ascii_digit() => StandardJson::Number(JsonNumber {
                 text: self.text,
                 start: text_pos,
+                bridge: self.index.bridge_tokens,
             }),
             // jq's remaining number spellings (#2877), each an error arm
             // until now so valid RFC 8259 input still reaches none of
@@ -871,6 +906,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 StandardJson::Number(JsonNumber {
                     text: self.text,
                     start: text_pos,
+                    bridge: self.index.bridge_tokens,
                 })
             }
             b'+' | b'i' | b'I' | b'N' | b's' | b'S'
@@ -879,6 +915,7 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                 StandardJson::Number(JsonNumber {
                     text: self.text,
                     start: text_pos,
+                    bridge: self.index.bridge_tokens,
                 })
             }
             _ => StandardJson::Error("unexpected character"),
@@ -2358,7 +2395,10 @@ fn word_special_mask(word: u64) -> u64 {
 /// deliberately unparseable via a repeated exponent marker, #472/#1083)
 /// round-trip correctly: their whole span must survive intact for
 /// `is_nan_sentinel`/`is_infinity_sentinel`'s exact-text comparison to
-/// recognize them.
+/// recognize them. The same greedy span captures those bytes in a user
+/// document too; there they are decoded as an ordinary malformed number,
+/// because only an index built over bridge text lets a token decode
+/// ([`JsonNumber::bridge_value`], #3034).
 ///
 /// See [`number_literal_end`]'s own doc comment for the full four-way
 /// survey of this crate's independent number-token scanners (#1218) --
@@ -2520,6 +2560,9 @@ pub fn jq_number_token_end(text: &[u8], start: usize) -> Option<usize> {
 pub struct JsonNumber<'a> {
     text: &'a [u8],
     start: usize,
+    /// Copied from the index's `bridge_tokens` (#3034): whether this span
+    /// may be one of the reindex bridge's number tokens.
+    bridge: bool,
 }
 
 impl<'a> JsonNumber<'a> {
@@ -2544,31 +2587,73 @@ impl<'a> JsonNumber<'a> {
         s.parse().map_err(|_| JsonError::InvalidNumber)
     }
 
+    /// The value this span stands for if it is one of the reindex bridge's
+    /// number tokens -- NaN (`NAN_SENTINEL`), ±Infinity
+    /// (`INFINITY_SENTINEL`/`NEG_INFINITY_SENTINEL`) or a computed finite
+    /// float (`crate::json::validate::computed_float_token`) -- **and** it
+    /// was read through an index built over bridge text
+    /// ([`JsonIndex::build_reindex`]); `None` otherwise.
+    ///
+    /// The one decoder of those tokens for a document number (#3034). The
+    /// tokens are unparseable by `str::parse`, but not unspellable: a user
+    /// document can hold the same bytes, and the scanners capture them as one
+    /// span there too. Such a span is an ordinary malformed number, read the
+    /// way its neighbours (`9e999e998`, `1e0e1`) are, so every reader that
+    /// decodes a token has to come through here, where provenance decides.
+    #[inline]
+    pub fn bridge_value(&self) -> Option<f64> {
+        if !self.bridge {
+            return None;
+        }
+        let bytes = self.raw_bytes();
+        crate::jq::OwnedValue::bridge_nonfinite_from_bytes(bytes)
+            .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
+    }
+
+    /// [`bridge_value`](Self::bridge_value) restricted to the NaN/infinity
+    /// tokens (#472/#1083): `None` for the computed-float token and for
+    /// everything read outside the bridge. For the cursor builtins that
+    /// special-case a non-finite value before their ordinary parse
+    /// (`length`, `isnan`, `isinfinite`, the date builtins).
+    #[inline]
+    pub fn bridge_nonfinite(&self) -> Option<f64> {
+        if !self.bridge {
+            return None;
+        }
+        crate::jq::OwnedValue::bridge_nonfinite_from_bytes(self.raw_bytes())
+    }
+
+    /// [`bridge_value`](Self::bridge_value) restricted to the computed-float
+    /// token (#2902): `None` for the NaN/infinity tokens and for everything
+    /// read outside the bridge.
+    #[inline]
+    pub fn bridge_computed_float(&self) -> Option<f64> {
+        if !self.bridge {
+            return None;
+        }
+        crate::json::validate::parse_computed_float_token(self.raw_bytes())
+    }
+
     /// Parse as f64.
     ///
     /// Also decodes every spelling the ordinary parse refuses but this
-    /// crate's one raw-bytes decoder,
-    /// [`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes),
-    /// reads as a number: the reindex bridge's computed-float token
-    /// (`crate::json::validate::computed_float_token`, #2902) and its NaN/
-    /// infinity tokens (#472/#1083 -- decoded here since #2877, when the
-    /// `--slurp`/`--seq` input path started writing them), and decNumber's
-    /// special values (#2877: Rust's `f64: FromStr` reads `nan`, `inf`,
-    /// `infinity` and a leading `+` case-insensitively, but rejects a
-    /// signalling NaN `sNaN` and a NaN payload `nan12`, both of which jq
-    /// 1.7.1 accepts). Every cursor-level reader of a document number in
-    /// both evaluators (`length`, the math builtins, dates, `isnan`, the
-    /// generic materializer's `as_f64` arm, ...) reaches its value through
-    /// this one accessor, so the decode lives here rather than being
-    /// repeated at each of them -- and delegating to `from_number_bytes`
-    /// rather than restating its arms keeps the two from drifting. Only
-    /// consulted once the ordinary parse has already failed, so a genuine
-    /// number pays nothing for it.
+    /// crate's number decoders read as a number: the reindex bridge's tokens
+    /// ([`bridge_value`](Self::bridge_value) -- only on a span read through
+    /// the bridge's own index, #3034), and decNumber's special values
+    /// (#2877: Rust's `f64: FromStr` reads `nan`, `inf`, `infinity` and a
+    /// leading `+` case-insensitively, but rejects a signalling NaN `sNaN`
+    /// and a NaN payload `nan12`, both of which jq 1.7.1 accepts). Every
+    /// cursor-level reader of a document number in both evaluators
+    /// (`length`, the math builtins, dates, `isnan`, the generic
+    /// materializer's `as_f64` arm, ...) reaches its value through this one
+    /// accessor, so the decode lives here rather than being repeated at each
+    /// of them. Only consulted once the ordinary parse has already failed,
+    /// so a genuine number pays nothing for it.
     ///
     /// The value is the **plain** correctly-rounded parse, the JSON
     /// library's own answer. jq mode's 17-digit literal model (#2936) is
     /// applied by the evaluators' number funnels
-    /// (`OwnedValue::from_number_bytes::<S>`, `document_number_f64::<S>`),
+    /// (`OwnedValue::from_json_number::<S>`, `document_number_f64::<S>`),
     /// not here: this type has no mode, and every spelling below the
     /// fallback is a non-literal (a bridge token or a decNumber word) whose
     /// value the model cannot change.
@@ -2576,8 +2661,7 @@ impl<'a> JsonNumber<'a> {
         let bytes = self.raw_bytes();
         let s = core::str::from_utf8(bytes).map_err(|_| JsonError::InvalidUtf8)?;
         s.parse().or_else(|_| {
-            crate::jq::OwnedValue::bridge_nonfinite_from_bytes(bytes)
-                .or_else(|| crate::json::validate::parse_computed_float_token(bytes))
+            self.bridge_value()
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
@@ -3701,9 +3785,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
 
     fn bridge_computed_float(&self) -> Option<f64> {
         match self {
-            StandardJson::Number(n) => {
-                crate::json::validate::parse_computed_float_token(n.raw_bytes())
-            }
+            StandardJson::Number(n) => n.bridge_computed_float(),
             _ => None,
         }
     }
@@ -4542,7 +4624,7 @@ fn write_json_number<Out: core::fmt::Write>(
             // model is jq's too (#2936) -- only the sanitized value of a
             // lenient span is printed from the double here, never a
             // preserved literal's.
-            match OwnedValue::from_number_bytes::<JqSemantics>(raw) {
+            match OwnedValue::from_json_number::<JqSemantics>(&n) {
                 OwnedValue::Int(i) => write!(out, "{i}"),
                 OwnedValue::Float(f) => {
                     if f.is_finite() {
@@ -8666,7 +8748,8 @@ mod tests {
             let json = format!("[{token}]");
             let bytes = json.as_bytes();
             assert_eq!(nested_number_span(bytes, 1), 1 + token.len());
-            let index = JsonIndex::build(bytes);
+            // Bridge text: the only index the token decodes under (#3034).
+            let index = JsonIndex::build_reindex(bytes);
             let root = index.root(bytes);
             let StandardJson::Array(mut items) = root.value() else {
                 panic!("expected an array");
@@ -8897,7 +8980,8 @@ mod tests {
             );
             let json = format!("[{token}]");
             let bytes = json.as_bytes();
-            let index = JsonIndex::build(bytes);
+            // Bridge text: the only index the token decodes under (#3034).
+            let index = JsonIndex::build_reindex(bytes);
             let root = index.root(bytes);
             let StandardJson::Number(n) = root.first_child().expect("one child").value() else {
                 panic!("expected a number"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the failure message for the assertion this #2877 test exists to make"
@@ -8905,6 +8989,58 @@ mod tests {
             match expected {
                 None => assert!(n.as_f64().is_ok_and(f64::is_nan), "{token}"),
                 Some(v) => assert_eq!(n.as_f64(), Ok(v), "{token}"),
+            }
+        }
+    }
+
+    /// #3034: the bridge's number tokens decode only under the index built
+    /// over bridge text. The same bytes in a user document are an ordinary
+    /// malformed span: `as_f64` refuses them like their neighbour spellings
+    /// (`9e999e998`, `1e0e1`), and neither `bridge_value` nor the
+    /// materializer's `bridge_computed_float` reads a value out of them.
+    #[test]
+    fn bridge_tokens_decode_only_under_the_bridge_index_3034() {
+        let tokens = [
+            crate::jq::OwnedValue::Float(f64::NAN).to_json_input_bridge(),
+            crate::jq::OwnedValue::Float(f64::INFINITY).to_json_input_bridge(),
+            crate::jq::OwnedValue::Float(f64::NEG_INFINITY).to_json_input_bridge(),
+            crate::json::validate::computed_float_token(1.0),
+            crate::json::validate::computed_float_token(-2.5),
+        ];
+        for token in &tokens {
+            let json = format!("[{token}]");
+            let bytes = json.as_bytes();
+            let number_under = |index: &JsonIndex| -> (Option<f64>, Result<f64, JsonError>, bool) {
+                let root = index.root(bytes);
+                let value = root.first_child().expect("one child").value();
+                let StandardJson::Number(n) = value else {
+                    panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+                };
+                let computed = value.bridge_computed_float().is_some();
+                (n.bridge_value(), n.as_f64(), computed)
+            };
+            let (bridge, as_f64, _) = number_under(&JsonIndex::build_reindex(bytes));
+            assert!(bridge.is_some(), "{token} must decode as bridge text");
+            assert!(as_f64.is_ok(), "{token} must decode as bridge text");
+            assert_eq!(
+                number_under(&JsonIndex::build(bytes)),
+                (None, Err(JsonError::InvalidNumber), false),
+                "{token} in a user document is a malformed number"
+            );
+        }
+        // Not everything outside `[0-9.eE+-]` is a token: decNumber's words
+        // are user text and read the same under either index (#2877).
+        for word in ["nan", "-Infinity"] {
+            let json = format!("[{word}]");
+            let bytes = json.as_bytes();
+            for index in [JsonIndex::build(bytes), JsonIndex::build_reindex(bytes)] {
+                let StandardJson::Number(n) =
+                    index.root(bytes).first_child().expect("one child").value()
+                else {
+                    panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
+                };
+                assert!(n.as_f64().is_ok(), "{word}");
+                assert_eq!(n.bridge_value(), None, "{word}");
             }
         }
     }

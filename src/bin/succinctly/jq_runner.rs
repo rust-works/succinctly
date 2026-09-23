@@ -6166,13 +6166,23 @@ fn evaluate_input_streaming(
     // finite literal. The bridge variant writes the reindex tokens the
     // reparse already decodes. The `--preserve-input` arm keeps
     // `to_json_jq_preserve` (see that variant's doc comment for why).
-    let json_str = if output_config.convention.preserves_source_values() {
+    //
+    // #3034: only the bridge variant's text is indexed as bridge text
+    // (`JsonIndex::build_reindex`), the one index its tokens decode under.
+    // `to_json_jq_preserve` writes no token, so its text is indexed like any
+    // document.
+    let preserve = output_config.convention.preserves_source_values();
+    let json_str = if preserve {
         input.to_json_jq_preserve()
     } else {
         input.to_json_input_bridge()
     };
     let json_bytes = json_str.as_bytes();
-    let index = JsonIndex::build(json_bytes);
+    let index = if preserve {
+        JsonIndex::build(json_bytes)
+    } else {
+        JsonIndex::build_reindex(json_bytes)
+    };
     let cursor = index.root(json_bytes);
 
     let mut write_err: Option<anyhow::Error> = None;
@@ -6950,10 +6960,15 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     Ok(match value {
         StandardJson::Null => JqValue::Null,
         StandardJson::Bool(b) => JqValue::Bool(b),
-        StandardJson::Number(n) => {
+        // A reindex-bridge token (#3034) is a computed value, not a
+        // spelling: decode it here, so a `RawNumber` only ever holds
+        // document text and its readers (`OwnedValue::from_number_bytes`,
+        // `format_raw_number`) never see a token.
+        StandardJson::Number(n) => match n.bridge_value() {
+            Some(f) => JqValue::Float(f),
             // Use RawNumber to preserve original formatting like "4e4"
-            JqValue::RawNumber(n.raw_bytes())
-        }
+            None => JqValue::RawNumber(n.raw_bytes()),
+        },
         StandardJson::String(s) => {
             // Keep string lazy - use raw bytes reference instead of decoding
             JqValue::String(
@@ -7981,9 +7996,13 @@ where
                 StandardJson::Null => out.write_all(b"null")?,
                 StandardJson::Bool(true) => out.write_all(b"true")?,
                 StandardJson::Bool(false) => out.write_all(b"false")?,
-                StandardJson::Number(n) => {
-                    out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?;
-                }
+                // A cursor can point into reindex-bridge text: its tokens
+                // print as the value they stand for, never as a spelling
+                // (#3034) -- the `JqValue::Float` arm above.
+                StandardJson::Number(n) => match n.bridge_value() {
+                    Some(f) => out.write_all(formatter.format_float(f).as_bytes())?,
+                    None => out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?,
+                },
                 StandardJson::String(s) => {
                     // Zero-copy optimization when the source span needs no
                     // re-encoding under jq's own escape convention -- see

@@ -1727,12 +1727,10 @@ fn evaluate_input(
     sink: &mut ErrorSink,
 ) -> Result<Vec<OwnedValue>> {
     // Convert OwnedValue to JSON bytes for indexing
-    let json_str = input.to_json_for_reindex::<jq::JqSemantics>();
-    let json_bytes = json_str.as_bytes();
+    let doc = input.reindexed::<jq::JqSemantics>();
 
     // Build index and evaluate
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let cursor = doc.root();
 
     let result = jq::eval::<Vec<u64>, YqSemantics>(expr, cursor);
     Ok(query_result_to_owned_values(result, sink))
@@ -3370,10 +3368,8 @@ fn owned_value_at_mut<'v>(
 /// stages the real evaluation is about to run anyway -- whatever fails
 /// there is reported *there*, once, not a second time here.
 fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
-    let json_str = input.to_json_for_reindex::<jq::JqSemantics>();
-    let json_bytes = json_str.as_bytes();
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let doc = input.reindexed::<jq::JqSemantics>();
+    let cursor = doc.root();
     match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
         QueryResult::One(v) => generic_to_owned::<YqSemantics, _>(&v).ok().map(|v| vec![v]),
         QueryResult::OneCursor(c) => generic_to_owned::<YqSemantics, _>(&c.value())

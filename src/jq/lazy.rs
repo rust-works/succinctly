@@ -939,9 +939,7 @@ fn cursor_number_to_owned<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Option<OwnedValue> {
     match value {
-        StandardJson::Number(number) => Some(OwnedValue::from_number_bytes::<JqSemantics>(
-            number.raw_bytes(),
-        )),
+        StandardJson::Number(number) => Some(OwnedValue::from_json_number::<JqSemantics>(number)),
         _ => None,
     }
 }
@@ -1245,7 +1243,7 @@ mod tests {
             .into(),
         )
         .to_json_for_reindex::<JqSemantics>();
-        let index = JsonIndex::build(source.as_bytes());
+        let index = JsonIndex::build_reindex(source.as_bytes());
         let cursor = index.root(source.as_bytes());
         for owned in [
             cursor_to_owned(&cursor).unwrap(),

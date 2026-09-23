@@ -88,7 +88,6 @@ use super::expr::{
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
-use crate::json::JsonIndex;
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
 /// [`to_owned_with_comments`] (#998).
@@ -2668,7 +2667,7 @@ fn owned_from_standard_json_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes::<S>(n.raw_bytes()),
+        StandardJson::Number(n) => OwnedValue::from_json_number::<S>(n),
         StandardJson::String(s) => OwnedValue::String(
             s.as_str()
                 .map_err(|e| EvalError::decode_failure(format!("{e}")))?
@@ -2823,10 +2822,8 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
-    let json_str = owned.to_json_for_reindex::<S>();
-    let json_bytes = json_str.as_bytes();
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let doc = owned.reindexed::<S>();
+    let cursor = doc.root();
 
     // No `if optional { wrap in Expr::Optional }` here: every public entry
     // point (`eval`/`eval_using`/`eval_with_cursor`/`eval_with_cursor_using`)
@@ -8765,10 +8762,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let expr = reroot_for_reentry::<S>(expr, &root);
             let expr = expr.as_ref();
             let owned = owned_or_err!(bridge_ambient_input::<_, S>(expr, &value, cursor));
-            let json_str = owned.to_json_for_reindex::<S>();
-            let json_bytes = json_str.as_bytes();
-            let index = JsonIndex::build(json_bytes);
-            let cursor = index.root(json_bytes);
+            let doc = owned.reindexed::<S>();
+            let cursor = doc.root();
 
             // No `if optional { wrap in Expr::Optional }` here (see
             // `eval_on_owned`'s matching comment): this `_` arm is only
@@ -28315,11 +28310,8 @@ mod tests {
     /// `JsonIndex::build`, `owned_from_standard_json`) and report whether it
     /// came back unchanged.
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {
-        use crate::json::JsonIndex;
-        let json = value.to_json_for_reindex::<S>();
-        let bytes = json.as_bytes();
-        let index = JsonIndex::build(bytes);
-        let cursor = index.root(bytes);
+        let doc = value.reindexed::<S>();
+        let cursor = doc.root();
         let round_tripped = owned_from_standard_json::<S, _>(&cursor.value())
             .expect("the bridge's own serialization must reparse");
 

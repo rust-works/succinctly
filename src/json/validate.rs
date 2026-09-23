@@ -1288,11 +1288,11 @@ const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";
 /// `1.0` where real yq answers `1` and `[2*1e16] | .[0] | tostring` echoed
 /// jq's literal-reformatting `2E+16` where real jq answers `2e+16`.
 ///
-/// Same accepted trade-off as the sentinels: an *invalid* document span
-/// that happens to spell this shape (`[1e0e0]`, rejected by every strict
-/// reader including jq's own) now materializes through the lenient
-/// semi-index path as the float instead of `null`, exactly as `[9e999e999]`
-/// already materializes NaN.
+/// A malformed document span can spell the same shape (`[1e0e0]`, rejected
+/// by every strict reader including jq's own). It is not a token there:
+/// only a number read through an index built over bridge text decodes one
+/// (`JsonNumber::bridge_value`), so `[1e0e0]` reads as `null` like `[1e0e1]`
+/// (#3034).
 ///
 /// `f` must be finite: NaN/±Infinity have their own sentinels, which every
 /// caller emits first.
@@ -1315,10 +1315,11 @@ pub(crate) fn computed_float_token(f: f64) -> String {
 }
 
 /// Decodes a [`computed_float_token`], `None` for anything else -- the one
-/// definition every reader of a `to_json_for_reindex` number token consults
-/// (`OwnedValue::from_number_bytes`, `JsonNumber::as_f64`), so the check
-/// cannot diverge between call sites the way three copies of one predicate
-/// did in #106.
+/// definition of the spelling, so the check cannot diverge between call
+/// sites the way three copies of one predicate did in #106. Spelling only:
+/// its readers (`JsonNumber::bridge_value`, `JsonNumber::bridge_computed_float`)
+/// consult it only for a span read through an index built over bridge text
+/// (#3034).
 ///
 /// Strips the suffix, then requires the remainder to start the way `{:e}`
 /// does (a digit or `-digit`), to still carry an exponent marker, and to

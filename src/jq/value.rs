@@ -2882,12 +2882,15 @@ impl OwnedValue {
     }
 
     /// The reindex bridge's NaN/infinity tokens (#472/#1083), decoded to
-    /// the bare `f64` they stand for; `None` for anything else. The first
-    /// check [`from_number_bytes`](Self::from_number_bytes) makes, split
-    /// out so `JsonNumber::as_f64` (`src/json/light.rs`) can decode the
-    /// same tokens without choosing a number model: no spelling this
-    /// accepts is a literal, so jq's 17-digit rule (#2936) has nothing to
-    /// say about it.
+    /// the bare `f64` they stand for; `None` for anything else.
+    ///
+    /// Spelling only, with no notion of where `bytes` came from: a user
+    /// document can hold the same bytes (#3034). Its one caller outside
+    /// tests is `JsonNumber::bridge_value` (`src/json/light.rs`), which
+    /// checks provenance first; decode a document number through that, or
+    /// through [`from_json_number`](Self::from_json_number), never through
+    /// this directly.
+    #[doc(hidden)]
     #[must_use]
     pub fn bridge_nonfinite_from_bytes(bytes: &[u8]) -> Option<f64> {
         if is_nan_sentinel(bytes) {
@@ -2902,19 +2905,39 @@ impl OwnedValue {
         })
     }
 
+    /// Materialize a document number read through a cursor: the reindex
+    /// bridge's value when the span is one of its tokens *and* was read
+    /// through the bridge's own index
+    /// ([`JsonNumber::bridge_value`](crate::json::light::JsonNumber::bridge_value)),
+    /// otherwise [`from_number_bytes`](Self::from_number_bytes) on the raw
+    /// span.
+    ///
+    /// Every call site holding a `JsonNumber` goes through this rather than
+    /// `from_number_bytes(n.raw_bytes())`: the raw bytes alone cannot say
+    /// whether `9e999e999` is the bridge's NaN or a malformed number a user
+    /// wrote (#3034). A token going in as a bare `Float` comes out as a bare
+    /// `Float` (#2902), never a `NumberLiteral`.
+    pub fn from_json_number<S: EvalSemantics>(n: &crate::json::light::JsonNumber<'_>) -> Self {
+        if let Some(f) = n.bridge_value() {
+            return Self::Float(f);
+        }
+        Self::from_number_bytes::<S>(n.raw_bytes())
+    }
+
     /// Materialize raw JSON number-token bytes into the correctly-gated
     /// `OwnedValue` -- the single conversion every "raw bytes -> number"
     /// call site in this crate (including the CLI binary, hence `pub` not
     /// `pub(crate)`) should go through (#966 found at least 7 independent
     /// hand-rolled copies of this decision).
     ///
-    /// Checks `is_nan_sentinel` first, so every caller gets that
-    /// `to_json_for_reindex`-bridge convention for free instead of having
-    /// to remember its own copy of the check (an earlier draft of this
-    /// function required exactly that, and three of its call sites forgot
-    /// it -- caught by review).
+    /// Reads `bytes` as **user text**: the reindex bridge's number tokens
+    /// (`9e999e999`, `8e999e999`, `1e0e0`, ...) are not decoded here and
+    /// fall through to the lossy fallback like any other malformed span
+    /// (`9e999e998`, `1e0e1`) -- #3034. A number read through a cursor, which
+    /// may be over bridge text, goes through
+    /// [`from_json_number`](Self::from_json_number) instead.
     ///
-    /// Otherwise preserves the source spelling via
+    /// Preserves the source spelling via
     /// [`NumberLiteral`](Self::NumberLiteral) only when `bytes` is valid
     /// RFC 8259 number syntax
     /// ([`is_valid_number`](crate::json::validate::is_valid_number));
@@ -2928,25 +2951,8 @@ impl OwnedValue {
     /// `S` is the number model the literal's double is read under (#2936);
     /// see `from_number_literal` and `parse_i64_or_f64_in` (both private).
     pub fn from_number_bytes<S: EvalSemantics>(bytes: &[u8]) -> Self {
-        if let Some(f) = Self::bridge_nonfinite_from_bytes(bytes) {
-            return Self::Float(f);
-        }
         if crate::json::validate::is_valid_number(bytes) {
             return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal::<S>);
-        }
-        // The reindex bridge's computed-float token (#2902): a bare `Float`
-        // going in must be a bare `Float` coming out, never a
-        // `NumberLiteral`. Checked only after `is_valid_number` fails --
-        // never before it, and never merged into the same `if`/`else`
-        // ordering as an unconditional first check: the token's doubled
-        // exponent marker (its whole design, see `computed_float_token`)
-        // makes `is_valid_number` reject every token unconditionally, so
-        // this is never reached for an ordinary number, including one that
-        // happens to end in this token's own suffix (`5e0`, `120e0`) --
-        // those take the literal-preserving arm above instead, without
-        // paying this check's `contains(&b'e')` scan at all.
-        if let Some(f) = crate::json::validate::parse_computed_float_token(bytes) {
-            return Self::Float(f);
         }
         // Real jq's own number reader also accepts a leading `.` (with or
         // without a preceding `-`) when at least one digit follows (`.5`
@@ -3043,10 +3049,9 @@ impl OwnedValue {
         // `format_number_jq_compat` echo a bare `nan`, which is not a
         // number in either output language.
         //
-        // After the bridge-token checks above, never before them: those
-        // tokens are drawn from `[0-9.eE+-]` and this grammar is letters,
-        // so the two can't collide, but the ordering rule is what every
-        // future interception in this function inherits (#1083/#2902).
+        // The bridge's tokens are drawn from `[0-9.eE+-]` and this grammar
+        // is letters, so the two can't collide; bridge decoding lives in
+        // `from_json_number`, ahead of this whole function (#3034).
         if let Some(f) = crate::json::validate::jq_special_number(bytes) {
             return Self::Float(f);
         }
@@ -3054,12 +3059,10 @@ impl OwnedValue {
         // the stored literal is the *unsigned* text (`+1.500` -> `1.500`,
         // see `strip_leading_plus`). The peel re-runs the strict grammar
         // and the three lenient escapes above on the unsigned text -- and
-        // *only* those. It deliberately does not recurse through this
-        // function's own entry, so the bridge-token checks at the top are
-        // never reached with a peeled token: `+9e999e999` and `+1e0e0` are
-        // user text, and must fall through to the lossy fallback below
-        // (`Null`, as `[+1.2.3]` does) rather than decode as NaN or a
-        // computed float. `strip_leading_plus` only peels before a digit
+        // *only* those. This function decodes no bridge token at all
+        // (#3034), so `+9e999e999` and `+1e0e0` fall through to the lossy
+        // fallback below (`Null`, as `[+1.2.3]` does) rather than decode as
+        // NaN or a computed float. `strip_leading_plus` only peels before a digit
         // or `.`, so a `+nan` was already `jq_special_number`'s above and
         // a doubled sign (`+-1`) stays out. `is_preservable_number_literal`
         // names the four gates above exactly, so the two spellings cannot
@@ -3432,10 +3435,11 @@ impl OwnedValue {
     /// `true`), and through `to_json` it came back as an actual `null`;
     /// `Infinity` came back as the *literal* `1.7976931348623157e+308`,
     /// which the final formatter then spelled `…E+308` where jq, printing
-    /// a computed infinity, writes `…e+308`. `from_number_bytes` and
-    /// `JsonNumber::as_f64` already decode both tokens back to the bare
-    /// `Float`, so every reader downstream sees what `input`/`inputs` (which
-    /// never round-trip) already saw.
+    /// a computed infinity, writes `…e+308`. Indexed as bridge text
+    /// ([`input_bridge_doc`](Self::input_bridge_doc)), both tokens decode
+    /// back to the bare `Float` (`JsonNumber::bridge_value`, #3034), so every
+    /// reader downstream sees what `input`/`inputs` (which never round-trip)
+    /// already saw.
     ///
     /// [`to_json_for_reindex`](Self::to_json_for_reindex) also preserves
     /// non-NaN number literals at any length. This path uses input-bridge
@@ -3645,8 +3649,9 @@ impl OwnedValue {
     /// bridge-only token `crate::json::validate::computed_float_token`
     /// (#2902) -- see that function's own doc comment for why a token
     /// rather than a display formatter, and the pre-#2902 bug it replaces.
-    /// [`from_number_bytes`](Self::from_number_bytes) and `JsonNumber::as_f64`
-    /// decode it back to a bare `Float`. A **document** float with no
+    /// Read back through [`reindexed`](Self::reindexed)'s index, it decodes
+    /// to a bare `Float` again (`JsonNumber::bridge_value`,
+    /// [`from_json_number`](Self::from_json_number)). A **document** float with no
     /// preserved literal (an i64-overflow YAML scalar) still keeps the full
     /// decimal spelling real yq gives *it* because its provenance is
     /// recorded upstream, at [`from_document_float`](Self::from_document_float),
@@ -3711,6 +3716,53 @@ impl OwnedValue {
             ),
         }
     }
+
+    /// [`to_json_for_reindex`](Self::to_json_for_reindex)'s text, indexed as
+    /// bridge text ([`JsonIndex::build_reindex`](crate::json::JsonIndex::build_reindex))
+    /// so its number tokens decode back to the values they stand for.
+    ///
+    /// The one way to get a cursor over this bridge: pairing the text with
+    /// its index here means no call site can index bridge text as if it were
+    /// a user document (which would read every NaN, infinity and computed
+    /// float as `null`) -- nor the reverse, which is #3034.
+    pub fn reindexed<S: EvalSemantics>(&self) -> ReindexedDoc {
+        ReindexedDoc::new(self.to_json_for_reindex::<S>())
+    }
+
+    /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
+    /// as bridge text -- see [`reindexed`](Self::reindexed).
+    pub fn input_bridge_doc(&self) -> ReindexedDoc {
+        ReindexedDoc::new(self.to_json_input_bridge())
+    }
+}
+
+/// Text the reindex bridge wrote, together with the index built over it
+/// ([`OwnedValue::reindexed`], [`OwnedValue::input_bridge_doc`]).
+///
+/// The index is built with
+/// [`JsonIndex::build_reindex`](crate::json::JsonIndex::build_reindex), the
+/// only construction under which a number read through
+/// [`root`](Self::root)'s cursors decodes the bridge's tokens (#3034).
+pub struct ReindexedDoc {
+    text: String,
+    index: crate::json::JsonIndex,
+}
+
+impl ReindexedDoc {
+    fn new(text: String) -> Self {
+        let index = crate::json::JsonIndex::build_reindex(text.as_bytes());
+        Self { text, index }
+    }
+
+    /// The root cursor over the bridge text.
+    pub fn root(&self) -> crate::json::light::JsonCursor<'_> {
+        self.index.root(self.text.as_bytes())
+    }
+
+    /// The bridge text itself.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// The reserved JSON number literal [`OwnedValue::to_json_for_reindex`]
@@ -3721,12 +3773,15 @@ impl OwnedValue {
 /// bit-for-bit indistinguishable from a genuine document literal that
 /// happened to be spelled the same way, misclassifying either direction
 /// depending which one a given call site assumed. Redesigned to mirror
-/// [`NAN_SENTINEL`]'s already-safe two-exponent-marker trick: guaranteed
-/// unparseable as an ordinary number (so it can never collide with real
-/// document text), intercepted early by [`is_infinity_sentinel`] the same
-/// way `is_nan_sentinel` intercepts its sibling, and still built entirely
-/// from `[0-9-+.eE]` so `JsonNumber::find_end()`'s span scan captures it
-/// whole. Distinguished from `NAN_SENTINEL` (`"9e999e999"`) by leading
+/// [`NAN_SENTINEL`]'s two-exponent-marker trick: unparseable as an
+/// ordinary number (so it is never mistaken for a *valid* document
+/// literal), recognized by [`is_infinity_sentinel`] the same way
+/// `is_nan_sentinel` recognizes its sibling, and still built entirely from
+/// `[0-9-+.eE]` so `JsonNumber::find_end()`'s span scan captures it whole.
+/// A malformed document span can still spell it; what keeps that from
+/// reading as infinity is provenance, not spelling -- only a number read
+/// through an index built over bridge text decodes a token
+/// (`JsonNumber::bridge_value`, #3034). Distinguished from `NAN_SENTINEL` (`"9e999e999"`) by leading
 /// digit rather than a sign prefix, so the sign survives as plain text for
 /// [`is_infinity_sentinel`] to read back off, uniformly for both spellings.
 pub(crate) const INFINITY_SENTINEL: &str = "8e999e999";
@@ -3735,10 +3790,9 @@ pub(crate) const INFINITY_SENTINEL: &str = "8e999e999";
 pub(crate) const NEG_INFINITY_SENTINEL: &str = "-8e999e999";
 
 /// `true`/`false` for [`NEG_INFINITY_SENTINEL`]/[`INFINITY_SENTINEL`],
-/// `None` for anything else -- the one definition every call site that
-/// reads a `to_json_for_reindex`-bridge number token must check before
-/// falling back to ordinary parsing, mirroring [`is_nan_sentinel`]'s own
-/// doc comment and existing call-site list exactly (#1083/#1087).
+/// `None` for anything else -- the one definition of the spelling,
+/// mirroring [`is_nan_sentinel`] (#1083/#1087), and like it read only
+/// through `JsonNumber::bridge_value`'s provenance check (#3034).
 pub(crate) fn is_infinity_sentinel(bytes: &[u8]) -> Option<bool> {
     if bytes == NEG_INFINITY_SENTINEL.as_bytes() {
         Some(true)
@@ -3812,15 +3866,19 @@ fn yq_infinite_float_json_text(_negative: bool) -> &'static str {
 /// `[0-9-+.eE]`, so `JsonNumber::find_end()`'s greedy span scan captures it
 /// whole; and carrying two exponent markers, so `str::parse::<f64>()`/
 /// `::<i64>()` both reject it outright rather than silently overflowing to
-/// something else -- see `test_nan_sentinel_is_unparseable_as_a_real_number`,
-/// the load-bearing proof this design depends on.
+/// something else -- see `test_nan_sentinel_is_unparseable_as_a_real_number`.
+///
+/// Unparseable is not unspellable: a malformed document span can hold the
+/// same bytes (#3034). Only a number read through an index built over bridge
+/// text decodes it (`JsonNumber::bridge_value`); in a document it is a
+/// malformed number like `9e999e998`.
 pub(crate) const NAN_SENTINEL: &str = "9e999e999";
 
-/// True if `bytes` is exactly [`NAN_SENTINEL`] -- the one definition every
-/// jq-layer call site that reads a `to_json_for_reindex`-bridge number token
-/// must check before falling back to ordinary parsing, so the comparison
-/// can't diverge between call sites the way three copies of one predicate
-/// did in #106.
+/// True if `bytes` is exactly [`NAN_SENTINEL`] -- the one definition of
+/// the spelling, so the comparison can't diverge between call sites the way
+/// three copies of one predicate did in #106. Spelling only: a reader of a
+/// document number goes through `JsonNumber::bridge_value`, which checks
+/// that the text is bridge text first (#3034).
 pub(crate) fn is_nan_sentinel(bytes: &[u8]) -> bool {
     bytes == NAN_SENTINEL.as_bytes()
 }
@@ -5976,15 +6034,32 @@ mod tests {
         }
     }
 
+    /// Reads the single number `text` the way the reindex bridge's reparse
+    /// does: through an index built over bridge text
+    /// ([`JsonIndex::build_reindex`](crate::json::JsonIndex::build_reindex)),
+    /// then [`OwnedValue::from_json_number`] -- the only route under which a
+    /// bridge token decodes (#3034).
+    fn read_as_bridge_text<S: EvalSemantics>(text: &str) -> OwnedValue {
+        let json = format!("[{text}]");
+        let bytes = json.as_bytes();
+        let index = crate::json::JsonIndex::build_reindex(bytes);
+        let root = index.root(bytes);
+        let crate::json::StandardJson::Number(n) = root.first_child().expect("one element").value()
+        else {
+            panic!("{text} is not a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion the calling test makes"
+        };
+        OwnedValue::from_json_number::<S>(&n)
+    }
+
     /// #2902: the bridge's computed-float token materializes as a bare
-    /// `Float`, never as a `NumberLiteral` carrying the token's text --
-    /// through the same public entry point real document numbers go
-    /// through, exactly like the overflow sentinels beside it.
+    /// `Float`, never as a `NumberLiteral` carrying the token's text, when
+    /// read back as bridge text -- exactly like the overflow sentinels
+    /// beside it.
     #[test]
-    fn test_from_number_bytes_decodes_the_computed_float_token_2902() {
+    fn test_bridge_read_decodes_the_computed_float_token_2902() {
         for f in [1.0, -0.0, 0.5, 2e16, 5e-6] {
             let token = crate::json::validate::computed_float_token(f);
-            let got = OwnedValue::from_number_bytes::<JqSemantics>(token.as_bytes());
+            let got = read_as_bridge_text::<JqSemantics>(&token);
             assert!(
                 matches!(got, OwnedValue::Float(back) if back.to_bits() == f.to_bits()),
                 "{token} materialized as {got:?}"
@@ -5999,6 +6074,71 @@ mod tests {
             OwnedValue::from_number_bytes::<JqSemantics>(b"1e0"),
             OwnedValue::NumberLiteral(_, _)
         ));
+    }
+
+    /// #3034: `from_number_bytes` reads user text, so the bridge's tokens are
+    /// ordinary malformed spans there -- `Null`, exactly like their nearest
+    /// non-token sibling spellings -- and only the bridge read
+    /// ([`read_as_bridge_text`]) decodes them. Neither side touches the
+    /// spellings jq itself reads as numbers.
+    #[test]
+    fn test_from_number_bytes_does_not_decode_bridge_tokens_3034() {
+        let tokens = [
+            NAN_SENTINEL.to_string(),
+            INFINITY_SENTINEL.to_string(),
+            NEG_INFINITY_SENTINEL.to_string(),
+            crate::json::validate::computed_float_token(1.0),
+            crate::json::validate::computed_float_token(-2.5e-7),
+        ];
+        for token in &tokens {
+            assert_eq!(
+                OwnedValue::from_number_bytes::<JqSemantics>(token.as_bytes()),
+                OwnedValue::Null,
+                "{token} as user text"
+            );
+            assert!(
+                matches!(
+                    read_as_bridge_text::<JqSemantics>(token),
+                    OwnedValue::Float(_)
+                ),
+                "{token} as bridge text"
+            );
+        }
+        for sibling in ["9e999e998", "8e999e998", "-8e999e998", "1e0e1"] {
+            assert_eq!(
+                OwnedValue::from_number_bytes::<JqSemantics>(sibling.as_bytes()),
+                OwnedValue::Null,
+                "{sibling}"
+            );
+        }
+        // Signed tokens a `+` peel could expose stay user text too (#2877).
+        for plus in ["+9e999e999", "+8e999e999", "+1e0e0"] {
+            assert_eq!(
+                OwnedValue::from_number_bytes::<JqSemantics>(plus.as_bytes()),
+                OwnedValue::Null,
+                "{plus}"
+            );
+        }
+        // Real jq number spellings read identically on both routes.
+        for text in [
+            "nan",
+            "-Infinity",
+            "sNaN12",
+            "+1.5",
+            ".5",
+            "007",
+            "1.e5",
+            "1e0",
+        ] {
+            assert_eq!(
+                format!("{:?}", read_as_bridge_text::<JqSemantics>(text)),
+                format!(
+                    "{:?}",
+                    OwnedValue::from_number_bytes::<JqSemantics>(text.as_bytes())
+                ),
+                "{text}"
+            );
+        }
     }
 
     /// #2877: decNumber's special values materialize as the same bare
@@ -6100,7 +6240,7 @@ mod tests {
         assert_eq!(inf, INFINITY_SENTINEL);
         assert_eq!(neg, NEG_INFINITY_SENTINEL);
         for token in [&nan, &inf, &neg] {
-            let back = OwnedValue::from_number_bytes::<JqSemantics>(token.as_bytes());
+            let back = read_as_bridge_text::<JqSemantics>(token);
             assert!(
                 matches!(back, OwnedValue::Float(_)),
                 "{token} must read back as a bare Float, got {back:?}"
@@ -6189,7 +6329,8 @@ mod tests {
         // element independently and `JsonIndex` parses each number span
         // independently too, so wrapping these six values in an array and
         // walking a real index would prove nothing this per-value round
-        // trip through `from_number_bytes` doesn't already cover.
+        // trip through the bridge read (`read_as_bridge_text`) doesn't
+        // already cover.
         let cases: &[(OwnedValue, &str)] = &[
             (OwnedValue::Float(1.0), "Float(1.0)"),
             (
@@ -6209,7 +6350,7 @@ mod tests {
                 value.to_json_for_reindex::<YqSemantics>(),
                 value.to_json_for_reindex::<JqSemantics>(),
             ] {
-                let round_tripped = OwnedValue::from_number_bytes::<YqSemantics>(json.as_bytes());
+                let round_tripped = read_as_bridge_text::<YqSemantics>(&json);
                 assert_eq!(format!("{round_tripped:?}"), *want, "{value:?} -> {json}");
             }
         }
@@ -6428,11 +6569,11 @@ mod tests {
     }
 
     /// #1083/#1087: the infinity sentinel must be as collision-safe as
-    /// `NAN_SENTINEL` already is -- guaranteed unparseable as an ordinary
-    /// number (so `from_number_bytes` can reliably recognize it as *the*
-    /// sentinel rather than a genuine document literal that happens to
-    /// share its spelling), yet still recoverable via
-    /// [`is_infinity_sentinel`] once reparsed.
+    /// `NAN_SENTINEL` already is -- unparseable as an ordinary number, so it
+    /// can never be mistaken for a *valid* document literal, yet still
+    /// recoverable via [`is_infinity_sentinel`] once reparsed as bridge
+    /// text. A document spelling it is a malformed number, not the sentinel
+    /// (#3034): provenance, not spelling, decides.
     #[test]
     fn test_infinity_sentinel_is_unparseable_but_recoverable_1087() {
         assert!(INFINITY_SENTINEL.parse::<f64>().is_err());
@@ -6451,14 +6592,13 @@ mod tests {
         assert_eq!(is_infinity_sentinel(b"1e400"), None);
         assert_eq!(is_infinity_sentinel(NAN_SENTINEL.as_bytes()), None);
 
-        // Round-trips correctly through the same public entry point real
-        // document numbers go through.
+        // Round-trips correctly when read back as bridge text.
         assert_eq!(
-            OwnedValue::from_number_bytes::<JqSemantics>(INFINITY_SENTINEL.as_bytes()),
+            read_as_bridge_text::<JqSemantics>(INFINITY_SENTINEL),
             OwnedValue::Float(f64::INFINITY)
         );
         assert_eq!(
-            OwnedValue::from_number_bytes::<JqSemantics>(NEG_INFINITY_SENTINEL.as_bytes()),
+            read_as_bridge_text::<JqSemantics>(NEG_INFINITY_SENTINEL),
             OwnedValue::Float(f64::NEG_INFINITY)
         );
 
