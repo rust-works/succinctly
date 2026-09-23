@@ -34458,10 +34458,9 @@ fn test_abs_agrees_with_yq_modes_own_null_ordering_3041() -> Result<()> {
     Ok(())
 }
 
-/// #2008 (code review): `fromjson`/`tonumber`'s shared decoder
-/// (`parse_json_string_value` in `eval.rs`, reachable from both jq and yq
-/// mode via the same unparameterized `Builtin::FromJson` dispatch) is not
-/// jq-only -- #2008's own low-surrogate fix initially applied jq's leniency
+/// #2008 (code review): `fromjson`'s former shared decoder
+/// (`parse_json_string_value` in `eval.rs`) was used in both jq and yq
+/// modes. #2008's low-surrogate fix initially applied jq's leniency
 /// (substitute U+FFFD) unconditionally, which broke `succinctly yq`'s own
 /// fidelity: real yq's `fromjson` doesn't use jq's JSON string grammar at
 /// all, it decodes through go-yaml's quoted-scalar scanner, which rejects
@@ -34470,6 +34469,8 @@ fn test_abs_agrees_with_yq_modes_own_null_ordering_3041() -> Result<()> {
 /// `succinctly yq`'s `fromjson` keeps rejecting a lone low surrogate
 /// (ADR-0018: mode decides, never format), unlike jq mode's
 /// `test_fromjson_low_surrogate_substitutes_replacement_character_2008`.
+/// #3032 moved jq-mode `fromjson` to the shared validator and JSON cursor;
+/// yq mode still uses this decoder.
 #[test]
 fn test_yq_fromjson_low_surrogate_still_rejected_2008() -> Result<()> {
     let (_stdout, stderr, code) =

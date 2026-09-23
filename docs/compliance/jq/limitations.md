@@ -337,7 +337,8 @@ approximates to the EOF form:
 | `"  a  "` | `Invalid numeric literal at line 1, column 4 …`        | as above, but with `at EOF` and column 5                             |
 
 Matching these needs a position-reporting JSON parser reporting jq's exact failure
-classes; the hand-rolled `parse_complete_json` in `src/jq/eval.rs` does not carry offsets.
+classes; the jq-mode `parse_complete_json` path validates the input but does not
+translate validation errors into jq's position-specific diagnostics.
 The shapes a filter is likely to branch on (`Invalid numeric literal`, `cannot be parsed
 as a number`) are exact, so this is left as a deliberate approximation.
 

@@ -1272,8 +1272,8 @@ fn test_argjson_reject_set_2052() -> Result<()> {
 /// The spelling matrix, on every path a number can enter: the primary
 /// document (top-level and nested, on the raw-echo, cursor, materializing
 /// and `--slurp` routes), `-n input`, `--argjson`, `--jsonargs`,
-/// `--slurpfile` and `--seq`. `fromjson` is the one path deliberately absent
-/// -- its hand-written parser has none of the jq leniencies and is #3032's.
+/// `--slurpfile` and `--seq`. `fromjson` uses the same accept-set as of #3032;
+/// its focused spelling and error tests are below.
 #[test]
 fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
     // (spelling, jq's printed form)
@@ -43689,13 +43689,13 @@ fn test_fromjson_jq_lenient_rejects_invalid_text_3032() -> Result<()> {
     Ok(())
 }
 
-/// #2008 (code review): `fromjson`/`tonumber`'s own hand-rolled JSON string
-/// decoder (`parse_json_string_value` in `eval.rs`) is a second,
-/// independent implementation of surrogate handling from
+/// #2008 (code review): the former jq-mode `fromjson` JSON string decoder
+/// (`parse_json_string_value` in `eval.rs`) was independent of
 /// `json::light::decode_escapes` and had the identical gap -- erroring
 /// instead of substituting U+FFFD for a lone low surrogate. Confirmed live
 /// against the pinned oracle before the fix (succinctly errored, real jq
-/// substituted); a valid surrogate pair is an unaffected control.
+/// substituted); a valid surrogate pair is an unaffected control. Since
+/// #3032, jq-mode `fromjson` uses the shared validator and JSON cursor.
 #[test]
 fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
     let (stdout, stderr, code) =
@@ -43711,7 +43711,7 @@ fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
 }
 
 /// #2013: the opposite-direction bug from #2008/the test above -- a lone
-/// *high* surrogate (`\uD800`-`\uDBFF`) in `fromjson`'s own decoder wrongly
+/// *high* surrogate (`\uD800`-`\uDBFF`) in `fromjson`'s former jq-mode decoder wrongly
 /// substituted U+FFFD instead of raising, where real jq 1.7.1 rejects it
 /// (confirmed live). Covers every shape the issue's own investigation
 /// found: end-of-string, followed by a non-`\u` escape, followed by a
@@ -65450,9 +65450,9 @@ fn test_escaped_control_characters_still_accepted_2878() -> Result<()> {
     Ok(())
 }
 
-/// `fromjson` is a second, independent decoder (`eval.rs`), not reached
-/// through the document splitter at all -- so it needs its own arm of the
-/// same rule. jq rejects; jq mode must now too (#2878).
+/// `fromjson` has a separate input path from the document splitter, so it
+/// needs its own arm of the same rule. jq rejects; jq mode must too (#2878).
+/// Since #3032, this path uses the shared jq validator.
 ///
 /// The yq-mode counter-test lives in `yq_cli_tests.rs`: real yq *accepts*
 /// this, so the fix is mode-gated rather than format-gated (ADR-0018).
@@ -65474,10 +65474,11 @@ fn test_fromjson_rejects_raw_control_character_in_jq_mode_2878() -> Result<()> {
     Ok(())
 }
 
-/// `tonumber` shares `fromjson`'s decoder, and its "valid JSON but not a
-/// number" vs "not valid JSON at all" probe picks between two *different*
-/// error messages. #2878's rule moves a control-character string across that
-/// boundary -- in jq mode only, because each oracle classifies it its own way
+/// `tonumber` probes with the same jq validator as `fromjson`, and its
+/// "valid JSON but not a number" vs "not valid JSON at all" result picks
+/// between two *different* error messages. #2878's rule moves a control-
+/// character string across that boundary -- in jq mode only, because each
+/// oracle classifies it its own way
 /// (jq: a parse error; yq: a tag-conversion error). Pins that the probe is
 /// mode-sensitive, which it did not need to be before this (#2878).
 #[test]

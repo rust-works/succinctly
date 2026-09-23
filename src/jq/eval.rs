@@ -83586,9 +83586,10 @@ mod tests {
     }
 
     /// A string that opens a container and stops used to index one byte past
-    /// the input while looking for an object key, panicking inside the JSON
-    /// parser. `fromjson` reached it directly; `tonumber` reaches it too, since
-    /// it asks the same parser whether a non-numeric string is valid JSON.
+    /// the input while looking for an object key, panicking inside the former
+    /// jq-mode JSON parser. `fromjson` reached it directly; `tonumber` did too
+    /// when probing whether a non-numeric string was valid JSON. Both now
+    /// validate first, but this remains a regression test for incomplete input.
     #[test]
     fn test_conversions_do_not_panic_at_end_of_input() {
         for input in [br#""{""#.as_slice(), br#""{\"a\":1,""#, br#""[""#] {

@@ -2410,12 +2410,14 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
   malformed-input wording fix. Filed as
   [#2006](https://github.com/rust-works/succinctly/issues/2006).
 
-### `fromjson`/`tonumber`'s shared decoder is jq-modeled, only narrowly gated for yq mode
+### yq-mode `fromjson` retains the hand-written decoder and its narrow surrogate gate
 
-`Builtin::FromJson`/`Builtin::ToNumber` dispatch to `builtin_fromjson`/`tonumber_from_str`
-in `src/jq/eval.rs` with no mode split at all -- the same hand-rolled JSON-string decoder
-(`parse_json_string_value`) backs `fromjson`/`tonumber` in both `succinctly jq` and
-`succinctly yq`. [#2008](https://github.com/rust-works/succinctly/issues/2008) (a lone
+Before #3032, `Builtin::FromJson` dispatched to the same hand-written parser
+(`parse_json_string_value` in `src/jq/eval.rs`) in both modes. Jq-mode `fromjson`
+now uses the shared lenient JSON validator and cursor; yq mode retains the
+hand-written parser. `tonumber` uses a separate number-conversion path and
+calls `parse_complete_json` only to classify non-numeric strings for jq-mode
+diagnostics. [#2008](https://github.com/rust-works/succinctly/issues/2008) (a lone
 *low* surrogate escape, `\uDC00`-`\uDFFF`, should substitute U+FFFD rather than error,
 matching real jq) initially applied that fix unconditionally, which broke yq-mode fidelity
 here: real yq's `fromjson` doesn't use jq's JSON string grammar at all -- it decodes
