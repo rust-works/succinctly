@@ -18,6 +18,70 @@ use cargo_run_exit::{
     write_stdin_then_wait, MAX_CARGO_RETRIES,
 };
 
+/// Captured from /usr/bin/jq 1.7.1-apple. Exercise the CLI's generic
+/// evaluator as well as its output and exit-status handling.
+#[test]
+fn test_pick_pathexps_cli_3026() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":1,"n":5}"#, "pick(.n)", "{\"n\":5}\n"),
+        (
+            r#"{"a":{"b":1,"c":2},"d":3}"#,
+            "pick(.a.b)",
+            "{\"a\":{\"b\":1}}\n",
+        ),
+        ("[1,2,3]", "pick(.[1])", "[null,2]\n"),
+        (r#"{"a":1}"#, "pick(.x.y)", "{\"x\":{\"y\":null}}\n"),
+        ("null", "pick(.a)", "{\"a\":null}\n"),
+        ("[1]", "pick(.[3])", "[null,null,null,null]\n"),
+        (
+            r#"{"a":1,"b":2}"#,
+            "first(pick(.a, .b))",
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (r#"{"a":1}"#, "pick(.x.y?)", "{\"x\":{\"y\":null}}\n"),
+        (r#"{"b":2}"#, "\"b\" as $top | pick(.[$top])", "{\"b\":2}\n"),
+    ] {
+        let actual = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(actual, (expected.into(), String::new(), 0), "{filter}");
+    }
+    Ok(())
+}
+
+/// jq emits no partial object when a later path fails.
+#[test]
+fn test_pick_pathexps_cli_errors_3026() -> Result<()> {
+    for (input, filter, message) in [
+        (
+            "[1,2,3]",
+            "pick(.[-1])",
+            "Out of bounds negative array index",
+        ),
+        (
+            r#"{"a":1,"n":5}"#,
+            "pick([\"a\"])",
+            "Invalid path expression with result [\"a\"]",
+        ),
+        (
+            r#"{"a":1}"#,
+            ". as $top | pick(.a | $top)",
+            "Invalid path expression with result {\"a\":1}",
+        ),
+        (r#"{"a":1}"#, "pick(.a, error(\"late\"))", "late"),
+    ] {
+        let actual = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            actual,
+            (
+                String::new(),
+                format!("jq: error (at <stdin>:0): {message}\n"),
+                5
+            ),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #3025: a reindexed value must keep the source number seen by native reads.
 /// Expectations were captured from /usr/bin/jq 1.7.1-apple.
 #[test]

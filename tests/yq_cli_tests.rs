@@ -20,6 +20,21 @@ use tempfile::{NamedTempFile, TempDir};
 mod cargo_run_exit;
 use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
+/// Captured from yq v4.53.3 with JSON input and compact JSON output.
+#[test]
+fn test_pick_keys_on_json_cli_3026() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "pick([\"a\",\"n\"])",
+        r#"{"a":1,"n":5,"other":9}"#,
+        &["-p=json", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("{\"a\":1,\"n\":5}\n", "", 0)
+    );
+    Ok(())
+}
+
 /// #3025: YAML literals that were admitted with their source text must keep
 /// that text through the shared owned-value bridge. Pinned yq v4.53.3.
 #[test]
