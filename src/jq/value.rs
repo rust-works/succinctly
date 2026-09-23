@@ -25,7 +25,7 @@ use indexmap::IndexMap;
 
 use super::error::EvalError;
 use super::escape::{escape_json_body, write_json_body_jq};
-use super::eval::{EvalSemantics, EvalTag, JqSemantics, YqSemantics};
+use super::eval::{EvalSemantics, JqSemantics, YqSemantics};
 use super::expr::Literal;
 
 /// Recursion-depth ceiling for tree-walkers over an already-materialized
@@ -3437,12 +3437,9 @@ impl OwnedValue {
     /// `Float`, so every reader downstream sees what `input`/`inputs` (which
     /// never round-trip) already saw.
     ///
-    /// Not [`to_json_for_reindex`](Self::to_json_for_reindex): that one
-    /// caps a preserved literal at 256 bytes and falls back to a bounded
-    /// rendering, a trade made for `reduce`/`foreach`'s per-iteration reuse
-    /// that would silently drop the spelling of a long `--slurp`ed literal.
-    /// This path serializes once per input and keeps `to_json`'s
-    /// unbounded literal rendering.
+    /// [`to_json_for_reindex`](Self::to_json_for_reindex) also preserves
+    /// non-NaN number literals at any length. This path uses input-bridge
+    /// float and NaN conventions; the reindex bridge uses its own tokens.
     ///
     /// `--preserve-input`'s sibling [`to_json_jq_preserve`](Self::to_json_jq_preserve)
     /// deliberately keeps the printer's `null`: under that convention the
@@ -3667,88 +3664,12 @@ impl OwnedValue {
     /// it needs the same guard [`to_json`](Self::to_json) does.
     fn to_json_for_reindex_at_depth<S: EvalSemantics>(&self, depth: usize) -> String {
         assert_value_tree_depth(depth);
-        // Shared by both `NumberLiteral` arms below (infinite and finite):
-        // this function's callers (`reduce`/`foreach`/etc.'s per-iteration
-        // reindex bridge) can run it over the same unchanged value
-        // thousands of times, and a document-sourced literal is
-        // otherwise-unbounded text -- see each arm's own comment for why
-        // its particular fallback is safe.
-        const MAX_REUSED_LITERAL_LEN: usize = 256;
         match self {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
-            // A document-sourced overflow literal (`123e400`) is, by
-            // construction, already valid JSON number syntax that reparses
-            // to this exact `f64` - reusing it here (instead of the generic
-            // sentinel) lets `describe()`'s preview show the real source
-            // text (#930) instead of a disconnected "1e999"/"-1e999"
-            // placeholder (#939). This arm only ever sees a JSON-sourced
-            // literal: JSON's `number_literal()` override (`json/light.rs`)
-            // is unconditional, so its overflow literals reach here
-            // directly, but YAML's own override (`yaml/light.rs`, #918)
-            // deliberately excludes non-finite values (`.inf`/`-.inf`/
-            // `.nan` never pass `is_preservable_float_literal`'s
-            // JSON-syntax check, since none of those spellings start with a
-            // digit or `-digit`) - a YAML `.inf`/`.nan` still becomes a
-            // plain `Float`, handled by the arm above, never this one - so
-            // no further shape-checking is needed for correctness.
-            //
-            // The length cap (`MAX_REUSED_LITERAL_LEN` above) *is* needed
-            // regardless of shape: a bound this loose still comfortably
-            // covers any realistic overflow literal (reaching `f64::MAX`
-            // needs on the order of ~300 exponent digits at most) while
-            // keeping the *reused* case itself O(1)-ish rather than
-            // O(iterations x literal length) for a pathological one.
-            Self::NumberLiteral(NumberRepr::Float(f), literal) if f.is_infinite() => {
-                if literal.len() <= MAX_REUSED_LITERAL_LEN {
-                    literal.to_string()
-                } else {
-                    overflow_literal(*f).to_string()
-                }
-            }
-            // A finite NumberLiteral's source text is already valid JSON
-            // number syntax (guaranteed by the two `is_preservable_float_literal`
-            // gates that construct one, and by JSON's own unconditional
-            // `number_literal()` override), so it needs no reformatting to
-            // survive this purely-internal round trip -- any valid JSON
-            // spelling of the same number works equally well for the
-            // reparse below, since jq mode's own final formatter
-            // (`format_number_jq_compat`, via `to_json`/`number_str`)
-            // re-normalizes it *after* reparsing regardless of what spelling
-            // fed the round trip. Echoing verbatim here instead of routing
-            // through that same formatter (`to_json_at_depth`'s fallback
-            // arm below, which the NaN/infinite arms above this one already
-            // bypass) closes the reindex-bridge gap #1008 left open for
-            // `[...]`/assignment/other Expr shapes with no native
-            // `eval_generic.rs` arm -- verified against real yq across
-            // `[.a]`, `.a,.a`, `map_values(.)`, and `with_entries(.)`, with
-            // zero jq-mode output change (21-query sweep against real jq).
-            //
-            // Same length cap as the infinite-literal arm above, and the
-            // same reason (#1211, found in that issue's own PR review):
-            // `is_preservable_float_literal` (`src/yaml/scalar.rs`) admits
-            // an arbitrarily long zero-mantissa or leading-zero-heavy
-            // literal (e.g. `0.` + 100,000 zeros), so this text is no
-            // longer bounded to `MAX_PRESERVABLE_FLOAT_DIGITS` the way it
-            // used to be incidentally. Without a cap here, a `reduce`/
-            // `foreach`/`while`/`until` loop touching such a value
-            // re-serializes the full literal on every iteration --
-            // measured live, wall time linear in iteration count for a
-            // 200,000-digit literal. Falls back to the parsed `NumberRepr`'s
-            // own bounded formatting (discarding the literal text, the
-            // finite-value analogue of `overflow_literal(*f)` above) rather
-            // than the general `to_json_at_depth`'s own `NumberLiteral` arm,
-            // which is not length-bounded either (it exists for one-shot
-            // output, not this function's per-iteration reuse).
-            Self::NumberLiteral(repr, literal) if literal.len() <= MAX_REUSED_LITERAL_LEN => {
-                literal.to_string()
-            }
-            Self::NumberLiteral(NumberRepr::Int(n), _) => format!("{n}"),
-            Self::NumberLiteral(NumberRepr::Float(f), _) if S::TAG == EvalTag::Yq => {
-                crate::yaml::format_float_yq(*f)
-            }
-            Self::NumberLiteral(NumberRepr::Float(f), _) => jq_bare_float_display(*f),
+            // The bridge must keep the source literal at every length.
+            Self::NumberLiteral(_, literal) => literal.to_string(),
             Self::Array(arr) => {
                 let elements: Vec<String> = arr
                     .iter()
@@ -6565,55 +6486,27 @@ mod tests {
         assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), "-1e400");
     }
 
-    /// #939 review: reusing the literal's own text is O(its length), and
-    /// this function's callers (`reduce`/`foreach`'s per-iteration reindex
-    /// bridge) can run it over the same unchanged value many times - so an
-    /// unbounded literal must fall back to the O(1) sentinel rather than
-    /// turning a loop into O(iterations x literal length). No realistic
-    /// document overflow literal is anywhere near this long (#930's own
-    /// tests only go up to a handful of digits before the exponent), so the
-    /// cap only ever trips on a pathological/adversarial one.
+    /// The internal bridge must not replace a long overflow literal with a
+    /// different spelling before the next filter sees it (#3025).
     #[test]
-    fn test_to_json_for_reindex_bounds_an_unrealistically_long_literal() {
+    fn test_to_json_for_reindex_keeps_long_overflow_literal() {
         let huge_literal = format!("{}e400", "9".repeat(300));
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), huge_literal.into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), INFINITY_SENTINEL);
+        let lit = OwnedValue::NumberLiteral(
+            NumberRepr::Float(f64::INFINITY),
+            huge_literal.clone().into(),
+        );
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), huge_literal);
+        assert_eq!(lit.to_json_for_reindex::<YqSemantics>(), huge_literal);
     }
 
-    /// #1211's own PR review: `is_preservable_float_literal`
-    /// (`src/yaml/scalar.rs`) now admits an arbitrarily long zero-mantissa
-    /// or leading-zero-heavy literal, so a *finite* `NumberLiteral` is no
-    /// longer bounded to 17-ish digits the way it used to be incidentally.
-    /// Same concern, same fix shape as the infinite-literal test above:
-    /// short literals still reuse their own text; a pathologically long one
-    /// falls back to the parsed value's own bounded formatting instead of
-    /// paying O(its length) on every reindex-bridge call.
+    /// Preserve finite source text even at #1211's pathological length.
     #[test]
-    fn test_to_json_for_reindex_bounds_an_unrealistically_long_finite_literal() {
-        let short_literal = "0.000e-400";
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), short_literal.into());
-        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), short_literal);
-
+    fn test_to_json_for_reindex_keeps_long_finite_literal() {
         let huge_zero_literal = format!("0.{}e-400", "0".repeat(200_000));
         let lit =
             OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.clone().into());
-        let out = lit.to_json_for_reindex::<JqSemantics>();
-        assert!(
-            out.len() < 100,
-            "expected a short, bounded fallback, got {} bytes",
-            out.len()
-        );
-
-        // Yq mode takes a separate branch for the same fallback
-        // (`format_float_with_fraction` instead of `jq_bare_float_display`,
-        // gated on `S::TAG`) -- must be bounded too.
-        let lit = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), huge_zero_literal.into());
-        let out = lit.to_json_for_reindex::<YqSemantics>();
-        assert!(
-            out.len() < 100,
-            "expected a short, bounded fallback, got {} bytes",
-            out.len()
-        );
+        assert_eq!(lit.to_json_for_reindex::<JqSemantics>(), huge_zero_literal);
+        assert_eq!(lit.to_json_for_reindex::<YqSemantics>(), huge_zero_literal);
     }
 
     #[test]

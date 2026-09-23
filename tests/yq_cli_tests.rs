@@ -20,6 +20,26 @@ use tempfile::{NamedTempFile, TempDir};
 mod cargo_run_exit;
 use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
+/// #3025: YAML literals that were admitted with their source text must keep
+/// that text through the shared owned-value bridge. Pinned yq v4.53.3.
+#[test]
+fn test_long_float_literal_survives_owned_reindex_3025() -> Result<()> {
+    for zeros in [257, 300] {
+        let input = format!("n: 0.{}e-400\n", "0".repeat(zeros));
+        let expected = format!("{}\n", zeros + 7);
+        for filter in [
+            ".n | tostring | length",
+            "to_entries | .[0].value | tostring | length",
+            "with_entries(.) | .n | tostring | length",
+        ] {
+            let (actual, code) = run_yq_stdin(filter, &input, &["-o=json", "-I=0"])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(actual, expected, "{filter}");
+        }
+    }
+    Ok(())
+}
+
 /// Helper to run yq command with input from stdin
 ///
 /// #2016: routed through `spawn_with_signal_retry` (previously hand-rolled
