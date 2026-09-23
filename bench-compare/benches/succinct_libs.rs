@@ -102,7 +102,10 @@ const DENSITIES: &[f64] = &[0.1, 0.5, 0.9];
 fn generate_words(size: usize, density: f64, seed: u64) -> Vec<u64> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let word_count = size.div_ceil(64);
-    let mut words = Vec::with_capacity(word_count);
+    let mut words = Vec::new();
+    words
+        .try_reserve_exact(word_count)
+        .expect("benchmark word count fits in memory");
 
     let threshold = (density * u64::MAX as f64) as u64;
     for _ in 0..word_count {
