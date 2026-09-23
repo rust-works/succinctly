@@ -2810,6 +2810,15 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
             None => owned_vec_to_generic_result(values),
         };
     }
+    if !embed_table_active() {
+        if let Some(result) = crate::jq::eval::eval_owned_reindex_free::<S>(expr, &owned) {
+            return match result {
+                Ok(value) => GenericResult::Owned(value),
+                Err(_) if optional => GenericResult::None,
+                Err(error) => GenericResult::Error(error),
+            };
+        }
+    }
 
     // After the bypasses on purpose: neither reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
@@ -3032,20 +3041,6 @@ fn query_result_to_generic<V: DocumentValue, S: EvalSemantics>(
     }
 }
 
-/// The `MAX_REUSED_LITERAL_LEN` cap in [`OwnedValue::to_json_for_reindex`]
-/// (`src/jq/value.rs`, #1211): past it, a `NumberLiteral`'s source text is
-/// discarded and replaced by its parsed `NumberRepr`'s own formatting, so the
-/// bridge stops being an identity on that node.
-///
-/// Duplicated from that function rather than shared because it is a private
-/// `const` inside its body. `test_reindex_bridge_identity_predicate_agrees_1909`
-/// is what keeps the two from drifting: it round-trips a literal either side
-/// of this length through the real bridge and checks the predicate never
-/// claims identity where the bridge did not deliver one. If the cap there
-/// ever *shrinks*, a short literal in that test's corpus starts being
-/// rewritten while this predicate still admits it, and the test fails.
-const REINDEX_LITERAL_LEN_CAP: usize = 256;
-
 /// Whether `eval_on_owned`'s reindex bridge -- serialize with
 /// [`OwnedValue::to_json_for_reindex`], `JsonIndex::build`, then
 /// `owned_from_standard_json` back on the far side -- is a **semantic identity**
@@ -3058,8 +3053,6 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// as much as a serializer:
 ///
 /// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
-/// - A `NumberLiteral` whose source text exceeds
-///   [`REINDEX_LITERAL_LEN_CAP`] is discarded (#1211).
 ///
 /// A bare **`Float`** used to head this list: the formatter re-spelled a
 /// finite one by a mode-forked rule (#953) and it came back as a
@@ -3074,7 +3067,7 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 ///
 /// Everything else -- `null`, booleans, strings (escaped and unescaped
 /// symmetrically), object keys, and the overwhelmingly common
-/// document-sourced `NumberLiteral` with short source text, which
+/// document-sourced `NumberLiteral` at any length, which
 /// `to_json_for_reindex` echoes verbatim -- survives the trip unchanged, so
 /// the bypass applies to it.
 ///
@@ -3109,7 +3102,7 @@ pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Float(_) | OwnedValue::Int(_) => true,
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => false,
-        OwnedValue::NumberLiteral(_, literal) => literal.len() <= REINDEX_LITERAL_LEN_CAP,
+        OwnedValue::NumberLiteral(_, _) => true,
         OwnedValue::Array(items) => items.iter().all(reindex_bridge_is_identity),
         OwnedValue::Object(fields) => fields.values().all(reindex_bridge_is_identity),
         OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::String(_) => true,
@@ -8489,6 +8482,31 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
 
         Expr::Array(inner) => {
+            // A loop followed by a projection must reach the projection's
+            // sink before its next state is retained. `eval_single` first
+            // collects every whole state, which can keep thousands of
+            // unchanged long literals alive for `[while(... ) | .i]`.
+            if matches!(inner.as_ref(), Expr::Pipe(stages) if stages.iter().any(|stage| matches!(stage, Expr::While { .. } | Expr::Until { .. })))
+            {
+                let mut items = Vec::new();
+                let mut conversion_error = None;
+                let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
+                    match generic_item_into_owned::<_, S>(item) {
+                        Ok(item) => {
+                            items.push(item);
+                            Demand::Continue
+                        }
+                        Err(control) => stop_with_escape(&mut conversion_error, control),
+                    }
+                });
+                return match resume_from_escape(conversion_error, flow) {
+                    Flow::Exhausted => GenericResult::Owned(OwnedValue::array_from(items)),
+                    Flow::Escaped(Control::Error(error)) => GenericResult::Error(error),
+                    Flow::Escaped(Control::Break(label)) => GenericResult::Break(label),
+                    Flow::Escaped(Control::Halt(code)) => GenericResult::Halt(code),
+                    Flow::Stopped { .. } => GenericResult::Owned(OwnedValue::array_from(items)),
+                };
+            }
             let inner_result = eval_single::<S, _>(inner, value, optional, cursor);
             // #2575 Phase 1: a cursor-shaped inner result stays a `LazySeq`
             // instead of materializing into an `OwnedValue::Array` up front --
@@ -11704,6 +11722,29 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
         if cond_control.is_none() && bits.len() == 1 && bits[0] == continues_on {
             if kind == LoopKind::While && sink.push(state.emit()) == Demand::Stop {
                 return Ok(Demand::Stop);
+            }
+            // The single continuing branch owns its state after emission.
+            // Consume eligible updates here, so changing `.i` need not
+            // retain another owner of an unchanged long-literal sibling.
+            if !embed_table_active() {
+                state = match state {
+                    LoopState::Owned(owned) => {
+                        match crate::jq::eval::try_eval_owned_step::<S>(update, owned) {
+                            crate::jq::eval::OwnedStep::Handled(Ok(next)) => {
+                                state = LoopState::Owned(next);
+                                continue;
+                            }
+                            crate::jq::eval::OwnedStep::Handled(Err(_)) if optional => {
+                                return Ok(Demand::Continue);
+                            }
+                            crate::jq::eval::OwnedStep::Handled(Err(error)) => {
+                                return Err(Control::Error(error));
+                            }
+                            crate::jq::eval::OwnedStep::Declined(owned) => LoopState::Owned(owned),
+                        }
+                    }
+                    document => document,
+                };
             }
             let (mut next, update_control) = state.fork::<S>(update, optional);
             if update_control.is_none() && next.len() == 1 {
@@ -26094,16 +26135,11 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
 /// value a position by serializing it into a throwaway document and taking
 /// that document's root cursor. That round trip is a semantic identity for
 /// almost every value ([`reindex_bridge_is_identity`]), but not for a NaN
-/// or a numeric literal past [`REINDEX_LITERAL_LEN_CAP`] (a bare finite
-/// `Float` used to be a third such case, until #2902 gave
-/// `to_json_for_reindex` a token spelling that survives the round trip
-/// intact): `to_json_for_reindex`'s mode-forked formatter re-spells those,
-/// so `syq --eval-all '.[0] | .a | parent'` over a document holding `.nan`
-/// would print the ancestor with `null` in place of the NaN, and the same
-/// pipe over an over-cap literal would print `1e+19` in place of
-/// `10000000000000000000.0`. Those values used to be kept off the bridge by
-/// handing the pipe to the eager evaluator; with that evaluator deleted,
-/// they take this route instead.
+/// literal. A bare finite `Float` used to be another exception, until #2902
+/// gave `to_json_for_reindex` a token spelling that survives the round trip.
+/// A NaN literal still needs the detached route: reindexing would put `null`
+/// in its place. #3025 removed the long-literal exception because its source
+/// text now survives the bridge verbatim.
 ///
 /// The owned identity pipe is the exact replacement: it never serializes,
 /// and a detached root is precisely the position the reindexed root cursor
@@ -27677,8 +27713,7 @@ mod tests {
     /// the same text it already rendered as — the one sanctioned exception,
     /// spelled out in `round_trips_unchanged`), a NaN literal (replaced by
     /// `NAN_SENTINEL`), and a `NumberLiteral` either side of
-    /// `REINDEX_LITERAL_LEN_CAP`, which is duplicated from a private `const`
-    /// inside `to_json_for_reindex`'s body and cannot be shared.
+    /// 256, 257, and 300-character `NumberLiteral`s, plus a much longer one.
     ///
     /// One case is *not* checked against the bridge here, and saying so
     /// matters more than the check it replaces: `round_trips_unchanged`
@@ -27693,25 +27728,25 @@ mod tests {
     /// an identity — not equivalence. Conservatism is free here (a `false`
     /// for something the bridge happens to leave alone costs a missed
     /// optimization, never a wrong answer), and the predicate genuinely is
-    /// conservative for a very long literal, which Rust's `Display` for a
-    /// small-magnitude float re-emits in the same decimal spelling. A
+    /// conservative only for values it cannot prove safe. A
     /// separate reachability block stops that latitude from being abused: a
     /// predicate that stayed sound by answering `false` to everything would
     /// silently un-fix #1909 while every other test still passed.
     #[test]
     fn test_reindex_bridge_identity_predicate_agrees_1909() {
-        // A literal at, and one past, the length cap. Both parse to the same
-        // number; only the longer one loses its text on the round trip.
-        let at_cap = format!("0.{}1", "0".repeat(super::REINDEX_LITERAL_LEN_CAP - 3));
-        let past_cap = format!("0.{}1", "0".repeat(super::REINDEX_LITERAL_LEN_CAP));
-        assert_eq!(at_cap.len(), super::REINDEX_LITERAL_LEN_CAP);
-        assert!(past_cap.len() > super::REINDEX_LITERAL_LEN_CAP);
-        assert!(super::reindex_bridge_is_identity(
-            &OwnedValue::from_number_literal::<JqSemantics>(&at_cap)
-        ));
-        assert!(!super::reindex_bridge_is_identity(
-            &OwnedValue::from_number_literal::<JqSemantics>(&past_cap)
-        ));
+        let at_cap = format!("0.{}1", "0".repeat(253));
+        let past_cap = format!("0.{}1", "0".repeat(254));
+        let long = format!("0.{}1", "0".repeat(297));
+        let huge = format!("0.{}1", "0".repeat(199_997));
+        assert_eq!(
+            (at_cap.len(), past_cap.len(), long.len(), huge.len()),
+            (256, 257, 300, 200_000)
+        );
+        for literal in [&at_cap, &past_cap, &long, &huge] {
+            assert!(super::reindex_bridge_is_identity(
+                &OwnedValue::from_number_literal::<JqSemantics>(literal)
+            ));
+        }
 
         let corpus: Vec<OwnedValue> = vec![
             OwnedValue::Null,
@@ -27726,6 +27761,8 @@ mod tests {
             OwnedValue::from_number_literal::<JqSemantics>("123e400"),
             OwnedValue::from_number_literal::<JqSemantics>(&at_cap),
             OwnedValue::from_number_literal::<JqSemantics>(&past_cap),
+            OwnedValue::from_number_literal::<JqSemantics>(&long),
+            OwnedValue::from_number_literal::<JqSemantics>(&huge),
             OwnedValue::Int(7),
             OwnedValue::Float(3.5),
             OwnedValue::Float(1e19),
@@ -27854,19 +27891,12 @@ mod tests {
         }
     }
 
-    /// #3122: `eval_builtin`'s `Builtin::Path` arm, the fallback taken when
-    /// `path_expr` is not cursor-navigable (`first(.a)` -- a resolver call,
-    /// not a plain field/index/pipe chain `path_expr_is_cursor_navigable`
-    /// recognises) *and* the document holds a value
-    /// [`reindex_bridge_is_identity`] refuses -- a `NumberLiteral` past
-    /// `REINDEX_LITERAL_LEN_CAP` here. `builtin_path_on_owned`'s direct,
-    /// no-round-trip route is only sound when the bridge would be a no-op,
-    /// so this shape falls all the way through to `eval_on_owned` under
-    /// `Reentry::Against(root)` instead, the same round trip the pre-#2061
-    /// evaluator always paid.
+    /// #3122: a long literal elsewhere in the input remains intact when
+    /// `path` receives a non-navigable expression and enters the owned route.
+    /// Length no longer disqualifies the reindex bridge from preserving it.
     #[test]
-    fn test_path_non_navigable_falls_back_when_reindex_is_not_identity_3122() {
-        let long = "1".repeat(super::REINDEX_LITERAL_LEN_CAP + 1);
+    fn test_path_non_navigable_preserves_long_literal_3025() {
+        let long = "1".repeat(257);
         let json = alloc::format!(r#"{{"a":[1,2],"big":{long}}}"#);
         let index = JsonIndex::build(json.as_bytes());
         let expr = crate::jq::parse("path(first(.a))").unwrap();

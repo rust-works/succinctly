@@ -153,3 +153,5 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - `docs/plan/` — implementation planning documents
 - Academic paper PDFs (referenced by URL but not ingested)
 - Test suite structure (`tests/`)
+
+- 2026-09-23: Updated the jq evaluator map for #3025's lossless long-number reindex bridge, bounded owned operations, and projected array collection. Sources: `src/jq/value.rs`, `src/jq/eval.rs`, `src/jq/eval_generic.rs`, the #3025 spike and implementation results, and the pinned jq/yq differential checks.

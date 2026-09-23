@@ -18,6 +18,104 @@ use cargo_run_exit::{
     write_stdin_then_wait, MAX_CARGO_RETRIES,
 };
 
+/// #3025: a reindexed value must keep the source number seen by native reads.
+/// Expectations were captured from /usr/bin/jq 1.7.1-apple.
+#[test]
+fn test_long_number_literals_survive_owned_reindex_3025() -> Result<()> {
+    for digits in [256, 257, 300] {
+        let input = format!("{{\"a\":1,\"b\":2,\"n\":{}}}", "9".repeat(digits));
+        let cases = [
+            (".n|tostring|length".to_string(), format!("{digits}\n")),
+            (
+                format!("to_entries|map(select(.value|tostring|length=={digits}))|length"),
+                "1\n".to_string(),
+            ),
+            (
+                format!("with_entries(select(.value|tostring|length=={digits}))|keys"),
+                "[\"n\"]\n".to_string(),
+            ),
+            (
+                format!("del(.[]|select(tostring|length=={digits}))|keys"),
+                "[\"a\",\"b\"]\n".to_string(),
+            ),
+            (
+                format!("(.[]|select(tostring|length=={digits})) |= 0 | .n"),
+                "0\n".to_string(),
+            ),
+            (
+                format!("[path(.n|select(tostring|length=={digits}))]"),
+                "[[\"n\"]]\n".to_string(),
+            ),
+            (
+                format!("[paths(tostring|length=={digits})]"),
+                "[[\"n\"]]\n".to_string(),
+            ),
+            (
+                "[path(.n|select(. == 1e300))]".to_string(),
+                "[]\n".to_string(),
+            ),
+            (
+                format!("reduce path(.[]|select(tostring|length=={digits})) as $p (0; .+1)"),
+                "1\n".to_string(),
+            ),
+        ];
+        for (filter, expected) in cases {
+            let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(&input))?;
+            assert_eq!(
+                (code, stderr.as_str(), stdout.as_str()),
+                (0, "", expected.as_str()),
+                "{digits} digits: {filter}"
+            );
+        }
+    }
+
+    let input = format!("{{\"i\":0,\"n\":0.{}e-400}}", "0".repeat(300));
+    for (filter, expected) in [
+        (
+            "reduce range(0;30) as $i (. ; to_entries | from_entries) | .n | tostring | length",
+            "6\n",
+        ),
+        ("[while(.i < 30; .i += 1) | .i] | length", "30\n"),
+        ("until(.i >= 30; .i += 1) | .n | tostring | length", "6\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(
+            (code, stderr.as_str(), stdout.as_str()),
+            (0, "", expected),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #3025: projected loop arrays publish only after the inner stream finishes.
+/// Complete stdout/stderr/exit tuples are from jq 1.7.1-apple.
+#[test]
+fn test_projected_loop_array_keeps_atomic_control_3025() -> Result<()> {
+    let input = r#"{"i":0,"n":1}"#;
+    for (filter, expected) in [
+        ("[while(.i < 3; .i += 1) | .i]", (0, "[0,1,2]\n", "")),
+        ("[while(.i < 3; .i += 1) | empty]", (0, "[]\n", "")),
+        (
+            "[while(.i < 3; .i += 1) | (if .i == 2 then error(\"boom\") else .i end)]",
+            (5, "", "jq: error (at <stdin>:0): boom\n"),
+        ),
+        (
+            "[while(.i < 3; .i += 1) | (if .i == 2 then error(\"boom\") else .i end)?]",
+            (0, "[0,1]\n", ""),
+        ),
+        ("[[while(.i < 3; .i += 1) | .i]]", (0, "[[0,1,2]]\n", "")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (code, stdout.as_str(), stderr.as_str()),
+            expected,
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// #1516: a signal-killed child used to render as an inscrutable
 /// `left: -1, right: 0` panic -- exercises `classify_cargo_run_exit`
 /// directly against constructed `ExitStatus` values (via
@@ -42327,7 +42425,7 @@ fn test_getpath_cursor_walk_matches_jq_2168() -> Result<()> {
 ///
 /// This is the one row where #2168 moved `getpath` *away* from real jq, and
 /// it did so by moving it onto succinctly's own `.big`. A `NumberLiteral`
-/// longer than `REINDEX_LITERAL_LEN_CAP` used to disqualify the whole
+/// longer than the former 256-character cap used to disqualify the whole
 /// document from the native arm (`reindex_bridge_is_identity`), sending the
 /// call through the reindex round trip, which re-spells it: jq prints
 /// `1E-301`, and so did `getpath(["big"])`, while `.big` on the same
@@ -42687,11 +42785,13 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
 /// `eval_generic.rs`'s `Builtin::Path` fallback this PR also fixed, reached
 /// only via the public `succinctly::jq::eval::eval` library API or, via the
 /// CLI, when `eval_generic.rs`'s own fallback re-enters the full evaluator
-/// for a non-`reindex_bridge_is_identity` value (any `NumberLiteral` longer
-/// than `REINDEX_LITERAL_LEN_CAP`, or a `Float`).
+/// for a non-`reindex_bridge_is_identity` value. Long `NumberLiteral`s and
+/// bare `Float`s are bridge-identity after #3025 and #2902 respectively;
+/// the caller-built NaN-literal case remains non-identity.
 ///
-/// Confirmed reachable from this exact CLI shape with temporary debug
-/// instrumentation during review. Cannot pin a suppress-vs-raise behavior
+/// Its reachability from this CLI shape was confirmed before #3025 with
+/// temporary debug instrumentation; the long-literal row now follows the
+/// identity route. Cannot pin a suppress-vs-raise behavior
 /// difference the way `test_optional_ignored_sites_2280` does for the other
 /// three sites, though: by the time this second materialization runs, the
 /// document has already survived one whole decode (`eval_generic.rs`'s own
@@ -50445,14 +50545,9 @@ fn path_mode_fold_resolves_init_by_demand_2903() -> Result<()> {
 fn path_results_stream_to_their_consumer_2908() -> Result<()> {
     let abc = r#"{"a":1,"b":2,"c":3}"#;
     let probes = "(.a|stderr), (.b|stderr), (.c|stderr)";
-    // #2925: the reindex bridge's own lazy `Builtin::Path` arm, exercised on
-    // a document it will not round-trip identically (a number literal past
-    // `REINDEX_LITERAL_LEN_CAP`, #2902), so `path(f)` takes the bridge
-    // instead of the cursor walk above. Every probe below reads only a
-    // small named field (`.a`/`.b`/`.c`/`.x`), never the oversized `n`
-    // field itself -- printing *that* to stderr hits a separate, unrelated
-    // bug (the bridge respells an over-cap literal, #3025), which this row
-    // set deliberately does not exercise.
+    // #2925's lazy `path(f)` rows over documents with long literals. #3025
+    // made those literals round-trip identically, changing the path route;
+    // the streaming and side-effect expectations still apply.
     let abc_big = format!(r#"{{"a":1,"b":2,"c":3,"n":{}}}"#, "9".repeat(300));
     let label_big = format!(r#"{{"a":1,"c":1,"n":{}}}"#, "9".repeat(300));
     let prefix_big = format!(r#"{{"a":{{"b":1}},"c":1,"n":{}}}"#, "9".repeat(300));
@@ -50608,14 +50703,8 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             String::new(),
             0,
         ),
-        // #2925: the reindex-bridge route (a document `reindex_bridge_is_identity`
-        // rejects) now forwards demand the same way the cursor-navigable route
-        // above always did, instead of collecting every path before the bound
-        // outside `path()` ever saw one. Every row below is captured whole from
-        // jq 1.7.1 -- stdout, stderr and exit code -- on a document holding a
-        // 300-character number literal (well past `REINDEX_LITERAL_LEN_CAP`,
-        // #2902), which is what selects this route; the identical filter on the
-        // cap-sized documents above stays on this same table, matching jq.
+        // These rows continue to pin demand forwarding and complete oracle
+        // output after #3025 made the 300-character number bridge-identity.
         (
             abc_big.as_str(),
             "[limit(1; path((.a|stderr), (.b|stderr), (.c|stderr)))]".to_string(),
@@ -50668,10 +50757,7 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             String::new(),
             0,
         ),
-        // The `?//` retry row from the table above, over a document that
-        // takes the bridge -- `.x` narrows away from the oversized `n`
-        // field before the `foreach`/`stderr` runs, so this still probes
-        // #2925's routing without also probing #3025's unrelated respelling.
+        // The `?//` retry row over a document with a long literal.
         (
             altq_big.as_str(),
             "[limit(1; path(.x | foreach (1 as $x ?// $y | (stderr|1)) as $v (.; .)))]"
@@ -50680,15 +50766,8 @@ fn path_results_stream_to_their_consumer_2908() -> Result<()> {
             "[true,false][true,false]".to_string(),
             0,
         ),
-        // End-to-end agreement at the cap boundary: 256 characters is
-        // `REINDEX_LITERAL_LEN_CAP` itself (stays on the identity/cursor
-        // route), 257 is one past it (takes the bridge route above) -- both
-        // now stream identically, so this CLI-level pair cannot by itself
-        // tell which route ran (both produce byte-identical output). The
-        // boundary itself is what `test_reindex_bridge_identity_predicate_agrees_1909`
-        // pins directly, against `reindex_bridge_is_identity`; these two
-        // rows are here for jq-agreement coverage on either side of it, not
-        // as that guard's substitute.
+        // 256 and 257 characters both preserve spelling after #3025. Keep
+        // the pair to catch regressions at the former cap boundary.
         (
             cap256.as_str(),
             "[limit(1; path((.a|stderr),(.b|stderr)))]".to_string(),
@@ -62505,9 +62584,8 @@ fn test_navigated_bind_at_its_own_node_3037() -> Result<()> {
             r".a[0] as $y | .a[0] | path($y)",
             "[]",
         ),
-        // A document the reindex bridge cannot round-trip verbatim (a number
-        // literal over `REINDEX_LITERAL_LEN_CAP`) takes the `Path` arm's
-        // owned fallback rather than `builtin_path_on_owned` directly.
+        // Long number literals now round-trip verbatim (#3025). Keep this
+        // path-context case to catch a future route that drops their text.
         (
             r#"{"a":{"b":111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111}}"#,
             r".a as $y | .a | path($y.b)",

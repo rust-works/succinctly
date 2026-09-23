@@ -8832,6 +8832,18 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     {
         return flow;
     }
+    if !super::eval_generic::embed_table_active() {
+        if let Some(result) = eval_owned_reindex_free::<S>(expr, input) {
+            return match result {
+                Ok(value) => match sink(value) {
+                    Demand::Continue => Flow::Exhausted,
+                    Demand::Stop => Flow::Stopped { pending: None },
+                },
+                Err(_) if optional => Flow::Exhausted,
+                Err(error) => Flow::Escaped(Control::Error(error)),
+            };
+        }
+    }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
     let expr = reentry.reroot::<S>(expr);
@@ -8848,6 +8860,155 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         sink(item.into_owned_lossy::<S>())
     })
+}
+
+/// Evaluate the few owned operations whose unchanged siblings must not be
+/// reindexed on every loop iteration. Eligibility is checked before any
+/// mutation or output; an unsupported shape goes through the usual bridge.
+pub(crate) enum OwnedStep {
+    Declined(OwnedValue),
+    Handled(Result<OwnedValue, EvalError>),
+}
+
+/// Consume a unique computed state when an eligible update can reuse its
+/// copy-on-write container. A decline returns the untouched original so the
+/// caller can take its existing evaluator route exactly once.
+pub(crate) fn try_eval_owned_step<S: EvalSemantics>(
+    expr: &Expr,
+    mut state: OwnedValue,
+) -> OwnedStep {
+    if let Expr::CompoundAssign { op, path, value } = expr {
+        if let (Expr::Field(name), OwnedValue::Object(fields)) = (path.as_ref(), &state) {
+            if let Some(old) = fields.get(name) {
+                if old.is_number() {
+                    if let Some(right) = literal_shaped_expr_to_owned(value, 0) {
+                        if right.is_number() {
+                            let op = match op {
+                                AssignOp::Add => ArithOp::Add,
+                                AssignOp::Sub => ArithOp::Sub,
+                                AssignOp::Mul(flags) => ArithOp::Mul(*flags),
+                                AssignOp::Div => ArithOp::Div,
+                                AssignOp::Mod => ArithOp::Mod,
+                            };
+                            return OwnedStep::Handled(
+                                arith_combine::<S>(op, old.clone(), right).map(|new| {
+                                    if let OwnedValue::Object(ref mut map) = state {
+                                        map.insert(name.clone(), new);
+                                    }
+                                    state
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        return OwnedStep::Declined(state);
+    }
+    match eval_owned_reindex_free::<S>(expr, &state) {
+        Some(result) => OwnedStep::Handled(result),
+        None => OwnedStep::Declined(state),
+    }
+}
+
+pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    match expr {
+        Expr::Paren(inner) => eval_owned_reindex_free::<S>(inner, input),
+        Expr::Pipe(stages) if !stages.is_empty() && stages.iter().all(owned_step_shape) => {
+            let mut current = input.clone();
+            for stage in stages {
+                current = match eval_owned_reindex_free::<S>(stage, &current)? {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+            }
+            Some(Ok(current))
+        }
+        Expr::Builtin(Builtin::ToEntries) => match input {
+            OwnedValue::Object(fields) => {
+                let entries = fields
+                    .iter()
+                    .map(|(key, value)| {
+                        OwnedValue::object_from([
+                            ("key".to_string(), OwnedValue::String(key.clone())),
+                            ("value".to_string(), value.clone()),
+                        ])
+                    })
+                    .collect();
+                Some(Ok(OwnedValue::array_from(entries)))
+            }
+            OwnedValue::Array(items) => {
+                let entries = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        OwnedValue::object_from([
+                            ("key".to_string(), OwnedValue::Int(i as i64)),
+                            ("value".to_string(), value.clone()),
+                        ])
+                    })
+                    .collect();
+                Some(Ok(OwnedValue::array_from(entries)))
+            }
+            _ => None,
+        },
+        Expr::Builtin(Builtin::FromEntries) => {
+            let entries: Vec<OwnedValue> = match input {
+                OwnedValue::Array(items) => items.iter().cloned().collect(),
+                OwnedValue::Object(fields) if S::TAG == EvalTag::Jq => {
+                    fields.values().cloned().collect()
+                }
+                _ => return None,
+            };
+            Some(entries_to_object::<S, _>(entries).map(OwnedValue::object_from))
+        }
+        Expr::CompoundAssign { op, path, value } => {
+            let Expr::Field(name) = path.as_ref() else {
+                return None;
+            };
+            let OwnedValue::Object(fields) = input else {
+                return None;
+            };
+            let old = fields.get(name)?;
+            if !old.is_number() {
+                return None;
+            }
+            let right = literal_shaped_expr_to_owned(value, 0)?;
+            if !right.is_number() {
+                return None;
+            }
+            let op = match op {
+                AssignOp::Add => ArithOp::Add,
+                AssignOp::Sub => ArithOp::Sub,
+                AssignOp::Mul(flags) => ArithOp::Mul(*flags),
+                AssignOp::Div => ArithOp::Div,
+                AssignOp::Mod => ArithOp::Mod,
+            };
+            Some(arith_combine::<S>(op, old.clone(), right).map(|new| {
+                let mut result = input.clone();
+                if let OwnedValue::Object(ref mut map) = result {
+                    map.insert(name.clone(), new);
+                }
+                result
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn owned_step_shape(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => owned_step_shape(inner),
+        Expr::Builtin(Builtin::ToEntries | Builtin::FromEntries) => true,
+        Expr::CompoundAssign { path, value, .. } => {
+            matches!(path.as_ref(), Expr::Field(_))
+                && literal_shaped_expr_to_owned(value, 0).is_some_and(|v| v.is_number())
+        }
+        _ => false,
+    }
 }
 
 /// Evaluate `body(bit)` once per truthy-bit of a condition stream, merging
@@ -43207,7 +43368,20 @@ fn fold_step_each<S: EvalSemantics>(
         // `may_enter_resolver_node`'s shapes, so the per-element copy needs
         // no walk of its own (that walk was +3% on a tight `reduce` over 24k
         // elements, 7950X).
-        None => eval_each_owned::<S>(expr, &state, optional, Reentry::Proven, on_update),
+        None if super::eval_generic::embed_table_active() => {
+            eval_each_owned::<S>(expr, &state, optional, Reentry::Proven, on_update)
+        }
+        None => match try_eval_owned_step::<S>(expr, state) {
+            OwnedStep::Handled(Ok(value)) => match on_update(value) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            },
+            OwnedStep::Handled(Err(_)) if optional => Flow::Exhausted,
+            OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
+            OwnedStep::Declined(state) => {
+                eval_each_owned::<S>(expr, &state, optional, Reentry::Proven, on_update)
+            }
+        },
     }
 }
 
@@ -46983,7 +47157,7 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// One value class must not take the round trip: one the reindex would
 /// re-spell ([`crate::jq::eval_generic::reindex_bridge_is_identity`]) -- a
-/// NaN or a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP` (#1211). A bare
+/// NaN literal. A bare
 /// `Float` used to be a third such case, until #2902 gave
 /// `to_json_for_reindex` a token spelling that survives the round trip
 /// intact, so a finite computed float is bridge-identity now and no longer
@@ -47136,8 +47310,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // public `succinctly::jq::eval::eval` library API and, via the CLI,
     // whenever `eval_generic.rs`'s *eager* `eval_single` arm for
     // `Builtin::Path` re-enters the full evaluator for a non-
-    // `reindex_bridge_is_identity` value (a number literal past
-    // `REINDEX_LITERAL_LEN_CAP`, or a NaN spelling -- a bare `Float` has
+    // `reindex_bridge_is_identity` value (a NaN spelling -- a bare `Float` has
     // been bridge-identity since #2902). The *lazy* `eval_each_generic` arm
     // for the same builtin no longer reaches here on that route (#2925): it
     // hands the same non-identity case to `eval_each_owned` instead, which
@@ -60385,6 +60558,151 @@ mod tests {
         (out, tag)
     }
 
+    #[test]
+    fn reindex_free_owned_steps_agree_with_forced_bridge_3025() {
+        let long = OwnedValue::from_number_literal::<JqSemantics>(
+            alloc::format!("0.{}e-400", "0".repeat(300)).as_str(),
+        );
+        let object = OwnedValue::object_from([
+            (
+                "i".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("0"),
+            ),
+            ("n".to_string(), long.clone()),
+        ]);
+        let cases = [
+            ("to_entries", object.clone()),
+            ("to_entries | from_entries", object.clone()),
+            (".i += 1", object.clone()),
+            (".i -= 1", object.clone()),
+            (".i *= 2", object.clone()),
+            (".i /= 2", object.clone()),
+            (".i %= 2", object.clone()),
+            (
+                "from_entries",
+                OwnedValue::array_from(vec![
+                    OwnedValue::object_from([
+                        ("key".to_string(), OwnedValue::string("n")),
+                        ("value".to_string(), long.clone()),
+                    ]),
+                    OwnedValue::object_from([
+                        ("key".to_string(), OwnedValue::string("n")),
+                        (
+                            "value".to_string(),
+                            OwnedValue::from_number_literal::<JqSemantics>("2"),
+                        ),
+                    ]),
+                ]),
+            ),
+            (
+                "from_entries",
+                OwnedValue::array_from(vec![OwnedValue::Null]),
+            ),
+        ];
+        for (src, input) in cases {
+            let expr = parse(src).unwrap();
+            for mode in [EvalTag::Jq, EvalTag::Yq] {
+                let (direct, bridge) = if mode == EvalTag::Jq {
+                    (
+                        eval_owned_reindex_free::<JqSemantics>(&expr, &input),
+                        normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                            &expr, &input, false,
+                        )),
+                    )
+                } else {
+                    (
+                        eval_owned_reindex_free::<YqSemantics>(&expr, &input),
+                        normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                            &expr, &input, false,
+                        )),
+                    )
+                };
+                let direct = direct.expect("supported shape must be handled");
+                let direct = match direct {
+                    Ok(value) => (vec![value], "ok".to_string()),
+                    Err(error) => (Vec::new(), format!("error:{}", error.message)),
+                };
+                assert_eq!(
+                    format!("{direct:?}"),
+                    format!("{bridge:?}"),
+                    "{mode:?}: {src}"
+                );
+                let consumed = if mode == EvalTag::Jq {
+                    try_eval_owned_step::<JqSemantics>(&expr, input.clone())
+                } else {
+                    try_eval_owned_step::<YqSemantics>(&expr, input.clone())
+                };
+                let OwnedStep::Handled(consumed) = consumed else {
+                    panic!("consuming route declined {mode:?}: {src}");
+                };
+                let consumed = match consumed {
+                    Ok(value) => (vec![value], "ok".to_string()),
+                    Err(error) => (Vec::new(), format!("error:{}", error.message)),
+                };
+                assert_eq!(
+                    format!("{consumed:?}"),
+                    format!("{bridge:?}"),
+                    "{mode:?}: {src}"
+                );
+            }
+        }
+
+        for src in [
+            ".missing += 1",
+            ".n += \"x\"",
+            ".i += .n",
+            ".a.i += 1",
+            ".i = 1",
+        ] {
+            let expr = parse(src).unwrap();
+            assert!(
+                eval_owned_reindex_free::<JqSemantics>(&expr, &object).is_none(),
+                "{src}"
+            );
+            let OwnedStep::Declined(returned) =
+                try_eval_owned_step::<JqSemantics>(&expr, object.clone())
+            else {
+                panic!("consuming route must decline {src}");
+            };
+            assert_eq!(format!("{returned:?}"), format!("{object:?}"));
+        }
+    }
+
+    #[test]
+    fn reindex_free_owned_update_moves_unchanged_literal_3025() {
+        let literal = alloc::format!("0.{}e-400", "0".repeat(200_000));
+        let mut state = OwnedValue::object_from([
+            ("i".to_string(), OwnedValue::Int(0)),
+            (
+                "n".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>(&literal),
+            ),
+        ]);
+        let literal_ptr = match &state {
+            OwnedValue::Object(fields) => match fields.get("n") {
+                Some(OwnedValue::NumberLiteral(_, text)) => text.as_ptr(),
+                _ => panic!("missing literal"),
+            },
+            _ => panic!("expected object"),
+        };
+        let expr = parse(".i += 1").unwrap();
+        for _ in 0..32 {
+            state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                OwnedStep::Handled(Ok(next)) => next,
+                _ => panic!("update did not complete"),
+            };
+        }
+        let OwnedValue::Object(fields) = state else {
+            panic!("expected object");
+        };
+        assert_eq!(fields.get("i"), Some(&OwnedValue::Int(32)));
+        let Some(OwnedValue::NumberLiteral(_, text)) = fields.get("n") else {
+            panic!("missing literal");
+        };
+        assert_eq!(text.as_ptr(), literal_ptr, "unchanged text was copied");
+        assert_eq!(&**text, literal);
+    }
+
     /// #2402: `eval`/`eval_lenient` (the public library API) skip
     /// `resolve.rs`'s scope-tracking pass, so a `builtin_fallback`-carrying
     /// `Expr::FuncCall` node -- built by the parser whenever a lexical
@@ -67849,7 +68167,7 @@ mod tests {
     /// the arms that hand a navigated subvalue straight back (`Field`,
     /// `Index`, and the `Pipe` threading built on them) are diffed on every
     /// numeric spelling too — the round trip those arms skip re-spells a
-    /// NaN or an over-cap `NumberLiteral` (`REINDEX_LITERAL_LEN_CAP`); a
+    /// NaN literal; a
     /// bare finite `Float` used to be a third such case until #2902 made
     /// that leg an identity (a token, not a formatter), so an
     /// un-round-tripped `Float`/`Int` reaching a caller is exactly where a
@@ -90176,45 +90494,24 @@ mod tests {
         );
     }
 
-    /// Spine 2416 (the exit), door 2: a value the reindex bridge would
-    /// re-spell must not take it.
+    /// Spine 2416 (the exit), door 2: a long literal keeps its spelling
+    /// through a path-context pipe.
     ///
     /// [`eval_path_context_pipe_owned`] gives a cursor-less owned value a
     /// position by serializing it into a throwaway document and walking that
     /// document's root cursor. `to_json_for_reindex`'s mode-forked formatter
-    /// re-spells a NaN and a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP`,
-    /// so `reindex_bridge_is_identity` keeps those off the bridge; before
-    /// the exit they went to the eager evaluator, and they take
-    /// `eval_generic::eval_path_context_pipe_detached` -- the owned identity
-    /// pipe at a detached root -- now. A bare `Float` used to be a third
-    /// such class, until #2902 gave `to_json_for_reindex` a token spelling
-    /// that survives the round trip intact: a finite computed float is
-    /// bridge-identity now, so it takes the ordinary bridge route instead of
-    /// this guard, and has no row here for the same reason the "not a row"
-    /// paragraph below explains for other bridge-identity values.
-    ///
-    /// Measured, not assumed: with the guard removed and the bridge taken,
-    /// a 300-digit literal came back as `"1e+299"` and the NaN as `Null`.
-    ///
-    /// One shape the detached route does *not* keep, and the reason it is
-    /// not a row: a stage it hands to the ordinary owned evaluator
-    /// (`.[] | select(key == 1)`) goes through `eval_owned_input_bridge`,
-    /// which applies the same formatter, so the 300-digit literal comes back
-    /// as `1E+299` there. That is the owned evaluator's round trip, not this
-    /// door's, and it is reachable only for a value class no document read
-    /// can produce -- a caller-supplied `OwnedValue` holding a NaN or an
-    /// over-cap literal. Recorded in `docs/compliance/jq/limitations.md`. `eval_owned_with_file_index` is the door's
-    /// caller that can be handed such a value (its `input` is the caller's
-    /// own `OwnedValue`, not a document read); `succinctly yq --eval-all`
-    /// over a document holding `.nan` is the CLI spelling of the same thing.
+    /// re-spells a NaN literal, so `reindex_bridge_is_identity` keeps it off
+    /// the bridge. `eval_generic::eval_path_context_pipe_detached` handles
+    /// that remaining non-identity case. #3025 made long literals
+    /// bridge-identity, even when a stage reaches the ordinary owned
+    /// evaluator. `eval_owned_with_file_index` can receive either kind of
+    /// caller-built value.
     #[test]
-    fn test_owned_door_keeps_a_value_the_reindex_would_respell_2419() {
+    fn test_owned_door_preserves_long_literal_3025() {
         use alloc::string::ToString as _;
         let long = "1".repeat(300);
-        // Only the over-cap literal has a spelling `to_json` can show: a NaN
-        // renders as `null` in jq mode whatever the route preserved. Both
-        // still take this guard's route; a bare `Float` no longer does
-        // (see the note above).
+        // The long literal now survives either route. A NaN renders as
+        // `null` in jq mode, so this fixture isolates the visible spelling.
         let rows: &[(OwnedValue, &str)] = &[(
             OwnedValue::NumberLiteral(NumberRepr::Float(1e299), long.clone().into()),
             &long,
