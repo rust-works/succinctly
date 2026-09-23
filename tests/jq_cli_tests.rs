@@ -45705,6 +45705,155 @@ fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
     Ok(())
 }
 
+/// #3030: jq collects empty-update paths and deletes them together after all
+/// path filters run. Expectations are from /usr/bin/jq 1.7.1-apple.
+#[test]
+fn test_multi_path_empty_update_deletes_simultaneously_3030() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,3,4]", "(.[] | select(. % 2 == 1)) |= empty", "[2,4]"),
+        ("[1,2,3,4]", "(.[] | select(. <= 2)) |= empty", "[3,4]"),
+        ("[1,2,3,4]", "(.[0], .[1]) |= empty", "[3,4]"),
+        ("[1,2,3,4]", "(.[0], .[1]) |= select(false)", "[3,4]"),
+        ("[1,2,3,4]", ".[(0,1)] |= empty", "[3,4]"),
+        ("[1,2,3]", "(.[-1], .[-2]) |= empty", "[1]"),
+        ("[1,2,3]", "(.[0], .[0]) |= empty", "[2,3]"),
+        (
+            "[1,2,3]",
+            ".[ (0,0) ] |= if . == 1 then empty else 9 end",
+            "[2,3]",
+        ),
+        (
+            "[1,2,3]",
+            "(.[0], .[1]) |= if . == 1 then empty else 9 end",
+            "[9,3]",
+        ),
+        ("[[1,2],[3,4]]", "(.[0][0], .[0][1]) |= empty", "[[],[3,4]]"),
+        ("[[1,2],[3,4]]", "(.[0], .[1][0]) |= empty", "[[4]]"),
+        ("[1,2,3,4]", "(.[0:1], .[1]) |= empty", "[3,4]"),
+        ("[1,2,3,4]", "(.[1:2], .[2:3]) |= empty", "[1,4]"),
+        ("[1,2,3]", "(.[], .[0]) |= empty", "[]"),
+        ("[1,2,3]", "(., .[0]) |= empty", "null"),
+        ("[1,2,3]", "(.[0], .) |= empty", "null"),
+        (
+            "[1,2]",
+            ". as $x | (.[0], .) |= if type == \"number\" then empty else ($x[0] = 9) end",
+            "[2]",
+        ),
+    ] {
+        let actual = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            actual,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_multi_path_empty_update_existing_behavior_3030() -> Result<()> {
+    for (input, filter, expected) in [
+        ("[1,2,3,4]", ".[] |= empty", "[]"),
+        ("[1,2,3,4]", "map_values(empty)", "[]"),
+        ("[[1,2],[3]]", ".[] |= (.[] |= empty)", "[[],[]]"),
+        ("[1,2,3,4]", ".[1:] |= empty", "[1]"),
+        ("[1,2,3,4]", "(.[1], .[0]) |= empty", "[3,4]"),
+        (r#"{"a":1,"b":2}"#, "(.a, .b) |= empty", "{}"),
+        (
+            r#"{"a":{"b":1},"c":2}"#,
+            "(.a, .a.b) |= empty",
+            r#"{"c":2}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"c":2}"#,
+            "(.a.b, .a) |= empty",
+            r#"{"c":2}"#,
+        ),
+        ("[1,2,3,4]", "del(.[0], .[1])", "[3,4]"),
+    ] {
+        let actual = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            actual,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+    for (input, filter, error) in [
+        (
+            "[1,2]",
+            "(.[0], .[0][0]) |= empty",
+            "Cannot index number with number",
+        ),
+        (
+            "[1,2,3,4]",
+            "(.[0], .[1]) |= (if . == 1 then empty else error(\"x\") end)",
+            "x",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(code, 5, "{filter}: {stderr}");
+        assert!(stderr.contains(error), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
+/// #3030: deferred deletions also need the path components produced by
+/// native iteration and by chained writes. Results are from /usr/bin/jq 1.7.1.
+#[test]
+fn test_multi_path_empty_update_chained_and_iterated_paths_3030() -> Result<()> {
+    for (input, filter, expected) in [
+        (r#"{"a":[1,2],"z":3}"#, "(.a[], .z) |= empty", r#"{"a":[]}"#),
+        (
+            r#"{"a":{"x":1,"y":2},"z":3}"#,
+            "(.a[], .z) |= empty",
+            r#"{"a":{}}"#,
+        ),
+        (
+            r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+            "(.a[].b, .z) |= empty",
+            r#"{"a":[{},{}]}"#,
+        ),
+        (
+            r#"{"a":{"x":{"b":1},"y":{"b":2}},"z":3}"#,
+            "(.a[].b, .z) |= empty",
+            r#"{"a":{"x":{},"y":{}}}"#,
+        ),
+        (r#"{"a":[],"z":3}"#, "(.a[2].b, .z) |= empty", r#"{"a":[]}"#),
+        ("[1,2]", "(.[4].b, .[0]) |= empty", "[2]"),
+        (
+            r#"{"a":{"b":1},"z":2}"#,
+            "(.a?.b, .z) |= empty",
+            r#"{"a":{}}"#,
+        ),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-c", filter], Some(input))?,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+
+    for (input, filter, error) in [
+        (
+            r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+            "(.a[0:2].b, .z) |= empty",
+            "Cannot index array with string \"b\"",
+        ),
+        (
+            r#"{"a":"hello","z":2}"#,
+            "(.a[0:2], .z) |= empty",
+            "Cannot delete fields from string",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(code, 5, "{filter}: {stderr}");
+        assert!(stderr.contains(error), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
 /// #1653: `--unbuffered` must actually interleave stdout and stderr in real
 /// time, not merely flush a batch that was already fully evaluated.
 ///

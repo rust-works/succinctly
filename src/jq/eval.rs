@@ -25305,6 +25305,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
         let pristine = result.clone();
         let mut untouched = true;
+        let mut deletes = DeferredUpdateDeletes::default();
         let outcome = stream_path_writes::<S>(
             path_expr,
             &pristine,
@@ -25318,24 +25319,53 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 });
                 // #3036: a root path before any write updates the document
                 // `|=` was called on, untouched -- see the eager loop below.
-                let ambient = core::mem::replace(&mut untouched, false) && is_root_path(path);
-                if ambient {
-                    return update_root_with_filter::<S>(
+                let ambient = untouched && is_root_path(path);
+                let pending_before = deletes.paths.len();
+                let write = if ambient {
+                    update_root_with_filter::<S>(
                         result,
                         filter_expr,
                         pos.as_ref(),
                         Reentry::Proven,
+                        Some(&mut deletes),
                     )
-                    .map(|_wrote| ());
+                } else {
+                    // `false` for `scalar_noop`, as the eager route computes it
+                    // in jq mode.
+                    update_path_with_deletes::<S>(
+                        result,
+                        path,
+                        filter_expr,
+                        false,
+                        false,
+                        pos.as_ref(),
+                        Some(&mut deletes),
+                    )
+                };
+                // A `?//` in the path generator can retry after a failed
+                // write. Its next path must not inherit this attempt's
+                // unbalanced walk prefix or uncommitted pending deletes.
+                match write {
+                    Ok(wrote) => {
+                        if wrote {
+                            untouched = false;
+                        }
+                        Ok(())
+                    }
+                    Err(escape) => {
+                        deletes.at.clear();
+                        deletes.paths.truncate(pending_before);
+                        Err(escape)
+                    }
                 }
-                // `false` for `scalar_noop`, as the eager route computes it in jq
-                // mode.
-                update_path::<S>(result, path, filter_expr, false, false, pos.as_ref())
-                    .map(|_wrote| ())
             },
         );
         return match outcome {
-            StreamedWrites::Done => QueryResult::Owned(result),
+            StreamedWrites::Done => match finish_deferred_update_deletes::<S>(result, deletes) {
+                Ok(result) => QueryResult::Owned(result),
+                Err(_) if optional => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            },
             StreamedWrites::ResolutionFailed(escape) | StreamedWrites::WriteFailed(escape) => {
                 match escape {
                     EvalEscape::Error(_) if optional => QueryResult::None,
@@ -25454,37 +25484,65 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         vivified
     });
 
-    // Get current value at path, apply filter, and set back
-    for (i, path) in paths.iter().enumerate() {
+    // A lone resolved path uses the existing direct write, including the
+    // one-pass `.[]` rebuild. Only sibling paths need `_modify`'s deferred
+    // `delpaths` state here; the streaming route cannot know its count ahead
+    // of time and therefore always collects.
+    let defer_deletes = S::TAG == EvalTag::Jq && paths.len() > 1;
+    let mut deletes = DeferredUpdateDeletes::default();
+    let mut untouched = true;
+    for path in &paths {
         let pos = positioned.then(|| UpdatePos {
             path: base.clone(),
             base_len: base.len(),
             pre: pre_update.as_ref(),
         });
-        // #3036: the first path, when it is the root itself, updates the
-        // very document `|=` was called on, untouched -- jq's filter then
-        // sees `$x`'s own node.
-        let outcome = if i == 0 && is_root_path(path) {
-            update_root_with_filter::<S>(&mut result, filter_expr, pos.as_ref(), Reentry::Proven)
+        // #3036: a root path before any successful write still updates the
+        // original document. A pending deletion leaves it untouched (#3030),
+        // so a later root filter still sees `$x`'s own node.
+        let outcome = if untouched && is_root_path(path) {
+            update_root_with_filter::<S>(
+                &mut result,
+                filter_expr,
+                pos.as_ref(),
+                Reentry::Proven,
+                defer_deletes.then_some(&mut deletes),
+            )
         } else {
-            update_path::<S>(
+            update_path_with_deletes::<S>(
                 &mut result,
                 path,
                 filter_expr,
                 false,
                 scalar_noop,
                 pos.as_ref(),
+                defer_deletes.then_some(&mut deletes),
             )
         };
-        if let Err(escape) = outcome {
-            return match escape {
-                EvalEscape::Error(_) if optional => QueryResult::None,
-                other => other.into(),
-            };
+        match outcome {
+            Ok(wrote) => {
+                if wrote {
+                    untouched = false;
+                }
+            }
+            Err(escape) => {
+                return match escape {
+                    EvalEscape::Error(_) if optional => QueryResult::None,
+                    other => other.into(),
+                };
+            }
         }
     }
     if let Some(pre) = &pre {
         alias_identity::mirror_after_write(pre, &mut result);
+    }
+
+    if defer_deletes {
+        result = match finish_deferred_update_deletes::<S>(result, deletes) {
+            Ok(result) => result,
+            Err(_) if optional => return QueryResult::None,
+            Err(e) => return QueryResult::Error(e),
+        };
     }
 
     QueryResult::Owned(result)
@@ -27033,6 +27091,7 @@ fn set_path<S: EvalSemantics>(
                 scalar_noop,
                 container_noop,
                 terminal_write: true,
+                defer_delete: false,
                 non_integer_bound: slice_has_non_integer_bound(
                     start_key.as_ref(),
                     end_key.as_ref(),
@@ -27259,6 +27318,7 @@ fn set_path_steps<S: EvalSemantics>(
                             // The slice genuinely is the last path component, so
                             // this call's own `edit` is the write (#1321).
                             terminal_write: true,
+                            defer_delete: false,
                             non_integer_bound: slice_has_non_integer_bound(
                                 start_key.as_ref(),
                                 end_key.as_ref(),
@@ -27508,6 +27568,7 @@ fn set_path_steps<S: EvalSemantics>(
                 scalar_noop,
                 container_noop,
                 terminal_write: false,
+                defer_delete: false,
                 non_integer_bound: slice_has_non_integer_bound(
                     start_key.as_ref(),
                     end_key.as_ref(),
@@ -27680,6 +27741,8 @@ struct SliceEditFlags {
     /// the answer, and forcing that same refusal on top would report the
     /// wrong thing (or a spurious error where jq no-ops) either way.
     terminal_write: bool,
+    /// Leave a jq `|= empty` slice untouched until the enclosing `delpaths`.
+    defer_delete: bool,
     /// #2853: this component carries a bound jq never parsed, which can only
     /// happen over a `null` target (see [`SliceBoundKey::Raw`]).
     ///
@@ -27721,6 +27784,7 @@ fn through_slice<E: From<EvalError>>(
         scalar_noop,
         container_noop,
         terminal_write,
+        defer_delete,
         non_integer_bound,
     } = flags;
     // #2853: a bound jq never parsed. This arm comes first because it is a
@@ -27854,6 +27918,9 @@ fn through_slice<E: From<EvalError>>(
             // `true`, since `sub` now holds genuine content to propagate),
             // so it never reaches here as `false` in the first place.
             if terminal_write && !wrote {
+                if defer_delete {
+                    return Ok(false);
+                }
                 arr.splice(range, core::iter::empty());
                 return Ok(true);
             }
@@ -27902,6 +27969,9 @@ fn through_slice<E: From<EvalError>>(
                 if wrote {
                     Err(EvalError::cannot_update_string_slices().into())
                 } else {
+                    if defer_delete {
+                        return Ok(false);
+                    }
                     // `|= empty` (#1894): jq's `_modify` falls back to
                     // `delpaths` on empty output, and deleting a string
                     // slice raises a different sentence than writing one
@@ -28260,7 +28330,9 @@ fn position_update_filter<S: EvalSemantics>(
 /// empty` from a literal `null` write), the mid-chain `Pipe` arm's
 /// "stranded" autoviv-undo check, and -- since #1916, jq mode only -- this
 /// function's own terminal `Field`/`Index`/`Iterate` arms, which delete the
-/// key/element outright on `false` instead of leaving it `null`. yq mode
+/// key/element outright on `false` for a single path. #3030's multi-path
+/// route instead records the concrete path and leaves the value in place
+/// until all updates finish. yq mode
 /// keeps its pre-#1916 behavior at those three arms unchanged; see the
 /// `Field` arm's own comment for why.
 /// Whether a resolved update path names the document itself (#3036): `.`,
@@ -28288,6 +28360,7 @@ fn update_root_with_filter<S: EvalSemantics>(
     filter_expr: &Expr,
     pos: Option<&UpdatePos<'_>>,
     reentry: Reentry,
+    mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
     let positioned = position_update_filter::<S>(filter_expr, pos)?;
     let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
@@ -28297,10 +28370,157 @@ fn update_root_with_filter<S: EvalSemantics>(
         None => run()?,
     };
     let wrote = !outputs.is_empty();
-    if wrote || S::TAG != EvalTag::Yq {
+    if !wrote {
+        if let Some(deletes) = deletes.as_mut() {
+            deletes.record();
+        }
+    }
+    if wrote || (S::TAG != EvalTag::Yq && deletes.is_none()) {
         *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
     }
     Ok(wrote)
+}
+
+/// jq's `_modify` carries the paths whose update emitted nothing until its
+/// final `delpaths`. `at` is relative to this one `|=` input, not to the
+/// ambient path used by the yq position builtins.
+#[derive(Default)]
+struct DeferredUpdateDeletes {
+    at: Vec<OwnedValue>,
+    paths: Vec<Vec<OwnedValue>>,
+}
+
+impl DeferredUpdateDeletes {
+    fn record(&mut self) {
+        self.paths.push(self.at.clone());
+    }
+
+    fn enter(&mut self, key: OwnedValue) {
+        self.at.push(key);
+    }
+
+    fn leave(&mut self) {
+        self.at.pop();
+    }
+}
+
+#[cfg(test)]
+mod deferred_update_delete_path_tests {
+    use super::*;
+    use crate::jq::parse;
+
+    // The public update resolves many paths into individual leaves before
+    // writing. Check the native path walker too, since callers can hand it
+    // unresolved iteration, slices, and fresh array positions.
+    #[test]
+    fn native_paths_record_their_deferred_delete_components() {
+        for (input, path, expected) in [
+            (r#"{"a":[1,2],"z":3}"#, ".a[]", r#"{"a":[],"z":3}"#),
+            (r#"{"a":{"x":1,"y":2},"z":3}"#, ".a[]", r#"{"a":{},"z":3}"#),
+            (
+                r#"{"a":[{"b":1},{"b":2}],"z":3}"#,
+                ".a[].b",
+                r#"{"a":[{},{}],"z":3}"#,
+            ),
+            (
+                r#"{"a":{"x":{"b":1},"y":{"b":2}},"z":3}"#,
+                ".a[].b",
+                r#"{"a":{"x":{},"y":{}},"z":3}"#,
+            ),
+            (r#"{"a":[],"z":3}"#, ".a[2].b", r#"{"a":[],"z":3}"#),
+        ] {
+            let mut root = parse_complete_json(input, false).unwrap();
+            let mut deletes = DeferredUpdateDeletes::default();
+            update_path_with_deletes::<JqSemantics>(
+                &mut root,
+                &parse(path).unwrap(),
+                &parse("empty").unwrap(),
+                false,
+                false,
+                None,
+                Some(&mut deletes),
+            )
+            .unwrap();
+            let result = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap();
+            assert_eq!(result.to_json(), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn native_chained_slice_and_optional_paths_preserve_delete_context() {
+        for (input, path, expected) in [
+            (r#"{"a":{"b":1},"z":2}"#, ".a?.b", r#"{"a":{},"z":2}"#),
+            (r#"{"a":{"b":1},"z":2}"#, ".a | . | .b", r#"{"a":{},"z":2}"#),
+        ] {
+            let mut root = parse_complete_json(input, false).unwrap();
+            let mut steps = Vec::new();
+            push_path_components(&mut steps, &parse(path).unwrap());
+            let mut deletes = DeferredUpdateDeletes::default();
+            update_path_steps::<JqSemantics>(
+                &mut root,
+                &steps,
+                &parse("empty").unwrap(),
+                false,
+                false,
+                None,
+                Some(&mut deletes),
+            )
+            .unwrap();
+            let result = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap();
+            assert_eq!(result.to_json(), expected, "{path}");
+        }
+
+        let mut root = parse_complete_json(r#"{"a":[{"b":1},{"b":2}]}"#, false).unwrap();
+        let mut steps = Vec::new();
+        push_path_components(&mut steps, &parse(".a[0:2].b").unwrap());
+        let mut deletes = DeferredUpdateDeletes::default();
+        let error = update_path_steps::<JqSemantics>(
+            &mut root,
+            &steps,
+            &parse("empty").unwrap(),
+            false,
+            false,
+            None,
+            Some(&mut deletes),
+        )
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot index array with string"));
+    }
+}
+
+fn update_delete_component(expr: &Expr) -> Option<OwnedValue> {
+    match unwrap_path_component(expr).0 {
+        Expr::Field(name) => Some(OwnedValue::String(name.clone())),
+        Expr::Index { idx, key } => Some(index_component_value(*idx, key.as_ref())),
+        _ => None,
+    }
+}
+
+fn finish_deferred_update_deletes<S: EvalSemantics>(
+    result: OwnedValue,
+    deletes: DeferredUpdateDeletes,
+) -> Result<OwnedValue, EvalError> {
+    if deletes.paths.is_empty() {
+        return Ok(result);
+    }
+    let mut paths: Vec<OwnedValue> = deletes
+        .paths
+        .into_iter()
+        .map(|path| OwnedValue::Array(path.into()))
+        .collect();
+    paths.sort_by(compare_values::<S>);
+    let paths: Vec<&[OwnedValue]> = paths
+        .iter()
+        .map(|path| match path {
+            OwnedValue::Array(parts) => parts.as_slice(),
+            _ => unreachable!("deferred delete paths are arrays"),
+        })
+        .collect();
+    if paths[0].is_empty() {
+        Ok(OwnedValue::Null)
+    } else {
+        delete_paths_sorted::<S>(result, &paths, 0)
+    }
 }
 
 fn update_path<S: EvalSemantics>(
@@ -28310,6 +28530,26 @@ fn update_path<S: EvalSemantics>(
     optional: bool,
     scalar_noop: bool,
     pos: Option<&UpdatePos<'_>>,
+) -> Result<bool, EvalEscape> {
+    update_path_with_deletes::<S>(
+        root,
+        path_expr,
+        filter_expr,
+        optional,
+        scalar_noop,
+        pos,
+        None,
+    )
+}
+
+fn update_path_with_deletes<S: EvalSemantics>(
+    root: &mut OwnedValue,
+    path_expr: &Expr,
+    filter_expr: &Expr,
+    optional: bool,
+    scalar_noop: bool,
+    pos: Option<&UpdatePos<'_>>,
+    mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
     // yq's slice-write container no-op (#1142) is unconditional on the
     // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
@@ -28356,12 +28596,12 @@ fn update_path<S: EvalSemantics>(
             // surface -- `.a |= (1, error("x"))` is `{"a":1}` in jq 1.7.1,
             // not an error.
             //
-            // A zero-output filter falls back to `Null` at *this* level in
-            // jq mode -- the `Field`/`Index`/`Iterate` arms above are what
-            // turn that into a real delete (#1916), by checking the
-            // `wrote` bool returned here rather than inspecting the
-            // resulting value (a legitimate `.a |= null` also leaves
-            // `Null` behind, and must not be deleted).
+            // A zero-output jq filter writes `Null` for the direct
+            // single-path route. The enclosing `Field`/`Index`/`Iterate`
+            // arms turn its `false` result into a delete (#1916). With a
+            // multi-path collector, the leaf remains untouched and its
+            // concrete path is queued for the final `delpaths` (#3030).
+            // A legitimate `.a |= null` still reports `true`.
             //
             // yq mode (#2484): a zero-output filter instead leaves `root`
             // completely untouched -- neither jq's "always null" nor its
@@ -28380,22 +28620,30 @@ fn update_path<S: EvalSemantics>(
             // nested assignment inside the filter (`.a | .b |= (.c |= path)`),
             // which reaches `eval_update` through the ordinary dispatch with
             // no parameter to ride on.
-            update_root_with_filter::<S>(root, filter_expr, pos, Reentry::REBUILT)
+            update_root_with_filter::<S>(root, filter_expr, pos, Reentry::REBUILT, deletes)
         }
         Expr::Field(name) => {
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_object(root);
             if let OwnedValue::Object(map) = root {
                 let child = pos.map(|pos| pos.child(OwnedValue::String(name.clone())));
+                let existed = map.contains_key(name);
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                let wrote = update_path::<S>(
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.enter(OwnedValue::String(name.clone()));
+                }
+                let wrote = update_path_with_deletes::<S>(
                     current,
                     &Expr::Identity,
                     filter_expr,
                     optional,
                     scalar_noop,
                     child.as_ref(),
+                    deletes.as_deref_mut(),
                 )?;
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.leave();
+                }
                 // #1916 is jq-mode only. An update filter that produced no
                 // output at all (`.a |= empty`) deletes the key instead of
                 // leaving it `null` -- jq's `_modify` falls back to
@@ -28425,11 +28673,11 @@ fn update_path<S: EvalSemantics>(
                 // pre-#1916 behavior exactly, rather than trading one
                 // undocumented divergence for a worse one. Closing yq's
                 // own gap is left to a follow-up issue.
-                if !wrote && S::TAG != EvalTag::Yq {
+                if !wrote && S::TAG != EvalTag::Yq && (deletes.is_none() || !existed) {
                     map.shift_remove(name);
-                    if root_was_null && map.is_empty() {
-                        *root = OwnedValue::Null;
-                    }
+                }
+                if !wrote && root_was_null && map.is_empty() {
+                    *root = OwnedValue::Null;
                 }
                 Ok(wrote)
             } else if optional
@@ -28447,7 +28695,7 @@ fn update_path<S: EvalSemantics>(
                 Err(EvalError::cannot_index_with_field(owned_type_name(root), name).into())
             }
         }
-        Expr::Index { idx, .. } => {
+        Expr::Index { idx, key } => {
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
@@ -28464,13 +28712,14 @@ fn update_path<S: EvalSemantics>(
                     // index 10. Keep the original eager `write_index`
                     // call, unconditional on the filter's outcome.
                     let child = index_child_pos(pos, *idx, arr.len());
-                    update_path::<S>(
+                    update_path_with_deletes::<S>(
                         write_index(arr, *idx)?,
                         &Expr::Identity,
                         filter_expr,
                         optional,
                         scalar_noop,
                         child.as_ref(),
+                        deletes.as_deref_mut(),
                     )
                 } else {
                     // #1916: bounds-checking is deferred behind the
@@ -28491,15 +28740,22 @@ fn update_path<S: EvalSemantics>(
                         Some(actual_idx) => {
                             let child =
                                 pos.map(|pos| pos.child(OwnedValue::Int(actual_idx as i64)));
-                            let wrote = update_path::<S>(
+                            if let Some(deletes) = deletes.as_deref_mut() {
+                                deletes.enter(index_component_value(*idx, key.as_ref()));
+                            }
+                            let wrote = update_path_with_deletes::<S>(
                                 &mut arr[actual_idx],
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
                                 child.as_ref(),
+                                deletes.as_deref_mut(),
                             )?;
-                            if !wrote {
+                            if let Some(deletes) = deletes.as_deref_mut() {
+                                deletes.leave();
+                            }
+                            if !wrote && deletes.is_none() {
                                 arr.remove(actual_idx);
                             }
                             wrote
@@ -28516,14 +28772,21 @@ fn update_path<S: EvalSemantics>(
                             // out-of-range index either direction.
                             let mut scratch = OwnedValue::Null;
                             let child = index_child_pos(pos, *idx, arr.len());
-                            let wrote = update_path::<S>(
+                            if let Some(deletes) = deletes.as_deref_mut() {
+                                deletes.enter(index_component_value(*idx, key.as_ref()));
+                            }
+                            let wrote = update_path_with_deletes::<S>(
                                 &mut scratch,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
                                 child.as_ref(),
+                                deletes.as_deref_mut(),
                             )?;
+                            if let Some(deletes) = deletes.as_deref_mut() {
+                                deletes.leave();
+                            }
                             if wrote {
                                 *write_index(arr, *idx)? = scratch;
                             }
@@ -28553,7 +28816,23 @@ fn update_path<S: EvalSemantics>(
             }
             match root {
                 OwnedValue::Array(arr) => {
-                    if S::TAG == EvalTag::Yq {
+                    if deletes.is_some() {
+                        for (index, elem) in arr.iter_mut().enumerate() {
+                            let child = pos.map(|pos| pos.child(OwnedValue::Int(index as i64)));
+                            let deletes = deletes.as_deref_mut().expect("deferred jq update");
+                            deletes.enter(OwnedValue::Int(index as i64));
+                            update_path_with_deletes::<S>(
+                                elem,
+                                &Expr::Identity,
+                                filter_expr,
+                                optional,
+                                scalar_noop,
+                                child.as_ref(),
+                                Some(deletes),
+                            )?;
+                            deletes.leave();
+                        }
+                    } else if S::TAG == EvalTag::Yq {
                         // #1916 is jq-mode only -- see the `Field` arm's
                         // comment above.
                         for (index, elem) in arr.iter_mut().enumerate() {
@@ -28599,7 +28878,23 @@ fn update_path<S: EvalSemantics>(
                     Ok(true)
                 }
                 OwnedValue::Object(map) => {
-                    if S::TAG == EvalTag::Yq {
+                    if deletes.is_some() {
+                        for (key, value) in map.iter_mut() {
+                            let child = pos.map(|pos| pos.child(OwnedValue::String(key.clone())));
+                            let deletes = deletes.as_deref_mut().expect("deferred jq update");
+                            deletes.enter(OwnedValue::String(key.clone()));
+                            update_path_with_deletes::<S>(
+                                value,
+                                &Expr::Identity,
+                                filter_expr,
+                                optional,
+                                scalar_noop,
+                                child.as_ref(),
+                                Some(deletes),
+                            )?;
+                            deletes.leave();
+                        }
+                    } else if S::TAG == EvalTag::Yq {
                         for (key, value) in map.iter_mut() {
                             let child = pos.map(|pos| pos.child(OwnedValue::String(key.clone())));
                             update_path::<S>(
@@ -28640,16 +28935,30 @@ fn update_path<S: EvalSemantics>(
                 _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
             }
         }
-        Expr::Pipe(exprs) if !exprs.is_empty() => {
-            update_path_steps::<S>(root, exprs, filter_expr, optional, scalar_noop, pos)
+        Expr::Pipe(exprs) if !exprs.is_empty() => update_path_steps::<S>(
+            root,
+            exprs,
+            filter_expr,
+            optional,
+            scalar_noop,
+            pos,
+            deletes,
+        ),
+        Expr::Optional(inner) => {
+            update_path_with_deletes::<S>(root, inner, filter_expr, true, scalar_noop, pos, deletes)
         }
-        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true, scalar_noop, pos),
         // `(EXPR)` at the top of a resolved path (e.g. `(.[0:1]) |= 99`) —
         // see `set_path`'s matching `Expr::Paren` arm for why this was
         // never needed before #1116.
-        Expr::Paren(inner) => {
-            update_path::<S>(root, inner, filter_expr, optional, scalar_noop, pos)
-        }
+        Expr::Paren(inner) => update_path_with_deletes::<S>(
+            root,
+            inner,
+            filter_expr,
+            optional,
+            scalar_noop,
+            pos,
+            deletes,
+        ),
         // `.[a:b] |= f` runs `f` on the sub-array — not on each element — and
         // splices the answer back, so `[1,2,3] | .[1:2] |= . + ["q"]` is
         // `[1,2,"q",3]`. `f` may return an array of any length, but it has to
@@ -28663,38 +28972,54 @@ fn update_path<S: EvalSemantics>(
             end,
             start_key,
             end_key,
-        } => through_slice(
-            root,
-            *start,
-            *end,
-            SliceEditFlags {
-                optional,
-                scalar_noop,
-                container_noop,
-                terminal_write: true,
-                non_integer_bound: slice_has_non_integer_bound(
+        } => {
+            if let Some(deletes) = deletes.as_deref_mut() {
+                deletes.enter(slice_component_value(
+                    *start,
                     start_key.as_ref(),
+                    *end,
                     end_key.as_ref(),
-                ),
-            },
-            // `None`: a slice has no path component to name it (real yq
-            // keeps the *container's* position for a slice, jq reports a
-            // `{"start":s,"end":e}` component -- see `OwnedIdentityRule::
-            // Slice`), and neither is the position of the sub-array this
-            // filter is handed. Left unpositioned rather than positioned
-            // wrongly; `.a[0:1] |= key` answers exactly as it did before
-            // #2522.
-            |sub| {
-                update_path::<S>(
-                    sub,
-                    &Expr::Identity,
-                    filter_expr,
+                ));
+            }
+            let result = through_slice(
+                root,
+                *start,
+                *end,
+                SliceEditFlags {
                     optional,
                     scalar_noop,
-                    None,
-                )
-            },
-        ),
+                    container_noop,
+                    terminal_write: true,
+                    defer_delete: deletes.is_some(),
+                    non_integer_bound: slice_has_non_integer_bound(
+                        start_key.as_ref(),
+                        end_key.as_ref(),
+                    ),
+                },
+                // `None`: a slice has no path component to name it (real yq
+                // keeps the *container's* position for a slice, jq reports a
+                // `{"start":s,"end":e}` component -- see `OwnedIdentityRule::
+                // Slice`), and neither is the position of the sub-array this
+                // filter is handed. Left unpositioned rather than positioned
+                // wrongly; `.a[0:1] |= key` answers exactly as it did before
+                // #2522.
+                |sub| {
+                    update_path_with_deletes::<S>(
+                        sub,
+                        &Expr::Identity,
+                        filter_expr,
+                        optional,
+                        scalar_noop,
+                        None,
+                        deletes.as_deref_mut(),
+                    )
+                },
+            );
+            if let Some(deletes) = deletes {
+                deletes.leave();
+            }
+            result
+        }
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -28759,6 +29084,7 @@ fn update_path_steps<S: EvalSemantics>(
     optional: bool,
     scalar_noop: bool,
     pos: Option<&UpdatePos<'_>>,
+    mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
     // `undo_stranded`: #1428 is a jq-mode divergence, and deliberately stays
     // one -- real yq *wants* the chain a suppressed write leaves behind
@@ -28778,6 +29104,7 @@ fn update_path_steps<S: EvalSemantics>(
 
     let mut root = root;
     let mut steps = steps;
+    let entry_depth = deletes.as_ref().map_or(0, |deletes| deletes.at.len());
     // #2522: extended in place as the loop peels components, so the
     // frame-free walk this function exists to perform still names every
     // position it passes through.
@@ -28792,24 +29119,34 @@ fn update_path_steps<S: EvalSemantics>(
             // between the two the way CLAUDE.md's "duplicated predicates
             // diverge silently" warns about.
             [] => {
-                return update_path::<S>(
+                let result = update_path_with_deletes::<S>(
                     root,
                     &Expr::Identity,
                     filter_expr,
                     optional,
                     scalar_noop,
                     pos.as_ref(),
+                    deletes.as_deref_mut(),
                 );
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return result;
             }
             [last] => {
-                return update_path::<S>(
+                let result = update_path_with_deletes::<S>(
                     root,
                     last,
                     filter_expr,
                     optional,
                     scalar_noop,
                     pos.as_ref(),
-                )
+                    deletes.as_deref_mut(),
+                );
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return result;
             }
             [first, rest @ ..] => (first, rest),
         };
@@ -28857,6 +29194,9 @@ fn update_path_steps<S: EvalSemantics>(
                     };
                     root = map.entry(name.clone()).or_insert(OwnedValue::Null);
                     pos = pos.map(|pos| pos.child(OwnedValue::String(name.clone())));
+                    if let Some(deletes) = deletes.as_deref_mut() {
+                        deletes.enter(OwnedValue::String(name.clone()));
+                    }
                     steps = rest;
                     continue;
                 }
@@ -28869,6 +29209,13 @@ fn update_path_steps<S: EvalSemantics>(
                 let (fresh, remainder) = steps.split_at(run_len);
                 let mut scratch = OwnedValue::Null;
                 let inner = fresh_run_pos(pos.as_ref(), fresh);
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    for component in fresh {
+                        deletes.enter(
+                            update_delete_component(component).expect("fresh path component"),
+                        );
+                    }
+                }
                 let wrote = update_path_steps::<S>(
                     &mut scratch,
                     remainder,
@@ -28876,7 +29223,11 @@ fn update_path_steps<S: EvalSemantics>(
                     optional,
                     scalar_noop,
                     inner.as_ref(),
+                    deletes.as_deref_mut(),
                 )?;
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
                 if !wrote && undo_stranded {
                     // Nothing was ever really written -- leave the object
                     // exactly as it was, and collapse it back to `Null` too
@@ -28935,6 +29286,9 @@ fn update_path_steps<S: EvalSemantics>(
                         };
                         root = &mut arr[actual_idx];
                         pos = pos.map(|pos| pos.child(OwnedValue::Int(actual_idx as i64)));
+                        if let Some(deletes) = deletes.as_deref_mut() {
+                            deletes.enter(update_delete_component(first).expect("index component"));
+                        }
                         steps = rest;
                         continue;
                     }
@@ -28943,6 +29297,13 @@ fn update_path_steps<S: EvalSemantics>(
                 let (fresh, remainder) = steps.split_at(run_len);
                 let mut scratch = OwnedValue::Null;
                 let inner = fresh_run_pos(pos.as_ref(), fresh);
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    for component in fresh {
+                        deletes.enter(
+                            update_delete_component(component).expect("fresh path component"),
+                        );
+                    }
+                }
                 let wrote = update_path_steps::<S>(
                     &mut scratch,
                     remainder,
@@ -28950,7 +29311,11 @@ fn update_path_steps<S: EvalSemantics>(
                     optional,
                     scalar_noop,
                     inner.as_ref(),
+                    deletes.as_deref_mut(),
                 )?;
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
                 if !wrote && undo_stranded {
                     // See the `Field` arm's matching comment above:
                     // `wrap_fresh` is never called on this path either, and
@@ -28978,17 +29343,28 @@ fn update_path_steps<S: EvalSemantics>(
                 }
                 let outer = pos.clone();
                 let fanned = for_each_container_entry(root, |component, slot| {
-                    let child = outer.as_ref().map(|pos| pos.child(component));
-                    update_path_steps::<S>(
+                    let child = outer.as_ref().map(|pos| pos.child(component.clone()));
+                    if let Some(deletes) = deletes.as_deref_mut() {
+                        deletes.enter(component);
+                    }
+                    let result = update_path_steps::<S>(
                         slot,
                         rest,
                         filter_expr,
                         optional,
                         scalar_noop,
                         child.as_ref(),
+                        deletes.as_deref_mut(),
                     )
-                    .map(|_| ())
+                    .map(|_| ());
+                    if let Some(deletes) = deletes.as_deref_mut() {
+                        deletes.leave();
+                    }
+                    result
                 });
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
                 return match fanned {
                     Some(result) => result.map(|()| true),
                     None if here || noop_scalar => Ok(false),
@@ -29000,14 +29376,19 @@ fn update_path_steps<S: EvalSemantics>(
             // rather than recursing on it alone, which would strand `rest`.
             Expr::Pipe(inner) => {
                 let spliced = splice_optional_group(inner, rest, here);
-                return update_path_steps::<S>(
+                let result = update_path_steps::<S>(
                     root,
                     &spliced,
                     filter_expr,
                     optional,
                     scalar_noop,
                     pos.as_ref(),
+                    deletes.as_deref_mut(),
                 );
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return result;
             }
             Expr::Slice {
                 start,
@@ -29015,7 +29396,15 @@ fn update_path_steps<S: EvalSemantics>(
                 start_key,
                 end_key,
             } => {
-                return through_slice(
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.enter(slice_component_value(
+                        *start,
+                        start_key.as_ref(),
+                        *end,
+                        end_key.as_ref(),
+                    ));
+                }
+                let result = through_slice(
                     root,
                     *start,
                     *end,
@@ -29028,6 +29417,7 @@ fn update_path_steps<S: EvalSemantics>(
                         // arm inline against the slice `rest` directly, with
                         // no need to allocate the `Pipe` just to check it.
                         terminal_write: rest.iter().all(is_effectively_identity),
+                        defer_delete: deletes.is_some(),
                         non_integer_bound: slice_has_non_integer_bound(
                             start_key.as_ref(),
                             end_key.as_ref(),
@@ -29036,9 +29426,21 @@ fn update_path_steps<S: EvalSemantics>(
                     // `None` for the same reason `update_path`'s own
                     // `Expr::Slice` arm drops the position -- see its comment.
                     |sub| {
-                        update_path_steps::<S>(sub, rest, filter_expr, optional, scalar_noop, None)
+                        update_path_steps::<S>(
+                            sub,
+                            rest,
+                            filter_expr,
+                            optional,
+                            scalar_noop,
+                            None,
+                            deletes.as_deref_mut(),
+                        )
                     },
                 );
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return result;
             }
             // #2241: a *mid-chain* bare `.` (`.a | . | .b`) is a transparent
             // pass-through, same as everywhere else in this file that walks
@@ -29058,7 +29460,19 @@ fn update_path_steps<S: EvalSemantics>(
                 continue;
             }
             _ => {
-                return update_path::<S>(root, first, filter_expr, here, scalar_noop, pos.as_ref())
+                let result = update_path_with_deletes::<S>(
+                    root,
+                    first,
+                    filter_expr,
+                    here,
+                    scalar_noop,
+                    pos.as_ref(),
+                    deletes.as_deref_mut(),
+                );
+                if let Some(deletes) = deletes.as_deref_mut() {
+                    deletes.at.truncate(entry_depth);
+                }
+                return result;
             }
         }
     }
@@ -51601,6 +52015,7 @@ fn delete_path_steps(
                         scalar_noop: false,
                         container_noop: false,
                         terminal_write: yq_mode,
+                        defer_delete: false,
                         non_integer_bound: slice_has_non_integer_bound(
                             start_key.as_ref(),
                             end_key.as_ref(),

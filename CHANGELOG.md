@@ -214,6 +214,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq `|=` now defers zero-output deletions across multiple paths** (#3030).
+  Empty updates collect their target paths and delete them together after the
+  last update, matching jq 1.7.1. Earlier deletions no longer shift later
+  array indices or change the value a later update filter reads.
+
 - **A destructuring pattern's computed key is now visible to every check built
   on `any_subexpr`** (#3017). `walk::any_subexpr`'s `AsPattern`/`Reduce`/
   `Foreach` arms skipped `patterns` entirely, under a comment claiming a
