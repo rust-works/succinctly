@@ -64,6 +64,11 @@ drawn from the same pool so a route that changes the answer is visible next
 to ones that must not. The stdin carries the document twice so `input` has
 a second, equal-valued document to read.
 
+#3049 adds a tracked-input array family. It collects a navigation from a
+computed value and then discards the array, so an inner refusal cannot be
+recovered by the terminal path check. The family also includes arrays jq
+accepts and the still-deferred optional-navigation cases from #2764.
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -300,6 +305,30 @@ def fold_program(rng):
 
 FOLD_P = 0.2
 
+# #3049: `[f]` keeps path tracking live even when its input is tracked.
+# Earlier pools generated array values but not this tracked-input placement
+# with navigation *inside* the constructor followed by an empty consumer.
+TRACKED_ARRAY_INNERS = [
+    "[[1] | .[0]]", "[.x | {k:1} | .k]",
+    "[.x | tojson | fromjson | .a]", "[.x | to_entries[] | .key]",
+    "[.a | length | .x?]", "[5 | .[]?]",
+    "[.a]", "[.x.a]", "[paths]", "[to_entries]",
+    "[.a[] | select(. == 1)]", "[limit(1; .a[])]",
+    "[recurse(.[]?)]", "[[.a]]", "[.a, .x]",
+    "[.x as $z | $z.a]", "[.x as $z | [.a, $z.a]]",
+]
+TRACKED_ARRAY_WRAPPERS = [
+    "path(%s | empty)", "del(%s | select(false))",
+    "(%s | empty) = 9", "(%s | empty) |= 9",
+]
+TRACKED_ARRAY_P = 0.12
+
+def tracked_array_program(rng):
+    inner = rng.choice(TRACKED_ARRAY_INNERS)
+    # Both the document and a navigated child are tracked inputs.
+    body = rng.choice(["%s", ".x | %s"]) % inner
+    return rng.choice(TRACKED_ARRAY_WRAPPERS) % body
+
 # #3036: routes into `eval.rs`'s own owned-value evaluator (see the module
 # doc). `%s` is the body. The `input` route binds the *second* stdin
 # document, a value-equal but different `jv` to jq -- the same document
@@ -462,7 +491,7 @@ def main():
     ap.add_argument("--jq", default="/usr/bin/jq")
     ap.add_argument("--baseline", default=None,
                     help="a succinctly binary built from a commit that predates the change under test; "
-                         "a fabricate/mismatch it reproduces byte-for-byte is reported as *-baseline "
+                         "a divergence it reproduces byte-for-byte is reported as *-baseline "
                          "and does not fail the run (it is not this change's), but is still listed")
     ap.add_argument("-n", type=int, default=500)
     ap.add_argument("--seed", type=int, default=1)
@@ -489,6 +518,8 @@ def main():
                            ("EMBEDS", EMBEDS),
                            ("USES", USES), ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS]),
                            ("ROUTES", ROUTES), ("REBUILDS", REBUILDS), ("ROOT_USES", ROOT_USES),
+                           ("TRACKED_ARRAY_INNERS", TRACKED_ARRAY_INNERS),
+                           ("TRACKED_ARRAY_WRAPPERS", TRACKED_ARRAY_WRAPPERS),
                            ("VALUE_BIND_SOURCES", VALUE_BIND_SOURCES), ("VALUE_BIND_USES", VALUE_BIND_USES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
@@ -500,27 +531,30 @@ def main():
     value_bind_p = (VALUE_BIND_P * (1.0 - fold_p) / max(1.0 - FOLD_P, 1e-9)
                     if a.value_bind_p is None else a.value_bind_p)
     kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "both-reject",
-             "fabricate-baseline", "mismatch-baseline", "timeout"]
+             "fabricate-baseline", "mismatch-baseline", "refuse-only-baseline",
+             "refuse-early-baseline", "timeout"]
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
         dv = doc(rng)
         d = json.dumps(dv)
         r = rng.random()
-        if r < route_p:
+        if r < TRACKED_ARRAY_P:
+            f = tracked_array_program(rng)
+        elif r < TRACKED_ARRAY_P + (1.0 - TRACKED_ARRAY_P) * route_p:
             # #3036: the document twice, so `input` reads a second copy.
             f, d = route_program(rng, dv), d + "\n" + d
-        elif r < route_p + value_bind_p:
+        elif r < TRACKED_ARRAY_P + (1.0 - TRACKED_ARRAY_P) * (route_p + value_bind_p):
             # #3037: same ROUTES, so `input` needs its second copy too.
             f, d = value_bind_program(rng, dv), d + "\n" + d
-        elif r < route_p + value_bind_p + fold_p:
+        elif r < TRACKED_ARRAY_P + (1.0 - TRACKED_ARRAY_P) * (route_p + value_bind_p + fold_p):
             f = fold_program(rng)
         else:
             f = program(rng)
         j = run([a.jq, "-c", f], d)
         s = run([a.bin, "jq", "-c", f], d)
         c = classify(j, s)
-        if c in ("fabricate", "mismatch") and a.baseline:
+        if c in ("fabricate", "mismatch", "refuse-only", "refuse-early") and a.baseline:
             b = run([a.baseline, "jq", "-c", f], d)
             if b == s:
                 c += "-baseline"

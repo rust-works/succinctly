@@ -66864,3 +66864,74 @@ fn test_double_iterate_key_skips_empty_inner_collections_3021() -> Result<()> {
     }
     Ok(())
 }
+
+/// #3049: jq runs the body of a collected array with path tracking live.
+#[test]
+fn test_tracked_array_inner_navigation_refuses_3049() -> Result<()> {
+    let doc = r#"{"a":[1],"b":{"k":1},"c":1}"#;
+    for (filter, input) in [
+        ("path([[1] | .[0]] | empty)", "null"),
+        (concat!("path([.b | {", "k:1} | .k] | empty)"), doc),
+        ("path([.b | tojson | fromjson | .k] | empty)", doc),
+        ("path([.b | to_entries[] | .key] | empty)", doc),
+        ("path(.b as $x | [$x.k] | empty)", doc),
+        ("path(.b as $x | [.c, $x.k] | empty)", doc),
+        ("del([[1] | .[0]] | select(false))", "null"),
+        (concat!("(.b | [{", "k:1} | .k] | empty) = 5"), doc),
+        (concat!("(.b | [{", "k:1} | .k] | empty) |= 5"), doc),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: a refused edit must emit nothing");
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_tracked_array_accepting_controls_3049() -> Result<()> {
+    let doc = r#"{"a":[1],"b":{"k":1},"c":1}"#;
+    for filter in [
+        "path([.b.k] | empty)",
+        "path([.a[]] | empty)",
+        "path([first(.a[])] | empty)",
+        "path(.a | map(. + 1) | empty)",
+        "path([to_entries] | empty)",
+        "path([paths] | empty)",
+        "path([.a[] | select(. == 1)] | empty)",
+        "path([limit(1; .a[])] | empty)",
+        "path([recurse(.[]?)] | empty)",
+        "path([[.a[]]] | empty)",
+        "path(.b as $x | [.c, $x] | empty)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+    }
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del([.b.k] | select(false))"], Some(doc))?;
+    assert_eq!(code, 0, "{stderr:?}");
+    assert_eq!(stdout.trim_end(), doc);
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(.x | [.x | tojson | fromjson | .a] | empty)"],
+        Some(r#"{"x":{"a":1}}"#),
+    )?;
+    assert_eq!(code, 0, "{stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// #2764 is a separate optional-navigation limitation, verified unchanged
+/// before and after #3049. Update this characterization when #2764 is fixed.
+#[test]
+fn test_tracked_array_optional_navigation_characterize_preexisting_bug_3049() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path([5 | .[]?] | empty)"], Some("null"))?;
+    assert_eq!(
+        code, 0,
+        "#2764 fix should update this characterization: {stderr:?}"
+    );
+    assert_eq!(stdout, "");
+    Ok(())
+}

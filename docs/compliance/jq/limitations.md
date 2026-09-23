@@ -869,13 +869,15 @@ is the revert that established what the other one costs.
    answers `["c"]` on both
    ([#3136](https://github.com/rust-works/succinctly/issues/3136)).
 
-   Fourteen rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Eleven rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
+
+   #3049 moved `path(.a as $y | .a | tojson | fromjson | $y)` to the accepting
+   matrix: `fromjson` does not navigate, so it can preserve the register for `$y`.
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
    | -------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
    | `.a as $y \| path(.a \| $y)`                             | `["a"]`                     | value-mode binding — `eval_as` never resolves its source in path position; the *positional* half of #3037 (its root-of-invocation half is closed)                                                                                                          |
-   | `path(.a as $y \| .a \| tojson \| fromjson \| $y)`       | `["a"]`                     | `tojson`/`fromjson` are not on `cannot_move_register`'s proven allowlist (#2041)                                                                                                                                          |
    | `path(.a as $y \| def f: $y; .a \| f)`                   | `["a"]`                     | a `def` inside `path()` resolves as an opaque leaf                                                                                                                                                                        |
    | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)`     | `["a"]`                     | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value                                                                         |
    | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`                     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                                                                                          |
