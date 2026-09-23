@@ -266,6 +266,12 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `to_unix` - Parse ISO 8601 string to Unix epoch (yq extension)
 - [x] `tz(zone)` - Convert Unix timestamp to datetime in specified timezone (yq extension)
 
+For broken-down-time arrays, jq converts each numeric field to a signed 32-bit
+integer. `strftime`, `todate`, and `todateiso8601` can display out-of-range
+calendar fields; for example, `[1970,-1,1,0,0,0,4,0] | todate` produces
+`"1970-00-01T00:00:00Z"`. `mktime` normalizes the fields when it can and
+raises `invalid gmtime representation` when that conversion fails (#3083).
+
 **Timezone support**: IANA names (`America/New_York`), abbreviations (`EST`, `PST`, `JST`), numeric offsets (`+05:30`, `-0800`), and `UTC`/`GMT`.
 
 ### YAML Metadata Functions (yq)

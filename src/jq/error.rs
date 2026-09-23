@@ -1585,19 +1585,12 @@ impl EvalError {
     }
 
     /// `mktime/strftime: broken-down time value out of representable
-    /// range` — a `mktime`/`strftime` broken-down-time array element
-    /// (year, month, day, hour, minute, second, weekday, or yearday) too
-    /// extreme for this codebase's checked civil-date arithmetic to
-    /// convert without overflow (#893, #911). Deliberately a distinct
-    /// message from [`Self::datetime_out_of_range`] rather than reusing
-    /// it: that message is anchored to real jq's own text for the
-    /// *opposite* (seconds -> broken-down-time) direction, and real jq has
-    /// no equivalent error for *this* direction at all — confirmed
-    /// empirically it silently computes a wrapped/nonsensical result
-    /// instead (`[9223372036854775807,0,1,0,0,0,0,0] | mktime` succeeds in
-    /// real jq with a bogus timestamp) — so there is no oracle text to
-    /// match here, and reusing the other message would misdescribe which
-    /// conversion actually failed.
+    /// range` — checked civil-date arithmetic could not represent a
+    /// broken-down-time conversion (#893, #911). jq's array fields now
+    /// saturate to C `int` before that arithmetic (#3083), so ordinary
+    /// extreme array elements do not reach this error. It remains distinct
+    /// from [`Self::datetime_out_of_range`], which describes conversion in
+    /// the opposite direction (seconds to broken-down time).
     pub fn broken_down_time_out_of_range() -> Self {
         Self::new("mktime/strftime: broken-down time value out of representable range")
     }
