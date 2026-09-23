@@ -53205,10 +53205,10 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let timestamp = match jq_timegm_secs(year, month, day, hour, minute, second) {
         Ok(Some(t)) => t,
-        Ok(None) if optional => return QueryResult::None,
+        Ok(None) if optional => return QueryResult::None, // omni-dev: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
         Ok(None) => return QueryResult::Error(EvalError::new("invalid gmtime representation")),
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
     };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
@@ -53572,7 +53572,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ) {
                 Ok(s) => s,
                 Err(_) if optional => return QueryResult::None,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable for strftime's C-int-clamped fields and bounded zone offset; shared checked date helpers retain overflow guards for other callers (#3083)"
             };
             QueryResult::Owned(OwnedValue::String(result))
         },
@@ -86579,6 +86579,18 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-306783377 -306783377"));
         query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
+        // Sunday is the special case in %W's Monday-first weekday remap.
+        query!(b"null", r#"[1970,0,1,0,0,0,0,0] | strftime("%W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "00"));
+    }
+
+    #[test]
+    fn test_checked_civil_date_rejects_unbounded_year_3083() {
+        let error = checked_days_from_civil(i64::MAX, 1, 1).unwrap_err();
+        assert_eq!(
+            error.message,
+            "mktime/strftime: broken-down time value out of representable range"
+        );
     }
 
     // `#[cfg(feature = "std")]`: `parse_simple_tz_offset` itself is
