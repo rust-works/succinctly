@@ -6311,7 +6311,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::ModuleMeta));
         }
 
-        // pick(keys) - yq: select only specified keys from object/array
+        // jq: pick(pathexps); yq: pick(keys). The evaluator chooses by mode.
         if self.matches_keyword("pick") {
             let keyword_start = self.pos;
             self.consume_keyword("pick");

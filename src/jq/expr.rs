@@ -1726,7 +1726,7 @@ pub enum Builtin {
     /// succinctly has no real module system to describe, and matches that
     /// behavior rather than stubbing it out (#2111).
     ModuleMeta,
-    /// `pick(keys)` - select only specified keys from object/array (yq)
+    /// jq `pick(pathexps)` or yq `pick(keys)`, selected by evaluation mode.
     Pick(Box<Expr>),
     /// `omit(keys)` - remove specified keys from object/indices from array (yq)
     /// Inverse of `pick`: keeps all keys/indices except those specified.

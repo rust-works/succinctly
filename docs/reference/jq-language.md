@@ -88,7 +88,7 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `has(key)`
 - [x] `in(obj)`
 - [x] `to_entries` / `from_entries` / `with_entries(f)`
-- [x] `pick(keys)` - select only specified keys (yq)
+- [x] `pick(pathexps)` in jq mode selects paths; `pick(keys)` in yq mode selects keys/indices
 - [x] `omit(keys)` - remove specified keys (inverse of pick, yq)
 - [x] Object construction: `{foo: .bar}`, `{(expr): value}`, shorthand `{foo}` -- a single trailing comma before `}` is accepted in jq mode only (`{foo: 1,}`, #2788), matching real jq; real yq rejects it
 

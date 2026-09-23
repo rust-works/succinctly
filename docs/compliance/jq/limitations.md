@@ -92,7 +92,7 @@ iterate over number` for the same condition, and `cannot parse 'a' as number` ag
 | `Invalid path expression with result <v>`                | `invalid_path_expression`                     |
 
 `EvalError::type_error` ("expected X, got Y") survives for the raise sites jq has no
-counterpart for — succinctly extensions (`at_offset`, `@dsv`, `pick`/`omit`, module
+counterpart for — succinctly extensions (`at_offset`, `@dsv`, `omit`, module
 loading) and builtins jq does not define. Anything jq also reports should use a named
 constructor instead.
 
@@ -2462,10 +2462,11 @@ file at all; they bypass the reindex bridge entirely via their own `eval_generic
 carried the identical #1194 silent-drop bug independently (confirmed live against a built
 release binary: `printf '{"a":1,"b"}' | succinctly jq paths` returned `["a"]` at exit 0 even
 after this file's own `builtin_paths`/`builtin_leaf_paths` were fixed, until `collect_paths_generic`
-was fixed too). `pick`/`omit` have no native `eval_generic.rs` arm, so the "CLI unaffected" claim
-does hold for them -- the reindex bridge they fall through to already fed them an
+was fixed too). At the time, `pick`/`omit` had no native `eval_generic.rs` arm, so the "CLI unaffected" claim
+did hold for them -- the reindex bridge they fell through to already fed them an
 already-validated `OwnedValue` before this file's own fix, making that fix real for the library
-API but largely redundant for `sjq`/`syq`.
+API but largely redundant for `sjq`/`syq`. #3026 adds a jq-mode `pick` arm in the generic
+evaluator; yq-mode `pick` and `omit` still use the older route.
 
 **The durable lesson**: a unit test against `succinctly::jq::eval` (this file's own entry point)
 proves a fix reaches library callers, never that it reaches the CLI -- only a build-and-run

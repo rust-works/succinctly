@@ -23072,6 +23072,28 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // jq `pick` consumes path expressions against the original input.
+        // Avoid a second materialization where the reindex bridge is an
+        // identity, and preserve path-variable provenance at the cursor root.
+        Builtin::Pick(path_expr) if S::TAG == EvalTag::Jq => {
+            let root = RootWitness::of(cursor.as_ref());
+            let owned = owned_or_suppress!(to_owned_with_cursor::<_, S>(&value, cursor), optional);
+            if reindex_bridge_is_identity(&owned) {
+                let path_expr = reroot_markers::<S>(path_expr, &root);
+                return query_result_to_generic::<V, S>(crate::jq::eval::pick_pathexps_on_owned::<
+                    Vec<u64>,
+                    S,
+                >(
+                    &path_expr, &owned, optional
+                ));
+            }
+            eval_on_owned::<S, _>(
+                &Expr::Builtin(builtin.clone()),
+                owned,
+                optional,
+                Reentry::Against(root),
+            )
+        }
         // #1909: `path(f)`'s output is a bounded set of path arrays, but the
         // `_` fallback below charged it a whole-document materialize +
         // re-serialize + re-index round trip *and* a second materialize
