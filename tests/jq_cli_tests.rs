@@ -33985,6 +33985,46 @@ fn test_foreach_alt_extract_break_also_retries_like_error_1458() -> Result<()> {
     Ok(())
 }
 
+/// #3099 write side: `cannot_move_register` gained an `Expr::Break` arm
+/// (mirroring its pre-existing `Expr::Error` arm) so a comma-emitted `$x`
+/// EXTRACT branch that a later `break` escapes past stays trackable
+/// through `del()`/`=`/`|=`, exactly as `error()` already did. All three
+/// rows captured live against jq 1.7.1 on `{"a":1}`.
+#[test]
+fn test_foreach_extract_comma_break_write_side_3099() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "del(label $out | foreach .a as $x (null; .; ($x, break $out)))",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{}");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "(label $out | foreach .a as $x (null; .; ($x, break $out))) = 5",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "(label $out | foreach .a as $x (null; .; ($x, break $out))) |= 5",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    Ok(())
+}
+
 #[test]
 fn test_foreach_alt_extract_error_on_last_alt_still_propagates_1458() -> Result<()> {
     let (out, err, code) = run_jq_full(
