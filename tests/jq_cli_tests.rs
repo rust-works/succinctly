@@ -27471,6 +27471,124 @@ fn test_duplicate_module_import_reports_each_compile_error_once_3085() -> Result
     Ok(())
 }
 
+/// #3085: counting restarts per module-level def, so two copies of a module
+/// that reach different defs -- or a dependency's link run, which keeps only
+/// the defs something references -- still cite each failing site's own line,
+/// and distinct sites are never merged. Every expectation was captured from
+/// the pinned jq 1.7.1. Order is not asserted: succinctly reports module
+/// errors in its own walk order, not jq's.
+#[test]
+fn test_module_errors_cite_their_own_def_whichever_defs_a_copy_holds_3085() -> Result<()> {
+    let expect_lines = |stderr: &str, diagnostic: &str, lines: &[usize]| {
+        assert_eq!(
+            stderr.matches(diagnostic).count(),
+            lines.len(),
+            "stderr: {stderr:?}"
+        );
+        for line in lines {
+            assert!(
+                stderr.contains(&format!("m.jq, line {line}:")),
+                "line {line}, stderr: {stderr:?}"
+            );
+        }
+        let noun = if lines.len() == 1 { "error" } else { "errors" };
+        assert!(
+            stderr.contains(&format!("jq: {} compile {noun}", lines.len())),
+            "stderr: {stderr:?}"
+        );
+    };
+
+    for (body, diagnostic) in [
+        (
+            "def g: missing;\ndef f: missing;\n",
+            "missing/0 is not defined",
+        ),
+        ("def g: $x;\ndef f: $x;\n", "$x is not defined"),
+        (
+            "def g: break $x;\ndef f: break $x;\n",
+            "$*label-x is not defined",
+        ),
+    ] {
+        // Two copies reaching different defs: two distinct sites.
+        let (_, stderr, code) = run_jq_with_modules(
+            &[("m", body)],
+            &["-nc", r#"import "m" as a; import "m" as b; a::f, b::g"#],
+        )?;
+        assert_eq!(code, 3, "stderr: {stderr:?}");
+        expect_lines(&stderr, diagnostic, &[1, 2]);
+
+        // An unreferenced sibling before the failing def shifts nothing.
+        let (_, stderr, code) =
+            run_jq_with_modules(&[("m", body)], &["-nc", r#"import "m" as a; a::f"#])?;
+        assert_eq!(code, 3, "stderr: {stderr:?}");
+        expect_lines(&stderr, diagnostic, &[2]);
+    }
+
+    // A dependency's link run holds only `g`; the top-level import holds both.
+    let modules = [
+        ("m", "def f: missing;\ndef g: missing;\n"),
+        ("n", "import \"m\" as m;\ndef h: m::g;\n"),
+    ];
+    let (_, stderr, code) = run_jq_with_modules(&modules, &["-nc", r#"import "n" as n; n::h"#])?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    expect_lines(&stderr, "missing/0 is not defined", &[2]);
+    let (_, stderr, code) = run_jq_with_modules(
+        &modules,
+        &["-nc", r#"import "m" as a; import "n" as n; a::f, n::h"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    expect_lines(&stderr, "missing/0 is not defined", &[1, 2]);
+
+    // Same-named defs are told apart by arity and by declaration order.
+    let (_, stderr, code) = run_jq_with_modules(
+        &[("m", "def f: 1;\ndef f: missing;\ndef f(a): missing;\n")],
+        &["-nc", r#"import "m" as a; import "m" as b; a::f, b::f(1)"#],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    expect_lines(&stderr, "missing/0 is not defined", &[2, 3]);
+
+    // A same-named site inside a nested, unreferenced def is still counted.
+    for (body, diagnostic) in [
+        (
+            "def f: (def u: missing; 1) |\n missing;\n",
+            "missing/0 is not defined",
+        ),
+        ("def f: (def u: $x; 1) |\n $x;\n", "$x is not defined"),
+        (
+            "def f: (def u: break $x; 1) |\n break $x;\n",
+            "$*label-x is not defined",
+        ),
+    ] {
+        let (_, stderr, code) = run_jq_with_modules(
+            &[("m", body)],
+            &["-nc", r#"import "m" as a; import "m" as b; a::f, b::f"#],
+        )?;
+        assert_eq!(code, 3, "stderr: {stderr:?}");
+        expect_lines(&stderr, diagnostic, &[2]);
+    }
+    Ok(())
+}
+
+/// #3085: in the main filter, a same-named site inside an unreferenced def
+/// is counted too, so the echoed position is the failing site's. jq encodes
+/// the column as trailing padding on the echoed line; the expectation was
+/// captured from jq 1.7.1.
+#[test]
+fn test_top_level_error_skips_site_in_unreferenced_def_3085() -> Result<()> {
+    // The `break` twin is `test_break_in_unreferenced_def_body_does_not_shift_the_caret_2964`.
+    let (_, stderr, code) = run_jq_with_modules(&[], &["-nc", "def u: missing; missing"])?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: missing/0 is not defined at <top-level>, line 1:\n\
+             def u: missing; missing{}\njq: 1 compile error\n",
+            " ".repeat(16)
+        )
+    );
+    Ok(())
+}
+
 /// #2865: a module's own `include` is processed transitively -- the third
 /// module's defs are available to the second module's body.
 ///
@@ -49047,29 +49165,23 @@ fn test_break_occurrence_counters_do_not_cross_module_boundaries_characterize_pr
     Ok(())
 }
 
-/// #2964 review finding, documented as an accepted residual in
-/// `docs/compliance/jq/limitations.md` (the "position-recovery site table
-/// can drift" section): `resolve::check` correctly skips an unreferenced
-/// `def`'s body (its own `reachable`-gated visit never counts this `break`),
-/// but `collect_break_sites`' second, reachability-blind textual re-parse
-/// still lists it, so the CLI's caret cites the *unreferenced* `break $x`
-/// (offset/occurrence 0) instead of the real, top-level one the oracle
-/// points at. Pins today's honest (wrong-caret) behavior so a future change
-/// can't silently make the drift worse without a test noticing.
+/// #2964 review finding, closed by #3085: a same-named `break` inside an
+/// unreferenced `def` used to take the failing break's slot in the
+/// position table, citing column 7. The resolver now counts the skipped
+/// body's breaks too, so the echo matches the pinned jq 1.7.1 (17 spaces of
+/// padding, pointing at the top-level `break $x`).
 #[test]
-fn test_break_in_unreferenced_def_body_shifts_the_caret_2964() -> Result<()> {
+fn test_break_in_unreferenced_def_body_does_not_shift_the_caret_2964() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "-c", "def f: break $x; break $x"], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "", "a compile error produces no output");
-    // The pinned oracle (`/usr/bin/jq` 1.7.1) instead cites the top-level
-    // `break $x` (17 spaces of padding, not 7) -- see limitations.md.
     assert_eq!(
         stderr,
         format!(
             "jq: error: $*label-x is not defined at <top-level>, line 1:\n\
              def f: break $x; break $x{}\n\
              jq: 1 compile error\n",
-            " ".repeat(7)
+            " ".repeat(17)
         )
     );
     Ok(())

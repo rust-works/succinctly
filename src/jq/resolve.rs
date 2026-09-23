@@ -67,6 +67,28 @@ use super::eval::pattern_alternatives_var_names;
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Expr, ObjectKey, Pattern, StringPart};
 
+/// The module-level `def` a module-body diagnostic sits inside (#3085): the
+/// scope its occurrence index is counted in.
+///
+/// The loader splices a module into the program once per `import`/`include`
+/// that names it, and a dependency's link run keeps only the defs something
+/// references. So neither "which copy" nor "which sibling defs are present"
+/// is stable, and a per-file count would point different copies of one
+/// module at different physical sites. A count restarted at each
+/// module-level def is stable: every copy of a def holds the same body, and
+/// the loader keeps every same-named def together, so `(name, arity,
+/// ordinal)` names one def in the file (`jq::DefSite`'s table).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ModuleDef {
+    /// The def's name as written in the module, with any import alias or
+    /// link-run prefix removed.
+    pub name: String,
+    /// How many parameters the def declares.
+    pub arity: usize,
+    /// How many earlier defs of the same `(name, arity)` the module holds.
+    pub ordinal: usize,
+}
+
 /// A call this pass could not resolve to any in-scope `def`, parameter or
 /// builtin — the compile error's payload.
 ///
@@ -112,7 +134,13 @@ pub struct UnresolvedCall {
     /// (`(def f: 1; f) | f` cited the resolving `f` inside the parens, not
     /// the failing one after the pipe -- both are `f/0`, only one is a
     /// compile error).
+    ///
+    /// Inside a module body the count restarts at each module-level def;
+    /// [`Self::module_def`] names which one (#3085).
     pub occurrence_index: usize,
+    /// The module-level def this call sits inside, when `origin` is a
+    /// module (#3085).
+    pub module_def: Option<ModuleDef>,
 }
 
 impl core::fmt::Display for UnresolvedCall {
@@ -140,10 +168,13 @@ pub struct UnboundVar {
     /// filter -- [`UnresolvedCall::origin`]'s twin, so a module body's
     /// unbound variable is reported against that module's file (#2962).
     pub origin: Option<u32>,
-    /// Index among same-named variable references in this source, counting
-    /// bound references too. The CLI uses it to recover a module site's
-    /// position when the module AST was cloned by multiple imports (#3085).
+    /// Index among same-named variable references, bound ones included, in
+    /// source order -- counted per module-level def inside a module body
+    /// ([`Self::module_def`]), per program otherwise (#3085).
     pub occurrence: usize,
+    /// The module-level def this reference sits inside, when `origin` is a
+    /// module (#3085).
+    pub module_def: Option<ModuleDef>,
 }
 
 impl core::fmt::Display for UnboundVar {
@@ -174,15 +205,15 @@ pub struct UnresolvedLabel {
     /// The label's name, without the `$` sigil — matching [`Expr::Break`]'s
     /// own storage.
     pub name: String,
-    /// Which same-named `break $name` site within this module instance
-    /// this belongs to (0-based, in `super::parser::collect_break_sites`'s
-    /// source order, scoped to whichever file `origin` names): when two
+    /// Which same-named `break $name` site this belongs to (0-based, in
+    /// `super::parser::collect_break_sites`'s source order, scoped to
+    /// whichever file `origin` names, and within it to `module_def`): when two
     /// same-named breaks differ only by lexical scope — one bound under an
     /// enclosing `label $name`, one genuinely unbound — the position
     /// recovery in `report_compile_errors` (the CLI) must cite the *failing*
     /// one, and this index is how it threads that decision through the AST,
-    /// which carries no positions. Counted per module instance so cloned
-    /// imports restart at the same physical site (#3085).
+    /// which carries no positions. Inside a module body the count restarts at
+    /// each module-level def, so every copy of the module agrees (#3085).
     pub occurrence: usize,
     /// Which module run the failing break was written in (#2951), or `None`
     /// for the main filter — [`UnboundVar::origin`]'s twin: without this, a
@@ -191,6 +222,9 @@ pub struct UnresolvedLabel {
     /// wrong (the position it would otherwise search for belongs to a
     /// different file's text entirely).
     pub origin: Option<u32>,
+    /// The module-level def this break sits inside, when `origin` is a
+    /// module (#3085).
+    pub module_def: Option<ModuleDef>,
 }
 
 impl core::fmt::Display for UnresolvedLabel {
@@ -1381,21 +1415,51 @@ fn is_jq_builtin(name: &str, arity: usize) -> bool {
         .any(|&(n, a)| a == arity && n == name)
 }
 
-/// Per-site occurrence counters and the active module instance, bundled into
-/// one argument so `check` and its siblings stay within the argument limit.
+/// Per-site occurrence counters, bundled into one argument so `check` and its
+/// siblings stay within the argument limit.
+///
+/// Each counter is keyed by a counting scope: `None` for the main filter,
+/// which is counted as one whole file, or the id of one visit to a
+/// module-level def body (#3085, see [`ModuleDef`]).
 #[derive(Default)]
 struct Occurrences {
     calls: BTreeMap<(Option<usize>, String, usize), usize>,
     vars: BTreeMap<(Option<usize>, String), usize>,
     breaks: BTreeMap<(Option<usize>, String), usize>,
-    run_stack: Vec<usize>,
-    next_run_instance: usize,
+    /// One frame per module run open at this point of the walk.
+    runs: Vec<RunFrame>,
+    next_scope: usize,
+}
+
+/// A module run's counting state: how many defs of each `(name, arity)` it
+/// has declared so far, and the module-level def whose body is being checked.
+#[derive(Default)]
+struct RunFrame {
+    ordinals: BTreeMap<(String, usize), usize>,
+    def: Option<(usize, ModuleDef)>,
 }
 
 impl Occurrences {
-    fn instance(&self) -> Option<usize> {
-        self.run_stack.last().copied()
+    fn scope(&self) -> Option<usize> {
+        self.runs.last()?.def.as_ref().map(|(scope, _)| *scope)
     }
+
+    fn module_def(&self) -> Option<ModuleDef> {
+        self.runs.last()?.def.as_ref().map(|(_, def)| def.clone())
+    }
+
+    /// Whether a `def` visited now is one of the open run's module-level
+    /// defs rather than one nested inside a def body.
+    fn at_module_level(&self) -> bool {
+        self.runs.last().is_some_and(|run| run.def.is_none())
+    }
+}
+
+/// The name a module-level def was written under: the loader prefixes an
+/// imported def with its alias (`a::f`) and a linked one with its link-run
+/// name, and neither appears in the module's own source.
+fn written_def_name(name: &str) -> &str {
+    name.rsplit_once("::").map_or(name, |(_, written)| written)
 }
 
 /// Records one more visit to `(name, arity)` -- resolved or not -- and
@@ -1405,10 +1469,10 @@ impl Occurrences {
 /// (not the "restore the original parse and re-dispatch" arm, which revisits
 /// the same position rather than a new one).
 fn next_call_occurrence(occurrences: &mut Occurrences, name: &str, arity: usize) -> usize {
-    let instance = occurrences.instance();
+    let scope = occurrences.scope();
     let count = occurrences
         .calls
-        .entry((instance, name.to_string(), arity))
+        .entry((scope, name.to_string(), arity))
         .or_insert(0);
     let index = *count;
     *count += 1;
@@ -1482,13 +1546,13 @@ fn check_break(
     errors: &mut Vec<ResolveError>,
     occurrences: &mut Occurrences,
 ) {
-    // Both a bound and an unbound break consume a slot in this instance's
+    // Both a bound and an unbound break consume a slot in this scope's
     // counter, mirroring the source's `collect_break_sites` table.
     let origin = enclosing_run(label_scope);
-    let instance = occurrences.instance();
+    let scope = occurrences.scope();
     let n = occurrences
         .breaks
-        .entry((instance, name.to_string()))
+        .entry((scope, name.to_string()))
         .or_insert(0);
     let occurrence = *n;
     *n += 1;
@@ -1501,6 +1565,7 @@ fn check_break(
             name: name.to_string(),
             occurrence,
             origin,
+            module_def: occurrences.module_def(),
         }));
     }
 }
@@ -1870,15 +1935,12 @@ fn check(
         // records the site unconditionally regardless of the `error` wrap.
         //
         // `occurrences.breaks` carries *which* same-named break site this
-        // one is, keyed by `(origin, name)` so a label repeated across
+        // one is, keyed by counting scope (the main filter, or one
+        // module-level def -- `ModuleDef`) so a label repeated across
         // module boundaries doesn't have one file's breaks consume
-        // another's slots -- the #2635-class limitation remains within a
-        // single origin: a break inside an unreachable `def` body that
-        // textually precedes the failing one, in the same file, shifts the
-        // CLI's caret target by one (see the `UnresolvedLabel` doc comment
-        // and the `BreakSite` doc comment for the full accounting), the
-        // exact same class `CallSite`/`VarSite` already record for
-        // calls/variables.
+        // another's slots. Breaks inside unreferenced `def` bodies are
+        // counted too (#3085), so the index lines up with the CLI's
+        // `BreakSite` table.
         Expr::Break(name) => {
             check_break(name, label_scope, errors, occurrences);
         }
@@ -1890,11 +1952,9 @@ fn check(
         // already resolved, never present on the freshly parsed tree this
         // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
         Expr::Var(name) => {
-            let origin = enclosing_run(var_scope);
-            let instance = occurrences.instance();
             let count = occurrences
                 .vars
-                .entry((instance, name.clone()))
+                .entry((occurrences.scope(), name.clone()))
                 .or_insert(0);
             let occurrence = *count;
             *count += 1;
@@ -1902,8 +1962,9 @@ fn check(
             if found.hit.is_none() {
                 errors.push(ResolveError::Var(UnboundVar {
                     name: name.clone(),
-                    origin,
+                    origin: found.run.map(|(id, _)| id),
                     occurrence,
+                    module_def: occurrences.module_def(),
                 }));
             }
         }
@@ -2087,8 +2148,48 @@ fn check(
             // graph walk, just one `BTreeSet` lookup) and never revisits
             // scope/`then`, which still need the same treatment either way.
             let body_addr = body.as_ref() as *const Expr as usize;
+            let marker = ModuleRun::parse(name);
+            // #3085: a module-level def of an open run is its own counting
+            // scope, identified the way the CLI's `DefSite` table can find
+            // it again (see `ModuleDef`).
+            let module_level = marker.is_none() && occurrences.at_module_level();
+            if module_level {
+                let scope_id = occurrences.next_scope;
+                occurrences.next_scope += 1;
+                if let Some(run) = occurrences.runs.last_mut() {
+                    let written = written_def_name(name);
+                    let seen = run
+                        .ordinals
+                        .entry((written.to_string(), params.len()))
+                        .or_insert(0);
+                    let ordinal = *seen;
+                    *seen += 1;
+                    run.def = Some((
+                        scope_id,
+                        ModuleDef {
+                            name: written.to_string(),
+                            arity: params.len(),
+                            ordinal,
+                        },
+                    ));
+                }
+            }
             if reachable.contains(&body_addr) {
                 check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
+            } else if !module_level {
+                // #3085: an unreferenced body is not diagnosed, but its
+                // sites are still in the source tables the occurrence
+                // indexes point into, so they are still counted. A
+                // module-level def needs no such walk: it is a counting
+                // scope of its own, so skipping it shifts nothing.
+                let kept = errors.len();
+                check(body, scope, var_scope, label_scope, errors, reachable, occurrences);
+                errors.truncate(kept);
+            }
+            if module_level {
+                if let Some(run) = occurrences.runs.last_mut() {
+                    run.def = None;
+                }
             }
             var_scope.truncate(var_outer);
             scope.truncate(with_self);
@@ -2101,25 +2202,18 @@ fn check(
             // inside the module must be attributable back to it (see
             // `enclosing_run`), neither of which works unless the marker is
             // visible on `label_scope` too.
-            let marker = ModuleRun::parse(name);
             let is_marker = marker.is_some();
-            let mut closed_instance = None;
+            let mut closed_run = None;
             if is_marker {
                 var_scope.push(name.clone());
                 label_scope.push(name.clone());
-                // A begin opens a fresh occurrence namespace even when its
-                // file shares a canonical run id with another import. An
-                // end temporarily closes it for `then`; on return the parent
-                // traversal still needs its instance on the stack.
+                // #3085: a begin opens a fresh run frame, even when its file
+                // shares a run id with another import of the same module. An
+                // end closes it for `then`; on return the begin that opened
+                // it still owns it.
                 match &marker {
-                    Some(RunMarker::Begin { .. }) => {
-                        let instance = occurrences.next_run_instance;
-                        occurrences.next_run_instance += 1;
-                        occurrences.run_stack.push(instance);
-                    }
-                    Some(RunMarker::End { .. }) => {
-                        closed_instance = occurrences.run_stack.pop();
-                    }
+                    Some(RunMarker::Begin { .. }) => occurrences.runs.push(RunFrame::default()),
+                    Some(RunMarker::End { .. }) => closed_run = occurrences.runs.pop(),
                     None => {}
                 }
             }
@@ -2127,9 +2221,9 @@ fn check(
             var_scope.truncate(var_outer);
             if is_marker {
                 if matches!(marker, Some(RunMarker::Begin { .. })) {
-                    occurrences.run_stack.pop();
-                } else if let Some(instance) = closed_instance {
-                    occurrences.run_stack.push(instance);
+                    occurrences.runs.pop();
+                } else if let Some(run) = closed_run {
+                    occurrences.runs.push(run);
                 }
                 label_scope.pop();
             }
@@ -2182,9 +2276,8 @@ fn check(
         // misattributed against `collect_var_sites`/`collect_break_sites`
         // (both sorted by pure text offset, so the earlier-in-text pattern
         // key occupies the table slot init's occurrence index expects) --
-        // an instance of the same #2635-class residual already documented
-        // for the unrelated unreferenced-`def`-body shape, not a new,
-        // independently fixable ordering bug: swapping this visit order to
+        // a #2635-class residual, not a new, independently fixable
+        // ordering bug: swapping this visit order to
         // fix the position match was tried and reverted, since it fixes the
         // *position* only by making the *order* of the two diagnostics
         // wrong relative to jq instead.
@@ -2364,6 +2457,7 @@ fn check(
                     arity,
                     origin,
                     occurrence_index,
+                    module_def: occurrences.module_def(),
                 }));
             }
         }
@@ -3077,6 +3171,7 @@ mod tests {
                 // attribute the failure to (#2951).
                 origin: None,
                 occurrence_index: 0,
+                module_def: None,
             })]
         );
 
@@ -3113,6 +3208,7 @@ mod tests {
                 // attribute the failure to (#2951).
                 origin: None,
                 occurrence_index: 0,
+                module_def: None,
             })]
         );
     }
@@ -3742,6 +3838,7 @@ mod tests {
                     arity: 0,
                     origin: None,
                     occurrence_index: 0,
+                    module_def: None,
                 }]
             );
         }
@@ -3762,6 +3859,25 @@ mod tests {
                     arity: 0,
                     origin: None,
                     occurrence_index: 1,
+                    module_def: None,
+                }]
+            );
+        }
+
+        /// #3085: a call inside an unreferenced def body is counted but not
+        /// reported, so the failing call after it is occurrence 1 -- the
+        /// index of its own entry in the source's call-site table.
+        #[test]
+        fn occurrence_index_counts_calls_in_unreferenced_def_bodies_3085() {
+            let mut expr = parse("def u: f; f").expect("filter must parse");
+            assert_eq!(
+                resolve_func_calls_all(&mut expr),
+                [UnresolvedCall {
+                    name: "f".into(),
+                    arity: 0,
+                    origin: None,
+                    occurrence_index: 1,
+                    module_def: None,
                 }]
             );
         }

@@ -518,6 +518,10 @@ struct Parser<'a> {
     /// rationale: the position is only wanted on the compile-error path,
     /// and keeping it out of the AST leaves the break nodes untouched.
     break_sites: Vec<BreakSite>,
+    /// Every module-level `def` the parse has built, with its source span
+    /// (#3085): the counting scope the resolver's occurrence indexes are
+    /// relative to inside a module body.
+    def_sites: Vec<DefSite>,
     /// #2036 Direction 3: every identifier that appears anywhere after a
     /// `def` keyword in `input`, computed once by [`collect_def_names`] at
     /// construction. A cheap, deliberately *imprecise* over-approximation
@@ -766,13 +770,10 @@ pub struct BreakSite {
 /// (`jq::UnresolvedLabel::occurrence`) is what fingers the failing one when
 /// two same-named breaks differ only by lexical scope — "this break is under
 /// an enclosing `label $x`, that one is not" cannot be told apart by offset
-/// alone. Reachability limits that pairing, exactly as it does for
-/// `collect_var_sites`: `resolve.rs` skips the bodies of *unreferenced* `def`s
-/// (#2740), so if a same-named `break` sits inside an unreferenced `def` body
-/// textually before the failing one, the counter counts only the visited
-/// breaks and the index drifts one short (the #2635-class limitation, on top
-/// of the scope one). Everything else — string-literal decoys, bound breaks
-/// earlier in source — is handled by construction.
+/// alone. `resolve.rs` counts the breaks inside unreferenced `def` bodies
+/// too, although it does not diagnose them (#2740, #3085), so the index
+/// lines up with this table. String-literal decoys and bound breaks earlier
+/// in source are handled by construction.
 pub fn collect_break_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<BreakSite> {
     collect_sites(
         input,
@@ -780,6 +781,40 @@ pub fn collect_break_sites(input: &str, mode: ParserMode, jq_extensions: bool) -
         jq_extensions,
         |p| &mut p.break_sites,
         |b| b.offset,
+    )
+}
+
+/// A module-level `def` in a parsed module, with its source span (#3085).
+///
+/// Inside a module body the resolver counts call, variable and break sites
+/// per module-level def rather than per file (`jq::ModuleDef`), because the
+/// loader does not always splice a module's full def list: a dependency's
+/// link run keeps only the defs something references. Counting per def
+/// keeps an occurrence index pointing at the same physical site no matter
+/// which of its siblings a given copy kept, and this table is what the CLI
+/// narrows a site table to before indexing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefSite {
+    /// The def's name, as written.
+    pub name: String,
+    /// How many parameters the def declares.
+    pub arity: usize,
+    /// Byte offset of the `def` keyword.
+    pub offset: usize,
+    /// Byte offset just past the def's closing `;`.
+    pub end: usize,
+}
+
+/// Every module-level `def` in `input`, in source order (#3085) -- the
+/// span table [`DefSite`] describes. Same second-parse reasoning as
+/// [`collect_call_sites`].
+pub fn collect_def_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<DefSite> {
+    collect_sites(
+        input,
+        mode,
+        jq_extensions,
+        |p| &mut p.def_sites,
+        |d| d.offset,
     )
 }
 
@@ -869,6 +904,7 @@ impl<'a> Parser<'a> {
             call_sites: Vec::new(),
             var_sites: Vec::new(),
             break_sites: Vec::new(),
+            def_sites: Vec::new(),
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
             wrong_arity_call: None,
@@ -7765,7 +7801,14 @@ impl<'a> Parser<'a> {
 
         // Parse function definitions until we hit something that isn't one
         while self.matches_keyword("def") {
+            let offset = self.pos;
             let (name, params, body) = self.parse_func_def_parts()?;
+            self.def_sites.push(DefSite {
+                name: name.clone(),
+                arity: params.len(),
+                offset,
+                end: self.pos,
+            });
             defs.push((name, params, body));
             self.skip_ws();
         }
