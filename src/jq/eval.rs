@@ -53076,15 +53076,12 @@ fn jq_tm_field(value: i64) -> i64 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
 }
 
-// `tm_year` stores the year relative to 1900. At the negative 32-bit limit,
-// jq's conversion wraps that offset and presents the positive year 2147483648.
+// `tm_year` stores the year relative to 1900. jq subtracts the offset in a
+// 32-bit field, so years from i32::MIN through i32::MIN + 1899 wrap into
+// positive years when the formatter adds 1900 back (#3083).
 fn jq_tm_year(value: i64) -> i64 {
-    let year = jq_tm_field(value);
-    if year == i64::from(i32::MIN) {
-        i64::from(i32::MAX) + 1
-    } else {
-        year
-    }
+    let tm_year = (jq_tm_field(value) as i32).wrapping_sub(1900);
+    i64::from(tm_year) + 1900
 }
 
 /// jq's month is 0-indexed in the array; C increments the 32-bit field
@@ -86474,6 +86471,29 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-00-01T00:00:00Z"));
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_broken_down_year_offset_wraps_across_full_boundary_3083() {
+        // jq 1.7.1 stores year - 1900 in a signed 32-bit tm_year. The wrap
+        // applies to 1900 consecutive input years, not only i32::MIN.
+        for (year, displayed, timestamp) in [
+            (i32::MIN, "2147483648", 67_767_976_233_532_800.0),
+            (i32::MIN + 1, "2147483649", 67_767_976_265_155_200.0),
+            (i32::MIN + 1899, "2147485547", 67_768_036_160_140_800.0),
+        ] {
+            let array = format!("[{year},0,1,0,0,0,4,0]");
+            let format_filter = format!("{array} | strftime(\"%Y\")");
+            query!(b"null", &format_filter,
+                QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, displayed, "{format_filter}"));
+            let mktime_filter = format!("{array} | mktime");
+            query!(b"null", &mktime_filter,
+                QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+        }
+        query!(b"null", r#"[-2147481748,0,1,0,0,0,4,0] | strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147481748"));
+        query!(b"null", r"[-2147481748,0,1,0,0,0,4,0] | mktime",
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
     }
 
     #[test]
