@@ -40,6 +40,7 @@ fn test_pick_pathexps_cli_3026() -> Result<()> {
         ),
         (r#"{"a":1}"#, "pick(.x.y?)", "{\"x\":{\"y\":null}}\n"),
         (r#"{"b":2}"#, "\"b\" as $top | pick(.[$top])", "{\"b\":2}\n"),
+        (r#"{"a":[1,2]}"#, "pick(.a[0:1], .a[0])", "{\"a\":[1]}\n"),
     ] {
         let actual = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(actual, (expected.into(), String::new(), 0), "{filter}");
@@ -67,6 +68,11 @@ fn test_pick_pathexps_cli_errors_3026() -> Result<()> {
             "Invalid path expression with result {\"a\":1}",
         ),
         (r#"{"a":1}"#, "pick(.a, error(\"late\"))", "late"),
+        (
+            "\"hello\"",
+            "pick(.[0:1])",
+            "A slice of an array can only be assigned another array",
+        ),
     ] {
         let actual = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(

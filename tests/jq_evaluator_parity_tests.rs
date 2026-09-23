@@ -87,6 +87,7 @@ fn test_pick_pathexps_jq_3026() {
         (br#"{"a":{"b":1}}"#, "pick(.a.b?)", r#"{"a":{"b":1}}"#),
         (br#"{"a":1}"#, "pick(.x.y?)", r#"{"x":{"y":null}}"#),
         (br#"{"b":2}"#, "\"b\" as $top | pick(.[$top])", r#"{"b":2}"#),
+        (br#"{"a":[1,2]}"#, "pick(.a[0:1], .a[0])", r#"{"a":[1]}"#),
     ] {
         assert_eq!(full_outputs(input, filter), [expected], "{filter}");
         assert_parity(input, filter);
@@ -144,6 +145,12 @@ fn test_pick_pathexps_errors_jq_3026() {
             ". as $top | pick(.a | $top)",
             "Invalid path expression with result {\"a\":1}",
         ),
+        (
+            br#""hello""#,
+            "pick(.[0:1])",
+            "A slice of an array can only be assigned another array",
+        ),
+        (br#"{"a":1}"#, "pick(.a, error(\"late\"))", "late"),
     ] {
         let index = JsonIndex::build(input);
         let expr = parse(filter).expect("parse failed");
