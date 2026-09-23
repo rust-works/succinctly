@@ -815,7 +815,6 @@ CASES_EOF
 # comment inside the `$( )`, so the closing `)` vanished).
 read -r -d '' REFUSE_ONLY <<'REFUSE_EOF' || true
 value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
-tojson-between:tojson/fromjson are not on cannot_move_register's proven allowlist (#2041)
 def-body-in-path:a def inside path() resolves as an opaque leaf, before #2042 too
 source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
 select-wrapped-source:the witness grammar is pure navigation (is_pure_navigation); a select-wrapped source binds by value

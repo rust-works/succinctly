@@ -32920,7 +32920,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
-        // #2689: array construction on an *untracked* input. jq's `[f]`
+        // #2689/#3049: array construction on a tracked or untracked input. jq's `[f]`
         // (`gen_collect`) runs `f` with path tracking live -- unlike `{k:f}`,
         // `if f`, `select(f)`, `try f`, an `as` source or `"\(f)"`, all of
         // which suspend it -- so an INDEX/EACH inside the brackets on a value
@@ -32943,9 +32943,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // is unlimited whatever the outer `keep` -- `keep` governs how many
         // *arrays* the consumer wants, and there is exactly one.
         //
-        // Keyed on `!trackable`: a trackable input (`path([.a] | empty)`,
-        // the plain-`as` control `path(.a as $v | [.a] | ...)`) is untouched
-        // and still takes the catch-all, so the seq-level register handling
+        // #3049: a tracked input needs the same live resolution when its
+        // body can move the register. A navigation-free body such as `[1]`
+        // keeps the old catch-all: `path(. as $x | [1] | $x)` relies on
+        // preserving the register for the later `$x`. Pass ambient tracking
+        // into a resolved `inner`; its constructed array is untracked. The
+        // seq-level register handling
         // (`cannot_move_register`'s own `Array` arm) is unchanged. jq mode
         // only (ADR-0018): real yq's lexer rejects every shape that reaches
         // here, so there is no yq oracle, and yq mode keeps `skip_untracked`.
@@ -32958,13 +32961,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // pre-existing bare-stage bug with its own oracle bracket, kept on
         // the catch-all here rather than fixed in passing:
         //
-        // - `TrackedVar`: a marker *re-establishes* tracking -- `$v` whose
+        // - `TrackedVar` on an untracked input: a marker *re-establishes*
+        //   tracking -- `$v` whose
         //   frozen value is still the live register is not navigation, it is
         //   the register (#1573) -- but that comparison happens one level up
         //   in `resolve_seq_stage`, against a `carried_register` this
         //   function is not handed. Resolved from here, `[$v.b?]` saw `$v` as
         //   just another untracked value and refused `.b` where jq accepts.
-        //   #2759.
+        //   #2759. On a tracked input, the ambient register is available.
         // - `GetPath`: #2896 made the `keys.is_empty()` arm *defer* in jq
         //   mode -- the only mode this guard runs in -- so the eager refusal
         //   this exclusion was originally written against is gone. It is
@@ -32990,25 +32994,25 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // The scan is O(|inner|), the same order as resolving it.
         Expr::Array(inner)
             if S::TAG == EvalTag::Jq
-                && !trackable
+                && (!trackable || !cannot_move_register(inner))
                 && !any_subexpr(inner, &mut |e| {
-                    matches!(
-                        e,
-                        Expr::TrackedVar(_)
-                            | Expr::Optional(_)
-                            | Expr::Builtin(
-                                Builtin::GetPath(_)
-                                    | Builtin::RecurseF(_)
-                                    | Builtin::RecurseCond(_, _)
-                            )
-                    )
+                    (!trackable && matches!(e, Expr::TrackedVar(_)))
+                        || matches!(
+                            e,
+                            Expr::Optional(_)
+                                | Expr::Builtin(
+                                    Builtin::GetPath(_)
+                                        | Builtin::RecurseF(_)
+                                        | Builtin::RecurseCond(_, _)
+                                )
+                        )
                 }) =>
         {
             let mut items = Vec::new();
             let flow = resolve_node_sink::<S>(
                 inner,
                 value,
-                false,
+                trackable,
                 snapshot,
                 frame,
                 Keep::AtMost(usize::MAX),
@@ -34676,6 +34680,9 @@ fn cannot_move_register(expr: &Expr) -> bool {
             None => true,
         },
 
+        // `fromjson` parses its input without indexing it. Its result can
+        // re-establish a null register by jq's null identity rule; otherwise
+        // the ordinary identity check still rejects rebuilt values (#3049).
         Expr::Builtin(builtin) => matches!(
             builtin,
             Builtin::Type
@@ -34686,6 +34693,7 @@ fn cannot_move_register(expr: &Expr) -> bool {
                 | Builtin::ToString
                 | Builtin::ToNumber
                 | Builtin::ToJson
+                | Builtin::FromJson
         ),
 
         // #2860: a nested `reduce`/`foreach` whose SOURCE/INIT/UPDATE
@@ -63048,6 +63056,38 @@ mod tests {
                 other => panic!("unexpected result: {:?}", other),
             }
         }};
+    }
+
+    #[test]
+    fn test_tracked_array_inner_navigation_refuses_3049() {
+        for (doc, filter) in [
+            ("null", r"path([[1] | .[0]] | empty)"),
+            (
+                r#"{"a":[1],"b":{"k":1}}"#,
+                concat!("path([.b | {", "k:1} | .k] | empty)"),
+            ),
+            (
+                r#"{"a":[1],"b":{"k":1}}"#,
+                r"path(.b as $x | [$x.k] | empty)",
+            ),
+        ] {
+            query!(doc.as_bytes(), filter,
+                QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {e:?}");
+                }
+            );
+        }
+        assert!(outputs(br#"{"a":[1],"b":{"k":1}}"#, "path([.b.k] | empty)").is_empty());
+        let null_child = br#"{"x":{"a":1}}"#;
+        assert_eq!(
+            outputs(null_child, "path(.x | .x | tojson | fromjson | .a)"),
+            [r#"["x","x","a"]"#]
+        );
+        assert!(outputs(
+            null_child,
+            "path(.x | [.x | tojson | fromjson | .a] | empty)"
+        )
+        .is_empty());
     }
 
     /// Like `query!`, but parses in `ParserMode::Yq` and evaluates with
@@ -99070,6 +99110,13 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // #3049: `fromjson` does not move the register. The marker can
+            // restore it after the reconstructed value, as jq does.
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | tojson | fromjson | $y)",
+                r#"[["a"]]"#,
+            ),
             // negative-index-spelling, refuse-only until #3177: `.[-2]` is
             // stored as written and never matches `.[0]`'s bind path, but
             // it lands on the very element `$y` was bound from, and the
@@ -99515,8 +99562,7 @@ mod tests {
     /// pinned so that closing one is a visible edit here rather than a
     /// silent flip: a value-mode binding has no path (`eval_as` never
     /// resolves its source; the accepting-direction twin of #2642),
-    /// `tojson`/`fromjson` are not on `cannot_move_register`'s proven
-    /// allowlist (#2041), a `def` inside `path()` resolves as an opaque leaf,
+    /// a `def` inside `path()` resolves as an opaque leaf,
     /// and a source navigating inside a construction is refused by the
     /// resolver where jq's suspended tracking allows it, so it binds a
     /// plain value. The last four rows (#2042 review) are not about the
@@ -99533,12 +99579,6 @@ mod tests {
             (
                 br#"{"a":{"b":1}}"#,
                 ".a as $y | path(.a | $y)",
-                r#"[["a"]]"#,
-            ),
-            // tojson-between
-            (
-                br#"{"a":{"b":1}}"#,
-                "path(.a as $y | .a | tojson | fromjson | $y)",
                 r#"[["a"]]"#,
             ),
             // def-body-in-path
