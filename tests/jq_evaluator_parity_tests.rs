@@ -1613,6 +1613,42 @@ fn test_range_bound_retry_consumes_sink_stop_3031() {
     assert_eq!(generic_outputs(b"0", filter), ["[1,5]"]);
 }
 
+#[test]
+fn test_parenthesized_bind_array_collector_control_3031() {
+    // These shapes enter the eager array collector through Try/Label while
+    // leaving a pattern retry live inside the body.
+    let null = b"null";
+    for (filter, expected) in [
+        ("[try [([1] as [$x] ?// $x | $x)]]", "[[1]]"),
+        ("[try (([1] as [$x] ?// $x | $x)?)]", "[1]"),
+    ] {
+        assert_eq!(full_outputs(null, filter), [expected], "{filter}");
+        assert_eq!(generic_outputs(null, filter), [expected], "{filter}");
+    }
+
+    let error = r#"[try ([1] as [$x] ?// $x | error("inner")) catch error("boom")]"#;
+    assert_error_parity(null, error);
+    let invalid = br#"{"bad":"\x"}"#;
+    assert_error_parity(invalid, "[try (1 as $x ?// $y | .bad) catch empty]");
+    assert_error_parity(invalid, "(. as $x ?// $y | $x) | .bad");
+    let filter = "([1] as [$x] ?// $x | .bad) | .";
+    let index = JsonIndex::build(invalid);
+    let expr = parse(filter).expect("parse failed");
+    match eval::<Vec<u64>, JqSemantics>(&expr, index.root(invalid)) {
+        QueryResult::Error(error) => {
+            assert!(error.message.contains("invalid escape sequence"), "{error}");
+        }
+        other => panic!("expected a decode error from {filter}, got {other:?}"),
+    }
+
+    let break_outer = "label $out | [label $inner | ([1] as [$x] ?// $x | break $out)]";
+    assert_eq!(full_outputs(null, break_outer), Vec::<String>::new());
+    assert_eq!(generic_outputs(null, break_outer), Vec::<String>::new());
+    let halt = "[try ([1] as [$x] ?// $x | halt)]";
+    assert_eq!(full_outputs(null, halt), Vec::<String>::new());
+    assert_eq!(generic_outputs(null, halt), Vec::<String>::new());
+}
+
 /// #1519, cursor-backed twin of the row above: the generic evaluator keeps a
 /// single `first(...)` item cursor-backed (`generic_item_to_result`) but has to
 /// route a multi-item `?//` retry through the batch adapter instead, so the two
