@@ -269,26 +269,6 @@ DEFAULT_THRESHOLD = 5.0
 # scan (-8.2% ARM64 / +2.2% x86_64 against its own merge-base) until #2963
 # removed it.
 #
-# `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999):
-# a drift that is *faster* on both architectures. Structural sharing in
-# `OwnedValue` (ADR-0024, option C) turned the whole-document copy that
-# `del(paths)` kept beside its result for path resolution into a refcount
-# bump, and measured by this guard on its own runners against the PR's
-# merge-base:
-#
-#                          users_del_select   users_del_bound_select   users_yq_del_select
-#   ARM64-Linux                 -13.2%               -13.2%                 -6.5%
-#   x86_64                      -11.3%               -11.3%                 -4.9%
-#
-# Every other row is within +2.3% (`users_path_walk`, the per-emitted-path
-# array's refcount box) and -0.2%. The guard is `abs(drift)`, so an accepted
-# improvement needs the same override a regression would; 20% / 20% / 12%
-# clear the measured numbers with headroom while still catching a further
-# move on top of them in either direction.
-#
-# **Remove these three entries once `main` has moved past #2999** (the rule
-# above). Tracked by #3077.
-#
 # `users_identity` (#2720): faster on both architectures. The identity writer
 # no longer materializes every field of an object (a 144-byte `DocumentField`
 # each, decoded up front) before writing the first one; it validates the
@@ -299,29 +279,15 @@ DEFAULT_THRESHOLD = 5.0
 # +0.4% (the `keys_unsorted` rows, for the `,` arm #2720's review added to
 # the key-only value-delimiter scan).
 # 12% clears the measured number with headroom; remove once `main` has moved
-# past #2720, per the rule above (alongside #3077's three).
+# past #2720, per the rule above.
 #
-# `users_assign_scores` (#3009): faster on both architectures. A write
-# produces an owned document and then prints it, and printing one used to
-# rebuild the whole tree as `lazy::JqValue` first -- freeing each source map
-# and allocating the destination one, which since #3000 lands in a different
-# allocator bin. #3009 prints the owned tree directly. Measured by this guard
-# on its own runners against the PR's merge-base:
-#
-#                          users_assign_scores   users_del_select   users_del_bound_select
-#   ARM64-Linux                  -6.4%               -5.7%                -5.5%
-#   x86_64                       -6.3%               -5.6%                -5.5%
-#
-# `arrays_map_iterate` (the `LazySeq` route, which #3009 does not touch)
-# reads -0.3%/-0.4%; every other row is within +/-0.0%.
-# 12% clears the measured number with headroom, matching #2720's entry for
-# a move of the same size. Remove once `main` has moved past #3009, per the
-# rule above -- tracked by #3161.
-#
-# The two `del` rows need no entry of their own *only because* #2999's 20%
-# entries above already cover them: #3009 moves them past the 5% default
-# too. So #3077 must not remove those two until `main` carries #3009 as
-# well, or they fail at the default -- #3161 records the coupling.
+# `users_del_select` / `users_del_bound_select` / `users_yq_del_select` (#2999)
+# and `users_assign_scores` (#3009) carried overrides of the same kind --
+# structural sharing in `OwnedValue` (ADR-0024, option C) and printing an
+# owned result directly instead of rebuilding it (#3000's residual) each made
+# a write/`del` shape faster. Both changes are now in `main`; the entries
+# were removed together (#3077, #3161) once every row read ~0% again against
+# a merge-base that already included both.
 #
 # `users_compact_identity` (#2608): faster on both architectures, measured
 # against the PR's own merge-base (~-66% Ir, see the `QUERIES` comment
@@ -361,11 +327,7 @@ DEFAULT_THRESHOLD = 5.0
 # merge-base includes the same code and this row reads ~0% again.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
-    "users_del_select": 20.0,
-    "users_del_bound_select": 20.0,
-    "users_yq_del_select": 12.0,
     "users_identity": 12.0,
-    "users_assign_scores": 12.0,
     "users_compact_identity": 75.0,
     "users_compact_latefail": 20.0,
     "arrays_first_map_iterate": 10.0,
