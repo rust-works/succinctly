@@ -11,6 +11,65 @@ use anyhow::Result;
 use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
+/// Captured from /usr/bin/jq 1.7.1-apple for both CLI input routes.
+#[test]
+fn test_parenthesized_pattern_bind_pipe_retry_cli_3031() -> Result<()> {
+    let bind = "[1] as [$x] ?// $x | if $x == 1 then 9 else empty end";
+    for (filter, expected) in [
+        (format!("[first((({bind}) | 3), 5)]"), "[3,5]\n"),
+        (format!("[limit(1; (({bind}) | 3), 5)]"), "[3,5]\n"),
+        (
+            format!("[label $o | ((({bind}) | 3), 5) | ., break $o]"),
+            "[3,5]\n",
+        ),
+        (format!("[isempty((({bind}) | 3), 5)]"), "[false,false]\n"),
+        (format!("[first((({bind}) | 3), 5), 6]"), "[3,5,6]\n"),
+        (format!("[first((({bind}) | 3 | 4), 5)]"), "[4,5]\n"),
+        (
+            format!("[try ((({bind}) | error(\"e\")), 5) catch \"c\"]"),
+            "[5]\n",
+        ),
+        (format!("[first(({bind} | 3), 5)]"), "[3,5]\n"),
+        (format!("[first((({bind})), 5)]"), "[9,5]\n"),
+        (format!("[(({bind}) | 3), 5]"), "[3,5]\n"),
+    ] {
+        for input in [None, Some("0")] {
+            let args = if input.is_none() {
+                vec!["-nc", &filter]
+            } else {
+                vec!["-c", &filter]
+            };
+            assert_eq!(
+                run_jq_full(&args, input)?,
+                (expected.into(), String::new(), 0),
+                "{filter} on {input:?}"
+            );
+        }
+    }
+
+    let filter = r#"(. as [$a] ?// $a | $a) | if type == "number" then error("e") else . end"#;
+    assert_eq!(
+        run_jq_full(&["-c", filter], Some("[1]"))?,
+        ("[1]\n".into(), String::new(), 0)
+    );
+    let range = "[first(range(([1] as [$x] ?// $x | if $x == 1 then 1 else empty end); 3), 5)]";
+    assert_eq!(
+        run_jq_full(&["-nc", range], None)?,
+        ("[1,5]\n".into(), String::new(), 0)
+    );
+    assert_eq!(
+        run_jq_full(
+            &[
+                "-nc",
+                "first((1 as $x ?// $y | 1) as $v | (\"h\"|halt_error(3)))"
+            ],
+            None
+        )?,
+        (String::new(), "h".into(), 3)
+    );
+    Ok(())
+}
+
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
 use cargo_run_exit::{

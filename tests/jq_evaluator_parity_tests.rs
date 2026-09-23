@@ -1568,6 +1568,51 @@ fn test_parity_pattern_alternatives_under_short_circuit_1519() {
     }
 }
 
+#[test]
+fn test_parenthesized_pattern_bind_pipe_retry_3031() {
+    let input = b"0";
+    let bind = "[1] as [$x] ?// $x | if $x == 1 then 9 else empty end";
+    for (filter, expected) in [
+        (format!("[first((({bind}) | 3), 5)]"), "[3,5]"),
+        (format!("[limit(1; (({bind}) | 3), 5)]"), "[3,5]"),
+        (
+            format!("[label $o | ((({bind}) | 3), 5) | ., break $o]"),
+            "[3,5]",
+        ),
+        (format!("[isempty((({bind}) | 3), 5)]"), "[false,false]"),
+        (format!("[first((({bind}) | 3), 5), 6]"), "[3,5,6]"),
+        (format!("[first((({bind}) | 3 | 4), 5)]"), "[4,5]"),
+        (
+            format!("[try ((({bind}) | error(\"e\")), 5) catch \"c\"]"),
+            "[5]",
+        ),
+        (format!("[first(({bind} | 3), 5)]"), "[3,5]"),
+        (format!("[first((({bind})), 5)]"), "[9,5]"),
+        (format!("[(({bind}) | 3), 5]"), "[3,5]"),
+    ] {
+        assert_eq!(full_outputs(input, &filter), [expected], "full: {filter}");
+        assert_eq!(
+            generic_outputs(input, &filter),
+            [expected],
+            "generic: {filter}"
+        );
+    }
+}
+
+#[test]
+fn test_parenthesized_bind_consumes_downstream_error_3031() {
+    let filter = r#"(. as [$a] ?// $a | $a) | if type == "number" then error("e") else . end"#;
+    assert_eq!(full_outputs(br"[1]", filter), ["[1]"]);
+    assert_eq!(generic_outputs(br"[1]", filter), ["[1]"]);
+}
+
+#[test]
+fn test_range_bound_retry_consumes_sink_stop_3031() {
+    let filter = "[first(range(([1] as [$x] ?// $x | if $x == 1 then 1 else empty end); 3), 5)]";
+    assert_eq!(full_outputs(b"0", filter), ["[1,5]"]);
+    assert_eq!(generic_outputs(b"0", filter), ["[1,5]"]);
+}
+
 /// #1519, cursor-backed twin of the row above: the generic evaluator keeps a
 /// single `first(...)` item cursor-backed (`generic_item_to_result`) but has to
 /// route a multi-item `?//` retry through the batch adapter instead, so the two

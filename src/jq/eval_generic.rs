@@ -7981,6 +7981,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 return GenericResult::One(value);
             }
 
+            // Keep the bind alive while a downstream stop/error unwinds into
+            // its next alternative; the eager fold below runs it too soon.
+            if matches!(exprs.first(), Some(Expr::Paren(inner)) if matches!(inner.as_ref(), Expr::AsPattern { .. }))
+            {
+                return collect_each_generic::<S, V>(expr, value, optional, cursor);
+            }
+
             // #2416 step 3: the owned identity pipe lives in the sink route;
             // the staged fold below would hand its owned values to
             // `eval_on_owned` with no position.
@@ -8482,11 +8489,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         }
 
         Expr::Array(inner) => {
+            // A label break or try escape may be consumed by a `?//` retry
+            // in its body, so collect those forms from the sink route too.
             // A loop followed by a projection must reach the projection's
             // sink before its next state is retained. `eval_single` first
             // collects every whole state, which can keep thousands of
             // unchanged long literals alive for `[while(... ) | .i]`.
-            if matches!(inner.as_ref(), Expr::Pipe(stages) if stages.iter().any(|stage| matches!(stage, Expr::While { .. } | Expr::Until { .. })))
+            if matches!(inner.as_ref(), Expr::Label { .. } | Expr::Try { .. })
+                || matches!(inner.as_ref(), Expr::Pipe(stages) if stages.iter().any(|stage| matches!(stage, Expr::While { .. } | Expr::Until { .. })))
             {
                 let mut items = Vec::new();
                 let mut conversion_error = None;
@@ -12262,6 +12272,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     let mut downstream: Option<Flow> = None;
+    let mut stopped_at = crate::jq::eval::pipe_retry_generation();
     // #2416 step 3: an owned value leaving the cursor domain at `first`
     // carries its identity into the rest of the pipe when a later stage
     // reads path context. Decided once, statically, so the per-item closure
@@ -12319,16 +12330,22 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
-                other => stop_with_downstream(&mut downstream, other),
+                other => {
+                    let demand = stop_with_downstream(&mut downstream, other);
+                    stopped_at = crate::jq::eval::pipe_retry_generation();
+                    demand
+                }
             }
         });
         eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
     };
 
-    match downstream {
-        Some(flow) => flow,
-        None => upstream,
-    }
+    crate::jq::eval::pipe_terminal_after_retry(
+        upstream,
+        downstream,
+        stopped_at,
+        crate::jq::eval::direct_pattern_retry(first),
+    )
 }
 
 /// One entry of a yq-mode *context list* (#2451): the succinctly spelling of
@@ -13731,6 +13748,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     // record an escape it discovers on its own.
     let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
     let mut sink_stopped = false;
+    let mut sink_stopped_at = crate::jq::eval::pipe_retry_generation();
 
     // See `each_range`'s own note (#3071): the 1-arg/2-arg call shapes (no
     // explicit step expression) select the float path's NaN-tolerant loop
@@ -13761,6 +13779,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         for v in values {
             if sink.push(GenericItem::Owned(v)) == Demand::Stop {
                 sink_stopped = true;
+                sink_stopped_at = crate::jq::eval::pipe_retry_generation();
                 return Demand::Stop;
             }
         }
@@ -13848,7 +13867,12 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         }
     });
 
-    if sink_stopped {
+    let direct_retry = crate::jq::eval::direct_pattern_retry(from)
+        || to.is_some_and(crate::jq::eval::direct_pattern_retry)
+        || step.is_some_and(crate::jq::eval::direct_pattern_retry);
+    if sink_stopped
+        && !crate::jq::eval::retry_consumed_stop(&from_flow, sink_stopped_at, direct_retry)
+    {
         return Flow::Stopped { pending: None };
     }
     match escape.into_inner() {
