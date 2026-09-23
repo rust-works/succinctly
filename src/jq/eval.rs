@@ -11801,6 +11801,9 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 10: Object functions
         Builtin::ModuleMeta => builtin_modulemeta::<W>(value, optional),
+        Builtin::Pick(arg) if S::TAG == EvalTag::Jq => {
+            builtin_pick_pathexps::<W, S>(arg, value, optional)
+        }
         Builtin::Pick(keys) => builtin_pick::<W, S>(keys, value, optional),
         Builtin::Omit(keys) => builtin_omit::<W, S>(keys, value, optional),
 
@@ -57142,6 +57145,59 @@ fn builtin_modulemeta<W: Clone + AsRef<[u64]>>(
     })
 }
 
+/// jq's `pick(pathexps)`: fold the paths against one immutable input.
+///
+/// Keeping the original input separate from the output matters for overlapping
+/// paths. This also avoids introducing a synthetic `$top` binding that could
+/// capture a variable in the user's path expression.
+fn builtin_pick_pathexps<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let input = to_owned_or_suppress!(&value, optional);
+    pick_pathexps_on_owned::<W, S>(path_expr, &input, optional)
+}
+
+pub(crate) fn pick_pathexps_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let mut output = OwnedValue::Null;
+    let mut write_error = None;
+    let flow = each_path_on_owned::<S>(path_expr, input, optional, &mut |path| {
+        let OwnedValue::Array(parts) = path else {
+            unreachable!("path expressions emit path arrays")
+        };
+        let selected = match getpath_walk_owned_segments::<W, S>(input, &parts, false) {
+            QueryResult::Owned(value) => value,
+            QueryResult::Error(error) => {
+                write_error = Some(error);
+                return Demand::Stop;
+            }
+            _ => unreachable!("getpath on a path array produces one value or an error"),
+        };
+        let current = core::mem::replace(&mut output, OwnedValue::Null);
+        match set_value_at_path(current, &parts, selected) {
+            Ok(value) => output = value,
+            Err(error) => {
+                write_error = Some(error);
+                return Demand::Stop;
+            }
+        }
+        Demand::Continue
+    });
+    if let Some(error) = write_error {
+        return suppress_or_raise(error, optional);
+    }
+    match flow {
+        Flow::Exhausted => QueryResult::Owned(output),
+        Flow::Escaped(control) => control_to_result(control),
+        Flow::Stopped { .. } => unreachable!("pick consumes every path unless a write failed"),
+    }
+}
+
 /// Builtin: pick(keys) - select only specified keys from object/array (yq)
 fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     keys_expr: &Expr,
@@ -63187,17 +63243,11 @@ mod tests {
     /// shape, same per-kept-value conversion in both its Object and Array
     /// arms) and needs the identical five-site fix.
     ///
-    /// Neither builtin is yq-only despite the doc comment on this function
-    /// previously claiming so (code review, #2001): both are reachable and
-    /// functional under `JqSemantics` too (real jq itself has no `pick`/
-    /// `omit`, but `succinctly jq` accepts both as its own extension --
-    /// live-verified: `succinctly jq 'pick([0])'`/`'omit([1])'` on
-    /// `[{"x":1,"y"},2,3]` both exit 5, matching the raise this whole gap
-    /// is about). Checked under both semantics below for that reason, not
-    /// just yq's -- unlike `eval_single`'s array-slice arm above, `?` *is*
-    /// reachable here through real CLI syntax (`pick([0])?` exits 0
-    /// live-verified), so a regression in either mode is not merely an
-    /// internal-consistency concern.
+    /// Historically both builtins were dispatched in jq and yq modes. #3026
+    /// routes jq-mode `pick` to jq's path-expression implementation; these
+    /// direct calls under `JqSemantics` now check this helper's internal
+    /// conversion rule, while yq-mode `pick` and both-mode `omit` remain
+    /// reachable through the public evaluator.
     ///
     /// The malformed member must be nested inside the *picked*/*kept*
     /// value, not the top-level document `pick`/`omit` themselves iterate
@@ -65480,12 +65530,12 @@ mod tests {
             "tojson",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
-        query!(
+        yq_query!(
             &b"{\"a\":\"\xff\xfe\",\"b\":2}"[..],
             "pick([\"a\"])",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
-        query!(
+        yq_query!(
             &b"[1,\"\xff\xfe\"]"[..],
             "pick([1])",
             QueryResult::Error(e) if e.is_decode_failure() => {}
@@ -65545,12 +65595,12 @@ mod tests {
         query!(br"[1]", "tojson",
             QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "[1]"); }
         );
-        query!(br#"{"a":1,"b":2}"#, "pick([\"a\"])",
+        yq_query!(br#"{"a":1,"b":2}"#, "pick([\"a\"])",
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
             }
         );
-        query!(br"[1,2]", "pick([1])",
+        yq_query!(br"[1,2]", "pick([1])",
             QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v, vec![OwnedValue::Int(2)]); }
         );
         query!(br#"{"a":1,"b":2}"#, "omit([\"b\"])",
@@ -65601,7 +65651,7 @@ mod tests {
     /// (empty-string-named) field entirely rather than erroring.
     #[test]
     fn test_pick_omit_keys_expression_raises_on_decode_failure_1755() {
-        query!(
+        yq_query!(
             &b"{\"a\":1,\"k\":[\"\xff\xfe\"]}"[..],
             "pick(.k)",
             QueryResult::Error(e) if e.is_decode_failure() => {}
@@ -65617,7 +65667,7 @@ mod tests {
         // *first* output (`v.into_iter().next()`), so a malformed field
         // must be the first of the two to actually reach that arm's own
         // `to_owned` call.
-        query!(
+        yq_query!(
             &b"{\"a\":1,\"k1\":[\"\xff\xfe\"],\"k2\":[\"b\"]}"[..],
             "pick((.k1,.k2))",
             QueryResult::Error(e) if e.is_decode_failure() => {}
@@ -65631,7 +65681,7 @@ mod tests {
         // reaches `keys_owned`'s `QueryResult::Many` arm and its own
         // `to_owned` success path -- distinct from the
         // decode-failure case above.
-        query!(
+        yq_query!(
             &b"{\"a\":1,\"b\":2,\"k1\":[\"a\"],\"k2\":[\"c\"]}"[..],
             "pick((.k1,.k2))",
             QueryResult::Owned(OwnedValue::Object(o)) => {
@@ -65651,7 +65701,7 @@ mod tests {
         // literal array) reaches the `QueryResult::One` arm -- distinct
         // from the literal-array case in the positive-control test above,
         // which resolves to `QueryResult::Owned` instead.
-        query!(br#"{"a":1,"b":2,"k":["a"]}"#, "pick(.k)",
+        yq_query!(br#"{"a":1,"b":2,"k":["a"]}"#, "pick(.k)",
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
                 assert!(!o.contains_key("b"));
@@ -65676,7 +65726,7 @@ mod tests {
     #[test]
     fn test_builtin_pick_finds_undecodable_key_via_fallback_spelling_1829() {
         let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
-        query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
+        yq_query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(o.len(), 1);
                 assert_eq!(o.get("\u{fffd}\u{fffd}"), Some(&OwnedValue::Int(1)));
@@ -65710,7 +65760,7 @@ mod tests {
     /// (a shrunk or unaffected object, not an error).
     #[test]
     fn test_builtin_pick_omit_raise_on_structurally_malformed_key_1829() {
-        query!(br#"{"a":1,"b"}"#, "pick([\"a\"])",
+        yq_query!(br#"{"a":1,"b"}"#, "pick([\"a\"])",
             QueryResult::Error(_) => {}
         );
         query!(br#"{"a":1,"b"}"#, "omit([\"c\"])",
@@ -65722,7 +65772,7 @@ mod tests {
     /// `pick`/`omit` too.
     #[test]
     fn test_builtin_pick_omit_raise_on_malformed_delimiter_1829() {
-        query!(br#"{"a" 1, "b": 2}"#, "pick([\"b\"])",
+        yq_query!(br#"{"a" 1, "b": 2}"#, "pick([\"b\"])",
             QueryResult::Error(_) => {}
         );
         query!(br#"{"a" 1, "b": 2}"#, "omit([\"b\"])",
@@ -65805,26 +65855,14 @@ mod tests {
         }
     }
 
-    /// #1829 code review: the object arm's `effective_fields_checked`
-    /// rewrite collapses a duplicate key to its last occurrence *before*
-    /// `pick` ever looks for it (jq mode) -- real jq collapses a repeated
-    /// document key at parse time, before any filter runs (`{"a":1,"a":2}
-    /// | .` is `{"a":2}`, confirmed live against jq 1.7.1), so `pick`
-    /// finding the *last* value here isn't a `pick`-specific policy, it's
-    /// `pick` correctly seeing the same document jq itself would. The old
-    /// raw `for field in *fields` scan `effective_fields_checked` replaced
-    /// found the *first* occurrence instead (`{"a":1}`), an undocumented
-    /// side effect this PR's diff didn't call out; pinned here so a future
-    /// change back to a raw scan doesn't silently regress it. `omit` is
-    /// unaffected either way -- its `IndexMap::insert` overwrite-on-
-    /// duplicate-key already produced last-value-wins under the old scan
-    /// too, since it walks (and inserts) every occurrence rather than
-    /// stopping at the first match the way `pick`'s lookup does.
+    /// jq collapses a repeated document key to its last value before
+    /// evaluating the path expression. This now exercises jq's path-based
+    /// `pick(.a)` rather than yq's `pick(["a"])` form.
     #[test]
     fn test_builtin_pick_finds_last_value_for_duplicate_key_1829() {
-        query!(br#"{"a":1,"a":2}"#, "pick([\"a\"])",
+        query!(br#"{"a":1,"a":2}"#, "pick(.a)",
             QueryResult::Owned(OwnedValue::Object(o)) => {
-                assert_eq!(o.get("a"), Some(&OwnedValue::Int(2)));
+                assert_eq!(o.get("a").map(OwnedValue::to_json).as_deref(), Some("2"));
             }
         );
     }
@@ -65839,7 +65877,7 @@ mod tests {
     #[test]
     fn test_builtin_pick_raises_on_colliding_fallback_keys_1829() {
         let doc: &[u8] = b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}";
-        query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
+        yq_query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
             QueryResult::Error(_) => {}
         );
     }
@@ -73105,9 +73143,9 @@ mod tests {
         // `test_assign_multi_output_rhs_errors_after_partial_output`, which
         // now pins the matching-jq `Partial` behavior instead.
 
-        // `pick`/`omit` key expressions. jq 1.7.1 rejects both filters
-        // outright ("Invalid path expression"), a separate pre-existing gap.
-        query!(br#"{"a":1,"b":2}"#, r#"pick((["a"],error("x")))"#,
+        // yq-style `pick`/`omit` key expressions take their first output.
+        // jq-mode `pick` now resolves a path expression instead.
+        yq_query!(br#"{"a":1,"b":2}"#, r#"pick((["a"],error("x")))"#,
             QueryResult::Owned(OwnedValue::Object(m)) => {
                 assert_eq!(m.len(), 1);
                 assert!(m.contains_key("a"));

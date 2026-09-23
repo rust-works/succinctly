@@ -61,6 +61,115 @@ fn assert_parity(json: &[u8], filter: &str) {
 }
 
 #[test]
+fn test_pick_pathexps_jq_3026() {
+    for (input, filter, expected) in [
+        (br#"{"a":1,"n":5}"#.as_slice(), "pick(.n)", r#"{"n":5}"#),
+        (
+            br#"{"a":{"b":1,"c":2},"d":3}"#,
+            "pick(.a.b)",
+            r#"{"a":{"b":1}}"#,
+        ),
+        (br"[1,2,3]", "pick(.[1])", "[null,2]"),
+        (
+            br#"{"a":1,"b":2,"c":3}"#,
+            "pick(.a, .c)",
+            r#"{"a":1,"c":3}"#,
+        ),
+        (br#"{"a":1}"#, "pick(.x.y)", r#"{"x":{"y":null}}"#),
+        (b"null", "pick(.a)", r#"{"a":null}"#),
+        (br"[1]", "pick(.[3])", "[null,null,null,null]"),
+        (br#"{"a":1,"b":2}"#, "pick(.a, .a)", r#"{"a":1}"#),
+        (
+            br#"{"a":1,"b":2}"#,
+            "first(pick(.a, .b))",
+            r#"{"a":1,"b":2}"#,
+        ),
+        (br#"{"a":{"b":1}}"#, "pick(.a.b?)", r#"{"a":{"b":1}}"#),
+        (br#"{"a":1}"#, "pick(.x.y?)", r#"{"x":{"y":null}}"#),
+        (br#"{"b":2}"#, "\"b\" as $top | pick(.[$top])", r#"{"b":2}"#),
+        (br#"{"a":[1,2]}"#, "pick(.a[0:1], .a[0])", r#"{"a":[1]}"#),
+    ] {
+        assert_eq!(full_outputs(input, filter), [expected], "{filter}");
+        assert_parity(input, filter);
+    }
+}
+
+#[test]
+fn test_pick_keys_yq_3026() {
+    for (input, filter, expected) in [
+        (
+            br#"{"a":1,"n":5}"#.as_slice(),
+            "pick([\"a\"])",
+            r#"{"a":1}"#,
+        ),
+        (br"[10,20,30,1]", "pick([.[-1]])", "[20]"),
+        (br"[10,20,30,1.0]", "pick([.[-1]])", "[20]"),
+    ] {
+        let index = JsonIndex::build(input);
+        let expr = succinctly::jq::parse_with_mode(filter, succinctly::jq::ParserMode::Yq)
+            .expect("parse failed");
+        let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, YqSemantics>(&expr, index.root(input));
+        let full: Vec<_> = full
+            .collect_owned::<YqSemantics>()
+            .iter()
+            .map(succinctly::jq::OwnedValue::to_json)
+            .collect();
+        let generic =
+            eval_generic::eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(input));
+        let generic: Vec<_> = generic
+            .collect_owned::<YqSemantics>()
+            .expect("materializes")
+            .iter()
+            .map(succinctly::jq::OwnedValue::to_json)
+            .collect();
+        assert_eq!(full, [expected], "{filter}");
+        assert_eq!(generic, full, "{filter}");
+    }
+}
+
+#[test]
+fn test_pick_pathexps_errors_jq_3026() {
+    for (input, filter, message) in [
+        (
+            br"[1,2,3]".as_slice(),
+            "pick(.[-1])",
+            "Out of bounds negative array index",
+        ),
+        (
+            br#"{"a":1,"n":5}"#,
+            "pick([\"a\"])",
+            "Invalid path expression with result [\"a\"]",
+        ),
+        (
+            br#"{"a":1}"#,
+            ". as $top | pick(.a | $top)",
+            "Invalid path expression with result {\"a\":1}",
+        ),
+        (
+            br#""hello""#,
+            "pick(.[0:1])",
+            "A slice of an array can only be assigned another array",
+        ),
+        (br#"{"a":1}"#, "pick(.a, error(\"late\"))", "late"),
+    ] {
+        let index = JsonIndex::build(input);
+        let expr = parse(filter).expect("parse failed");
+        let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, index.root(input));
+        match full {
+            QueryResult::Error(error) => assert_eq!(error.message, message, "{filter}"),
+            other => panic!("expected jq error for {filter}, got {other:?}"),
+        }
+        let generic = eval_generic::eval_with_cursor(&expr, index.root(input));
+        match generic {
+            eval_generic::GenericResult::Error(error) => {
+                assert_eq!(error.message, message, "{filter}");
+            }
+            other => panic!("expected generic jq error for {filter}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn test_parity_values_builtin() {
     // `values` drops null inputs.
     assert_parity(br"[1,null,2,null,3]", "[.[] | values]");
@@ -868,10 +977,7 @@ fn test_parity_number_literal_reaches_more_numeric_arg_builtins_387() {
         (br"[10,20,30,1.7]", "setpath([.[-1]]; 99)", "[10,99,30,1.7]"),
         (br"[2020.0,0,1,0,0,0]", "mktime", "1577836800"),
         (br"[1,2,3,2]", "[combinations(.[-1])] | length", "16"),
-        // Both an Int- and a Float-repr'd `NumberLiteral` index.
-        (br"[10,20,30,1]", "pick([.[-1]])", "[20]"),
         (br"[10,20,30,1]", "omit([.[-1]])", "[10,30,1]"),
-        (br"[10,20,30,1.0]", "pick([.[-1]])", "[20]"),
         (br"[10,20,30,1.0]", "omit([.[-1]])", "[10,30,1.0]"),
         (br"1e100", "tonumber", "1E+100"),
         (br"1e2", "@sh", "\"1E+2\""),
