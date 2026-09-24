@@ -134,6 +134,62 @@ fn refill_boundaries(raw_bytes: &[(Option<usize>, Vec<u8>)], size_limit: bool) -
     boundaries
 }
 
+/// [`Reader::yielded_at`]'s marker for a value jq's EOF branch yields.
+const YIELDED_AT_EOF: usize = usize::MAX;
+
+/// jq's `(source index, line)` for each yield offset (ascending, as
+/// [`Reader::yielded_at`] records them), per jq 1.7.1's `src/util.c`:
+/// `jq_util_input_read_more` names the file it is reading and bumps
+/// `current_line` for every `fgets` chunk holding a newline, and a value is
+/// reported with whatever those were when it was yielded (#3250).
+///
+/// So the file is the one holding the yielding byte -- a string or container
+/// yields on its own closing byte, which is why `"x"` at the very end of one
+/// file belongs to that file, not the next -- and the line counts every
+/// newline up to the end of the [`fgets_chunk_lens`] chunk holding that
+/// byte, since the whole chunk was read before any of it was parsed. A value
+/// yielded by the EOF branch is named after the last source, with all of
+/// its newlines.
+fn value_locations(
+    raw_bytes: &[(Option<usize>, Vec<u8>)],
+    yielded_at: &[usize],
+) -> Vec<(usize, usize)> {
+    let ends = source_ends(raw_bytes);
+    let last_source = raw_bytes.len().saturating_sub(1);
+    // The source being walked, how far its chunks have been read, and the
+    // newlines in them.
+    let mut source = usize::MAX;
+    let mut chunk_end = 0usize;
+    let mut newlines = 0usize;
+    let mut out = Vec::with_capacity(yielded_at.len());
+    for &at in yielded_at {
+        let (index, local) = if at == YIELDED_AT_EOF {
+            (last_source, usize::MAX)
+        } else {
+            let index = ends.partition_point(|&end| end <= at).min(last_source);
+            (index, at - (ends[index] - raw_bytes[index].1.len()))
+        };
+        let raw: &[u8] = raw_bytes.get(index).map_or(&[], |(_, raw)| raw.as_slice());
+        if index != source {
+            source = index;
+            chunk_end = 0;
+            newlines = 0;
+        }
+        // Read chunks until the one holding `local` has been read.
+        while chunk_end <= local && chunk_end < raw.len() {
+            let len = fgets_chunk_lens(&raw[chunk_end..])
+                .next()
+                .expect("a non-empty rest has a first chunk");
+            chunk_end += len;
+            if raw[chunk_end - 1] == b'\n' {
+                newlines += 1;
+            }
+        }
+        out.push((index, newlines));
+    }
+    out
+}
+
 /// Where jq's `fgets`-chunked *final* buffer begins, as a raw byte offset
 /// into the whole concatenated raw stream (all sources, in order).
 ///
@@ -333,6 +389,7 @@ pub(crate) fn walk_stream(
             && !(reader.last_byte_yielded_value && final_buffer_start < total));
     SeqStreamWalk {
         slurp_position_lost,
+        locations: value_locations(raw_bytes, &reader.yielded_at),
         values: reader.values,
     }
 }
@@ -473,6 +530,14 @@ pub(crate) struct SeqStreamWalk {
     /// its strings, and substitution is scoped per string (#1743), so the
     /// result is the same as substituting the whole document.
     pub(crate) values: Vec<(usize, usize)>,
+    /// Parallel to `values`: each one's `(source index, line)`, jq's
+    /// `input_filename`/`input_line_number` and `(at file:line)` for it
+    /// (#3250). jq reports where its reader stood when the value was
+    /// *yielded* -- by its closing byte, or for a number or keyword by the
+    /// delimiter after it -- not where the value ends: that byte's file, and
+    /// the newlines of every `fgets` chunk read by then, the whole chunk
+    /// holding it included ([`value_locations`]).
+    pub(crate) locations: Vec<(usize, usize)>,
 }
 
 /// [`SeqStreamWalk::slurp_position_lost`] on its own: literally
@@ -581,6 +646,10 @@ struct Reader<'a> {
     /// off the `1` in `1 {invalid}` when the space scan completed.
     completed: Option<(usize, usize)>,
     values: Vec<(usize, usize)>,
+    /// Parallel to `values`: the absolute offset of the byte whose scan
+    /// yielded each one, or [`YIELDED_AT_EOF`] for jq's EOF branch. jq names
+    /// a value's position from where its reader stood *then* (#3250).
+    yielded_at: Vec<usize>,
     /// See [`walk_stream`]: a malformed BOM plus an empty final `fgets`
     /// buffer (the stream ends on a newline, or fills its last chunk
     /// exactly) means jq's own EOF report is wiped before it is written. It
@@ -666,6 +735,7 @@ impl<'a> Reader<'a> {
             value_end: 0,
             completed: None,
             values: Vec::new(),
+            yielded_at: Vec::new(),
             suppress_eof_warning: false,
             last_warning_at_eof: false,
             at_eof: false,
@@ -803,6 +873,11 @@ impl<'a> Reader<'a> {
                 self.yielded_in_final_buffer = true;
             }
             self.values.push(range);
+            self.yielded_at.push(if self.at_eof {
+                YIELDED_AT_EOF
+            } else {
+                self.offset
+            });
             self.produced_value = true;
         }
     }
@@ -2072,6 +2147,39 @@ mod tests {
             bounds(&[spaces(4096), spaces(10), spaces(0)], false),
             vec![4096, 4106]
         );
+    }
+
+    /// #3250: each value's `(source index, line)` is where jq's reader stood
+    /// when it yielded the value -- the yielding byte's file, and the
+    /// newlines of every `fgets` chunk read by then, including the whole
+    /// chunk holding that byte. Captured from `/usr/bin/jq` 1.7.1 as
+    /// `[., input_filename, input_line_number]` over the same files.
+    #[test]
+    fn value_locations_follow_the_yielding_byte_3250() {
+        let locations = |sources: &[&[u8]]| {
+            let owned: Vec<(Option<usize>, Vec<u8>)> =
+                sources.iter().map(|s| (None, s.to_vec())).collect();
+            walk_stream(&owned, false, &mut |_| {}).locations
+        };
+        // `"x"` yields on its own closing quote, at the end of the first
+        // file; `1` yields on the newline after it, in the second.
+        assert_eq!(locations(&[b"\x1e\"x\"", b" 1\n"]), vec![(0, 0), (1, 1)]);
+        // `1` ending the first file yields on the space opening the second.
+        assert_eq!(locations(&[b"\x1e1", b" \n\x1e2\n"]), vec![(1, 1), (1, 2)]);
+        // The whole chunk holding the yielding byte is read first, so its
+        // newline counts though it comes after the value.
+        assert_eq!(locations(&[b"\x1e\"x\"1\x1e}b\na "]), vec![(0, 1)]);
+        // A value yielded by the EOF branch is named after the last source,
+        // with all of its newlines -- even an empty one.
+        assert_eq!(locations(&[b"\x1e\ntrue"]), vec![(0, 1)]);
+        assert_eq!(locations(&[b"\x1e\ntrue", b""]), vec![(1, 0)]);
+        assert_eq!(locations(&[b"\x1e\ntrue", b"\n\n"]), vec![(1, 1)]);
+        // A value completed at a full 4095-byte chunk's end is yielded
+        // before the chunk holding its newline is read.
+        let mut full = b"\xef\xbb[".to_vec();
+        full.resize(4094, b' ');
+        full.extend_from_slice(b"]\n");
+        assert_eq!(locations(&[&full]), vec![(0, 0)]);
     }
 
     /// One leading BOM is consumed without advancing the column, and only
