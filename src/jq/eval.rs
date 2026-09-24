@@ -81876,6 +81876,31 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_foreach_extract_budget_exceeded_errors() {
+        // `resolve_foreach`'s own copy of the EXTRACT charge above --
+        // `eval_foreach`'s value-mode budget is bounded by
+        // `test_foreach_extract_fanout_charged_independently_of_input_length`,
+        // this pins the same charge site in the `path()`-tracking fold.
+        // A single source element (`(1)`, not `(1,2)`) keeps the fold state
+        // the document root throughout: `foreach`'s "last UPDATE output
+        // carries forward" rule would otherwise hand the second element's
+        // own `.[]` a non-array leftover from the first element's last
+        // branch. UPDATE = `.[]` fans a root array of
+        // `REDUCE_FOREACH_MAX_STEPS + 1` (all-null, trackable) elements out
+        // to that many `update_branch`es; EXTRACT = `.` is trackable on
+        // each. 1 UPDATE charge precedes the fan-out, so
+        // `REDUCE_FOREACH_MAX_STEPS - 1` outputs survive before the budget
+        // is exhausted mid-fanout, one EXTRACT charge per branch.
+        let doc = format!("[{}]", vec!["null"; REDUCE_FOREACH_MAX_STEPS + 1].join(","));
+        query!(doc.as_bytes(), r"path(foreach (1) as $x (.; .[]; .))",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS - 1);
+                assert!(e.message.contains("foreach: maximum iterations exceeded"));
+            }
+        );
+    }
+
+    #[test]
     fn test_foreach_hoisted_extract_substitution_stays_aligned_per_input_val() {
         // Regression test for the #695 substitute_var hoist: EXTRACT must
         // see the *matching* input_val's substitution at each position
@@ -103421,6 +103446,42 @@ mod tests {
         // yq mode's dispatch guard stays `[Pattern::Var(_)]`-only (#2676's
         // widening is jq-mode-only) -- see `test_fold_pattern_admitted_gate_2676`
         // for the direct check on the guard function itself.
+    }
+
+    /// `apply_pattern_bindings`'s `None`-origin arm: a destructured `$var`
+    /// substituted *without* a [`LazyMarker`] because the ambient
+    /// [`Frame`] the walk ran under has no absolute position at all
+    /// (`Frame::at == None`), not merely a register the walk could not
+    /// prove -- the `Some` arm's own `frame.origin_at` would answer `None`
+    /// here regardless of the walk's own verdict.
+    ///
+    /// Reached via `FoldRegister::advance`'s third arm: the *outer*
+    /// `foreach`'s UPDATE (`def f: null; f`, a call -- `cannot_move_register`
+    /// is unconditionally `false` for a call, unlike a literal) produces an
+    /// untrackable branch, so the fold's own register frame becomes
+    /// `self.frame.unknown()` for the rest of that step. The *inner*
+    /// `foreach`'s own destructuring pattern (`{a:$x}`, admitted by
+    /// #2676's widened `may_bind_navigated` gate) then walks under that
+    /// unknown frame: `fold_pattern_seed`'s `null_bool_identical` exception
+    /// still lets the step through (both the source element and the
+    /// inherited register are `null`), but the resulting binding's
+    /// `frame.origin_at` has nothing to answer with.
+    ///
+    /// The inner fold's own *structural* register (`walked_reg.path`, used
+    /// for `EXTRACT`'s emitted position) tracks independently of the
+    /// `$x` marker, so the output still matches jq exactly -- confirmed
+    /// live, `["a"]` -- even though `$x` itself now carries no marker to
+    /// re-establish from.
+    #[test]
+    fn test_fold_pattern_none_origin_under_unknown_frame() {
+        assert_eq!(
+            outputs(
+                b"null",
+                "path(foreach (1) as $y (.; (def f: null; f); \
+                 foreach (null) as {a:$x} (.; .; $x)))"
+            ),
+            [r#"["a"]"#]
+        );
     }
 
     /// #2676 step 1: `may_bind_navigated`'s syntactic gate widens to admit a
