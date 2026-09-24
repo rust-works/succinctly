@@ -42103,7 +42103,7 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
 /// independent jq-mode-verified history at each scattered check, not
 /// just this one terminal position.
 ///
-/// `del()` (`Untracked::Record`) is deliberately **excluded**
+/// `del()` (`Untracked::RecordIdentical`) is deliberately **excluded**
 /// from the skip and keeps raising here, unlike its three siblings: real yq's
 /// `del()` turns out not to share their simple per-branch-independent
 /// model at all. Confirmed live: `del(.a, 1)` on `{a: 1, b: 2}` deletes
@@ -42122,9 +42122,9 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
 /// direction, not merely a cosmetic one. Left on the pre-existing raise
 /// until that ordering is implemented for real; tracked as a follow-up
 /// rather than guessed at here. The one exception is a yq `del()` whose
-/// resolved targets are *all* untracked: whichever target it processes
-/// first aborts it, so it deletes nothing under any ordering (#3207, see
-/// [`Untracked::Record`]).
+/// resolved targets are *all* a `null`/`true`/`false` literal identical to
+/// the input (`null | del(null)`): real yq deletes nothing, however many
+/// there are (#3207, see [`Untracked::RecordIdentical`]).
 fn resolve_terminal<'a, S: EvalSemantics>(
     expr: &Expr,
     input: &'a OwnedValue,
@@ -42221,11 +42221,13 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 match &mut untracked {
                     Untracked::Refuse => {}
                     Untracked::Skip => return Demand::Continue,
-                    Untracked::Record(first) => {
-                        if first.is_none() {
-                            **first = Some(refusal());
+                    Untracked::RecordIdentical(first) => {
+                        if null_bool_identical(&branch.value, input) {
+                            if first.is_none() {
+                                **first = Some(refusal());
+                            }
+                            return Demand::Continue;
                         }
-                        return Demand::Continue;
                     }
                 }
                 // #3125: the terminal-literal carve-out -- a bearer literal
@@ -42240,14 +42242,13 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 //
                 // jq mode only (#3207). The rule is jq's `jv_identical`, and
                 // yq has no counterpart: real yq v4.53.3 treats `del(null)`
-                // on `null` as the same untracked target as `del(1)` on
-                // `{a: 1}`. Every yq caller skips or records an untracked
-                // branch above, so only `Untracked::Refuse` -- jq mode --
-                // gets here; the tag test says so rather than leaving it to
-                // the callers. Before #3207 yq's `del()` refused here too,
-                // and this carve-out turned `null | del(null)` into the root
-                // path, i.e. yq's bare-`del(.)` rule (#1702), which prints
-                // nothing.
+                // on `null` as a target with no path, and deletes nothing.
+                // yq's `del()` records that branch above instead
+                // (`Untracked::RecordIdentical`), so only jq mode reaches
+                // here with one; the tag test says so rather than leaving it
+                // to the callers. Before #3207 this carve-out turned yq's
+                // `null | del(null)` into the root path, i.e. yq's
+                // bare-`del(.)` rule (#1702), which prints nothing.
                 if S::TAG == EvalTag::Jq && null_bool_identical(&branch.value, input) {
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
@@ -42290,11 +42291,18 @@ enum Untracked<'r> {
     /// Drop the branch and resolve the rest -- yq's `path()`, `=` and `|=`,
     /// where real yq skips an untracked target (#1764).
     Skip,
-    /// Drop the branch like `Skip`, keeping the refusal it would have raised
-    /// (the first one only) for the caller to decide on -- yq's `del()`,
-    /// which deletes nothing when every target is untracked and refuses a
-    /// mix pending #1865 (#3207, see [`resolve_del_path_branches`]).
-    Record(&'r mut Option<EvalEscape>),
+    /// yq's `del()` (#3207): an untracked `null`/`true`/`false` identical to
+    /// the input is dropped, keeping the refusal it would have raised (the
+    /// first one only) for [`resolve_del_path_branches`] to decide on; every
+    /// other untracked branch refuses as under `Refuse`, pending #1865.
+    ///
+    /// Only the identical literal, because only there does real yq v4.53.3
+    /// reliably have no path. succinctly's "untracked" is wider than yq's
+    /// "pathless": yq's `$var` carries node identity (`del(.a as $y | $y)`
+    /// deletes `.a`, #2643) and `tojson` keeps its input's path
+    /// (`del(.a | tojson)` deletes `.a`). A blanket skip would turn those
+    /// refusals into silently discarded deletes.
+    RecordIdentical(&'r mut Option<EvalEscape>),
 }
 
 /// What `del()`'s own path prepass resolved a `del(f)` argument to.
@@ -42350,12 +42358,10 @@ enum DelPaths<'a> {
 ///   orderings (`del(.a, 1)` deletes nothing in real yq; `del(1, .a)`
 ///   deletes `.a`). See [`resolve_terminal`]'s own doc comment
 ///   for the live-verified permutations. yq mode resolves with
-///   [`Untracked::Record`] instead (#3207): it still refuses a mix of
-///   tracked and untracked targets, but when *every* target is untracked
-///   the first one processed aborts under any ordering, so the document
-///   comes back unchanged. Recording rather than stopping also lets a later
-///   argument's genuine error surface, as it does in yq
-///   (`del(1, error("boom"))` raises `boom`).
+///   [`Untracked::RecordIdentical`] instead (#3207): when *every* target is
+///   a `null`/`true`/`false` literal identical to the input, the document
+///   comes back unchanged, as in real yq; a mix with any other target still
+///   refuses.
 ///
 /// The `Err` half is just the escape: `builtin_del` discards the assembled
 /// prefix its sibling builds (`Err((_, escape))` at every one of its match
@@ -42368,21 +42374,22 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     if !needs_path_prepass(expr) {
         return Ok(DelPaths::Verbatim);
     }
-    let mut first_untracked = None;
+    let mut identical = None;
     let untracked = if S::TAG == EvalTag::Yq {
-        Untracked::Record(&mut first_untracked)
+        Untracked::RecordIdentical(&mut identical)
     } else {
         Untracked::Refuse
     };
     match resolve_terminal::<S>(expr, input, false, untracked) {
-        // #3207: every resolved target untracked -- real yq deletes nothing
-        // and the document comes back unchanged (`del(1)` on `{a: 1}`,
-        // `.[] |= del(null)` on `[null]`). A mix with tracked targets is
-        // #1865's order-dependent case and still refuses.
-        Ok(branches) if branches.is_empty() && first_untracked.is_some() => {
+        // #3207: every resolved target is an identical null/bool literal --
+        // real yq deletes nothing (`null | del(null)`, `[null] | .[] |=
+        // del(null)`). A mix with a tracked target is #1865's
+        // order-dependent case (`null | del(., null)` keeps the document,
+        // `del(null, .)` deletes it) and still refuses.
+        Ok(branches) if branches.is_empty() && identical.is_some() => {
             Ok(DelPaths::Branches(branches))
         }
-        Ok(_) if first_untracked.is_some() => Err(first_untracked.expect("checked is_some above")),
+        Ok(_) if identical.is_some() => Err(identical.expect("checked is_some above")),
         Ok(branches) => {
             if branches.iter().any(|b| b.path.depth() == 0) {
                 Ok(DelPaths::Root)

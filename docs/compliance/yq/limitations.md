@@ -1939,15 +1939,21 @@ what distinguishes its call shape from its three siblings') until the real rever
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 
-This affects only a *mix* of tracked and untracked targets. When **every** resolved target
-is untracked, the first one real yq processes aborts it under any ordering, so the
-document comes back unchanged, and succinctly matches that: `del(1)`, `del(1, 2)`,
-`.a |= del(1)` ([#3207](https://github.com/rust-works/succinctly/issues/3207)). A later
-argument's genuine error still surfaces, as it does in yq (`del(1, error("boom"))` raises
-`boom`). A `null`/`true`/`false` literal identical to the document (`del(null)` on
-`null`) is one more untracked target in yq mode. jq's `jv_identical` rule would answer it
-with the root path `[]` (in jq, `null | path(null)` is `[[]]`), and yq's bare-`del(.)`
-rule would then print nothing.
+A lone untracked target refuses too, although real yq deletes nothing: `del(1)` on
+`{a: 1}` prints `a: 1` in yq. succinctly cannot skip it safely, because its "untracked" is
+wider than yq's "has no path". yq's `$var` keeps node identity, so `del(.a as $y | $y)`
+deletes `.a` ([#2643](https://github.com/rust-works/succinctly/issues/2643)). yq's `tojson`
+keeps its input's path, so `del(.a | tojson)` deletes `.a` as well. Skipping untracked
+targets would turn both refusals into silently dropped deletes.
+
+The one untracked target succinctly does skip is a `null`/`true`/`false` literal
+identical to its input ([#3207](https://github.com/rust-works/succinctly/issues/3207)).
+When every target is one of those, the result matches real yq: `null | del(null)`,
+`[null] | .[] |= del(null)` and `map(del(null))` leave their input unchanged. jq's
+`jv_identical` rule answers such a literal with the root path `[]` (in jq,
+`null | path(null)` is `[[]]`), and that rule is gated to jq mode. In yq mode the root
+path used to reach yq's bare-`del(.)` rule, which printed nothing. A mix with a tracked
+target (`null | del(null, .a)`) still refuses.
 
 ### `del()` with a field key against a scalar root: errors instead of no-op
 
