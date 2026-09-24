@@ -6155,13 +6155,13 @@ mod tests {
         let mut children = doc.root().children();
         let crate::json::StandardJson::Number(nan) = children.next().expect("nan element").value()
         else {
-            panic!("expected a number");
+            panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
         };
         assert!(nan.as_f64().is_ok_and(f64::is_nan));
 
         let crate::json::StandardJson::Number(one) = children.next().expect("int element").value()
         else {
-            panic!("expected a number");
+            panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
         };
         assert_eq!(one.bridge_value(), None, "1 is not a bridge token");
         assert_eq!(one.as_f64(), Ok(1.0));
