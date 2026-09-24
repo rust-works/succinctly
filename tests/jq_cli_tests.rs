@@ -38765,6 +38765,42 @@ fn test_tonumber_preserves_source_spelling_1090() {
     }
 }
 
+/// #3033: `tonumber`'s literal-preserving escapes extend past #1090's own
+/// set (strict RFC 8259, and a leading `+`) to the same three lenient
+/// spellings the document path already preserves via
+/// `OwnedValue::from_number_bytes` (`is_preservable_number_literal`,
+/// #1149/#1171/#2220): a redundant leading zero, a leading `.`, and a
+/// trailing `.` immediately before an exponent. #1090's own `"007"`/`".5"`
+/// rows above don't distinguish this from the old lossy fallback, since
+/// neither has trailing zeros or an exponent to lose -- these do. All three
+/// escapes also apply after a leading `+` peel (extended alongside this
+/// fix, since `from_number_bytes` treats its own `+`-peel identically).
+/// Table captured live from jq 1.7.1.
+#[test]
+fn test_tonumber_preserves_lenient_spellings_with_trailing_digits_3033() {
+    for (input, expected) in [
+        (r#""007.500""#, "7.500\n"),
+        (r#""-007.50""#, "-7.50\n"),
+        (r#""007e5""#, "7E+5\n"),
+        (r#"".500""#, "0.500\n"),
+        (r#""-.5e3""#, "-5E+2\n"),
+        (r#""1.e5""#, "1E+5\n"),
+        (r#""1.e999""#, "1E+999\n"),
+        (r#""0.500""#, "0.500\n"), // strict RFC 8259 control, unaffected
+        (r#""+007.500""#, "7.500\n"),
+        (r#""+.500""#, "0.500\n"),
+        (r#""+1.e5""#, "1E+5\n"),
+        // Both escapes composing on one literal (#3033, mirroring
+        // `from_number_bytes`'s own `007.e999` composition test).
+        (r#""007.500e2""#, "750.0\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
+            .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
+        assert_eq!(code, 0, "`{input}`\nstdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "`{input}`\nstderr: {stderr}");
+    }
+}
+
 /// #1090 follow-on: the leading-`+` retry must not turn a *doubled* sign
 /// into an accepted number. `is_valid_number` accepts a leading `-` of its
 /// own, so stripping the `+` off `"+-1"` leaves a perfectly valid `-1` --
@@ -38778,6 +38814,10 @@ fn test_tonumber_rejects_doubled_sign_1090() {
         r#""+-0""#,
         r#""+-1e3""#,
         r#""-+1""#,
+        // #3033: the relaxed digit-or-dot gate that lets `+.5` through must
+        // not also let a doubled sign through a leading-dot spelling.
+        r#""+-.5""#,
+        r#""+-.5e3""#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["tonumber"], Some(input))
             .unwrap_or_else(|e| panic!("`{input} | tonumber` failed to run: {e}"));
