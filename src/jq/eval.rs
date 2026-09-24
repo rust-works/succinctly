@@ -15629,26 +15629,18 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
 /// (`"NaN"`/`"inf"`/`"-inf"`), which this unconditionally rendered before
 /// #1075.
 ///
-/// This also applies to a jq-mode `NumberLiteral` overflowing to infinity
-/// (e.g. `1e400`), even though real jq's own decNumber-backed literal
-/// preservation would reformat *some* such literals' source text instead
-/// (`1e400 | tostring` -> `"1E+400"`, live-verified) rather than substituting
-/// `DBL_MAX` text -- deliberately not attempted here (#1075 review): the
-/// `eval_owned_expr`/`eval_owned_pipe` reindex bridge (`reduce`/`foreach`/
-/// `as $x`/multi-stage pipes) round-trips a *computed* infinity through its
-/// own smuggling literal (`to_json_for_reindex`'s `1e999`/`-1e999`, see
-/// `overflow_literal` in `value.rs`) which -- unlike its NaN-sentinel sibling
-/// -- is NOT guaranteed-unparseable as a genuine document literal, so once
-/// reparsed it is bit-for-bit indistinguishable from a real `1e999` literal a
-/// user actually typed. Letting jq mode fall through to
-/// `format_number_jq_compat` here (an earlier draft of this fix did exactly
-/// that) reformats that reindexed sentinel as `"1E+999"` instead of the
-/// correct `DBL_MAX` substitution -- a real, oracle-confirmed regression this
-/// review caught. See issue #1083 (filed alongside this fix) for the
-/// literal-preservation gap this leaves: it needs the reindex bridge's own
-/// infinity sentinel made collision-safe first (mirroring `NAN_SENTINEL`'s
-/// already-safe two-exponent-marker trick) before this function can safely
-/// stop intercepting a jq-mode `NumberLiteral` here.
+/// A jq-mode `NumberLiteral` overflowing to infinity (`1e400`) is *not* a
+/// computed infinity: it keeps its literal and reformats through
+/// `format_number_jq_compat` (`1e400 | tostring` -> `"1E+400"`, as in jq
+/// 1.7.1, on every route that does no arithmetic -- `@uri`, interpolation,
+/// `as $x`, `reduce`, `@csv` alike). Until #3212 this substituted `DBL_MAX`
+/// text too, because the reindex bridge once smuggled a computed infinity as
+/// the literal `1e999`, indistinguishable from a user's. That sentinel has
+/// since become the unparseable `8e999e999`, decoded only through
+/// `JsonNumber::bridge_value`'s provenance check, and a bridge token always
+/// materializes as a bare `Float` (#1087, #2902, #3034) -- so a computed
+/// infinity still takes the `Float` arm's `DBL_MAX` text (`1e400 + 0 |
+/// tostring`), and nothing left here can be one.
 ///
 /// yq mode instead wants YAML's own `.nan`/`.inf`/`-.inf` spelling (#1060) --
 /// this was previously unconditional (`f.to_string()`, jq's own spelling in
@@ -15669,7 +15661,14 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
 pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> String {
     if let OwnedValue::NumberLiteral(repr, literal) = value {
         if let NumberRepr::Float(f) = repr {
-            if f.is_nan() || f.is_infinite() {
+            // A `NumberLiteral` is always a user-written spelling -- the
+            // reindex bridge's infinity token materializes as a bare `Float`
+            // (#2902, `OwnedValue::from_json_number`) -- so in jq mode an
+            // overflowed one keeps its literal like any other and reaches
+            // `format_number_jq_compat` below: `1e400 | tostring` is
+            // `"1E+400"` in jq 1.7.1 (#1083, #3212). A document literal is
+            // never NaN; the check stays as a guard.
+            if f.is_nan() || (f.is_infinite() && S::TAG == EvalTag::Yq) {
                 return nonfinite_display_string::<S>(*f).to_string();
             }
         }
@@ -77886,16 +77885,13 @@ mod tests {
         // producing garbage like "NaNE+2147483647" (#561), then later
         // "inf"/"-inf" (Rust's own `f64::Display`, still wrong -- #1075).
         //
-        // Both signs now take jq mode's `DBL_MAX`-text substitution
-        // (`nonfinite_display_string`, #1075) -- this still isn't a full
-        // match for real jq, which reformats *both* an overflowed literal's
-        // own source text (`1e400 | tostring` -> `"1E+400"`, `-1e400 |
-        // tostring` -> `"-1E+400"`, live-verified against jq 1.7.1 for this
-        // exact input-document shape -- i.e. the literal typed directly as
-        // the JSON document, which is what `query!`'s first argument always
-        // is) rather than substituting `DBL_MAX` for either sign; see
-        // `numeric_display_string`'s own doc comment and issue #1083 for why
-        // that gap is deliberately left open here. (A leading `-` typed
+        // Both signs keep the overflowed literal's own source text, as real
+        // jq does (`1e400 | tostring` -> `"1E+400"`, `-1e400 | tostring` ->
+        // `"-1E+400"`, live-verified against jq 1.7.1 for this exact
+        // input-document shape -- the literal typed directly as the JSON
+        // document, which is what `query!`'s first argument always is).
+        // Until #3212 both took `DBL_MAX` text instead (#1075/#1083); a
+        // *computed* infinity still does, below. (A leading `-` typed
         // *inside a filter expression* instead, e.g. `-1e400 | tostring` as
         // the filter text rather than the input, is a different story --
         // jq's own filter grammar treats that as unary negation on the
@@ -77904,35 +77900,44 @@ mod tests {
         // test here exercises.)
         query!(br"1e400", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
         query!(br"-1e400", "tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "-1.7976931348623157e+308");
+                assert_eq!(s, "-1E+400");
             }
         );
 
         query!(br"1e400", "@uri",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e%2B308");
+                assert_eq!(s, "1E%2B400");
             }
         );
 
         query!(br"1e400", "@html",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
         query!(br"1e400", "@sh",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
         query!(br"1e400", r#""\(.)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "1E+400");
+            }
+        );
+
+        // Control: arithmetic makes it a computed infinity, which jq
+        // spells as `DBL_MAX` text (live-verified: `1e400 | . + 0 |
+        // tostring` -> `"1.7976931348623157e+308"`).
+        query!(br"1e400", ". + 0 | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "1.7976931348623157e+308");
             }
@@ -77948,35 +77953,32 @@ mod tests {
         // the same bridge pattern `eval_generic.rs` had. Before switching
         // these to `to_json_for_reindex`, an overflowed `NumberLiteral` was
         // silently turned into JSON `null` by that round-trip (#561); now it
-        // survives as the same `DBL_MAX`-text substitution the bare-literal
-        // test above uses (#1075) -- these bridges are exactly the reason
-        // `numeric_display_string` cannot safely stop substituting here for
-        // *any* jq-mode overflowed `NumberLiteral` yet (see its own doc
-        // comment and issue #1083): `to_json_for_reindex`'s own `1e999`
-        // smuggling literal reparses into a `NumberLiteral` indistinguishable
-        // from a real one, so a literal-preserving reformat here would wrongly
-        // reformat that internal sentinel too.
+        // keeps its literal through the bridge, the same `1E+400` the
+        // bare-literal test above renders (#3212) -- the bridge's own
+        // infinity token is the unparseable `8e999e999`, decoded to a bare
+        // `Float` only through `JsonNumber::bridge_value`'s provenance check
+        // (#1087, #2902, #3034), so a real literal is never mistaken for it.
         query!(br"1e400", ". as $x | $x | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
         query!(br"-1e400", ". as $x | $x | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "-1.7976931348623157e+308");
+                assert_eq!(s, "-1E+400");
             }
         );
 
         query!(br"1e400", "reduce (1) as $x (.; .) | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
         query!(br"1e400", "foreach (1) as $x (.; .) | tostring",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1.7976931348623157e+308");
+                assert_eq!(s, "1E+400");
             }
         );
 
@@ -77984,7 +77986,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(
                     obj.get("a"),
-                    Some(&OwnedValue::String("1.7976931348623157e+308".to_string()))
+                    Some(&OwnedValue::String("1E+400".to_string()))
                 );
             }
         );

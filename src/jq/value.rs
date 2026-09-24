@@ -597,8 +597,10 @@ fn strip_insignificant_leading_zero_and_plus(s: &str) -> String {
 ///
 /// Deliberately conservative -- it answers "certainly unchanged", never
 /// "probably". Anything with an exponent, a leading `+`, an insignificant
-/// leading zero, or an absent integer part (`.5`, #1171) returns `false`
-/// and takes the full formatter, so a `true` here is always safe to echo.
+/// leading zero, an absent integer part (`.5`, #1171), or a `0.` followed by
+/// enough zeros that decNumber writes it in scientific notation (`0.0000001`
+/// -> `1E-7`, #3212) returns `false` and takes the full formatter, so a
+/// `true` here is always safe to echo.
 ///
 /// Kept adjacent to the formatter it predicts, and pinned against it by
 /// `is_jq_canonical_number_agrees_with_the_formatter_2206`, which asserts
@@ -649,10 +651,84 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
         if i == frac_start {
             return false;
         }
+        // decNumber writes `0.` followed by 6+ zeros and a digit, or by 7+
+        // zeros alone, in scientific notation (`1E-7`, `0E-7`), which the
+        // formatter reproduces (`plain_decimal_scientific`, #3212). Only an
+        // integer part of `0` can get there.
+        if raw[int_start] == b'0' {
+            let frac = &raw[frac_start..i];
+            let zeros = frac.iter().take_while(|&&b| b == b'0').count();
+            if zeros >= 6 && !(zeros == 6 && frac.len() == 6) {
+                return false;
+            }
+        }
     }
     // Any exponent (or trailing junk like `1.2.3`) leaves the canonical
     // set: the formatter has its own reformatting path for exponents.
     i == n
+}
+
+/// decNumber's to-scientific-string for a plain decimal literal (no
+/// exponent, a `.` present) -- `Some` exactly when it picks scientific
+/// notation, which jq 1.7.1 then prints (#3212).
+///
+/// The literal's coefficient is its digits with leading zeros dropped (`0`
+/// if none remain) and its exponent is minus the fraction's length; the
+/// adjusted exponent is `exponent + coefficient digits - 1`. decNumber
+/// writes plain notation when the exponent is at most 0 and the adjusted
+/// exponent at least -6 -- a plain decimal's exponent is never positive, so
+/// only the second test can fail -- and otherwise one digit, the rest after
+/// a point, then `E` and the adjusted exponent. Trailing zeros are digits of
+/// the coefficient and survive, as in jq: `0.000000100` -> `1.00E-7`. All on
+/// the digit string, so no length or magnitude reaches an `f64`
+/// (`0.` + 200,000 zeros + `1` -> `1E-200001`).
+fn plain_decimal_scientific(s: &str) -> Option<String> {
+    let (negative, unsigned) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (int_part, frac_part) = unsigned.split_once('.')?;
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits: &str = {
+        let all = int_part.len() + frac_part.len();
+        let leading = int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .take_while(|&b| b == b'0')
+            .count();
+        if leading == all {
+            "0"
+        } else if leading < int_part.len() {
+            // A nonzero integer digit: the adjusted exponent is >= 0.
+            return None;
+        } else {
+            &frac_part[leading - int_part.len()..]
+        }
+    };
+    let exponent = -i64::try_from(frac_part.len()).ok()?;
+    let adjusted = exponent + i64::try_from(digits.len()).ok()? - 1;
+    if adjusted >= -6 {
+        return None;
+    }
+    let mut out = String::with_capacity(digits.len() + 24);
+    if negative {
+        out.push('-');
+    }
+    out.push_str(&digits[..1]);
+    if digits.len() > 1 {
+        out.push('.');
+        out.push_str(&digits[1..]);
+    }
+    out.push('E');
+    out.push_str(&adjusted.to_string());
+    Some(out)
 }
 
 /// Format a raw JSON number string the way jq itself would print it.
@@ -747,7 +823,14 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
         // does. Also now the real display fix for #1149's leading-zero
         // leniency (`007.500` -> `7.500`), for the same reason as the
         // plain-integer branch above.
-        return strip_insignificant_leading_zero_and_plus(s);
+        //
+        // Unless decNumber's to-scientific-string rule, which jq 1.7.1
+        // renders every literal with, picks scientific (#3212): a plain
+        // decimal's exponent is minus its fraction digits, so the only
+        // question is whether the adjusted exponent falls below -6
+        // (`0.0000001` -> `1E-7`, `0.0000000` -> `0E-7`).
+        return plain_decimal_scientific(s)
+            .unwrap_or_else(|| strip_insignificant_leading_zero_and_plus(s));
     }
 
     // Has exponent - need to reformat according to jq rules
@@ -7780,6 +7863,38 @@ mod tests {
     /// to be conservative (say `false` where the formatter happens to be
     /// the identity anyway); that only costs an allocation, never
     /// correctness. Rows below marked `conservative` are exactly those.
+    /// #3212: jq 1.7.1 renders a plain decimal with decNumber's
+    /// to-scientific-string rule, so an adjusted exponent below -6 prints in
+    /// scientific notation, trailing zeros kept. Every row captured from
+    /// `/usr/bin/jq` 1.7.1 as `echo <literal> | jq -c .`.
+    #[test]
+    fn plain_decimal_follows_decnumber_notation_3212() {
+        for (literal, jq) in [
+            ("0.0000001", "1E-7"),
+            ("0.00000012", "1.2E-7"),
+            ("-0.0000001", "-1E-7"),
+            ("0.000000100", "1.00E-7"),
+            ("0.0000000", "0E-7"),
+            ("-0.0000000", "-0E-7"),
+            ("0.0000001000", "1.000E-7"),
+            ("00.0000001", "1E-7"),
+            (".0000001", "1E-7"),
+            ("0.00000000000000000000001", "1E-23"),
+            ("0.000001", "0.000001"),
+            ("0.0000010", "0.0000010"),
+            ("0.000000", "0.000000"),
+            ("0.0000100", "0.0000100"),
+            ("1.0000001", "1.0000001"),
+            ("10.0000001", "10.0000001"),
+            ("0.10", "0.10"),
+        ] {
+            assert_eq!(format_number_jq_compat(literal.as_bytes()), jq, "{literal}");
+        }
+        // Long enough that no `f64` could hold the exponent's context.
+        let long = format!("0.{}1", "0".repeat(200_000));
+        assert_eq!(format_number_jq_compat(long.as_bytes()), "1E-200001");
+    }
+
     #[test]
     fn is_jq_canonical_number_agrees_with_the_formatter_2206() {
         let corpus = [
@@ -7805,6 +7920,19 @@ mod tests {
             "-.5",
             "00",
             "+0.5",
+            // decNumber's adjusted-exponent boundary for a plain decimal
+            // (#3212): `0.000001`/`0.000000` stay plain, one more zero goes
+            // scientific
+            "0.000001",
+            "0.0000010",
+            "0.000000",
+            "0.0000001",
+            "0.00000012",
+            "-0.0000001",
+            "0.000000100",
+            "0.0000000",
+            "-0.0000000",
+            "10.0000001",
             // exponent forms: the formatter has its own path for these
             "1e100",
             "1E5",
