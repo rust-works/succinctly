@@ -86,52 +86,52 @@ const MAX_PARSING_DEPTH: usize = 256;
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 const JQ_FGETS_CHUNK: usize = 4095;
 
-/// Every raw offset (absolute, all sources concatenated) at which jq's
-/// `fgets` starts a new chunk because the previous one filled
-/// [`JQ_FGETS_CHUNK`] bytes without reaching a newline -- the refills
-/// [`final_buffer_start`]'s chunk walk passes over, for every source (#3200).
-/// Chunking restarts at each source's own start, and an offset at a source's
-/// end is left out: the next source's start is already a boundary, and at
-/// the stream's end it is the empty final buffer, which
-/// [`Reader::suppress_eof_warning`] covers.
-fn size_limit_refills(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Vec<usize> {
-    let mut refills = Vec::new();
-    let mut source_start = 0usize;
-    for (_, raw) in raw_bytes {
-        let mut chunk = 0usize;
-        while chunk < raw.len() {
-            let rest = &raw[chunk..];
-            match rest.iter().take(JQ_FGETS_CHUNK).position(|&b| b == b'\n') {
-                Some(newline) => chunk += newline + 1,
-                None if rest.len() > JQ_FGETS_CHUNK => {
-                    chunk += JQ_FGETS_CHUNK;
-                    refills.push(source_start + chunk);
-                }
-                None => break,
-            }
-        }
-        source_start += raw.len();
-    }
-    refills
+/// jq's `fgets` chunks over one source, as their lengths in order: each
+/// ends just after a newline or after [`JQ_FGETS_CHUNK`] bytes, whichever
+/// comes first. The one definition of that rule, shared by
+/// [`final_buffer_start`] and [`refill_boundaries`] (#3200).
+fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
+        let len = rest
+            .iter()
+            .take(JQ_FGETS_CHUNK)
+            .position(|&byte| byte == b'\n')
+            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1);
+        pos += len;
+        Some(len)
+    })
 }
 
-/// Two ascending offset lists as one, duplicates kept (a reset is
-/// idempotent, and [`Reader::run`] consumes each entry once).
-fn merge_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i] <= b[j] {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            out.push(b[j]);
-            j += 1;
+/// The absolute offsets, ascending, at which jq starts a `jv_parser_next`
+/// that the reader's own byte loop does not already reset at: each source
+/// after the first, since jq refills one file at a time (#3002), and, with
+/// `size_limit`, each refill after a full [`JQ_FGETS_CHUNK`]-byte chunk that
+/// did not end on a newline (#3200). A chunk ending on a newline needs no
+/// entry, since the reader resets as it scans the newline. A chunk ending at
+/// its source's own end needs none either: the next source's start is
+/// already here, and at the stream's end it is the empty final buffer,
+/// which [`Reader::suppress_eof_warning`] covers.
+fn refill_boundaries(raw_bytes: &[(Option<usize>, Vec<u8>)], size_limit: bool) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    let ends = source_ends(raw_bytes);
+    for (index, (_, raw)) in raw_bytes.iter().enumerate() {
+        let source_start = ends[index] - raw.len();
+        if index > 0 {
+            boundaries.push(source_start);
+        }
+        if size_limit {
+            let mut chunk_end = 0usize;
+            for len in fgets_chunk_lens(raw) {
+                chunk_end += len;
+                if len == JQ_FGETS_CHUNK && raw[chunk_end - 1] != b'\n' && chunk_end < raw.len() {
+                    boundaries.push(source_start + chunk_end);
+                }
+            }
         }
     }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
-    out
+    boundaries
 }
 
 /// Where jq's `fgets`-chunked *final* buffer begins, as a raw byte offset
@@ -162,28 +162,27 @@ fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> u
     let last: &[u8] = raw_bytes.last().map_or(&[], |(_, raw)| raw.as_slice());
     let last_start = total - last.len();
 
-    let mut chunk = 0usize;
-    loop {
-        let rest = &last[chunk..];
-        let len = rest
-            .iter()
-            .take(JQ_FGETS_CHUNK)
-            .position(|&byte| byte == b'\n')
-            .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1);
-        if chunk + len < last.len() {
-            chunk += len;
-            continue;
-        }
+    let mut chunk_start = 0usize;
+    let mut final_chunk = None;
+    for len in fgets_chunk_lens(last) {
+        final_chunk = Some((chunk_start, len));
+        chunk_start += len;
+    }
+    match final_chunk {
+        // An empty last source is itself the (empty) final buffer.
+        None => total,
         // The last chunk holding data. An `fgets` that stopped on a
         // newline or on the size limit has not reached EOF yet, so an
         // *empty* buffer follows and that one is final; otherwise this
         // chunk is.
-        let stopped_early = len == JQ_FGETS_CHUNK || (len > 0 && rest[len - 1] == b'\n');
-        break if stopped_early {
-            total
-        } else {
-            last_start + chunk
-        };
+        Some((start, len)) => {
+            let stopped_early = len == JQ_FGETS_CHUNK || last[start + len - 1] == b'\n';
+            if stopped_early {
+                total
+            } else {
+                last_start + start
+            }
+        }
     }
 }
 
@@ -307,18 +306,15 @@ pub(crate) fn walk_stream(
     // reused below instead of a second `.sum()` over the same sources --
     // both `final_buffer_start` and the EOF answer need it. The same ends
     // map each value back to its file in `build_seq_values`.
-    let mut boundaries = source_ends(raw_bytes);
-    let total = boundaries.last().copied().unwrap_or(0);
-    boundaries.pop();
+    let total = source_ends(raw_bytes).last().copied().unwrap_or(0);
+    // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
+    // `jv_parser_next`, and each `fgets` refill starts one: resets after a
+    // newline happen as the reader scans it, and a refill after a full
+    // 4095-byte chunk with no newline is one more (#3200).
+    let boundaries = refill_boundaries(raw_bytes, bom.malformed);
     let final_buffer_start = final_buffer_start(raw_bytes, total);
     reader.final_buffer_start = final_buffer_start;
     if bom.malformed {
-        // With a malformed BOM jq re-runs `parser_reset` at the top of
-        // *every* `jv_parser_next`, and each `fgets` refill starts one.
-        // Resets after a newline happen as the reader scans it; a refill
-        // after a full 4095-byte chunk with no newline is a reset too
-        // (#3200), so those offsets join the file starts.
-        boundaries = merge_sorted(&boundaries, &size_limit_refills(raw_bytes));
         // The call for an *empty* final buffer -- after a chunk that ended
         // on a newline, or filled the buffer exactly -- resets as well,
         // wiping the accumulated state before the EOF branch can report on
@@ -564,9 +560,10 @@ struct Reader<'a> {
     last_ch_was_ws: bool,
     /// A malformed BOM makes jq re-run `parser_reset` at the top of every
     /// `jv_parser_next`. That call returns on each value, on each error,
-    /// and when the buffer runs out -- and jq refills a line at a time --
-    /// so under this flag the parser is wiped after every value and every
-    /// newline as well. An unterminated string therefore stops swallowing
+    /// and when the buffer runs out -- and jq refills one `fgets` chunk at a
+    /// time, up to a newline or 4095 bytes -- so under this flag the parser
+    /// is wiped after every value, every newline, and every size-limit
+    /// refill ([`refill_boundaries`], #3200) as well. An unterminated string therefore stops swallowing
     /// the rest of the stream, and `\x1e9"-si-\n` reports on `-si-`
     /// because emitting `9` dropped the string it had just opened.
     resets_per_call: bool,
@@ -706,15 +703,15 @@ impl<'a> Reader<'a> {
     }
 
     /// Walk the stream's scanned bytes, applying the malformed-BOM
-    /// `parser_reset` jq runs at the top of every `jv_parser_next` where
-    /// this model already does (a value, a newline, an error).
+    /// `parser_reset` jq runs at the top of every `jv_parser_next`: at a
+    /// value, a newline or an error as the bytes are scanned, and at each of
+    /// `boundaries` ([`refill_boundaries`]).
     ///
-    /// [`walk_stream`] additionally hands over the absolute offsets at
-    /// which each source after the first begins, and (under a malformed
-    /// BOM) where each full 4095-byte `fgets` chunk ends without a newline
-    /// (#3200). jq refills its reader one *file* at a time, so a source
-    /// boundary is another `jv_parser_next`,
-    /// and its reset wipes whatever survived the previous source's scan
+    /// Those are where each source after the first begins, and (under a
+    /// malformed BOM) where each full 4095-byte `fgets` chunk ends without a
+    /// newline (#3200). jq refills its reader one *file* at a time, so a
+    /// source boundary is another `jv_parser_next`, and its reset wipes
+    /// whatever survived the previous source's scan
     /// (#3002) -- `EF BF` across two sources therefore vanishes where the
     /// same bytes in one buffer fail (`EF BF` then `1E` cleanly starts a new
     /// record, where `EF BF 1E` still reports `Truncated value`). Resetting
@@ -2037,26 +2034,43 @@ mod tests {
         );
     }
 
-    /// #3200: the refill offsets restart at each source and skip a chunk
-    /// that ends at its source's own end.
+    /// #3200: the refill boundaries are the later sources' starts plus, with
+    /// `size_limit`, each full chunk's end that is not a newline or its
+    /// source's own end; the count restarts at each source.
     #[test]
-    fn size_limit_refills_restart_per_source_3200() {
-        let refills = |sources: &[Vec<u8>]| {
+    fn refill_boundaries_restart_per_source_3200() {
+        let bounds = |sources: &[Vec<u8>], size_limit| {
             let owned: Vec<(Option<usize>, Vec<u8>)> =
                 sources.iter().map(|s| (None, s.clone())).collect();
-            size_limit_refills(&owned)
+            refill_boundaries(&owned, size_limit)
         };
-        assert_eq!(refills(&[vec![b' '; 4095]]), Vec::<usize>::new());
-        assert_eq!(refills(&[vec![b' '; 4096]]), vec![4095]);
-        assert_eq!(refills(&[vec![b' '; 8191]]), vec![4095, 8190]);
+        let spaces = |n| vec![b' '; n];
+        assert_eq!(bounds(&[spaces(4095)], true), Vec::<usize>::new());
+        assert_eq!(bounds(&[spaces(4096)], true), vec![4095]);
+        assert_eq!(bounds(&[spaces(8191)], true), vec![4095, 8190]);
         // A newline inside the first 4095 bytes ends that chunk early.
-        let mut nl = vec![b' '; 5000];
+        let mut nl = spaces(5000);
         nl[10] = b'\n';
-        assert_eq!(refills(&[nl]), vec![11 + 4095]);
-        // A second source restarts the count at its own start.
+        assert_eq!(bounds(&[nl], true), vec![11 + 4095]);
+        // A full chunk ending on its newline needs no entry.
+        let mut full_nl = spaces(5000);
+        full_nl[4094] = b'\n';
+        assert_eq!(bounds(&[full_nl], true), Vec::<usize>::new());
+        // A later source's start, and its own count restarting there.
         assert_eq!(
-            refills(&[vec![b' '; 100], vec![b' '; 4096]]),
-            vec![100 + 4095]
+            bounds(&[spaces(100), spaces(4096)], true),
+            vec![100, 100 + 4095]
+        );
+        // A non-final source filling its chunk exactly adds only the next
+        // source's start.
+        assert_eq!(
+            bounds(&[spaces(4095), spaces(4096)], true),
+            vec![4095, 4095 + 4095]
+        );
+        // Without `size_limit`, only the source starts (#3002).
+        assert_eq!(
+            bounds(&[spaces(4096), spaces(10), spaces(0)], false),
+            vec![4096, 4106]
         );
     }
 

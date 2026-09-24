@@ -7738,6 +7738,33 @@ fn test_seq_malformed_bom_resets_at_fgets_size_limit_refill_3200() -> Result<()>
             input.len()
         );
     }
+
+    // The refill inside the *first* of two files: jq's reset drops the
+    // string it cut, `"x` opens another that the file boundary resets
+    // (#3002), and only the second file's `1` survives. `main` read the
+    // whole padded string as a value.
+    let dir = tempfile::tempdir()?;
+    let r1 = dir.path().join("r1");
+    let r2 = dir.path().join("r2");
+    std::fs::write(&r1, padded(b"\xef\xbb\"a", 4091, b"\"x"))?;
+    std::fs::write(&r2, b" 1\n")?;
+    let files = [r1.to_str().unwrap(), r2.to_str().unwrap()];
+    for (slurp, expected) in [
+        (&[][..], "\x1e[1,\"r2\"]\n"),
+        (&["-s"][..], "\x1e[[1],\"r2\"]\n"),
+    ] {
+        let mut args = vec!["--seq", "-c"];
+        args.extend_from_slice(slurp);
+        args.push("[., (input_filename | split(\"/\") | last)]");
+        args.extend_from_slice(&files);
+        let (output, code) = spawn_jq(&args, None)?;
+        assert_eq!(code, 0, "{slurp:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{slurp:?}"
+        );
+    }
     Ok(())
 }
 
