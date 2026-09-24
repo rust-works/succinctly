@@ -9207,118 +9207,166 @@ fn owned_assign_step<S: EvalSemantics>(
         _ => return None,
     };
 
-    // The concrete components the write names, each settled against the
-    // container it lands in by a read-only walk before anything is written.
-    // A single step -- the common fold shape -- borrows its static
-    // component and allocates nothing for the path.
-    let mut steps = Vec::new();
-    let single = match owned_assign_single_step::<S>(path) {
-        SingleStep::Step(step) => Some(step),
-        SingleStep::Unclosed => return None,
-        SingleStep::Chain => {
-            owned_assign_path_steps::<S>(path, &mut steps)?;
-            None
+    // The keys the write names, each settled against the container it lands
+    // in by a read-only walk before anything is written. A single step --
+    // the common fold shape -- borrows its key, keeps no step list, and
+    // writes through `set_field`/`set_index` directly; this path runs once
+    // per fold step, and the general `set_path` walk cost #3025's
+    // `.i += 1` loop ~6% of its instructions.
+    match owned_assign_single_step::<S>(path) {
+        SingleStep::Unclosed => None,
+        SingleStep::Step(key) => {
+            let old = owned_assign_step_child(&key, state)?;
+            let yq_shape =
+                matches!(key, StepKey::Field(_)) && matches!(state, OwnedValue::Object(_));
+            let new_value = owned_assign_new_value::<S>(expr, rhs, old, yq_shape)?;
+            Some(match key {
+                StepKey::Field(name) => set_field(state, name.into_owned(), new_value)
+                    .map_err(|_| unreachable_owned_assign_write()),
+                StepKey::Index(idx) => set_index(state, idx, new_value)
+                    .unwrap_or_else(|| Err(unreachable_owned_assign_write())),
+            })
         }
-    };
-    let mut old: &OwnedValue = state;
-    for step in single.iter().chain(steps.iter()) {
-        old = owned_assign_step_child(step, old)?;
+        SingleStep::Chain => {
+            let mut steps = Vec::new();
+            owned_assign_path_steps::<S>(path, &mut steps)?;
+            if steps.is_empty() {
+                return None;
+            }
+            let mut old: &OwnedValue = state;
+            for step in &steps {
+                old = owned_assign_step_child(step, old)?;
+            }
+            let new_value = owned_assign_new_value::<S>(expr, rhs, old, false)?;
+            let path = Expr::Pipe(steps.into_iter().map(StepKey::into_component).collect());
+            Some(set_path::<S>(state, &path, new_value, false, false))
+        }
     }
-    if single.is_none() && steps.is_empty() {
-        return None;
-    }
+}
 
+/// The value [`owned_assign_step`] writes, given the old value at its path,
+/// or `None` to decline. yq mode keeps only #3025's `.field op= <number>`
+/// shape (`yq_shape`: one field step into an object), since its `=`
+/// vivifies before the right side runs (#2481) and redirects through
+/// aliases (#1351).
+fn owned_assign_new_value<S: EvalSemantics>(
+    expr: &Expr,
+    rhs: OwnedAssignRhs,
+    old: &OwnedValue,
+    yq_shape: bool,
+) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq
-        && !(matches!(expr, Expr::CompoundAssign { .. })
-            && matches!(single.as_deref(), Some(Expr::Field(_)))
-            && matches!(state, OwnedValue::Object(_))
+        && !(yq_shape
+            && matches!(expr, Expr::CompoundAssign { .. })
             && old.is_number()
             && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
     {
         return None;
     }
+    match rhs {
+        OwnedAssignRhs::Value(value) => Some(value),
+        OwnedAssignRhs::Combine(op, right) => arith_combine::<S>(op, old.clone(), right).ok(),
+        OwnedAssignRhs::Alternative(_) if old.is_truthy() => Some(old.clone()),
+        OwnedAssignRhs::Alternative(value) => Some(value),
+    }
+}
 
-    let new_value = match rhs {
-        OwnedAssignRhs::Value(value) => value,
-        OwnedAssignRhs::Combine(op, right) => arith_combine::<S>(op, old.clone(), right).ok()?,
-        OwnedAssignRhs::Alternative(_) if old.is_truthy() => old.clone(),
-        OwnedAssignRhs::Alternative(value) => value,
-    };
+/// The error a single-step write reports if its container ever stops being
+/// the one [`owned_assign_step_child`] just accepted -- which the borrow on
+/// `state` makes impossible between the check and the write.
+#[cold]
+fn unreachable_owned_assign_write() -> EvalError {
+    debug_assert!(
+        false,
+        "owned_assign_step wrote into a container it did not check"
+    );
+    EvalError::new("internal error: owned assignment target changed shape")
+}
 
-    Some(match single {
-        Some(step) => set_path::<S>(state, &step, new_value, false, false),
-        None => {
-            let path = Expr::Pipe(steps.into_iter().map(Cow::into_owned).collect());
-            set_path::<S>(state, &path, new_value, false, false)
+/// One step of an [`owned_assign_step`] path: an object key or an array
+/// index, the two components [`key_to_path_component`] produces for a
+/// string or an integer-spelled number.
+enum StepKey<'e> {
+    Field(Cow<'e, str>),
+    Index(i64),
+}
+
+impl StepKey<'_> {
+    /// The static path component [`set_path`] writes this step through.
+    fn into_component(self) -> Expr {
+        match self {
+            StepKey::Field(name) => Expr::Field(name.into_owned()),
+            StepKey::Index(idx) => Expr::Index { idx, key: None },
         }
-    })
+    }
 }
 
 /// What [`owned_assign_single_step`] found at the head of a path.
 enum SingleStep<'e> {
     /// `.name`, `.[n]` or `.[K]` with a closed `K`, under any parens or
-    /// one-stage pipe: the one component the write names.
-    Step(Cow<'e, Expr>),
+    /// one-stage pipe: the one step the write names.
+    Step(StepKey<'e>),
     /// A single `.[K]` whose `K` is not closed: the assignment declines.
     Unclosed,
     /// Not a single step; [`owned_assign_path_steps`] walks it.
     Chain,
 }
 
-/// The one component a single-step [`owned_assign_step`] path names, found
+/// The one step a single-step [`owned_assign_step`] path names, found
 /// without allocating a step list for the common fold shape.
 fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> SingleStep<'_> {
     match path {
-        Expr::Field(_) | Expr::Index { key: None, .. } => SingleStep::Step(Cow::Borrowed(path)),
         Expr::Paren(inner) => owned_assign_single_step::<S>(inner),
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => owned_assign_single_step::<S>(only),
             _ => SingleStep::Chain,
         },
         Expr::IndexExpr { target, key } if matches!(target.as_ref(), Expr::Identity) => {
-            closed_key_component::<S>(key).map_or(SingleStep::Unclosed, |step| {
-                SingleStep::Step(Cow::Owned(step))
-            })
+            closed_key_step::<S>(key).map_or(SingleStep::Unclosed, SingleStep::Step)
         }
-        _ => SingleStep::Chain,
+        _ => static_step(path).map_or(SingleStep::Chain, SingleStep::Step),
     }
 }
 
-/// The components of an [`owned_assign_step`] path, outermost first, or
-/// `None` when a step is neither static nor closed.
+/// A static `.name` / `.[n]` step, borrowed from the path.
+fn static_step(path: &Expr) -> Option<StepKey<'_>> {
+    match path {
+        Expr::Field(name) => Some(StepKey::Field(Cow::Borrowed(name))),
+        Expr::Index { idx, key: None } => Some(StepKey::Index(*idx)),
+        _ => None,
+    }
+}
+
+/// The steps of an [`owned_assign_step`] path, outermost first, or `None`
+/// when a step is neither static nor closed.
 fn owned_assign_path_steps<'e, S: EvalSemantics>(
     path: &'e Expr,
-    steps: &mut Vec<Cow<'e, Expr>>,
+    steps: &mut Vec<StepKey<'e>>,
 ) -> Option<()> {
     match path {
         Expr::Identity => Some(()),
         Expr::Paren(inner) => owned_assign_path_steps::<S>(inner, steps),
-        Expr::Field(_) | Expr::Index { key: None, .. } => {
-            steps.push(Cow::Borrowed(path));
-            Some(())
-        }
         Expr::Pipe(stages) => stages
             .iter()
             .try_for_each(|stage| owned_assign_path_steps::<S>(stage, steps)),
         Expr::IndexExpr { target, key } => {
             owned_assign_path_steps::<S>(target, steps)?;
-            steps.push(Cow::Owned(closed_key_component::<S>(key)?));
+            steps.push(closed_key_step::<S>(key)?);
             Some(())
         }
-        _ => None,
+        _ => {
+            steps.push(static_step(path)?);
+            Some(())
+        }
     }
 }
 
-/// The static component a closed `.[K]` key names -- the one
-/// [`key_to_path_component`] produces for a string or an integer-spelled
+/// The step a closed `.[K]` key names -- a string or an integer-spelled
 /// number -- or `None` for any other key, which the evaluator handles.
-fn closed_key_component<S: EvalSemantics>(key: &Expr) -> Option<Expr> {
+fn closed_key_step<S: EvalSemantics>(key: &Expr) -> Option<StepKey<'static>> {
     match closed_expr_to_owned::<S>(key)? {
-        OwnedValue::String(name) => Some(Expr::Field(name)),
-        key => Some(Expr::Index {
-            idx: integral_key(&key)?,
-            key: None,
-        }),
+        OwnedValue::String(name) => Some(StepKey::Field(Cow::Owned(name))),
+        key => Some(StepKey::Index(integral_key(&key)?)),
     }
 }
 
@@ -9327,13 +9375,17 @@ fn closed_key_component<S: EvalSemantics>(key: &Expr) -> Option<Expr> {
 /// write creates, which is what jq reads there too -- and `None` for every
 /// case jq treats specially: a key of the wrong kind for its container, a
 /// negative index, or one past the end, which pads.
-fn owned_assign_step_child<'v>(step: &Expr, container: &'v OwnedValue) -> Option<&'v OwnedValue> {
+#[inline]
+fn owned_assign_step_child<'v>(
+    step: &StepKey<'_>,
+    container: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
     match (step, container) {
-        (Expr::Field(name), OwnedValue::Object(map)) => {
-            Some(map.get(name).unwrap_or(&OwnedValue::Null))
+        (StepKey::Field(name), OwnedValue::Object(map)) => {
+            Some(map.get(name.as_ref()).unwrap_or(&OwnedValue::Null))
         }
-        (Expr::Field(_) | Expr::Index { idx: 0, .. }, OwnedValue::Null) => Some(&OwnedValue::Null),
-        (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
+        (StepKey::Field(_) | StepKey::Index(0), OwnedValue::Null) => Some(&OwnedValue::Null),
+        (StepKey::Index(idx), OwnedValue::Array(items)) => {
             let idx = usize::try_from(*idx).ok()?;
             (idx <= items.len()).then(|| items.get(idx).unwrap_or(&OwnedValue::Null))
         }
@@ -27185,6 +27237,38 @@ fn autovivify_object(root: &mut OwnedValue) {
     }
 }
 
+/// [`set_path`]'s one-field write: vivify a `null` root into an object and
+/// insert `new_value` under `name`, handing `new_value` back when the root
+/// is not an object for the caller to diagnose. Shared with
+/// [`owned_assign_step`]'s single-step write (#3138), so there is one
+/// definition of what writing a field does.
+fn set_field(root: &mut OwnedValue, name: String, new_value: OwnedValue) -> Result<(), OwnedValue> {
+    autovivify_object(root);
+    match root {
+        OwnedValue::Object(map) => {
+            map.insert(name, new_value);
+            Ok(())
+        }
+        _ => Err(new_value),
+    }
+}
+
+/// [`set_path`]'s one-index write, the sibling of [`set_field`]: vivify a
+/// `null` root into an array and write `new_value` at `idx` (padding past
+/// the end, counting back from it for a negative index). `None` when the
+/// root is not an array.
+fn set_index(
+    root: &mut OwnedValue,
+    idx: i64,
+    new_value: OwnedValue,
+) -> Option<Result<(), EvalError>> {
+    autovivify_array(root);
+    match root {
+        OwnedValue::Array(arr) => Some(write_index(arr, idx).map(|slot| *slot = new_value)),
+        _ => None,
+    }
+}
+
 /// Sibling of [`autovivify_object`] for an `Index` step.
 fn autovivify_array(root: &mut OwnedValue) {
     if matches!(root, OwnedValue::Null) {
@@ -27319,34 +27403,22 @@ fn set_path<S: EvalSemantics>(
             *root = new_value;
             Ok(())
         }
-        Expr::Field(name) => {
-            autovivify_object(root);
-            if let OwnedValue::Object(map) = root {
-                map.insert(name.clone(), new_value);
-                Ok(())
-            } else if scalar_noop && is_yq_field_index_noop_scalar(root) {
-                Ok(())
-            } else {
-                Err(EvalError::cannot_index_with_field(
-                    owned_type_name(root),
-                    name,
-                ))
-            }
-        }
-        Expr::Index { idx, .. } => {
-            autovivify_array(root);
-            if let OwnedValue::Array(arr) = root {
-                *write_index(arr, *idx)? = new_value;
-                Ok(())
-            } else if scalar_noop && is_yq_field_index_noop_scalar(root) {
-                Ok(())
-            } else {
-                Err(EvalError::cannot_index_with_type(
-                    owned_type_name(root),
-                    "number",
-                ))
-            }
-        }
+        Expr::Field(name) => match set_field(root, name.clone(), new_value) {
+            Ok(()) => Ok(()),
+            Err(_) if scalar_noop && is_yq_field_index_noop_scalar(root) => Ok(()),
+            Err(_) => Err(EvalError::cannot_index_with_field(
+                owned_type_name(root),
+                name,
+            )),
+        },
+        Expr::Index { idx, .. } => match set_index(root, *idx, new_value) {
+            Some(written) => written,
+            None if scalar_noop && is_yq_field_index_noop_scalar(root) => Ok(()),
+            None => Err(EvalError::cannot_index_with_type(
+                owned_type_name(root),
+                "number",
+            )),
+        },
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // #1429: one flat, peel-one-component-and-recurse walk, the shape
             // `update_path` and `delete_at_path` already use -- not a
