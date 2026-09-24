@@ -163,11 +163,10 @@ pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
     bom_prefix_from(raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()))
 }
 
-/// Same rule as [`bom_prefix`], but scanning any byte iterator directly --
-/// so a single already-owned buffer (like `value_ranges`'s) never needs to
-/// be wrapped in a fresh `Vec` just to match [`bom_prefix`]'s multi-source
-/// signature. Only ever reads at most `UTF8_BOM.len() + 1` bytes before
-/// returning, so callers may pass an iterator over arbitrarily large input.
+/// [`bom_prefix`]'s rule over any byte iterator. Only ever reads at most
+/// `UTF8_BOM.len() + 1` bytes before returning, so callers may pass an
+/// iterator over arbitrarily large input. Raw bytes only: see
+/// [`strip_bom_prefix`] for why a UTF-8-substituted stream cannot be asked.
 fn bom_prefix_from(bytes: impl Iterator<Item = u8>) -> BomPrefix {
     let mut consumed = 0;
     for byte in bytes {
@@ -186,6 +185,38 @@ fn bom_prefix_from(bytes: impl Iterator<Item = u8>) -> BomPrefix {
         consumed,
         malformed: false,
     }
+}
+
+/// Removes the bytes [`bom_prefix`] says jq swallows from the front of
+/// `raw_bytes` -- across sources, since the prefix can straddle a file
+/// boundary -- and returns whether that prefix was malformed, for
+/// [`value_ranges`].
+///
+/// For the value walk, which runs over the stream *after* the UTF-8
+/// substitution `get_inputs` applies. The verdict has to come from the raw
+/// bytes, and the prefix has to go before substituting, because
+/// substitution rewrites exactly the bytes a BOM prefix is made of
+/// (#3195/#3199). An invalid lead byte becomes U+FFFD, `EF BF BD`, which
+/// itself reads as a malformed BOM prefix: `\xe0\x1e"0` flipped the value
+/// walk into malformed-BOM mode and read the string's `0` as a value. A
+/// raw malformed prefix is itself invalid UTF-8, and its replacement is a
+/// different width: `\xef\xbb1 2` became `EF BF BD 1 2`, the walk swallowed
+/// only the `EF`, and `BF BD 1` read as one junk token, losing jq's `1`.
+/// Outside a string a short segment can even collapse into a single
+/// U+FFFD, dropping the byte after it, so no offset mapping could recover
+/// these.
+pub(crate) fn strip_bom_prefix(raw_bytes: &mut [(Option<usize>, Vec<u8>)]) -> bool {
+    let bom = bom_prefix(raw_bytes);
+    let mut left = bom.consumed;
+    for (_, raw) in raw_bytes.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let n = left.min(raw.len());
+        raw.drain(..n);
+        left -= n;
+    }
+    bom.malformed
 }
 
 /// Every byte of the input stream, as jq's scanner sees it: all sources
@@ -429,6 +460,10 @@ pub(crate) struct SeqWarningWalk {
 /// later handed to the materializer.  Diagnostics use the original bytes at
 /// their separate call site, so invalid UTF-8 retains jq's raw-byte columns.
 ///
+/// `bytes` starts *after* jq's BOM prefix, and `bom_malformed` is the raw
+/// bytes' verdict on it: [`strip_bom_prefix`], run before substituting. The
+/// substituted stream cannot answer either question (#3195/#3199).
+///
 /// `boundaries` are the absolute offsets into `bytes` at which each source
 /// after the first begins -- the cumulative lengths `build_seq_values`
 /// already records for its file remap -- so the walker can apply the
@@ -446,17 +481,17 @@ pub(crate) struct SeqWarningWalk {
 /// function exactly as before the drop rule existed.
 pub(crate) fn value_ranges(
     bytes: &[u8],
+    bom_malformed: bool,
     boundaries: &[usize],
     value_cap: Option<usize>,
 ) -> Vec<(usize, usize)> {
-    let bom = bom_prefix_from(bytes.iter().copied());
+    let bom = BomPrefix {
+        consumed: 0,
+        malformed: bom_malformed,
+    };
     let mut ignore = |_: &str| {};
     let mut reader = Reader::new(bom, &mut ignore);
-    reader.run(
-        bytes.iter().copied().enumerate().skip(bom.consumed),
-        boundaries,
-        value_cap,
-    );
+    reader.run(bytes.iter().copied().enumerate(), boundaries, value_cap);
     let mut values = reader.values;
     if let Some(cap) = value_cap {
         values.truncate(cap);
@@ -1298,11 +1333,13 @@ mod tests {
     /// letting this test stay at the byte level rather than routing
     /// through UTF-8 substitution too).
     fn seq_value_texts(input: &[u8], slurp: bool) -> Vec<String> {
-        let owned = vec![(None, input.to_vec())];
+        let mut owned = vec![(None, input.to_vec())];
         let cap = for_each_warning(&owned, slurp, &mut |_| {}).value_cap;
-        value_ranges(input, &[], cap)
+        let malformed = strip_bom_prefix(&mut owned);
+        let stream = &owned[0].1;
+        value_ranges(stream, malformed, &[], cap)
             .into_iter()
-            .map(|(start, end)| String::from_utf8(input[start..end].to_vec()).unwrap())
+            .map(|(start, end)| String::from_utf8(stream[start..end].to_vec()).unwrap())
             .collect()
     }
 
@@ -1311,13 +1348,16 @@ mod tests {
     /// a comma instead causes the same scan call to fail, so it is discarded.
     #[test]
     fn value_ranges_follow_jq_recovery_2653() {
-        assert_eq!(value_ranges(b"\x1e1 {invalid\n", &[], None), vec![(1, 2)]);
-        assert_eq!(value_ranges(b"\x1e1,2\n", &[], None), vec![(3, 4)]);
         assert_eq!(
-            value_ranges(b"\x1e1-2\n", &[], None),
+            value_ranges(b"\x1e1 {invalid\n", false, &[], None),
+            vec![(1, 2)]
+        );
+        assert_eq!(value_ranges(b"\x1e1,2\n", false, &[], None), vec![(3, 4)]);
+        assert_eq!(
+            value_ranges(b"\x1e1-2\n", false, &[], None),
             Vec::<(usize, usize)>::new()
         );
-        assert_eq!(value_ranges(b"\x1e5-3 7\n", &[], None), vec![(5, 6)]);
+        assert_eq!(value_ranges(b"\x1e5-3 7\n", false, &[], None), vec![(5, 6)]);
     }
 
     /// Real jq's non-slurp `--seq` driver can end the *entire* stream
@@ -1558,7 +1598,7 @@ mod tests {
         assert_eq!(cap, None, "a's own drop is masked by joining with b");
         let combined: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
         assert_eq!(
-            value_ranges(&combined, &[a.len()], cap)
+            value_ranges(&combined, false, &[a.len()], cap)
                 .into_iter()
                 .map(|(s, e)| String::from_utf8(combined[s..e].to_vec()).unwrap())
                 .collect::<Vec<_>>(),
@@ -1938,16 +1978,54 @@ mod tests {
     /// then `1 ` yields `[1]` in real jq and nothing in one buffer.
     #[test]
     fn malformed_bom_value_walk_resets_at_source_boundaries_3002() {
-        let a = b"\xef\xbf".to_vec();
-        let b = b"1 \n".to_vec();
-        let mut combined = a.clone();
-        combined.extend_from_slice(&b);
+        // Stripped as production strips it: jq swallows the `EF`, and the
+        // dangling `BF` is left for the walk.
+        let mut sources = vec![(None, b"\xef\xbf".to_vec()), (None, b"1 \n".to_vec())];
+        assert!(strip_bom_prefix(&mut sources));
+        let a = &sources[0].1;
+        let combined: Vec<u8> = a.iter().chain(&sources[1].1).copied().collect();
         // Source `a`'s exclusive end is the boundary (`b` starts there).
-        assert_eq!(value_ranges(&combined, &[a.len()], None), vec![(2, 3)]);
+        assert_eq!(
+            value_ranges(&combined, true, &[a.len()], None),
+            vec![(1, 2)]
+        );
         // Same bytes in one buffer: `BF` derails and the record is dropped.
         assert_eq!(
-            value_ranges(&combined, &[], None),
+            value_ranges(&combined, true, &[], None),
             Vec::<(usize, usize)>::new()
+        );
+    }
+
+    /// #3195/#3199: `strip_bom_prefix` removes exactly the bytes jq swallows,
+    /// across a source boundary, and reports the raw verdict -- never one
+    /// derived from a U+FFFD that UTF-8 substitution would put there.
+    #[test]
+    fn strip_bom_prefix_takes_the_raw_prefix_and_verdict_3195_3199() {
+        fn strip(sources: &[&[u8]]) -> (bool, Vec<Vec<u8>>) {
+            let mut owned: Vec<(Option<usize>, Vec<u8>)> =
+                sources.iter().map(|s| (None, s.to_vec())).collect();
+            let malformed = strip_bom_prefix(&mut owned);
+            (malformed, owned.into_iter().map(|(_, b)| b).collect())
+        }
+        assert_eq!(strip(&[b"\xef\xbb1 2"]), (true, vec![b"1 2".to_vec()]));
+        assert_eq!(strip(&[b"\xef1 2"]), (true, vec![b"1 2".to_vec()]));
+        assert_eq!(
+            strip(&[b"\xef\xbb\xbf\x1e1"]),
+            (false, vec![b"\x1e1".to_vec()])
+        );
+        // An invalid lead byte that is not a BOM prefix stays, unflagged.
+        assert_eq!(
+            strip(&[b"\xe0\x1e\"0"]),
+            (false, vec![b"\xe0\x1e\"0".to_vec()])
+        );
+        // Split across sources, including an empty one in between.
+        assert_eq!(
+            strip(&[b"\xef", b"", b"\xbb1"]),
+            (true, vec![vec![], vec![], b"1".to_vec()])
+        );
+        assert_eq!(
+            strip(&[b"\xef\xbb", b"\xbf\x1e1"]),
+            (false, vec![vec![], b"\x1e1".to_vec()])
         );
     }
 
