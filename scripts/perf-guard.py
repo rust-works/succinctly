@@ -147,6 +147,17 @@ QUERIES = [
     ("users_identity", "users", "2mb", "jq", "."),
     ("arrays_identity", "arrays", "2mb", "jq", "."),
     ("users_yq_keys_unsorted", "users", "2mb", "yq", "keys_unsorted"),
+    # #3157: the owned print path. Every row above either streams (keys_unsorted,
+    # identity) or, for `map_iterate` below, produces a `LazySeq`; none reaches
+    # `GenericResult::Owned` directly, so #3009's rewrite of that path (29-42%
+    # cheaper peak RSS, ~20% cheaper wall clock, by no longer rebuilding into
+    # `lazy::JqValue` before printing) had nothing watching it for a regression
+    # back. `to_entries` on the `wide` fixture is #3009's own headline shape: a
+    # large owned tree of many small objects, reaching `GenericResult::Owned`
+    # directly via `eval_generic.rs`'s `Builtin::ToEntries` arm. No
+    # `QUERY_THRESHOLDS` entry: this is a new row with nothing accepted against
+    # it yet.
+    ("wide_to_entries", "wide", "2mb", "jq", "to_entries"),
     # #2666: the two sides of the `map(f) | .[]` atomicity boundary, on the
     # one fixture where `map` applies at the root (a top-level array of
     # arrays). The first is #1565's win -- a truncating consumer over a
