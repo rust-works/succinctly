@@ -36012,14 +36012,10 @@ fn resolve_bind_source_in<S: EvalSemantics>(
         Keep::AtMost(usize::MAX),
     ) {
         Ok(branches) => Some((branches.into_iter().map(bind).collect(), None)),
-        // Either of the resolver's own refusal kinds is an artefact here
-        // (jq raises no path error inside a source at all), and on the
+        // The resolver's own refusal (`is_resolver_refusal`) is an artefact
+        // here (jq raises no path error inside a source at all), and on the
         // witness grammar it always escapes -- nothing in it catches.
-        Err((_, EvalEscape::Error(e)))
-            if e.is_untracked_navigation_error() || e.is_invalid_path_expression() =>
-        {
-            None
-        }
+        Err((_, EvalEscape::Error(e))) if is_resolver_refusal(&e) => None,
         Err((prefix, escape)) => Some((
             prefix.into_iter().map(bind).collect(),
             Some(Control::from(escape)),
@@ -36584,25 +36580,14 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // already had, with `halt` and an uncatchable error always
                 // propagating. Off the register (`!trackable`), a first-step
                 // refusal retries only when it is provably jq's own verdict
-                // (`refusal_is_exact`); otherwise it is a guess -- see the
-                // dispatch arm -- and never retries (#2979, #3120).
-                Flow::Escaped(Control::Error(e)) => {
-                    if is_last
-                        || (!trackable && !refusal_is_exact && is_resolver_refusal(&e))
-                        || e.is_uncatchable_at_value_position()
-                    {
-                        return ResolveFlow::Escaped(e.into());
+                // (`refusal_is_exact`); otherwise it is a guess -- see
+                // `walk_escape_retries` -- and never retries (#2979, #3120,
+                // #3112).
+                Flow::Escaped(control) => {
+                    if walk_escape_retries(&control, is_last, !trackable && !refusal_is_exact) {
+                        continue;
                     }
-                    continue;
-                }
-                Flow::Escaped(Control::Break(label)) => {
-                    if is_last {
-                        return ResolveFlow::Escaped(EvalEscape::Break(label));
-                    }
-                    continue;
-                }
-                Flow::Escaped(Control::Halt(code)) => {
-                    return ResolveFlow::Escaped(EvalEscape::Halt(code));
+                    return ResolveFlow::Escaped(control.into());
                 }
             }
         }
@@ -37094,7 +37079,8 @@ struct FoldAlternative {
 /// `Stopped` means `sink` stopped it, `Escaped` a pattern step's refusal or
 /// the key generator's own trailing control, raised after every branch
 /// that completed before it. Whether a refusal may retry the next
-/// alternative is [`fold_walk_refusal_retries`]'s question.
+/// alternative is [`walk_escape_retries`]'s question, with
+/// [`fold_walk_refusal_is_guess`] supplying its `guessed`.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the fold's own ambients, as `resolve_foreach`
 fn each_fold_alternative<S: EvalSemantics>(
     pattern: &Pattern,
@@ -37184,8 +37170,10 @@ fn each_fold_alternative<S: EvalSemantics>(
     }
 }
 
-/// Whether a pattern-walk refusal out of [`each_fold_alternative`] may act
-/// as "this alternative did not match, try the next" (#2979).
+/// Whether a pattern-walk refusal against `elem`/`reg` out of
+/// [`each_fold_alternative`] might be this arm's own guess at jq's
+/// `path_intact`, rather than jq's real verdict -- [`walk_escape_retries`]'s
+/// `guessed` for the two fold call sites (#2979, #3112).
 ///
 /// **A walk refusal is retryable only when it is jq's own verdict.** jq runs
 /// the next alternative when a pattern step fails `path_intact`, so a walk
@@ -37197,27 +37185,19 @@ fn each_fold_alternative<S: EvalSemantics>(
 /// alternative -- so retrying would bind a different alternative than jq
 /// does, and `del`/`=` would write through it. That refusal propagates
 /// instead: a refusal where jq might answer, never an answer jq would not
-/// give. A key generator's own uncatchable error (a decode failure, a
-/// resource cap) never retries either, as nowhere else does.
-fn fold_walk_refusal_retries(
-    elem: &FoldSourceValue,
-    reg: &FoldRegister,
-    error: &EvalError,
-) -> bool {
-    let guessed = elem.register_path.is_none()
+/// give.
+fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> bool {
+    elem.register_path.is_none()
         && (!reg.trackable
             || (!matches!(elem.value, OwnedValue::Null | OwnedValue::Bool(_))
-                && elem.value == reg.value));
-    if error.is_uncatchable_at_value_position() {
-        return false;
-    }
-    !(guessed && is_resolver_refusal(error))
+                && elem.value == reg.value))
 }
 
 /// The resolver's own two refusal kinds (#2979): a pattern step or a
 /// navigation on a value that is not the register's node, and a terminal
-/// value that is not a path. Named once so the three `?//` sites below
-/// agree on what "the resolver's own refusal" means.
+/// value that is not a path. Named once so every caller -- the three
+/// `?//` walk sites below, plus [`resolve_bind_source_in`]'s witness route
+/// -- agrees on what "the resolver's own refusal" means (#3112).
 fn is_resolver_refusal(e: &EvalError) -> bool {
     e.is_untracked_navigation_error() || e.is_invalid_path_expression()
 }
@@ -37240,6 +37220,45 @@ fn path_alternative_retries(escape: &EvalEscape, is_last: bool) -> bool {
         }
         EvalEscape::Break(_) => !is_last,
         EvalEscape::Halt(_) => false,
+    }
+}
+
+/// Whether a pattern-walk escape out of one `?//` alternative retries the
+/// next -- the walk-side twin of [`path_alternative_retries`], shared by
+/// [`resolve_as_pattern`] and the two fold sites (`resolve_reduce`,
+/// `resolve_foreach`) so the three cannot drift (#2979, #2872, #3112).
+///
+/// `guessed` only affects [`Control::Error`]: whether the refusal may be
+/// this walk's own value-level model of jq's `path_intact` rather than jq's
+/// verdict, per [`fold_walk_refusal_is_guess`]'s doc comment (the fold
+/// sites) or [`resolve_as_pattern`]'s own `refusal_is_exact`/`trackable`
+/// pair. An uncatchable error and the last alternative never retry
+/// regardless of `guessed`; `Break` retries whenever it is not the last
+/// alternative; `Halt` never retries.
+///
+/// **The two `guessed` formulas disagree on one input**, left unaligned
+/// (#3112): a source value-equal to the register *and* `null`/a boolean.
+/// `fold_walk_refusal_is_guess` calls that case exact (not guessed, so a
+/// refusal there retries); `resolve_as_pattern`'s `!trackable &&
+/// !refusal_is_exact` calls it a guess (never retries). Believed
+/// unreachable for `resolve_as_pattern`: that same equality also drives
+/// `identical`/`is_input` there, so an on-register walk never reaches this
+/// refusal path for it in the first place. Confirmed against `/usr/bin/jq`
+/// 1.7.1 on every probed row (`.a | null | . as [$a] ?// $b | $b`, the same
+/// with `[[$a]]`, and `.t | true | . as [$a] ?// $b | $b}` on `{"t":true}`).
+/// Aligning the two would only *widen* `resolve_as_pattern`'s retries
+/// (guess -> exact), the fabrication direction, so this is left as a
+/// documented gap rather than folded in speculatively.
+fn walk_escape_retries(control: &Control, is_last: bool, guessed: bool) -> bool {
+    if is_last {
+        return false;
+    }
+    match control {
+        Control::Error(e) => {
+            !(e.is_uncatchable_at_value_position() || (guessed && is_resolver_refusal(e)))
+        }
+        Control::Break(_) => true,
+        Control::Halt(_) => false,
     }
 }
 
@@ -37437,8 +37456,9 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // error inside it backtracks to the next alternative:
             //
             // - a pattern-walk refusal leaves the accumulator untouched, since
-            //   `LOADVN` has not run (`fold_walk_refusal_retries` decides whether
-            //   the refusal is jq's own, or a guess that must not retry);
+            //   `LOADVN` has not run (`walk_escape_retries`, guided by
+            //   `fold_walk_refusal_is_guess`, decides whether the refusal is
+            //   jq's own, or a guess that must not retry);
             // - an UPDATE escape leaves it at UPDATE's last output before the
             //   escape, or `null` when there was none (`LOADVN` nulled it),
             //   with that output's provenance -- value mode's
@@ -37453,6 +37473,12 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
                 let is_last = i == last_idx;
+                // Gated on `alternatives.is_some()` unlike `resolve_as_pattern`'s
+                // unconditional call (#3112): with one pattern (`alternatives ==
+                // None`), this is the only, `is_last` iteration, and both
+                // `is_retryable_stop` and `path_alternative_retries` refuse to
+                // retry once `is_last` regardless of this flag -- so no retry
+                // ever reads a stale flag left over from a previous attempt.
                 if alternatives.is_some() {
                     clear_nonretryable_stop();
                 }
@@ -37611,24 +37637,19 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                     }
                     // A pattern-walk refusal leaves the accumulator untouched
-                    // for the branch it refused (`LOADVN` has not run for it),
-                    // and retries only when it is jq's own verdict
-                    // (`fold_walk_refusal_retries`); a key generator's `break`
+                    // for the branch it refused (`LOADVN` has not run for
+                    // it), and retries only when it is jq's own verdict
+                    // (`walk_escape_retries`); a key generator's `break`
                     // retries like any other, `halt` never.
-                    Flow::Escaped(Control::Error(e)) => {
-                        if !is_last && fold_walk_refusal_retries(&elem, &reg, &e) {
+                    Flow::Escaped(control) => {
+                        if walk_escape_retries(
+                            &control,
+                            is_last,
+                            fold_walk_refusal_is_guess(&elem, &reg),
+                        ) {
                             continue;
                         }
-                        return stop_with_escape(&mut aborted, Control::Error(e));
-                    }
-                    Flow::Escaped(Control::Break(label)) => {
-                        if !is_last {
-                            continue;
-                        }
-                        return stop_with_escape(&mut aborted, Control::Break(label));
-                    }
-                    Flow::Escaped(Control::Halt(code)) => {
-                        return stop_with_escape(&mut aborted, Control::Halt(code));
+                        return stop_with_escape(&mut aborted, control);
                     }
                 }
             }
@@ -37885,6 +37906,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             let mut ran_update = false;
             for (i, pattern) in patterns.iter().enumerate() {
                 let is_last = i == last_idx;
+                // See `resolve_reduce`'s identical gate and its #3112 comment.
                 if alternatives.is_some() {
                     clear_nonretryable_stop();
                 }
@@ -38181,21 +38203,16 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     Flow::Stopped { .. } => {
                         unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
                     }
-                    // See `resolve_reduce`'s identical arms.
-                    Flow::Escaped(Control::Error(e)) => {
-                        if !is_last && fold_walk_refusal_retries(&elem, &reg, &e) {
+                    // See `resolve_reduce`'s identical arm.
+                    Flow::Escaped(control) => {
+                        if walk_escape_retries(
+                            &control,
+                            is_last,
+                            fold_walk_refusal_is_guess(&elem, &reg),
+                        ) {
                             continue;
                         }
-                        return stop_with_escape(&mut aborted, Control::Error(e));
-                    }
-                    Flow::Escaped(Control::Break(label)) => {
-                        if !is_last {
-                            continue;
-                        }
-                        return stop_with_escape(&mut aborted, Control::Break(label));
-                    }
-                    Flow::Escaped(Control::Halt(code)) => {
-                        return stop_with_escape(&mut aborted, Control::Halt(code));
+                        return stop_with_escape(&mut aborted, control);
                     }
                 }
             }
@@ -98210,7 +98227,7 @@ mod tests {
             query!(br#"{"a":{"b":1},"c":{"b":1}}"#, filter,
                 QueryResult::Error(e) => {
                     assert!(
-                        e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
+                        is_resolver_refusal(&e),
                         "{filter}: {}",
                         e.message
                     );
@@ -98238,7 +98255,7 @@ mod tests {
                     // jq's "near attempt to access element" wording rather
                     // than the bare "with result" one.
                     assert!(
-                        e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
+                        is_resolver_refusal(&e),
                         "{filter}: {}",
                         e.message
                     );
@@ -99875,11 +99892,7 @@ mod tests {
         ];
         for (input, filter) in rows {
             match bind_origin_outputs(input, filter) {
-                Err(e) => assert!(
-                    e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
-                    "{filter}: {}",
-                    e.message
-                ),
+                Err(e) => assert!(is_resolver_refusal(&e), "{filter}: {}", e.message),
                 Ok(got) => panic!("{filter}: answered {got} where jq refuses"),
             }
         }
