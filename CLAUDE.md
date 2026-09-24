@@ -464,27 +464,31 @@ for the full list.
 | `mmap-tests`          | Memory-mapped bitvector tests                                                                                             |
 | `broadword-yaml`      | Non-additive: replaces NEON YAML scanning with broadword (SWAR) on ARM64                                                  |
 | `scalar-yaml`         | Non-additive: disables all SIMD/broadword YAML parsing                                                                    |
-| `select-stats`        | Non-additive: adds a counter to five hot `select` scan loops (#40 measurement; never for timing runs)                     |
+| `select-stats`        | Adds a counter to five hot `select` scan loops (#40 measurement; never for timing runs)                                   |
 | `unshared-containers` | Non-additive: the #3000 layout (boxed map, inline array `Vec`) instead of `Rc` containers (#2999 A/B holdout; never ship) |
 | `share-stats`         | Record every copy-on-write that copied, with its call site (#2999 clone audit)                                            |
 
 ### `--all-features` is not a superset build (#3006)
 
-Five features above are marked **non-additive**: enabling one *replaces* the
+Four features above are marked **non-additive**: enabling one *replaces* the
 default with a slower or measurement-only build rather than adding behavior
-on top of it. `cargo build --all-features` turns on all five at once
-(`share-stats` is additive — instrumentation only, no default behavior
-replaced — and not part of this set), so an `--all-features` binary is a
-strictly slower, non-shipping build with no diagnostic that it's non-default.
-This has already bitten twice:
+on top of it (`select-stats`/`share-stats` are additive — instrumentation
+only, no default behavior replaced — and not part of this set, even though
+both must also never be on for a timing/shipped build for their own,
+different reason). `cargo build --all-features` turns on all four at once,
+so an `--all-features` binary is a strictly slower, non-shipping build with
+no diagnostic that it's non-default. This has already bitten twice, in ways
+CI works around but this repo's own docs don't all say consistently:
 
 - **Clippy's blind spot, twice over**: `--all-features` enables `scalar-yaml`,
-  which compiles out every YAML SIMD backend (`src/yaml/simd/{x86,neon,broadword}.rs`)
-  entirely, *and* `portable-popcount`, which together with `simd` also
-  un-gates the AVX-512 popcount path (`src/bits/popcount.rs`) the same way —
-  so `cargo clippy --all-targets --all-features` never lints either (#185,
-  #388). CI's x86_64 `Clippy` job therefore runs *twice* — once with
-  `--all-features`, once with `--features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests`
+  which compiles out the YAML SIMD backend for whichever architecture is
+  building (`src/yaml/simd/x86.rs` on x86_64; `neon.rs` and `broadword.rs`
+  on ARM64 — `broadword.rs` itself never even compiles on x86_64, feature
+  or not) entirely, *and* `portable-popcount`, which together with `simd`
+  also gates *out* the AVX-512 popcount path (`src/bits/popcount.rs`) the
+  same way — so `cargo clippy --all-targets --all-features` never lints
+  either (#185, #388). CI's x86_64 `Clippy` job therefore runs *twice* —
+  once with `--all-features`, once with `--features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests`
   (excludes both `scalar-yaml` and `portable-popcount`, so both real paths
   compile in) — and the ARM64 leg runs a *third* time on top of that with
   `broadword-yaml` added (the YAML backend selectors are cfg-exclusive, so
@@ -493,16 +497,33 @@ This has already bitten twice:
   matrix entry for the exact commands). When validating clippy locally for
   any change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run
   every invocation ci.yml runs for your architecture, not just
-  `--all-features`.
+  `--all-features` — and see [docs/guides/developer.md](docs/guides/developer.md)'s
+  own Linting section, which now lists them too.
 - **Pins gated out of the most-run build**: an exact-size or exact-behaviour
   pin describing the *shipped* shape has to be `#[cfg(not(feature = "…"))]`-gated
   so `cargo test --all-features` stays green, which makes the pin silently
-  absent in exactly the build most likely to be run to "check everything."
+  absent in exactly the build most likely to be run to "check everything" —
+  including [docs/guides/release.md](docs/guides/release.md)'s own release
+  checklist, which now also runs the shipped feature set for this reason.
+  `unshared-containers` specifically is the #2999/#3000 A/B holdout pattern
+  [docs/guides/benchmarking.md](docs/guides/benchmarking.md#ab-benchmarking-method)
+  documents its own rules for; this is the general case that pattern is one
+  instance of.
 
 If you're deciding what `cargo test`/`cargo clippy` invocation "covers
 everything": it's the CI legs matching the **default** feature set
 (`cli,simd,regex,serde` for tests) plus the non-`--all-features` clippy
-invocation(s) above, not `--all-features`.
+invocation(s) above, not `--all-features` — including the bare
+`--all-features` clippy line under the CI/CD section below, which only
+covers part of the picture.
+
+This documents the footgun; it doesn't remove it (that needs the `--cfg`
+conversion this issue's own Option 1 describes, deliberately not attempted
+here since a `RUSTFLAGS` change invalidates every developer's and every CI
+run's build cache and needs its own measurement first). Don't treat this
+section's existence as the issue being closed for good — a new non-additive
+feature added later needs the same write-up, not just a line in the table
+above.
 
 ## Testing Strategy
 
@@ -523,6 +544,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ./scripts/build.sh
 ```
+
+The `--all-features` clippy line above is only one of the invocations CI
+actually runs — see the "`--all-features` is not a superset build" section
+under Feature Flags above for the rest and why they're all needed.
 
 ## Key Documentation
 

@@ -267,10 +267,19 @@ cargo fmt
 
 ### Linting
 
-Use clippy with all warnings as errors:
+Use clippy with all warnings as errors. `--all-features` alone is not
+enough: it enables `scalar-yaml` and `portable-popcount`, which compile out
+the real YAML SIMD backends and the AVX-512 popcount path respectively, so
+neither is ever linted by that invocation alone (see CLAUDE.md's Feature
+Flags section for why). Run the invocation(s) matching your architecture:
 
 ```bash
+# Every architecture
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
+
+# ARM64 only, additionally (lints neon.rs/broadword.rs, which don't compile on x86_64 at all)
+cargo clippy --all-targets --features std,simd,broadword-yaml,serde,cli,regex,bench-runner,large-tests,mmap-tests -- -D warnings
 ```
 
 ### Documentation
