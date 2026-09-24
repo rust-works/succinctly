@@ -679,6 +679,12 @@ jobs:
         with:
           fetch-depth: 0            # full history for git merge-base (PR fork point) -- #1582
 
+      # #3169: fails fast, before either the Rust toolchain install or the
+      # expensive valgrind-based measurement below -- pure logic on
+      # perf-guard.py itself, no binary or fixtures needed.
+      - name: perf-guard.py self-tests
+        run: python3 scripts/test_perf_guard.py -v
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
