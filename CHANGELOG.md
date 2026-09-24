@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A `reduce`/`until` step that assigns into the accumulator is linear, not
+  O(n²)** (#3138). `reduce .users[] as $r ({}; .[$r.name] = $r.score)` (and
+  the same with `|=`, `+=`-style `op=`, or `//=`, through a `.x[$k]` chain,
+  or into an array accumulator) re-indexed the whole accumulator on every
+  step; it now writes in place on the owned state: 43 s -> 0.05 s at 13,981
+  records (Apple M5 Max), at the process floor at every size measured. A
+  computed-key object accumulator (`. + {($r.name): $r.score}`) takes the
+  by-value path the same way (34 s -> 0.06 s).
+  Output is unchanged, and every case the new path does not cover (padding
+  or negative indexes, float or `null` keys, multi-output or `.`-reading right
+  sides) still takes the evaluator's own route with its own diagnostics.
+  `foreach`/`while` get a constant-factor win only, and yq mode is unchanged;
+  see `docs/compliance/jq/limitations.md`.
+
 - **`OwnedValue` shares its containers by refcount and copies on write** (#2999,
   Experiment C of ADR-0024). `OwnedValue::Array` and `OwnedValue::Object` now hold
   their storage behind an `Rc`, so `OwnedValue::clone()` is one refcount bump per

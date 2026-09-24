@@ -8893,33 +8893,12 @@ pub(crate) fn try_eval_owned_step<S: EvalSemantics>(
     expr: &Expr,
     mut state: OwnedValue,
 ) -> OwnedStep {
-    if let Expr::CompoundAssign { op, path, value } = expr {
-        if let (Expr::Field(name), OwnedValue::Object(fields)) = (path.as_ref(), &state) {
-            if let Some(old) = fields.get(name) {
-                if old.is_number() {
-                    if let Some(right) = literal_shaped_expr_to_owned(value, 0) {
-                        if right.is_number() {
-                            let op = match op {
-                                AssignOp::Add => ArithOp::Add,
-                                AssignOp::Sub => ArithOp::Sub,
-                                AssignOp::Mul(flags) => ArithOp::Mul(*flags),
-                                AssignOp::Div => ArithOp::Div,
-                                AssignOp::Mod => ArithOp::Mod,
-                            };
-                            return OwnedStep::Handled(
-                                arith_combine::<S>(op, old.clone(), right).map(|new| {
-                                    if let OwnedValue::Object(ref mut map) = state {
-                                        map.insert(name.clone(), new);
-                                    }
-                                    state
-                                }),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        return OwnedStep::Declined(state);
+    if is_owned_assign(expr) {
+        return match owned_assign_step::<S>(expr, &mut state) {
+            Some(Ok(())) => OwnedStep::Handled(Ok(state)),
+            Some(Err(error)) => OwnedStep::Handled(Err(error)),
+            None => OwnedStep::Declined(state),
+        };
     }
     match eval_owned_reindex_free::<S>(expr, &state) {
         Some(result) => OwnedStep::Handled(result),
@@ -8981,35 +8960,12 @@ pub(crate) fn eval_owned_reindex_free<S: EvalSemantics>(
             };
             Some(entries_to_object::<S, _>(entries).map(OwnedValue::object_from))
         }
-        Expr::CompoundAssign { op, path, value } => {
-            let Expr::Field(name) = path.as_ref() else {
-                return None;
-            };
-            let OwnedValue::Object(fields) = input else {
-                return None;
-            };
-            let old = fields.get(name)?;
-            if !old.is_number() {
-                return None;
-            }
-            let right = literal_shaped_expr_to_owned(value, 0)?;
-            if !right.is_number() {
-                return None;
-            }
-            let op = match op {
-                AssignOp::Add => ArithOp::Add,
-                AssignOp::Sub => ArithOp::Sub,
-                AssignOp::Mul(flags) => ArithOp::Mul(*flags),
-                AssignOp::Div => ArithOp::Div,
-                AssignOp::Mod => ArithOp::Mod,
-            };
-            Some(arith_combine::<S>(op, old.clone(), right).map(|new| {
-                let mut result = input.clone();
-                if let OwnedValue::Object(ref mut map) = result {
-                    map.insert(name.clone(), new);
-                }
-                result
-            }))
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => {
+            let mut result = input.clone();
+            owned_assign_step::<S>(expr, &mut result).map(|written| written.map(|()| result))
         }
         _ => None,
     }
@@ -9019,11 +8975,368 @@ fn owned_step_shape(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(inner) => owned_step_shape(inner),
         Expr::Builtin(Builtin::ToEntries | Builtin::FromEntries) => true,
-        Expr::CompoundAssign { path, value, .. } => {
-            matches!(path.as_ref(), Expr::Field(_))
-                && literal_shaped_expr_to_owned(value, 0).is_some_and(|v| v.is_number())
+        _ if is_owned_assign(expr) => owned_assign_shape(expr),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is one of the four value-position assignment operators
+/// [`owned_assign_step`] may answer (#3138).
+fn is_owned_assign(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+    )
+}
+
+/// The structural half of [`owned_assign_step`]'s eligibility, with nothing
+/// evaluated: a path of static and closed-key steps, and a right side
+/// [`closed_expr_to_owned`] can answer. What the state and the keys turn out
+/// to hold is still [`owned_assign_step`]'s to decide, so this only saves a
+/// pipe whose stage can never qualify from starting at all.
+fn owned_assign_shape(expr: &Expr) -> bool {
+    fn path_shape(path: &Expr) -> bool {
+        match path {
+            Expr::Identity | Expr::Field(_) | Expr::Index { key: None, .. } => true,
+            Expr::Paren(inner) => path_shape(inner),
+            Expr::Pipe(stages) => stages.iter().all(path_shape),
+            Expr::IndexExpr { target, key } => path_shape(target) && closed_expr_shape(key),
+            _ => false,
+        }
+    }
+    match expr {
+        Expr::Assign { path, value }
+        | Expr::CompoundAssign { path, value, .. }
+        | Expr::AlternativeAssign { path, value } => path_shape(path) && closed_expr_shape(value),
+        Expr::Update { path, filter } => {
+            path_shape(path)
+                && match filter.as_ref() {
+                    Expr::Arithmetic { left, right, .. }
+                        if matches!(left.as_ref(), Expr::Identity) =>
+                    {
+                        closed_expr_shape(right)
+                    }
+                    other => closed_expr_shape(other),
+                }
         }
         _ => false,
+    }
+}
+
+/// [`closed_expr_to_owned`]'s grammar, checked without evaluating anything.
+fn closed_expr_shape(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Paren(inner) => closed_expr_shape(inner),
+        Expr::Array(inner) => match inner.as_ref() {
+            Expr::Builtin(Builtin::Empty) => true,
+            Expr::Comma(items) => items.iter().all(closed_expr_shape),
+            single => closed_expr_shape(single),
+        },
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            closed_expr_shape(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => closed_expr_shape(key),
+                }
+        }),
+        Expr::Pipe(stages) => stages.first().is_some_and(closed_expr_shape),
+        _ => false,
+    }
+}
+
+/// Evaluate an expression that provably never reads `.` and has exactly one
+/// output (#3138): a literal, an array or object built from closed parts,
+/// or a pipe whose head is closed and whose later stages
+/// [`eval_owned_fast_path`] answers against the value so far -- `$r.name`, `$r.name | tostring` once
+/// `substitute_vars` has spliced `$r` in as a literal object.
+///
+/// `None` for anything else, and for any stage that errors or produces no
+/// output: the caller then declines, so a key that would raise (`$r.name` on
+/// a number) still raises on the evaluator's own route, with its own text.
+/// Nothing here has a side effect or reads the input, so evaluating it
+/// earlier than jq would, or once where jq might ask twice, is unobservable.
+///
+/// It replaces #2152's literal-only `closed_expr_to_owned`, of
+/// which it is a superset: every literal tree converts to the same value,
+/// and each addition is a pure function of the literal it starts from.
+fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    closed_expr_to_owned_at_depth::<S>(expr, 0)
+}
+
+/// [`closed_expr_to_owned`], with a depth guard over the array/object shapes `owned_to_expr_at_depth` builds.
+fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
+    expr: &Expr,
+    depth: usize,
+) -> Option<OwnedValue> {
+    assert_value_tree_depth(depth);
+    match expr {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        Expr::Paren(inner) => closed_expr_to_owned_at_depth::<S>(inner, depth + 1),
+        Expr::Pipe(stages) => {
+            let (head, rest) = stages.split_first()?;
+            let mut value = closed_expr_to_owned_at_depth::<S>(head, depth + 1)?;
+            for stage in rest {
+                value = match eval_owned_fast_path::<S>(stage, &value, false)? {
+                    Ok(Some(next)) => next,
+                    Ok(None) | Err(_) => return None,
+                };
+            }
+            Some(value)
+        }
+        // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
+        // adds `Expr::Comma` when a `,` is present (#2152).
+        Expr::Array(inner) => match inner.as_ref() {
+            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::array()),
+            Expr::Comma(items) => {
+                let mut out = vec_with_capacity(items.len());
+                for item in items {
+                    out.push(closed_expr_to_owned_at_depth::<S>(item, depth + 1)?);
+                }
+                Some(OwnedValue::array_from(out))
+            }
+            single => Some(OwnedValue::array_from(vec![
+                closed_expr_to_owned_at_depth::<S>(single, depth + 1)?,
+            ])),
+        },
+        // Duplicate keys fold through `IndexMap`'s own `FromIterator`, as
+        // `eval_object_construction` does.
+        Expr::Object(entries) => {
+            let mut out = vec_with_capacity(entries.len());
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(s) => s.clone(),
+                    ObjectKey::Expr(e) => match closed_expr_to_owned_at_depth::<S>(e, depth + 1)? {
+                        OwnedValue::String(s) => s,
+                        _ => return None,
+                    },
+                };
+                out.push((
+                    key,
+                    closed_expr_to_owned_at_depth::<S>(&entry.value, depth + 1)?,
+                ));
+            }
+            Some(OwnedValue::Object(out.into_iter().collect()))
+        }
+        _ => None,
+    }
+}
+
+/// What an eligible assignment writes at its path, before the old value
+/// there is known.
+enum OwnedAssignRhs {
+    /// `=`, and `|=` with a closed filter: the value itself.
+    Value(OwnedValue),
+    /// `op=`, and `|= . op closed`: the old value combined with this one.
+    Combine(ArithOp, OwnedValue),
+    /// `//=`: the old value if truthy, else this one.
+    Alternative(OwnedValue),
+}
+
+/// Answer `PATH = V`, `PATH |= F`, `PATH op= V` or `PATH //= V` directly
+/// against an owned state, without the reindex bridge (#3138).
+///
+/// A `reduce`/`foreach` UPDATE such as `.[$r.name] = $r.score` used to
+/// serialize, re-index, resolve and re-materialize the whole accumulator on
+/// every step -- O(n²) over the fold. With the state unaliased (the fold
+/// loops hand it over by value, #2157) and containers copy-on-write (#2999),
+/// the write below is an in-place insert.
+///
+/// Speed-only by construction: it answers the all-success case and declines
+/// (`None`, `state` untouched) everything else, so every diagnostic still
+/// comes from the evaluator's own route. Eligibility is settled completely
+/// before the one write:
+///
+/// - jq mode only, bar the narrow `.field op= <number>` shape #3025
+///   already took in both modes. yq's `=` vivifies its targets before the
+///   right side runs (#2481), classifies no-op writes, and redirects through
+///   aliases (#1351), none of which a direct write reproduces.
+/// - The path is static `.name`/`.[n]` steps and `.[K]` steps whose `K` is
+///   closed ([`closed_expr_to_owned`]), in any pipe/paren nesting; the right
+///   side is closed too (for `|=`, the filter, or its `. op X` operand).
+/// - Each step is a string key into an object or `null`, or an integer key
+///   `0 <= k <= len` into an array (or `0` into `null`). Everything jq treats
+///   specially -- a negative or padding index, a float key, a `null` key, a
+///   key of the wrong kind for its container -- declines.
+/// - A combine or alternative that fails declines too.
+///
+/// The write itself goes through [`set_path`] with the component
+/// [`key_to_path_component`] would produce for the key, so there is one
+/// definition of what the write does.
+fn owned_assign_step<S: EvalSemantics>(
+    expr: &Expr,
+    state: &mut OwnedValue,
+) -> Option<Result<(), EvalError>> {
+    let (path, rhs) = match expr {
+        Expr::Assign { path, value } => (
+            path,
+            OwnedAssignRhs::Value(closed_expr_to_owned::<S>(value)?),
+        ),
+        Expr::Update { path, filter } => (
+            path,
+            match filter.as_ref() {
+                Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
+                    OwnedAssignRhs::Combine(*op, closed_expr_to_owned::<S>(right)?)
+                }
+                other => OwnedAssignRhs::Value(closed_expr_to_owned::<S>(other)?),
+            },
+        ),
+        Expr::CompoundAssign { op, path, value } => {
+            let op = match op {
+                AssignOp::Add => ArithOp::Add,
+                AssignOp::Sub => ArithOp::Sub,
+                AssignOp::Mul(flags) => ArithOp::Mul(*flags),
+                AssignOp::Div => ArithOp::Div,
+                AssignOp::Mod => ArithOp::Mod,
+            };
+            (
+                path,
+                OwnedAssignRhs::Combine(op, closed_expr_to_owned::<S>(value)?),
+            )
+        }
+        Expr::AlternativeAssign { path, value } => (
+            path,
+            OwnedAssignRhs::Alternative(closed_expr_to_owned::<S>(value)?),
+        ),
+        _ => return None,
+    };
+
+    // The concrete components the write names, each settled against the
+    // container it lands in by a read-only walk before anything is written.
+    // A single step -- the common fold shape -- borrows its static
+    // component and allocates nothing for the path.
+    let mut steps = Vec::new();
+    let single = match owned_assign_single_step::<S>(path) {
+        Some(step) => Some(step?),
+        None => {
+            owned_assign_path_steps::<S>(path, &mut steps)?;
+            None
+        }
+    };
+    let mut current: Option<&OwnedValue> = Some(state);
+    for step in single.iter().chain(steps.iter()) {
+        current = owned_assign_step_child(step, current.unwrap_or(&OwnedValue::Null))?;
+    }
+    if single.is_none() && steps.is_empty() {
+        return None;
+    }
+    let old = current.unwrap_or(&OwnedValue::Null);
+
+    if S::TAG != EvalTag::Jq
+        && !(matches!(expr, Expr::CompoundAssign { .. })
+            && matches!(single.as_deref(), Some(Expr::Field(_)))
+            && matches!(state, OwnedValue::Object(_))
+            && current.is_some_and(OwnedValue::is_number)
+            && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
+    {
+        return None;
+    }
+
+    let new_value = match rhs {
+        OwnedAssignRhs::Value(value) => value,
+        OwnedAssignRhs::Combine(op, right) => arith_combine::<S>(op, old.clone(), right).ok()?,
+        OwnedAssignRhs::Alternative(_) if old.is_truthy() => old.clone(),
+        OwnedAssignRhs::Alternative(value) => value,
+    };
+
+    Some(match single {
+        Some(step) => set_path::<S>(state, &step, new_value, false, false),
+        None => {
+            let path = Expr::Pipe(steps.into_iter().map(Cow::into_owned).collect());
+            set_path::<S>(state, &path, new_value, false, false)
+        }
+    })
+}
+
+/// The one component a single-step [`owned_assign_step`] path names:
+/// `Some(Some(_))` for `.name`, `.[n]` or `.[K]` with a closed `K` (under
+/// any parens or one-stage pipe), `Some(None)` when that one step's key is
+/// not closed, and `None` when the path is not a single step at all.
+fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> Option<Option<Cow<'_, Expr>>> {
+    match path {
+        Expr::Field(_) | Expr::Index { key: None, .. } => Some(Some(Cow::Borrowed(path))),
+        Expr::Paren(inner) => owned_assign_single_step::<S>(inner),
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [only] => owned_assign_single_step::<S>(only),
+            _ => None,
+        },
+        Expr::IndexExpr { target, key } if matches!(target.as_ref(), Expr::Identity) => {
+            Some(closed_key_component::<S>(key).map(Cow::Owned))
+        }
+        _ => None,
+    }
+}
+
+/// The components of an [`owned_assign_step`] path, outermost first, or
+/// `None` when a step is neither static nor closed.
+fn owned_assign_path_steps<'e, S: EvalSemantics>(
+    path: &'e Expr,
+    steps: &mut Vec<Cow<'e, Expr>>,
+) -> Option<()> {
+    match path {
+        Expr::Identity => Some(()),
+        Expr::Paren(inner) => owned_assign_path_steps::<S>(inner, steps),
+        Expr::Field(_) | Expr::Index { key: None, .. } => {
+            steps.push(Cow::Borrowed(path));
+            Some(())
+        }
+        Expr::Pipe(stages) => stages
+            .iter()
+            .try_for_each(|stage| owned_assign_path_steps::<S>(stage, steps)),
+        Expr::IndexExpr { target, key } => {
+            owned_assign_path_steps::<S>(target, steps)?;
+            steps.push(Cow::Owned(closed_key_component::<S>(key)?));
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// The static component a closed `.[K]` key names -- the one
+/// [`key_to_path_component`] produces for a string or an integer-spelled
+/// number -- or `None` for any other key, which the evaluator handles.
+fn closed_key_component<S: EvalSemantics>(key: &Expr) -> Option<Expr> {
+    match closed_expr_to_owned::<S>(key)? {
+        OwnedValue::String(name) => Some(Expr::Field(name)),
+        key => Some(Expr::Index {
+            idx: integral_key(&key)?,
+            key: None,
+        }),
+    }
+}
+
+/// Where `step` lands inside `container`: `Some(child)` (`None` for a slot
+/// the write creates) when [`owned_assign_step`] may write through it, and
+/// `None` for every case jq treats specially -- a key of the wrong kind for
+/// its container, a negative index, or one past the end, which pads.
+fn owned_assign_step_child<'v>(
+    step: &Expr,
+    container: &'v OwnedValue,
+) -> Option<Option<&'v OwnedValue>> {
+    match (step, container) {
+        (Expr::Field(name), OwnedValue::Object(map)) => Some(map.get(name)),
+        (Expr::Field(_), OwnedValue::Null) | (Expr::Index { idx: 0, .. }, OwnedValue::Null) => {
+            Some(None)
+        }
+        (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
+            let idx = usize::try_from(*idx).ok()?;
+            (idx <= items.len()).then(|| items.get(idx))
+        }
+        _ => None,
+    }
+}
+
+/// An integer-spelled numeric key's value: `Int`, or a document literal
+/// whose representation is an integer. A float-spelled key keeps its
+/// spelling in `path()` output and truncates on a write (#1088), so it is
+/// left to the evaluator.
+fn integral_key(key: &OwnedValue) -> Option<i64> {
+    match key {
+        OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => Some(*n),
+        _ => None,
     }
 }
 
@@ -43762,82 +44075,6 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// through the round trip too), and this arm is speed-only.
 /// `owned_to_string` is the same function `builtin_tostring` calls
 /// directly, so it is unobservable except in speed for every value shape.
-/// Converts `expr` to an `OwnedValue` directly, without the general
-/// evaluator, succeeding only when every leaf `expr` reaches is already an
-/// `Expr::Literal` -- the shape `substitute_var`'s `Expr::Var` arm (via
-/// `owned_to_expr_at_depth`) leaves behind when a `reduce`/`foreach`
-/// UPDATE body's bound variable sits *directly* inside an array/object
-/// accumulator literal (`. + [$x]`, `. + {($x): true}`, #2152). Returns
-/// `None` for anything else -- notably, a leaf that is itself computed
-/// rather than merely placed (`. + [$x + 1]`, `Expr::Arithmetic`, not
-/// `Expr::Literal`) is not recognized and falls back to the general
-/// evaluator unchanged, same as [`eval_owned_fast_path`]'s own caller does
-/// for any other unrecognized shape -- this function's job is narrow
-/// (literal-tree conversion only), not "every way `$x` might appear".
-///
-/// Confirmed live (not assumed from #2152's own text, which guessed a
-/// different, incorrect AST shape): `[$x]` parses as
-/// `Expr::Array(Box::new(Expr::Var("x")))` -- `parse_array_construction`
-/// only wraps its inner expression in `Expr::Comma` when an actual `,`
-/// token is present, so a *single*-element array's inner expression is
-/// substituted directly, with no `Comma` wrapper at all
-/// (`Expr::Array(Box::new(Expr::Literal(...)))` post-substitution, not
-/// `Expr::Array(Box::new(Expr::Comma(vec![Expr::Literal(...)])))`) --
-/// handled here via the recursive call on `inner` directly for any shape
-/// other than `Comma`, rather than assuming every array has one.
-///
-/// Object keys: a static key (`ObjectKey::Literal`) needs no conversion; a
-/// dynamic key (`ObjectKey::Expr`, `{($x): ...}`) is handled the same
-/// recursive way and must itself resolve to `OwnedValue::String` (jq's own
-/// rule for what a computed object key may be) or this returns `None`.
-/// Duplicate keys are collected in entry order and folded via
-/// `IndexMap`'s own `FromIterator`, matching `eval_object_construction`'s
-/// identical `acc.into_iter().collect::<IndexMap<_, _>>()` -- same
-/// later-value-wins, first-position-kept semantics, not reimplemented.
-///
-/// `depth`/`assert_value_tree_depth` (#2152 review): this walks exactly
-/// the `Expr::Array`/`Expr::Object` shapes `owned_to_expr_at_depth` builds
-/// (#1025's own guard against unbounded recursion when splicing a value
-/// back into the AST) -- not currently reachable past that ceiling, since
-/// every input either comes from that same guarded splice or from
-/// `MAX_EXPR_DEPTH`-bounded parsed source, but guarded explicitly anyway
-/// to match every other recursive `Expr`/`OwnedValue`-tree walker in this
-/// file rather than relying on an upstream bound staying in place.
-fn literal_shaped_expr_to_owned(expr: &Expr, depth: usize) -> Option<OwnedValue> {
-    assert_value_tree_depth(depth);
-    match expr {
-        Expr::Literal(lit) => Some(literal_to_owned(lit)),
-        Expr::Array(inner) => match inner.as_ref() {
-            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::array()), // omni-dev: coverage tolerate-line reason="pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
-            Expr::Comma(items) => {
-                let mut out = vec_with_capacity(items.len());
-                for item in items {
-                    out.push(literal_shaped_expr_to_owned(item, depth + 1)?);
-                }
-                Some(OwnedValue::array_from(out))
-            }
-            single => Some(OwnedValue::Array(
-                vec![literal_shaped_expr_to_owned(single, depth + 1)?].into(),
-            )),
-        },
-        Expr::Object(entries) => {
-            let mut out = vec_with_capacity(entries.len());
-            for entry in entries {
-                let key = match &entry.key {
-                    ObjectKey::Literal(s) => s.clone(),
-                    ObjectKey::Expr(e) => match literal_shaped_expr_to_owned(e, depth + 1)? {
-                        OwnedValue::String(s) => s,
-                        _ => return None,
-                    },
-                };
-                out.push((key, literal_shaped_expr_to_owned(&entry.value, depth + 1)?));
-            }
-            Some(OwnedValue::Object(out.into_iter().collect()))
-        }
-        _ => None,
-    }
-}
-
 fn eval_owned_fast_path<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -43895,11 +44132,11 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // of this borrowed one.
         //
         // #2152: extended from a bare `Expr::Literal` `right` to any shape
-        // [`literal_shaped_expr_to_owned`] recognizes -- the array/object
+        // [`closed_expr_to_owned`] recognizes -- the array/object
         // accumulator idioms (`. + [$x]`, `. + {($x): true}`) that #2086's
         // own body flagged as unmeasured and out of scope at the time.
         Expr::Arithmetic { .. } => {
-            let (op, rhs) = owned_arith_accumulator_shape(expr)?;
+            let (op, rhs) = owned_arith_accumulator_shape::<S>(expr)?;
             match arith_combine::<S>(op, input.clone(), rhs) {
                 Ok(v) => Some(Ok(Some(v))),
                 // Mirrors the `Field`/`Index` arms' own `_ if optional`
@@ -43920,15 +44157,23 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// idiom both [`eval_owned_fast_path`]'s own arm and #2157's genuinely
 /// owned [`fold_step_each`] fast-path. `None` for any other
 /// shape, including a syntactically-`Arithmetic` one whose right operand
-/// isn't [`literal_shaped_expr_to_owned`]-recognizable.
-fn owned_arith_accumulator_shape(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
+/// isn't closed.
+///
+/// #3138: the right operand is any [`closed_expr_to_owned`] expression, not
+/// only a literal tree, so a computed key spliced from the loop variable
+/// (`. + {($r.name): $r.score}`) takes the by-value path too. That is a
+/// superset of #2152's literal-only recognizer (the same value for every
+/// literal tree), and every addition is a pure function of the literal it
+/// starts from, so the borrowed [`eval_owned_fast_path`] arm that shares
+/// this recognizer answers nothing its general evaluator would not.
+fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
     let Expr::Arithmetic { op, left, right } = expr else {
         return None;
     };
     if !matches!(left.as_ref(), Expr::Identity) {
         return None;
     }
-    Some((*op, literal_shaped_expr_to_owned(right.as_ref(), 0)?))
+    Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
 }
 
 /// #2157: `reduce`/`foreach`'s own fold-loop UPDATE dispatch -- shared by
@@ -43992,7 +44237,7 @@ fn fold_step_each<S: EvalSemantics>(
     optional: bool,
     on_update: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow {
-    match owned_arith_accumulator_shape(expr) {
+    match owned_arith_accumulator_shape::<S>(expr) {
         Some((op, rhs)) => match arith_combine::<S>(op, state, rhs) {
             Ok(v) => match on_update(v) {
                 Demand::Continue => Flow::Exhausted,
@@ -61026,13 +61271,9 @@ mod tests {
             }
         }
 
-        for src in [
-            ".missing += 1",
-            ".n += \"x\"",
-            ".i += .n",
-            ".a.i += 1",
-            ".i = 1",
-        ] {
+        // `.missing += 1`, `.a.i += 1` and `.i = 1` are handled since #3138
+        // -- see `owned_assign_step_agrees_with_forced_bridge_3138`.
+        for src in [".n += \"x\"", ".i += .n"] {
             let expr = parse(src).unwrap();
             assert!(
                 eval_owned_reindex_free::<JqSemantics>(&expr, &object).is_none(),
@@ -61045,6 +61286,163 @@ mod tests {
             };
             assert_eq!(format!("{returned:?}"), format!("{object:?}"));
         }
+    }
+
+    /// #3138: every assignment [`owned_assign_step`] answers must be exactly
+    /// what the reindex bridge answers, and every shape it declines must come
+    /// back untouched. The expressions are substituted the way a fold's
+    /// UPDATE is (`$r` spliced in as a literal), since that is the shape the
+    /// fold loops hand to [`try_eval_owned_step`].
+    #[test]
+    fn owned_assign_step_agrees_with_forced_bridge_3138() {
+        let record = OwnedValue::object_from([
+            ("name".to_string(), OwnedValue::string("User7")),
+            (
+                "id".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("2"),
+            ),
+            (
+                "score".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("70"),
+            ),
+            ("tag".to_string(), OwnedValue::Null),
+        ]);
+        let subst = |src: &str| substitute_vars(&parse(src).unwrap(), [("r", &record)]);
+        let object = OwnedValue::object_from([
+            (
+                "User7".to_string(),
+                OwnedValue::from_number_literal::<JqSemantics>("1"),
+            ),
+            ("a".to_string(), OwnedValue::Bool(false)),
+            ("x".to_string(), OwnedValue::object_from([])),
+        ]);
+        let array = OwnedValue::array_from(vec![
+            OwnedValue::from_number_literal::<JqSemantics>("0"),
+            OwnedValue::from_number_literal::<JqSemantics>("1"),
+        ]);
+
+        let handled = [
+            (".[$r.name] = $r.score", OwnedValue::object_from([])),
+            (".[$r.name] = $r.score", object.clone()),
+            (".[$r.name] = $r.score", OwnedValue::Null),
+            (".[$r.name | tostring] = $r", object.clone()),
+            (".[$r.name] |= $r.score", object.clone()),
+            (".[$r.name] |= . + $r.score", object.clone()),
+            (".[$r.name] += $r.score", object.clone()),
+            (".[$r.name] -= 1", object.clone()),
+            (".missing += 1", object.clone()),
+            (".[$r.name] //= 5", object.clone()),
+            (".a //= $r.name", object.clone()),
+            (".x[$r.name] = [$r.id, $r.tag]", object.clone()),
+            (".new.deeper[$r.name] = 1", object.clone()),
+            ("(.[$r.name]) = 1", object.clone()),
+            (".[$r.id] = $r.score", array.clone()),
+            (".[2] = 9", array.clone()),
+            (".[0] = 9", OwnedValue::Null),
+            (".[$r.name] = {($r.name): $r.id}", object.clone()),
+        ];
+        for (src, input) in handled {
+            let expr = subst(src);
+            let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, JqSemantics>(
+                &expr, &input, false,
+            ));
+            let direct = eval_owned_reindex_free::<JqSemantics>(&expr, &input)
+                .unwrap_or_else(|| panic!("borrowed route declined {src} on {input:?}"));
+            let direct = match direct {
+                Ok(value) => (vec![value], "ok".to_string()),
+                Err(error) => (Vec::new(), format!("error:{}", error.message)),
+            };
+            assert_eq!(format!("{direct:?}"), format!("{bridge:?}"), "{src}");
+            let OwnedStep::Handled(Ok(consumed)) =
+                try_eval_owned_step::<JqSemantics>(&expr, input.clone())
+            else {
+                panic!("consuming route did not handle {src} on {input:?}");
+            };
+            assert_eq!(
+                format!("{:?}", (vec![consumed], "ok")),
+                format!("{bridge:?}"),
+                "{src}"
+            );
+        }
+
+        // Each of these is correct on the evaluator's route today (jq pads,
+        // truncates, counts back from the end, or raises with its own text),
+        // and none of it is the fold shape #3138 is about.
+        let declined = [
+            (".[$r.name] = 1", array.clone()),       // string key into an array
+            (".[$r.id] = 1", object.clone()),        // number key into an object
+            (".[$r.tag] = 1", object.clone()),       // null key
+            (".[-1] = 1", array.clone()),            // negative index
+            (".[5] = 1", array.clone()),             // padding index
+            (".[1] = 1", OwnedValue::Null),          // padding from null
+            (".[1.5] = 1", array.clone()),           // float key
+            (".a[$r.name] = 1", object.clone()),     // through a boolean
+            (".[$r.name] -= \"s\"", object.clone()), // combine fails
+            (".[$r.name] = (1, 2)", object.clone()), // two outputs
+            (".[$r.name] |= empty", object.clone()), // deletes
+            (".[$r.name] = .a", object.clone()),     // reads `.`
+            (".[.a] = 1", object.clone()),           // key reads `.`
+            (".[] = 1", object.clone()),             // iterate
+            (". = 1", object.clone()),               // no step at all
+            (".[$r.name.x] = 1", object.clone()),    // key raises
+        ];
+        for (src, input) in declined {
+            let expr = subst(src);
+            assert!(
+                eval_owned_reindex_free::<JqSemantics>(&expr, &input).is_none(),
+                "{src}"
+            );
+            let OwnedStep::Declined(returned) =
+                try_eval_owned_step::<JqSemantics>(&expr, input.clone())
+            else {
+                panic!("consuming route must decline {src}");
+            };
+            assert_eq!(format!("{returned:?}"), format!("{input:?}"), "{src}");
+        }
+
+        // yq mode keeps only #3025's `.field op= <number>` shape: its `=`
+        // vivifies before the right side runs and redirects through aliases.
+        for src in [".[$r.name] = 1", ".missing += 1", ".a.i += 1", ".User7 = 1"] {
+            let expr = subst(src);
+            assert!(
+                matches!(
+                    try_eval_owned_step::<YqSemantics>(&expr, object.clone()),
+                    OwnedStep::Declined(_)
+                ),
+                "yq: {src}"
+            );
+        }
+    }
+
+    /// #3138: a fold's assignment step writes into the state it is handed
+    /// rather than copying it -- the unchanged sibling's text is the same
+    /// allocation after every step, which is what keeps the fold linear.
+    #[test]
+    fn owned_assign_step_writes_in_place_3138() {
+        let literal = "x".repeat(100_000);
+        let mut state =
+            OwnedValue::object_from([("keep".to_string(), OwnedValue::string(&literal))]);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Object(fields) => match fields.get("keep") {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"),
+            },
+            other => panic!("expected object: {other:?}"),
+        };
+        let before = text_ptr(&state);
+        for i in 0..64 {
+            let key = OwnedValue::string(alloc::format!("k{i}"));
+            let expr = substitute_vars(&parse(".[$k] = $k").unwrap(), [("k", &key)]);
+            state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                OwnedStep::Handled(Ok(next)) => next,
+                _ => panic!("step {i} was not handled"),
+            };
+        }
+        assert_eq!(text_ptr(&state), before, "the unchanged sibling was copied");
+        let OwnedValue::Object(fields) = &state else {
+            unreachable!()
+        };
+        assert_eq!(fields.len(), 65);
     }
 
     #[test]
@@ -81089,7 +81487,7 @@ mod tests {
     #[test]
     fn test_2152_array_object_accumulator_fast_path_matches_general_evaluator() {
         // #2152: extends #2086's fast-path arm from a bare `Expr::Literal`
-        // `right` to any shape `literal_shaped_expr_to_owned` recognizes --
+        // `right` to any shape `closed_expr_to_owned` recognizes --
         // the array/object accumulator idioms (`. + [$x]`, `. + {($x):
         // v}`) #2086's own body flagged as unmeasured. Every case here is
         // confirmed live against jq 1.7.1 to still agree byte-for-byte with
@@ -81146,7 +81544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_2152_literal_shaped_expr_to_owned_single_element_array_has_no_comma_wrapper() {
+    fn test_2152_closed_expr_to_owned_single_element_array_has_no_comma_wrapper() {
         // #2152 review: pins the exact AST shape confirmed live (a debug
         // probe against the real repro), correcting this issue's own
         // stated hypothesis (`Expr::Array(Expr::Comma([Literal(...)]))`) --
@@ -81155,11 +81553,11 @@ mod tests {
         // substituted element leaves a *bare* `Expr::Literal` directly
         // inside `Expr::Array`, with no `Comma` in between. Both shapes
         // are exercised so a future change to either the parser's or
-        // `literal_shaped_expr_to_owned`'s own assumption is caught here
+        // `closed_expr_to_owned`'s own assumption is caught here
         // rather than only showing up as a silent fast-path miss.
         let bare = Expr::Array(Box::new(Expr::Literal(Literal::Int(1))));
         assert_eq!(
-            literal_shaped_expr_to_owned(&bare, 0),
+            closed_expr_to_owned::<JqSemantics>(&bare),
             Some(OwnedValue::array_from(vec![OwnedValue::Int(1)]))
         );
         let comma = Expr::Array(Box::new(Expr::Comma(vec![
@@ -81167,7 +81565,7 @@ mod tests {
             Expr::Literal(Literal::Int(2)),
         ])));
         assert_eq!(
-            literal_shaped_expr_to_owned(&comma, 0),
+            closed_expr_to_owned::<JqSemantics>(&comma),
             Some(OwnedValue::Array(
                 vec![OwnedValue::Int(1), OwnedValue::Int(2)].into()
             ))
@@ -81175,19 +81573,16 @@ mod tests {
     }
 
     #[test]
-    fn test_2152_literal_shaped_expr_to_owned_falls_back_on_non_literal_leaf() {
+    fn test_2152_closed_expr_to_owned_falls_back_on_non_literal_leaf() {
         // A shape this function doesn't recognize (a field access mixed
         // into an otherwise-literal array/object) must return `None`, not
         // a wrong/partial value -- the caller's whole point in checking
         // for `None` is to fall back to the general evaluator safely.
         assert_eq!(
-            literal_shaped_expr_to_owned(
-                &Expr::Array(Box::new(Expr::Comma(vec![
-                    Expr::Literal(Literal::Int(1)),
-                    Expr::Field("foo".to_string()),
-                ]))),
-                0
-            ),
+            closed_expr_to_owned::<JqSemantics>(&Expr::Array(Box::new(Expr::Comma(vec![
+                Expr::Literal(Literal::Int(1)),
+                Expr::Field("foo".to_string()),
+            ])))),
             None
         );
         // Same rejection, but through the *bare* (non-`Comma`) single-child
@@ -81197,29 +81592,25 @@ mod tests {
         // see the sibling AST-shape test), so this exercises that arm's
         // own `?` failure path independently of the multi-element one.
         assert_eq!(
-            literal_shaped_expr_to_owned(&Expr::Array(Box::new(Expr::Field("foo".to_string()))), 0),
+            closed_expr_to_owned::<JqSemantics>(&Expr::Array(Box::new(Expr::Field(
+                "foo".to_string()
+            )))),
             None
         );
         assert_eq!(
-            literal_shaped_expr_to_owned(
-                &Expr::Object(vec![ObjectEntry {
-                    key: ObjectKey::Literal("a".to_string()),
-                    value: Expr::Field("foo".to_string()),
-                }]),
-                0
-            ),
+            closed_expr_to_owned::<JqSemantics>(&Expr::Object(vec![ObjectEntry {
+                key: ObjectKey::Literal("a".to_string()),
+                value: Expr::Field("foo".to_string()),
+            }])),
             None
         );
         // A dynamic key that doesn't resolve to a string is also rejected,
         // matching jq's own "object keys must be strings" rule.
         assert_eq!(
-            literal_shaped_expr_to_owned(
-                &Expr::Object(vec![ObjectEntry {
-                    key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
-                    value: Expr::Literal(Literal::Bool(true)),
-                }]),
-                0
-            ),
+            closed_expr_to_owned::<JqSemantics>(&Expr::Object(vec![ObjectEntry {
+                key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
+                value: Expr::Literal(Literal::Bool(true)),
+            }])),
             None
         );
     }
@@ -81236,8 +81627,8 @@ mod tests {
     }
 
     #[test]
-    fn test_2152_literal_shaped_expr_to_owned_panics_past_nesting_depth_limit() {
-        // #2152 review: `literal_shaped_expr_to_owned` walks exactly the
+    fn test_2152_closed_expr_to_owned_panics_past_nesting_depth_limit() {
+        // #2152 review: `closed_expr_to_owned` walks exactly the
         // `Expr::Array`/`Expr::Object` shapes `owned_to_expr_at_depth`
         // builds (#1025's own guarded splice), but had no depth guard of
         // its own -- unlike every other recursive `Expr`/`OwnedValue`-tree
@@ -81250,15 +81641,15 @@ mod tests {
         use crate::jq::value::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_expr_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        assert!(literal_shaped_expr_to_owned(&under, 0).is_some());
+        assert!(closed_expr_to_owned::<JqSemantics>(&under).is_some());
 
         let over = linear_expr_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            literal_shaped_expr_to_owned(&over, 0)
+            closed_expr_to_owned::<JqSemantics>(&over)
         }));
         assert!(
             result.is_err(),
-            "literal_shaped_expr_to_owned should panic at MAX_VALUE_TREE_DEPTH"
+            "closed_expr_to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 
@@ -81266,13 +81657,13 @@ mod tests {
     fn test_2157_owned_arith_accumulator_shape_recognizes_and_rejects_correctly() {
         // Direct unit coverage of the shape-check `fold_step_each`
         // gates on: `Some` only for a bare `Identity`-left `Arithmetic` whose
-        // right side `literal_shaped_expr_to_owned` can convert with no
+        // right side `closed_expr_to_owned` can convert with no
         // input access, `None` for everything else (including a
         // syntactically-`Arithmetic` node whose right side isn't literal
         // enough) -- the fold loop's fallback correctness depends on this
         // never mis-classifying a shape it can't actually answer.
         assert_eq!(
-            owned_arith_accumulator_shape(&Expr::Arithmetic {
+            owned_arith_accumulator_shape::<JqSemantics>(&Expr::Arithmetic {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Identity),
                 right: Box::new(Expr::Literal(Literal::Int(1))),
@@ -81282,7 +81673,7 @@ mod tests {
         // Non-`Identity` left (e.g. `.foo + 1`) is out of scope here --
         // `eval_owned_expr_fork`'s general path handles it.
         assert_eq!(
-            owned_arith_accumulator_shape(&Expr::Arithmetic {
+            owned_arith_accumulator_shape::<JqSemantics>(&Expr::Arithmetic {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Field("foo".to_string())),
                 right: Box::new(Expr::Literal(Literal::Int(1))),
@@ -81291,7 +81682,7 @@ mod tests {
         );
         // Right side isn't literal-shaped (a field access, not a constant).
         assert_eq!(
-            owned_arith_accumulator_shape(&Expr::Arithmetic {
+            owned_arith_accumulator_shape::<JqSemantics>(&Expr::Arithmetic {
                 op: ArithOp::Add,
                 left: Box::new(Expr::Identity),
                 right: Box::new(Expr::Field("foo".to_string())),
@@ -81299,7 +81690,10 @@ mod tests {
             None
         );
         // Not an `Arithmetic` node at all.
-        assert_eq!(owned_arith_accumulator_shape(&Expr::Identity), None);
+        assert_eq!(
+            owned_arith_accumulator_shape::<JqSemantics>(&Expr::Identity),
+            None
+        );
     }
 
     #[test]

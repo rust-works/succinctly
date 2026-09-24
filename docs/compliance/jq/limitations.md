@@ -6257,7 +6257,9 @@ with output verified identical pre/post-fix. A dynamic object key that
 itself isn't literal-shaped after substitution (e.g. `($x | tostring)`
 evaluated *inside* the fold body rather than on the outer generator) still
 falls through to the slow general path in both builds -- `literal_shaped_expr_to_owned`
-was, and remains, unchanged by #2157.
+was unchanged by #2157. (Since #3138 a key computed from the loop variable
+through `.field`/`.[n]`/`tostring` -- `{($r.name): $r.score}` -- takes this
+by-value path too; see the #3138 paragraph below.)
 
 **One correction to the AST shape this issue's own text guessed, confirmed
 live via a debug probe against the real repro rather than assumed**: a
@@ -6271,7 +6273,9 @@ inside `Array`, not `Expr::Array(Box::new(Expr::Comma(vec![Expr::Literal(...)]))
 as this issue's own "Suggested fix direction" section stated. `literal_shaped_expr_to_owned`
 handles both shapes (a bare non-`Comma` inner expression, and an actual
 multi-element `Comma`), confirmed by a dedicated unit test
-(`test_2152_literal_shaped_expr_to_owned_single_element_array_has_no_comma_wrapper`)
+(`test_2152_closed_expr_to_owned_single_element_array_has_no_comma_wrapper`;
+[#3138](https://github.com/rust-works/succinctly/issues/3138) folded
+`literal_shaped_expr_to_owned` into its superset `closed_expr_to_owned`)
 rather than relying on the single repro's own AST happening to exercise the
 right arm. A precomputed fanout-product bound
 (INIT-fork count x element count, both known before either loop starts)
@@ -6286,6 +6290,63 @@ value with real headroom over #2079's own repro while keeping the
 pathological-body worst case in the single-digit seconds (measured, not
 extrapolated) rather than the tens of minutes a further 10x would cost at
 the same pathological shape.
+
+**An UPDATE that *assigns* into the accumulator
+([#3138](https://github.com/rust-works/succinctly/issues/3138))** --
+`reduce .users[] as $r ({}; .[$r.name] = $r.score)`, and the same with
+`|=`, `op=` or `//=` -- was a third O(n²) shape neither #2086 nor #2157
+reached: the UPDATE is an assignment, not arithmetic, so every step went
+through `eval_each_owned`'s reindex bridge, serializing, re-indexing,
+resolving and re-materializing the whole accumulator. `owned_assign_step`
+(`src/jq/eval.rs`) now answers it on the owned state the fold hands over by
+value, as an in-place write into the copy-on-write container (#2999). It
+takes a path of static `.name`/`.[n]` steps and `.[K]` steps whose `K` is
+*closed* -- a literal, or a pipe from a spliced `$r` through
+`.field`/`.[n]`/`tostring` (`closed_expr_to_owned`) -- with a closed right
+side, a string key into an object or `null`, and an integer key
+`0 <= k <= len` into an array. Everything else is left to the evaluator
+untouched, so every diagnostic is unchanged: a negative or padding index,
+a float or `null` key, a key of the wrong kind, a combine that fails, a
+multi-output or `.`-reading right side.
+
+Measured (Apple M5 Max, release build, `json generate 2mb -p users`, 13,981
+records; interleaved A/B against the merge-base `82e73c6f9`, min of 2-3
+reps, output identical to the merge-base and to jq 1.7.1 on every row):
+
+| UPDATE (`reduce .users[0:N][] as $r (INIT; ...)`) | N      | before  | after  |
+|---------------------------------------------------|--------|---------|--------|
+| `.[$r.name] = $r.score`                           | 2,000  | 0.91 s  | 0.05 s |
+| `.[$r.name] = $r.score`                           | 4,000  | 3.52 s  | 0.06 s |
+| `.[$r.name] = $r.score`                           | 8,000  | 14.03 s | 0.08 s |
+| `.[$r.name] = $r.score`                           | 13,981 | 42.98 s | 0.05 s |
+| `.[$r.name] \|= $r.score`                         | 13,981 | 41.67 s | 0.05 s |
+| `.[$r.name] += $r.score`                          | 13,981 | 41.46 s | 0.05 s |
+| `.x[$r.name] = $r.score`                          | 13,981 | 43.55 s | 0.06 s |
+| `[]` INIT, `.[$r.id] = $r.score`                  | 13,981 | 13.14 s | 0.05 s |
+| `. + {($r.name): $r.score}`                       | 13,981 | 33.68 s | 0.06 s |
+| `.[$r.name \| tostring] = $r`                     | 4,000  | 25.23 s | 0.06 s |
+
+The "after" column is the ~40 ms process floor at every N. The before
+column grows ~4x per doubling. The same holds for `. + {($r.name): $r.score}`,
+because the arithmetic by-value path above (#2157) now takes a closed right
+side too, not only a literal one. Controls are unchanged: `.users[] | .name`,
+`. + "x"` (#2086), `. + [$x]` (#2152), `.i += 1` (#3025, 99,999 steps),
+identity and `map` all read 1.0x.
+
+What it does not change:
+
+- **`foreach`** and **`while`** still hand the state to a second reader
+  each step (EXTRACT, or the emit), so the copy-on-write write copies the
+  map: still O(n²), at a memcpy constant instead of a re-index -- the same
+  structural limit #2157 recorded above. Measured: `[foreach .users[0:4000][]
+  as $r ({}; .[$r.name] = $r.score; length)]` 4.89 s -> 1.38 s (3.5x).
+- **yq mode** keeps the evaluator's route for every assignment but #3025's
+  `.field op= <number>`: yq's `=` vivifies its targets before the right side
+  runs (#2481), classifies no-op writes, and redirects writes through
+  aliases (#1351), none of which a direct write reproduces.
+- A fold running inside an `as` binding that holds a document node (the
+  #2889 embed table is active, e.g. `. as $d | reduce ...`) skips the
+  owned step entirely, as before (3.44 s at N=4,000, unchanged).
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
 
