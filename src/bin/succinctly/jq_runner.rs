@@ -2518,11 +2518,13 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// to right), so this function must not re-sort or re-group them.
 /// Report one unresolved call, in jq's own `name/arity is not defined at
 /// {location}[, line N:]` shape. Tries `source`'s own call-site table first
-/// (the real, parser-recorded position -- see [`jq::CallSite`]), then a
-/// text-search fallback for a call the table does not record -- a
-/// namespaced call, since `Parser::parse_namespaced_call` never pushes to
-/// `call_sites`, unlike the plain-call path a few lines above it in the same
-/// file -- and finally the bare `at {location}` form if even that fails.
+/// (the real, parser-recorded position -- see [`jq::CallSite`], and since
+/// #3010 this includes a namespaced call, recorded under its joined
+/// `namespace::name` spelling), then a text-search fallback for a call the
+/// table does not record -- an `include`d module or `~/.jq` call with no
+/// occurrence in `source` at all, or a filter whose own parse differed from
+/// the one that built the table -- and finally the bare `at {location}` form
+/// if even that fails.
 ///
 /// `taken`/`resume_from` are the caller's own per-name counters (each
 /// caller keys its own map, since `filter` and a given module are unrelated
@@ -2821,13 +2823,12 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // call-site table -- re-derived here (never at load time:
                 // this is a cold error path, and most runs never take it) by
                 // re-reading the file `run_origin` already resolved.
-                // `report_unresolved_call` gives it the same fallback the
-                // main filter's own diagnostic uses below, for the same
-                // reason: `collect_call_sites` never records a namespaced
-                // call at all (`parse_namespaced_call` has no
-                // `call_sites.push`, unlike the plain-call path a few lines
-                // below it in the same file), so `def f: ns::g;` inside a
-                // module needs the search to find `ns::g`'s real occurrence.
+                // `report_unresolved_call` gives it the same lookup the main
+                // filter's own diagnostic uses below, so `def f: ns::g;`
+                // inside a module finds `ns::g`'s real occurrence the same
+                // way: from the table directly since #3010 (its own
+                // `namespace::name`-joined `CallSite`), falling back to a
+                // text search only for what the table still cannot record.
                 if let Some(id) = origin {
                     let key = (
                         *id,

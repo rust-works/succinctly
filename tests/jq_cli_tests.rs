@@ -7118,10 +7118,11 @@ fn test_namespaced_call_whitespace_around_colons_is_a_syntax_error() -> Result<(
 }
 
 /// The adjacent form (`mymod::func`) keeps byte-for-byte jq parity: it still
-/// parses as a namespaced call, and `report_unresolved_call`'s text-search
-/// fallback (the call-site table never records a namespaced call —
-/// `parse_namespaced_call` has no `call_sites.push`) finds the source's own
-/// `mymod::func` exactly, so line marker and source echo both survive.
+/// parses as a namespaced call, and since #3010 `parse_namespaced_call`
+/// itself pushes a `CallSite` under the joined `mymod::func` spelling, so
+/// `report_unresolved_call` finds the real call position from that table
+/// directly (no text search needed here), and line marker and source echo
+/// both survive.
 #[test]
 fn test_namespaced_call_adjacent_reports_jq_parity_diagnostic() -> Result<()> {
     let (output, code) = spawn_jq(&["-n", "mymod::func"], None)?;
@@ -7132,6 +7133,28 @@ fn test_namespaced_call_adjacent_reports_jq_parity_diagnostic() -> Result<()> {
         stderr,
         "jq: error: mymod::func/0 is not defined at <top-level>, line 1:\n\
          mymod::func\n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// #3010: before this fix, `parse_namespaced_call` never pushed a
+/// `CallSite`, so every namespaced-call diagnostic fell back to
+/// `locate_identifier_from`'s plain identifier-boundary text search — which
+/// has no awareness of `#`-comments, so a coincidental earlier occurrence of
+/// the same spelling inside one won the match over the real call. Confirmed
+/// live against jq 1.7.1: both cite line 2 (the real call), never line 1
+/// (the comment).
+#[test]
+fn test_namespaced_call_diagnostic_skips_earlier_comment_occurrence_3010() -> Result<()> {
+    let (output, code) = spawn_jq(&["-n", "# see ns::g here\nns::g"], None)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        "jq: error: ns::g/0 is not defined at <top-level>, line 2:\n\
+         ns::g\n\
          jq: 1 compile error\n"
     );
     Ok(())
@@ -48579,18 +48602,18 @@ fn test_second_unresolved_call_in_the_same_module_finds_its_own_line_2991() -> R
     Ok(())
 }
 
-/// #2991: a namespaced call inside a module body needs the text-search
-/// fallback, not just the call-site table. `collect_call_sites` never
-/// records a namespaced call at all -- `parse_namespaced_call`
-/// (`src/jq/parser.rs`) has no `call_sites.push`, unlike the plain-call path
-/// a few lines above it in the same file -- so `def f: ns::g;` inside a
-/// module would otherwise fall through to the file-name-only report even
-/// though the call has a real, findable occurrence in the module's own
-/// source. Found while implementing this issue's own fix, by testing the
-/// case a sibling test (`test_module_body_cannot_see_siblings_or_home_jq_2951`)
-/// happens to also exercise (`sibA3.jq`'s `b::sb`) without asserting on the
-/// line -- a coverage check surfaced the fallback going unused and this is
-/// the direct pin for why it is needed.
+/// #2991: a namespaced call inside a module body must find its own line, not
+/// fall through to the file-name-only report. Originally this relied on
+/// `report_unresolved_call`'s text-search fallback, since `collect_call_sites`
+/// did not record a namespaced call at all at the time. Since #3010,
+/// `parse_namespaced_call` (`src/jq/parser.rs`) pushes its own `CallSite`
+/// under the joined `namespace::name` spelling, so `ModuleSource::calls()`
+/// (itself built via `collect_call_sites` on the module's own source) now
+/// finds `def f: ns::g;`'s call site directly from that table instead —
+/// same observable result, one fewer path relied on to get there. Found
+/// while implementing #2991's own fix, by testing the case a sibling test
+/// (`test_module_body_cannot_see_siblings_or_home_jq_2951`) happens to also
+/// exercise (`sibA3.jq`'s `b::sb`) without asserting on the line.
 #[test]
 fn test_namespaced_call_inside_module_body_finds_its_own_line_2991() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;

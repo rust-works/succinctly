@@ -3994,7 +3994,7 @@ impl<'a> Parser<'a> {
         // (`unexpected ':'` in jq, `lexer: invalid input text` in yq), never a
         // namespaced call. So the check happens before `skip_ws()` (#3116).
         if self.peek_str(2) == "::" {
-            return self.parse_namespaced_call(name);
+            return self.parse_namespaced_call(start_pos, name);
         }
         self.skip_ws();
 
@@ -8093,8 +8093,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a namespaced call: `namespace::func` or `namespace::func(args)`.
-    /// Called when we've seen an identifier followed by `::`.
-    fn parse_namespaced_call(&mut self, namespace: String) -> Result<Expr, ParseError> {
+    /// Called when we've seen an identifier followed by `::`. `start_pos` is
+    /// the byte offset of the namespace identifier's first byte -- the
+    /// call's own start, before `::` was consumed.
+    fn parse_namespaced_call(
+        &mut self,
+        start_pos: usize,
+        namespace: String,
+    ) -> Result<Expr, ParseError> {
         // Consume '::'
         self.next();
         self.next();
@@ -8124,6 +8130,19 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+
+        // #3010: record this call site under its `namespace::name` spelling
+        // -- the same form `rewrite_namespaced_calls` (jq_runner.rs) joins an
+        // unresolved namespaced call's diagnostic name into -- so
+        // `report_unresolved_call` can find its real position via this table
+        // instead of falling back to `locate_identifier_from`'s comment/
+        // string-unaware text search, which could cite an unrelated earlier
+        // occurrence of the same spelling.
+        self.call_sites.push(CallSite {
+            name: format!("{namespace}::{name}"),
+            arity: args.len(),
+            offset: start_pos,
+        });
 
         Ok(Expr::NamespacedCall {
             namespace,
