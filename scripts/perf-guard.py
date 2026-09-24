@@ -678,8 +678,10 @@ def main(argv=None):
 def failure_advice(baseline_binary: bool) -> str:
     """The closing message printed after a failed run's per-query table
     (#3169). Must depend on `baseline_binary`: CI's `--baseline-binary` mode
-    (every PR and push run) never consults the checked-in baseline file at
-    all -- `--update-baseline` is not just unhelpful there but rejected
+    (every `pull_request` run, and a `push` run whose `before` is a real,
+    buildable commit -- see ci.yml's own "Build previous-commit binary"
+    step for the fallback case) never consults the checked-in baseline file
+    at all -- `--update-baseline` is not just unhelpful there but rejected
     outright by `--baseline-binary is only valid with --check`, since
     there's nothing to update a checked-in baseline *from* a transient
     second binary. Advising it anyway sent a real PR (#3160) chasing a
