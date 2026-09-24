@@ -4457,6 +4457,8 @@ fn get_inputs(
     // Empty when no walk runs, which is only #1525's no-RS-byte stream,
     // where nothing ever leaves `WAITING_FOR_RS`.
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
+    // And each value's `(source index, line)` from the same walk (#3250).
+    let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
     // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
     // just after it, and the `build_seq_values` gate further down -- one
     // definition rather than three hand-copies of the same shape, so a
@@ -4490,6 +4492,7 @@ fn get_inputs(
                             eprintln!("{warning}");
                         });
                     seq_values = walk.values;
+                    seq_value_locations = walk.locations;
                     walk.slurp_position_lost
                 }
             };
@@ -4501,6 +4504,7 @@ fn get_inputs(
         // location, so it runs the walk here with a no-op sink.
         let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
         seq_values = walk.values;
+        seq_value_locations = walk.locations;
         seq_slurp_position_lost = walk.slurp_position_lost;
     }
 
@@ -4701,7 +4705,13 @@ fn get_inputs(
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
     if seq_stream_shape {
-        values = build_seq_values(&seq_raw, &seq_values, &mut locations, args.slurp);
+        values = build_seq_values(
+            &seq_raw,
+            &seq_values,
+            &seq_value_locations,
+            &mut locations,
+            args.slurp,
+        );
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
@@ -4989,7 +4999,7 @@ impl InputLocations {
     /// per-value `line_at` rescan from byte 0 produced (#1213). `--seq`'s
     /// own per-value locations no longer go through this helper at all
     /// (#1808): a boundary-spanning record's own file can't be recovered
-    /// from an isolated `raw`, so `build_seq_values`/`seq_values_with_ends`
+    /// from an isolated `raw`, so `build_seq_values`/`seq_values_with_indices`
     /// track offsets across the whole multi-file stream directly instead.
     fn extend_from_ends(&mut self, src: usize, raw: &str, ends: &[usize], values: usize) {
         if ends.len() == values {
@@ -5717,51 +5727,48 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// end-of-input, never a false EOF at some earlier file's own end -- no
 /// separate per-file special-casing needed for that interaction.
 ///
-/// `!slurp` locations still need each value's own *file* and *file-local*
-/// line, not the byte offset's raw position in the throwaway `combined`
-/// stream, so each value's own end offset (from the same range as the value
-/// itself -- never a separately-scanned list to fall out of sync with) is
-/// mapped back to
-/// whichever file's own byte range contains it via `partition_point`, since
-/// both `file_ends` and each value's own `end` are non-decreasing (a
-/// boundary-spanning record is attributed to the file its *end* falls in --
-/// matching #1568's own precedent for the stream's trailing record, which
-/// uses the same rule). `current` caches the one `LineCounter` in use,
-/// replaced only when `partition_point` reports a new file index -- since
-/// `end` values are non-decreasing, that index is too, so this never
-/// backtracks to a file already passed.
+/// `!slurp` locations come from the same walk, one per value
+/// (`jq_seq_reader::SeqStreamWalk::locations`, #3250): the file and line
+/// jq's reader stood at when it *yielded* the value, not the file holding
+/// its end offset. A value dropped by the materializer drops its location
+/// with it, since both are looked up by the value's index.
 fn build_seq_values(
     // The raw sources, before any UTF-8 substitution (#3247).
     raw_sources: &[(Option<usize>, Vec<u8>)],
     // `jq_seq_reader::SeqStreamWalk::values` for these same sources: raw
     // offsets into their concatenation.
     ranges: &[(usize, usize)],
+    // `jq_seq_reader::SeqStreamWalk::locations`, parallel to `ranges`: each
+    // value's `(source index, line)` as jq reports it (#3250).
+    value_locations: &[(usize, usize)],
     locations: &mut InputLocations,
     slurp: bool,
 ) -> Vec<OwnedValue> {
     // One source (stdin, or a single file) is borrowed as is; only a
     // multi-file stream, whose records can span a boundary, is copied into
     // one buffer.
-    let file_ends = crate::jq_seq_reader::source_ends(raw_sources);
     let combined: std::borrow::Cow<'_, [u8]> = match raw_sources {
         [(_, only)] => std::borrow::Cow::Borrowed(only),
         _ => {
-            let mut all = Vec::with_capacity(file_ends.last().copied().unwrap_or(0));
+            let mut all = Vec::with_capacity(raw_sources.iter().map(|(_, raw)| raw.len()).sum());
             for (_, raw) in raw_sources {
                 all.extend_from_slice(raw);
             }
             std::borrow::Cow::Owned(all)
         }
     };
-    let parsed = seq_values_with_ends(&combined, ranges);
+    let parsed = seq_values_with_indices(&combined, ranges);
 
     if !slurp {
-        remap_ends_to_locations(
-            parsed.iter().map(|&(_, end)| end),
-            raw_sources,
-            &file_ends,
-            locations,
+        debug_assert_eq!(
+            value_locations.len(),
+            ranges.len(),
+            "one location per value"
         );
+        for &(_, index) in &parsed {
+            let (source, line) = value_locations[index];
+            locations.push(raw_sources[source].0.unwrap_or(0), line);
+        }
     }
 
     parsed.into_iter().map(|(v, _)| v).collect()
@@ -5770,9 +5777,10 @@ fn build_seq_values(
 /// Build the values and one `(source, line)` location per value for
 /// raw-input (`-R`) mode across the whole file list at once (#1809).
 ///
-/// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern (sharing
-/// its `jq_seq_reader::source_ends`/[`remap_ends_to_locations`] helpers
-/// directly): real jq's `-R` reader treats multiple files as one
+/// Concatenates the files like [`build_seq_values`] and maps each line's
+/// end offset back to a file and line with [`remap_ends_to_locations`]
+/// (`--seq` no longer does: its locations come from where jq's reader
+/// yielded each value, #3250): real jq's `-R` reader treats multiple files as one
 /// continuous byte stream for line-splitting too -- confirmed live against
 /// jq 1.7.1 that a file's own unterminated trailing line joins with the
 /// next file's first line, the same way `--seq` joins a boundary-split
@@ -5851,15 +5859,17 @@ fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec
 /// within the `combined` stream `file_ends` was built from -- see
 /// [`concat_with_file_ends`]) to its owning file and file-local line
 /// number, pushing one `(source, line)` location per `end` onto
-/// `locations` in the same order. Shared by [`build_seq_values`] and
-/// [`build_raw_input_values`].
+/// `locations` in the same order. [`build_raw_input_values`]'s (`-R`) only:
+/// `--seq` names a value from where jq's reader yielded it instead
+/// (`jq_seq_reader::value_locations`, #3250), which this end-offset rule
+/// gets wrong for a value ending at a file's end.
 ///
 /// A value/line ending *exactly* at a file boundary is attributed to the
 /// file *starting* there, not the file ending there: `partition_point`'s
 /// `fe <= end` predicate (not `fe < end`) is what makes that call, since
 /// `file_ends[i]` is both file `i`'s own exclusive end and file `i+1`'s
 /// start offset -- an `end` equal to that offset means the byte the
-/// record/line's own trailing delimiter occupies is the *first* byte of
+/// line's own trailing delimiter occupies is the *first* byte of
 /// file `i+1`, not the last byte of file `i`. Getting this wrong (an
 /// earlier version of both callers used `fe < end`) misattributes the
 /// line/record to the wrong file entirely whenever a file's sole content is
@@ -5905,8 +5915,8 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 
 /// Materialize the `--seq` values [`jq_seq_reader::walk_stream`] found:
 /// each `(start, end)` range is raw offsets into `combined`, the
-/// concatenated raw sources, and comes back paired with its own `end` for
-/// the file/line remap.
+/// concatenated raw sources, and comes back paired with its index in
+/// `ranges`, which is also its index in the walk's locations.
 ///
 /// The reader already checked every value's grammar, so this only
 /// decodes; `json_bytes_to_owned_value_checked` stays as defense in depth
@@ -5923,7 +5933,7 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 /// reader decides on.
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
-fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
+fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
     // One pass over the whole stream. Almost every stream is valid, and then
     // no value needs a check of its own; otherwise only a value reaching
     // past the first invalid byte can hold one.
@@ -5932,7 +5942,8 @@ fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(Owne
         .map_or(usize::MAX, |e| e.offset);
     ranges
         .iter()
-        .filter_map(|&(start, end)| {
+        .enumerate()
+        .filter_map(|(index, &(start, end))| {
             let raw = &combined[start..end];
             let substituted;
             let bytes =
@@ -5947,7 +5958,7 @@ fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(Owne
             // retain the checked materializer as defense in depth.
             json_bytes_to_owned_value_checked(bytes)
                 .ok()
-                .map(|value| (value, end))
+                .map(|value| (value, index))
         })
         .collect()
 }
@@ -9388,8 +9399,8 @@ mod tests {
             .iter()
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
-        let ranges = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {}).values;
-        build_seq_values(&raw, &ranges, locations, false)
+        let walk = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
+        build_seq_values(&raw, &walk.values, &walk.locations, locations, false)
     }
 
     /// One `--seq` stream's values, the way `get_inputs` builds them.

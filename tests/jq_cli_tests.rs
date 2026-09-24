@@ -7698,6 +7698,53 @@ fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
     Ok(())
 }
 
+/// #3250: a `--seq` value's `input_filename`, `input_line_number` and
+/// `(at file:line)` are where jq's reader stood when it *yielded* the value:
+/// the yielding byte's file, and the newlines of every `fgets` chunk read by
+/// then, the chunk holding that byte included. Captured from `/usr/bin/jq`
+/// 1.7.1.
+#[test]
+fn test_seq_value_location_is_where_the_value_was_yielded_3250() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a1 = dir.path().join("a1");
+    let a2 = dir.path().join("a2");
+    std::fs::write(&a1, b"\x1e\"x\"")?;
+    std::fs::write(&a2, b" 1\n")?;
+    let (output, code) = spawn_jq(
+        &[
+            "--seq",
+            "-c",
+            "[., (input_filename | split(\"/\") | last), input_line_number]",
+            a1.to_str().unwrap(),
+            a2.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\x1e[\"x\",\"a1\",0]\n\x1e[1,\"a2\",1]\n"
+    );
+
+    let (output, code) = spawn_jq(
+        &["--seq", "-c", "input_line_number"],
+        Some(b"\x1e\"x\"1\x1e}b\na "),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "\x1e1\n");
+
+    let mut full = b"\xef\xbb[".to_vec();
+    full.resize(4094, b' ');
+    full.extend_from_slice(b"]\n");
+    let (output, code) = spawn_jq(&["--seq", "-c", "error(\"x\")"], Some(&full))?;
+    assert_eq!(code, 5);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "jq: error (at <stdin>:0): x\n"
+    );
+    Ok(())
+}
+
 /// #3200: under a malformed BOM jq resets at every `fgets` refill, including
 /// the one after a full 4095-byte chunk with no newline, and at an empty final
 /// buffer. The issue's three rows, with their stderr and `(at ...)` location,
