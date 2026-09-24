@@ -41,7 +41,7 @@ use super::m2_gate::can_use_m2_streaming;
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, FloatStyle, InputLocation,
+    self, exit_codes, flush_then_err, ColorScheme, DiagStyle, ErrorSink, InputLocation,
     JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
@@ -4498,25 +4498,15 @@ fn output_value<W: Write>(
     // formatter with yq's control-char escaping so the two agree byte-for-byte
     // on control characters — `\u0008`/`\u000c` (not jq's `\b`/`\f`) and raw
     // DEL/C1 controls — matching `mikefarah/yq` and the M2 streaming fast path
-    // (#262).
-    //
-    // `float_style` below is **inert on this route**, and this comment used to
-    // claim otherwise ("compact keeps jq-shortest floats (e.g. `1`) to match
-    // the streaming path; pretty preserves whole floats"). It is read at
-    // exactly one place -- `format_json_impl`'s `Float` arm -- and only inside
-    // that arm's `JqCompat | JqPreserveInput` branch; `Preserve` takes
-    // `format_float_yq` (or `json_sourced_float_display`) regardless.
-    // Confirmed live: a computed whole float prints `1.0` under both
-    // `-o json` and `-o json -I0`, and real yq v4.53.3 agrees on both, which
-    // is the behaviour that actually matters. `JsonFormatOpts::json_sourced`'s
-    // own doc comment already recorded that yq's compact and pretty JSON agree
-    // on float formatting.
-    //
-    // #2874 corrected the claim but deliberately left the conditional: pinning
-    // it to one value makes `FloatStyle::PreserveWholeFloat` unconstructed
-    // binary-wide (this is its only constructor outside tests), which turns a
-    // comment fix into deleting an enum, a `JsonFormatOpts` field and a #169
-    // test pin -- a different axis from the one #2874 unifies. Filed as #2988.
+    // (#262). `convention: Preserve` below takes `format_float_yq` (or
+    // `json_sourced_float_display`) for floats regardless of compact/pretty:
+    // a computed whole float prints `1.0` under both `-o json` and
+    // `-o json -I0`, and real yq v4.53.3 agrees on both, which is the
+    // behaviour that actually matters. `JsonFormatOpts::json_sourced`'s own
+    // doc comment records that yq's compact and pretty JSON agree on float
+    // formatting; #2988 removed a dead `float_style` field this site used to
+    // pass, which never actually reached this convention's own float
+    // rendering.
     let json_str = output::format_json(
         value,
         &JsonFormatOpts {
@@ -4527,11 +4517,6 @@ fn output_value<W: Write>(
             },
             sort_keys: config.sort_keys,
             ascii: config.ascii_output,
-            float_style: if config.compact {
-                FloatStyle::Shortest
-            } else {
-                FloatStyle::PreserveWholeFloat
-            },
             json_sourced: config.json_sourced_floats,
             // #2874: was `control_escape: ControlEscape::Yq` plus a
             // documented dummy `jq_compat: true` this site never consults.
