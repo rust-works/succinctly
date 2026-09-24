@@ -33,8 +33,12 @@ git pull origin main
 # Run the full quality check
 ./scripts/build.sh
 
-# Run the complete test suite
-cargo test --all-features
+# Run the complete test suite against the shipped feature set --
+# NOT --all-features, which builds several non-shipping measurement/holdout
+# configurations instead (portable-popcount, broadword-yaml, scalar-yaml,
+# unshared-containers) and would let a shipped-shape-only regression pass
+# silently. See CLAUDE.md's Feature Flags section for why.
+cargo test --features cli,simd,regex,serde
 
 # Run benchmarks (see docs/guides/benchmarking.md for details)
 cargo bench
