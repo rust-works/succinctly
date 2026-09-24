@@ -1113,30 +1113,33 @@ these queries' paths). The seven test-only commits after it leave the stripped b
 byte-identical. Current `main` (`82e73c6f9`) has drifted back to the fast side (`users
 keys_unsorted` −1.5% against `220cc911b`).
 
-**Attribution.** Cachegrind with `--cache-sim=yes --branch-sim=yes` on the two binaries
-agrees *per function* on `Ir`, `I1mr`, `D1mr` and the simulated conditional and indirect
-mispredicts (program totals: 34,280,525 vs 34,280,550 `Ir`). Every hot symbol keeps its
-size and moves by exactly +0xB0 (176 bytes, 48 mod 64). The function that moved matters:
+**Attribution.** Cachegrind with `--cache-sim=yes --branch-sim=yes` on the two binaries,
+run on the corpus's `users` `1mb` fixture (666,928 bytes), agrees *per function* on `Ir`,
+`I1mr`, `D1mr` and the simulated conditional and indirect mispredicts (program totals:
+34,280,525 vs 34,280,550 `Ir`). Every hot symbol keeps its size and moves by
+exactly +0xB0 (176 bytes, 48 mod 64). The function that moved matters:
 `json::simd::avx2::process_chunk_standard` is 54% of the query's `Ir` and 99% of its
 indirect branches. Its per-byte `match state` compiles to a jump table, so the build
-dispatches one `jmp *reg` per byte, about 670k per MB. Cachegrind models none of what
-Zen 4 does with those branches (op cache, BTB, indirect predictor), so it cannot see
-the effect.
+dispatches one `jmp *reg` per input byte: 666,928 indirect branches on that fixture.
+Cachegrind models none of what Zen 4 does with those branches (op cache, BTB, indirect
+predictor), so it cannot see the effect.
 
 **The holdout that settled it.** `220cc911b` was rebuilt with an inert padding
 function (`.fill N, 1, 0x90` in an `asm!` block) called from `main` behind
 `black_box(false)`, so it moves everything linked after it by N bytes and changes no
 executed instruction. A comment-only edit would not work, because it produces an
-identical binary. `A` is `220cc911b`. Min delta against `A`, 10 MB, 9 interleaved reps:
+identical binary. `A` is `220cc911b`, and unpadded it places `process_chunk_standard` at
+16 mod 64. Delta against `A` (min / median), 10 MB, 9 interleaved reps:
 
 | `process_chunk_standard` at | build (hot code moved) | `users keys_unsorted` | `arrays keys_unsorted` | `wide keys_unsorted` |
 |-----------------------------|------------------------|-----------------------|------------------------|----------------------|
-| 16 mod 64                   | `A` padded (+64 B)     | +0.3%                 | +0.4%                  | +0.5%                |
-| 32 mod 64                   | `A` padded (+80 B)     | +9.9%                 | +4.0%                  | +2.3%                |
-| 48 mod 64                   | `A` padded (+96 B)     | +12.1%                | +5.2%                  | +1.5%                |
-| 0 mod 64                    | `A` padded (+112 B)    | +14.7%                | +6.2%                  | +2.8%                |
-| 16 mod 64                   | `A` padded (+128 B)    | +0.4%                 | −0.2%                  | +0.2%                |
-| 0 mod 64                    | `e11cd6da8` (+176 B)   | +11.4%                | +6.5%                  | +3.4%                |
+| 16 mod 64                   | `A` (baseline)         | —                     | —                      | —                    |
+| 16 mod 64                   | `A` padded (+64 B)     | +0.3% / +0.3%         | +0.4% / +0.1%          | +0.5% / +0.6%        |
+| 32 mod 64                   | `A` padded (+80 B)     | +9.9% / +9.9%         | +4.0% / +4.0%          | +2.3% / +2.1%        |
+| 48 mod 64                   | `A` padded (+96 B)     | +12.1% / +17.4%       | +5.2% / +6.6%          | +1.5% / +3.4%        |
+| 0 mod 64                    | `A` padded (+112 B)    | +14.7% / +23.5%       | +6.2% / +7.0%          | +2.8% / +5.0%        |
+| 16 mod 64                   | `A` padded (+128 B)    | +0.4% / +0.7%         | −0.2% / −0.9%          | +0.2% / +0.4%        |
+| 0 mod 64                    | `e11cd6da8` (+176 B)   | +11.4% / +20.6%       | +6.5% / +7.6%          | +3.4% / +5.1%        |
 
 The padding alone reproduces the regression with no #2937 code in the binary, and the
 effect repeats every 64 bytes. The padding shifts the whole block of code linked after it,
@@ -1151,21 +1154,21 @@ share of the indirect branches, not on a test that isolates it.
 | `-align-loops=64`                 | −2.4%              | +12.7%            | the same                                                 |
 | `-align-all-nofallthru-blocks=5`  | −0.4%              | +0.1%             | narrows the band to about 4%; binary +15%                |
 
-`-align-all-nofallthru-blocks=5` leaves the hot function only two positions, 0 or 32 mod
-64. At 32 it still reads `users` +3–4% slower. Current `main` lands there, so turning the
-flag on for `main` makes `users keys_unsorted` +4.3% slower and `.[]` 2–4% faster. The binary also
-grows 15% (12.5 MB to 14.4 MB). None of the flags was adopted. A source-level fix, a
-dispatch loop whose speed does not depend on where its jump targets land, is the remaining
-option.
+`-align-all-nofallthru-blocks=5` aligns every jump target to 32 bytes, so the dispatch
+loop's targets can only sit at 0 or 32 mod 64. At 32 it still reads `users` +3–4% slower.
+Current `main` lands there, so turning the flag on for `main` makes
+`users keys_unsorted` +4.3% slower and `.[]` 2–4% faster. The binary also grows 15% (12.5 MB to 14.4 MB). None
+of the flags was adopted. A source-level fix, a dispatch loop whose speed does not depend
+on where its jump targets land, is the remaining option.
 
 **Rule.** On x86_64, a wall-clock delta between two builds whose per-function `Ir` agrees
 is layout until a padding holdout says otherwise. Before blaming the diff, rebuild the
 *base* with an inert padding function sized to move the hot code by 16/32/48/64 bytes, and
 time it with the same method. If the padding alone reproduces the delta, the delta is a
 position on this curve, not the change's cost. In the #3100 data that curve spans
-**15% (min; 23% median) on `users keys_unsorted`** on a 7950X. On `A`'s tree that is enough to flip the sign
-of any change under 15% that moves the index builder: an `Ir`-neutral change that moves
-the builder forward 16 bytes reads +10% slower.
+**15% (min; 23% median) on `users keys_unsorted`** on a 7950X. On `A`'s tree that is
+enough to flip the sign of any change under 15% that moves the index builder: an
+`Ir`-neutral change that moves the builder forward 16 bytes reads +10% slower.
 
 ### 10. Attribute the cost before you A/B it — hold one suspect quantity fixed
 
