@@ -48602,6 +48602,71 @@ fn test_second_unresolved_call_in_the_same_module_finds_its_own_line_2991() -> R
     Ok(())
 }
 
+/// #3109: a module's own unresolved-call occurrence counting must not
+/// conflate two failing calls to the same *name* at *different* arities
+/// interleaved with a resolving call at yet another arity -- mirroring
+/// (and, per this test, already fixed alongside) #2635's arity-aware
+/// counting for the top-level diagnostic path. #3109 filed this as an
+/// unverified theoretical gap in the (module id, name)-keyed counter
+/// `jq_runner.rs` used to carry; a constructed repro against the pinned
+/// jq 1.7.1 oracle found no divergence on `main` -- `resolve.rs`'s
+/// `Occurrences` (its own doc comment: "the id of one visit to a
+/// module-level def body", #3085) already scopes occurrence counting per
+/// `(scope, name, arity)`, which generalized past #2635's fix before this
+/// issue could ever reach a live counter keyed on name alone. Pinning the
+/// exact shape #3109 constructed (`f/0`, `f/1`, `f/0` interleaved) as a
+/// permanent regression test, since this diagnostic machinery has changed
+/// hands several times (#2635, #2951, #2991, #3010, #3085) and a future
+/// change could reintroduce the gap #3109 worried about.
+#[test]
+fn test_module_diagnostic_occurrence_counting_is_arity_aware_3109() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("mymod.jq"),
+        "def f(a;b): a+b;\ndef wrap0a: f;\ndef wrapx: f(1);\ndef wrapok: f(1;2);\ndef wrap0b: f;\n",
+    )?;
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-L",
+            &temp_dir.path().to_string_lossy(),
+            r#"include "mymod"; wrap0a, wrapx, wrapok, wrap0b"#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout} stderr: {stderr}");
+
+    let module_path = std::fs::canonicalize(temp_dir.path().join("mymod.jq"))?;
+    assert!(
+        stderr.contains(&format!(
+            "f/0 is not defined at {}, line 2:",
+            module_path.display()
+        )),
+        "wrap0a's f/0 must cite its own line 2, not line 5's later f/0: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "f/1 is not defined at {}, line 3:",
+            module_path.display()
+        )),
+        "the interleaved f/1 must not consume wrap0a's or wrap0b's f/0 occurrence: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "f/0 is not defined at {}, line 5:",
+            module_path.display()
+        )),
+        "wrap0b's f/0 must cite its own line 5, not repeat wrap0a's line 2: {stderr}"
+    );
+    assert!(
+        !stderr.contains("f/2 is not defined"),
+        "wrapok's f(1;2) resolves and must not raise: {stderr}"
+    );
+    assert!(stderr.contains("jq: 3 compile errors"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// #2991: a namespaced call inside a module body must find its own line, not
 /// fall through to the file-name-only report. Originally this relied on
 /// `report_unresolved_call`'s text-search fallback, since `collect_call_sites`
