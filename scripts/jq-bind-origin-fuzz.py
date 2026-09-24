@@ -141,6 +141,31 @@ EMBEDS = [
     "([.,.] | .[1])", "({k:{j:.}} | .k.j)", "([.] | min)", "(. * {})",
     "(. + null)", "(null + .)", "([] + [.] | .[0])", "([[.]] | .[0][0])",
     "({k:.} | getpath([\"k\"]))",
+    # #3183: the multi-element/object fold shapes #2889's review recovered
+    # (`eval_owned_relocating_fold` widened to the owned route -- `add`/
+    # `min`/`max` over more than the single-element `[.]` this pool already
+    # had, and over an object) -- pinned by
+    # `test_owned_embed_keeps_node_identity_2889`, but only exercised by that
+    # fixed sweep, never by this differential fuzz. All three hold
+    # regardless of `.`'s value: `[.,.] | max` compares `.` against itself,
+    # a tie by construction whichever position the builtin's tie-break
+    # keeps; `null`/`{a:.}`'s single value are folded through `add`'s
+    # `null + x`, and jq's `+` treats a `null` operand as the *other* side's
+    # identity for every type, not just when it numerically ties.
+    #
+    # The issue's two tie-break-specific rows (`[{a:1},.] | max`,
+    # `[.,{a:1}] | min`) are deliberately not here: unlike the three above,
+    # they embed `.` only when `.`'s *value* genuinely ties with the literal
+    # `{a:1}`, which needs a document equal to that exact literal --
+    # something this fuzzer's `doc()` generator does not produce, so drawing
+    # them would silently test ordinary (non-tied) object comparison
+    # instead almost every time (confirmed live: `null | [{a:1},.] | max`
+    # answers the literal, not `.`, and `{"b":1} | [.,{a:1}] | max` answers
+    # `.` itself, not the literal -- the opposite of `EMBEDS`'/`REBUILDS`'
+    # own "holds for any document" contract every other entry in both pools
+    # relies on). The tie-break path they were meant to add coverage for
+    # remains covered only by the fixed-input Rust test above.
+    "([.,.] | max)", "([null,.] | add)", "({a:.} | add)",
 ]
 # #3182: a string or number literal is `Rc`-backed like a container, so the
 # same placements keep a scalar's identity -- and so do the builtins real jq
