@@ -47235,12 +47235,14 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
 /// nothing for any range that doesn't involve NaN, but a NaN `to` (or a NaN
 /// running `i`, from a NaN `from`) makes `i >= to` false unconditionally,
 /// so the negation never stops the loop -- matching jq's native fast path
-/// for these two arities. The descending branch is untouched: `from`/`to`/
-/// `step` are always `RangeNum::Int(1)`-shaped positive steps at the two
-/// `implicit_step` call sites, so it's unreachable under `implicit_step`
-/// today; jq's 3-arg range has its own further NaN divergence on a
-/// *negative* step that this issue doesn't cover, filed separately as
-/// [#3102](https://github.com/rust-works/succinctly/issues/3102).
+/// for these two arities. The descending branch is unreachable under
+/// `implicit_step` (`from`/`to`/`step` are always `RangeNum::Int(1)`-shaped
+/// positive steps at the two `implicit_step` call sites), so it stayed a
+/// plain `f64` comparison here; `range/3`'s own further NaN divergence, on a
+/// negative step and on a NaN `from`, was a separate issue
+/// ([#3102](https://github.com/rust-works/succinctly/issues/3102)) fixed by
+/// routing the `!implicit_step` arms of both loops through `cmp_f64`'s total
+/// order instead.
 ///
 /// `first_value`, when `Some`, replaces the plain computed `OwnedValue::
 /// Float` this would otherwise push for the very first emitted element only
@@ -47288,11 +47290,10 @@ pub(crate) fn range_values_f64(
     // Both `implicit_step` call sites (`each_range`, `each_range_generic`)
     // only ever pass a positive `RangeNum::Int(1)` step -- the 1-arg/2-arg
     // grammar has no way to spell a negative one -- so the descending
-    // (`step < 0.0`) branch below is unreachable under `implicit_step` and
-    // was deliberately left with the plain, non-NaN-tolerant comparison
-    // (jq's own further divergence there, on `range/3`'s negative step, is
-    // out of scope here -- #3102). Catches a future caller that breaks this
-    // pairing instead of silently answering `range/3`'s wrong shape.
+    // (`step < 0.0`) branch below is unreachable under `implicit_step`,
+    // meaning its `cmp_f64`-based comparison (#3102) only ever applies to the
+    // 3-arg shape. Catches a future caller that breaks this pairing instead
+    // of silently answering `range/3`'s wrong shape.
     debug_assert!(
         !implicit_step || step > 0.0,
         "implicit_step range call with a non-positive step: {step}"
@@ -47309,8 +47310,32 @@ pub(crate) fn range_values_f64(
     // agree for every comparable `f64` pair, and deliberately disagree
     // when `to` (or `i`, from a NaN `from`) is NaN -- exactly the case this
     // function exists to reproduce (#3071).
+    //
+    // The `!implicit_step` (`range/3`) arms route through `cmp_f64` --
+    // jq's total order, where NaN sorts strictly below every other float,
+    // including another NaN -- rather than a raw `f64` comparison, which
+    // returns `false` for *any* comparison against NaN. Confirmed against
+    // `/usr/bin/jq` 1.7.1: `range/3`'s own further NaN divergence, on top of
+    // #3071's implicit_step one, has all four `(from, to)` NaN placements
+    // disagree with a naive `i < to`/`i > to` reading (#3102):
+    // `range(0; nan; 1)` => `[]` (a raw compare already gets this right, by
+    // accident -- `0 < nan` and `nan < 0` under total order are both
+    // `false`), `range(0; nan; -1)` => `[0, -1, -2, ...]` (loops forever:
+    // total order puts NaN below every finite `i`, so `i > to` never stops),
+    // `range(nan; 3; 1)` => `[nan, nan, nan, ...]` (loops forever: NaN sorts
+    // below `3`, and stays NaN after `+ step`), `range(nan; -3; -1)` => `[]`
+    // (NaN is not above `-3` under total order). `implicit_step`'s own arm is
+    // untouched -- it never reaches a negative step (see the `debug_assert`
+    // above), so this only changes the 3-arg shape.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    let continue_ascending = |i: f64| if implicit_step { !(i >= to) } else { i < to };
+    let continue_ascending = |i: f64| {
+        if implicit_step {
+            !(i >= to)
+        } else {
+            cmp_f64(i, to) == core::cmp::Ordering::Less
+        }
+    };
+    let continue_descending = |i: f64| cmp_f64(i, to) == core::cmp::Ordering::Greater;
 
     if step > 0.0 {
         let mut i = from;
@@ -47321,11 +47346,11 @@ pub(crate) fn range_values_f64(
         truncated = continue_ascending(i);
     } else if step < 0.0 {
         let mut i = from;
-        while i > to && values.len() < MAX_RANGE {
+        while continue_descending(i) && values.len() < MAX_RANGE {
             values.push(next_value(i));
             i += step;
         }
-        truncated = i > to;
+        truncated = continue_descending(i);
     }
 
     (values, truncated)
@@ -80824,6 +80849,41 @@ mod tests {
         // an explicit step -- confirmed against `/usr/bin/jq` 1.7.1 that
         // this arity really does answer differently for a NaN bound.
         query!(br"null", r"[limit(3; range(0; nan; 1))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_3_arg_nan_bound_full_matrix_3102() {
+        // #3071 only checked a NaN `to` on an ascending (positive-step) call.
+        // The other three placements -- a NaN `to` descending, and a NaN
+        // `from` on both directions -- all disagree with the naive `i < to`/
+        // `i > to` reading too. All four confirmed against `/usr/bin/jq`
+        // 1.7.1; `range(0; nan; 1)` (the #3071 case, unaffected by this fix)
+        // is covered by the sibling test above, not repeated here.
+        query!(br"null", r"[limit(3; range(0; nan; -1))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![
+                    OwnedValue::Float(0.0),
+                    OwnedValue::Float(-1.0),
+                    OwnedValue::Float(-2.0),
+                ]);
+            }
+        );
+        query!(br"null", r"[limit(3; range(nan; 3; 1))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3);
+                for v in &arr {
+                    match v {
+                        OwnedValue::Float(f) => assert!(f.is_nan()),
+                        other => panic!("expected a NaN float, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this test's own diagnostic (#3102)"
+                    }
+                }
+            }
+        );
+        query!(br"null", r"[limit(3; range(nan; -3; -1))]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, Vec::<OwnedValue>::new());
             }
