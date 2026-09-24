@@ -42380,24 +42380,23 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     } else {
         Untracked::Refuse
     };
-    match resolve_terminal::<S>(expr, input, false, untracked) {
+    let resolved = resolve_terminal::<S>(expr, input, false, untracked);
+    match (resolved, identical) {
         // #3207: every resolved target is an identical null/bool literal --
         // real yq deletes nothing (`null | del(null)`, `[null] | .[] |=
         // del(null)`). A mix with a tracked target is #1865's
         // order-dependent case (`null | del(., null)` keeps the document,
         // `del(null, .)` deletes it) and still refuses.
-        Ok(branches) if branches.is_empty() && identical.is_some() => {
-            Ok(DelPaths::Branches(branches))
-        }
-        Ok(_) if identical.is_some() => Err(identical.expect("checked is_some above")),
-        Ok(branches) => {
+        (Ok(branches), Some(_)) if branches.is_empty() => Ok(DelPaths::Branches(branches)),
+        (Ok(_), Some(refusal)) => Err(refusal),
+        (Ok(branches), None) => {
             if branches.iter().any(|b| b.path.depth() == 0) {
                 Ok(DelPaths::Root)
             } else {
                 Ok(DelPaths::Branches(branches))
             }
         }
-        Err((_prefix, escape)) => Err(escape),
+        (Err((_prefix, escape)), _) => Err(escape),
     }
 }
 
@@ -42576,16 +42575,14 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     // it. Unconditional now that `del()` -- the one caller that wanted
     // `false` in yq mode -- resolves through `resolve_del_path_branches`
     // instead (#1690).
-    let untracked = || {
-        if S::TAG == EvalTag::Yq {
-            Untracked::Skip
-        } else {
-            Untracked::Refuse
-        }
+    let untracked = if S::TAG == EvalTag::Yq {
+        Untracked::Skip
+    } else {
+        Untracked::Refuse
     };
 
     if trailing.is_empty() {
-        return resolve_terminal_sink::<S>(expr, input, false, untracked(), &mut |b| {
+        return resolve_terminal_sink::<S>(expr, input, false, untracked, &mut |b| {
             sink(assemble_one_branch(&b))
         });
     }
@@ -42595,7 +42592,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    resolve_terminal_sink::<S>(&reduced_expr, input, true, untracked(), &mut |b| {
+    resolve_terminal_sink::<S>(&reduced_expr, input, true, untracked, &mut |b| {
         sink(append_trailing(assemble_one_branch(&b), &trailing))
     })
 }
@@ -51256,6 +51253,12 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
         Err(escape) => return escape.into(),
     };
+    // No path at all -- `del(empty)`, or yq's all-identical-literal no-op
+    // (#3207): the input comes back unchanged. Said here rather than left to
+    // the per-path walk below.
+    if matches!(&resolved, DelPaths::Branches(branches) if branches.is_empty()) {
+        return QueryResult::Owned(result);
+    }
 
     // #1690: every match set with more than one resolved path merges into a
     // `DeleteTrie` and skips flattening entirely. `assemble_one_branch`,

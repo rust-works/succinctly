@@ -1955,6 +1955,13 @@ When every target is one of those, the result matches real yq: `null | del(null)
 path used to reach yq's bare-`del(.)` rule, which printed nothing. A mix with a tracked
 target (`null | del(null, .a)`) still refuses.
 
+The test is value identity with the input, not whether the target has a path, so a literal
+that doesn't equal its input still refuses where real yq deletes nothing:
+`true | del(null)`, `true | del(. == false)`, `{a: {b: 1}} | .a.b |= del(null)`, and
+`[null, 1] | map(del(null))`, where the `1` element refuses. Skipping by the value's
+*source* (literal versus `$var`/`tojson`) instead would need that provenance at the
+resolver's terminal, which it does not have.
+
 ### `del()` with a field key against a scalar root: errors instead of no-op
 
 Deleting a field key from a scalar document raises `Cannot index <type> with string

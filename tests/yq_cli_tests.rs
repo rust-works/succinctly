@@ -24810,6 +24810,13 @@ fn test_yq_del_other_untracked_targets_still_refuse_3207() -> Result<()> {
         ("del(1)", "a: 1\n"),
         ("del(.a as $y | $y)", "a: {b: 1}\nc: 2\n"),
         ("del(.a | tojson)", "a: {b: 1}\n"),
+        // Recorded divergences: the skip keys on value identity with the
+        // input, so a literal that is *not* identical refuses where yq
+        // deletes nothing (docs/compliance/yq/limitations.md).
+        ("del(null)", "true\n"),
+        ("del(. == false)", "true\n"),
+        (".a.b |= del(null)", "a: {b: 1}\n"),
+        ("map(del(null))", "[null, 1]\n"),
     ] {
         let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
         assert_eq!((out.as_str(), code), ("", 1), "{filter} on {doc:?}");
