@@ -34466,6 +34466,53 @@ fn test_foreach_alt_extract_halt_never_retries_1458() -> Result<()> {
     Ok(())
 }
 
+/// #1458's `?//` twin, one level lower: not UPDATE/EXTRACT's own `halt`, but
+/// the *pattern walk's own computed key* halting (#2872's lazy key
+/// generator), on a `?//` alternative that is not the last one. Closes a
+/// coverage gap #3112's refactor surfaced: `resolve_as_pattern`,
+/// `resolve_reduce` and `resolve_foreach` each used to write their walk's
+/// `Halt` arm out by hand at three separate lines, none of them exercised by
+/// a test where the halting alternative *isn't* the last -- so merging the
+/// three into one shared `walk_escape_retries` (which returns early on
+/// `is_last` before ever looking at `Halt`) left that arm provably
+/// unreachable by the existing suite.
+///
+/// Every row confirmed live against jq 1.7.1, stdout/stderr captured
+/// separately: `halt_error(7)`'s own diagnostic (the input at the point of
+/// the call -- the document being destructured) always lands on stderr, so
+/// only stdout/exit code are pinned here. The `as`-pattern row completes one
+/// path() output before the key generator's second output halts; `reduce`'s
+/// single accumulator has nothing to emit yet, so its row halts before
+/// producing anything; `foreach`'s per-step EXTRACT already ran for the
+/// first element, so its row emits that one path. None fall through to
+/// `?// $z`/`$r`'s retry the way an ordinary catchable refusal there would
+/// (#2979's rule 1) -- `halt` bypasses the retry mechanism same as #1458.
+#[test]
+fn test_pattern_walk_key_halt_propagates_past_non_last_alternative_3112() -> Result<()> {
+    for (filter, input, want_out) in [
+        (
+            r#"path(. as {("a", halt_error(7)):$q} ?// $z | $q)"#,
+            r#"{"a":1,"b":2}"#,
+            r#"["a"]"#,
+        ),
+        (
+            r#"path(reduce .[] as {("c", halt_error(7)):$q} ?// $r (.; .))"#,
+            r#"[{"c":1},{"c":2}]"#,
+            "",
+        ),
+        (
+            r#"path(foreach .[] as {("c", halt_error(7)):$q} ?// $r (.; .; $q))"#,
+            r#"[{"c":1},{"c":2}]"#,
+            r#"[0,"c"]"#,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 7, "`{filter}`: out={out} err={err}");
+        assert_eq!(out.trim(), want_out, "`{filter}`");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_foreach_alt_extract_retry_cascades_through_three_alternatives_1458() -> Result<()> {
     let (out, err, code) = run_jq_full(
