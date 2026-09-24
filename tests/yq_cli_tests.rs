@@ -48594,3 +48594,30 @@ fn test_getpath_navigated_index_flat_over_alias_fanout_2641() -> Result<()> {
 
     Ok(())
 }
+
+/// #3020: `path_context_root` seeds a nested `..` candidate's own trail with
+/// its full document ancestry so `key`/`path`/`parent` answer absolute
+/// positions -- but `assert_nesting_depth` counted that seeded depth as if
+/// it were native recursion, so `key` on anything past a 256-deep document
+/// panicked even though the query itself takes exactly one step (`.b`) past
+/// the (deeply nested) position `..` already handed it. 300 nested `a:`
+/// mappings, matching the issue's own repro; real yq answers `[["b"]]`.
+#[test]
+fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
+    let mut input = String::new();
+    for i in 0..300 {
+        input.push_str(&"  ".repeat(i));
+        input.push_str("a:\n");
+    }
+    input.push_str(&"  ".repeat(300));
+    input.push_str("b: 1\n");
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#"[.. | select(tag == "!!map" and has("b")) | [.b | key]]"#,
+        &input,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[["b"]]"#);
+    Ok(())
+}
