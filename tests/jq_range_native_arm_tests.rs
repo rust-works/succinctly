@@ -71,3 +71,22 @@ fn range_3_arg_nan_bound_full_matrix_via_generic_evaluator_3102() {
         vec!["[null,null,null]"]
     );
 }
+
+/// #3227, via `each_range_generic` -- same rationale as #3102's sibling test
+/// above: a NaN *step* routes into the descending arm (confirmed against
+/// `/usr/bin/jq` 1.7.1), not neither arm.
+#[test]
+fn range_3_arg_nan_step_matches_total_order_via_generic_evaluator_3227() {
+    assert_eq!(
+        run_filter("[limit(3; range(5; 0; nan))]", "null"),
+        vec!["[5]"]
+    );
+    assert_eq!(
+        run_filter("[limit(3; range(0; 5; nan))]", "null"),
+        vec!["[]"]
+    );
+    assert_eq!(
+        run_filter("[limit(3; range(0; -5; nan))]", "null"),
+        vec!["[0]"]
+    );
+}

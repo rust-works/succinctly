@@ -47343,20 +47343,34 @@ pub(crate) fn range_values_f64(
     };
     let continue_descending = |i: f64| cmp_f64(i, to) == core::cmp::Ordering::Greater;
 
-    if step > 0.0 {
-        let mut i = from;
-        while continue_ascending(i) && values.len() < MAX_RANGE {
-            values.push(next_value(i));
-            i += step;
+    // #3227: the outer step-sign dispatch also goes through `cmp_f64`, not a
+    // raw `step > 0.0`/`step < 0.0` compare, for the same reason the bound
+    // comparisons above do -- confirmed against `/usr/bin/jq` 1.7.1 that a
+    // NaN *step* (not bound) is routed into the descending arm, not treated
+    // as neither: `range(5; 0; nan)` is `[5]` (descending: `5 > 0` true,
+    // push `5`; `i` becomes NaN; `NaN > 0` false under total order, stop),
+    // where a raw `f64` compare answers `[]` (neither `step > 0.0` nor
+    // `step < 0.0` holds for NaN). `implicit_step`'s own two call sites only
+    // ever pass a literal positive step (the `debug_assert!` above), so this
+    // only changes the 3-arg shape, same as #3102's bound fix.
+    match cmp_f64(step, 0.0) {
+        core::cmp::Ordering::Greater => {
+            let mut i = from;
+            while continue_ascending(i) && values.len() < MAX_RANGE {
+                values.push(next_value(i));
+                i += step;
+            }
+            truncated = continue_ascending(i);
         }
-        truncated = continue_ascending(i);
-    } else if step < 0.0 {
-        let mut i = from;
-        while continue_descending(i) && values.len() < MAX_RANGE {
-            values.push(next_value(i));
-            i += step;
+        core::cmp::Ordering::Less => {
+            let mut i = from;
+            while continue_descending(i) && values.len() < MAX_RANGE {
+                values.push(next_value(i));
+                i += step;
+            }
+            truncated = continue_descending(i);
         }
-        truncated = continue_descending(i);
+        core::cmp::Ordering::Equal => {}
     }
 
     (values, truncated)
@@ -80901,6 +80915,51 @@ mod tests {
             }
         );
         query!(br"null", r"[limit(3; range(nan; -3; -1))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+    }
+
+    #[test]
+    fn test_range_3_arg_nan_step_matches_total_order_3227() {
+        // #3102 fixed a NaN `from`/`to`; a NaN *step* is a separate
+        // divergence in the same function's outer dispatch, found while
+        // re-verifying #3102's fix. All four confirmed against
+        // `/usr/bin/jq` 1.7.1: a NaN step routes into the descending arm
+        // (`cmp_f64(nan, 0.0)` is `Less`, matching how `nan < 0` reads under
+        // jq's own total order), not neither arm the way a raw `step >
+        // 0.0`/`step < 0.0` compare would.
+        query!(br"null", r"[limit(3; range(5; 0; nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Float(5.0)]);
+            }
+        );
+        query!(br"null", r"[limit(3; range(0; 5; nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+        query!(br"null", r"[limit(3; range(0; -5; nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Float(0.0)]);
+            }
+        );
+        query!(br"null", r"[limit(3; range(5; 5; nan))]",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, Vec::<OwnedValue>::new());
+            }
+        );
+        // A literal zero step, not NaN -- `cmp_f64(0.0, 0.0)` is `Equal`,
+        // the one arm of the outer match this fix's own review found no
+        // existing test reached (previously an implicit "neither branch"
+        // fallthrough, not its own line). `0.0`, not a bare `0`: an
+        // all-integer `range/3` call takes the sibling `range_values_int`
+        // fast path and never reaches this function at all -- confirmed by
+        // temporarily panicking this arm, which a plain `range(1;5;0)` did
+        // not trip but this spelling did. Confirmed against `/usr/bin/jq`
+        // 1.7.1.
+        query!(br"null", r"[range(1; 5; 0.0)]",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, Vec::<OwnedValue>::new());
             }
