@@ -37283,6 +37283,53 @@ fn charge_alternative_update(
     }
 }
 
+/// One `?//` alternative's verdict in a path-mode fold (#2979, #2872): try
+/// the next alternative, or answer the source drive with this `Demand`.
+/// Richer than the `Demand` the per-branch sink can return, so the sink
+/// records it out-of-band and [`settle_fold_alternative`] reads it back.
+enum FoldStepOutcome {
+    Retry,
+    Return(Demand),
+}
+
+/// Settle one `?//` alternative of [`resolve_reduce`]/[`resolve_foreach`]
+/// from what its sink recorded and how its pattern walk ended -- shared so
+/// the two folds' retry rules cannot drift.
+///
+/// A recorded `outcome` wins: every `Demand::Stop` the sink answers is
+/// preceded by one. Otherwise every branch's step ran (none, for a
+/// zero-output key: zero steps, and the alternative still wins), or the walk
+/// itself escaped. A pattern-walk refusal leaves the accumulator/state
+/// untouched for the branch it refused (`LOADVN` has not run for it), and
+/// retries only when it is jq's own verdict ([`walk_escape_retries`],
+/// guided by [`fold_walk_refusal_is_guess`]); a key generator's `break`
+/// retries like any other, `halt` never.
+fn settle_fold_alternative(
+    outcome: Option<FoldStepOutcome>,
+    walk: Flow,
+    is_last: bool,
+    elem: &FoldSourceValue,
+    reg: &FoldRegister,
+    aborted: &mut Option<Control>,
+) -> FoldStepOutcome {
+    if let Some(outcome) = outcome {
+        return outcome;
+    }
+    match walk {
+        Flow::Exhausted => FoldStepOutcome::Return(Demand::Continue),
+        Flow::Stopped { .. } => {
+            unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, returned just above (#2872)"
+        }
+        Flow::Escaped(control) => {
+            if walk_escape_retries(&control, is_last, fold_walk_refusal_is_guess(elem, reg)) {
+                FoldStepOutcome::Retry
+            } else {
+                FoldStepOutcome::Return(stop_with_escape(aborted, control))
+            }
+        }
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -37525,11 +37572,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // . as {("a","b"):$q} (.; $q))` runs UPDATE twice). The
                 // step's own verdict, richer than the `Demand` a sink can
                 // answer, is recorded out-of-band in `outcome`.
-                enum StepOutcome {
-                    Retry,
-                    Return(Demand),
-                }
-                let mut outcome: Option<StepOutcome> = None;
+                let mut outcome: Option<FoldStepOutcome> = None;
                 let walk = each_fold_alternative::<S>(
                     pattern,
                     &elem,
@@ -37579,8 +37622,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "reduce")
                         {
-                            outcome =
-                                Some(StepOutcome::Return(stop_with_escape(&mut aborted, control)));
+                            outcome = Some(FoldStepOutcome::Return(stop_with_escape(
+                                &mut aborted,
+                                control,
+                            )));
                             return Demand::Stop;
                         }
                         match reg.resolve::<S>(
@@ -37630,42 +37675,21 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                                     reg.branch_provenance::<S>(last.as_ref(), frame);
                                 acc = last.map(|b| b.value.into_owned());
                                 outcome = Some(if path_alternative_retries(&e, is_last) {
-                                    StepOutcome::Retry
+                                    FoldStepOutcome::Retry
                                 } else {
-                                    StepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
+                                    FoldStepOutcome::Return(stop_with_escape(
+                                        &mut aborted,
+                                        e.into(),
+                                    ))
                                 });
                                 Demand::Stop
                             }
                         }
                     },
                 );
-                match outcome {
-                    Some(StepOutcome::Retry) => continue,
-                    Some(StepOutcome::Return(demand)) => return demand,
-                    None => {}
-                }
-                match walk {
-                    // Every branch's UPDATE ran (none, for a zero-output key:
-                    // zero steps, and the alternative still wins).
-                    Flow::Exhausted => return Demand::Continue,
-                    Flow::Stopped { .. } => {
-                        unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
-                    }
-                    // A pattern-walk refusal leaves the accumulator untouched
-                    // for the branch it refused (`LOADVN` has not run for
-                    // it), and retries only when it is jq's own verdict
-                    // (`walk_escape_retries`); a key generator's `break`
-                    // retries like any other, `halt` never.
-                    Flow::Escaped(control) => {
-                        if walk_escape_retries(
-                            &control,
-                            is_last,
-                            fold_walk_refusal_is_guess(&elem, &reg),
-                        ) {
-                            continue;
-                        }
-                        return stop_with_escape(&mut aborted, control);
-                    }
+                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &mut aborted) {
+                    FoldStepOutcome::Retry => continue,
+                    FoldStepOutcome::Return(demand) => return demand,
                 }
             }
             unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
@@ -37929,13 +37953,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // through, each with the register its branch moved --
                 // `path(foreach .[] as {("c","d"):$q} (.; .; $q))` on
                 // `{"a":{..},"b":{..}}` is `["a","c"]`, `["a","d"]`,
-                // `["b","c"]`, `["b","d"]`. See `resolve_reduce`'s identical
-                // `outcome` slot.
-                enum StepOutcome {
-                    Retry,
-                    Return(Demand),
-                }
-                let mut outcome: Option<StepOutcome> = None;
+                // `["b","c"]`, `["b","d"]`. The step's verdict is recorded in
+                // `outcome`, as `resolve_reduce`'s is ([`FoldStepOutcome`]).
+                let mut outcome: Option<FoldStepOutcome> = None;
                 let walk = each_fold_alternative::<S>(
                     pattern,
                     &elem,
@@ -38061,8 +38081,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         if let Some(control) =
                             charge_alternative_update(&mut budget, &mut ran_update, "foreach")
                         {
-                            outcome =
-                                Some(StepOutcome::Return(stop_with_escape(&mut aborted, control)));
+                            outcome = Some(FoldStepOutcome::Return(stop_with_escape(
+                                &mut aborted,
+                                control,
+                            )));
                             return Demand::Stop;
                         }
                         // An UPDATE escape still delivers the outputs before it, as
@@ -38109,7 +38131,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                             state = update_branch.value.clone().into_owned();
                             if let Some(ext_expr) = &bound.extract {
                                 if let Some(control) = charge_budget(&mut budget, "foreach") {
-                                    outcome = Some(StepOutcome::Return(stop_with_escape(
+                                    outcome = Some(FoldStepOutcome::Return(stop_with_escape(
                                         &mut aborted,
                                         control,
                                     )));
@@ -38142,18 +38164,18 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     // state already stored, which is `update_branch`.
                                     ResolveFlow::Stopped => {
                                         outcome = Some(if is_retryable_stop(is_last) {
-                                            StepOutcome::Retry
+                                            FoldStepOutcome::Retry
                                         } else {
                                             downstream_stopped = true;
-                                            StepOutcome::Return(Demand::Stop)
+                                            FoldStepOutcome::Return(Demand::Stop)
                                         });
                                         return Demand::Stop;
                                     }
                                     ResolveFlow::Escaped(e) => {
                                         outcome = Some(if path_alternative_retries(&e, is_last) {
-                                            StepOutcome::Retry
+                                            FoldStepOutcome::Retry
                                         } else {
-                                            StepOutcome::Return(stop_with_escape(
+                                            FoldStepOutcome::Return(stop_with_escape(
                                                 &mut aborted,
                                                 e.into(),
                                             ))
@@ -38182,10 +38204,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                 };
                                 if sink(emitted) == Demand::Stop {
                                     outcome = Some(if is_retryable_stop(is_last) {
-                                        StepOutcome::Retry
+                                        FoldStepOutcome::Retry
                                     } else {
                                         downstream_stopped = true;
-                                        StepOutcome::Return(Demand::Stop)
+                                        FoldStepOutcome::Return(Demand::Stop)
                                     });
                                     return Demand::Stop;
                                 }
@@ -38193,38 +38215,18 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         }
                         if let Some(e) = update_escape {
                             outcome = Some(if path_alternative_retries(&e, is_last) {
-                                StepOutcome::Retry
+                                FoldStepOutcome::Retry
                             } else {
-                                StepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
+                                FoldStepOutcome::Return(stop_with_escape(&mut aborted, e.into()))
                             });
                             return Demand::Stop;
                         }
                         Demand::Continue
                     },
                 );
-                match outcome {
-                    Some(StepOutcome::Retry) => continue,
-                    Some(StepOutcome::Return(demand)) => return demand,
-                    None => {}
-                }
-                match walk {
-                    // Every branch's step ran (none, for a zero-output key:
-                    // zero steps, and the alternative still wins).
-                    Flow::Exhausted => return Demand::Continue,
-                    Flow::Stopped { .. } => {
-                        unreachable!("outcome recorded before the stop") // omni-dev: coverage tolerate-line reason="unreachable: every Demand::Stop the sink answers is preceded by `outcome = Some(..)`, handled just above (#2872)"
-                    }
-                    // See `resolve_reduce`'s identical arm.
-                    Flow::Escaped(control) => {
-                        if walk_escape_retries(
-                            &control,
-                            is_last,
-                            fold_walk_refusal_is_guess(&elem, &reg),
-                        ) {
-                            continue;
-                        }
-                        return stop_with_escape(&mut aborted, control);
-                    }
+                match settle_fold_alternative(outcome, walk, is_last, &elem, &reg, &mut aborted) {
+                    FoldStepOutcome::Retry => continue,
+                    FoldStepOutcome::Return(demand) => return demand,
                 }
             }
             unreachable!("the last alternative always returns") // omni-dev: coverage tolerate-line reason="unreachable: every path through the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
