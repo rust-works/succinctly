@@ -13132,6 +13132,28 @@ fn test_tonumber_preserves_source_spelling_1090() -> Result<()> {
     Ok(())
 }
 
+/// #3033: jq mode's `tonumber` gained new literal-preserving escapes for
+/// spellings like `007.500`/`1.e5`, but real yq's own `tonumber` has a
+/// different, already-tracked fidelity model (#1356, #2960) -- confirm the
+/// jq-mode fix left yq mode's own (pre-existing, lossy on these spellings)
+/// output on these same inputs byte-for-byte unchanged.
+#[test]
+fn test_tonumber_lenient_spellings_unaffected_in_yq_mode_3033() -> Result<()> {
+    for (text, want) in [
+        ("007.500", "7.5"),
+        (".500", "0.5"),
+        ("1.e5", "100000"),
+        ("+007.500", "7.5"),
+        ("+.500", "0.5"),
+    ] {
+        let input = format!("a: \"{text}\"\n");
+        let (out, code) = run_yq_stdin(".a | tonumber", &input, &[])?;
+        assert_eq!(code, 0, "for {text:?}");
+        assert_eq!(out.trim(), want, "for {text:?}");
+    }
+    Ok(())
+}
+
 /// #1090 follow-on: #1176's tag-forced-float re-spelling is scoped to the
 /// one materialization that crosses `evaluate_input`'s reindex bridge, and
 /// must not reach the cursor materialization that string-producing

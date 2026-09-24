@@ -17145,14 +17145,24 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // the same constraint `preservable_float_literal_text` documents on the
     // YAML side.)
     //
-    // The digit check is load-bearing, not defensive: `is_valid_number`
-    // accepts a leading `-` of its own, so a doubled sign (`+-1`) would
-    // otherwise strip to a perfectly valid `-1` and silently succeed where
-    // both oracles error out (jq 1.7.1: "Invalid numeric literal"; yq
-    // 4.53.3: "cannot convert node value [+-1] ... to number").
-    if let Some(unsigned) = trimmed.strip_prefix('+') {
-        if unsigned.starts_with(|c: char| c.is_ascii_digit())
-            && crate::json::validate::is_valid_number(unsigned.as_bytes())
+    // `strip_leading_plus`'s own digit-or-dot gate is load-bearing, not
+    // defensive: `is_valid_number` accepts a leading `-` of its own, so a
+    // doubled sign (`+-1`) would otherwise strip to a perfectly valid `-1`
+    // and silently succeed where both oracles error out (jq 1.7.1: "Invalid
+    // numeric literal"; yq 4.53.3: "cannot convert node value [+-1] ... to
+    // number"). Sharing that gate (#3033), not hand-rolling a second copy of
+    // it, is what lets a `+`-prefixed leading-dot spelling (`+.500`) reach
+    // the lenient check below without also letting `+-.5` through -- jq
+    // 1.7.1 accepts `+.500` (renders `0.500`) and rejects `+-.5`, both
+    // confirmed live.
+    if let Some(unsigned_bytes) = crate::json::validate::strip_leading_plus(trimmed.as_bytes()) {
+        let unsigned = &trimmed[trimmed.len() - unsigned_bytes.len()..];
+        if crate::json::validate::is_valid_number(unsigned.as_bytes())
+            // #3033: the same lenient escapes the unsigned-text arm below
+            // reaches, jq mode only -- yq's own `+`-prefixed fidelity gaps
+            // (#1356, #2960) are left alone, so this half of the `||` never
+            // fires when `yq_mode` is true.
+            || (!yq_mode && crate::json::validate::is_preservable_number_literal(unsigned.as_bytes()))
         {
             if yq_mode && yq_literal_overflows_f64(unsigned) {
                 return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
@@ -17177,6 +17187,28 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     if yq_mode {
         return tonumber_from_str_yq(s);
     }
+    // jq's decNumber reader also accepts the same three lenient spellings a
+    // document number does -- a leading `.` (`.5` -> `0.5`), a redundant
+    // leading zero (`007` -> `7`), and a trailing `.` before an exponent
+    // (`1.e5` -> `1.0e5`) -- and, like the document path, preserves the
+    // *source spelling* rather than collapsing through a lossy parse
+    // (#3033; confirmed live against jq 1.7.1: `"007.500" | tonumber` is
+    // `7.500`, `"1.e999" | tonumber` is `1E+999`, not the
+    // double-precision-clamped `1.7976931348623157e+308` a bare `f64` parse
+    // gives). `is_preservable_number_literal` names exactly those three
+    // gates -- the same helper `from_number_bytes` (`value.rs`) uses for
+    // the document path -- deliberately excluding the bridge-token checks
+    // that helper layers around it (#1083): a bridge sentinel
+    // (`9e999e999`, `8e999e999`) starts with a digit, has no leading zero
+    // and no dot at all, so it can never satisfy any of the three gates,
+    // confirmed by that helper's own doctest and
+    // `is_preservable_number_literal_names_the_four_gates_2877`. jq mode
+    // only, by construction -- yq mode has already returned above with its
+    // own, differently-fidelity-gapped grammar (#1356, #2960), left alone
+    // here.
+    if crate::json::validate::is_preservable_number_literal(trimmed.as_bytes()) {
+        return Ok(OwnedValue::from_number_literal::<JqSemantics>(trimmed));
+    }
     // jq reads a number string with the same decNumber grammar as a
     // document number, so the special-value words are numbers here too
     // (#2877): `"sNaN" | tonumber` and `"nan12" | tonumber` are `null`
@@ -17186,12 +17218,15 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
         return Ok(OwnedValue::Float(f));
     }
-    // The lenient spellings jq's decNumber reader accepts and this crate
-    // does not keep as a literal (`007`, `5.`, `1.e0`, and a `+` before any
-    // of them): a plain `Int`/`Float`, read under jq's number model
-    // (#2936) -- `"14455058590201385605." | tonumber + 0` is
-    // `14455058590201387000` in jq, the same 17-digit rounding a document
-    // number gets, where Rust's own parse gave `…385000`.
+    // The remaining lenient spellings jq's decNumber reader accepts but
+    // does not preserve the spelling of even on the document path -- a
+    // bare trailing `.` with no exponent (`5.` -> `5`, matching
+    // `from_number_bytes`'s own "deliberately left alone" rule, since real
+    // jq doesn't preserve that spelling either) -- fall through to a plain
+    // `Int`/`Float`, read under jq's number model (#2936) --
+    // `"14455058590201385605." | tonumber + 0` is `14455058590201387000`
+    // in jq, the same 17-digit rounding a document number gets, where
+    // Rust's own parse gave `…385000`.
     if let Some(repr) = super::value::parse_i64_or_f64_in::<JqSemantics>(trimmed) {
         return Ok(match repr {
             NumberRepr::Int(i) => OwnedValue::Int(i),
