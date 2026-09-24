@@ -121,14 +121,14 @@ pub use expr::{
 };
 pub use lazy::JqValue;
 pub use parser::{
-    collect_break_sites, collect_call_sites, collect_var_sites, parse, parse_program,
-    parse_program_with_extra_shadowable_defs, parse_program_with_mode,
+    collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,
+    parse_program, parse_program_with_extra_shadowable_defs, parse_program_with_mode,
     parse_program_with_mode_and_extensions, parse_with_mode, parse_with_mode_and_extensions,
-    BreakSite, CallSite, ParseError, ParserMode, VarSite,
+    BreakSite, CallSite, DefSite, ParseError, ParserMode, VarSite,
 };
 pub use resolve::{
-    call_arity, resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleRun, ResolveError,
-    RunMarker, UnboundVar, UnresolvedCall, UnresolvedLabel,
+    call_arity, resolve_all, resolve_func_calls, resolve_func_calls_all, ModuleDef, ModuleRun,
+    ResolveError, RunMarker, UnboundVar, UnresolvedCall, UnresolvedLabel,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{

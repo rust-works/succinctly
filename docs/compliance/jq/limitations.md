@@ -7560,42 +7560,29 @@ error`/exit-3 reporting as the unresolved-call and unbound-variable paths), so
 compile byte-for-byte like jq, including the caret-echo padding pointing at the break's own
 column. Four CLI tests pin this under the "compile-time label-scope check" heading.
 
-**Residual: the position-recovery site table can drift one (or more) slots from the
-occurrence counter it is indexed by, even though `resolve::check` itself correctly skips
-unreferenced `def` bodies.** `check`'s `FuncDef` arm already gates a body's visit behind
-`reachable.contains(&body_addr)`, exactly as `resolve_func_calls_all`'s call-graph
-reachability does for calls — an unreferenced `def`'s `break` is never visited and never
-increments the occurrence counter, matching jq's own call-graph-driven compilation. The
-actual mismatch is between two *separately built* things that are each individually
-correct: the occurrence counter (`check`'s own visit order, reachability-aware) and
-`collect_break_sites`'s table (a second, independent, purely textual re-parse that lists
-every `break $name` in source order, reachability-*blind* by construction — it has no
-access to `reachable` at all). When a same-named, unreferenced `break` sits textually
-before the failing one, it still occupies an earlier table slot despite never being
-visited, so the counter's index and the table's index disagree by one:
+**Formerly a residual, closed by #3085: an unreferenced `def` body shifted the cited
+position.** The occurrence counter the CLI indexes its site tables with used to count only
+the sites `resolve::check` visited, and `check` skips unreferenced `def` bodies (jq never
+compiles them either). The site tables come from a separate textual re-parse that lists
+every site, so a same-named site inside an unreferenced body, textually before the failing
+one, took the failing site's slot: `def f: break $x; break $x` cited column 7 where jq
+cites column 17. `check` now walks an unreferenced body to count its sites and discards
+the errors it would raise, so the index and the table agree for calls and breaks:
 
 ```console
-$ jq            -nc 'def f: break $x; break $x'
+$ succinctly jq -nc 'def f: break $x; break $x'
 jq: error: $*label-x is not defined at <top-level>, line 1:
 def f: break $x; break $x                 
 jq: 1 compile error
-$ succinctly jq -nc 'def f: break $x; break $x'
-jq: error: $*label-x is not defined at <top-level>, line 1:
-def f: break $x; break $x       
-jq: 1 compile error
 ```
 
-Both reject (exit 3, same message and trailer), but the caret differs: jq cites the
-top-level `break $x` (column 17, the only one its reachable call graph sees), succinctly
-cites the def-body `break $x` (column 7, occurrence 0 — the first textual break site, which
-the table lists first despite `check` never visiting it). The exit code and the
-error/count lines are identical, so only tooling that parses the echoed column differs;
-per ADR-0018's decision order this is the closest match that keeps the resolver's
-whole-program walk and the site table as two clean, independently-correct passes, and
-closing it fully would mean making `collect_break_sites` (and its `CallSite`/`VarSite`
-siblings, which have the identical structure and the identical gap, tracked at #2635)
-reachability-aware too — a shared fix across all three diagnostic kinds, not something
-specific to `break`.
+Inside a module body the count also restarts at each module-level `def`, because the
+loader does not always splice the whole module: a dependency's link run keeps only the
+defs something references, and each `import` of a module is a separate copy that can reach
+different defs. Per-def counting keeps every copy pointing at the same physical site, which
+is also what lets the CLI report a site once however many copies reach it, as jq does.
+An unbound variable in the *main filter* still uses the older failures-only counter, so
+`def u: $x; $x` still cites the first `$x`; that is #3107.
 
 A second, distinct shape hits the same table-vs-counter mismatch for a different reason:
 `reduce`/`foreach` checks `init` before the bound pattern's own computed keys (`init` must

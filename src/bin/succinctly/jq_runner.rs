@@ -2616,51 +2616,45 @@ fn report_site_error(
 }
 
 /// Report one unbound `$name` against `source` (the main filter, or a
-/// module's own text), at its `taken`-th recorded site -- the variable twin
-/// of [`report_unresolved_call`].
+/// module's own text), at its `site_index`-th recorded site -- the variable
+/// twin of [`report_unresolved_call`]. Returns whether the table had that
+/// site.
 ///
 /// Unlike calls, no text-search fallback: `collect_var_sites` records every
 /// `$name` a parse sees (a `$name` token has none of the retry, shadow or
 /// builtin-fallback machinery that can make the call-site table diverge from
-/// the real parse), so a miss here is never a site the table lost. It is a
-/// second report for the same site, from a second copy of a module dependency
-/// (#3058), and a text search could only land on a coincidental `$name` in a
-/// string or comment. The file-only form is the honest report for it.
+/// the real parse). A text search could land on a coincidental `$name` in a
+/// string or comment, so a missing table entry gets a file-only report.
 fn report_unbound_var(
     name: &str,
     location: &str,
     source: &str,
     var_sites: &[jq::VarSite],
-    taken: &mut usize,
-) {
+    site_index: usize,
+) -> bool {
     let offset = var_sites
         .iter()
         .filter(|v| v.name == name)
-        .nth(*taken)
+        .nth(site_index)
         .map(|v| v.offset);
-    match offset {
-        Some(offset) => {
-            *taken += 1;
-            let (line_no, line_text, column) = line_at_offset(source, offset);
-            report_site_error(
-                format_args!("${name}"),
-                location,
-                Some((line_no, &line_text, column)),
-            );
-        }
-        None => report_site_error(format_args!("${name}"), location, None),
-    }
+    let site = offset.map(|offset| line_at_offset(source, offset));
+    report_site_error(
+        format_args!("${name}"),
+        location,
+        site.as_ref()
+            .map(|(line_no, line_text, column)| (*line_no, line_text.as_str(), *column)),
+    );
+    site.is_some()
 }
 
 /// Report one out-of-scope `break $name` against `source` (the main filter,
 /// or a module's own text), at its `occurrence`-th recorded site --
 /// [`report_unbound_var`]'s sibling for labels (#2964).
 ///
-/// Unlike `report_unbound_var`'s `taken`, `occurrence` is not a counter this
-/// function advances: `resolve::check` already counted it while walking the
-/// tree, scoped to this exact `(origin, name)` pair (`UnresolvedLabel`'s own
-/// doc comment), so a single lookup is enough -- there is no second call for
-/// the same name that needs to remember where the first one left off.
+/// `occurrence` is not a counter this function advances: `resolve::check`
+/// already counted it while walking the tree (`UnresolvedLabel`'s own doc
+/// comment), and a module caller has already narrowed `break_sites` to the
+/// def it was counted in, so a single lookup is enough.
 fn report_unresolved_label(
     name: &str,
     location: &str,
@@ -2682,7 +2676,89 @@ fn report_unresolved_label(
     );
 }
 
+/// Which kind of compile error a module-site key names, so a call, a variable
+/// and a break that happen to share a name and index stay distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SiteKind {
+    Call,
+    Var,
+    Break,
+}
+
+/// One module's source, re-read on the compile-error path, with its site
+/// tables parsed on first use (#2991, #2962, #2964) and its module-level def
+/// spans (#3085).
+struct ModuleSource {
+    source: String,
+    defs: Vec<jq::DefSite>,
+    calls: std::cell::OnceCell<Vec<jq::CallSite>>,
+    vars: std::cell::OnceCell<Vec<jq::VarSite>>,
+    breaks: std::cell::OnceCell<Vec<jq::BreakSite>>,
+}
+
+impl ModuleSource {
+    fn read(path: &str) -> Option<Self> {
+        let source = std::fs::read_to_string(path).ok()?;
+        let defs = jq::collect_def_sites(&source, jq::ParserMode::Jq, true);
+        Some(Self {
+            source,
+            defs,
+            calls: std::cell::OnceCell::new(),
+            vars: std::cell::OnceCell::new(),
+            breaks: std::cell::OnceCell::new(),
+        })
+    }
+
+    fn calls(&self) -> &[jq::CallSite] {
+        self.calls
+            .get_or_init(|| jq::collect_call_sites(&self.source, jq::ParserMode::Jq, true))
+    }
+
+    fn vars(&self) -> &[jq::VarSite] {
+        self.vars
+            .get_or_init(|| jq::collect_var_sites(&self.source, jq::ParserMode::Jq, true))
+    }
+
+    fn breaks(&self) -> &[jq::BreakSite] {
+        self.breaks
+            .get_or_init(|| jq::collect_break_sites(&self.source, jq::ParserMode::Jq, true))
+    }
+
+    /// The part of `sites` (sorted by offset) inside module-level def `def`,
+    /// which is what a module diagnostic's occurrence index counts within
+    /// (`jq::ModuleDef`). The whole table when the def cannot be found.
+    fn within<'s, T>(
+        &self,
+        sites: &'s [T],
+        offset: impl Fn(&T) -> usize,
+        def: Option<&jq::ModuleDef>,
+    ) -> &'s [T] {
+        let span = def.and_then(|def| {
+            self.defs
+                .iter()
+                .filter(|d| d.name == def.name && d.arity == def.arity)
+                .nth(def.ordinal)
+        });
+        match span {
+            Some(span) => {
+                let lo = sites.partition_point(|t| offset(t) < span.offset);
+                let hi = sites.partition_point(|t| offset(t) < span.end);
+                &sites[lo..hi]
+            }
+            None => sites, // omni-dev: coverage tolerate-line reason="unreachable in practice today: `def` is only `None` when `occurrences.module_def()` is `None`, which (given `origin` is `Some`) would require an open run whose innermost frame has no def set at a `check` point that isn't itself inside a module-level def body -- but every module run is a strict chain of `def` nodes (the loader's own defs, each wrapping its dependency stubs INSIDE its own body via `wrap_defs`/`dep_stubs_for`) terminated by the run's own end marker, so a diagnosable call/var/break site is always reached either inside a module-level def's body (module_def Some) or outside every run (origin None) -- and even when `def` is `Some`, `self.defs` is always `ModuleSource::read`'s own re-parse of the exact same file `run_id_for` interned this origin's id from, so `collect_def_sites` always finds the matching (name, arity, ordinal) span. Kept as a defensive fallback rather than a panic/unwrap in case that invariant is ever violated (#3085)"
+        }
+    }
+}
+
 fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &ModuleLoader) {
+    // #3085: a file may be spliced in by several import/include directives,
+    // and the resolver visits every copy, but jq diagnoses each physical
+    // module site once. A module diagnostic's def and occurrence identify
+    // its site the same way in every copy (`jq::ModuleDef`), so a repeat of
+    // an already reported key is another copy's report of the same site.
+    type ModuleSiteKey = (u32, SiteKind, String, usize, Option<jq::ModuleDef>, usize);
+    let mut reported_module_sites: BTreeSet<ModuleSiteKey> = BTreeSet::new();
+    let mut duplicates = 0;
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
     // first one's. Used only by the text-search fallback below, which only
@@ -2690,32 +2766,17 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     let mut call_resume_from: HashMap<&str, usize> = HashMap::new();
 
     // #2991: a module-body error's `origin` names a *different* source than
-    // `filter`, so it needs its own text and its own call-site table --
-    // built lazily, once per module, and cached here rather than up front,
-    // since most runs raise no module-body errors at all. `None` marks a
-    // module whose file could not be re-read (deleted between load and this
-    // error path, or similar); such an error keeps today's file-name-only
-    // report rather than panicking or guessing a line.
-    let mut module_diagnostics: HashMap<u32, Option<(String, Vec<jq::CallSite>)>> = HashMap::new();
-    // Per-(module, name) resume counters, the module-body counterpart of
-    // `calls_consumed` above -- kept separate so a name repeated in two
-    // different modules does not share (and so prematurely exhaust) one
-    // counter.
-    let mut module_calls_consumed: HashMap<(u32, &str), usize> = HashMap::new();
+    // `filter`, so it needs its own text and its own site tables -- built
+    // lazily, once per module, and cached here rather than up front, since
+    // most runs raise no module-body errors at all. `None` marks a module
+    // whose file could not be re-read (deleted between load and this error
+    // path, or similar); such an error keeps today's file-name-only report
+    // rather than panicking or guessing a line.
+    let mut module_sources: HashMap<u32, Option<ModuleSource>> = HashMap::new();
     // The module-body counterpart of `call_resume_from` above, for the same
     // text-search fallback -- see the `origin` branch's own doc comment for
     // why a module needs one too.
     let mut module_call_resume_from: HashMap<(u32, &str), usize> = HashMap::new();
-    // The variable counterparts of the three module maps above (#2962).
-    let mut module_var_diagnostics: HashMap<u32, Option<(String, Vec<jq::VarSite>)>> =
-        HashMap::new();
-    let mut module_vars_consumed: HashMap<(u32, &str), usize> = HashMap::new();
-    // The label counterpart of `module_var_diagnostics` (#2964): a break
-    // inside a module body needs that module's own text and its own
-    // break-site table, the same route `Call`/`Var` already take, keyed by
-    // `origin` rather than `filter`'s own top-level table below.
-    let mut module_break_diagnostics: HashMap<u32, Option<(String, Vec<jq::BreakSite>)>> =
-        HashMap::new();
 
     // #2085: real positions for the calls this filter's own text contains.
     // Only consulted on this error path, so the extra parse is never on
@@ -2725,15 +2786,8 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // `jq::collect_var_sites`.
     let var_sites = jq::collect_var_sites(filter, jq::ParserMode::Jq, true);
     // #2964: the same, for `break $name` sites written directly in `filter`
-    // -- see `jq::collect_break_sites`. A module-body break uses
-    // `module_break_diagnostics` instead, built lazily from that module's
-    // own source. Unlike calls/variables, which the resolver revisits
-    // through the same "how many of each name seen so far" logic this
-    // table's `nth` indexes with, a break's *occurrence* is carried in the
-    // diagnostic itself (`UnresolvedLabel::occurrence`) -- the resolver
-    // counts each same-named break it visits *within that diagnostic's own
-    // `origin`*, and that count is the table index, so no separate
-    // consuming cursor is needed here.
+    // -- see `jq::collect_break_sites`. A module-body break uses its
+    // module's own table instead, built lazily from that module's source.
     let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
     // How many variables of each name we have already reported, so a
     // repeated undefined `$name` walks its own successive sites in source
@@ -2750,6 +2804,7 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 arity,
                 origin,
                 occurrence_index,
+                module_def,
             }) => {
                 // #2951: a call that failed inside a *module* body has no
                 // occurrence in `filter` at all, so neither the call-site
@@ -2774,32 +2829,29 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // below it in the same file), so `def f: ns::g;` inside a
                 // module needs the search to find `ns::g`'s real occurrence.
                 if let Some(id) = origin {
+                    let key = (
+                        *id,
+                        SiteKind::Call,
+                        name.clone(),
+                        *arity,
+                        module_def.clone(),
+                        *occurrence_index,
+                    );
+                    if !reported_module_sites.insert(key) {
+                        duplicates += 1;
+                        continue;
+                    }
                     let at = loader
                         .run_origin(*id)
                         .map_or_else(|| "<module>".to_string(), ToString::to_string);
-
-                    let cached = module_diagnostics.entry(*id).or_insert_with(|| {
-                        std::fs::read_to_string(&at).ok().map(|source| {
-                            let sites = jq::collect_call_sites(&source, jq::ParserMode::Jq, true);
-                            (source, sites)
-                        })
-                    });
+                    let cached = module_sources
+                        .entry(*id)
+                        .or_insert_with(|| ModuleSource::read(&at));
 
                     match cached {
-                        Some((source, call_sites)) => {
-                            // #2635 does not cover a module's own diagnostics:
-                            // `occurrence_index` is computed against the
-                            // fully-inlined tree (main filter + every
-                            // included module), not scoped per module the
-                            // way this module's own, independently re-parsed
-                            // `call_sites` table is -- so this keeps its
-                            // pre-existing (failures-only) counter rather
-                            // than an index that would not line up with it.
-                            let taken = module_calls_consumed
-                                .entry((*id, name.as_str()))
-                                .or_insert(0);
-                            let this_occurrence = *taken;
-                            *taken += 1;
+                        Some(module) => {
+                            let sites =
+                                module.within(module.calls(), |c| c.offset, module_def.as_ref());
                             let resume = module_call_resume_from
                                 .entry((*id, name.as_str()))
                                 .or_insert(0);
@@ -2807,9 +2859,9 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                                 name,
                                 *arity,
                                 &at,
-                                source,
-                                call_sites,
-                                this_occurrence,
+                                &module.source,
+                                sites,
+                                *occurrence_index,
                                 resume,
                             );
                         }
@@ -2831,27 +2883,40 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     resume,
                 );
             }
-            jq::ResolveError::Var(jq::UnboundVar { name, origin }) => {
+            jq::ResolveError::Var(jq::UnboundVar {
+                name,
+                origin,
+                occurrence,
+                module_def,
+            }) => {
                 // #2962: a module body's unbound variable is reported against
                 // that module's own file, as jq does -- the same route the
                 // `Call` arm's `origin` branch takes, with the module's own
                 // variable sites.
                 if let Some(id) = origin {
+                    let key = (
+                        *id,
+                        SiteKind::Var,
+                        name.clone(),
+                        0,
+                        module_def.clone(),
+                        *occurrence,
+                    );
+                    if !reported_module_sites.insert(key) {
+                        duplicates += 1;
+                        continue;
+                    }
                     let at = loader
                         .run_origin(*id)
                         .map_or_else(|| "<module>".to_string(), ToString::to_string);
-                    let cached = module_var_diagnostics.entry(*id).or_insert_with(|| {
-                        std::fs::read_to_string(&at).ok().map(|source| {
-                            let sites = jq::collect_var_sites(&source, jq::ParserMode::Jq, true);
-                            (source, sites)
-                        })
-                    });
+                    let cached = module_sources
+                        .entry(*id)
+                        .or_insert_with(|| ModuleSource::read(&at));
                     match cached {
-                        Some((source, var_sites)) => {
-                            let taken = module_vars_consumed
-                                .entry((*id, name.as_str()))
-                                .or_insert(0);
-                            report_unbound_var(name, &at, source, var_sites, taken);
+                        Some(module) => {
+                            let sites =
+                                module.within(module.vars(), |v| v.offset, module_def.as_ref());
+                            report_unbound_var(name, &at, &module.source, sites, *occurrence);
                         }
                         None => {
                             eprintln!("jq: error: ${name} is not defined at {at}");
@@ -2869,32 +2934,46 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // references differing only by lexical scope) -- #2635 fixed
                 // the identical shape for calls; this one is #3107.
                 let taken = vars_consumed.entry(name.as_str()).or_insert(0);
-                report_unbound_var(name, "<top-level>", filter, &var_sites, taken);
+                if report_unbound_var(name, "<top-level>", filter, &var_sites, *taken) {
+                    *taken += 1;
+                }
             }
             jq::ResolveError::Break(jq::UnresolvedLabel {
                 name,
                 occurrence,
                 origin,
+                module_def,
             }) => {
                 // #2964: a break inside a module body is reported against
                 // that module's own file, the same route `Call`/`Var` take
-                // above -- `occurrence` was counted scoped to this exact
-                // `origin` (see `UnresolvedLabel`'s own doc comment), so it
-                // indexes straight into that module's own break-site table
-                // with no separate resume counter needed.
+                // above -- `occurrence` was counted within `module_def` (see
+                // `UnresolvedLabel`'s own doc comment), so it indexes
+                // straight into that def's part of the module's break-site
+                // table with no separate resume counter needed.
                 if let Some(id) = origin {
+                    let key = (
+                        *id,
+                        SiteKind::Break,
+                        name.clone(),
+                        0,
+                        module_def.clone(),
+                        *occurrence,
+                    );
+                    if !reported_module_sites.insert(key) {
+                        duplicates += 1;
+                        continue;
+                    }
                     let at = loader
                         .run_origin(*id)
                         .map_or_else(|| "<module>".to_string(), ToString::to_string);
-                    let cached = module_break_diagnostics.entry(*id).or_insert_with(|| {
-                        std::fs::read_to_string(&at).ok().map(|source| {
-                            let sites = jq::collect_break_sites(&source, jq::ParserMode::Jq, true);
-                            (source, sites)
-                        })
-                    });
+                    let cached = module_sources
+                        .entry(*id)
+                        .or_insert_with(|| ModuleSource::read(&at));
                     match cached {
-                        Some((source, break_sites)) => {
-                            report_unresolved_label(name, &at, source, break_sites, *occurrence);
+                        Some(module) => {
+                            let sites =
+                                module.within(module.breaks(), |b| b.offset, module_def.as_ref());
+                            report_unresolved_label(name, &at, &module.source, sites, *occurrence);
                         }
                         // omni-dev: coverage tolerate reason="unreachable in a single-process run by construction: `run_id_for` (the sole source of an `origin` id) always inserts a `run_origins` entry for the id it hands back -- from a real load's canonical path, or its own literal-path fallback on a resolve failure -- and a def body only ever gets stamped with an `origin` after its module loaded successfully, so `at` always names a file that existed and was readable moments earlier. Reaching this arm needs that same file to vanish (or become unreadable) in the narrow window between that load and this re-read, entirely outside this process's control (#2964)"
                         None => {
@@ -2904,19 +2983,16 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                     continue;
                 }
                 // #2964: the real `break` keyword position from
-                // `break_sites`, not a text search -- see
-                // `jq::BreakSite`'s own doc comment for the one class of
-                // ambiguity this still can't resolve (a same-named break
-                // inside an unreferenced `def` body that textually precedes
-                // the failing one), the same known limitation
-                // `jq::CallSite`/`jq::VarSite` have for calls/variables
-                // (#2635).
+                // `break_sites`, not a text search. The resolver counts the
+                // breaks inside unreferenced `def` bodies too (#3085), so
+                // the index lines up with this table; see `jq::BreakSite`'s
+                // own doc comment for what it still cannot place.
                 report_unresolved_label(name, "<top-level>", filter, &break_sites, *occurrence);
             }
         }
     }
 
-    let count = errors.len();
+    let count = errors.len() - duplicates;
     let noun = if count == 1 { "error" } else { "errors" };
     eprintln!("jq: {count} compile {noun}");
 }
