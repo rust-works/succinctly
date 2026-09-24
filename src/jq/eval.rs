@@ -9064,7 +9064,13 @@ fn closed_expr_shape(expr: &Expr) -> bool {
 /// It replaces #2152's literal-only `literal_shaped_expr_to_owned`, of
 /// which it is a superset: every literal tree converts to the same value,
 /// and each addition is a pure function of the literal it starts from.
+#[inline]
 fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    // A bare literal -- `.i += 1`, the per-step right side of most folds --
+    // needs none of the recursive walk's setup.
+    if let Expr::Literal(lit) = expr {
+        return Some(literal_to_owned(lit));
+    }
     closed_expr_to_owned_at_depth::<S>(expr, 0)
 }
 
@@ -9249,6 +9255,7 @@ fn owned_assign_step<S: EvalSemantics>(
 /// shape (`yq_shape`: one field step into an object), since its `=`
 /// vivifies before the right side runs (#2481) and redirects through
 /// aliases (#1351).
+#[inline]
 fn owned_assign_new_value<S: EvalSemantics>(
     expr: &Expr,
     rhs: OwnedAssignRhs,
