@@ -3953,10 +3953,19 @@ Two deliberate remainders:
   [#2991](https://github.com/rust-works/succinctly/issues/2991) re-derives the module's
   own text (a second, cold-path-only read of the file `origin` resolves to) and the
   module's own call-site table, using the same `nth`-occurrence rule and the same
-  text-search fallback (for a namespaced call, which the call-site table never records —
-  `parse_namespaced_call` has no `call_sites.push`) that the main filter's own diagnostics
-  already use. `... is not defined at /path/mymod.jq, line 1:` with the module's own
-  source line echoed, byte-for-byte against jq.
+  lookup the main filter's own diagnostics already use. `... is not defined at
+  /path/mymod.jq, line 1:` with the module's own source line echoed, byte-for-byte
+  against jq.
+- **Closed: a namespaced call (`ns::f`) no longer relies on a text search at all.**
+  [#3010](https://github.com/rust-works/succinctly/issues/3010): `parse_namespaced_call`
+  (`src/jq/parser.rs`) previously had no `call_sites.push`, unlike the plain-call path a
+  few lines above it, so every namespaced-call diagnostic (main filter or module body)
+  fell back to a plain identifier-boundary text search with no awareness of `#`-comments
+  or string literals — a coincidental earlier occurrence of the same spelling inside
+  either would win over the real call. `parse_namespaced_call` now pushes its own
+  `CallSite` under the joined `namespace::name` spelling, so the diagnostic is a direct
+  table lookup like any other call, the same fix #2085's own sibling gap would need for
+  plain identifiers.
 - **jq's trailing padding on the echoed source line is not reproduced exactly.** jq pads with
   a `%*s` whose width follows the failing node's start column for a simple undefined name but
   points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is

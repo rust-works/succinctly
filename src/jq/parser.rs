@@ -3994,7 +3994,7 @@ impl<'a> Parser<'a> {
         // (`unexpected ':'` in jq, `lexer: invalid input text` in yq), never a
         // namespaced call. So the check happens before `skip_ws()` (#3116).
         if self.peek_str(2) == "::" {
-            return self.parse_namespaced_call(name);
+            return self.parse_namespaced_call(start_pos, name);
         }
         self.skip_ws();
 
@@ -4041,16 +4041,26 @@ impl<'a> Parser<'a> {
         // #2085: record where this call's identifier actually started, so an
         // unresolved-call diagnostic can cite the call rather than text-search
         // for the name and find an unrelated same-spelling occurrence.
-        self.call_sites.push(CallSite {
-            name: name.clone(),
-            arity: args.len(),
-            offset: start_pos,
-        });
+        self.record_call_site(name.clone(), args.len(), start_pos);
         Ok(Expr::FuncCall {
             name,
             args,
             builtin_fallback: None,
         })
+    }
+
+    /// Record one call's identifier position for an unresolved-call
+    /// diagnostic (#2085) to cite later, rather than falling back to a text
+    /// search that could match an unrelated same-spelling occurrence. `name`
+    /// is the diagnostic's own spelling -- a plain call's bare name, or
+    /// (#3010) a namespaced call's joined `namespace::name` form, matching
+    /// `rewrite_namespaced_calls`'s (`jq_runner.rs`) join for the same call.
+    fn record_call_site(&mut self, name: String, arity: usize, offset: usize) {
+        self.call_sites.push(CallSite {
+            name,
+            arity,
+            offset,
+        });
     }
 
     /// The `Expr`-returning counterpart of
@@ -4145,11 +4155,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(')')?;
 
-        self.call_sites.push(CallSite {
-            name: name.clone(),
-            arity: args.len(),
-            offset: start_pos,
-        });
+        self.record_call_site(name.clone(), args.len(), start_pos);
         let call = Expr::FuncCall {
             name,
             args,
@@ -8093,8 +8099,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a namespaced call: `namespace::func` or `namespace::func(args)`.
-    /// Called when we've seen an identifier followed by `::`.
-    fn parse_namespaced_call(&mut self, namespace: String) -> Result<Expr, ParseError> {
+    /// Called when we've seen an identifier followed by `::`. `start_pos` is
+    /// the byte offset of the namespace identifier's first byte -- the
+    /// call's own start, before `::` was consumed.
+    fn parse_namespaced_call(
+        &mut self,
+        start_pos: usize,
+        namespace: String,
+    ) -> Result<Expr, ParseError> {
         // Consume '::'
         self.next();
         self.next();
@@ -8124,6 +8136,15 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+
+        // #3010: record this call site under its `namespace::name` spelling
+        // -- the same form `rewrite_namespaced_calls` (jq_runner.rs) joins an
+        // unresolved namespaced call's diagnostic name into -- so
+        // `report_unresolved_call` can find its real position via this table
+        // instead of falling back to `locate_identifier_from`'s comment/
+        // string-unaware text search, which could cite an unrelated earlier
+        // occurrence of the same spelling.
+        self.record_call_site(format!("{namespace}::{name}"), args.len(), start_pos);
 
         Ok(Expr::NamespacedCall {
             namespace,
