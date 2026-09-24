@@ -7631,8 +7631,21 @@ loader does not always splice the whole module: a dependency's link run keeps on
 defs something references, and each `import` of a module is a separate copy that can reach
 different defs. Per-def counting keeps every copy pointing at the same physical site, which
 is also what lets the CLI report a site once however many copies reach it, as jq does.
-An unbound variable in the *main filter* still uses the older failures-only counter, so
-`def u: $x; $x` still cites the first `$x`; that is #3107.
+**Closed by #3107: an unbound variable in the *main filter* used the older failures-only
+counter.** `UnboundVar` (`resolve.rs`) already carried the same scope-aware `occurrence`
+count `#3085` gave calls and breaks, but `jq_runner.rs`'s `report_unbound_var` call site for
+the main filter still indexed `var_sites` with its own separately-tracked, failures-only
+counter instead of consuming `occurrence` directly (the module-body branch a few lines away
+already did). `def u: $x; $x` used to cite the first `$x` (inside the unreferenced `def`)
+instead of the second; now byte-for-byte against jq:
+
+```console
+$ succinctly jq -nc 'def u: $x;
+$x'
+jq: error: $x is not defined at <top-level>, line 2:
+$x
+jq: 1 compile error
+```
 
 A second, distinct shape hits the same table-vs-counter mismatch for a different reason:
 `reduce`/`foreach` checks `init` before the bound pattern's own computed keys (`init` must
