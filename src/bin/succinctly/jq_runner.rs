@@ -2619,21 +2619,24 @@ fn report_site_error(
 
 /// Report one unbound `$name` against `source` (the main filter, or a
 /// module's own text), at its `site_index`-th recorded site -- the variable
-/// twin of [`report_unresolved_call`]. Returns whether the table had that
-/// site.
+/// twin of [`report_unresolved_call`].
 ///
 /// Unlike calls, no text-search fallback: `collect_var_sites` records every
 /// `$name` a parse sees (a `$name` token has none of the retry, shadow or
 /// builtin-fallback machinery that can make the call-site table diverge from
 /// the real parse). A text search could land on a coincidental `$name` in a
 /// string or comment, so a missing table entry gets a file-only report.
+/// `site_index` is always a resolver-computed occurrence count (#3107), so
+/// callers have nothing left to do with whether the table had that site --
+/// unlike `report_unresolved_call`'s own fallback-driving `bool`, this one
+/// had no remaining reader once that was true for both call sites.
 fn report_unbound_var(
     name: &str,
     location: &str,
     source: &str,
     var_sites: &[jq::VarSite],
     site_index: usize,
-) -> bool {
+) {
     let offset = var_sites
         .iter()
         .filter(|v| v.name == name)
@@ -2646,7 +2649,6 @@ fn report_unbound_var(
         site.as_ref()
             .map(|(line_no, line_text, column)| (*line_no, line_text.as_str(), *column)),
     );
-    site.is_some()
 }
 
 /// Report one out-of-scope `break $name` against `source` (the main filter,
