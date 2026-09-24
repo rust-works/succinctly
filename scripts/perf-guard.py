@@ -300,48 +300,17 @@ DEFAULT_THRESHOLD = 5.0
 # were removed together (#3077, #3161) once every row read ~0% again against
 # a merge-base that already included both.
 #
-# `users_compact_identity` (#2608): faster on both architectures, measured
-# against the PR's own merge-base (~-66% Ir, see the `QUERIES` comment
-# above). Unlike the entries above, this one is not simply a one-off to
-# remove the moment it's added: the drift comes from comparing a binary
-# *with* the canonical-compact echo fast path against a merge-base
-# *without* it, which is exactly what every `--baseline-binary` run does
-# on every PR/push until `main` itself carries #2608. 75% clears the
-# measured number with headroom. Remove only once `main` has moved past
-# #2608, per the rule above (tracked by #3170) -- from that point on the merge-base always
-# includes the echo path too and this row reads ~0% again like every other
-# row.
-#
-# `users_compact_latefail` (#2608): slower on both architectures, measured
-# the same way (~+13% Ir) -- the gate's own precheck cost, paid in full
-# (a walk of the whole document) before falling back to the unchanged
-# re-render. 20% clears the measured number with headroom. Remove once
-# `main` has moved past #2608, per the rule above (tracked by #3170).
-#
-# `arrays_first_map_iterate` (#3035): a codegen ripple, not a work change.
-# ARM64-Linux measured this row at +5.7% against the PR's own merge-base,
-# deterministic across three full runs (111,191,225 -> 117,480,515-682 Ir);
-# x86_64 passes at the default threshold. The row
-# (`first(map(length) | .[])` over the pure-number `arrays`/2mb fixture)
-# provably executes none of #3035's changed keyword-decoding code -- the
-# fixture has no `t`/`f`/`n` values, `length` walks children via
-# `len_checked` without a value decode, and `type` isn't called -- so the
-# delta is the evaluator monomorph's inlining ripple when `value_at`/the
-# `Builtin::Type` arm gained code. Confirming the class: a follow-up commit
-# made `keyword_span` `#[inline]` and compressed the uniform +1-2% drift on
-# *every other* row (all equally keyword-unreachable) down to +0.2-0.9%,
-# while this row barely moved (117,480,515 -> 117,482,684) -- it is the
-# smallest row, so the fixed per-element ripple is its largest fraction.
-# A one-off cost that only shows against a merge-base predating the change,
-# per the rule above: 10% clears the measured +5.7% with headroom. Remove
-# once `main` has moved past #3035 (tracked by #3175); from then on the
-# merge-base includes the same code and this row reads ~0% again.
+# `users_compact_identity` / `users_compact_latefail` (#2608) and
+# `arrays_first_map_iterate` (#3035) carried overrides of the same kind --
+# a one-off cost that only shows against a merge-base predating the change
+# (the canonical-compact echo fast path and its precheck cost for the
+# former two, an evaluator-monomorph codegen ripple for the latter). All
+# three changes are now in `main`; the entries were removed together
+# (#3170, #3175) once every row read ~0% again against a merge-base that
+# already included all three.
 QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
     "users_identity": 12.0,
-    "users_compact_identity": 75.0,
-    "users_compact_latefail": 20.0,
-    "arrays_first_map_iterate": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
