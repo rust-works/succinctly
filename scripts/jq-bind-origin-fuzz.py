@@ -146,14 +146,26 @@ EMBEDS = [
     # `min`/`max` over more than the single-element `[.]` this pool already
     # had, and over an object) -- pinned by
     # `test_owned_embed_keeps_node_identity_2889`, but only exercised by that
-    # fixed sweep, never by this differential fuzz. `[.,.] | max` embeds the
-    # same node on both sides, so either tie-break direction keeps it;
-    # `[{a:1},.] | max` and `[.,{a:1}] | min` each place the embed on the
-    # side its builtin's own tie-break (`max` keeps the last of an equal
-    # run, `min` the first) actually keeps -- their must-refuse mirror
-    # images are in `REBUILDS` below.
-    "([.,.] | max)", "([{a:1},.] | max)", "([null,.] | add)", "({a:.} | add)",
-    "([.,{a:1}] | min)",
+    # fixed sweep, never by this differential fuzz. All three hold
+    # regardless of `.`'s value: `[.,.] | max` compares `.` against itself,
+    # a tie by construction whichever position the builtin's tie-break
+    # keeps; `null`/`{a:.}`'s single value are folded through `add`'s
+    # `null + x`, and jq's `+` treats a `null` operand as the *other* side's
+    # identity for every type, not just when it numerically ties.
+    #
+    # The issue's two tie-break-specific rows (`[{a:1},.] | max`,
+    # `[.,{a:1}] | min`) are deliberately not here: unlike the three above,
+    # they embed `.` only when `.`'s *value* genuinely ties with the literal
+    # `{a:1}`, which needs a document equal to that exact literal --
+    # something this fuzzer's `doc()` generator does not produce, so drawing
+    # them would silently test ordinary (non-tied) object comparison
+    # instead almost every time (confirmed live: `null | [{a:1},.] | max`
+    # answers the literal, not `.`, and `{"b":1} | [.,{a:1}] | max` answers
+    # `.` itself, not the literal -- the opposite of `EMBEDS`'/`REBUILDS`'
+    # own "holds for any document" contract every other entry in both pools
+    # relies on). The tie-break path they were meant to add coverage for
+    # remains covered only by the fixed-input Rust test above.
+    "([.,.] | max)", "([null,.] | add)", "({a:.} | add)",
 ]
 # #3182: a string or number literal is `Rc`-backed like a container, so the
 # same placements keep a scalar's identity -- and so do the builtins real jq
@@ -371,14 +383,6 @@ REBUILDS = [
     # handler) runs through `eval.rs`'s owned-value evaluator instead, which
     # stays refuse-only until Stage B (docs/plan/jq-bind-origin-frame.md).
     "({} + .)", "(. + {a:1})", "([.[]])", "map(.)", "({k:{a:1}} | .k)",
-    # #3183: the must-refuse twins of the two tie-break `EMBEDS` rows above
-    # -- same builtin, embed on the *losing* side of the tie instead
-    # (`max` keeps the last of an equal run, so the embed-first spelling
-    # loses to the trailing literal; `min` keeps the first, so the
-    # embed-last spelling loses to the leading literal). Both confirmed
-    # live against jq 1.7.1 (`Invalid path expression`) in
-    # `test_owned_embed_fold_ties_and_identity_stage_2889`.
-    "([.,{a:1}] | max)", "([{a:1},.] | min)",
 ]
 # Writes and reads through the root marker; every key is present in `doc`.
 ROOT_USES = [
