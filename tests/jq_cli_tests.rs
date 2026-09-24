@@ -33991,37 +33991,57 @@ fn test_foreach_alt_extract_break_also_retries_like_error_1458() -> Result<()> {
 /// through `del()`/`=`/`|=`, exactly as `error()` already did. All three
 /// rows captured live against jq 1.7.1 on `{"a":1}`.
 #[test]
-fn test_foreach_extract_comma_break_write_side_3099() -> Result<()> {
-    let (out, err, code) = run_jq_full(
-        &[
-            "-c",
-            "del(label $out | foreach .a as $x (null; .; ($x, break $out)))",
-        ],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), "{}");
+fn test_foreach_extract_comma_break_write_side_3099() {
+    assert_jq_answers(
+        "3099-break",
+        "del",
+        &["-c"],
+        "del(label $out | foreach .a as $x (null; .; ($x, break $out)))",
+        r#"{"a":1}"#,
+        "{}",
+    );
+    assert_jq_answers(
+        "3099-break",
+        "=",
+        &["-c"],
+        "(label $out | foreach .a as $x (null; .; ($x, break $out))) = 5",
+        r#"{"a":1}"#,
+        r#"{"a":5}"#,
+    );
+    assert_jq_answers(
+        "3099-break",
+        "|=",
+        &["-c"],
+        "(label $out | foreach .a as $x (null; .; ($x, break $out))) |= 5",
+        r#"{"a":1}"#,
+        r#"{"a":5}"#,
+    );
+}
 
-    let (out, err, code) = run_jq_full(
-        &[
-            "-c",
-            "(label $out | foreach .a as $x (null; .; ($x, break $out))) = 5",
-        ],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), r#"{"a":5}"#);
-
-    let (out, err, code) = run_jq_full(
-        &[
-            "-c",
-            "(label $out | foreach .a as $x (null; .; ($x, break $out))) |= 5",
-        ],
-        Some(r#"{"a":1}"#),
-    )?;
-    assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), r#"{"a":5}"#);
-
+/// #3099 follow-up: `halt`/`halt_error`/`halt_error(code)` navigate nothing
+/// and unwind control flow exactly like `break` above, so `cannot_move_
+/// register`'s new `Expr::Builtin` arms cover them too. Unlike `break`,
+/// none of these are catchable by an enclosing `label` -- they abort path
+/// resolution itself before `del()`/`=`/`|=` produce any output at all, and
+/// the process exits with the escape's own code (0 for `halt`, 5 for bare
+/// `halt_error`, the given code for `halt_error(n)`). All rows captured
+/// live against jq 1.7.1 on `{"a":1}`.
+#[test]
+fn test_foreach_extract_comma_halt_write_side_3099() -> Result<()> {
+    for (escape, expect_code) in [("halt", 0), ("halt_error", 5), ("halt_error(3)", 3)] {
+        for op in [
+            format!("del(label $out | foreach .a as $x (null; .; ($x, {escape})))"),
+            format!("(label $out | foreach .a as $x (null; .; ($x, {escape}))) = 5"),
+            format!("(label $out | foreach .a as $x (null; .; ($x, {escape}))) |= 5"),
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", &op], Some(r#"{"a":1}"#))?;
+            assert_eq!(
+                code, expect_code,
+                "[{escape}] {op}\nstdout: {out:?}\nstderr: {err:?}"
+            );
+            assert_eq!(out, "", "[{escape}] {op}\nstderr: {err:?}");
+        }
+    }
     Ok(())
 }
 

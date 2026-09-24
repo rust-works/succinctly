@@ -34741,18 +34741,27 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // `fromjson` parses its input without indexing it. Its result can
         // re-establish a null register by jq's null identity rule; otherwise
         // the ordinary identity check still rejects rebuilt values (#3049).
-        Expr::Builtin(builtin) => matches!(
-            builtin,
+        //
+        // `halt`/`halt_error` unwind the whole interpreter exactly like
+        // `break` above -- same escaping-prefix shape, this builtin family
+        // instead of a label escape (#3099 follow-up, confirmed live: `($x,
+        // halt)` and `($x, halt_error)` both keep jq's already-emitted `$x`
+        // before it exits). `halt_error(code)`'s code expression is still
+        // evaluated, so that recurses exactly like `error`'s message.
+        Expr::Builtin(builtin) => match builtin {
+            Builtin::Halt | Builtin::HaltError => true,
+            Builtin::HaltErrorCode(code) => cannot_move_register(code),
             Builtin::Type
-                | Builtin::Length
-                | Builtin::Utf8ByteLength
-                | Builtin::Keys
-                | Builtin::KeysUnsorted
-                | Builtin::ToString
-                | Builtin::ToNumber
-                | Builtin::ToJson
-                | Builtin::FromJson
-        ),
+            | Builtin::Length
+            | Builtin::Utf8ByteLength
+            | Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::ToString
+            | Builtin::ToNumber
+            | Builtin::ToJson
+            | Builtin::FromJson => true,
+            _ => false,
+        },
 
         // #2860: a nested `reduce`/`foreach` whose SOURCE/INIT/UPDATE
         // (and EXTRACT) all provably never navigate anywhere cannot have
@@ -34797,9 +34806,9 @@ fn cannot_move_register(expr: &Expr) -> bool {
                 && extract.as_deref().map_or(true, cannot_move_register)
         }
 
-        // Everything else — navigation, `label`, a function definition or
-        // call, `..`, and every builtin not listed above — is assumed to
-        // have moved the register.
+        // Everything else — navigation, a function definition or call,
+        // `..`, and every builtin not listed above — is assumed to have
+        // moved the register.
         _ => false,
     }
 }
@@ -101821,6 +101830,56 @@ mod tests {
                     e.message,
                     r#"Invalid path expression near attempt to access element "b" of null"#
                 );
+            }
+        );
+    }
+
+    /// #3099 follow-up: `halt`/`halt_error`/`halt_error(code)` navigate
+    /// nothing and unwind control flow exactly like `break` above -- the
+    /// same escaping-prefix shape, this builtin family instead of a label
+    /// escape. `cannot_move_register`'s old `Expr::Builtin` allowlist
+    /// (`Type`/`Length`/...) didn't cover them, so `($x, halt)` fell to the
+    /// catch-all `false` the same way `($x, break $out)` did before this
+    /// PR's own fix. All rows captured live against jq 1.7.1.
+    #[test]
+    fn test_foreach_extract_comma_halt_reestablishes_register_3099() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"label $out | path(foreach .a as $x (null; .; ($x, halt)))"
+            ),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"label $out | path(foreach .a as $x (null; .; ($x, halt_error)))"
+            ),
+            [r#"["a"]"#]
+        );
+        // `halt_error(code)`'s code expression ($x here -- a tracked var,
+        // not navigation) is still evaluated on the way to halting, but
+        // that alone must not cost the already-emitted `$x` its tracking.
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"label $out | path(foreach .a as $x (null; .; ($x, halt_error(3))))"
+            ),
+            [r#"["a"]"#]
+        );
+
+        // Negative control: `halt_error`'s code argument is a carried
+        // `Box<Expr>`, not a bare builtin -- unlike `Halt`/`HaltError`, it
+        // needs its own recursive `cannot_move_register` call rather than a
+        // blanket `true`. A navigating code expression (`.b` on the fold's
+        // `null` accumulator) must still cost the refusal, proving the
+        // recursion is real and not a hard-coded `true` for the whole
+        // `HaltErrorCode` arm.
+        query!(
+            br#"{"a":1,"b":2}"#,
+            r"label $out | path(foreach .a as $x (null; .; ($x, halt_error(.b))))",
+            QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e)) => {
+                assert_eq!(e.message, "Invalid path expression with result 1");
             }
         );
     }
