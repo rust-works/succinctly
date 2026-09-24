@@ -4958,8 +4958,15 @@ $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints 2
 ```
 
 Verified by `scripts/jq-seq-oracle-sweep.py`, which compares stderr, stdout and exit code
-jointly: **0 stderr mismatches and 0 stdout supersets** over 4,068 generated streams per
+jointly: **0 stderr mismatches and 0 stdout supersets** over 4,083 generated streams per
 seed.
+
+The randomized corpus doesn't generate invalid UTF-8 outside a string, and there one stdout
+gap remains. succinctly finds values by walking the stream after UTF-8 substitution, and
+outside a string jq's short-tail rule can fold an invalid lead byte *and* the RS or
+whitespace after it into one U+FFFD. The value after the lost boundary is then dropped:
+`printf '\xe0\x1e"a"\n' | jq --seq -c .` prints `"a"`, and succinctly prints nothing
+([#3247](https://github.com/rust-works/succinctly/issues/3247)). stderr still matches.
 
 One `--seq` divergence remains, an artifact of jq's 4096-byte `fgets` *line reader* rather
 than its parser, and unreachable from a newline-free chunk:
@@ -5092,7 +5099,8 @@ $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level num
 ```
 
 `succinctly jq` reproduces this on both stderr and stdout, including the pre-RS `1` jq
-reads. The value walk takes its BOM verdict from the raw bytes, and the swallowed prefix is
+reads, except where invalid UTF-8 after the prefix hits the
+[#3247](https://github.com/rust-works/succinctly/issues/3247) gap above. The value walk takes its BOM verdict from the raw bytes, and the swallowed prefix is
 removed before UTF-8 substitution. The substituted stream can't answer either question:
 a raw `\xef\xbb` is itself invalid UTF-8 and becomes a U+FFFD of a different width
 ([#3199](https://github.com/rust-works/succinctly/issues/3199)), and a U+FFFD substituted
