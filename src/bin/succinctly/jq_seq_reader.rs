@@ -149,16 +149,18 @@ const YIELDED_AT_EOF: usize = usize::MAX;
 /// newline up to the end of the [`fgets_chunk_lens`] chunk holding that
 /// byte, since the whole chunk was read before any of it was parsed. A value
 /// yielded by the EOF branch is named after the last source, with all of
-/// its newlines.
+/// its newlines. (jq would name a last file operand it failed to open
+/// there; `get_inputs` doesn't reach this walk with one.)
 fn value_locations(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     yielded_at: &[usize],
 ) -> Vec<(usize, usize)> {
     let ends = source_ends(raw_bytes);
     let last_source = raw_bytes.len().saturating_sub(1);
-    // The source being walked, how far its chunks have been read, and the
-    // newlines in them.
+    // The source being walked, its chunks still unread, how far they have
+    // been read, and the newlines in them.
     let mut source = usize::MAX;
+    let mut chunks = fgets_chunk_lens(&[]);
     let mut chunk_end = 0usize;
     let mut newlines = 0usize;
     let mut out = Vec::with_capacity(yielded_at.len());
@@ -172,14 +174,13 @@ fn value_locations(
         let raw: &[u8] = raw_bytes.get(index).map_or(&[], |(_, raw)| raw.as_slice());
         if index != source {
             source = index;
+            chunks = fgets_chunk_lens(raw);
             chunk_end = 0;
             newlines = 0;
         }
         // Read chunks until the one holding `local` has been read.
-        while chunk_end <= local && chunk_end < raw.len() {
-            let len = fgets_chunk_lens(&raw[chunk_end..])
-                .next()
-                .expect("a non-empty rest has a first chunk");
+        while chunk_end <= local {
+            let Some(len) = chunks.next() else { break };
             chunk_end += len;
             if raw[chunk_end - 1] == b'\n' {
                 newlines += 1;
@@ -283,9 +284,9 @@ pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
 }
 
 /// Each source's exclusive end offset in the concatenation of all of
-/// them, in order -- which is also where the next source starts. The
-/// walk's source boundaries, and `build_seq_values`' map from a value's
-/// offset back to its file, so the two cannot disagree.
+/// them, in order -- which is also where the next source starts. The one
+/// definition of those offsets for the walk's boundaries, its value
+/// locations ([`value_locations`]) and `-R`'s line remap.
 pub(crate) fn source_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec<usize> {
     sources
         .iter()
@@ -360,8 +361,7 @@ pub(crate) fn walk_stream(
     // subsequent one), matching `indexed_stream_bytes`'s undecorated
     // numbering. The last of these ends is the stream's whole length,
     // reused below instead of a second `.sum()` over the same sources --
-    // both `final_buffer_start` and the EOF answer need it. The same ends
-    // map each value back to its file in `build_seq_values`.
+    // both `final_buffer_start` and the EOF answer need it.
     let total = source_ends(raw_bytes).last().copied().unwrap_or(0);
     // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
     // `jv_parser_next`, and each `fgets` refill starts one: resets after a
@@ -389,7 +389,14 @@ pub(crate) fn walk_stream(
             && !(reader.last_byte_yielded_value && final_buffer_start < total));
     SeqStreamWalk {
         slurp_position_lost,
-        locations: value_locations(raw_bytes, &reader.yielded_at),
+        // Only non-slurp output names a location per value; `-s` would throw
+        // this pass away.
+        locations: if slurp {
+            Vec::new()
+        } else {
+            debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
+            value_locations(raw_bytes, &reader.yielded_at)
+        },
         values: reader.values,
     }
 }
@@ -530,7 +537,8 @@ pub(crate) struct SeqStreamWalk {
     /// its strings, and substitution is scoped per string (#1743), so the
     /// result is the same as substituting the whole document.
     pub(crate) values: Vec<(usize, usize)>,
-    /// Parallel to `values`: each one's `(source index, line)`, jq's
+    /// Parallel to `values` (empty under `-s`): each one's `(source index,
+    /// line)`, jq's
     /// `input_filename`/`input_line_number` and `(at file:line)` for it
     /// (#3250). jq reports where its reader stood when the value was
     /// *yielded* -- by its closing byte, or for a number or keyword by the

@@ -5747,11 +5747,10 @@ fn build_seq_values(
     // One source (stdin, or a single file) is borrowed as is; only a
     // multi-file stream, whose records can span a boundary, is copied into
     // one buffer.
-    let file_ends = crate::jq_seq_reader::source_ends(raw_sources);
     let combined: std::borrow::Cow<'_, [u8]> = match raw_sources {
         [(_, only)] => std::borrow::Cow::Borrowed(only),
         _ => {
-            let mut all = Vec::with_capacity(file_ends.last().copied().unwrap_or(0));
+            let mut all = Vec::with_capacity(raw_sources.iter().map(|(_, raw)| raw.len()).sum());
             for (_, raw) in raw_sources {
                 all.extend_from_slice(raw);
             }
@@ -5761,6 +5760,11 @@ fn build_seq_values(
     let parsed = seq_values_with_indices(&combined, ranges);
 
     if !slurp {
+        debug_assert_eq!(
+            value_locations.len(),
+            ranges.len(),
+            "one location per value"
+        );
         for &(_, index) in &parsed {
             let (source, line) = value_locations[index];
             locations.push(raw_sources[source].0.unwrap_or(0), line);
@@ -5773,9 +5777,10 @@ fn build_seq_values(
 /// Build the values and one `(source, line)` location per value for
 /// raw-input (`-R`) mode across the whole file list at once (#1809).
 ///
-/// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern (sharing
-/// its `jq_seq_reader::source_ends`/[`remap_ends_to_locations`] helpers
-/// directly): real jq's `-R` reader treats multiple files as one
+/// Concatenates the files like [`build_seq_values`] and maps each line's
+/// end offset back to a file and line with [`remap_ends_to_locations`]
+/// (`--seq` no longer does: its locations come from where jq's reader
+/// yielded each value, #3250): real jq's `-R` reader treats multiple files as one
 /// continuous byte stream for line-splitting too -- confirmed live against
 /// jq 1.7.1 that a file's own unterminated trailing line joins with the
 /// next file's first line, the same way `--seq` joins a boundary-split
@@ -5854,15 +5859,17 @@ fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec
 /// within the `combined` stream `file_ends` was built from -- see
 /// [`concat_with_file_ends`]) to its owning file and file-local line
 /// number, pushing one `(source, line)` location per `end` onto
-/// `locations` in the same order. Shared by [`build_seq_values`] and
-/// [`build_raw_input_values`].
+/// `locations` in the same order. [`build_raw_input_values`]'s (`-R`) only:
+/// `--seq` names a value from where jq's reader yielded it instead
+/// (`jq_seq_reader::value_locations`, #3250), which this end-offset rule
+/// gets wrong for a value ending at a file's end.
 ///
 /// A value/line ending *exactly* at a file boundary is attributed to the
 /// file *starting* there, not the file ending there: `partition_point`'s
 /// `fe <= end` predicate (not `fe < end`) is what makes that call, since
 /// `file_ends[i]` is both file `i`'s own exclusive end and file `i+1`'s
 /// start offset -- an `end` equal to that offset means the byte the
-/// record/line's own trailing delimiter occupies is the *first* byte of
+/// line's own trailing delimiter occupies is the *first* byte of
 /// file `i+1`, not the last byte of file `i`. Getting this wrong (an
 /// earlier version of both callers used `fe < end`) misattributes the
 /// line/record to the wrong file entirely whenever a file's sole content is
