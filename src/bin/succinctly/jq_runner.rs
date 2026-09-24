@@ -4499,8 +4499,8 @@ fn get_inputs(
         // The only way this function still runs `build_seq_values` with
         // `seq_warnings_apply` false is `-n` forcing a real read: DSV and
         // `-R` are excluded from both gates identically. That combination
-        // skips the warnings but still needs the values, so it pays for its
-        // own walk here, exactly as the location below does.
+        // skips the warnings but still needs the values and `-s`'s
+        // location, so it runs the walk here with a no-op sink.
         let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
         seq_values = walk.values;
         seq_slurp_position_lost = walk.slurp_position_lost;
@@ -4616,7 +4616,8 @@ fn get_inputs(
 
     // `--slurp`'s single combined value has no content of its own to name a
     // line in -- jq instead names the *last source*'s own newline count at
-    // EOF (#1520), computed here from `raw_inputs` while it's still whole,
+    // EOF (#1520), computed here from the last source (`seq_raw`'s under
+    // `--seq`, `raw_inputs`' otherwise) while it's still whole,
     // before either branch below consumes it, and only when slurping: every
     // ordinary invocation would otherwise pay this O(n) scan of the last
     // input for a value neither branch below ever reads. `line_at(bytes,
@@ -5743,15 +5744,16 @@ fn build_seq_values(
     // One source (stdin, or a single file) is borrowed as is; only a
     // multi-file stream, whose records can span a boundary, is copied into
     // one buffer.
-    let file_ends = cumulative_file_ends(raw_sources);
+    let file_ends = crate::jq_seq_reader::source_ends(raw_sources);
     let combined: std::borrow::Cow<'_, [u8]> = match raw_sources {
         [(_, only)] => std::borrow::Cow::Borrowed(only),
-        _ => std::borrow::Cow::Owned(
-            raw_sources
-                .iter()
-                .flat_map(|(_, raw)| raw.iter().copied())
-                .collect(),
-        ),
+        _ => {
+            let mut all = Vec::with_capacity(file_ends.last().copied().unwrap_or(0));
+            for (_, raw) in raw_sources {
+                all.extend_from_slice(raw);
+            }
+            std::borrow::Cow::Owned(all)
+        }
     };
     let parsed = seq_values_with_ends(&combined, ranges);
 
@@ -5771,7 +5773,7 @@ fn build_seq_values(
 /// raw-input (`-R`) mode across the whole file list at once (#1809).
 ///
 /// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern (sharing
-/// its [`cumulative_file_ends`]/[`remap_ends_to_locations`] helpers
+/// its `jq_seq_reader::source_ends`/[`remap_ends_to_locations`] helpers
 /// directly): real jq's `-R` reader treats multiple files as one
 /// continuous byte stream for line-splitting too -- confirmed live against
 /// jq 1.7.1 that a file's own unterminated trailing line joins with the
@@ -5840,27 +5842,11 @@ fn build_raw_input_values(
 }
 
 /// Concatenate every file's decoded content, in order, into one string,
-/// with [`cumulative_file_ends`] for it -- [`build_raw_input_values`]'s
+/// with `jq_seq_reader::source_ends` for it -- [`build_raw_input_values`]'s
 /// view of the whole multi-file input as one continuous stream of lines.
 fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec<usize>) {
     let combined: String = raw_inputs.iter().map(|(_, raw)| raw.as_str()).collect();
-    (combined, cumulative_file_ends(raw_inputs))
-}
-
-/// Each source's exclusive end offset in the concatenation of all of them,
-/// in order -- which is also where the next source starts. Shared by
-/// [`build_seq_values`] (raw bytes) and [`concat_with_file_ends`] (decoded
-/// `-R` text), both of which treat the whole multi-file input as one
-/// continuous stream, so [`remap_ends_to_locations`] reads the same
-/// arithmetic for both.
-fn cumulative_file_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec<usize> {
-    sources
-        .iter()
-        .scan(0usize, |end, (_, raw)| {
-            *end += raw.as_ref().len();
-            Some(*end)
-        })
-        .collect()
+    (combined, crate::jq_seq_reader::source_ends(raw_inputs))
 }
 
 /// Map each `end` offset in `ends` (non-decreasing, an exclusive position
@@ -5940,21 +5926,25 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
 fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
-    // One pass over the whole stream; almost every stream is valid, and
-    // then no value needs a check of its own.
-    let all_valid = succinctly::text::utf8::validate_utf8(combined).is_ok();
+    // One pass over the whole stream. Almost every stream is valid, and then
+    // no value needs a check of its own; otherwise only a value reaching
+    // past the first invalid byte can hold one.
+    let first_invalid = succinctly::text::utf8::validate_utf8(combined)
+        .err()
+        .map_or(usize::MAX, |e| e.offset);
     ranges
         .iter()
         .filter_map(|&(start, end)| {
             let raw = &combined[start..end];
             let substituted;
-            let bytes = if all_valid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
-                raw
-            } else {
-                substituted =
-                    succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
-                substituted.as_bytes()
-            };
+            let bytes =
+                if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
+                    raw
+                } else {
+                    substituted =
+                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
+                    substituted.as_bytes()
+                };
             // #2295: the sequence reader already checks the grammar, but
             // retain the checked materializer as defense in depth.
             json_bytes_to_owned_value_checked(bytes)

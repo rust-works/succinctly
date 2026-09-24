@@ -179,6 +179,20 @@ pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
     }
 }
 
+/// Each source's exclusive end offset in the concatenation of all of
+/// them, in order -- which is also where the next source starts. The
+/// walk's source boundaries, and `build_seq_values`' map from a value's
+/// offset back to its file, so the two cannot disagree.
+pub(crate) fn source_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec<usize> {
+    sources
+        .iter()
+        .scan(0usize, |end, (_, raw)| {
+            *end += raw.as_ref().len();
+            Some(*end)
+        })
+        .collect()
+}
+
 /// Every byte of the input stream, as jq's scanner sees it: all sources
 /// concatenated, with [`bom_prefix`]'s bytes already removed.
 ///
@@ -254,16 +268,11 @@ pub(crate) fn walk_stream(
     // walk must reproduce (#3002). The offsets are the sources' absolute
     // boundaries (the end of each but the last, i.e. the start of each
     // subsequent one), matching `indexed_stream_bytes`'s undecorated
-    // numbering. The running total this scan ends on is also the stream's
-    // whole length, reused below instead of a second `.sum()` over the same
-    // sources -- both `final_buffer_start` and the EOF answer need it.
-    let mut boundaries = raw_bytes
-        .iter()
-        .scan(0usize, |end, (_, raw)| {
-            *end += raw.len();
-            Some(*end)
-        })
-        .collect::<Vec<usize>>();
+    // numbering. The last of these ends is the stream's whole length,
+    // reused below instead of a second `.sum()` over the same sources --
+    // both `final_buffer_start` and the EOF answer need it. The same ends
+    // map each value back to its file in `build_seq_values`.
+    let mut boundaries = source_ends(raw_bytes);
     let total = boundaries.last().copied().unwrap_or(0);
     boundaries.pop();
     let final_buffer_start = final_buffer_start(raw_bytes, total);
@@ -283,8 +292,9 @@ pub(crate) fn walk_stream(
 }
 
 /// What one raw-byte walk over a `--seq` stream ([`walk_stream`])
-/// answers, bundled so a caller that needs both questions (the ordinary
-/// non-`-n` case, `jq_runner`'s own call site) pays for the walk once.
+/// answers -- the warnings go to its `emit` as it runs; the values and
+/// `-s`'s location come back here -- so a caller that needs several of them
+/// pays for the walk once.
 pub(crate) struct SeqStreamWalk {
     /// Whether `--seq -s`'s runtime-error location is lost entirely -- real
     /// jq answering `(at <unknown>)` where it would otherwise name a file
@@ -423,9 +433,9 @@ pub(crate) struct SeqStreamWalk {
 /// [`walk_stream`] with the warnings thrown away. The stderr
 /// diagnostics and this question are the same walk, and the ordinary call
 /// site runs it once and uses both answers rather than paying for a second
-/// pass over the whole stream; this is for the two `-s` call sites that
-/// print no warnings from the walk (#1525's own template, and `-n`/DSV) but
-/// still need the location.
+/// pass over the whole stream; this is for the `-s` call sites that run no
+/// [`walk_stream`] of their own (#1525's no-RS-byte template, and
+/// `--input-dsv`) but still need the location.
 ///
 /// Takes the same raw, pre-UTF-8-substitution sources that function does,
 /// and for the same reason -- a substituted byte is a 3-byte U+FFFD, which
@@ -525,7 +535,10 @@ struct Reader<'a> {
     completed: Option<(usize, usize)>,
     values: Vec<(usize, usize)>,
     /// See [`walk_stream`]: a malformed BOM plus a newline-terminated
-    /// stream means jq's own EOF report is wiped before it is written.
+    /// stream means jq's own EOF report is wiped before it is written. It
+    /// models jq's reset at the empty final buffer, so [`Reader::finish`]
+    /// yields no value either -- none can be pending there, since that same
+    /// reset already ran at the newline -- and the value walk is this walk.
     suppress_eof_warning: bool,
     /// Whether the most recent [`Reader::warn`] came from [`Reader::finish`],
     /// jq's EOF branch. `finish` warns at most once and runs last, so this
@@ -1509,11 +1522,19 @@ mod tests {
         );
 
         let empty: &[u8] = b"";
+        let combined: Vec<u8> = [a, empty].concat();
+        let kept = |slurp| -> Vec<String> {
+            walk_values(&[a, empty], slurp)
+                .into_iter()
+                .map(|(s, e)| String::from_utf8(combined[s..e].to_vec()).unwrap())
+                .collect()
+        };
         assert_eq!(
-            walk_values(&[a, empty], false),
-            walk_values(&[a, empty], true),
+            kept(false),
+            vec!["true"],
             "an empty trailing file has no final buffer to drop from"
         );
+        assert_eq!(kept(false), kept(true));
     }
 
     /// Every message template, captured from `/usr/bin/jq` 1.7.1. The
@@ -1893,9 +1914,12 @@ mod tests {
     /// BOM bytes included. Captured from `/usr/bin/jq` 1.7.1.
     #[test]
     fn values_are_ranges_into_the_raw_stream_3247() {
+        // Both modes: none of these reaches #2998's drop, so they agree.
         let texts = |sources: &[&[u8]]| -> Vec<Vec<u8>> {
             let raw: Vec<u8> = sources.concat();
-            walk_values(sources, true)
+            let slurped = walk_values(sources, true);
+            assert_eq!(walk_values(sources, false), slurped, "{sources:?}");
+            slurped
                 .into_iter()
                 .map(|(start, end)| raw[start..end].to_vec())
                 .collect()

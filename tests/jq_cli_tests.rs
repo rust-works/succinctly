@@ -7746,10 +7746,33 @@ fn test_seq_invalid_utf8_outside_strings_keeps_record_boundaries_3247() -> Resul
         }
     }
 
+    // A valid two-byte character split across two files inside one string:
+    // jq reads the files as one stream, so it stays `é`. Substituting each
+    // file on its own gave two U+FFFDs.
+    let dir = tempfile::tempdir()?;
+    let u1 = dir.path().join("u1");
+    let u2 = dir.path().join("u2");
+    std::fs::write(&u1, b"\x1e\"a\xc3")?;
+    std::fs::write(&u2, b"\xa9b\"\n")?;
+    let (output, code) = spawn_jq(
+        &[
+            "--seq",
+            "-c",
+            ".",
+            u1.to_str().unwrap(),
+            u2.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\x1e\"a\u{e9}b\"\n"
+    );
+
     // A record split across files with an invalid byte in its string, and
     // an invalid byte eating an RS in the second file: every value keeps
     // its file.
-    let dir = tempfile::tempdir()?;
     let a = dir.path().join("m1");
     let b = dir.path().join("m2");
     std::fs::write(&a, b"\x1e1\n\x1e{\"a\":\"x")?;
