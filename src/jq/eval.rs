@@ -56442,11 +56442,22 @@ fn builtin_fabs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// codebase already uses for every other `<`/`<=`/`>`/`>=` (`eval_compare`,
 /// `eval_generic`'s own compare arm) closes that gap by construction
 /// instead of needing a second yq-mode special case copied here too.
+///
+/// `to_owned_or_suppress!`, not `to_owned_lossy`: this builtin passes its
+/// input straight through unchanged whenever it isn't negated, so an
+/// undecodable string/error node must raise `decode_failure`, not silently
+/// substitute `""`/`null` and hand that corrupted value back as output
+/// (#3089, matching the checked idiom `builtin_length`/`builtin_keys`/
+/// `SortKeysOneLevel` already use for the same "any type, not just
+/// numbers" shape). Not currently reachable through either shipped CLI --
+/// the general value-materialization machinery upstream of builtin dispatch
+/// already decodes checked -- but a latent gap for a direct library caller
+/// of `succinctly::jq::eval`.
 fn builtin_abs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned_lossy::<S, W>(&value);
+    let owned = to_owned_or_suppress!(&value, optional);
     let sorts_below_zero = apply_compare_op::<S>(CompareOp::Lt, &owned, &OwnedValue::Int(0));
     if sorts_below_zero {
         match arith_negate::<S>(owned) {
@@ -92258,6 +92269,27 @@ mod tests {
             assert_eq!(f, 1.5);
             assert_eq!(text.as_ref(), "1.50");
         });
+    }
+
+    /// #3089: `abs` passes a non-negative string straight through unchanged
+    /// (see `test_abs`'s `"a" | abs` row above), so an undecodable string
+    /// must raise `decode_failure` like `sort`/`unique`/`min`/`max` do
+    /// (`test_sort_family_raises_on_decode_failure_1755`), not silently
+    /// substitute `""` and hand that back as `abs`'s own output. Not
+    /// reachable through either shipped CLI (confirmed in the issue): the
+    /// general value-materialization machinery upstream of builtin dispatch
+    /// already decodes checked before `builtin_abs` is ever reached, so this
+    /// is a library-API-only regression test, exercised directly the same
+    /// way `test_sort_family_raises_on_decode_failure_1755` is.
+    #[test]
+    fn test_abs_raises_on_decode_failure_3089() {
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "abs",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "{}", e.message);
+            }
+        );
     }
 
     #[test]
