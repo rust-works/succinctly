@@ -2214,7 +2214,7 @@ fn check(
                 match &marker {
                     Some(RunMarker::Begin { .. }) => occurrences.runs.push(RunFrame::default()),
                     Some(RunMarker::End { .. }) => closed_run = occurrences.runs.pop(),
-                    None => {}
+                    None => {} // omni-dev: coverage tolerate-line reason="unreachable by construction: this match is only entered when is_marker (marker.is_some()) is true, and RunMarker has only Begin/End variants -- the None arm exists solely for exhaustiveness against Option<RunMarker>'s type"
                 }
             }
             check(then, scope, var_scope, label_scope, errors, reachable, occurrences);
