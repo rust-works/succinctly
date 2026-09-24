@@ -20,6 +20,7 @@ use alloc::format;
 use alloc::string::String;
 
 use super::eval::EvalTag;
+use super::parser::floor_char_boundary;
 use super::stream::{stream_owned_value_json, stream_owned_value_json_jq};
 use super::value::OwnedValue;
 
@@ -360,10 +361,8 @@ impl PreviewSink {
 
     /// Cut `buf` back to at most `len` bytes, on a `char` boundary.
     fn truncate_to(&mut self, len: usize) {
-        let mut cut = len.min(self.buf.len());
-        while cut > 0 && !self.buf.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let cut = len.min(self.buf.len());
+        let cut = floor_char_boundary(&self.buf, cut, 0);
         self.buf.truncate(cut);
     }
 }
@@ -377,10 +376,7 @@ impl core::fmt::Write for PreviewSink {
         }
         // More arrived than fits: take what we can, on a boundary, and stop the
         // traversal — nothing further can change the preview.
-        let mut cut = room;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let cut = floor_char_boundary(s, room, 0);
         self.buf.push_str(&s[..cut]);
         self.overflowed = true;
         Err(core::fmt::Error)

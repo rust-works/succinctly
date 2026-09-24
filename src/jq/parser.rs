@@ -476,6 +476,21 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
     names
 }
 
+/// Round `idx` down to the nearest `char` boundary of `s`, never going below
+/// `floor` -- shared by [`Parser::peek_str`] below and `error.rs`'s
+/// `PreviewSink::truncate_to`/`write_str` (#2984), which had each hand-rolled
+/// this identical loop independently (`peek_str`'s own #2975 doc comment has
+/// the "why floor, not ceil" reasoning; not repeated at the other two
+/// call sites, which is exactly the drift risk this collapses). No stable
+/// `core`/`std` equivalent exists at this crate's MSRV (1.73.0) --
+/// `str::floor_char_boundary` is nightly-only.
+pub(crate) fn floor_char_boundary(s: &str, mut idx: usize, floor: usize) -> usize {
+    while idx > floor && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
@@ -936,10 +951,8 @@ impl<'a> Parser<'a> {
     /// harmless outcome a slice that ran off the end of `input` already
     /// produces via the existing `.min(self.input.len())`.
     fn peek_str(&self, n: usize) -> &str {
-        let mut end = (self.pos + n).min(self.input.len());
-        while end > self.pos && !self.input.is_char_boundary(end) {
-            end -= 1;
-        }
+        let end = (self.pos + n).min(self.input.len());
+        let end = floor_char_boundary(self.input, end, self.pos);
         &self.input[self.pos..end]
     }
 
@@ -11196,6 +11209,44 @@ mod tests {
             p.peek_str(10),
             "（",
             "requesting past the end still stops at the real end"
+        );
+    }
+
+    /// #2984: the shared helper `peek_str` above and `error.rs`'s
+    /// `PreviewSink::truncate_to`/`write_str` all reduce to, directly --
+    /// the "test that call sites agree" the issue's own CLAUDE.md-cited
+    /// precedent (#106) calls for, so a future edit to one caller's
+    /// expectations can't silently drift from what the shared function
+    /// actually does.
+    #[test]
+    fn test_floor_char_boundary_2984() {
+        let s = "aあb"; // 'a' (1 byte), 'あ' (3 bytes), 'b' (1 byte): boundaries at 0,1,4,5
+        assert_eq!(floor_char_boundary(s, 5, 0), 5, "already on a boundary");
+        assert_eq!(floor_char_boundary(s, 4, 0), 4, "already on a boundary");
+        assert_eq!(
+            floor_char_boundary(s, 3, 0),
+            1,
+            "mid-character, rounds down past it"
+        );
+        assert_eq!(
+            floor_char_boundary(s, 2, 0),
+            1,
+            "mid-character, rounds down past it"
+        );
+        assert_eq!(floor_char_boundary(s, 1, 0), 1, "already on a boundary");
+        assert_eq!(floor_char_boundary(s, 0, 0), 0, "already on a boundary");
+        // `floor` stops the walk before it reaches 0 -- `peek_str`'s own use,
+        // where `self.pos` (not 0) is the slice's real lower bound.
+        assert_eq!(
+            floor_char_boundary(s, 3, 1),
+            1,
+            "floor caps the descent at 1, same answer here since 1 is a boundary"
+        );
+        assert_eq!(
+            floor_char_boundary("あ", 2, 1),
+            1,
+            "a single 3-byte character: floor=1 stops the walk before byte 0, \
+             even though the true nearest boundary would be 0"
         );
     }
 }
