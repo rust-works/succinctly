@@ -5414,6 +5414,60 @@ mod tests {
         let _ = JsonIndex::from_parts(vec![], u32::MAX as usize + 1, vec![], 0);
     }
 
+    /// `from_parts`'s success path -- the loading-from-serialized-parts
+    /// route (mmap, `SimpleJsonIndex::from_parts`'s own sibling test in
+    /// `simple_light.rs`) -- reconstructs an index that navigates
+    /// identically to the one it was extracted from. `bridge_tokens` isn't
+    /// serialized (`from_parts` always sets it `false`, matching `build`):
+    /// deliberate, since the only route to a `true` one is
+    /// `JsonIndex::build_reindex` over freshly-generated bridge text, never
+    /// data loaded back from a store (#3034).
+    #[test]
+    fn test_from_parts_round_trips_an_existing_index() {
+        let json = br#"{"data":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+
+        let ib = index.ib().to_vec();
+        let ib_len = index.ib_len();
+        let bp = index.bp().words().to_vec();
+        let bp_len = index.bp().len();
+
+        let reconstructed = JsonIndex::from_parts(ib, ib_len, bp, bp_len);
+
+        let orig_root = index.root(json);
+        let new_root = reconstructed.root(json);
+        assert_eq!(
+            format!("{:?}", orig_root.value()),
+            format!("{:?}", new_root.value())
+        );
+        let orig_child = orig_root.first_child().expect("object has a field");
+        let new_child = new_root.first_child().expect("object has a field");
+        assert_eq!(
+            format!("{:?}", orig_child.value()),
+            format!("{:?}", new_child.value())
+        );
+    }
+
+    /// `Debug` is hand-written (not derived) so `seq_hint`, a navigation
+    /// cache, can be left out -- its own doc comment explains why a derived
+    /// impl would make two cursors that reached the same node by different
+    /// routes print differently. Exercised directly since nothing else in
+    /// the suite formats a `JsonIndex`.
+    #[test]
+    fn test_json_index_debug_omits_seq_hint_includes_bridge_tokens() {
+        let json = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let debug = format!("{index:?}");
+        assert!(debug.contains("bridge_tokens: false"), "{debug}");
+        assert!(!debug.contains("seq_hint"), "{debug}");
+
+        let reindexed = JsonIndex::build_reindex(json);
+        assert!(
+            format!("{reindexed:?}").contains("bridge_tokens: true"),
+            "{reindexed:?}"
+        );
+    }
+
     #[test]
     fn test_root_cursor() {
         let json = br#"{"a": 1}"#;

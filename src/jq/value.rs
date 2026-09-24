@@ -6096,11 +6096,9 @@ mod tests {
                 OwnedValue::Null,
                 "{token} as user text"
             );
+            let got = read_as_bridge_text::<JqSemantics>(token);
             assert!(
-                matches!(
-                    read_as_bridge_text::<JqSemantics>(token),
-                    OwnedValue::Float(_)
-                ),
+                matches!(got, OwnedValue::Float(_)),
                 "{token} as bridge text"
             );
         }
@@ -6139,6 +6137,34 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// [`OwnedValue::input_bridge_doc`] is the exact `to_json_input_bridge` +
+    /// `JsonIndex::build_reindex` pair `evaluate_input_streaming`
+    /// (`src/bin/succinctly/jq_runner.rs`) used to spell out by hand, bundled
+    /// so the flag can't be forgotten (#3034): `text()` is the same string
+    /// `to_json_input_bridge` alone would have produced, and a cursor over
+    /// `root()` decodes the bridge's tokens the same way
+    /// [`reindexed`](OwnedValue::reindexed)'s does.
+    #[test]
+    fn test_input_bridge_doc_pairs_bridge_text_with_its_flagged_index_3034() {
+        let input = OwnedValue::array_from(vec![OwnedValue::Float(f64::NAN), OwnedValue::Int(1)]);
+        let doc = input.input_bridge_doc();
+        assert_eq!(doc.text(), input.to_json_input_bridge());
+
+        let mut children = doc.root().children();
+        let crate::json::StandardJson::Number(nan) = children.next().expect("nan element").value()
+        else {
+            panic!("expected a number");
+        };
+        assert!(nan.as_f64().is_ok_and(f64::is_nan));
+
+        let crate::json::StandardJson::Number(one) = children.next().expect("int element").value()
+        else {
+            panic!("expected a number");
+        };
+        assert_eq!(one.bridge_value(), None, "1 is not a bridge token");
+        assert_eq!(one.as_f64(), Ok(1.0));
     }
 
     /// #2877: decNumber's special values materialize as the same bare
