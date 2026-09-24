@@ -668,17 +668,50 @@ def main(argv=None):
         for query_id, drift, threshold in failed:
             print(f"  {query_id}: {drift:+.1f}% (threshold {threshold}%)")
         print()
-        print("A drift in either direction fails: a genuine improvement needs the same "
-              "conscious baseline update as a regression, so a stale baseline can't quietly "
-              "keep passing. If this is real and understood (new correctness work that "
-              "genuinely costs more, or an optimization that genuinely costs less), re-run "
-              "with --update-baseline and say why in the commit message. If it's unexpected, "
-              "that's exactly what this guard exists to catch -- see "
-              "docs/guides/benchmarking.md for how to investigate.")
+        print(failure_advice(bool(args.baseline_binary)))
         return 1
 
     print("OK: all queries within threshold")
     return 0
+
+
+def failure_advice(baseline_binary: bool) -> str:
+    """The closing message printed after a failed run's per-query table
+    (#3169). Must depend on `baseline_binary`: CI's `--baseline-binary` mode
+    (every `pull_request` run, and a `push` run whose `before` is a real,
+    buildable commit -- see ci.yml's own "Build previous-commit binary"
+    step for the fallback case) never consults the checked-in baseline file
+    at all -- `--update-baseline` is not just unhelpful there but rejected
+    outright by `--baseline-binary is only valid with --check`, since
+    there's nothing to update a checked-in baseline *from* a transient
+    second binary. Advising it anyway sent a real PR (#3160) chasing a
+    baseline regeneration that could never have changed the result -- the
+    `QUERY_THRESHOLDS` override (see that dict's own comment for the
+    procedure #2878/#2720/#2999/#3009 all followed) is what actually clears
+    a `--baseline-binary` failure."""
+    if baseline_binary:
+        return (
+            "A drift in either direction fails: a genuine improvement needs the same "
+            "conscious threshold update as a regression, so a stale threshold can't "
+            "quietly keep passing. This run compared against a same-run baseline binary "
+            "(--baseline-binary), not the checked-in baseline file -- --update-baseline "
+            "cannot help here and is rejected outright in this mode. If this is real and "
+            "understood (new correctness work that genuinely costs more, or an "
+            "optimization that genuinely costs less), add a QUERY_THRESHOLDS override "
+            "sized from this run's own measured drift, with a note to remove it once "
+            "main carries the change (see that dict's own comment for the procedure). "
+            "If it's unexpected, that's exactly what this guard exists to catch -- see "
+            "docs/guides/benchmarking.md for how to investigate."
+        )
+    return (
+        "A drift in either direction fails: a genuine improvement needs the same "
+        "conscious baseline update as a regression, so a stale baseline can't quietly "
+        "keep passing. If this is real and understood (new correctness work that "
+        "genuinely costs more, or an optimization that genuinely costs less), re-run "
+        "with --update-baseline and say why in the commit message. If it's unexpected, "
+        "that's exactly what this guard exists to catch -- see "
+        "docs/guides/benchmarking.md for how to investigate."
+    )
 
 
 if __name__ == "__main__":
