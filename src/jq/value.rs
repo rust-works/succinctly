@@ -683,38 +683,23 @@ pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
 /// the digit string, so no length or magnitude reaches an `f64`
 /// (`0.` + 200,000 zeros + `1` -> `1E-200001`).
 fn plain_decimal_scientific(s: &str) -> Option<String> {
-    let (negative, unsigned) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
+    let (negative, unsigned) = strip_leading_sign(s);
     let (int_part, frac_part) = unsigned.split_once('.')?;
-    if !int_part
-        .bytes()
-        .chain(frac_part.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
+    // A nonzero (or non-digit) integer digit means an adjusted exponent of
+    // at least 0: the common case, answered without scanning the fraction.
+    if int_part.bytes().any(|b| b != b'0') {
         return None;
     }
-    let digits: &str = {
-        let all = int_part.len() + frac_part.len();
-        let leading = int_part
-            .bytes()
-            .chain(frac_part.bytes())
-            .take_while(|&b| b == b'0')
-            .count();
-        if leading == all {
-            "0"
-        } else if leading < int_part.len() {
-            // A nonzero integer digit: the adjusted exponent is >= 0.
-            return None;
-        } else {
-            &frac_part[leading - int_part.len()..]
-        }
+    let leading = frac_part.bytes().take_while(|&b| b == b'0').count();
+    // Coefficient digits with leading zeros dropped, `0` when none remain.
+    let digits = if leading == frac_part.len() {
+        "0"
+    } else {
+        &frac_part[leading..]
     };
     let exponent = -i64::try_from(frac_part.len()).ok()?;
     let adjusted = exponent + i64::try_from(digits.len()).ok()? - 1;
-    if adjusted >= -6 {
+    if adjusted >= -6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let mut out = String::with_capacity(digits.len() + 24);
@@ -748,6 +733,10 @@ fn plain_decimal_scientific(s: &str) -> Option<String> {
 /// - Floats with trailing zeros: preserve them (`0.10` -> `0.10`); an
 ///   insignificant leading zero/`+` in the integer part is stripped the
 ///   same way integers are (`007.10` -> `7.10`)
+/// - Unless decNumber's adjusted exponent falls below -6, which only a `0.`
+///   followed by 6+ zeros can reach: then scientific, trailing zeros kept
+///   (`0.0000001` -> `1E-7`, `0.000000100` -> `1.00E-7`, `0.0000000` ->
+///   `0E-7`; #3212)
 /// - Scientific notation: normalize mantissa (`12e2` -> `1.2E+3`), uppercase E, explicit +
 /// - `e0`/`e-0`: eliminate the exponent entirely (`5.5e0` -> `5.5`)
 /// - Negative exponents >= -5: convert to decimal (`1e-3` -> `0.001`)
@@ -856,10 +845,9 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     // `log10`/`pow` on `value`, which on an infinite input produces garbage
     // (`log10(inf).floor() as i32` saturates to `i32::MAX`, and dividing by
     // `10^i32::MAX` yields `NaN`) rather than erroring - so it must be
-    // special-cased here, before that branch ever runs. Every existing
-    // caller already guards non-finite `NumberLiteral`s before reaching this
-    // function (see #930), so this exists purely to make the function
-    // correct for a caller that stops doing that.
+    // special-cased here, before that branch ever runs. `tostring` and the
+    // text formats reach it with a jq-mode overflowed literal (`1e400` ->
+    // `1E+400`, #3212), as does ordinary output.
     if !value.is_finite() {
         return format_overflow_literal_mantissa(s, exp_pos, value.is_sign_negative());
     }
@@ -7848,21 +7836,6 @@ mod tests {
         assert!(result.is_err(), "== should panic at MAX_VALUE_TREE_DEPTH");
     }
 
-    /// #2206: the fast-path predicate must agree with the formatter it
-    /// predicts, on every spelling either of them has an opinion about.
-    ///
-    /// `is_jq_canonical_number` restates part of
-    /// `format_number_jq_compat`'s rules so a writer can skip its
-    /// allocation. That is the "duplicated predicates diverge silently"
-    /// shape `CLAUDE.md` warns about (#106), and the divergence here would
-    /// be *silent wrong output* -- a number echoed verbatim that jq would
-    /// have reformatted. This asserts the exact contract the fast path
-    /// relies on: `true` implies the formatter is the identity.
-    ///
-    /// The reverse is deliberately not asserted. The predicate is allowed
-    /// to be conservative (say `false` where the formatter happens to be
-    /// the identity anyway); that only costs an allocation, never
-    /// correctness. Rows below marked `conservative` are exactly those.
     /// #3212: jq 1.7.1 renders a plain decimal with decNumber's
     /// to-scientific-string rule, so an adjusted exponent below -6 prints in
     /// scientific notation, trailing zeros kept. Every row captured from
@@ -7895,6 +7868,21 @@ mod tests {
         assert_eq!(format_number_jq_compat(long.as_bytes()), "1E-200001");
     }
 
+    /// #2206: the fast-path predicate must agree with the formatter it
+    /// predicts, on every spelling either of them has an opinion about.
+    ///
+    /// `is_jq_canonical_number` restates part of
+    /// `format_number_jq_compat`'s rules so a writer can skip its
+    /// allocation. That is the "duplicated predicates diverge silently"
+    /// shape `CLAUDE.md` warns about (#106), and the divergence here would
+    /// be *silent wrong output* -- a number echoed verbatim that jq would
+    /// have reformatted. This asserts the exact contract the fast path
+    /// relies on: `true` implies the formatter is the identity.
+    ///
+    /// The reverse is deliberately not asserted. The predicate is allowed
+    /// to be conservative (say `false` where the formatter happens to be
+    /// the identity anyway); that only costs an allocation, never
+    /// correctness. Rows below marked `conservative` are exactly those.
     #[test]
     fn is_jq_canonical_number_agrees_with_the_formatter_2206() {
         let corpus = [

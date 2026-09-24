@@ -43506,11 +43506,13 @@ fn test_getpath_cursor_walk_matches_jq_2168() -> Result<()> {
 /// written form is deliberate (`DocumentValue::number_literal`, #387/#966),
 /// so the round trip was the odd one out, not `.big`.
 ///
-/// jq 1.7.1 prints `1E-301` for **both** spellings, and since #3212 so does
-/// succinctly: a preserved literal renders with decNumber's notation rule.
+/// jq 1.7.1 printed `1E-301` for both of that literal's spellings, which
+/// since #3212 succinctly does too -- so a `0.000...1` literal no longer
+/// tells the routes apart. This uses a literal jq keeps plain instead,
+/// `1.` + 300 zeros + `1`, whose 303 characters any re-spelling would lose.
 #[test]
 fn test_getpath_keeps_a_document_numbers_spelling_2168() -> Result<()> {
-    let long_literal = "0.".to_string() + &"0".repeat(300) + "1";
+    let long_literal = "1.".to_string() + &"0".repeat(300) + "1";
     let doc = format!(r#"{{"a":1,"big":{long_literal}}}"#);
 
     let (via_getpath, _, code) = run_jq_stdin_streams(r#"getpath(["big"])"#, &doc, &["-c"])?;
@@ -43523,10 +43525,9 @@ fn test_getpath_keeps_a_document_numbers_spelling_2168() -> Result<()> {
     );
     assert_eq!(
         via_getpath.trim(),
-        "1E-301",
-        "jq's decNumber spelling (#3212)"
+        long_literal,
+        "the source spelling, as jq prints it"
     );
-    assert_eq!(long_literal.len(), 303);
 
     // The short sibling in the same document is unaffected either way.
     let (stdout, _, code) = run_jq_stdin_streams(r#"getpath(["a"])"#, &doc, &["-c"])?;

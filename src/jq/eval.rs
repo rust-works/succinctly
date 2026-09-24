@@ -15721,10 +15721,11 @@ pub(crate) fn numeric_display_string<S: EvalSemantics>(value: &OwnedValue) -> St
 /// `infinite | tostring` -> `"1.7976931348623157e+308"`, `-infinite |
 /// tostring` -> `"-1.7976931348623157e+308"`).
 ///
-/// See `numeric_display_string`'s own doc comment (`src/jq/eval.rs`, not
-/// doc-linkable from here since it's `pub(crate)`) for the
-/// "document-sourced vs computed" caveat this doesn't attempt to resolve,
-/// and issue #1083 for the gap that leaves open.
+/// Only a *computed* non-finite value reaches this in jq mode: a jq-mode
+/// overflowed document literal keeps its spelling instead (#3212). See
+/// `numeric_display_string`'s own doc comment (`src/jq/eval.rs`, not
+/// doc-linkable from here since it's `pub(crate)`) for the yq-side
+/// "document-sourced vs computed" caveat this doesn't attempt to resolve.
 ///
 /// `pub`, not `pub(crate)`: `src/bin/succinctly/yq_runner.rs` is a separate
 /// binary crate depending on this one as an external dependency, and is one
