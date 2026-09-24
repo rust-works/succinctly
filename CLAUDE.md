@@ -450,22 +450,59 @@ for the full list.
 
 ## Feature Flags
 
-| Feature             | Description                               |
-|---------------------|-------------------------------------------|
-| `std`               | Standard library (default, CPU detection) |
-| `simd`              | Explicit SIMD intrinsics                  |
-| `portable-popcount` | Portable bitwise popcount                 |
-| `serde`             | Serde serialize/deserialize support       |
-| `regex`             | Regex builtins in jq (included in `cli`)  |
-| `cli`               | CLI tool (jq, yq, locate, generators)     |
-| `bench-runner`      | Unified benchmark runner (bench list/run) |
-| `large-tests`       | 1GB bitvector tests                       |
-| `huge-tests`        | 5GB bitvector tests                       |
-| `mmap-tests`        | Memory-mapped bitvector tests             |
-| `broadword-yaml`    | Portable broadword (SWAR) YAML on ARM64   |
-| `scalar-yaml`       | Pure scalar YAML parsing (no SIMD)        |
-| `unshared-containers`| Measurement-only: the #3000 layout (boxed map, inline array `Vec`) instead of `Rc` containers (#2999 A/B holdout; never ship) |
-| `share-stats`       | Record every copy-on-write that copied, with its call site (#2999 clone audit) |
+| Feature               | Description                                                                                                               |
+|-----------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `std`                 | Standard library (default, CPU detection)                                                                                 |
+| `simd`                | Explicit SIMD intrinsics                                                                                                  |
+| `portable-popcount`   | Non-additive: replaces intrinsic popcount with the portable bitwise one                                                   |
+| `serde`               | Serde serialize/deserialize support                                                                                       |
+| `regex`               | Regex builtins in jq (included in `cli`)                                                                                  |
+| `cli`                 | CLI tool (jq, yq, locate, generators)                                                                                     |
+| `bench-runner`        | Unified benchmark runner (bench list/run)                                                                                 |
+| `large-tests`         | 1GB bitvector tests                                                                                                       |
+| `huge-tests`          | 5GB bitvector tests                                                                                                       |
+| `mmap-tests`          | Memory-mapped bitvector tests                                                                                             |
+| `broadword-yaml`      | Non-additive: replaces NEON YAML scanning with broadword (SWAR) on ARM64                                                  |
+| `scalar-yaml`         | Non-additive: disables all SIMD/broadword YAML parsing                                                                    |
+| `select-stats`        | Non-additive: adds a counter to five hot `select` scan loops (#40 measurement; never for timing runs)                     |
+| `unshared-containers` | Non-additive: the #3000 layout (boxed map, inline array `Vec`) instead of `Rc` containers (#2999 A/B holdout; never ship) |
+| `share-stats`         | Record every copy-on-write that copied, with its call site (#2999 clone audit)                                            |
+
+### `--all-features` is not a superset build (#3006)
+
+Five features above are marked **non-additive**: enabling one *replaces* the
+default with a slower or measurement-only build rather than adding behavior
+on top of it. `cargo build --all-features` turns on all five at once
+(`share-stats` is additive — instrumentation only, no default behavior
+replaced — and not part of this set), so an `--all-features` binary is a
+strictly slower, non-shipping build with no diagnostic that it's non-default.
+This has already bitten twice:
+
+- **Clippy's blind spot, twice over**: `--all-features` enables `scalar-yaml`,
+  which compiles out every YAML SIMD backend (`src/yaml/simd/{x86,neon,broadword}.rs`)
+  entirely, *and* `portable-popcount`, which together with `simd` also
+  un-gates the AVX-512 popcount path (`src/bits/popcount.rs`) the same way —
+  so `cargo clippy --all-targets --all-features` never lints either (#185,
+  #388). CI's x86_64 `Clippy` job therefore runs *twice* — once with
+  `--all-features`, once with `--features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests`
+  (excludes both `scalar-yaml` and `portable-popcount`, so both real paths
+  compile in) — and the ARM64 leg runs a *third* time on top of that with
+  `broadword-yaml` added (the YAML backend selectors are cfg-exclusive, so
+  no single build reaches neon/broadword/scalar at once; see
+  `.github/workflows/ci.yml`'s own comment above the `clippy-all-variants`
+  matrix entry for the exact commands). When validating clippy locally for
+  any change touching `src/yaml/simd/*.rs` or `src/bits/popcount.rs`, run
+  every invocation ci.yml runs for your architecture, not just
+  `--all-features`.
+- **Pins gated out of the most-run build**: an exact-size or exact-behaviour
+  pin describing the *shipped* shape has to be `#[cfg(not(feature = "…"))]`-gated
+  so `cargo test --all-features` stays green, which makes the pin silently
+  absent in exactly the build most likely to be run to "check everything."
+
+If you're deciding what `cargo test`/`cargo clippy` invocation "covers
+everything": it's the CI legs matching the **default** feature set
+(`cli,simd,regex,serde` for tests) plus the non-`--all-features` clippy
+invocation(s) above, not `--all-features`.
 
 ## Testing Strategy
 
