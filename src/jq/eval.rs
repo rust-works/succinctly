@@ -37989,8 +37989,10 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     &mut |walked, bind| {
                         let bound_update = bind.apply(update, WalkOrigins::Keep);
                         let bound_extract = extract.map(|ext| bind.apply(ext, WalkOrigins::Keep));
-                        // #2031: see `resolve_reduce`'s identical per-step register
-                        // override.
+                        // #2031: this step's own register -- where the pattern walk
+                        // left it, else the register-derived element's own position,
+                        // else the fold's persistent `reg`. `resolve_reduce` has no
+                        // counterpart: it never seeds a per-step register.
                         let (active_reg, active_at_register) = if let Some(walked_reg) = &walked {
                             let step_reg = FoldRegister {
                                 path: Rc::clone(&walked_reg.path),
