@@ -4958,11 +4958,15 @@ $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints 2
 ```
 
 Verified by `scripts/jq-seq-oracle-sweep.py`, which compares stderr, stdout and exit code
-jointly: **0 stderr mismatches and 0 stdout supersets** over 4,068 generated streams per
-seed (one separately-filed, pre-existing bug can still surface at low probability --
-[#3195](https://github.com/rust-works/succinctly/issues/3195), `value_ranges` misreading a
-substituted U+FFFD as a malformed BOM when invalid UTF-8 opens the document; unrelated to
-anything on this page, since it never touches the `--seq` reader's own control flow at all).
+jointly: **0 stderr mismatches and 0 stdout supersets** over 4,083 generated streams per
+seed.
+
+The randomized corpus doesn't generate invalid UTF-8 outside a string, and there one stdout
+gap remains. succinctly finds values by walking the stream after UTF-8 substitution, and
+outside a string jq's short-tail rule can fold an invalid lead byte *and* the RS or
+whitespace after it into one U+FFFD. The value after the lost boundary is then dropped:
+`printf '\xe0\x1e"a"\n' | jq --seq -c .` prints `"a"`, and succinctly prints nothing
+([#3247](https://github.com/rust-works/succinctly/issues/3247)). stderr still matches.
 
 One `--seq` divergence remains, an artifact of jq's 4096-byte `fgets` *line reader* rather
 than its parser, and unreachable from a newline-free chunk:
@@ -5078,11 +5082,10 @@ filter suppresses it entirely, and `input`/`inputs` in the filter turn it into a
 error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5; `try input catch
 .` yields the message). None of that is modeled: `--seq` never queues a trailing parse error
 the way a plain JSON stream does (#2961), and the warning is always printed up front —
-[#3201](https://github.com/rust-works/succinctly/issues/3201). Two further malformed-BOM
-gaps the same probing surfaced are pre-existing and separate: the pre-RS record's *value*
-is dropped ([#3199](https://github.com/rust-works/succinctly/issues/3199)), and jq's
-per-refill `parser_reset` is modeled at newlines only, not at the 4095-byte `fgets`
-boundary ([#3200](https://github.com/rust-works/succinctly/issues/3200)).
+[#3201](https://github.com/rust-works/succinctly/issues/3201). One further malformed-BOM
+gap the same probing surfaced is pre-existing and separate: jq's per-refill `parser_reset`
+is modeled at newlines only, not at the 4095-byte `fgets` boundary
+([#3200](https://github.com/rust-works/succinctly/issues/3200)).
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
@@ -5095,10 +5098,14 @@ $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level num
                                           # -- not the abandoned-text template, despite no RS byte anywhere
 ```
 
-`succinctly jq` reproduces the stderr side of this exactly. The stdout side does not yet
-match: the pre-RS `1` jq reads is never emitted (`printf '\xef\xbb1 2' | succinctly jq
---seq -c .` prints nothing, jq prints `1`) —
-[#3199](https://github.com/rust-works/succinctly/issues/3199).
+`succinctly jq` reproduces this on both stderr and stdout, including the pre-RS `1` jq
+reads, except where invalid UTF-8 after the prefix hits the
+[#3247](https://github.com/rust-works/succinctly/issues/3247) gap above. The value walk takes its BOM verdict from the raw bytes, and the swallowed prefix is
+removed before UTF-8 substitution. The substituted stream can't answer either question:
+a raw `\xef\xbb` is itself invalid UTF-8 and becomes a U+FFFD of a different width
+([#3199](https://github.com/rust-works/succinctly/issues/3199)), and a U+FFFD substituted
+for any invalid lead byte starts with `EF BF`, which reads as a malformed BOM of its own
+([#3195](https://github.com/rust-works/succinctly/issues/3195)).
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
 materializes `--seq` input before evaluating, so all warnings precede all values. jq's

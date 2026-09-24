@@ -7638,7 +7638,8 @@ fn test_seq_warning_columns_count_raw_bytes_1723() -> Result<()> {
 /// `bom_malformed` filter, never #1525's "no RS byte" one. Exercised only
 /// by `scripts/jq-seq-oracle-sweep.py`'s `HAND` corpus until now; pinned
 /// here so a regression in that filter fails CI rather than only a manual
-/// sweep. Captured from `/usr/bin/jq` 1.7.1.
+/// sweep. Captured from `/usr/bin/jq` 1.7.1. The pre-RS `1` jq reads is
+/// printed too (#3199): this test used to pin empty stdout.
 #[test]
 fn test_seq_malformed_bom_with_no_rs_byte_warns_1723() -> Result<()> {
     for input in [&b"\xef\xbb1 2"[..], b"\xef1 2"] {
@@ -7649,7 +7650,74 @@ fn test_seq_malformed_bom_with_no_rs_byte_warns_1723() -> Result<()> {
             "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 1, column 3\n",
             "input {input:?}"
         );
-        assert_eq!(output.stdout, b"", "input {input:?}");
+        assert_eq!(output.stdout, b"\x1e1\n", "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #3195/#3199: the value walk runs over the UTF-8-substituted stream, but
+/// its BOM verdict has to come from the raw bytes. An invalid lead byte
+/// substitutes to U+FFFD (`EF BF BD`), which reads as a malformed BOM of
+/// its own, so `\xe0\x1e"0` fabricated a `0` from inside an unterminated
+/// string (#3195). A raw malformed prefix is itself invalid UTF-8 and
+/// substitutes to a U+FFFD of a different width, so the walk lost the
+/// pre-RS value jq reads (#3199). Every row captured from `/usr/bin/jq`
+/// 1.7.1, stdout only (stderr already matched and is pinned elsewhere).
+#[test]
+fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
+    for (input, plain, slurp) in [
+        (&b"\xe0\x1e\"0\n"[..], &b""[..], &b"\x1e[]\n"[..]),
+        (b"\xef\x1e\"0\n", b"", b"\x1e[]\n"),
+        (b"\xef\xbb1 ", b"\x1e1\n", b"\x1e[1]\n"),
+        (b"\xef\xbb1{", b"\x1e1\n", b"\x1e[1]\n"),
+        (b"\xef\xbb\"a\" 2", b"\x1e\"a\"\n", b"\x1e[\"a\"]\n"),
+        (
+            b"\xef\xbb{\"a\":1} 3",
+            b"\x1e{\"a\":1}\n",
+            b"\x1e[{\"a\":1}]\n",
+        ),
+        // Controls that already matched: a complete BOM, and an invalid
+        // lead byte *before* the first RS with a real record after it.
+        (b"\xef\xbb\xbf\x1e1\n", b"\x1e1\n", b"\x1e[1]\n"),
+        (b"\x80\x1e1\n", b"\x1e1\n", b"\x1e[1]\n"),
+    ] {
+        for (args, expected) in [
+            (&["--seq", "-c", "."][..], plain),
+            (&["--seq", "-s", "-c", "."][..], slurp),
+        ] {
+            let (output, code) = spawn_jq(args, Some(input))?;
+            assert_eq!(code, 0, "input {input:?} {args:?}");
+            assert_eq!(
+                output.stdout,
+                expected,
+                "input {input:?} {args:?}: got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #3195/#3199: a BOM prefix split across two files is swallowed whole, as
+/// jq's reader treats the file list as one stream. Captured from
+/// `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_seq_bom_prefix_split_across_files_3195() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for (first, second, expected) in [
+        (&b"\xef"[..], &b"\xbb1 2"[..], &b"\x1e1\n"[..]),
+        (b"\xef\xbb", b"\xbf\x1e1\n", b"\x1e1\n"),
+    ] {
+        let a = dir.path().join("a.json");
+        let b = dir.path().join("b.json");
+        std::fs::write(&a, first)?;
+        std::fs::write(&b, second)?;
+        let (output, code) = spawn_jq(
+            &["--seq", "-c", ".", a.to_str().unwrap(), b.to_str().unwrap()],
+            None,
+        )?;
+        assert_eq!(code, 0, "{first:?} + {second:?}");
+        assert_eq!(output.stdout, expected, "{first:?} + {second:?}");
     }
     Ok(())
 }

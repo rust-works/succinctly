@@ -146,7 +146,7 @@ fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> u
 /// eaten even though it never completes one. Those bytes never reach the
 /// scanner, so they never advance a column either -- getting this wrong
 /// shifts every position in the stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BomPrefix {
     /// Bytes jq swallowed before parsing began.
     consumed: usize,
@@ -159,18 +159,18 @@ pub(crate) struct BomPrefix {
     pub(crate) malformed: bool,
 }
 
-pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
-    bom_prefix_from(raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()))
+#[cfg(test)]
+impl BomPrefix {
+    /// No BOM at all: nothing consumed, nothing malformed.
+    pub(crate) const NONE: Self = Self {
+        consumed: 0,
+        malformed: false,
+    };
 }
 
-/// Same rule as [`bom_prefix`], but scanning any byte iterator directly --
-/// so a single already-owned buffer (like `value_ranges`'s) never needs to
-/// be wrapped in a fresh `Vec` just to match [`bom_prefix`]'s multi-source
-/// signature. Only ever reads at most `UTF8_BOM.len() + 1` bytes before
-/// returning, so callers may pass an iterator over arbitrarily large input.
-fn bom_prefix_from(bytes: impl Iterator<Item = u8>) -> BomPrefix {
+pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
     let mut consumed = 0;
-    for byte in bytes {
+    for byte in raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()) {
         if consumed == UTF8_BOM.len() || byte != UTF8_BOM[consumed] {
             // A mismatch at offset 0 just means "no BOM here"; one after a
             // partial match is the malformed case. Running out of input
@@ -185,6 +185,54 @@ fn bom_prefix_from(bytes: impl Iterator<Item = u8>) -> BomPrefix {
     BomPrefix {
         consumed,
         malformed: false,
+    }
+}
+
+/// Readies `raw_bytes` for [`value_ranges`], which runs over the stream
+/// *after* the UTF-8 substitution `get_inputs` applies, and returns the
+/// [`BomPrefix`] that walk should apply to it. `bom` is [`bom_prefix`] of
+/// these same raw bytes.
+///
+/// The verdict has to come from the raw bytes, because substitution
+/// rewrites exactly the bytes a BOM prefix is made of (#3195/#3199). An
+/// invalid lead byte becomes U+FFFD, `EF BF BD`, which itself reads as a
+/// malformed BOM prefix: `\xe0\x1e"0` flipped the value walk into
+/// malformed-BOM mode and read the string's `0` as a value. And a raw
+/// malformed prefix is itself invalid UTF-8, replaced by a U+FFFD of a
+/// different width: `\xef\xbb1 2` became `EF BF BD 1 2`, the walk swallowed
+/// only the `EF`, and `BF BD 1` read as one junk token, losing jq's `1`.
+/// Outside a string a short segment can even collapse into a single U+FFFD
+/// and drop the byte after it (`\xef1 2`), so no offset mapping could
+/// recover the prefix's end.
+///
+/// So a malformed prefix, or one split across sources (each fragment
+/// invalid on its own), is removed here, before substituting, and the walk
+/// skips nothing. A complete BOM inside one source is valid UTF-8 and
+/// survives substitution byte for byte, so it stays and the walk skips it,
+/// which spares a large BOM-prefixed file a whole-buffer copy.
+pub(crate) fn value_walk_bom(
+    raw_bytes: &mut [(Option<usize>, Vec<u8>)],
+    bom: BomPrefix,
+) -> BomPrefix {
+    let intact = raw_bytes
+        .iter()
+        .find(|(_, raw)| !raw.is_empty())
+        .map_or(true, |(_, raw)| raw.len() >= bom.consumed);
+    if !bom.malformed && intact {
+        return bom;
+    }
+    let mut left = bom.consumed;
+    for (_, raw) in raw_bytes.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let n = left.min(raw.len());
+        raw.drain(..n);
+        left -= n;
+    }
+    BomPrefix {
+        consumed: 0,
+        malformed: bom.malformed,
     }
 }
 
@@ -415,12 +463,16 @@ pub(crate) struct SeqWarningWalk {
     /// that function's caller has them), so it cannot derive this rule
     /// itself: the drop point is a property of jq's raw `fgets` chunking,
     /// not of the JSON content. Capping by *value count* rather than by
-    /// byte offset sidesteps that entirely -- the two walks scan the same
-    /// structural bytes (RS, whitespace, `{}[]:,"`) in the same order,
-    /// since UTF-8 substitution only ever replaces genuinely invalid
-    /// multi-byte sequences and never touches, removes, or introduces an
-    /// ASCII byte, so they agree on how many values exist and in what
-    /// order even though a byte *offset* can shift between them.
+    /// byte offset sidesteps the offset shift -- the two walks scan the same
+    /// structural bytes (RS, whitespace, `{}[]:,"`) in the same order, so
+    /// they agree on how many values exist and in what order.
+    ///
+    /// That agreement has two known exceptions. The BOM prefix is one:
+    /// substitution rewrites it, so [`value_walk_bom`] hands the value walk
+    /// the raw bytes' verdict instead (#3195/#3199). The other is still
+    /// open: outside a string, jq's short-tail rule can collapse an invalid
+    /// lead byte *and* the RS or whitespace after it into one U+FFFD, so
+    /// the substituted walk loses a boundary the raw one sees (#3247).
     pub(crate) value_cap: Option<usize>,
 }
 
@@ -428,6 +480,9 @@ pub(crate) struct SeqWarningWalk {
 /// Ranges are into `bytes`, which must be the same UTF-8-normalized stream
 /// later handed to the materializer.  Diagnostics use the original bytes at
 /// their separate call site, so invalid UTF-8 retains jq's raw-byte columns.
+///
+/// `bom` is [`value_walk_bom`]'s answer for the raw bytes `bytes` was
+/// substituted from; the substituted stream cannot be asked (#3195/#3199).
 ///
 /// `boundaries` are the absolute offsets into `bytes` at which each source
 /// after the first begins -- the cumulative lengths `build_seq_values`
@@ -446,10 +501,10 @@ pub(crate) struct SeqWarningWalk {
 /// function exactly as before the drop rule existed.
 pub(crate) fn value_ranges(
     bytes: &[u8],
+    bom: BomPrefix,
     boundaries: &[usize],
     value_cap: Option<usize>,
 ) -> Vec<(usize, usize)> {
-    let bom = bom_prefix_from(bytes.iter().copied());
     let mut ignore = |_: &str| {};
     let mut reader = Reader::new(bom, &mut ignore);
     reader.run(
@@ -1298,11 +1353,16 @@ mod tests {
     /// letting this test stay at the byte level rather than routing
     /// through UTF-8 substitution too).
     fn seq_value_texts(input: &[u8], slurp: bool) -> Vec<String> {
-        let owned = vec![(None, input.to_vec())];
+        let mut owned = vec![(None, input.to_vec())];
         let cap = for_each_warning(&owned, slurp, &mut |_| {}).value_cap;
-        value_ranges(input, &[], cap)
+        let bom = {
+            let raw = bom_prefix(&owned);
+            value_walk_bom(&mut owned, raw)
+        };
+        let stream = &owned[0].1;
+        value_ranges(stream, bom, &[], cap)
             .into_iter()
-            .map(|(start, end)| String::from_utf8(input[start..end].to_vec()).unwrap())
+            .map(|(start, end)| String::from_utf8(stream[start..end].to_vec()).unwrap())
             .collect()
     }
 
@@ -1311,13 +1371,22 @@ mod tests {
     /// a comma instead causes the same scan call to fail, so it is discarded.
     #[test]
     fn value_ranges_follow_jq_recovery_2653() {
-        assert_eq!(value_ranges(b"\x1e1 {invalid\n", &[], None), vec![(1, 2)]);
-        assert_eq!(value_ranges(b"\x1e1,2\n", &[], None), vec![(3, 4)]);
         assert_eq!(
-            value_ranges(b"\x1e1-2\n", &[], None),
+            value_ranges(b"\x1e1 {invalid\n", BomPrefix::NONE, &[], None),
+            vec![(1, 2)]
+        );
+        assert_eq!(
+            value_ranges(b"\x1e1,2\n", BomPrefix::NONE, &[], None),
+            vec![(3, 4)]
+        );
+        assert_eq!(
+            value_ranges(b"\x1e1-2\n", BomPrefix::NONE, &[], None),
             Vec::<(usize, usize)>::new()
         );
-        assert_eq!(value_ranges(b"\x1e5-3 7\n", &[], None), vec![(5, 6)]);
+        assert_eq!(
+            value_ranges(b"\x1e5-3 7\n", BomPrefix::NONE, &[], None),
+            vec![(5, 6)]
+        );
     }
 
     /// Real jq's non-slurp `--seq` driver can end the *entire* stream
@@ -1558,7 +1627,7 @@ mod tests {
         assert_eq!(cap, None, "a's own drop is masked by joining with b");
         let combined: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
         assert_eq!(
-            value_ranges(&combined, &[a.len()], cap)
+            value_ranges(&combined, BomPrefix::NONE, &[a.len()], cap)
                 .into_iter()
                 .map(|(s, e)| String::from_utf8(combined[s..e].to_vec()).unwrap())
                 .collect::<Vec<_>>(),
@@ -1938,16 +2007,90 @@ mod tests {
     /// then `1 ` yields `[1]` in real jq and nothing in one buffer.
     #[test]
     fn malformed_bom_value_walk_resets_at_source_boundaries_3002() {
-        let a = b"\xef\xbf".to_vec();
-        let b = b"1 \n".to_vec();
-        let mut combined = a.clone();
-        combined.extend_from_slice(&b);
+        // Stripped as production strips it: jq swallows the `EF`, and the
+        // dangling `BF` is left for the walk.
+        let mut sources = vec![(None, b"\xef\xbf".to_vec()), (None, b"1 \n".to_vec())];
+        let bom = {
+            let raw = bom_prefix(&sources);
+            value_walk_bom(&mut sources, raw)
+        };
+        assert_eq!(
+            bom,
+            BomPrefix {
+                consumed: 0,
+                malformed: true
+            }
+        );
+        let a = &sources[0].1;
+        let combined: Vec<u8> = a.iter().chain(&sources[1].1).copied().collect();
         // Source `a`'s exclusive end is the boundary (`b` starts there).
-        assert_eq!(value_ranges(&combined, &[a.len()], None), vec![(2, 3)]);
+        assert_eq!(value_ranges(&combined, bom, &[a.len()], None), vec![(1, 2)]);
         // Same bytes in one buffer: `BF` derails and the record is dropped.
         assert_eq!(
-            value_ranges(&combined, &[], None),
+            value_ranges(&combined, bom, &[], None),
             Vec::<(usize, usize)>::new()
+        );
+    }
+
+    /// #3195/#3199: `value_walk_bom` keeps the raw verdict, removes a
+    /// malformed or source-straddling prefix before substitution would
+    /// rewrite it, and leaves an intact complete BOM for the walk to skip.
+    #[test]
+    fn value_walk_bom_takes_the_raw_prefix_and_verdict_3195_3199() {
+        fn prepare(sources: &[&[u8]]) -> (BomPrefix, Vec<Vec<u8>>) {
+            let mut owned: Vec<(Option<usize>, Vec<u8>)> =
+                sources.iter().map(|s| (None, s.to_vec())).collect();
+            let bom = {
+                let raw = bom_prefix(&owned);
+                value_walk_bom(&mut owned, raw)
+            };
+            (bom, owned.into_iter().map(|(_, b)| b).collect())
+        }
+        let stripped = BomPrefix {
+            consumed: 0,
+            malformed: true,
+        };
+        assert_eq!(
+            prepare(&[b"\xef\xbb1 2"]),
+            (stripped, vec![b"1 2".to_vec()])
+        );
+        assert_eq!(prepare(&[b"\xef1 2"]), (stripped, vec![b"1 2".to_vec()]));
+        // A complete BOM in one source stays, for the walk to skip.
+        assert_eq!(
+            prepare(&[b"\xef\xbb\xbf\x1e1"]),
+            (
+                BomPrefix {
+                    consumed: 3,
+                    malformed: false
+                },
+                vec![b"\xef\xbb\xbf\x1e1".to_vec()]
+            )
+        );
+        // An invalid lead byte that is not a BOM prefix stays, unflagged.
+        assert_eq!(
+            prepare(&[b"\xe0\x1e\"0"]),
+            (BomPrefix::NONE, vec![b"\xe0\x1e\"0".to_vec()])
+        );
+        // Split across sources, including an empty one in between: removed,
+        // since each fragment alone would substitute to a U+FFFD.
+        assert_eq!(
+            prepare(&[b"\xef", b"", b"\xbb1"]),
+            (stripped, vec![vec![], vec![], b"1".to_vec()])
+        );
+        assert_eq!(
+            prepare(&[b"\xef\xbb", b"\xbf\x1e1"]),
+            (BomPrefix::NONE, vec![vec![], b"\x1e1".to_vec()])
+        );
+        // A complete BOM after an empty leading source is still intact.
+        assert_eq!(
+            prepare(&[b"", b"\xef\xbb\xbf1"]),
+            (
+                BomPrefix {
+                    consumed: 3,
+                    malformed: false
+                },
+                vec![vec![], b"\xef\xbb\xbf1".to_vec()]
+            )
         );
     }
 

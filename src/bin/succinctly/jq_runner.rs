@@ -4400,7 +4400,7 @@ fn get_inputs(
     // rather than through `read_to_string`, which refused the whole input on
     // a stray byte and reported it as a *read* failure when the read had in
     // fact succeeded (#1247).
-    let raw_bytes: Vec<(Option<usize>, Vec<u8>)> = if files.is_empty() {
+    let mut raw_bytes: Vec<(Option<usize>, Vec<u8>)> = if files.is_empty() {
         match read_stdin_bytes() {
             Ok(b) => vec![(None, b)],
             Err(e) => return Ok(Err(e)),
@@ -4468,14 +4468,16 @@ fn get_inputs(
     // predicates diverge silently").
     let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
     let seq_warnings_apply = seq_stream_shape && !args.null_input;
+    // jq's BOM verdict on the raw bytes, read by the warning gate below and
+    // by the value walk's preparation after it (#3195/#3199).
+    let seq_bom = crate::jq_seq_reader::bom_prefix(&raw_bytes);
     if seq_warnings_apply {
         // A *malformed* BOM is the one case where "no RS byte anywhere"
         // does not imply #1525's template: it costs jq a `parser_reset`
         // that leaves the parser reading rather than waiting for an RS, so
         // the reader owns that case too (#1723).
-        let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
         seq_slurp_position_lost =
-            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
+            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !seq_bom.malformed) {
                 Some(warning) => {
                     eprintln!("{warning}");
                     // #1525's arm prints its own template instead of the
@@ -4523,6 +4525,17 @@ fn get_inputs(
         } else {
             crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
         }
+    };
+
+    // The value walk runs after the substitution below, which can rewrite
+    // the BOM prefix, so it gets the raw verdict and, where substitution
+    // would mangle it, a stream with the prefix already removed
+    // (`jq_seq_reader::value_walk_bom`, #3195/#3199). Every raw-byte walk
+    // above has already run.
+    let seq_bom = if seq_stream_shape {
+        crate::jq_seq_reader::value_walk_bom(&mut raw_bytes, seq_bom)
+    } else {
+        seq_bom
     };
 
     // All reads happen first, then decoding: a later file's read error still
@@ -4688,7 +4701,13 @@ fn get_inputs(
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
     if seq_stream_shape {
-        values = build_seq_values(&raw_inputs, &mut locations, args.slurp, seq_value_cap);
+        values = build_seq_values(
+            &raw_inputs,
+            seq_bom,
+            &mut locations,
+            args.slurp,
+            seq_value_cap,
+        );
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
@@ -5718,6 +5737,9 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// backtracks to a file already passed.
 fn build_seq_values(
     raw_inputs: &[(Option<usize>, String)],
+    // `jq_seq_reader::value_walk_bom`'s answer for the raw bytes
+    // `raw_inputs` was decoded from (#3195/#3199).
+    bom: crate::jq_seq_reader::BomPrefix,
     locations: &mut InputLocations,
     slurp: bool,
     // #2998: `Some(n)` when the caller's own raw-byte walk found real jq's
@@ -5734,6 +5756,7 @@ fn build_seq_values(
     // (#3002). The last entry is the stream's own end, not a boundary.
     let parsed = parse_json_seq_with_ends(
         &combined,
+        bom,
         &file_ends[..file_ends.len().saturating_sub(1)],
         value_cap,
     );
@@ -5964,10 +5987,11 @@ fn remap_ends_to_locations(
 /// spelling nit.
 fn parse_json_seq_with_ends(
     s: &str,
+    bom: crate::jq_seq_reader::BomPrefix,
     boundaries: &[usize],
     value_cap: Option<usize>,
 ) -> Vec<(OwnedValue, usize)> {
-    crate::jq_seq_reader::value_ranges(s.as_bytes(), boundaries, value_cap)
+    crate::jq_seq_reader::value_ranges(s.as_bytes(), bom, boundaries, value_cap)
         .into_iter()
         .filter_map(|(start, end)| {
             // #2295: the sequence reader already checks the grammar, but
@@ -9411,10 +9435,15 @@ mod tests {
     /// of accepting it the way real jq does.
     #[test]
     fn test_parse_json_seq_tolerates_leading_zero_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E007e5\n", &[], None)
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect();
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
+            "\x1E007e5\n",
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &[],
+            None,
+        )
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "7E+5");
     }
@@ -9424,10 +9453,15 @@ mod tests {
     /// leading-zero retry.
     #[test]
     fn test_parse_json_seq_still_drops_genuine_malformed_record_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E{invalid\n\x1E5\n", &[], None)
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect();
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
+            "\x1E{invalid\n\x1E5\n",
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &[],
+            None,
+        )
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "5");
     }
@@ -9440,10 +9474,15 @@ mod tests {
     /// primary document input already produces for it.
     #[test]
     fn test_parse_json_seq_accepts_magnitude_overflowing_number_1267() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E1e400\n", &[], None)
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect();
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
+            "\x1E1e400\n",
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &[],
+            None,
+        )
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "1E+400");
     }
@@ -9461,7 +9500,13 @@ mod tests {
         ];
         let mut locations =
             InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
-        let values = build_seq_values(&raw_inputs, &mut locations, false, None);
+        let values = build_seq_values(
+            &raw_inputs,
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &mut locations,
+            false,
+            None,
+        );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
@@ -9498,7 +9543,13 @@ mod tests {
         ];
         let mut locations =
             InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
-        let values = build_seq_values(&raw_inputs, &mut locations, false, None);
+        let values = build_seq_values(
+            &raw_inputs,
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &mut locations,
+            false,
+            None,
+        );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "2");
@@ -9525,7 +9576,13 @@ mod tests {
             Some("f2".to_string()),
             Some("f3".to_string()),
         ]);
-        let values = build_seq_values(&raw_inputs, &mut locations, false, None);
+        let values = build_seq_values(
+            &raw_inputs,
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &mut locations,
+            false,
+            None,
+        );
         assert_eq!(values.len(), 3);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
@@ -9539,7 +9596,13 @@ mod tests {
     fn test_build_seq_values_still_drops_genuinely_malformed_record_1571() {
         let raw_inputs = vec![(Some(0), "\x1E1\n\x1E{invalid\n\x1E3\n".to_string())];
         let mut locations = InputLocations::new(vec![Some("f1".to_string())]);
-        let values = build_seq_values(&raw_inputs, &mut locations, false, None);
+        let values = build_seq_values(
+            &raw_inputs,
+            crate::jq_seq_reader::BomPrefix::NONE,
+            &mut locations,
+            false,
+            None,
+        );
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "3");
