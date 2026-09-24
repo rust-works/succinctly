@@ -24470,6 +24470,62 @@ fn nested_arrays(depth: usize) -> String {
     format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
 }
 
+/// `{"a":{"a":...{"b":1}...}}`, `depth` levels of object nesting wrapping
+/// `{"b":1}` -- the jq-mode twin of `yq_cli_tests.rs`'s
+/// `test_key_past_a_seeded_deep_position_does_not_panic_3020` repro shape.
+fn nested_objects_with_b(depth: usize) -> String {
+    format!(
+        "{}{{\"b\":1}}{}",
+        "{\"a\":".repeat(depth),
+        "}".repeat(depth)
+    )
+}
+
+/// #3020, jq-mode twin of `yq_cli_tests.rs`'s
+/// `test_key_past_a_seeded_deep_position_does_not_panic_3020`: `..`'s own
+/// descent into a >256-deep document is an iterative worklist walk here
+/// (`select` after it forces the per-candidate sink route, `try_path_
+/// context_walk_sink`/`continue_pipe_element_generic`), not native
+/// recursion -- confirmed separately not to panic even at 2000 levels. Only
+/// `.b`'s single field step past that (deeply seeded) candidate used to
+/// panic, because `path_context_root` seeds the candidate's own trail with
+/// its full document ancestry and the guard counted that seeded depth as
+/// native recursion. Real jq answers `[["b"]]` regardless of depth.
+#[test]
+fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
+    let doc = nested_objects_with_b(300);
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"[.. | select(type=="object" and has("b")) | [.b | key]]"#,
+        ],
+        Some(&doc),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[["b"]]"#);
+    Ok(())
+}
+
+/// #3020 companion: a `..` walk with *no* rest-pipe stage after it (`key`
+/// evaluated inside the same walked portion, not through a re-seeded
+/// downstream candidate) genuinely does recurse natively once per document
+/// level via `path_context_step_recurse` -- confirmed by the panic site
+/// itself (`eval_generic.rs:18990`, that function's own entry guard, not
+/// `path_field_step_generic`'s). This must keep failing past the 256 limit;
+/// #3020's fix only stopped a *seeded* trail from being miscounted as
+/// native recursion, it did not raise or remove the recursion guard itself.
+#[test]
+fn test_recurse_only_walk_past_the_limit_still_fails_cleanly_3020() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.. | key]"], Some(&nested_arrays(300)))?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1016/#1371: `deep(60)` used to be refused -- static expansion could not
 /// observe that `n == 0` would eventually hold, so it unrolled until
 /// `MAX_FUNC_EXPANSION_DEPTH` (50) stopped it and reported "recursion depth

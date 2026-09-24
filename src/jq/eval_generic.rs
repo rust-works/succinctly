@@ -16645,15 +16645,21 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 ///
 /// `Clone` shares the trail (an `Rc` bump) for a step that keeps the position.
 trait StepTrail<V: DocumentValue>: Clone {
-    /// Components from the root to here; O(1).
-    fn trail_depth(&self) -> usize;
+    /// Steps taken by native recursion since this walk's own root; O(1) --
+    /// what [`assert_nesting_depth`] guards against a Rust stack overflow,
+    /// not the trail's distance from the *document* root (#3020). `PathTrail`
+    /// never starts anywhere but empty, so the two coincide for it; a
+    /// [`PathContextTrail`] can start already seeded with a nested input's
+    /// real ancestry (`path_context_root`), which contributes zero native
+    /// recursion frames of its own.
+    fn recursion_depth(&self) -> usize;
     /// The trail one `component` below this one, taken from `from` -- the
     /// node standing at `self`.
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self;
 }
 
 impl<V: DocumentValue> StepTrail<V> for Rc<PathTrail> {
-    fn trail_depth(&self) -> usize {
+    fn recursion_depth(&self) -> usize {
         self.depth()
     }
 
@@ -16696,8 +16702,16 @@ struct PathContextLink<V: DocumentValue> {
     parent: PathContextTrail<V>,
     step: PathContextStep<V>,
     /// Components from the root to here, inclusive: the same O(1) depth
-    /// [`PathTrail`] caches, for the same `assert_nesting_depth` guards.
+    /// [`PathTrail`] caches.
     depth: usize,
+    /// `depth` at the point this link's trail was seeded from a nested
+    /// input's real ancestry (#3020) -- 0 for a trail rooted at the document
+    /// root. A genuine navigation step (`extend_from`) inherits its parent's
+    /// value unchanged; only the initial climb itself (`from_climb`) sets a
+    /// link's own `seed` to its own `depth`, marking every link *in* the
+    /// seed. `depth - seed` is then exactly the native recursion frames
+    /// [`StepTrail::recursion_depth`] needs to guard.
+    seed: usize,
 }
 
 /// Links from the current position toward the root, including the visible
@@ -16774,13 +16788,15 @@ impl<V: DocumentValue> PathContextTrail<V> {
         debug_assert_eq!(path.len(), ancestors.len());
         // A shared seed needs a backing Vec and an Rc. At one or two levels
         // that cannot save allocations over one link per level, so keep the
-        // old representation for shallow nested roots.
+        // old representation for shallow nested roots. `seeded_link`, not
+        // `extend_from`: these links *are* the seed (#3020), unlike a real
+        // navigation step reached through the trait method during evaluation.
         if path.len() < PATH_CONTEXT_SEED_MIN_LEVELS {
             return path
                 .into_iter()
                 .zip(ancestors)
                 .fold(Self::Root, |trail, (component, from)| {
-                    trail.extend_from(component, &PathNode::At(from))
+                    trail.seeded_link(component, &PathNode::At(from))
                 });
         }
         let steps = path
@@ -16795,6 +16811,40 @@ impl<V: DocumentValue> PathContextTrail<V> {
         Self::Seed {
             steps: Rc::new(steps),
             visible_len,
+        }
+    }
+
+    /// One link below `self`, at an explicit `seed` -- shared by
+    /// [`seeded_link`](Self::seeded_link) and
+    /// [`extend_from`](StepTrail::extend_from), which differ only in what
+    /// they pass here (#3020 review: keeps the two `PathContextLink`
+    /// constructions from drifting out of sync on a future field).
+    fn link(&self, component: OwnedValue, from: &PathNode<V>, seed: usize) -> Self {
+        Self::Link(Rc::new(PathContextLink {
+            parent: self.clone(),
+            step: PathContextStep {
+                component,
+                from: from.clone(),
+            },
+            depth: self.depth() + 1,
+            seed,
+        }))
+    }
+
+    /// One link of the initial seed itself -- see `PathContextLink`'s own
+    /// `seed` field doc comment for why this passes a different `seed` than
+    /// [`extend_from`](StepTrail::extend_from) does.
+    fn seeded_link(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
+        self.link(component, from, self.depth() + 1)
+    }
+
+    /// `depth` at the point this trail was seeded from a nested input's real
+    /// ancestry (#3020) -- 0 for a trail rooted at the document root.
+    fn seed_depth(&self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Seed { visible_len, .. } => *visible_len,
+            Self::Link(link) => link.seed,
         }
     }
 
@@ -16875,19 +16925,12 @@ impl<V: DocumentValue> PathContextTrail<V> {
 }
 
 impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
-    fn trail_depth(&self) -> usize {
-        self.depth()
+    fn recursion_depth(&self) -> usize {
+        self.depth() - self.seed_depth()
     }
 
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        Self::Link(Rc::new(PathContextLink {
-            parent: self.clone(),
-            step: PathContextStep {
-                component,
-                from: from.clone(),
-            },
-            depth: self.depth() + 1,
-        }))
+        self.link(component, from, self.seed_depth())
     }
 }
 
@@ -17045,7 +17088,7 @@ fn path_field_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    assert_nesting_depth(path.trail_depth());
+    assert_nesting_depth(path.recursion_depth());
     let next = match node {
         PathNode::Absent => PathNode::Absent,
         PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"), // omni-dev: coverage tolerate-line reason="unreachable: both step dispatchers route owned nodes to path_step_owned before calling this cursor helper (#3022)"
@@ -17092,7 +17135,7 @@ fn path_index_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     node: &PathNode<V>,
     path: &T,
 ) -> Result<Option<(T, PathNode<V>)>, EvalError> {
-    assert_nesting_depth(path.trail_depth());
+    assert_nesting_depth(path.recursion_depth());
     let mut component = index_component_value(idx, key);
     let next = match node {
         PathNode::Absent => PathNode::Absent,
@@ -17149,7 +17192,7 @@ fn path_iterate_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>
     collapse_duplicate_keys: bool,
     emit: &mut dyn FnMut(T, PathNode<V>) -> Demand,
 ) -> Result<Demand, EvalError> {
-    assert_nesting_depth(path.trail_depth());
+    assert_nesting_depth(path.recursion_depth());
     match node {
         // #2346: real yq's `.[]` over any non-container -- including a
         // missing/null node here -- is a silent no-op (confirmed live
@@ -17317,7 +17360,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     out: &mut Vec<(T, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment (#2058 code review).
-    assert_nesting_depth(path.trail_depth());
+    assert_nesting_depth(path.recursion_depth());
     // spine 2416 (walk residue): a step from an owned value descends the
     // value itself, with the components the owned identity pipe would name.
     // Only the path-context walk produces such a node (`path()`'s own walk
@@ -17522,7 +17565,7 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue, T: StepTrail<V>>(
     // See `path_walk_generic`'s own doc comment -- like `path_walk_pipe_
     // generic`, this recurses into itself once per pipe stage (#2058 code
     // review).
-    assert_nesting_depth(path.trail_depth());
+    assert_nesting_depth(path.recursion_depth());
     let Some((first, rest)) = exprs.split_first() else {
         out.push((path.clone(), node.clone()));
         return Ok(());
@@ -18941,7 +18984,7 @@ fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
 ) -> Result<(), Control> {
-    assert_nesting_depth(pos.trail.depth());
+    assert_nesting_depth(pos.trail.recursion_depth());
     out.push(pos.clone());
     let mut children = Vec::new();
     path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
