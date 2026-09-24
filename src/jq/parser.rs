@@ -4041,16 +4041,26 @@ impl<'a> Parser<'a> {
         // #2085: record where this call's identifier actually started, so an
         // unresolved-call diagnostic can cite the call rather than text-search
         // for the name and find an unrelated same-spelling occurrence.
-        self.call_sites.push(CallSite {
-            name: name.clone(),
-            arity: args.len(),
-            offset: start_pos,
-        });
+        self.record_call_site(name.clone(), args.len(), start_pos);
         Ok(Expr::FuncCall {
             name,
             args,
             builtin_fallback: None,
         })
+    }
+
+    /// Record one call's identifier position for an unresolved-call
+    /// diagnostic (#2085) to cite later, rather than falling back to a text
+    /// search that could match an unrelated same-spelling occurrence. `name`
+    /// is the diagnostic's own spelling -- a plain call's bare name, or
+    /// (#3010) a namespaced call's joined `namespace::name` form, matching
+    /// `rewrite_namespaced_calls`'s (`jq_runner.rs`) join for the same call.
+    fn record_call_site(&mut self, name: String, arity: usize, offset: usize) {
+        self.call_sites.push(CallSite {
+            name,
+            arity,
+            offset,
+        });
     }
 
     /// The `Expr`-returning counterpart of
@@ -4145,11 +4155,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(')')?;
 
-        self.call_sites.push(CallSite {
-            name: name.clone(),
-            arity: args.len(),
-            offset: start_pos,
-        });
+        self.record_call_site(name.clone(), args.len(), start_pos);
         let call = Expr::FuncCall {
             name,
             args,
@@ -8138,11 +8144,7 @@ impl<'a> Parser<'a> {
         // instead of falling back to `locate_identifier_from`'s comment/
         // string-unaware text search, which could cite an unrelated earlier
         // occurrence of the same spelling.
-        self.call_sites.push(CallSite {
-            name: format!("{namespace}::{name}"),
-            arity: args.len(),
-            offset: start_pos,
-        });
+        self.record_call_site(format!("{namespace}::{name}"), args.len(), start_pos);
 
         Ok(Expr::NamespacedCall {
             namespace,
