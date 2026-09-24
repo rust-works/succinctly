@@ -7206,6 +7206,40 @@ need a representation change; recorded here on its merits, tracked as
 NaN is compared against the very same NaN; `sort`, `unique`, `group_by` and `<` already agree
 with jq.
 
+### A malformed nested number reads as `null`; jq rejects the document (#966, #3034) — accepted uniform divergence
+
+A number *inside* an array or object is recovered by a greedy span (`[0-9.eE+-]`, plus
+#2877's decNumber words), and a span that none of jq's number spellings accepts reads as
+`null` rather than failing the document. jq's parser rejects the whole document instead:
+
+```console
+$ printf '[1.2.3,2]' | jq -c .              # parse error: Invalid numeric literal at line 1, column 7, exit 5
+$ printf '[1.2.3,2]' | succinctly jq -c .   # [null,2], exit 0
+$ printf '[1ee5]' | succinctly jq -c .      # [null]
+$ printf '{"a":9e999e999}' | succinctly jq -c .   # {"a":null}
+```
+
+This is the semi-index's "minimal validation" trade: ADR-0018's #2103 amendment sanctions a
+*uniform* divergence where the reference rejects the whole document at parse time. Whether a
+malformed number should instead raise when read, the way a malformed object member does, is
+[#3222](https://github.com/rust-works/succinctly/issues/3222) -- as is the `null` not being a
+consistent one on every route (`.[0] | type` is `"number"`, `.[0] | length` errors). A top-level malformed number is still rejected (the
+top-level splitter is strict), and `--validate` rejects the document up front (exit 3).
+
+**The reindex bridge's number tokens are in the class, not exceptions to it (#3034).**
+succinctly's evaluator round-trips computed values through JSON text, and writes a NaN, an
+infinity and a computed float as `9e999e999`, `8e999e999`/`-8e999e999` and `<float>e0` there.
+Until #3034 the same bytes in a *document* decoded as the value they stand for, breaking the
+uniformity above: `[9e999e999]` was NaN, `[8e999e999]` was `DBL_MAX`, `[1e0e0]` was `1`, and
+routes disagreed (`isnan` true, `tostring` `"null"`). Only an index built over the bridge's own
+text decodes a token now (`JsonIndex::build_reindex`, `JsonNumber::bridge_value`), so each
+spelling reads exactly like its nearest non-token sibling (`9e999e998`, `1e0e1`) on every route.
+
+Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
+`test_bridge_tokens_still_round_trip_computed_values_3034` (`tests/jq_cli_tests.rs`),
+`test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034` (`src/jq/eval.rs`), and
+`bridge_tokens_decode_only_under_the_bridge_index_3034` (`src/json/light.rs`).
+
 ### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 
 `foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward

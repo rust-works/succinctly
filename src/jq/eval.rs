@@ -383,8 +383,8 @@ use super::expr::{
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, document_number_f64, infinite_float_preview_text, int_to_f64,
-    is_infinity_sentinel, is_nan_sentinel, jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp,
-    owned_value_eq, owned_value_eq_at_depth_generic, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    jq_literal_int_to_f64, jq_numeric_cmp, numeric_repr_cmp, owned_value_eq,
+    owned_value_eq_at_depth_generic, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
 };
 
 /// Which binary operator an operand that produced *zero outputs* is being
@@ -1990,7 +1990,7 @@ fn to_owned_lossy_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes::<S>(n.raw_bytes()),
+        StandardJson::Number(n) => OwnedValue::from_json_number::<S>(n),
         StandardJson::String(s) => {
             if let Ok(cow) = s.as_str() {
                 OwnedValue::String(cow.into_owned())
@@ -2219,7 +2219,7 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
     Ok(match value {
         StandardJson::Null => OwnedValue::Null,
         StandardJson::Bool(b) => OwnedValue::Bool(*b),
-        StandardJson::Number(n) => OwnedValue::from_number_bytes::<S>(n.raw_bytes()),
+        StandardJson::Number(n) => OwnedValue::from_json_number::<S>(n),
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => OwnedValue::String(cow.into_owned()),
             Err(e) => return Err(EvalError::decode_failure(e.message())),
@@ -8884,12 +8884,8 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     let expr = expr.as_ref();
     // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
     // `eval_owned_input`.
-    let json_str = input.to_json_for_reindex::<S>();
-    let json_bytes = json_str.as_bytes();
-
-    use crate::json::JsonIndex;
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let doc = input.reindexed::<S>();
+    let cursor = doc.root();
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
         sink(item.into_owned_lossy::<S>())
@@ -12001,12 +11997,11 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Length of a number: jq's absolute-value rule, or the width
             // of yq's own rendering -- see `numeric_length_owned`'s doc
             // comment (#2453).
-            if is_nan_sentinel(n.raw_bytes()) {
-                QueryResult::Owned(OwnedValue::Float(f64::NAN))
-            } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
-                // Sign doesn't matter: `.abs()` of either infinity is the
-                // same positive infinity (#1083/#1087).
-                QueryResult::Owned(OwnedValue::Float(f64::INFINITY))
+            if let Some(f) = n.bridge_nonfinite() {
+                // The bridge's NaN/infinity tokens (#472/#1083, #3034). Sign
+                // doesn't matter: `.abs()` of either infinity is the same
+                // positive infinity (#1083/#1087), and NaN stays NaN.
+                QueryResult::Owned(OwnedValue::Float(f.abs()))
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Ok(f) = json_number_f64::<S>(n) {
@@ -15372,14 +15367,16 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let f: &Expr = &f;
     let mut transformed: Vec<OwnedValue> = Vec::new();
     for entry in entries {
-        let entry_json = owned_to_json_bytes::<S>(&entry);
-        let index = crate::json::JsonIndex::build(&entry_json);
-        let cursor = index.root(&entry_json);
+        // `reindexed`, not `to_json`: this round-trip is purely internal,
+        // so an overflowed `NumberLiteral`/`Float` must keep its ±Infinity
+        // rather than being silently substituted with JSON's `"null"` (#561).
+        let entry_doc = entry.reindexed::<S>();
+        let cursor = entry_doc.root();
 
         // #1755: to_owned, not to_owned_lossy -- an undecodable output
         // of `f` must raise, not silently become "" and get folded into
         // the object as if it were the real value. Not reachable via any
-        // query today: `entry_json` comes from `owned_to_json_bytes`,
+        // query today: `entry_doc` comes from `OwnedValue::reindexed`,
         // which serializes into a Rust `String` (always valid UTF-8 by
         // the type system) before ever building the cursor `f` evaluates
         // against, so `v` can never carry an undecodable string here --
@@ -15420,16 +15417,6 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(_) if optional => QueryResult::None,
         Err(e) => e.into(),
     }
-}
-
-/// Convert an OwnedValue to JSON bytes for re-parsing.
-///
-/// Uses `to_json_for_reindex` rather than `to_json`: this round-trip is
-/// purely internal (e.g. `with_entries`'s per-entry re-evaluation), so an
-/// overflowed `NumberLiteral`/`Float` must keep its ±Infinity rather than
-/// being silently substituted with JSON's `"null"` (#561).
-fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
-    value.to_json_for_reindex::<S>().into_bytes()
 }
 
 // =============================================================================
@@ -17054,7 +17041,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Already a number, return as-is -- this is a passthrough, not a
             // computation, so (like `.`) it keeps the source literal when
             // that literal is valid RFC 8259 syntax (#966).
-            QueryResult::Owned(OwnedValue::from_number_bytes::<S>(n.raw_bytes()))
+            QueryResult::Owned(OwnedValue::from_json_number::<S>(n))
         }
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => match tonumber_from_str(cow.as_ref(), S::TAG == EvalTag::Yq) {
@@ -24731,34 +24718,19 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     documents: &[(OwnedValue, usize, usize)],
 ) -> QueryResult<'a, W> {
     use super::eval_generic::{reindex_bridge_is_identity, NodeOrigin, YqDocument};
-    use crate::json::JsonIndex;
 
     // Same throwaway document `eval_owned_input_bridge` builds, and the
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561) --
     // one per input document rather than one for a combined array.
-    let texts: Vec<String> = documents
+    let docs: Vec<Option<super::value::ReindexedDoc>> = documents
         .iter()
-        .map(|(value, _, _)| {
-            if reindex_bridge_is_identity(value) {
-                value.to_json_for_reindex::<S>()
-            } else {
-                String::new()
-            }
-        })
-        .collect();
-    let indexes: Vec<Option<JsonIndex>> = documents
-        .iter()
-        .zip(&texts)
-        .map(|((value, _, _), text)| {
-            reindex_bridge_is_identity(value).then(|| JsonIndex::build(text.as_bytes()))
-        })
+        .map(|(value, _, _)| reindex_bridge_is_identity(value).then(|| value.reindexed::<S>()))
         .collect();
     let inputs: Vec<YqDocument<_>> = documents
         .iter()
-        .zip(&texts)
-        .zip(&indexes)
-        .map(|(((value, file, document), text), index)| YqDocument {
-            cursor: index.as_ref().map(|index| index.root(text.as_bytes())),
+        .zip(&docs)
+        .map(|((value, file, document), doc)| YqDocument {
+            cursor: doc.as_ref().map(super::value::ReindexedDoc::root),
             value: value.clone(),
             origin: NodeOrigin {
                 file: *file,
@@ -44430,13 +44402,10 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let json_str = input.to_json_for_reindex::<S>();
-    let json_bytes = json_str.as_bytes();
+    let doc = input.reindexed::<S>();
 
     // We need to create a temporary index and cursor
-    use crate::json::JsonIndex;
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let cursor = doc.root();
 
     match eval_single::<Vec<u64>, S>(&expr, cursor.value(), optional).materialize_cursor() {
         QueryResult::One(v) => Ok(Some((to_owned_lossy::<S, _>(&v), None))),
@@ -44635,12 +44604,8 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
     // internal, so an overflowed `NumberLiteral`/`Float` must keep its
     // ±Infinity rather than being silently substituted with "null" (#561).
-    let json_str = input.to_json_for_reindex::<S>();
-    let json_bytes = json_str.as_bytes();
-
-    use crate::json::JsonIndex;
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let doc = input.reindexed::<S>();
+    let cursor = doc.root();
 
     detach_from_temp_document::<_, S>(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
 }
@@ -47787,10 +47752,8 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Same throwaway document `eval_owned_input_bridge` builds, and the
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561).
-    let json_str = owned.to_json_for_reindex::<S>();
-    let json_bytes = json_str.as_bytes();
-    let index = crate::json::JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let doc = owned.reindexed::<S>();
+    let cursor = doc.root();
 
     let result =
         super::eval_generic::eval_path_context_pipe_with_cursor::<S, _>(exprs, cursor, optional);
@@ -53464,14 +53427,8 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Extracted directly rather than via `get_float_value_with`:
             // `value` is already known to be a `Number` here, so that
             // helper's generic `not_a_number` case would be unreachable.
-            let timestamp = if is_nan_sentinel(n.raw_bytes()) {
-                f64::NAN
-            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
-                if negative {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                }
+            let timestamp = if let Some(f) = n.bridge_nonfinite() {
+                f
             } else if let Ok(f) = json_number_f64::<S>(n) {
                 f
             // Defensive: a `Number` whose bytes are neither the NaN/infinity
@@ -56296,14 +56253,8 @@ fn get_float_value_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Result<f64, QueryResult<'a, W>> {
     match value {
         StandardJson::Number(n) => {
-            if is_nan_sentinel(n.raw_bytes()) {
-                Ok(f64::NAN)
-            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
-                Ok(if negative {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                })
+            if let Some(f) = n.bridge_nonfinite() {
+                Ok(f)
             } else if let Ok(f) = json_number_f64::<S>(n) {
                 Ok(f)
             } else if optional {
@@ -56995,10 +56946,8 @@ fn builtin_isinfinite<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if is_nan_sentinel(n.raw_bytes()) {
-                QueryResult::Owned(OwnedValue::Bool(false))
-            } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
-                QueryResult::Owned(OwnedValue::Bool(true))
+            if let Some(f) = n.bridge_nonfinite() {
+                QueryResult::Owned(OwnedValue::Bool(f.is_infinite()))
             } else if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(OwnedValue::Bool(f.is_infinite()))
             } else {
@@ -57016,7 +56965,7 @@ fn builtin_isnan<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Number(n) => {
-            if is_nan_sentinel(n.raw_bytes()) {
+            if n.bridge_nonfinite().is_some_and(f64::is_nan) {
                 QueryResult::Owned(OwnedValue::Bool(true))
             } else if let Ok(f) = json_number_f64::<S>(n) {
                 QueryResult::Owned(OwnedValue::Bool(f.is_nan()))
@@ -68627,10 +68576,8 @@ mod tests {
         input: &OwnedValue,
         optional: bool,
     ) -> Result<Option<OwnedValue>, EvalError> {
-        let json_str = input.to_json_for_reindex::<JqSemantics>();
-        let json_bytes = json_str.as_bytes();
-        let index = JsonIndex::build(json_bytes);
-        let cursor = index.root(json_bytes);
+        let doc = input.reindexed::<JqSemantics>();
+        let cursor = doc.root();
         let result = match expr {
             Expr::Identity => QueryResult::One(cursor.value()),
             Expr::Field(name) => {
@@ -77832,7 +77779,7 @@ mod tests {
     fn test_number_literal_overflow_survives_owned_value_reindex_bridges() {
         // `eval_owned_expr`/`eval_owned_input` (backing `reduce`, `foreach`,
         // `as $x` variable binding via `eval_owned_pipe`) and
-        // `owned_to_json_bytes` (backing `with_entries`) each serialize an
+        // `with_entries`'s per-entry `OwnedValue::reindexed` each serialize an
         // `OwnedValue` back to JSON text and reparse it to keep evaluating --
         // the same bridge pattern `eval_generic.rs` had. Before switching
         // these to `to_json_for_reindex`, an overflowed `NumberLiteral` was
@@ -82869,21 +82816,60 @@ mod tests {
     }
 
     #[test]
-    fn test_nan_sentinel_collision_with_real_document_is_well_defined() {
-        // #472's design tradeoff, made explicit: `NAN_SENTINEL` is reserved
-        // and unparseable by construction
-        // (`test_nan_sentinel_is_unparseable_as_a_real_number`), but it's
-        // still just number-shaped text, not a value that only the reindex
-        // bridge can produce -- a *real* document containing this exact byte
-        // sequence is affected too. Pin that this is well-defined (treated
-        // as NaN, consistently across builtins) rather than a panic or a
-        // silently different fallback per call site.
-        query!(br"9e999e999", "isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
-            assert!(b);
-        });
-        query!(br"9e999e999", "length", QueryResult::Owned(OwnedValue::Float(f)) => {
-            assert!(f.is_nan());
-        });
+    fn test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034() {
+        // #472 once pinned the opposite: `NAN_SENTINEL` is unparseable by
+        // `str::parse` but still number-shaped text, so a *real* document
+        // holding the same bytes was read as NaN (and `8e999e999` as
+        // infinity, `1e0e0` as `1`). #3034 made provenance the gate: only an
+        // index built over bridge text decodes a token, so in a document each
+        // reads exactly like its nearest non-token sibling spelling, the way
+        // every malformed nested number does (#966). Compared through the
+        // `Debug` of the whole result, so the rule covers whatever each
+        // builtin answers rather than one hand-picked value.
+        let run = |doc: &str, filter: &str| {
+            let bytes = doc.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let expr = parse(filter).unwrap();
+            format!(
+                "{:?}",
+                eval::<Vec<u64>, JqSemantics>(&expr, index.root(bytes))
+            )
+        };
+        for (token, sibling) in [
+            ("9e999e999", "9e999e998"),
+            ("-9e999e999", "-9e999e998"),
+            ("8e999e999", "8e999e998"),
+            ("-8e999e999", "-8e999e998"),
+            ("1e0e0", "1e0e1"),
+        ] {
+            for filter in [
+                ".[0] | isnan",
+                ".[0] | isinfinite",
+                ".[0] | isnormal",
+                ".[0] | isfinite",
+                ".[0] | length",
+                ".[0] | todate?",
+                ".[0] | floor?",
+                "map(.)",
+            ] {
+                assert_eq!(
+                    run(&format!("[{token}]"), filter),
+                    run(&format!("[{sibling}]"), filter),
+                    "{filter} on [{token}]"
+                );
+            }
+        }
+        // The bridge's own text still decodes: the same bytes, indexed as
+        // bridge text, are NaN and infinity again.
+        for (token, filter) in [("9e999e999", "isnan"), ("8e999e999", "isinfinite")] {
+            let index = JsonIndex::build_reindex(token.as_bytes());
+            let expr = parse(filter).unwrap();
+            let result = eval::<Vec<u64>, JqSemantics>(&expr, index.root(token.as_bytes()));
+            assert!(
+                matches!(result, QueryResult::Owned(OwnedValue::Bool(true))),
+                "{token} | {filter} as bridge text: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -82911,12 +82897,11 @@ mod tests {
         query!(b"null", "infinite | isnan", QueryResult::Owned(OwnedValue::Bool(b)) => {
             assert!(!b);
         });
-        // Same #472 collision discipline as
-        // `test_nan_sentinel_collision_with_real_document_is_well_defined`,
-        // flipped to the infinity sentinel: a real document containing the
-        // bridge's number-shaped text is read as the value it spells.
+        // A real document spelling the infinity token is *not* infinite: only
+        // bridge text carries tokens (#3034,
+        // `test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034`).
         query!(br"8e999e999", "isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
-            assert!(b);
+            assert!(!b);
         });
         // yq mode shares the evaluator path (the `--jq-extensions` surface): a
         // YAML `.inf` scalar resolves to `f64::INFINITY`, so the predicate must

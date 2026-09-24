@@ -1392,6 +1392,144 @@ fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
     Ok(())
 }
 
+/// #3034: document text spelled like one of the reindex bridge's number
+/// tokens (`9e999e999` = NaN, `8e999e999` = Infinity, `1e0e0` = the computed
+/// float `1`) used to decode as the value the token stands for. jq 1.7.1
+/// rejects every one of these documents (`Invalid numeric literal`, exit 5),
+/// as it rejects every malformed nested number; succinctly reads each
+/// malformed nested number the same way instead (#966's uniform divergence,
+/// ADR-0018's #2103 amendment). A token is only a token in text the bridge
+/// wrote, so each row must behave exactly like its nearest non-token
+/// sibling spelling, on every route.
+///
+/// Output is compared with the token's spelling substituted by the
+/// sibling's, so a route that echoes the source text (`--preserve-input`)
+/// compares equal too.
+#[test]
+fn test_bridge_token_spellings_read_like_their_siblings_3034() -> Result<()> {
+    // (bridge-token spelling, a malformed sibling that is not a token)
+    let pairs: &[(&str, &str)] = &[
+        ("9e999e999", "9e999e998"),
+        ("-9e999e999", "-9e999e998"),
+        ("8e999e999", "8e999e998"),
+        ("-8e999e999", "-8e999e998"),
+        ("1e0e0", "1e0e1"),
+        ("2.5e0e0", "2.5e0e1"),
+        ("-1e0e0", "-1e0e1"),
+        ("1.2345e-7e0", "1.2345e-7e1"),
+    ];
+    for &(token, sibling) in pairs {
+        for (wrap, at) in [("[{}]", ".[0]"), (r#"{"a":{}}"#, ".a")] {
+            let doc = |n: &str| wrap.replace("{}", n);
+            let scalar = |f: &str| format!("{at} | {f}");
+            let filters: Vec<(Vec<&str>, String)> = [
+                (vec!["-c"], ".".to_string()),
+                (vec!["-c"], "map(.)".to_string()),
+                (vec!["-c"], at.to_string()),
+                (vec!["-c"], "[.[]]".to_string()),
+                (vec!["-c"], scalar("[isnan, isinfinite, isnormal]")),
+                (vec!["-c"], scalar("length")),
+                (vec!["-c"], scalar("tostring")),
+                (vec!["-c"], scalar(". + 0")),
+                (vec!["-c"], scalar("type")),
+                (vec!["-c"], scalar("todate")),
+                (vec!["-c"], "tojson".to_string()),
+                (vec!["-c"], "reduce .[] as $x (0; $x)".to_string()),
+                (vec!["-c"], ". as $x | $x".to_string()),
+                (vec!["-c"], "getpath([0]), getpath([\"a\"])".to_string()),
+                (vec!["-c"], "with_entries(.)".to_string()),
+                (vec!["-c", "-s"], ".".to_string()),
+                (vec!["-c", "-s"], format!(".[0] | {at}")),
+                (vec!["-c", "-n"], "input".to_string()),
+                (vec!["-c", "-n"], "[inputs]".to_string()),
+                (vec!["-c", "-S"], ".".to_string()),
+                (vec!["-c", "-a"], ".".to_string()),
+                (vec!["-c", "--preserve-input"], ".".to_string()),
+            ]
+            .into_iter()
+            .collect();
+            for (flags, filter) in &filters {
+                let mut args = flags.clone();
+                args.push(filter);
+                let got = run_jq_full(&args, Some(&doc(token)))?;
+                let want = run_jq_full(&args, Some(&doc(sibling)))?;
+                let got = (
+                    got.0.replace(token, sibling),
+                    got.1.replace(token, sibling),
+                    got.2,
+                );
+                assert_eq!(got, want, "{args:?} on {} vs {}", doc(token), doc(sibling));
+            }
+
+            // `--slurpfile`: the file's values are read, then bound.
+            let mut outputs = Vec::new();
+            for n in [token, sibling] {
+                let mut file = NamedTempFile::new()?;
+                writeln!(file, "{}", doc(n))?;
+                let path = file.path().to_str().unwrap().to_string();
+                let (stdout, _, code) =
+                    run_jq_full(&["-nc", "--slurpfile", "s", &path, "$s"], None)?;
+                outputs.push((stdout.replace(token, sibling), code));
+            }
+            assert_eq!(outputs[0], outputs[1], "--slurpfile {}", doc(token));
+        }
+    }
+    Ok(())
+}
+
+/// #3034's other half: the bridge's own tokens still decode on every route
+/// that reindexes a computed value, so a NaN, an infinity and a computed
+/// float survive the round trip. Values captured from jq 1.7.1.
+#[test]
+fn test_bridge_tokens_still_round_trip_computed_values_3034() -> Result<()> {
+    for (filter, expected) in [
+        (
+            "[nan, infinite, -infinite, 0.5 + 0.25]",
+            "[null,1.7976931348623157e+308,-1.7976931348623157e+308,0.75]",
+        ),
+        (
+            "[nan, infinite, 0.5 + 0.25] | map(isnan)",
+            "[true,false,false]",
+        ),
+        (
+            "[nan, infinite, 0.5 + 0.25] | map(isinfinite)",
+            "[false,true,false]",
+        ),
+        (
+            "reduce (nan, infinite, 0.5 + 0.25) as $x ([]; . + [$x]) | map(isnan, isinfinite)",
+            "[true,false,false,true,false,false]",
+        ),
+        (
+            "{a: nan, b: infinite} | with_entries(.) | map_values(isnan)",
+            r#"{"a":true,"b":false}"#,
+        ),
+        (
+            "[nan, -infinite] | . as $x | $x | map(length)",
+            "[null,1.7976931348623157e+308]",
+        ),
+    ] {
+        assert_eq!(
+            run_jq_full(&["-nc", filter], None)?,
+            (format!("{expected}\n"), String::new(), 0),
+            "{filter}"
+        );
+    }
+    // The `--slurp` input path writes the same tokens for a document `nan`/
+    // `Infinity` (#2877) and must keep reading them back.
+    assert_eq!(
+        run_jq_full(
+            &["-c", "-s", ". , map(map(isnan))"],
+            Some("[nan, Infinity]")
+        )?,
+        (
+            "[[null,1.7976931348623157e+308]]\n[[true,false]]\n".into(),
+            String::new(),
+            0
+        )
+    );
+    Ok(())
+}
+
 /// The builtins see the *value*, not the printed form: a document `nan` is a
 /// number that `isnan`, an `Infinity` a number that `isinfinite`, and
 /// `+1.50` keeps its spelling for display while computing as `1.5`. Rows

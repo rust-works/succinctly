@@ -6126,7 +6126,7 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 ///
 /// A per-item materialization failure (`materialize_stream_item`'s
 /// `sink.materialize` calls) is defense-in-depth rather than reachable in
-/// practice: `cursor` is always rooted in `input.to_json()`/
+/// practice: `cursor` is always rooted in `input.to_json_input_bridge()`/
 /// `input.to_json_jq_preserve()` (#2852), a fresh serialization of an
 /// already-decoded `OwnedValue` -- a Rust `String`, which by construction
 /// cannot hold an undecodable byte sequence, and whose escapes this crate's
@@ -6135,6 +6135,24 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 /// Kept as a reported diagnostic rather than an `unwrap()` so a real
 /// failure, if that invariant is ever violated, surfaces as an ordinary
 /// `EvalError` instead of a panic.
+enum InputDoc {
+    /// `--preserve-input`: text carries no bridge token, indexed like any
+    /// ordinary document.
+    Preserve(String, JsonIndex),
+    /// The reindex bridge's own text, paired with its flagged index
+    /// (`OwnedValue::input_bridge_doc`).
+    Bridge(succinctly::jq::ReindexedDoc),
+}
+
+impl InputDoc {
+    fn root(&self) -> JsonCursor<'_> {
+        match self {
+            Self::Preserve(text, index) => index.root(text.as_bytes()),
+            Self::Bridge(doc) => doc.root(),
+        }
+    }
+}
+
 fn evaluate_input_streaming(
     input: &OwnedValue,
     expr: &jq::Expr,
@@ -6166,14 +6184,23 @@ fn evaluate_input_streaming(
     // finite literal. The bridge variant writes the reindex tokens the
     // reparse already decodes. The `--preserve-input` arm keeps
     // `to_json_jq_preserve` (see that variant's doc comment for why).
-    let json_str = if output_config.convention.preserves_source_values() {
-        input.to_json_jq_preserve()
+    //
+    // #3034: only the bridge variant's text is indexed as bridge text
+    // (`JsonIndex::build_reindex`), the one index its tokens decode under.
+    // `to_json_jq_preserve` writes no token, so its text is indexed like any
+    // document. `input_bridge_doc` pairs the bridge text with its flagged
+    // index (`OwnedValue::input_bridge_doc`'s own doc comment) so this site
+    // can't forget the flag the way a hand-rolled `to_json_input_bridge` +
+    // `JsonIndex::build_reindex` pair could.
+    let preserve = output_config.convention.preserves_source_values();
+    let doc = if preserve {
+        let text = input.to_json_jq_preserve();
+        let index = JsonIndex::build(text.as_bytes());
+        InputDoc::Preserve(text, index)
     } else {
-        input.to_json_input_bridge()
+        InputDoc::Bridge(input.input_bridge_doc())
     };
-    let json_bytes = json_str.as_bytes();
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
+    let cursor = doc.root();
 
     let mut write_err: Option<anyhow::Error> = None;
     let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
@@ -6950,10 +6977,15 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     Ok(match value {
         StandardJson::Null => JqValue::Null,
         StandardJson::Bool(b) => JqValue::Bool(b),
-        StandardJson::Number(n) => {
+        // A reindex-bridge token (#3034) is a computed value, not a
+        // spelling: decode it here, so a `RawNumber` only ever holds
+        // document text and its readers (`OwnedValue::from_number_bytes`,
+        // `format_raw_number`) never see a token.
+        StandardJson::Number(n) => match n.bridge_value() {
+            Some(f) => JqValue::Float(f),
             // Use RawNumber to preserve original formatting like "4e4"
-            JqValue::RawNumber(n.raw_bytes())
-        }
+            None => JqValue::RawNumber(n.raw_bytes()),
+        },
         StandardJson::String(s) => {
             // Keep string lazy - use raw bytes reference instead of decoding
             JqValue::String(
@@ -7981,9 +8013,13 @@ where
                 StandardJson::Null => out.write_all(b"null")?,
                 StandardJson::Bool(true) => out.write_all(b"true")?,
                 StandardJson::Bool(false) => out.write_all(b"false")?,
-                StandardJson::Number(n) => {
-                    out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?;
-                }
+                // A cursor can point into reindex-bridge text: its tokens
+                // print as the value they stand for, never as a spelling
+                // (#3034) -- the `JqValue::Float` arm above.
+                StandardJson::Number(n) => match n.bridge_value() {
+                    Some(f) => out.write_all(formatter.format_float(f).as_bytes())?,
+                    None => out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?,
+                },
                 StandardJson::String(s) => {
                     // Zero-copy optimization when the source span needs no
                     // re-encoding under jq's own escape convention -- see
@@ -9571,6 +9607,33 @@ mod tests {
         assert_eq!(map.keys().collect::<Vec<_>>(), vec!["a", "bc"]);
     }
 
+    /// #3034: `standard_json_to_jq_value`'s number arm decodes a reindex
+    /// bridge token to the float it stands for, rather than handing back the
+    /// raw span as `JqValue::RawNumber`.
+    ///
+    /// No production call site builds this function's `cursor` over
+    /// `JsonIndex::build_reindex` today -- `evaluate_bytes_streaming`, the
+    /// only caller reachable from ordinary CLI usage, always indexes an
+    /// actual user document with the plain `JsonIndex::build` (see its own
+    /// doc comment), so a bridge token there is deliberately read back as
+    /// ordinary malformed text (`test_bridge_tokens_decode_only_under_the_
+    /// bridge_index_3034` in `src/json/light.rs` covers that half). This
+    /// pins the arm directly so it doesn't silently bit-rot if a future
+    /// caller does route bridge text through here.
+    #[test]
+    fn test_standard_json_to_jq_value_decodes_bridge_token_3034() {
+        let token = OwnedValue::Float(f64::NAN).to_json_input_bridge();
+        let json = format!("[{token}]");
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build_reindex(bytes);
+        let cursor = index.root(bytes).first_child().expect("one element");
+        let jq_value = standard_json_to_jq_value(cursor.value(), &cursor).unwrap();
+        assert!(
+            matches!(jq_value, JqValue::Float(f) if f.is_nan()),
+            "{token}"
+        );
+    }
+
     /// #1194: a key that isn't `StandardJson::String` at all (structurally
     /// malformed, not a decode failure) raises instead of dropping the field.
     ///
@@ -10157,6 +10220,49 @@ mod tests {
             "message: {err}"
         );
         assert!(out.is_empty(), "nothing may be written before refusing");
+    }
+
+    /// #3034: `print_json`'s `JqValue::Cursor` arm decodes a reindex bridge
+    /// token to the float it stands for, rather than printing the token's
+    /// raw span through `format_raw_number` -- the streaming-writer
+    /// counterpart of `test_standard_json_to_jq_value_decodes_bridge_token_
+    /// 3034` above.
+    ///
+    /// Like that test, direct construction rather than a CLI-level
+    /// regression test: `evaluate_bytes_streaming`'s `index` is always built
+    /// with the plain `JsonIndex::build` over a real user document, never
+    /// `build_reindex` (its own doc comment), so this arm has no reachable
+    /// caller in the shipped binary today -- pinned here so it doesn't
+    /// silently bit-rot if a future one routes bridge text through it.
+    #[test]
+    fn test_write_output_jq_value_decodes_bridge_token_cursor_3034() {
+        let token = OwnedValue::Float(f64::INFINITY).to_json_input_bridge();
+        let json = format!("[{token}]");
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build_reindex(bytes);
+        let cursor = index.root(bytes).first_child().expect("one element");
+        let config = OutputConfig {
+            compact: true,
+            raw_output: false,
+            join_output: false,
+            raw_output0: false,
+            ascii_output: false,
+            color_output: false,
+            color_scheme: ColorScheme::default(),
+            sort_keys: false,
+            indent_string: String::new(),
+            unbuffered: false,
+            seq: false,
+            convention: JsonConvention::JqCompat,
+        };
+        let mut out = Vec::new();
+        write_output_jq_value(&mut out, &JqValue::Cursor(cursor), &config)
+            .expect("a bridge-text cursor prints cleanly");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", OwnedValue::Float(f64::INFINITY).to_json()),
+            "{token}"
+        );
     }
 
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --
