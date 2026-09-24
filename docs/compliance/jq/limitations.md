@@ -5065,7 +5065,7 @@ $ printf '\x1e1}\n\x1e2{'  | jq --seq -s -c 'error("x")'   # jq: error (at <stdi
 position at 4094 and 4096 bytes and loses it at 4095, where `fgets` fills its buffer exactly
 and an *empty* final buffer follows — and across files, where the final buffer is the last
 file's own last chunk (`\x1e1` in one file and `{` in the next keeps `second:0`). The rule is
-[`jq_seq_reader::SeqWarningWalk::slurp_position_lost`](../../../src/bin/succinctly/jq_seq_reader.rs),
+[`jq_seq_reader::SeqStreamWalk::slurp_position_lost`](../../../src/bin/succinctly/jq_seq_reader.rs),
 read off the same walk that produces the warnings; `scripts/jq-seq-oracle-sweep.py
 --slurp-location` sweeps it.
 

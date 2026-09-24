@@ -44,14 +44,10 @@ not two separate corner cases, and #2998 modeled it: the corpus no longer
 excludes either shape.
 
 Expected result: `0 stderr mismatches, 0 stdout supersets`; exits non-zero
-otherwise. **One separately-filed, pre-existing bug can still surface** at low
-probability (a handful of cases per 4,000): #3195, `value_ranges` misreading a
-substituted U+FFFD as a malformed BOM when invalid UTF-8 opens the document,
-fabricating an extra value. Confirmed present on `main` before #2998 too, via
-a throwaway comparison binary -- unrelated to what this script targets (the
-mismatch never touches `final_buffer_start`/`for_each_warning`'s raw-byte walk
-at all). A superset whose input does *not* start with an invalid UTF-8 lead
-byte is a new, unattributed failure and should be investigated as such.
+otherwise. Any superset is a real failure. The one this corpus used to hit
+(#3195, a substituted U+FFFD read as a malformed BOM when invalid UTF-8 opened
+the document) is gone: values now come from the same raw-byte walk as the
+diagnostics (#3247).
 
 **`--slurp-location` mode** runs the same corpus through `--seq -s -c
 'error("x")'` instead, so the `jq: error (at ...)` line carries jq's

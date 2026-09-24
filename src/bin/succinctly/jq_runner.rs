@@ -4453,7 +4453,7 @@ fn get_inputs(
     // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
     // (interleaved A/B, release, output-identity gated).
     let mut seq_slurp_position_lost = false;
-    // The raw walk's value ranges (`jq_seq_reader::SeqWarningWalk::values`,
+    // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
     // over the same raw bytes, already cut at #2998's end-of-stream drop.
     // Empty when no walk runs, which is only #1525's no-RS-byte stream,
@@ -4487,11 +4487,10 @@ fn get_inputs(
                     args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
                 }
                 None => {
-                    let walk = crate::jq_seq_reader::for_each_warning(
-                        &raw_bytes,
-                        args.slurp,
-                        &mut |warning| eprintln!("{warning}"),
-                    );
+                    let walk =
+                        crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |warning| {
+                            eprintln!("{warning}");
+                        });
                     seq_values = walk.values;
                     walk.slurp_position_lost
                 }
@@ -4502,8 +4501,9 @@ fn get_inputs(
         // `-R` are excluded from both gates identically. That combination
         // skips the warnings but still needs the values, so it pays for its
         // own walk here, exactly as the location below does.
-        seq_values =
-            crate::jq_seq_reader::for_each_warning(&raw_bytes, args.slurp, &mut |_| {}).values;
+        let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
+        seq_values = walk.values;
+        seq_slurp_position_lost = walk.slurp_position_lost;
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -4512,11 +4512,12 @@ fn get_inputs(
     // the function's docs). `-R` takes over entirely from `--seq` for
     // raw-text mode, keeping the same priority the location has below.
     let seq_trailing_record_dropped = args.slurp && args.seq && !args.raw_input && {
-        // The gates differ: `--input-dsv` and `-n` skip the warnings but
-        // can still reach the location, so those pay for their own walk.
-        // The rule itself lives with the reader:
-        // `jq_seq_reader::SeqWarningWalk::slurp_position_lost`.
-        if seq_warnings_apply {
+        // Every `--seq` stream shape already walked above, `-n` included;
+        // `--input-dsv` skips that walk but can still reach the location,
+        // so it pays for its own here. The rule itself lives with the
+        // reader:
+        // `jq_seq_reader::SeqStreamWalk::slurp_position_lost`.
+        if seq_stream_shape {
             seq_slurp_position_lost
         } else {
             crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
@@ -5708,11 +5709,11 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 ///
 /// Concatenates every file's raw bytes, in order, and materializes the
 /// value ranges the reader's single raw-byte walk found over that same
-/// concatenation (`jq_seq_reader::SeqWarningWalk::values`, #3247) -- matching real
+/// concatenation (`jq_seq_reader::SeqStreamWalk::values`, #3247) -- matching real
 /// jq's own `-s` reader, which treats the entire multi-file input as one
 /// continuous RFC 7464 byte stream and doesn't stop scanning a record at a
 /// file boundary. The reader's own EOF-location rule
-/// (`jq_seq_reader::SeqWarningWalk::slurp_position_lost`) walks the same
+/// (`jq_seq_reader::SeqStreamWalk::slurp_position_lost`) walks the same
 /// full stream for the same reason: it can only ever see genuine
 /// end-of-input, never a false EOF at some earlier file's own end -- no
 /// separate per-file special-casing needed for that interaction.
@@ -5733,18 +5734,25 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 fn build_seq_values(
     // The raw sources, before any UTF-8 substitution (#3247).
     raw_sources: &[(Option<usize>, Vec<u8>)],
-    // `jq_seq_reader::SeqWarningWalk::values` for these same sources: raw
+    // `jq_seq_reader::SeqStreamWalk::values` for these same sources: raw
     // offsets into their concatenation.
     ranges: &[(usize, usize)],
     locations: &mut InputLocations,
     slurp: bool,
 ) -> Vec<OwnedValue> {
-    let mut combined: Vec<u8> = Vec::new();
-    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_sources.len());
-    for (_, raw) in raw_sources {
-        combined.extend_from_slice(raw);
-        file_ends.push(combined.len());
-    }
+    // One source (stdin, or a single file) is borrowed as is; only a
+    // multi-file stream, whose records can span a boundary, is copied into
+    // one buffer.
+    let file_ends = cumulative_file_ends(raw_sources);
+    let combined: std::borrow::Cow<'_, [u8]> = match raw_sources {
+        [(_, only)] => std::borrow::Cow::Borrowed(only),
+        _ => std::borrow::Cow::Owned(
+            raw_sources
+                .iter()
+                .flat_map(|(_, raw)| raw.iter().copied())
+                .collect(),
+        ),
+    };
     let parsed = seq_values_with_ends(&combined, ranges);
 
     if !slurp {
@@ -5763,7 +5771,7 @@ fn build_seq_values(
 /// raw-input (`-R`) mode across the whole file list at once (#1809).
 ///
 /// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern (sharing
-/// its [`concat_with_file_ends`]/[`remap_ends_to_locations`] helpers
+/// its [`cumulative_file_ends`]/[`remap_ends_to_locations`] helpers
 /// directly): real jq's `-R` reader treats multiple files as one
 /// continuous byte stream for line-splitting too -- confirmed live against
 /// jq 1.7.1 that a file's own unterminated trailing line joins with the
@@ -5831,19 +5839,28 @@ fn build_raw_input_values(
         .collect()
 }
 
-/// Concatenate every file's raw content, in order, into one string,
-/// recording each file's own cumulative end offset in the result -- shared
-/// by [`build_seq_values`] and [`build_raw_input_values`], both of which
-/// treat the whole multi-file input as one continuous byte stream for
-/// their own purposes (RFC 7464 records / newline-delimited lines).
+/// Concatenate every file's decoded content, in order, into one string,
+/// with [`cumulative_file_ends`] for it -- [`build_raw_input_values`]'s
+/// view of the whole multi-file input as one continuous stream of lines.
 fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec<usize>) {
-    let mut combined = String::new();
-    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
-    for (_, raw) in raw_inputs {
-        combined.push_str(raw);
-        file_ends.push(combined.len());
-    }
-    (combined, file_ends)
+    let combined: String = raw_inputs.iter().map(|(_, raw)| raw.as_str()).collect();
+    (combined, cumulative_file_ends(raw_inputs))
+}
+
+/// Each source's exclusive end offset in the concatenation of all of them,
+/// in order -- which is also where the next source starts. Shared by
+/// [`build_seq_values`] (raw bytes) and [`concat_with_file_ends`] (decoded
+/// `-R` text), both of which treat the whole multi-file input as one
+/// continuous stream, so [`remap_ends_to_locations`] reads the same
+/// arithmetic for both.
+fn cumulative_file_ends<S: AsRef<[u8]>>(sources: &[(Option<usize>, S)]) -> Vec<usize> {
+    sources
+        .iter()
+        .scan(0usize, |end, (_, raw)| {
+            *end += raw.as_ref().len();
+            Some(*end)
+        })
+        .collect()
 }
 
 /// Map each `end` offset in `ends` (non-decreasing, an exclusive position
@@ -5902,91 +5919,41 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
     }
 }
 
-/// Parse `--seq` content into values paired with each surviving segment's
-/// own trimmed end byte offset, both computed in the same pass so they can
-/// never fall out of sync (#1808 code review, following #1571's own
-/// cross-file fix: an earlier version scanned end offsets separately via a
-/// now-removed `json_seq_ends` helper and reconciled the two lists by comparing lengths
-/// afterward -- when a record anywhere in a multi-file stream was
-/// genuinely malformed, that reconciliation's "counts disagree" fallback
-/// attributed *every* value across the *whole* stream to the last file's
-/// last line, not just the dropped record's own, silently misreporting the
-/// filename in an error message for records that had nothing to do with
-/// the drop). [`build_seq_values`] is this function's only remaining
-/// caller; a `parse_json_seq(s) -> Vec<OwnedValue>` values-only wrapper
-/// existed here too until its own last caller (this function's own
-/// predecessor) was replaced -- removed rather than kept unused, per its
-/// own three unit tests now calling this function directly instead.
+/// Materialize the `--seq` values [`jq_seq_reader::walk_stream`] found:
+/// each `(start, end)` range is raw offsets into `combined`, the
+/// concatenated raw sources, and comes back paired with its own `end` for
+/// the file/line remap.
 ///
-/// The rationale below described the `parse_json_seq` wrapper named
-/// above and outlived it, left stacked on `build_seq_values`'s own
-/// docs where it read as one comment describing the wrong function.
-/// Moved here, where the behaviour it describes actually lives (#1723).
+/// The reader already checked every value's grammar, so this only
+/// decodes; `json_bytes_to_owned_value_checked` stays as defense in depth
+/// (#2295). It keeps number-literal source fidelity (#1058/#1093), jq's
+/// leading-zero tolerance (`007e5`, #1243), and an `f64`-overflowing
+/// literal (`1e400` -> `1E+400`, #1267), all pinned by this module's
+/// tests.
 ///
-/// Preserves number-literal source fidelity the same way `parse_json_value`
-/// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
-/// segment is already isolated by the RS split, so a validate-then-
-/// materialize step can validate and materialize the same segment text
-/// directly -- no boundary-tracking needed, unlike `parse_json_stream`
-/// above.
+/// UTF-8 substitution happens here, per value, and only when the stream
+/// has invalid UTF-8 at all (#3247). A value the reader accepted has
+/// invalid bytes only inside its strings, and the substitution is scoped
+/// per string (#1743), so this is what substituting the whole document
+/// would have given -- without rewriting the bytes between values that the
+/// reader decides on.
 ///
-/// Validates via the crate's own zero-allocation RFC 8259 grammar
-/// validator (`json::validate::validate`, already used by `--validate`/
-/// `json validate`) rather than the `serde_json::Value`-tree-based check
-/// `--argjson` used to run (#1267; that gate is gone as of #2052, which
-/// moved every one of these call sites onto this same validator) --
-/// `--seq` is a streaming,
-/// record-oriented format, so a discarded parse tree's allocation cost is
-/// paid once per record rather than a bounded number of times per run the
-/// way `--argjson`/`--jsonargs` pay it. Measured (500k-record stream,
-/// interleaved A/B, 5 reps -- real jq's own baseline is ~0.47s either way):
-/// a real but modest ~10-20% improvement (median ~1.30s -> ~1.15s), not the
-/// dramatic win a first, non-interleaved measurement suggested (1.38s ->
-/// 1.56s, i.e. apparently *worse* -- sequential-halves noise, the exact
-/// trap this repo's own benchmarking guide warns about). The remaining gap
-/// to real jq is dominated by something else entirely, out of this issue's
-/// own scope.
-///
-/// This also fixes a real, jq-observable divergence, not just a speed one:
-/// `json::validate::validate` is a pure grammar check with no `f64`-range
-/// rejection, unlike `serde_json::Value` -- so a magnitude-overflowing
-/// literal (`1e400`) that used to silently drop as an "unparseable" record
-/// now materializes correctly (`1E+400`, matching real jq's own primary-
-/// document-input behavior, live-verified) instead. #1267 scoped that to
-/// this hot path only, leaving `--argjson`'s own `serde_json::Value`
-/// magnitude rejection in place; #2052 has since removed that gate too, so
-/// jq mode now answers `1E+400` on every path (see `parse_json_value`).
-/// The paragraph below records why #1267 stopped where it did (the path's
-/// error-message text is user-visible
-/// and untouched by this issue).
-///
-/// Also retries a failed segment with its leading zeros stripped before
-/// giving up on it, mirroring `parse_json_value`'s own `--argjson` retry
-/// (#1094, extended here to `--seq`, #1243) -- real jq's own number parser
-/// tolerates a leading zero (`007`) that strict JSON doesn't, so `007e5`
-/// silently dropping as an unparseable record (RFC 7464's own recommended
-/// failure mode -- but only for content that's actually malformed, not for
-/// a shape jq itself accepts) was a real, jq-observable divergence, not a
-/// spelling nit.
+/// [`jq_seq_reader::walk_stream`]: crate::jq_seq_reader::walk_stream
 fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
+    // One pass over the whole stream; almost every stream is valid, and
+    // then no value needs a check of its own.
+    let all_valid = succinctly::text::utf8::validate_utf8(combined).is_ok();
     ranges
         .iter()
         .filter_map(|&(start, end)| {
             let raw = &combined[start..end];
-            // #3247: the range is raw, so jq's UTF-8 substitution happens
-            // here, per value. A value the reader accepted has invalid bytes
-            // only inside its strings, and the substitution is scoped per
-            // string (#1743), so this is what substituting the whole
-            // document would have given -- without rewriting the bytes
-            // between values that the reader decides on.
             let substituted;
-            let bytes = match succinctly::text::utf8::validate_utf8(raw) {
-                Ok(()) => raw,
-                Err(_) => {
-                    substituted =
-                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
-                    substituted.as_bytes()
-                }
+            let bytes = if all_valid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
+                raw
+            } else {
+                substituted =
+                    succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
+                substituted.as_bytes()
             };
             // #2295: the sequence reader already checks the grammar, but
             // retain the checked materializer as defense in depth.
@@ -9433,7 +9400,7 @@ mod tests {
             .iter()
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
-        let ranges = crate::jq_seq_reader::for_each_warning(&raw, false, &mut |_| {}).values;
+        let ranges = crate::jq_seq_reader::walk_stream(&raw, false, &mut |_| {}).values;
         build_seq_values(&raw, &ranges, locations, false)
     }
 

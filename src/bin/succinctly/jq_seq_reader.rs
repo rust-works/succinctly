@@ -71,7 +71,7 @@
 //! returning an error -- which an error in the final buffer prevents, and
 //! which the EOF branch prevents unless the buffer's last byte completed a
 //! value and so ended the call before that branch ran. See
-//! [`SeqWarningWalk::slurp_position_lost`] for the full derivation.
+//! [`SeqStreamWalk::slurp_position_lost`] for the full derivation.
 
 use crate::front_matter::UTF8_BOM;
 
@@ -100,14 +100,14 @@ const JQ_FGETS_CHUNK: usize = 4095;
 /// source's chunk boundary.
 ///
 /// Two rules hang off "does offset X fall in jq's last buffer": `-s`'s
-/// EOF-location answer ([`SeqWarningWalk::slurp_position_lost`] -- a
+/// EOF-location answer ([`SeqStreamWalk::slurp_position_lost`] -- a
 /// diagnostic's position) and the non-slurp end-of-stream rule (a *value*,
 /// #2998). Returns the stream's own total length when the final buffer is
 /// empty, so a caller comparing `offset >= final_buffer_start` correctly
 /// finds nothing: no real offset ever reaches the stream's own length --
 /// and `final_buffer_start == total` is how that emptiness is read back.
 ///
-/// `total` is the stream's byte length, which [`for_each_warning`] already
+/// `total` is the stream's byte length, which [`walk_stream`] already
 /// has from its own `boundaries` walk; a second `Vec`-of-lengths reduction
 /// over the same sources on every call was pure waste.
 fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> usize {
@@ -210,8 +210,11 @@ fn indexed_stream_bytes(
         .skip(bom_prefix(raw_bytes).consumed)
 }
 
-/// Hands `emit` every `jq: ignoring parse error: ...` line real jq would
-/// write for this `--seq` stream, in order.
+/// jq's own reader over this `--seq` stream's raw bytes: the one walk that
+/// decides every `jq: ignoring parse error: ...` line (handed to `emit`, in
+/// order), the values jq yields ([`SeqStreamWalk::values`]) and `-s`'s EOF
+/// location ([`SeqStreamWalk::slurp_position_lost`]). A caller that wants
+/// only the values or the location passes a no-op `emit`.
 ///
 /// A sink rather than a `Vec`: an adversarial stream can warn once per
 /// byte, and collecting those first cost ~140x the input in peak RSS
@@ -221,16 +224,16 @@ fn indexed_stream_bytes(
 /// `slurp` matters beyond the warnings: real jq's non-slurp `--seq` driver
 /// (`jq_util_input_next_input`, `src/util.c`) can end the *entire* stream
 /// silently once it reaches jq's own `fgets`-chunked final buffer -- see
-/// [`SeqWarningWalk::values`] and [`final_buffer_start`] (#2998). `-s`
+/// [`SeqStreamWalk::values`] and [`final_buffer_start`] (#2998). `-s`
 /// keeps looping (`has_more`), so this never applies there; passing
 /// `slurp: true` disables it, matching jq's own mode split exactly. The
-/// walk's other answer, [`SeqWarningWalk::slurp_position_lost`], is
+/// walk's other answer, [`SeqStreamWalk::slurp_position_lost`], is
 /// computed either way and only read under `-s`.
-pub(crate) fn for_each_warning(
+pub(crate) fn walk_stream(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
     emit: &mut dyn FnMut(&str),
-) -> SeqWarningWalk {
+) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
     // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
     // `jv_parser_next` -- including the call for the empty final buffer
@@ -273,16 +276,16 @@ pub(crate) fn for_each_warning(
     let slurp_position_lost = reader.warned_in_final_buffer
         || (reader.last_warning_at_eof
             && !(reader.last_byte_yielded_value && final_buffer_start < total));
-    SeqWarningWalk {
+    SeqStreamWalk {
         slurp_position_lost,
         values: reader.values,
     }
 }
 
-/// What one raw-byte walk over a `--seq` stream ([`for_each_warning`])
+/// What one raw-byte walk over a `--seq` stream ([`walk_stream`])
 /// answers, bundled so a caller that needs both questions (the ordinary
 /// non-`-n` case, `jq_runner`'s own call site) pays for the walk once.
-pub(crate) struct SeqWarningWalk {
+pub(crate) struct SeqStreamWalk {
     /// Whether `--seq -s`'s runtime-error location is lost entirely -- real
     /// jq answering `(at <unknown>)` where it would otherwise name a file
     /// and line (#1542/#1550/#1568/#2947/#3003). Only meaningful under
@@ -416,8 +419,8 @@ pub(crate) struct SeqWarningWalk {
     pub(crate) values: Vec<(usize, usize)>,
 }
 
-/// [`SeqWarningWalk::slurp_position_lost`] on its own: literally
-/// [`for_each_warning`] with the warnings thrown away. The stderr
+/// [`SeqStreamWalk::slurp_position_lost`] on its own: literally
+/// [`walk_stream`] with the warnings thrown away. The stderr
 /// diagnostics and this question are the same walk, and the ordinary call
 /// site runs it once and uses both answers rather than paying for a second
 /// pass over the whole stream; this is for the two `-s` call sites that
@@ -429,7 +432,7 @@ pub(crate) struct SeqWarningWalk {
 /// moves every offset *and* can masquerade as a malformed BOM, whose
 /// handling above changes what the reader treats as a record at all.
 pub(crate) fn slurp_eof_position_lost(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> bool {
-    for_each_warning(raw_bytes, true, &mut |_| {}).slurp_position_lost
+    walk_stream(raw_bytes, true, &mut |_| {}).slurp_position_lost
 }
 
 /// The kinds jq's parser distinguishes while classifying a failure. It
@@ -521,7 +524,7 @@ struct Reader<'a> {
     /// off the `1` in `1 {invalid}` when the space scan completed.
     completed: Option<(usize, usize)>,
     values: Vec<(usize, usize)>,
-    /// See [`for_each_warning`]: a malformed BOM plus a newline-terminated
+    /// See [`walk_stream`]: a malformed BOM plus a newline-terminated
     /// stream means jq's own EOF report is wiped before it is written.
     suppress_eof_warning: bool,
     /// Whether the most recent [`Reader::warn`] came from [`Reader::finish`],
@@ -535,12 +538,12 @@ struct Reader<'a> {
     /// EOF branch apart from a mid-stream detection.
     at_eof: bool,
     /// The raw offset where jq's final `fgets` buffer begins (see
-    /// [`final_buffer_start`]), or `usize::MAX` when the caller has no
-    /// stream shape to enforce -- no real offset ever
-    /// reaches that, so none of the comparisons below can fire. Two rules
+    /// [`final_buffer_start`]). [`walk_stream`] always sets it; the
+    /// `usize::MAX` it starts at is past every real offset, so a `Reader`
+    /// built without it would silently skip both rules below. Two rules
     /// hang off it: the non-slurp end-of-stream drop (#2998, gated by
     /// [`Reader::drops_at_first_empty_record`]) and `-s`'s EOF-location
-    /// answer (#3003, [`SeqWarningWalk::slurp_position_lost`]).
+    /// answer (#3003, [`SeqStreamWalk::slurp_position_lost`]).
     final_buffer_start: usize,
     /// Whether real jq's non-slurp end-of-stream rule (#2998) applies:
     /// `-s` keeps its own `has_more` loop going past the event that ends a
@@ -562,7 +565,7 @@ struct Reader<'a> {
     /// an offset `>= final_buffer_start`. Under `-s` that is an early
     /// `return` out of the very `next_input` call that performed the
     /// terminal refill, which is what costs jq its position (#2947/#3003);
-    /// see [`SeqWarningWalk::slurp_position_lost`].
+    /// see [`SeqStreamWalk::slurp_position_lost`].
     warned_in_final_buffer: bool,
     /// Whether scanning the stream's *last* byte handed a value to the
     /// caller -- jq's `jv_parser_next` returning `OK` with its buffer fully
@@ -642,7 +645,7 @@ impl<'a> Reader<'a> {
     /// `parser_reset` jq runs at the top of every `jv_parser_next` where
     /// this model already does (a value, a newline, an error).
     ///
-    /// [`for_each_warning`] additionally hands over the absolute offsets at
+    /// [`walk_stream`] additionally hands over the absolute offsets at
     /// which each source after the first begins: jq refills its reader one
     /// *file* at a time, so a source boundary is another `jv_parser_next`,
     /// and its reset wipes whatever survived the previous source's scan
@@ -1097,7 +1100,7 @@ impl<'a> Reader<'a> {
         let (line, column) = (self.line, self.column);
         if self.st == St::WaitingForRs {
             // #1525's template. The *stderr* call site never reaches this
-            // -- `for_each_warning` routes a stream with no RS byte to
+            // -- `walk_stream` routes a stream with no RS byte to
             // `seq_no_rs_byte_warning` instead -- but
             // `slurp_eof_position_lost` does, and depends on it: this arm
             // is what makes an RS-less stream (down to an empty one, which
@@ -1214,7 +1217,7 @@ mod tests {
         // `jq --seq -c .`, not `-s` (#2998 gives the two modes different
         // end-of-stream behavior, but none of these inputs reach it --
         // see `warnings_are_unaffected_by_the_2998_drop_rule` below).
-        for_each_warning(&owned, false, &mut |w| {
+        walk_stream(&owned, false, &mut |w| {
             got.push(
                 w.strip_prefix("jq: ignoring parse error: ")
                     .expect("every warning carries jq's prefix")
@@ -1228,11 +1231,11 @@ mod tests {
         assert_eq!(warnings(&[input]), expected, "input: {input:?}");
     }
 
-    /// [`SeqWarningWalk::values`] over the given sources.
+    /// [`SeqStreamWalk::values`] over the given sources.
     fn walk_values(sources: &[&[u8]], slurp: bool) -> Vec<(usize, usize)> {
         let owned: Vec<(Option<usize>, Vec<u8>)> =
             sources.iter().map(|s| (None, s.to_vec())).collect();
-        for_each_warning(&owned, slurp, &mut |_| {}).values
+        walk_stream(&owned, slurp, &mut |_| {}).values
     }
 
     /// The decoded texts of the values that survive for one single-source
@@ -1351,7 +1354,7 @@ mod tests {
         let owned: Vec<(Option<usize>, Vec<u8>)> =
             sources.iter().map(|s| (None, s.to_vec())).collect();
         let mut got = Vec::new();
-        for_each_warning(&owned, true, &mut |w| {
+        walk_stream(&owned, true, &mut |w| {
             got.push(
                 w.strip_prefix("jq: ignoring parse error: ")
                     .expect("every warning carries jq's prefix")
@@ -1908,8 +1911,13 @@ mod tests {
             texts(&[b"\xef\xbb\xbf\x1e\"\xff\"\n"]),
             [b"\"\xff\"".to_vec()]
         );
-        // A malformed BOM split across sources.
+        // BOM prefixes split across sources, with empty sources around
+        // them: the ranges still count the BOM bytes. Captured from jq as
+        // files.
         assert_eq!(texts(&[b"\xef", b"\xbb1 2"]), [b"1".to_vec()]);
+        assert_eq!(texts(&[b"\xef", b"", b"\xbb1 2"]), [b"1".to_vec()]);
+        assert_eq!(texts(&[b"\xef\xbb", b"\xbf\x1e1\n"]), [b"1".to_vec()]);
+        assert_eq!(texts(&[b"", b"\xef\xbb\xbf\x1e1\n"]), [b"1".to_vec()]);
     }
 
     /// One leading BOM is consumed without advancing the column, and only
