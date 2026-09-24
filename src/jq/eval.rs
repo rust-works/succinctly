@@ -47235,14 +47235,11 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
 /// nothing for any range that doesn't involve NaN, but a NaN `to` (or a NaN
 /// running `i`, from a NaN `from`) makes `i >= to` false unconditionally,
 /// so the negation never stops the loop -- matching jq's native fast path
-/// for these two arities. The descending branch is unreachable under
-/// `implicit_step` (`from`/`to`/`step` are always `RangeNum::Int(1)`-shaped
-/// positive steps at the two `implicit_step` call sites), so it stayed a
-/// plain `f64` comparison here; `range/3`'s own further NaN divergence, on a
+/// for these two arities. `range/3`'s own further NaN divergence, on a
 /// negative step and on a NaN `from`, was a separate issue
-/// ([#3102](https://github.com/rust-works/succinctly/issues/3102)) fixed by
-/// routing the `!implicit_step` arms of both loops through `cmp_f64`'s total
-/// order instead.
+/// ([#3102](https://github.com/rust-works/succinctly/issues/3102)) -- see the
+/// `continue_ascending`/`continue_descending` comment inside the function
+/// body for that fix's detail.
 ///
 /// `first_value`, when `Some`, replaces the plain computed `OwnedValue::
 /// Float` this would otherwise push for the very first emitted element only
