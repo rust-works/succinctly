@@ -7744,6 +7744,32 @@ fn test_seq_slurp_deferred_eof_warning_follows_the_filter_3201() -> Result<()> {
         assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "{filter}");
         assert_eq!(code, exit, "{filter}");
     }
+    // Once `input` has read it, jq's stream is closed: `input_filename` is
+    // null. And `-n`'s forced read queues it the same way (review).
+    for (args, filter, stdout) in [
+        (
+            &["--seq", "-s", "-c"][..],
+            "(try input catch .), input_filename",
+            "\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
+        ),
+        (
+            &["--seq", "-s", "-n", "-c"][..],
+            "input, (try input catch .), input_filename",
+            "\x1e[1]\n\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
+        ),
+    ] {
+        let mut argv = args.to_vec();
+        argv.push(filter);
+        let (output, code) = spawn_jq(&argv, Some(b"\x1e1{"))?;
+        assert_eq!(String::from_utf8_lossy(&output.stdout), stdout, "{filter}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{filter}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    let (output, code) = spawn_jq(&["--seq", "-s", "-n", "-c", "[inputs]"], Some(b"\x1e1{"))?;
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), AS_ERROR);
+    assert_eq!(code, 5);
+
     // Control: a warning jq reports in the reading call still comes first,
     // and `halt` does not suppress it.
     let (output, code) = spawn_jq(&["--seq", "-s", "-c", "halt"], Some(b"\x1e1 {"))?;

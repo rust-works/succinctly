@@ -4069,9 +4069,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         // ignored, and reads on to the end (#3201).
                         jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
                             eprintln!(
-                                "{}{}",
-                                crate::jq_seq_reader::IGNORED_PARSE_ERROR,
-                                error.message
+                                "{}",
+                                crate::jq_seq_reader::ignored_parse_error(&error.message)
                             );
                             break;
                         }
@@ -4154,9 +4153,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             if let Some(t) = trailing_error {
                 if t.seq_warning {
                     eprintln!(
-                        "{}{}",
-                        crate::jq_seq_reader::IGNORED_PARSE_ERROR,
-                        t.error.message
+                        "{}",
+                        crate::jq_seq_reader::ignored_parse_error(&t.error.message)
                     );
                 } else {
                     sink.report(
@@ -4726,7 +4724,7 @@ fn get_inputs(
     let mut trailing_error: Option<TrailingParseError> =
         seq_deferred_warning.map(|message| TrailingParseError {
             error: EvalError::new(message),
-            source: 0,
+            source: NO_SOURCE,
             line: UNKNOWN_LINE,
             seq_warning: true,
         });
@@ -4979,6 +4977,12 @@ fn content_lines(raw: &str) -> usize {
 /// and reported the raw `u32::MAX` (`4294967295`) instead of real jq's own
 /// `0` for a dropped trailing `--seq -s` record.
 const UNKNOWN_LINE: u32 = jq::UNKNOWN_INPUT_LINE;
+
+/// A source tag no input has: once jq has closed its stream it names no file,
+/// so `input_filename` answers `null` after reading a location tagged with it
+/// (#3201's deferred `--seq -s` warning). Paired with [`UNKNOWN_LINE`], which
+/// renders the `(at <unknown>)` marker before the tag is ever looked up.
+const NO_SOURCE: u32 = u32::MAX;
 
 /// Source locations for the values returned by [`get_inputs`].
 ///
@@ -6069,9 +6073,9 @@ fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<Stri
     if raw_bytes.is_empty() {
         return None;
     }
-    Some(format!(
-        "jq: ignoring parse error: Unfinished abandoned text at EOF at line {line}, column {column}"
-    ))
+    Some(crate::jq_seq_reader::ignored_parse_error(&format!(
+        "Unfinished abandoned text at EOF at line {line}, column {column}"
+    )))
 }
 
 /// Validate that the DSV delimiter is acceptable.

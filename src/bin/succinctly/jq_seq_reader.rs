@@ -86,9 +86,13 @@ const MAX_PARSING_DEPTH: usize = 256;
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 const JQ_FGETS_CHUNK: usize = 4095;
 
-/// The prefix jq 1.7.1's `main` puts on a `--seq` parse error it skips
-/// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`).
-pub(crate) const IGNORED_PARSE_ERROR: &str = "jq: ignoring parse error: ";
+/// jq 1.7.1's `main` line for a `--seq` parse error it skips
+/// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`), for the
+/// parse error `body`. The one spelling of it: the reader's warnings, #1525's
+/// no-RS-byte template and the driver's deferred warning (#3201) all use it.
+pub(crate) fn ignored_parse_error(body: &str) -> String {
+    format!("jq: ignoring parse error: {body}")
+}
 
 /// jq's `fgets` chunks over one source, as their lengths in order: each
 /// ends just after a newline or after [`JQ_FGETS_CHUNK`] bytes, whichever
@@ -817,7 +821,7 @@ impl<'a> Reader<'a> {
     }
 
     fn emit_warning(&mut self, body: &str) {
-        (self.emit)(&format!("{IGNORED_PARSE_ERROR}{body}"));
+        (self.emit)(&ignored_parse_error(body));
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a

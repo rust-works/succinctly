@@ -5111,8 +5111,11 @@ materializes `--seq` input before evaluating, so all warnings precede all values
 but `jq --unbuffered` does not. Without `-s` the same cause shows on stderr too. jq prints each
 warning after evaluating the values read before it, so a runtime error on an earlier value
 comes first, and `halt` suppresses the warnings after it. jq's `input`/`inputs` read each
-warning as an error, and under `-n` that means every one of them. succinctly prints them all up
-front, before any of that can happen.
+warning as an error, and under `-n` that means every one of them, `-n -s` included: there only
+the deferred warning above reaches `input` here, while jq's `input` also raises a warning from
+the reading call (`printf '\x1e1 {' | jq --seq -s -n 'input'` fails with `Unfinished JSON
+term at EOF`, exit 5). succinctly prints all the others up front, before any of that can
+happen -- or, under `-n`, not at all.
 
 The differential guard remains deliberately asymmetric: **0 stdout supersets** across the
 randomized corpus. A fabricated value is a correctness failure even where an unrelated jq
