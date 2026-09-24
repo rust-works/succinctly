@@ -5069,17 +5069,21 @@ file's own last chunk (`\x1e1` in one file and `{` in the next keeps `second:0`)
 read off the same walk that produces the warnings; `scripts/jq-seq-oracle-sweep.py
 --slurp-location` sweeps it.
 
-One consequence is deliberately not reproduced: **the order of the two stderr lines.** Real
-jq prints the runtime error first and the `ignoring parse error` line second on these
-streams, because the warning belongs to the call *after* the one that dispatched the array;
-succinctly prints every `--seq` warning inside `get_inputs`, before evaluating anything, so
-it comes first (the same materialize-then-evaluate cause as the stdout ordering note below).
-The deferred diagnostic is really the next input's parse error, so in real jq `halt` in the
-filter suppresses it entirely, and `input`/`inputs` in the filter turn it into a runtime
-error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5; `try input catch
-.` yields the message). None of that is modeled: `--seq` never queues a trailing parse error
-the way a plain JSON stream does (#2961), and the warning is always printed up front —
-[#3201](https://github.com/rust-works/succinctly/issues/3201).
+The warning on these streams belongs to jq's call *after* the one that dispatched the array,
+and succinctly reproduces that too
+([#3201](https://github.com/rust-works/succinctly/issues/3201)). The walk holds that one
+warning back, and it follows the array the way a plain JSON stream's trailing parse error
+does (#2961):
+
+- a runtime error prints first and the `ignoring parse error` line second;
+- `halt` in the filter suppresses the warning entirely;
+- `input`/`inputs` in the filter receive it as a runtime error instead
+  (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5), and
+  `try input catch .` yields the message.
+
+Every other `--seq -s` warning is reported in the reading call, before the filter runs, in
+jq as here. Without `-s`, the interleaving of warnings with evaluation is still not
+reproduced; see the ordering note below.
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
@@ -5102,8 +5106,13 @@ U+FFFD substituted for any invalid lead byte starts with `EF BF`, which reads as
 malformed BOM of its own ([#3195](https://github.com/rust-works/succinctly/issues/3195)).
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
-materializes `--seq` input before evaluating, so all warnings precede all values. jq's
-default block-buffered stdout produces the same ordering, but `jq --unbuffered` does not.
+materializes `--seq` input before evaluating, so all warnings precede all values (apart from
+`-s`'s deferred warning above). jq's default block-buffered stdout produces the same ordering,
+but `jq --unbuffered` does not. Without `-s` the same cause shows on stderr too. jq prints each
+warning after evaluating the values read before it, so a runtime error on an earlier value
+comes first, and `halt` suppresses the warnings after it. jq's `input`/`inputs` read each
+warning as an error, and under `-n` that means every one of them. succinctly prints them all up
+front, before any of that can happen.
 
 The differential guard remains deliberately asymmetric: **0 stdout supersets** across the
 randomized corpus. A fabricated value is a correctness failure even where an unrelated jq

@@ -380,6 +380,7 @@ pub(crate) fn walk_stream(
         reader.suppress_eof_warning = final_buffer_start == total;
     }
     reader.drops_at_first_empty_record = !slurp;
+    reader.defers_eof_warning = slurp;
     reader.run(indexed_stream_bytes(raw_bytes), &boundaries);
     // The same pass answers `--seq -s`'s EOF-location question; see the
     // field's docs for the rule. `final_buffer_start == total` is how
@@ -397,6 +398,7 @@ pub(crate) fn walk_stream(
             debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
             value_locations(raw_bytes, &reader.yielded_at)
         },
+        deferred_warning: reader.deferred_warning,
         values: reader.values,
     }
 }
@@ -546,6 +548,19 @@ pub(crate) struct SeqStreamWalk {
     /// the newlines of every `fgets` chunk read by then, the whole chunk
     /// holding it included ([`value_locations`]).
     pub(crate) locations: Vec<(usize, usize)>,
+    /// Under `-s`, the EOF branch's warning when jq raises it only on the
+    /// *next* `next_input` call, after the slurped array has been handed to
+    /// the filter (#3201) -- the same-call exit [`Self::slurp_position_lost`]
+    /// describes for #3003: the terminal call yielded a value on the final
+    /// buffer's last byte and returned, so what that byte opened is reported
+    /// by the call after. Not passed to `emit`. The body only, without the
+    /// `jq: ignoring parse error: ` prefix.
+    ///
+    /// jq's main loop prints it as an ignored parse error once the filter
+    /// has run -- so a runtime error comes first, and `halt` suppresses it
+    /// -- and an `input`/`inputs` in the filter receives it as its own
+    /// error instead, at `(at <unknown>)`.
+    pub(crate) deferred_warning: Option<String>,
 }
 
 /// [`SeqStreamWalk::slurp_position_lost`] on its own: literally
@@ -705,6 +720,11 @@ struct Reader<'a> {
     /// terminal refill, which is what costs jq its position (#2947/#3003);
     /// see [`SeqStreamWalk::slurp_position_lost`].
     warned_in_final_buffer: bool,
+    /// [`walk_stream`]'s `slurp`: whether an EOF warning can be deferred to
+    /// jq's next `next_input` call ([`SeqStreamWalk::deferred_warning`]).
+    defers_eof_warning: bool,
+    /// The EOF warning held back instead of emitted, per `defers_eof_warning`.
+    deferred_warning: Option<String>,
     /// Whether scanning the stream's *last* byte handed a value to the
     /// caller -- jq's `jv_parser_next` returning `OK` with its buffer fully
     /// consumed, so `has_more == 0` and the EOF branch is never reached in
@@ -751,6 +771,8 @@ impl<'a> Reader<'a> {
             drops_at_first_empty_record: false,
             yielded_in_final_buffer: false,
             warned_in_final_buffer: false,
+            defers_eof_warning: false,
+            deferred_warning: None,
             last_byte_yielded_value: false,
             stopped: false,
             emit,
@@ -764,6 +786,17 @@ impl<'a> Reader<'a> {
             if !self.at_eof {
                 self.warned_in_final_buffer = true;
             }
+        }
+        // #3201: under `-s`, a value yielded on a non-empty final buffer's
+        // last byte ends jq's terminal `next_input` call there, and the EOF
+        // branch's report waits for the next call -- after the filter ran.
+        if self.at_eof
+            && self.defers_eof_warning
+            && self.last_byte_yielded_value
+            && self.final_buffer_start < self.offset
+        {
+            self.deferred_warning = Some(body.to_string());
+            return;
         }
         (self.emit)(&format!("jq: ignoring parse error: {body}"));
     }
@@ -1598,15 +1631,84 @@ mod tests {
     }
 
     /// The #3003 answer is read off the same walk as the diagnostics and
-    /// the values: keeping the position changes neither.
+    /// the values: keeping the position changes neither the warning's text
+    /// nor the values. Under `-s` the warning is jq's *next* `next_input`
+    /// call's, so it is deferred rather than emitted (#3201); the
+    /// non-slurp walk still emits it.
     #[test]
     fn final_byte_rule_leaves_warnings_and_values_alone_3003() {
+        assert_eq!(warnings_slurp(&[b"\x1e1{"]), Vec::<String>::new());
         assert_eq!(
-            warnings_slurp(&[b"\x1e1{"]),
+            deferred_slurp(&[b"\x1e1{"]).as_deref(),
+            Some("Unfinished JSON term at EOF at line 1, column 3"),
+        );
+        assert_eq!(
+            warnings(&[b"\x1e1{"]),
             ["Unfinished JSON term at EOF at line 1, column 3"],
         );
         assert_eq!(seq_value_texts(b"\x1e1{", true), vec!["1"]);
         assert_eq!(seq_value_texts(b"\x1e1{", false), vec!["1"]);
+    }
+
+    /// [`SeqStreamWalk::deferred_warning`] under `-s`.
+    fn deferred_slurp(sources: &[&[u8]]) -> Option<String> {
+        let owned: Vec<(Option<usize>, Vec<u8>)> =
+            sources.iter().map(|s| (None, s.to_vec())).collect();
+        walk_stream(&owned, true, &mut |_| {}).deferred_warning
+    }
+
+    /// #3201: jq defers exactly the EOF warning whose terminal call yielded
+    /// a value on the final buffer's last byte. Anything else it reports in
+    /// the reading call, before the filter runs. Captured from
+    /// `/usr/bin/jq` 1.7.1 as `--seq -s 'error("x")'` (the deferred warning
+    /// prints *after* the runtime error).
+    #[test]
+    fn slurp_defers_only_the_next_calls_eof_warning_3201() {
+        for (input, deferred) in [
+            (
+                &b"\x1e1{"[..],
+                "Unfinished JSON term at EOF at line 1, column 3",
+            ),
+            (
+                b"\x1etrue\"",
+                "Unfinished string at EOF at line 1, column 6",
+            ),
+            (b"\x1e1\"", "Unfinished string at EOF at line 1, column 3"),
+            (
+                b"\x1e1 2{",
+                "Unfinished JSON term at EOF at line 1, column 5",
+            ),
+        ] {
+            assert_eq!(
+                deferred_slurp(&[input]).as_deref(),
+                Some(deferred),
+                "{input:?}"
+            );
+            assert_eq!(warnings_slurp(&[input]), Vec::<String>::new(), "{input:?}");
+        }
+        // Reported in the reading call: a string or container completes on
+        // its own last byte, so the `{` after it is scanned in the same call;
+        // a separator before the `{` means the last byte yielded nothing.
+        for (input, warning) in [
+            (
+                &b"\x1e\"a\"{"[..],
+                "Unfinished JSON term at EOF at line 1, column 5",
+            ),
+            (
+                b"\x1e1 {",
+                "Unfinished JSON term at EOF at line 1, column 4",
+            ),
+            (
+                b"\x1e[1]{",
+                "Unfinished JSON term at EOF at line 1, column 5",
+            ),
+        ] {
+            assert_eq!(deferred_slurp(&[input]), None, "{input:?}");
+            assert_eq!(warnings_slurp(&[input]), [warning], "{input:?}");
+        }
+        // The final buffer's last byte: a trailing newline starts an empty
+        // final buffer, which reports in the reading call.
+        assert_eq!(deferred_slurp(&[b"\x1e1{\n"]), None);
     }
 
     /// [`final_buffer_start`]'s own boundary arithmetic: real jq's `fgets`

@@ -3955,6 +3955,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             locations.files().to_vec()
         });
 
+        // Read before the queue takes `trailing_error` over (#3201).
+        let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
             // (#723) with every document `get_inputs` just read -- under
@@ -4061,6 +4063,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 loop {
                     let input = match jq::pop_input() {
                         jq::InputPop::Document(input) => input,
+                        // jq's main loop prints a `--seq` parse error as
+                        // ignored, and reads on to the end (#3201).
+                        jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
+                            eprintln!("jq: ignoring parse error: {}", error.message);
+                            break;
+                        }
                         jq::InputPop::ParseError(error) => {
                             sink.report(
                                 DiagStyle::Jq,
@@ -4135,13 +4143,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 }
             }
             // The parse error the stream ended in, reported after the
-            // documents before it (#2961).
+            // documents before it (#2961) -- or, for `--seq -s`, the warning
+            // jq defers past the filter (#3201).
             if let Some(t) = trailing_error {
-                sink.report(
-                    DiagStyle::Jq,
-                    &t.error,
-                    &locations.resolve(t.source, t.line),
-                );
+                if t.seq_warning {
+                    eprintln!("jq: ignoring parse error: {}", t.error.message);
+                } else {
+                    sink.report(
+                        DiagStyle::Jq,
+                        &t.error,
+                        &locations.resolve(t.source, t.line),
+                    );
+                }
             }
         }
     }
@@ -4359,6 +4372,11 @@ struct TrailingParseError {
     error: EvalError,
     source: u32,
     line: u32,
+    /// A `--seq -s` warning jq raises only on the `next_input` call after
+    /// the slurped array (#3201): the driver prints it as an ignored parse
+    /// error, not an uncaught one, and it never costs exit 5. `input`/
+    /// `inputs` still receive it as an error.
+    seq_warning: bool,
 }
 
 /// What [`get_inputs`] read: every document, their locations, and -- when a
@@ -4451,6 +4469,8 @@ fn get_inputs(
     // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
     // (interleaved A/B, release, output-identity gated).
     let mut seq_slurp_position_lost = false;
+    // `jq_seq_reader::SeqStreamWalk::deferred_warning` (#3201).
+    let mut seq_deferred_warning: Option<String> = None;
     // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
     // over the same raw bytes, already cut at #2998's end-of-stream drop.
@@ -4493,6 +4513,7 @@ fn get_inputs(
                         });
                     seq_values = walk.values;
                     seq_value_locations = walk.locations;
+                    seq_deferred_warning = walk.deferred_warning;
                     walk.slurp_position_lost
                 }
             };
@@ -4686,7 +4707,17 @@ fn get_inputs(
 
     // Process based on input mode
     let mut values = Vec::new();
-    let mut trailing_error: Option<TrailingParseError> = None;
+    // A `--seq -s` warning jq defers past the filter rides the same slot
+    // (#3201): delivered after the slurped array, to the driver or to the
+    // filter's own `input`. jq has lost its position by then -- the call
+    // that raises it closed the stream -- so it names `<unknown>`.
+    let mut trailing_error: Option<TrailingParseError> =
+        seq_deferred_warning.map(|message| TrailingParseError {
+            error: EvalError::new(message),
+            source: 0,
+            line: UNKNOWN_LINE,
+            seq_warning: true,
+        });
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
     // genuinely join content across a file boundary -- real jq's own
@@ -4806,6 +4837,7 @@ fn get_inputs(
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
                         line: u32::try_from(error_line).unwrap_or(u32::MAX),
+                        seq_warning: false,
                     });
                     break;
                 }
@@ -4832,7 +4864,10 @@ fn get_inputs(
         Ok(Ok((
             vec![OwnedValue::array_from(values)],
             InputLocations::single(at),
-            None,
+            // A plain-JSON parse error fails `--slurp` outright instead
+            // (above); only `--seq`'s deferred warning follows the array
+            // (#3201).
+            trailing_error.filter(|t| t.seq_warning),
         )))
     } else {
         Ok(Ok((values, locations, trailing_error)))

@@ -7698,6 +7698,63 @@ fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
     Ok(())
 }
 
+/// #3201: under `--seq -s`, when jq's terminal read yields a value on the
+/// final buffer's last byte, the `at EOF` report for what that byte opened
+/// comes from the *next* `next_input` call, after the slurped array has been
+/// handed to the filter. So a runtime error prints before it, `halt` never
+/// lets it print, and an `input`/`inputs` in the filter receives it as an
+/// error at `(at <unknown>)`. Every row captured from `/usr/bin/jq` 1.7.1:
+/// stdout, the full stderr in order, and the exit code.
+#[test]
+fn test_seq_slurp_deferred_eof_warning_follows_the_filter_3201() -> Result<()> {
+    const WARNING: &str =
+        "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n";
+    const AS_ERROR: &str =
+        "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3\n";
+    for (filter, stdout, stderr, exit) in [
+        (".", "\x1e[1]\n".to_string(), WARNING.to_string(), 0),
+        ("halt", String::new(), String::new(), 0),
+        (
+            "error(\"x\")",
+            String::new(),
+            format!("jq: error (at <stdin>:0): x\n{WARNING}"),
+            5,
+        ),
+        (
+            ".,  input",
+            "\x1e[1]\n".to_string(),
+            AS_ERROR.to_string(),
+            5,
+        ),
+        (
+            "., (try input catch .)",
+            "\x1e[1]\n\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            "., ([inputs] | length)",
+            "\x1e[1]\n".to_string(),
+            AS_ERROR.to_string(),
+            5,
+        ),
+    ] {
+        let (output, code) = spawn_jq(&["--seq", "-s", "-c", filter], Some(b"\x1e1{"))?;
+        assert_eq!(String::from_utf8_lossy(&output.stdout), stdout, "{filter}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "{filter}");
+        assert_eq!(code, exit, "{filter}");
+    }
+    // Control: a warning jq reports in the reading call still comes first,
+    // and `halt` does not suppress it.
+    let (output, code) = spawn_jq(&["--seq", "-s", "-c", "halt"], Some(b"\x1e1 {"))?;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n"
+    );
+    assert_eq!(code, 0);
+    Ok(())
+}
+
 /// #3250: a `--seq` value's `input_filename`, `input_line_number` and
 /// `(at file:line)` are where jq's reader stood when it *yielded* the value:
 /// the yielding byte's file, and the newlines of every `fgets` chunk read by
