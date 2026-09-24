@@ -37262,6 +37262,27 @@ fn walk_escape_retries(control: &Control, is_last: bool, guessed: bool) -> bool 
     }
 }
 
+/// Charge one `?//` alternative's UPDATE run in a path-mode fold (#2979),
+/// as value mode charges (#695) -- shared by [`resolve_reduce`] and
+/// [`resolve_foreach`] so the two cannot drift.
+///
+/// The first UPDATE a source element runs is already covered by that
+/// element's own charge, made by the caller on entry; only a *retried*
+/// alternative that reaches UPDATE is charged here, and an alternative whose
+/// bind failed ran nothing. `ran_update` is the caller's per-element flag,
+/// reset with each element.
+fn charge_alternative_update(
+    budget: &mut usize,
+    ran_update: &mut bool,
+    what: &str,
+) -> Option<Control> {
+    if core::mem::replace(ran_update, true) {
+        charge_budget(budget, what)
+    } else {
+        None
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -37555,19 +37576,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                         acc_at_register = acc_at_register
                             || reg.identical(acc_effective, &acc_snapshot, S::TAG == EvalTag::Jq);
                         let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-                        // Charged once per UPDATE that runs, as value mode charges
-                        // (#695): the element's own charge above covers the first,
-                        // and an alternative whose bind failed ran nothing.
-                        if ran_update {
-                            if let Some(control) = charge_budget(&mut budget, "reduce") {
-                                outcome = Some(StepOutcome::Return(stop_with_escape(
-                                    &mut aborted,
-                                    control,
-                                )));
-                                return Demand::Stop;
-                            }
+                        if let Some(control) =
+                            charge_alternative_update(&mut budget, &mut ran_update, "reduce")
+                        {
+                            outcome =
+                                Some(StepOutcome::Return(stop_with_escape(&mut aborted, control)));
+                            return Demand::Stop;
                         }
-                        ran_update = true;
                         match reg.resolve::<S>(
                             &substituted,
                             acc_input,
@@ -38043,17 +38058,13 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                                     ),
                                 }
                             };
-                        // See `resolve_reduce`'s identical charge.
-                        if ran_update {
-                            if let Some(control) = charge_budget(&mut budget, "foreach") {
-                                outcome = Some(StepOutcome::Return(stop_with_escape(
-                                    &mut aborted,
-                                    control,
-                                )));
-                                return Demand::Stop;
-                            }
+                        if let Some(control) =
+                            charge_alternative_update(&mut budget, &mut ran_update, "foreach")
+                        {
+                            outcome =
+                                Some(StepOutcome::Return(stop_with_escape(&mut aborted, control)));
+                            return Demand::Stop;
                         }
-                        ran_update = true;
                         // An UPDATE escape still delivers the outputs before it, as
                         // jq's generator does (`path(foreach (1) as $x (.; (.a,
                         // error("x"))))` prints `["a"]` before raising), and then
