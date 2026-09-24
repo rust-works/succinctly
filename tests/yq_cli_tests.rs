@@ -24755,29 +24755,70 @@ fn test_yq_untracked_comma_branch_del_still_raises_1764() -> Result<()> {
     Ok(())
 }
 
-/// #3207: a `null`/`true`/`false` target identical to the document is an
-/// untracked `del()` target like any other, so it refuses with #1764's error
-/// (pending #1865) on both routes. #3125's jq-only identity carve-out used to
-/// resolve it to the root path, which yq's bare-`del(.)` rule (#1702) turned
-/// into *no output at all*, exit 0 -- the document silently discarded. Real
-/// yq v4.53.3 prints the document unchanged.
+/// #3207: a `del()` whose resolved targets are *all* untracked deletes
+/// nothing -- real yq v4.53.3 aborts at whichever target it processes first,
+/// so the order question #1865 leaves open does not arise. That includes a
+/// `null`/`true`/`false` literal identical to the document, which #3125's
+/// jq-only identity carve-out used to resolve to the root path; yq's
+/// bare-`del(.)` rule (#1702) then printed *nothing*, exit 0, silently
+/// discarding the document. Nested in `|=`/`=`, the unchanged value is what
+/// the enclosing update writes back. Every expected output was captured
+/// from yq v4.53.3 with `-o json -I0`.
 #[test]
-fn test_yq_del_identical_null_bool_literal_refuses_not_discards_3207() -> Result<()> {
+fn test_yq_del_all_untracked_targets_is_noop_3207() -> Result<()> {
+    for (filter, doc, expected) in [
+        ("del(null)", "null\n", "null"),
+        ("del(true)", "true\n", "true"),
+        ("del(false)", "false\n", "false"),
+        ("del(false)", "null\n", "null"),
+        ("del(1)", "a: 1\n", r#"{"a":1}"#),
+        ("del(1, 2)", "a: 1\n", r#"{"a":1}"#),
+        ("del(1 + 1)", "a: 1\n", r#"{"a":1}"#),
+        ("del(.a | 1)", "a: 1\n", r#"{"a":1}"#),
+        (".[] |= del(null)", "[null]\n", "[null]"),
+        ("map(del(null))", "[null]\n", "[null]"),
+        (".[] |= del(1)", "[1]\n", "[1]"),
+        (
+            ".b = (.a | del(null))",
+            "a: null\n",
+            r#"{"a":null,"b":null}"#,
+        ),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter} on {doc:?}: err={err}");
+        assert_eq!(out.trim(), expected, "{filter} on {doc:?}");
+    }
+    // The default YAML route prints the document, not nothing.
+    for (filter, doc) in [("del(null)", "null\n"), ("del(1)", "a: 1 # c\n")] {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out, doc, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3207: recording an untracked `del()` target instead of stopping at it
+/// lets a later argument's genuine error surface, as in yq v4.53.3
+/// (`del(1, error("boom"))` raises `boom`); a mix of tracked and untracked
+/// targets still refuses, pending #1865's ordering -- including the
+/// identical-literal shape that used to discard the document.
+#[test]
+fn test_yq_del_mixed_untracked_targets_still_refuse_3207() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr("del(1, error(\"boom\"))", "a: 1\n", &[])?;
+    assert_eq!((out.as_str(), code), ("", 1), "err={err}");
+    assert!(err.contains("boom"), "err={err}");
+
     for (filter, doc) in [
-        ("del(null)", "null\n"),
-        ("del(true)", "true\n"),
-        ("del(false)", "false\n"),
         ("del(null, .a)", "null\n"),
         ("del(.a, null)", "null\n"),
+        ("del(1, .a)", "a: 1\nb: 2\n"),
     ] {
-        for args in [&[][..], &["-o", "json"][..]] {
-            let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
-            assert_ne!(code, 0, "{filter} on {doc:?} {args:?}: out={out:?}");
-            assert!(
-                err.contains("Invalid path expression"),
-                "{filter} on {doc:?} {args:?}: err={err}"
-            );
-        }
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter} on {doc:?}");
+        assert!(
+            err.contains("Invalid path expression"),
+            "{filter} on {doc:?}: err={err}"
+        );
     }
     Ok(())
 }

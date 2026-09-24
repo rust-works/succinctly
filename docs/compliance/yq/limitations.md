@@ -1939,12 +1939,15 @@ what distinguishes its call shape from its three siblings') until the real rever
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 
-A `null`/`true`/`false` literal identical to the document (`del(null)` on `null`) is one
-more untracked target and refuses the same way, where real yq prints the document
-unchanged. jq's `jv_identical` rule answers that literal with the root path `[]` (jq's
-`null | path(null)` is `[[]]`), but that rule is gated to jq mode: in yq mode the root
-path reached yq's bare-`del(.)` rule and printed nothing, silently discarding the
-document ([#3207](https://github.com/rust-works/succinctly/issues/3207)).
+This affects only a *mix* of tracked and untracked targets. When **every** resolved target
+is untracked, the first one real yq processes aborts it under any ordering, so the
+document comes back unchanged, and succinctly matches that: `del(1)`, `del(1, 2)`,
+`.a |= del(1)` ([#3207](https://github.com/rust-works/succinctly/issues/3207)). A later
+argument's genuine error still surfaces, as it does in yq (`del(1, error("boom"))` raises
+`boom`). A `null`/`true`/`false` literal identical to the document (`del(null)` on
+`null`) is one more untracked target in yq mode. jq's `jv_identical` rule would answer it
+with the root path `[]` (in jq, `null | path(null)` is `[[]]`), and yq's bare-`del(.)`
+rule would then print nothing.
 
 ### `del()` with a field key against a scalar root: errors instead of no-op
 
