@@ -4453,14 +4453,12 @@ fn get_inputs(
     // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
     // (interleaved A/B, release, output-identity gated).
     let mut seq_slurp_position_lost = false;
-    // #2998: real jq's non-slurp `--seq` driver can end the *entire*
-    // stream silently once it reaches jq's own `fgets`-chunked final
-    // buffer -- a property of jq's raw byte chunking, not of the JSON
-    // content, so `value_ranges`'s later walk over the UTF-8-normalized
-    // `combined` string can't derive it on its own. `None` under `-s`
-    // (unaffected) or when nothing is dropped; see
-    // `jq_seq_reader::SeqWarningWalk::value_cap`.
-    let mut seq_value_cap = None;
+    // The raw walk's value ranges (`jq_seq_reader::SeqWarningWalk::values`,
+    // #3247): the same pass that decides jq's warnings decides its values,
+    // over the same raw bytes, already cut at #2998's end-of-stream drop.
+    // Empty when no walk runs, which is only #1525's no-RS-byte stream,
+    // where nothing ever leaves `WAITING_FOR_RS`.
+    let mut seq_values: Vec<(usize, usize)> = Vec::new();
     // Shared by `seq_warnings_apply` below, the `-n`-forced-read fallback
     // just after it, and the `build_seq_values` gate further down -- one
     // definition rather than three hand-copies of the same shape, so a
@@ -4468,26 +4466,24 @@ fn get_inputs(
     // predicates diverge silently").
     let seq_stream_shape = args.seq && !args.raw_input && args.input_dsv.is_none();
     let seq_warnings_apply = seq_stream_shape && !args.null_input;
-    // jq's BOM verdict on the raw bytes, read by the warning gate below and
-    // by the value walk's preparation after it (#3195/#3199).
-    let seq_bom = crate::jq_seq_reader::bom_prefix(&raw_bytes);
     if seq_warnings_apply {
         // A *malformed* BOM is the one case where "no RS byte anywhere"
         // does not imply #1525's template: it costs jq a `parser_reset`
         // that leaves the parser reading rather than waiting for an RS, so
         // the reader owns that case too (#1723).
+        let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
         seq_slurp_position_lost =
-            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !seq_bom.malformed) {
+            match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
                 Some(warning) => {
                     eprintln!("{warning}");
                     // #1525's arm prints its own template instead of the
                     // reader's, but the location still needs the walk. A
                     // stream with no RS byte anywhere yields nothing, so
                     // this is the degenerate input, never the hot path --
-                    // and `seq_value_cap` stays `None`, correctly: nothing
-                    // ever leaves `WAITING_FOR_RS`, so no value can exist
-                    // to cap. Only read under `-s` below, so the walk is
-                    // skipped otherwise.
+                    // and `seq_values` stays empty, correctly: nothing ever
+                    // leaves `WAITING_FOR_RS`, so no value can exist. Only
+                    // read under `-s` below, so the walk is skipped
+                    // otherwise.
                     args.slurp && crate::jq_seq_reader::slurp_eof_position_lost(&raw_bytes)
                 }
                 None => {
@@ -4496,18 +4492,18 @@ fn get_inputs(
                         args.slurp,
                         &mut |warning| eprintln!("{warning}"),
                     );
-                    seq_value_cap = walk.value_cap;
+                    seq_values = walk.values;
                     walk.slurp_position_lost
                 }
             };
-    } else if !args.slurp && seq_stream_shape {
+    } else if seq_stream_shape {
         // The only way this function still runs `build_seq_values` with
         // `seq_warnings_apply` false is `-n` forcing a real read: DSV and
         // `-R` are excluded from both gates identically. That combination
-        // skips the warnings but still needs the cap, so it pays for its
+        // skips the warnings but still needs the values, so it pays for its
         // own walk here, exactly as the location below does.
-        seq_value_cap =
-            crate::jq_seq_reader::for_each_warning(&raw_bytes, false, &mut |_| {}).value_cap;
+        seq_values =
+            crate::jq_seq_reader::for_each_warning(&raw_bytes, args.slurp, &mut |_| {}).values;
     }
 
     // Answered here, before the UTF-8 substitution below consumes
@@ -4527,15 +4523,14 @@ fn get_inputs(
         }
     };
 
-    // The value walk runs after the substitution below, which can rewrite
-    // the BOM prefix, so it gets the raw verdict and, where substitution
-    // would mangle it, a stream with the prefix already removed
-    // (`jq_seq_reader::value_walk_bom`, #3195/#3199). Every raw-byte walk
-    // above has already run.
-    let seq_bom = if seq_stream_shape {
-        crate::jq_seq_reader::value_walk_bom(&mut raw_bytes, seq_bom)
+    // `--seq` keeps its raw bytes: its values are ranges into them, and
+    // each is substituted on its own in `build_seq_values` (#3247). The
+    // whole-document substitution below would rewrite bytes the reader
+    // already decided on. Nothing else below reads a `--seq` source.
+    let seq_raw = if seq_stream_shape {
+        std::mem::take(&mut raw_bytes)
     } else {
-        seq_bom
+        Vec::new()
     };
 
     // All reads happen first, then decoding: a later file's read error still
@@ -4638,8 +4633,13 @@ fn get_inputs(
     // that same priority for the location, oracle-verified: `-R --seq -s`
     // on a truncated trailing record still reports its plain newline count,
     // not `<unknown>`.
+    let last_source: Option<&[u8]> = if seq_stream_shape {
+        seq_raw.last().map(|(_, raw)| raw.as_slice())
+    } else {
+        raw_inputs.last().map(|(_, raw)| raw.as_bytes())
+    };
     let slurp_eof_line: Option<usize> = if args.slurp {
-        raw_inputs.last().and_then(|(_, raw)| {
+        last_source.and_then(|raw| {
             // #1550: the drop check reads across every file as one stream,
             // not just `raw_inputs.last()` alone -- a truncated record's
             // own opening RS byte and its closing/disambiguating bytes can
@@ -4648,7 +4648,7 @@ fn get_inputs(
             if seq_trailing_record_dropped {
                 None
             } else {
-                Some(line_at(raw.as_bytes(), raw.len()))
+                Some(line_at(raw, raw.len()))
             }
         })
     } else {
@@ -4701,13 +4701,7 @@ fn get_inputs(
     // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
     // which the DSV branch inside the loop already takes over first.
     if seq_stream_shape {
-        values = build_seq_values(
-            &raw_inputs,
-            seq_bom,
-            &mut locations,
-            args.slurp,
-            seq_value_cap,
-        );
+        values = build_seq_values(&seq_raw, &seq_values, &mut locations, args.slurp);
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
@@ -4995,7 +4989,7 @@ impl InputLocations {
     /// per-value `line_at` rescan from byte 0 produced (#1213). `--seq`'s
     /// own per-value locations no longer go through this helper at all
     /// (#1808): a boundary-spanning record's own file can't be recovered
-    /// from an isolated `raw`, so `build_seq_values`/`parse_json_seq_with_ends`
+    /// from an isolated `raw`, so `build_seq_values`/`seq_values_with_ends`
     /// track offsets across the whole multi-file stream directly instead.
     fn extend_from_ends(&mut self, src: usize, raw: &str, ends: &[usize], values: usize) {
         if ends.len() == values {
@@ -5270,7 +5264,7 @@ fn report_unopenable_input(e: &InputFileOpenError) -> i32 {
 /// remembering how far the previous call already counted.
 ///
 /// `advance_to` must be called with non-decreasing `end` values -- the same
-/// order [`find_json_values`]/[`parse_json_seq_with_ends`] already produce
+/// order [`find_json_values`] and the `--seq` reader already produce
 /// their offsets in, since both are themselves single left-to-right scans.
 struct LineCounter<'a> {
     bytes: &'a [u8],
@@ -5712,8 +5706,9 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// Build the values (and, when `!slurp`, one `(source, line)` location per
 /// value) for `--seq` input across the whole file list at once (#1571).
 ///
-/// Concatenates every file's raw content, in order, into one string and
-/// runs [`parse_json_seq_with_ends`] over it exactly once -- matching real
+/// Concatenates every file's raw bytes, in order, and materializes the
+/// value ranges the reader's single raw-byte walk found over that same
+/// concatenation (`jq_seq_reader::SeqWarningWalk::values`, #3247) -- matching real
 /// jq's own `-s` reader, which treats the entire multi-file input as one
 /// continuous RFC 7464 byte stream and doesn't stop scanning a record at a
 /// file boundary. The reader's own EOF-location rule
@@ -5724,9 +5719,9 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 ///
 /// `!slurp` locations still need each value's own *file* and *file-local*
 /// line, not the byte offset's raw position in the throwaway `combined`
-/// string, so each value's own end offset (computed by
-/// `parse_json_seq_with_ends` in the same pass as the value itself -- never
-/// a separately-scanned list to fall out of sync with) is mapped back to
+/// stream, so each value's own end offset (from the same range as the value
+/// itself -- never a separately-scanned list to fall out of sync with) is
+/// mapped back to
 /// whichever file's own byte range contains it via `partition_point`, since
 /// both `file_ends` and each value's own `end` are non-decreasing (a
 /// boundary-spanning record is attributed to the file its *end* falls in --
@@ -5736,35 +5731,26 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// `end` values are non-decreasing, that index is too, so this never
 /// backtracks to a file already passed.
 fn build_seq_values(
-    raw_inputs: &[(Option<usize>, String)],
-    // `jq_seq_reader::value_walk_bom`'s answer for the raw bytes
-    // `raw_inputs` was decoded from (#3195/#3199).
-    bom: crate::jq_seq_reader::BomPrefix,
+    // The raw sources, before any UTF-8 substitution (#3247).
+    raw_sources: &[(Option<usize>, Vec<u8>)],
+    // `jq_seq_reader::SeqWarningWalk::values` for these same sources: raw
+    // offsets into their concatenation.
+    ranges: &[(usize, usize)],
     locations: &mut InputLocations,
     slurp: bool,
-    // #2998: `Some(n)` when the caller's own raw-byte walk found real jq's
-    // non-slurp end-of-stream rule dropping everything after the `n`th
-    // value; see `jq_seq_reader::SeqWarningWalk::value_cap`. Always `None`
-    // when `slurp` (the caller never computes one then).
-    value_cap: Option<usize>,
 ) -> Vec<OwnedValue> {
-    let (combined, file_ends) = concat_with_file_ends(raw_inputs);
-    // The file remap's cumulative ends double as the sequence reader's
-    // source boundaries: each is the absolute offset where the next file
-    // begins in `combined`, so a malformed BOM under which jq refills and
-    // resets at each file boundary is reproduced in the value walk too
-    // (#3002). The last entry is the stream's own end, not a boundary.
-    let parsed = parse_json_seq_with_ends(
-        &combined,
-        bom,
-        &file_ends[..file_ends.len().saturating_sub(1)],
-        value_cap,
-    );
+    let mut combined: Vec<u8> = Vec::new();
+    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_sources.len());
+    for (_, raw) in raw_sources {
+        combined.extend_from_slice(raw);
+        file_ends.push(combined.len());
+    }
+    let parsed = seq_values_with_ends(&combined, ranges);
 
     if !slurp {
         remap_ends_to_locations(
             parsed.iter().map(|&(_, end)| end),
-            raw_inputs,
+            raw_sources,
             &file_ends,
             locations,
         );
@@ -5782,7 +5768,7 @@ fn build_seq_values(
 /// continuous byte stream for line-splitting too -- confirmed live against
 /// jq 1.7.1 that a file's own unterminated trailing line joins with the
 /// next file's first line, the same way `--seq` joins a boundary-split
-/// record. This can't reuse `parse_json_seq_with_ends` itself
+/// record. This can't reuse the `--seq` reader itself
 /// (RS-delimited/JSON-shaped, not newline-shaped), so it does its own `\n`
 /// scan to find each line's byte range instead.
 ///
@@ -5887,9 +5873,9 @@ fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec
 /// `partition_point` reports a new file index -- since `end` values are
 /// non-decreasing, that index is too, so this never backtracks to a file
 /// already passed.
-fn remap_ends_to_locations(
+fn remap_ends_to_locations<S: AsRef<[u8]>>(
     ends: impl Iterator<Item = usize>,
-    raw_inputs: &[(Option<usize>, String)],
+    raw_inputs: &[(Option<usize>, S)],
     file_ends: &[usize],
     locations: &mut InputLocations,
 ) {
@@ -5899,10 +5885,7 @@ fn remap_ends_to_locations(
             .partition_point(|&fe| fe <= end)
             .min(file_ends.len().saturating_sub(1));
         if current.as_ref().map(|(idx, _)| *idx) != Some(file_idx) {
-            current = Some((
-                file_idx,
-                LineCounter::new(raw_inputs[file_idx].1.as_bytes()),
-            ));
+            current = Some((file_idx, LineCounter::new(raw_inputs[file_idx].1.as_ref())));
         }
         let file_start = if file_idx == 0 {
             0
@@ -5985,18 +5968,29 @@ fn remap_ends_to_locations(
 /// failure mode -- but only for content that's actually malformed, not for
 /// a shape jq itself accepts) was a real, jq-observable divergence, not a
 /// spelling nit.
-fn parse_json_seq_with_ends(
-    s: &str,
-    bom: crate::jq_seq_reader::BomPrefix,
-    boundaries: &[usize],
-    value_cap: Option<usize>,
-) -> Vec<(OwnedValue, usize)> {
-    crate::jq_seq_reader::value_ranges(s.as_bytes(), bom, boundaries, value_cap)
-        .into_iter()
-        .filter_map(|(start, end)| {
+fn seq_values_with_ends(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            let raw = &combined[start..end];
+            // #3247: the range is raw, so jq's UTF-8 substitution happens
+            // here, per value. A value the reader accepted has invalid bytes
+            // only inside its strings, and the substitution is scoped per
+            // string (#1743), so this is what substituting the whole
+            // document would have given -- without rewriting the bytes
+            // between values that the reader decides on.
+            let substituted;
+            let bytes = match succinctly::text::utf8::validate_utf8(raw) {
+                Ok(()) => raw,
+                Err(_) => {
+                    substituted =
+                        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
+                    substituted.as_bytes()
+                }
+            };
             // #2295: the sequence reader already checks the grammar, but
             // retain the checked materializer as defense in depth.
-            json_bytes_to_owned_value_checked(&s.as_bytes()[start..end])
+            json_bytes_to_owned_value_checked(bytes)
                 .ok()
                 .map(|value| (value, end))
         })
@@ -9429,21 +9423,33 @@ mod tests {
         assert!(parse_json_stream("{invalid").is_err());
     }
 
+    /// `build_seq_values` over string sources, wired the way `get_inputs`
+    /// wires it: the raw walk's value ranges (#3247), non-slurp.
+    fn seq_build(
+        sources: &[(Option<usize>, String)],
+        locations: &mut InputLocations,
+    ) -> Vec<OwnedValue> {
+        let raw: Vec<(Option<usize>, Vec<u8>)> = sources
+            .iter()
+            .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
+            .collect();
+        let ranges = crate::jq_seq_reader::for_each_warning(&raw, false, &mut |_| {}).values;
+        build_seq_values(&raw, &ranges, locations, false)
+    }
+
+    /// One `--seq` stream's values, the way `get_inputs` builds them.
+    fn parse_seq(stream: &str) -> Vec<OwnedValue> {
+        let mut locations = InputLocations::new(vec![None]);
+        seq_build(&[(None, stream.to_string())], &mut locations)
+    }
+
     /// #1243: same leading-zero tolerance as `--slurpfile`/`--slurp` above,
     /// for `--seq` (RFC 7464) -- previously silently dropped the whole
     /// record (its own documented "ignore parse failures" fallback) instead
     /// of accepting it the way real jq does.
     #[test]
     fn test_parse_json_seq_tolerates_leading_zero_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
-            "\x1E007e5\n",
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &[],
-            None,
-        )
-        .into_iter()
-        .map(|(v, _)| v)
-        .collect();
+        let values: Vec<OwnedValue> = parse_seq("\x1E007e5\n");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "7E+5");
     }
@@ -9453,15 +9459,7 @@ mod tests {
     /// leading-zero retry.
     #[test]
     fn test_parse_json_seq_still_drops_genuine_malformed_record_1243() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
-            "\x1E{invalid\n\x1E5\n",
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &[],
-            None,
-        )
-        .into_iter()
-        .map(|(v, _)| v)
-        .collect();
+        let values: Vec<OwnedValue> = parse_seq("\x1E{invalid\n\x1E5\n");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "5");
     }
@@ -9474,15 +9472,7 @@ mod tests {
     /// primary document input already produces for it.
     #[test]
     fn test_parse_json_seq_accepts_magnitude_overflowing_number_1267() {
-        let values: Vec<OwnedValue> = parse_json_seq_with_ends(
-            "\x1E1e400\n",
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &[],
-            None,
-        )
-        .into_iter()
-        .map(|(v, _)| v)
-        .collect();
+        let values: Vec<OwnedValue> = parse_seq("\x1E1e400\n");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "1E+400");
     }
@@ -9500,13 +9490,7 @@ mod tests {
         ];
         let mut locations =
             InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
-        let values = build_seq_values(
-            &raw_inputs,
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &mut locations,
-            false,
-            None,
-        );
+        let values = seq_build(&raw_inputs, &mut locations);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
@@ -9543,13 +9527,7 @@ mod tests {
         ];
         let mut locations =
             InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
-        let values = build_seq_values(
-            &raw_inputs,
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &mut locations,
-            false,
-            None,
-        );
+        let values = seq_build(&raw_inputs, &mut locations);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "2");
@@ -9576,13 +9554,7 @@ mod tests {
             Some("f2".to_string()),
             Some("f3".to_string()),
         ]);
-        let values = build_seq_values(
-            &raw_inputs,
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &mut locations,
-            false,
-            None,
-        );
+        let values = seq_build(&raw_inputs, &mut locations);
         assert_eq!(values.len(), 3);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
@@ -9596,13 +9568,7 @@ mod tests {
     fn test_build_seq_values_still_drops_genuinely_malformed_record_1571() {
         let raw_inputs = vec![(Some(0), "\x1E1\n\x1E{invalid\n\x1E3\n".to_string())];
         let mut locations = InputLocations::new(vec![Some("f1".to_string())]);
-        let values = build_seq_values(
-            &raw_inputs,
-            crate::jq_seq_reader::BomPrefix::NONE,
-            &mut locations,
-            false,
-            None,
-        );
+        let values = seq_build(&raw_inputs, &mut locations);
         assert_eq!(values.len(), 2);
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "3");
