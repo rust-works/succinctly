@@ -5079,16 +5079,15 @@ filter suppresses it entirely, and `input`/`inputs` in the filter turn it into a
 error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5; `try input catch
 .` yields the message). None of that is modeled: `--seq` never queues a trailing parse error
 the way a plain JSON stream does (#2961), and the warning is always printed up front —
-[#3201](https://github.com/rust-works/succinctly/issues/3201). One further malformed-BOM
-gap the same probing surfaced is pre-existing and separate: jq's per-refill `parser_reset`
-is modeled at newlines only, not at the 4095-byte `fgets` boundary
-([#3200](https://github.com/rust-works/succinctly/issues/3200)).
+[#3201](https://github.com/rust-works/succinctly/issues/3201).
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
 match without counting them as columns, and then re-runs `parser_reset` at the top of every
 read, which leaves it parsing the bytes before the first RS instead of discarding them and
-wipes its state after every value, every newline, and at end of input:
+wipes its state after every value, at every `fgets` refill (after a newline, or after a full
+4095-byte chunk with no newline,
+[#3200](https://github.com/rust-works/succinctly/issues/3200)), and at an empty final buffer:
 
 ```
 $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level numeric value at EOF at line 1, column 3

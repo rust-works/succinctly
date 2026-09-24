@@ -7698,6 +7698,49 @@ fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
     Ok(())
 }
 
+/// #3200: under a malformed BOM jq resets at every `fgets` refill, including
+/// the one after a full 4095-byte chunk with no newline, and at an empty final
+/// buffer. The issue's three rows, with their stderr and `(at ...)` location,
+/// captured from `/usr/bin/jq` 1.7.1 (stdin).
+#[test]
+fn test_seq_malformed_bom_resets_at_fgets_size_limit_refill_3200() -> Result<()> {
+    let padded = |head: &[u8], pad: usize, tail: &[u8]| -> Vec<u8> {
+        let mut v = head.to_vec();
+        v.resize(head.len() + pad, b' ');
+        v.extend_from_slice(tail);
+        v
+    };
+    for (input, stderr) in [
+        // 4095 bytes: the empty final buffer's reset wipes the `{`.
+        (
+            padded(b"\xef\xbb{", 4092, b""),
+            "jq: error (at <stdin>:0): x\n",
+        ),
+        // 4096 bytes: the refill at 4095 wipes it.
+        (
+            padded(b"\xef\xbb{", 4093, b""),
+            "jq: error (at <stdin>:0): x\n",
+        ),
+        // The refill drops the open string; the trailing `"` opens another,
+        // which the EOF branch reports, and the location is lost.
+        (
+            padded(b"\xef\xbb\"a", 4091, b"\""),
+            "jq: ignoring parse error: Unfinished string at EOF at line 1, column 4094\n\
+             jq: error (at <unknown>): x\n",
+        ),
+    ] {
+        let (output, code) = spawn_jq(&["--seq", "-s", "-c", "error(\"x\")"], Some(&input))?;
+        assert_eq!(code, 5, "len {}", input.len());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            stderr,
+            "len {}",
+            input.len()
+        );
+    }
+    Ok(())
+}
+
 /// #3247: `--seq` values are ranges from the same raw-byte walk as the
 /// diagnostics, and UTF-8 substitution is applied to each value on its own.
 /// Substituting the whole stream first let jq's short-tail rule fold an

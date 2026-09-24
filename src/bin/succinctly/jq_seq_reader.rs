@@ -86,6 +86,54 @@ const MAX_PARSING_DEPTH: usize = 256;
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 const JQ_FGETS_CHUNK: usize = 4095;
 
+/// Every raw offset (absolute, all sources concatenated) at which jq's
+/// `fgets` starts a new chunk because the previous one filled
+/// [`JQ_FGETS_CHUNK`] bytes without reaching a newline -- the refills
+/// [`final_buffer_start`]'s chunk walk passes over, for every source (#3200).
+/// Chunking restarts at each source's own start, and an offset at a source's
+/// end is left out: the next source's start is already a boundary, and at
+/// the stream's end it is the empty final buffer, which
+/// [`Reader::suppress_eof_warning`] covers.
+fn size_limit_refills(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Vec<usize> {
+    let mut refills = Vec::new();
+    let mut source_start = 0usize;
+    for (_, raw) in raw_bytes {
+        let mut chunk = 0usize;
+        while chunk < raw.len() {
+            let rest = &raw[chunk..];
+            match rest.iter().take(JQ_FGETS_CHUNK).position(|&b| b == b'\n') {
+                Some(newline) => chunk += newline + 1,
+                None if rest.len() > JQ_FGETS_CHUNK => {
+                    chunk += JQ_FGETS_CHUNK;
+                    refills.push(source_start + chunk);
+                }
+                None => break,
+            }
+        }
+        source_start += raw.len();
+    }
+    refills
+}
+
+/// Two ascending offset lists as one, duplicates kept (a reset is
+/// idempotent, and [`Reader::run`] consumes each entry once).
+fn merge_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
 /// Where jq's `fgets`-chunked *final* buffer begins, as a raw byte offset
 /// into the whole concatenated raw stream (all sources, in order).
 ///
@@ -249,20 +297,7 @@ pub(crate) fn walk_stream(
     emit: &mut dyn FnMut(&str),
 ) -> SeqStreamWalk {
     let bom = bom_prefix(raw_bytes);
-    // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
-    // `jv_parser_next` -- including the call for the empty final buffer
-    // that a newline-terminated stream produces, since `fgets` stops at
-    // the newline without reaching EOF. That reset wipes the accumulated
-    // state before the EOF branch can report on it, so no `at EOF` warning
-    // survives. A stream not ending in a newline hits EOF in the same read
-    // and does report one.
-    let ends_with_newline = raw_bytes
-        .iter()
-        .rev()
-        .find_map(|(_, raw)| raw.last().copied())
-        == Some(b'\n');
     let mut reader = Reader::new(bom, emit);
-    reader.suppress_eof_warning = bom.malformed && ends_with_newline;
     // jq refills its reader one file at a time, so each source after the
     // first begins its own `jv_parser_next` -- whose malformed-BOM reset the
     // walk must reproduce (#3002). The offsets are the sources' absolute
@@ -277,6 +312,21 @@ pub(crate) fn walk_stream(
     boundaries.pop();
     let final_buffer_start = final_buffer_start(raw_bytes, total);
     reader.final_buffer_start = final_buffer_start;
+    if bom.malformed {
+        // With a malformed BOM jq re-runs `parser_reset` at the top of
+        // *every* `jv_parser_next`, and each `fgets` refill starts one.
+        // Resets after a newline happen as the reader scans it; a refill
+        // after a full 4095-byte chunk with no newline is a reset too
+        // (#3200), so those offsets join the file starts.
+        boundaries = merge_sorted(&boundaries, &size_limit_refills(raw_bytes));
+        // The call for an *empty* final buffer -- after a chunk that ended
+        // on a newline, or filled the buffer exactly -- resets as well,
+        // wiping the accumulated state before the EOF branch can report on
+        // it, so no `at EOF` warning survives. A final buffer holding data
+        // hits EOF in the same read and does report one. `final_buffer_start
+        // == total` is how [`final_buffer_start`] spells an empty one.
+        reader.suppress_eof_warning = final_buffer_start == total;
+    }
     reader.drops_at_first_empty_record = !slurp;
     reader.run(indexed_stream_bytes(raw_bytes), &boundaries);
     // The same pass answers `--seq -s`'s EOF-location question; see the
@@ -534,11 +584,12 @@ struct Reader<'a> {
     /// off the `1` in `1 {invalid}` when the space scan completed.
     completed: Option<(usize, usize)>,
     values: Vec<(usize, usize)>,
-    /// See [`walk_stream`]: a malformed BOM plus a newline-terminated
-    /// stream means jq's own EOF report is wiped before it is written. It
-    /// models jq's reset at the empty final buffer, so [`Reader::finish`]
-    /// yields no value either -- none can be pending there, since that same
-    /// reset already ran at the newline -- and the value walk is this walk.
+    /// See [`walk_stream`]: a malformed BOM plus an empty final `fgets`
+    /// buffer (the stream ends on a newline, or fills its last chunk
+    /// exactly) means jq's own EOF report is wiped before it is written. It
+    /// models jq's reset at that empty buffer, so [`Reader::finish`] yields
+    /// no value either -- none can be pending there, since the refill before
+    /// it already reset -- and the value walk is this walk.
     suppress_eof_warning: bool,
     /// Whether the most recent [`Reader::warn`] came from [`Reader::finish`],
     /// jq's EOF branch. `finish` warns at most once and runs last, so this
@@ -659,8 +710,10 @@ impl<'a> Reader<'a> {
     /// this model already does (a value, a newline, an error).
     ///
     /// [`walk_stream`] additionally hands over the absolute offsets at
-    /// which each source after the first begins: jq refills its reader one
-    /// *file* at a time, so a source boundary is another `jv_parser_next`,
+    /// which each source after the first begins, and (under a malformed
+    /// BOM) where each full 4095-byte `fgets` chunk ends without a newline
+    /// (#3200). jq refills its reader one *file* at a time, so a source
+    /// boundary is another `jv_parser_next`,
     /// and its reset wipes whatever survived the previous source's scan
     /// (#3002) -- `EF BF` across two sources therefore vanishes where the
     /// same bytes in one buffer fail (`EF BF` then `1E` cleanly starts a new
@@ -1942,6 +1995,69 @@ mod tests {
         assert_eq!(texts(&[b"\xef", b"", b"\xbb1 2"]), [b"1".to_vec()]);
         assert_eq!(texts(&[b"\xef\xbb", b"\xbf\x1e1\n"]), [b"1".to_vec()]);
         assert_eq!(texts(&[b"", b"\xef\xbb\xbf\x1e1\n"]), [b"1".to_vec()]);
+    }
+
+    /// #3200: with a malformed BOM, jq resets at *every* `fgets` refill,
+    /// including one after a full 4095-byte chunk with no newline, and an
+    /// empty final buffer (a stream filling its last chunk exactly) wipes
+    /// the EOF report just as a trailing newline does. Rows are the issue's
+    /// three, captured from `/usr/bin/jq` 1.7.1 as `--seq -s 'error("x")'`.
+    #[test]
+    fn malformed_bom_resets_at_every_fgets_refill_3200() {
+        let padded = |head: &[u8], pad: usize, tail: &[u8]| -> Vec<u8> {
+            let mut v = head.to_vec();
+            v.resize(head.len() + pad, b' ');
+            v.extend_from_slice(tail);
+            v
+        };
+        // 4095 bytes: the chunk fills exactly, an empty final buffer
+        // follows, and its reset wipes the `{`: no warning, position kept.
+        let exact = padded(b"\xef\xbb{", 4092, b"");
+        assert_eq!(exact.len(), 4095);
+        assert_eq!(warnings_slurp(&[&exact]), Vec::<String>::new());
+        assert!(!position_lost(&[&exact]));
+        // 4096 bytes: the refill at 4095 resets before the last space.
+        let over = padded(b"\xef\xbb{", 4093, b"");
+        assert_eq!(warnings_slurp(&[&over]), Vec::<String>::new());
+        assert!(!position_lost(&[&over]));
+        // The reverse: the refill drops the open string, the trailing `"`
+        // opens a new one, and the EOF branch reports it -- position lost.
+        let reopened = padded(b"\xef\xbb\"a", 4091, b"\"");
+        assert_eq!(reopened.len(), 4096);
+        assert_eq!(
+            warnings_slurp(&[&reopened]),
+            ["Unfinished string at EOF at line 1, column 4094"]
+        );
+        assert!(position_lost(&[&reopened]));
+        // Control: without a malformed BOM there is no reset at a refill.
+        let plain = padded(b"\x1e{", 4093, b"");
+        assert_eq!(
+            warnings_slurp(&[&plain]),
+            ["Unfinished JSON term at EOF at line 1, column 4095"]
+        );
+    }
+
+    /// #3200: the refill offsets restart at each source and skip a chunk
+    /// that ends at its source's own end.
+    #[test]
+    fn size_limit_refills_restart_per_source_3200() {
+        let refills = |sources: &[Vec<u8>]| {
+            let owned: Vec<(Option<usize>, Vec<u8>)> =
+                sources.iter().map(|s| (None, s.clone())).collect();
+            size_limit_refills(&owned)
+        };
+        assert_eq!(refills(&[vec![b' '; 4095]]), Vec::<usize>::new());
+        assert_eq!(refills(&[vec![b' '; 4096]]), vec![4095]);
+        assert_eq!(refills(&[vec![b' '; 8191]]), vec![4095, 8190]);
+        // A newline inside the first 4095 bytes ends that chunk early.
+        let mut nl = vec![b' '; 5000];
+        nl[10] = b'\n';
+        assert_eq!(refills(&[nl]), vec![11 + 4095]);
+        // A second source restarts the count at its own start.
+        assert_eq!(
+            refills(&[vec![b' '; 100], vec![b' '; 4096]]),
+            vec![100 + 4095]
+        );
     }
 
     /// One leading BOM is consumed without advancing the column, and only
