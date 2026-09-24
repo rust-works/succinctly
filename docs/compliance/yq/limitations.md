@@ -1939,6 +1939,13 @@ what distinguishes its call shape from its three siblings') until the real rever
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 
+A `null`/`true`/`false` literal identical to the document (`del(null)` on `null`) is one
+more untracked target and refuses the same way, where real yq prints the document
+unchanged. jq's `jv_identical` rule answers that literal with the root path `[]` (jq's
+`null | path(null)` is `[[]]`), but that rule is gated to jq mode: in yq mode the root
+path reached yq's bare-`del(.)` rule and printed nothing, silently discarding the
+document ([#3207](https://github.com/rust-works/succinctly/issues/3207)).
+
 ### `del()` with a field key against a scalar root: errors instead of no-op
 
 Deleting a field key from a scalar document raises `Cannot index <type> with string

@@ -42220,7 +42220,18 @@ fn resolve_terminal_sink<'a, S: EvalSemantics>(
                 // other carrier (`123 | path(123)`, `"" | path("")`, `[] |
                 // path([])`) and every non-identical null/bool pairing
                 // (`null | path(false)`) still refuses here.
-                if null_bool_identical(&branch.value, input) {
+                //
+                // jq mode only (#3207). The rule is jq's `jv_identical`, and
+                // yq has no counterpart: real yq v4.53.3 treats `del(null)`
+                // on `null` as the same untracked target as `del(1)` on
+                // `{a: 1}` -- the document comes back unchanged. The one yq
+                // caller that reaches here is `del()` (every other yq caller
+                // sets `skip_untracked`), and there a root `[]` path became
+                // `DelPaths::Root`, i.e. yq's bare-`del(.)` rule (#1702),
+                // which prints nothing: `null | del(null)` silently lost the
+                // document. Without the carve-out the branch refuses like
+                // every other untracked `del()` target, pending #1865.
+                if S::TAG == EvalTag::Jq && null_bool_identical(&branch.value, input) {
                     // emission: mirror the navigation family's identical
                     // seed (#2691) -- the identical literal carried through
                     // the *root* (empty) path answers `[]` in real jq 1.7.1.

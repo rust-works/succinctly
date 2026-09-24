@@ -24755,6 +24755,33 @@ fn test_yq_untracked_comma_branch_del_still_raises_1764() -> Result<()> {
     Ok(())
 }
 
+/// #3207: a `null`/`true`/`false` target identical to the document is an
+/// untracked `del()` target like any other, so it refuses with #1764's error
+/// (pending #1865) on both routes. #3125's jq-only identity carve-out used to
+/// resolve it to the root path, which yq's bare-`del(.)` rule (#1702) turned
+/// into *no output at all*, exit 0 -- the document silently discarded. Real
+/// yq v4.53.3 prints the document unchanged.
+#[test]
+fn test_yq_del_identical_null_bool_literal_refuses_not_discards_3207() -> Result<()> {
+    for (filter, doc) in [
+        ("del(null)", "null\n"),
+        ("del(true)", "true\n"),
+        ("del(false)", "false\n"),
+        ("del(null, .a)", "null\n"),
+        ("del(.a, null)", "null\n"),
+    ] {
+        for args in [&[][..], &["-o", "json"][..]] {
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+            assert_ne!(code, 0, "{filter} on {doc:?} {args:?}: out={out:?}");
+            assert!(
+                err.contains("Invalid path expression"),
+                "{filter} on {doc:?} {args:?}: err={err}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #1764: the no-op is not specific to a multi-branch `Expr::Comma` --
 /// a single bare untracked expression, with no comma at all, is the
 /// identical no-op. Confirmed live against yq v4.53.3: `(1) = 5` on
