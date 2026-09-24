@@ -421,21 +421,20 @@ fn test_parity_formats_over_iteration() {
 /// typed inside the *filter* text instead, rather than the document, is a
 /// different, unrelated case: jq's own grammar treats that as unary
 /// negation on the positive literal, degrading fidelity -- not what any
-/// case here exercises.) That literal-preservation gap is a separate
-/// pre-existing issue (#1083), out of scope for both #124 and #1075 -- see
-/// `numeric_display_string`'s own doc comment (`src/jq/eval.rs`) for why.
+/// case here exercises.) succinctly now does the same (#3212); the
+/// YAML-only `@yaml`/`@props` rows keep yq's `.inf`.
 #[test]
 fn test_formats_non_finite_parity_124() {
     for (json, filter, expected) in [
-        (b"1e400".as_slice(), "@text", r#""1.7976931348623157e+308""#),
-        (b"-1e400", "@text", r#""-1.7976931348623157e+308""#),
-        (b"1e400", "@uri", r#""1.7976931348623157e%2B308""#),
-        (b"1e400", "@html", r#""1.7976931348623157e+308""#),
+        (b"1e400".as_slice(), "@text", r#""1E+400""#),
+        (b"-1e400", "@text", r#""-1E+400""#),
+        (b"1e400", "@uri", r#""1E%2B400""#),
+        (b"1e400", "@html", r#""1E+400""#),
         (b"1e400", "@yaml", r#"".inf""#),
         (b"1e400", "@props", r#"".inf""#),
-        (b"[1e400]", "@csv", r#""1.7976931348623157e+308""#),
-        (b"[1e400]", "@tsv", r#""1.7976931348623157e+308""#),
-        (b"[1e400]", "@sh", r#""1.7976931348623157e+308""#),
+        (b"[1e400]", "@csv", r#""1E+400""#),
+        (b"[1e400]", "@tsv", r#""1E+400""#),
+        (b"[1e400]", "@sh", r#""1E+400""#),
     ] {
         assert_eq!(
             as_strs(&full_outputs(json, filter)),

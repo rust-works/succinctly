@@ -7123,6 +7123,23 @@ magnitude error, a narrower divergence from real jq than #2240's own issue text 
 scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
 be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
 
+### A plain decimal and an overflowing literal render with decNumber's notation (#3212) — divergence closed, one cap residual
+
+jq 1.7.1 renders every number literal with decNumber's to-scientific-string rule: scientific
+notation when the exponent is positive or the adjusted exponent (`exponent + digits - 1`) is
+below -6. succinctly applied that rule only to literals *written* with an exponent
+(#1207/#1226), and echoed a plain decimal verbatim. Now a plain decimal follows it too, on
+printing, `tostring` and every text format alike: `0.0000001` → `1E-7`, `0.000000100` →
+`1.00E-7`, `0.0000000` → `0E-7`, while `0.000001` stays `0.000001`. Separately, `tostring` of
+a literal that overflows `f64` (`1e400`) keeps its literal as jq does (`"1E+400"`), where it
+substituted `DBL_MAX` text. Only a *computed* infinity (`1e400 + 0`) still takes the
+`DBL_MAX` text, as in jq.
+
+**Residual:** the scientific path renders at most 100,000 mantissa digits
+(`MAX_RENDERED_MANTISSA_DIGITS`), so a literal with more significant digits than that comes
+out truncated where jq renders every one —
+[#3257](https://github.com/rust-works/succinctly/issues/3257).
+
 ### A magnitude-overflowing literal is no longer rejected by `--argjson`/`--jsonargs` (#2052) — divergence closed
 
 Until #2052 these two flags validated through `serde_json::Value`, whose "number out of
@@ -7483,19 +7500,15 @@ routes (`-S`, `-s`) still raise on that document, because rendering both keys in
 is what the collision *is*; `.,.` no longer does, since #2103 it forwards the cursor to the
 printer without building a map (see its entry above).
 
-**One row moved away from jq, with no ADR-0018 carve-out.** A `NumberLiteral` longer than
-former 256-character reindex cap disqualified a document from `getpath`'s native arm, sending the
-call through the reindex round trip, which re-spells it. jq prints `1E-301` for a
-303-character literal and so did `getpath(["big"])`; `.big` printed all 303 characters,
-because preserving a document number's written form is deliberate
-(`DocumentValue::number_literal`,
+**A long literal's spelling now matches jq on both routes.** A `NumberLiteral` longer than
+the former 256-character reindex cap disqualified a document from `getpath`'s native arm,
+sending the call through the reindex round trip, which re-spelled it: `getpath(["big"])`
+printed jq's `1E-301` for a 303-character `0.000…1`, and `.big` printed all 303 characters,
+because a document number's written form is preserved (`DocumentValue::number_literal`,
 [#387](https://github.com/rust-works/succinctly/issues/387)/[#966](https://github.com/rust-works/succinctly/issues/966)).
-Both spellings now print the source form. No rule-4 condition applies here, so ADR-0018's
-decision order does not license preferring this on its own terms — absent an exemption, step
-2 says the reference's `1E-301` should have stood. This is recorded as an accepted, if
-imperfect, side effect of unifying `getpath`'s number handling with `.big`'s rather than as a
-decision the order above actually reaches; the pre-existing divergence it joins
-is the entry above on the owned route's re-spelling.
+#2168 made both print the source form. Since
+[#3212](https://github.com/rust-works/succinctly/issues/3212), rendering a preserved literal
+applies decNumber's notation rule, as jq does, so both routes print `1E-301`.
 
 Pinned by `test_lazy_validation_boundary_2168` (the table above, as one test),
 `test_path_answers_past_an_undecodable_sibling_2168`,

@@ -9956,9 +9956,9 @@ fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
 }
 
 /// A `NumberLiteral` that overflows to infinity (e.g. `1e400`) used to render
-/// as garbage like `"NaNE+2147483647"` in every non-JSON text format instead
-/// of jq's own `DBL_MAX`-text substitution (#561), then as Rust's own
-/// `f64::Display` (`"inf"`/`"-inf"`, still wrong -- #1075). `tostring`
+/// as garbage like `"NaNE+2147483647"` in every non-JSON text format (#561),
+/// then as Rust's own `f64::Display` (`"inf"`/`"-inf"`, #1075), then as
+/// `DBL_MAX` text. jq keeps the literal: `"1E+400"` (#3212). `tostring`
 /// reaches the fix directly, but `@uri`/`@html`/`@sh`/string
 /// interpolation/`@csv` are dispatched through `eval_generic`'s
 /// cursor-reindexing bridge, which round-trips the value through JSON text --
@@ -9969,31 +9969,31 @@ fn regression_issue_575_break_in_loop_constructs_reaches_label() -> Result<()> {
 fn test_number_literal_overflow_text_formats_via_cli() -> Result<()> {
     let (output, code) = run_jq_stdin("tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin("tostring", "-1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""-1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""-1E+400""#);
 
     let (output, code) = run_jq_stdin("@uri", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e%2B308""#);
+    assert_eq!(output.trim(), r#""1E%2B400""#);
 
     let (output, code) = run_jq_stdin("@html", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin("@sh", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin(r#""\(.)""#, "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin("@csv", "[1e400]", &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     Ok(())
 }
@@ -10246,19 +10246,19 @@ fn test_number_literal_scientific_notation_mantissa_stays_below_ten_via_cli_1206
 fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
     let (output, code) = run_jq_stdin(". as $x | $x | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin(". as $x | $x | tostring", "-1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""-1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""-1E+400""#);
 
     let (output, code) = run_jq_stdin("reduce (1) as $x (.; .) | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin("foreach (1) as $x (.; .) | tostring", "1e400", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#""1.7976931348623157e+308""#);
+    assert_eq!(output.trim(), r#""1E+400""#);
 
     let (output, code) = run_jq_stdin(
         "with_entries(.value |= (. | tostring))",
@@ -10266,7 +10266,7 @@ fn test_number_literal_overflow_owned_reindex_bridges_via_cli() -> Result<()> {
         &["-c"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"a":"1.7976931348623157e+308"}"#);
+    assert_eq!(output.trim(), r#"{"a":"1E+400"}"#);
 
     Ok(())
 }
@@ -43506,12 +43506,13 @@ fn test_getpath_cursor_walk_matches_jq_2168() -> Result<()> {
 /// written form is deliberate (`DocumentValue::number_literal`, #387/#966),
 /// so the round trip was the odd one out, not `.big`.
 ///
-/// jq 1.7.1 prints `1E-301` for **both** spellings, so this trades one
-/// divergence for internal agreement rather than removing one; recorded in
-/// `docs/compliance/jq/limitations.md`.
+/// jq 1.7.1 printed `1E-301` for both of that literal's spellings, which
+/// since #3212 succinctly does too -- so a `0.000...1` literal no longer
+/// tells the routes apart. This uses a literal jq keeps plain instead,
+/// `1.` + 300 zeros + `1`, whose 303 characters any re-spelling would lose.
 #[test]
 fn test_getpath_keeps_a_document_numbers_spelling_2168() -> Result<()> {
-    let long_literal = "0.".to_string() + &"0".repeat(300) + "1";
+    let long_literal = "1.".to_string() + &"0".repeat(300) + "1";
     let doc = format!(r#"{{"a":1,"big":{long_literal}}}"#);
 
     let (via_getpath, _, code) = run_jq_stdin_streams(r#"getpath(["big"])"#, &doc, &["-c"])?;
@@ -43522,7 +43523,11 @@ fn test_getpath_keeps_a_document_numbers_spelling_2168() -> Result<()> {
         via_getpath, via_nav,
         "getpath must spell a document number the way the bare read does"
     );
-    assert_eq!(via_getpath.trim(), long_literal, "the source spelling");
+    assert_eq!(
+        via_getpath.trim(),
+        long_literal,
+        "the source spelling, as jq prints it"
+    );
 
     // The short sibling in the same document is unaffected either way.
     let (stdout, _, code) = run_jq_stdin_streams(r#"getpath(["a"])"#, &doc, &["-c"])?;
