@@ -1272,8 +1272,8 @@ fn test_argjson_reject_set_2052() -> Result<()> {
 /// The spelling matrix, on every path a number can enter: the primary
 /// document (top-level and nested, on the raw-echo, cursor, materializing
 /// and `--slurp` routes), `-n input`, `--argjson`, `--jsonargs`,
-/// `--slurpfile` and `--seq`. `fromjson` is the one path deliberately absent
-/// -- its hand-written parser has none of the jq leniencies and is #3032's.
+/// `--slurpfile` and `--seq`. `fromjson` uses the same accept-set as of #3032;
+/// its focused spelling and error tests are below.
 #[test]
 fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
     // (spelling, jq's printed form)
@@ -43621,13 +43621,81 @@ fn test_low_surrogate_key_participates_in_duplicate_collapse_2008() {
     assert_eq!(stdout.trim(), "{\"a\u{FFFD}\":2}");
 }
 
-/// #2008 (code review): `fromjson`/`tonumber`'s own hand-rolled JSON string
-/// decoder (`parse_json_string_value` in `eval.rs`) is a second,
-/// independent implementation of surrogate handling from
+/// #3032: `fromjson` must use the jq input accept-set and preserve number
+/// literals, including overflow, inside containers as well as at the root.
+#[test]
+fn test_fromjson_jq_lenient_numbers_and_literal_spelling_3032() -> Result<()> {
+    for (source, expected) in [
+        ("007", "7"),
+        (".5", "0.5"),
+        ("1.e5", "1E+5"),
+        ("007.500", "7.500"),
+        ("[007,.5]", "[7,0.5]"),
+        (
+            r#"{"n":007.500,"big":1e400}"#,
+            r#"{"n":7.500,"big":1E+400}"#,
+        ),
+        ("1e400", "1E+400"),
+        ("+1", "1"),
+        ("nan", "null"),
+        ("sNaN", "null"),
+        ("Infinity", "1.7976931348623157e+308"),
+        ("  [007,.5] \n", "[7,0.5]"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson"], None)?;
+        assert_eq!(code, 0, "{source:?}: {stderr}");
+        assert_eq!(stdout.trim_end(), expected, "{source:?}");
+    }
+    Ok(())
+}
+
+/// #3032: validation still rejects malformed input, preserves the existing
+/// fromjson diagnostic and optional suppression, and does not change the
+/// `tonumber` probe for valid JSON that is not a number.
+#[test]
+fn test_fromjson_jq_lenient_rejects_invalid_text_3032() -> Result<()> {
+    for source in ["1.", "01x", "[1,]", r#""\ud800""#, "\"a\tb\""] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson"], None)?;
+        assert_eq!(code, 5, "{source:?}: {stdout:?} {stderr:?}");
+        assert!(
+            stderr.contains(&format!("(while parsing '{source}')")),
+            "{source:?}: {stderr}"
+        );
+
+        let (stdout, stderr, code) =
+            run_jq_full(&["-nc", "--arg", "s", source, "$s | fromjson?"], None)?;
+        assert_eq!(code, 0, "{source:?}: {stderr}");
+        assert!(stdout.is_empty(), "{source:?}: {stdout:?}");
+    }
+
+    // Validation runs before the cursor walk and caps nesting below the
+    // materializer's own recursion limit.
+    let deep = format!("{}0{}", "[".repeat(129), "]".repeat(129));
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "--arg", "s", &deep, "$s | fromjson"], None)?;
+    assert_eq!(code, 5, "{stdout:?} {stderr:?}");
+    assert!(stderr.contains("while parsing"), "{stderr}");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "--arg", "s", "null", "$s | try tonumber catch ."],
+        None,
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#""string (\"null\") cannot be parsed as a number""#
+    );
+    Ok(())
+}
+
+/// #2008 (code review): the former jq-mode `fromjson` JSON string decoder
+/// (`parse_json_string_value` in `eval.rs`) was independent of
 /// `json::light::decode_escapes` and had the identical gap -- erroring
 /// instead of substituting U+FFFD for a lone low surrogate. Confirmed live
 /// against the pinned oracle before the fix (succinctly errored, real jq
-/// substituted); a valid surrogate pair is an unaffected control.
+/// substituted); a valid surrogate pair is an unaffected control. Since
+/// #3032, jq-mode `fromjson` uses the shared validator and JSON cursor.
 #[test]
 fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
     let (stdout, stderr, code) =
@@ -43643,7 +43711,7 @@ fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
 }
 
 /// #2013: the opposite-direction bug from #2008/the test above -- a lone
-/// *high* surrogate (`\uD800`-`\uDBFF`) in `fromjson`'s own decoder wrongly
+/// *high* surrogate (`\uD800`-`\uDBFF`) in `fromjson`'s former jq-mode decoder wrongly
 /// substituted U+FFFD instead of raising, where real jq 1.7.1 rejects it
 /// (confirmed live). Covers every shape the issue's own investigation
 /// found: end-of-string, followed by a non-`\u` escape, followed by a
@@ -65382,9 +65450,9 @@ fn test_escaped_control_characters_still_accepted_2878() -> Result<()> {
     Ok(())
 }
 
-/// `fromjson` is a second, independent decoder (`eval.rs`), not reached
-/// through the document splitter at all -- so it needs its own arm of the
-/// same rule. jq rejects; jq mode must now too (#2878).
+/// `fromjson` has a separate input path from the document splitter, so it
+/// needs its own arm of the same rule. jq rejects; jq mode must too (#2878).
+/// Since #3032, this path uses the shared jq validator.
 ///
 /// The yq-mode counter-test lives in `yq_cli_tests.rs`: real yq *accepts*
 /// this, so the fix is mode-gated rather than format-gated (ADR-0018).
@@ -65406,10 +65474,11 @@ fn test_fromjson_rejects_raw_control_character_in_jq_mode_2878() -> Result<()> {
     Ok(())
 }
 
-/// `tonumber` shares `fromjson`'s decoder, and its "valid JSON but not a
-/// number" vs "not valid JSON at all" probe picks between two *different*
-/// error messages. #2878's rule moves a control-character string across that
-/// boundary -- in jq mode only, because each oracle classifies it its own way
+/// `tonumber` probes with the same jq validator as `fromjson`, and its
+/// "valid JSON but not a number" vs "not valid JSON at all" result picks
+/// between two *different* error messages. #2878's rule moves a control-
+/// character string across that boundary -- in jq mode only, because each
+/// oracle classifies it its own way
 /// (jq: a parse error; yq: a tag-conversion error). Pins that the probe is
 /// mode-sensitive, which it did not need to be before this (#2878).
 #[test]

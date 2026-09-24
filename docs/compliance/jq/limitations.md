@@ -337,7 +337,8 @@ approximates to the EOF form:
 | `"  a  "` | `Invalid numeric literal at line 1, column 4 …`        | as above, but with `at EOF` and column 5                             |
 
 Matching these needs a position-reporting JSON parser reporting jq's exact failure
-classes; the hand-rolled `parse_complete_json` in `src/jq/eval.rs` does not carry offsets.
+classes; the jq-mode `parse_complete_json` path validates the input but does not
+translate validation errors into jq's position-specific diagnostics.
 The shapes a filter is likely to branch on (`Invalid numeric literal`, `cannot be parsed
 as a number`) are exact, so this is left as a deliberate approximation.
 
@@ -7050,7 +7051,7 @@ behaviours to make. Pinned against jq 1.7.1 on a 2,015-row table
 (`tests/data/jq-literal-17-digit-oracle-2936.tsv`) plus the entry-point matrix in
 `tests/jq_cli_tests.rs` and the two-evaluator rows in `tests/jq_evaluator_parity_tests.rs`.
 
-### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
+### `--argjson`/`--jsonargs`/`fromjson` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240, #3032)
 
 Real jq's own number reader accepts a bare trailing `.` with nothing after it at all,
 treating it the same as if the dot weren't there:
@@ -7161,9 +7162,22 @@ side is jq's too: `nanx`, `nan1.5`, `nan(1)`, `infinity1`, `inf1`, `+-1`, `++1`,
 valid prefix is never read out of an invalid word. The grammar lives once, in
 `json::validate::jq_special_number`/`strip_leading_plus`; the `--seq` reader that first
 implemented it (#1723) now calls the same function. No ADR: ADR-0018 rule 2 decides this, and
-none of the rule-4 conditions apply. Not the `fromjson` path: its hand-written parser has
-none of the jq leniencies and is
-[#3032](https://github.com/rust-works/succinctly/issues/3032)'s.
+none of the rule-4 conditions apply. The `fromjson` path joined them in
+[#3032](https://github.com/rust-works/succinctly/issues/3032): jq mode now validates the
+entire string with `validate_jq_lenient` and materializes it through the JSON
+cursor, preserving decimal spelling and overflowing literals. Its former hand-written
+parser remains on the yq path, whose separate fidelity issue is #2018.
+
+```console
+$ jq -nc --arg s '007.500' '$s|fromjson'
+7.500
+$ succinctly jq -nc --arg s '007.500' '$s|fromjson'   # after #3032
+7.500
+$ jq -nc --arg s '1e400' '$s|fromjson'
+1E+400
+$ succinctly jq -nc --arg s '1e400' '$s|fromjson'     # after #3032
+1E+400
+```
 
 `--preserve-input` (a succinctly extension) echoes the source spelling verbatim, as it does
 for `007` and `.5`. yq mode is unmoved: `-p json` goes through the YAML parser and rejects

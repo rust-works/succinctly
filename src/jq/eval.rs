@@ -17692,8 +17692,22 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// JSON at all" (`"0x10"`), which jq words differently.
 fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     let bytes = s.as_bytes();
+    if !yq_mode {
+        // #3032: use the same jq accept-set and literal-preserving decoder as
+        // --argjson. Validation must precede semi-indexing: the index alone
+        // does not check JSON grammar or guarantee one complete value.
+        crate::json::validate::validate_jq_lenient(bytes).map_err(|e| e.to_string())?;
+        let index = crate::json::JsonIndex::build(bytes);
+        // STYLE-0012: this parser has no `optional` flag; its caller handles
+        // suppression, and the validator already bounds nesting below the
+        // materializer's own limit.
+        return super::eval_generic::to_owned::<JqSemantics, _>(&index.root(bytes).value())
+            .map_err(|e| e.to_string());
+    }
+
+    // yq retains its existing parser and error behavior (#2018).
     let mut pos = 0;
-    let value = parse_json_value(bytes, &mut pos, yq_mode)?;
+    let value = parse_json_value(bytes, &mut pos)?;
     while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
     }
@@ -17703,8 +17717,13 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     Ok(value)
 }
 
-/// Parse a JSON value starting at the given position
-fn parse_json_value(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
+/// Parse a JSON value starting at the given position.
+///
+/// Only reached in yq mode (#3032): `parse_complete_json` handles jq mode's
+/// `fromjson` through the shared validator and `JsonIndex` before this
+/// function is ever called, so everything below it always runs with yq's own
+/// accept/reject rules, never jq's.
+fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
     // Skip whitespace
     while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
         *pos += 1;
@@ -17744,19 +17763,19 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
         }
         b'"' => {
             // string
-            parse_json_string_value(bytes, pos, yq_mode)
+            parse_json_string_value(bytes, pos)
         }
         b'[' => {
             // array
-            parse_json_array(bytes, pos, yq_mode)
+            parse_json_array(bytes, pos)
         }
         b'{' => {
             // object
-            parse_json_object(bytes, pos, yq_mode)
+            parse_json_object(bytes, pos)
         }
         b'-' | b'0'..=b'9' => {
             // number
-            parse_json_number(bytes, pos, yq_mode)
+            parse_json_number(bytes, pos)
         }
         c => Err(format!("unexpected character: '{}'", c as char)),
     }
@@ -17767,11 +17786,7 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
 /// The bounds check is not redundant with [`parse_json_value`]'s: an object's
 /// key position is reached from [`parse_json_object`] directly, so `"{"` and
 /// `{"a":1,` arrive here at end of input.
-fn parse_json_string_value(
-    bytes: &[u8],
-    pos: &mut usize,
-    yq_mode: bool,
-) -> Result<OwnedValue, String> {
+fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() {
         return Err("unexpected end of input".to_string());
     }
@@ -17865,12 +17880,12 @@ fn parse_json_string_value(
                             // is a larger, separate gap (#2013); this only
                             // keeps yq's pre-#2008 behavior for the lone-low
                             // case unchanged (error) rather than silently
-                            // picking up jq's leniency here too.
-                            if yq_mode {
-                                return Err("invalid unicode codepoint".to_string());
-                            }
-                            result.push('\u{FFFD}');
-                            *pos += 3;
+                            // picking up jq's leniency here too. #3032 moved
+                            // jq mode off this decoder entirely, so the
+                            // U+FFFD substitution jq wants never applies here
+                            // any more -- this function only ever runs in yq
+                            // mode now.
+                            return Err("invalid unicode codepoint".to_string());
                         } else {
                             // codepoint is <= 0xFFFF (4 hex digits) and
                             // outside 0xD800-0xDFFF (both arms above already
@@ -17886,33 +17901,14 @@ fn parse_json_string_value(
                 }
                 *pos += 1;
             }
-            c if c < 0x20 && !yq_mode => {
-                // #2878: a raw, unescaped control character is rejected by
-                // real jq everywhere, `fromjson` included:
-                //   jq -nc '"[\"a\tb\"]" | fromjson'
-                //   -> Invalid string: control characters from U+0000
-                //      through U+001F must be escaped
-                // Gated on `yq_mode` because real yq *accepts* it here and
-                // answers `["a\tb"]` (confirmed live against yq v4.53.3) --
-                // the mode decides, not the format (ADR-0018). Same
-                // per-mode split precedent as the surrogate arms above
-                // (#2008/#2013). `0x7F` is deliberately not covered: jq's
-                // own check is on a signed char, so DEL passes it.
-                //
-                // This text is an internal signal, not output: both
-                // `parse_complete_json` callers discard the `Err(String)`
-                // and render their own diagnostic, so `fromjson` actually
-                // reports `Invalid numeric literal at EOF ...` here. That
-                // approximation of jq's per-reason wording is pre-existing
-                // and recorded in `docs/compliance/jq/limitations.md`; it is
-                // deliberately not widened by this fix, which is about
-                // accept-vs-reject.
-                return Err(format!(
-                    "Invalid string: control character 0x{c:02X} from U+0000 through U+001F must be escaped"
-                ));
-            }
             c => {
-                // Regular character - handle UTF-8
+                // Regular character - handle UTF-8, including a raw,
+                // unescaped control character: real jq rejects one here
+                // (`fromjson` included), but real yq *accepts* it and answers
+                // e.g. `["a\tb"]` for a raw tab (confirmed live against yq
+                // v4.53.3) -- the mode decides, not the format (ADR-0018).
+                // jq's own rejection lives in the shared validator this
+                // parser no longer shares with jq mode (#2878, #3032).
                 let remaining = &bytes[*pos..];
                 if let Ok(s) = core::str::from_utf8(remaining) {
                     if let Some(c) = s.chars().next() {
@@ -17933,7 +17929,7 @@ fn parse_json_string_value(
 }
 
 /// Parse a JSON array
-fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
+fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() || bytes[*pos] != b'[' {
         return Err("expected '['".to_string());
     }
@@ -17953,7 +17949,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
     }
 
     loop {
-        let value = parse_json_value(bytes, pos, yq_mode)?;
+        let value = parse_json_value(bytes, pos)?;
         elements.push(value);
 
         // Skip whitespace
@@ -17979,7 +17975,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Owne
 }
 
 /// Parse a JSON object
-fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
+fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() || bytes[*pos] != b'{' {
         return Err("expected '{{'".to_string());
     }
@@ -18005,7 +18001,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
         }
 
         // Parse key (must be a string)
-        let key = match parse_json_string_value(bytes, pos, yq_mode)? {
+        let key = match parse_json_string_value(bytes, pos)? {
             OwnedValue::String(s) => s,
             _ => return Err("object key must be a string".to_string()),
         };
@@ -18022,7 +18018,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
         *pos += 1;
 
         // Parse value
-        let value = parse_json_value(bytes, pos, yq_mode)?;
+        let value = parse_json_value(bytes, pos)?;
         entries.insert(key, value);
 
         // Skip whitespace
@@ -18048,7 +18044,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
 }
 
 /// Parse a JSON number
-fn parse_json_number(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
+fn parse_json_number(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
     let start = *pos;
 
     // Optional minus sign
@@ -18103,17 +18099,12 @@ fn parse_json_number(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<Own
     let num_str =
         core::str::from_utf8(&bytes[start..*pos]).map_err(|_| "invalid number encoding")?;
 
-    // #2936: `fromjson` is one of the entry points jq reads a literal
-    // through, so its double follows the mode like every other -- jq's
-    // 17-digit rounding, yq's plain parse. This parser predates the
-    // literal-preserving funnels and still hands back a bare `Float`
-    // (#3032 tracks moving it onto them); only the *value* moves here.
+    // #3032 moved jq mode off this decoder entirely (it now reads
+    // `fromjson` numbers through the literal-preserving funnels, same as
+    // `--argjson`), so this always runs in yq mode -- yq's own plain
+    // `f64::parse`, no 17-digit rounding.
     let to_float = |text: &str, err: &'static str| -> Result<f64, String> {
-        if yq_mode {
-            text.parse::<f64>().map_err(|_| err.to_string())
-        } else {
-            super::value::jq_literal_text_to_f64(text).ok_or_else(|| err.to_string())
-        }
+        text.parse::<f64>().map_err(|_| err.to_string())
     };
     if is_float {
         Ok(OwnedValue::Float(to_float(num_str, "invalid float")?))
@@ -83572,9 +83563,10 @@ mod tests {
     }
 
     /// A string that opens a container and stops used to index one byte past
-    /// the input while looking for an object key, panicking inside the JSON
-    /// parser. `fromjson` reached it directly; `tonumber` reaches it too, since
-    /// it asks the same parser whether a non-numeric string is valid JSON.
+    /// the input while looking for an object key, panicking inside the former
+    /// jq-mode JSON parser. `fromjson` reached it directly; `tonumber` did too
+    /// when probing whether a non-numeric string was valid JSON. Both now
+    /// validate first, but this remains a regression test for incomplete input.
     #[test]
     fn test_conversions_do_not_panic_at_end_of_input() {
         for input in [br#""{""#.as_slice(), br#""{\"a\":1,""#, br#""[""#] {

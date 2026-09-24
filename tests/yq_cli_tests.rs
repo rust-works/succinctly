@@ -34458,10 +34458,9 @@ fn test_abs_agrees_with_yq_modes_own_null_ordering_3041() -> Result<()> {
     Ok(())
 }
 
-/// #2008 (code review): `fromjson`/`tonumber`'s shared decoder
-/// (`parse_json_string_value` in `eval.rs`, reachable from both jq and yq
-/// mode via the same unparameterized `Builtin::FromJson` dispatch) is not
-/// jq-only -- #2008's own low-surrogate fix initially applied jq's leniency
+/// #2008 (code review): `fromjson`'s former shared decoder
+/// (`parse_json_string_value` in `eval.rs`) was used in both jq and yq
+/// modes. #2008's low-surrogate fix initially applied jq's leniency
 /// (substitute U+FFFD) unconditionally, which broke `succinctly yq`'s own
 /// fidelity: real yq's `fromjson` doesn't use jq's JSON string grammar at
 /// all, it decodes through go-yaml's quoted-scalar scanner, which rejects
@@ -34470,6 +34469,8 @@ fn test_abs_agrees_with_yq_modes_own_null_ordering_3041() -> Result<()> {
 /// `succinctly yq`'s `fromjson` keeps rejecting a lone low surrogate
 /// (ADR-0018: mode decides, never format), unlike jq mode's
 /// `test_fromjson_low_surrogate_substitutes_replacement_character_2008`.
+/// #3032 moved jq-mode `fromjson` to the shared validator and JSON cursor;
+/// yq mode still uses this decoder.
 #[test]
 fn test_yq_fromjson_low_surrogate_still_rejected_2008() -> Result<()> {
     let (_stdout, stderr, code) =
@@ -47402,6 +47403,128 @@ fn test_fromjson_accepts_raw_control_character_in_yq_mode_2878() -> Result<()> {
         stdout.contains("a\\tb"),
         "yq mode should decode the raw tab, got: {stdout:?}"
     );
+    Ok(())
+}
+
+/// #3032 moved jq-mode `fromjson` off this hand-rolled recursive-descent
+/// parser (`parse_json_value` and friends in `eval.rs`) onto the shared
+/// validator/`JsonIndex` path. Before that, jq-mode's own extensive
+/// `fromjson`/`tonumber` test suite exercised this parser's branches for
+/// free; now it's reachable only through yq mode, and yq's own `fromjson`
+/// coverage here was thin (surrogates and the raw-control-character case
+/// above, nothing else) -- a PR review coverage report on #3032 caught the
+/// resulting drop. These tests restore direct coverage of the literal,
+/// whitespace, container, number and string-escape branches, now that
+/// nothing else exercises them.
+#[test]
+fn test_yq_fromjson_literals_null_true_false_3032() -> Result<()> {
+    for (json, expected) in [("null", "null"), ("true", "true"), ("false", "false")] {
+        let filter = format!("\"{json}\" | fromjson");
+        let (out, code) = run_yq_stdin(&filter, "", &["-n"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), expected, "{filter}");
+    }
+
+    // Truncated/misspelled literals fall through the `starts_with` checks
+    // into each literal arm's own error.
+    for json in ["nul", "tru", "fals"] {
+        let filter = format!("\"{json}\" | fromjson");
+        let (_out, code) = run_yq_stdin(&filter, "", &["-n"])?;
+        assert_ne!(code, 0, "{filter} should be rejected");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_fromjson_whitespace_and_incomplete_input_3032() -> Result<()> {
+    // Leading/trailing whitespace around a value is skipped on both ends.
+    let (out, code) = run_yq_stdin(r#""   null   " | fromjson"#, "", &["-n"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    // Whitespace-only and empty input never reach a value at all.
+    for filter in [r#""   " | fromjson"#, r#""" | fromjson"#] {
+        let (_out, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_ne!(code, 0, "{filter} should be rejected");
+    }
+
+    // A second value after the first is trailing content, not a second
+    // document -- `fromjson` must consume the whole string.
+    let (_out, code) = run_yq_stdin(r#""1 2" | fromjson"#, "", &["-n"])?;
+    assert_ne!(code, 0, "trailing content after a value should be rejected");
+    Ok(())
+}
+
+#[test]
+fn test_yq_fromjson_containers_3032() -> Result<()> {
+    let ok_cases = [
+        (r#""[]" | fromjson"#, "[]"),
+        (r#""{}" | fromjson"#, "{}"),
+        (r#""[1,2,3]" | fromjson"#, "- 1\n- 2\n- 3"),
+        (r#""{\"a\":1}" | fromjson"#, "a: 1"),
+    ];
+    for (filter, expected) in ok_cases {
+        let (out, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), expected, "{filter}");
+    }
+
+    // Missing closing delimiter, missing separator, and a missing colon
+    // between an object's key and value all raise rather than panic.
+    let err_cases = [
+        r#""[1,2" | fromjson"#,        // unterminated array
+        r#""[1 2]" | fromjson"#,       // expected ',' or ']'
+        r#""{\"a\":1" | fromjson"#,    // unterminated object
+        r#""{\"a\" 1}" | fromjson"#,   // expected ':'
+        r#""{\"a\":1 2}" | fromjson"#, // expected ',' or '}'
+    ];
+    for filter in err_cases {
+        let (_out, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_ne!(code, 0, "{filter} should be rejected");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_fromjson_number_formats_3032() -> Result<()> {
+    let ok_cases = [
+        (r#""0" | fromjson"#, "0"),
+        (r#""123" | fromjson"#, "123"),
+        (r#""-5" | fromjson"#, "-5"),
+        (r#""1e+5" | fromjson"#, "100000"),
+        (r#""1e10" | fromjson"#, "1e+10"),
+        // Too large for i64: falls back to the float path.
+        (r#""99999999999999999999" | fromjson"#, "1e+20"),
+    ];
+    for (filter, expected) in ok_cases {
+        let (out, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), expected, "{filter}");
+    }
+
+    // A lone minus, a decimal point with no fractional digit, and an
+    // exponent marker with no exponent digit are each incomplete numbers.
+    let err_cases = [
+        r#""-a" | fromjson"#,
+        r#""1." | fromjson"#,
+        r#""1e" | fromjson"#,
+    ];
+    for filter in err_cases {
+        let (_out, code) = run_yq_stdin(filter, "", &["-n"])?;
+        assert_ne!(code, 0, "{filter} should be rejected");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yq_fromjson_standard_string_escapes_3032() -> Result<()> {
+    // JSON text `"a\nb\tc\rd\be\ff\/g\\h\"i"`, embedded in a yq string
+    // literal (each backslash and quote doubled once more for the outer
+    // literal's own escaping).
+    let filter = r#""\"a\\nb\\tc\\rd\\be\\ff\\/g\\\\h\\\"i\"" | fromjson"#;
+    let (out, code) = run_yq_stdin(filter, "", &["-n"])?;
+    assert_eq!(code, 0, "stdout: {out:?}");
+    assert_eq!(out.trim_end_matches('\n'), "a\nb\tc\rd\x08e\x0Cf/g\\h\"i");
     Ok(())
 }
 

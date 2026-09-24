@@ -61,6 +61,18 @@ fn assert_parity(json: &[u8], filter: &str) {
 }
 
 #[test]
+fn test_fromjson_jq_lenient_numbers_match_both_evaluators_3032() {
+    for (filter, expected) in [
+        (r#""007.500" | fromjson"#, "7.500"),
+        (r#""[007,.5,1e400]" | fromjson"#, "[7,0.5,1E+400]"),
+        (r#""+1" | fromjson"#, "1"),
+    ] {
+        assert_eq!(full_outputs(b"null", filter), [expected], "{filter}");
+        assert_parity(b"null", filter);
+    }
+}
+
+#[test]
 fn test_pick_pathexps_jq_3026() {
     for (input, filter, expected) in [
         (br#"{"a":1,"n":5}"#.as_slice(), "pick(.n)", r#"{"n":5}"#),
