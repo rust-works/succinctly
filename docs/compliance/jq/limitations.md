@@ -6341,12 +6341,14 @@ What it does not change:
   structural limit #2157 recorded above. Measured: `[foreach .users[0:4000][]
   as $r ({}; .[$r.name] = $r.score; length)]` 4.89 s -> 1.38 s (3.5x).
 - **yq mode** keeps the evaluator's route for every assignment but #3025's
-  `.field op= <number>`: yq's `=` vivifies its targets before the right side
+  `.field op= <number>` (the field spelled `.f`, `.["f"]` or `(.f)`, the
+  number any closed expression such as `$r.n`): yq's `=` vivifies its targets before the right side
   runs (#2481), classifies no-op writes, and redirects writes through
   aliases (#1351), none of which a direct write reproduces.
 - A fold running inside an `as` binding that holds a document node (the
   #2889 embed table is active, e.g. `. as $d | reduce ...`) skips the
-  owned step entirely, as before (3.44 s at N=4,000, unchanged).
+  owned step entirely, as before (3.44 s at N=4,000, unchanged); tracked
+  in [#3241](https://github.com/rust-works/succinctly/issues/3241).
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
 

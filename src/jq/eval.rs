@@ -9051,8 +9051,9 @@ fn closed_expr_shape(expr: &Expr) -> bool {
 /// Evaluate an expression that provably never reads `.` and has exactly one
 /// output (#3138): a literal, an array or object built from closed parts,
 /// or a pipe whose head is closed and whose later stages
-/// [`eval_owned_fast_path`] answers against the value so far -- `$r.name`, `$r.name | tostring` once
-/// `substitute_vars` has spliced `$r` in as a literal object.
+/// [`eval_owned_fast_path`] answers against the value so far -- `$r.name`,
+/// `$r.name | tostring` once `substitute_vars` has spliced `$r` in as a
+/// literal object.
 ///
 /// `None` for anything else, and for any stage that errors or produces no
 /// output: the caller then declines, so a key that would raise (`$r.name` on
@@ -9060,14 +9061,15 @@ fn closed_expr_shape(expr: &Expr) -> bool {
 /// Nothing here has a side effect or reads the input, so evaluating it
 /// earlier than jq would, or once where jq might ask twice, is unobservable.
 ///
-/// It replaces #2152's literal-only `closed_expr_to_owned`, of
+/// It replaces #2152's literal-only `literal_shaped_expr_to_owned`, of
 /// which it is a superset: every literal tree converts to the same value,
 /// and each addition is a pure function of the literal it starts from.
 fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
     closed_expr_to_owned_at_depth::<S>(expr, 0)
 }
 
-/// [`closed_expr_to_owned`], with a depth guard over the array/object shapes `owned_to_expr_at_depth` builds.
+/// [`closed_expr_to_owned`], with a depth guard over the array/object
+/// shapes `owned_to_expr_at_depth` builds.
 fn closed_expr_to_owned_at_depth<S: EvalSemantics>(
     expr: &Expr,
     depth: usize,
@@ -9151,7 +9153,8 @@ enum OwnedAssignRhs {
 /// before the one write:
 ///
 /// - jq mode only, bar the narrow `.field op= <number>` shape #3025
-///   already took in both modes. yq's `=` vivifies its targets before the
+///   already took in both modes (the field spelled `.f`, `.["f"]` or `(.f)`,
+///   the number any closed expression, `$r.n` included). yq's `=` vivifies its targets before the
 ///   right side runs (#2481), classifies no-op writes, and redirects through
 ///   aliases (#1351), none of which a direct write reproduces.
 /// - The path is static `.name`/`.[n]` steps and `.[K]` steps whose `K` is
@@ -9210,26 +9213,26 @@ fn owned_assign_step<S: EvalSemantics>(
     // component and allocates nothing for the path.
     let mut steps = Vec::new();
     let single = match owned_assign_single_step::<S>(path) {
-        Some(step) => Some(step?),
-        None => {
+        SingleStep::Step(step) => Some(step),
+        SingleStep::Unclosed => return None,
+        SingleStep::Chain => {
             owned_assign_path_steps::<S>(path, &mut steps)?;
             None
         }
     };
-    let mut current: Option<&OwnedValue> = Some(state);
+    let mut old: &OwnedValue = state;
     for step in single.iter().chain(steps.iter()) {
-        current = owned_assign_step_child(step, current.unwrap_or(&OwnedValue::Null))?;
+        old = owned_assign_step_child(step, old)?;
     }
     if single.is_none() && steps.is_empty() {
         return None;
     }
-    let old = current.unwrap_or(&OwnedValue::Null);
 
     if S::TAG != EvalTag::Jq
         && !(matches!(expr, Expr::CompoundAssign { .. })
             && matches!(single.as_deref(), Some(Expr::Field(_)))
             && matches!(state, OwnedValue::Object(_))
-            && current.is_some_and(OwnedValue::is_number)
+            && old.is_number()
             && matches!(&rhs, OwnedAssignRhs::Combine(_, right) if right.is_number()))
     {
         return None;
@@ -9251,22 +9254,33 @@ fn owned_assign_step<S: EvalSemantics>(
     })
 }
 
-/// The one component a single-step [`owned_assign_step`] path names:
-/// `Some(Some(_))` for `.name`, `.[n]` or `.[K]` with a closed `K` (under
-/// any parens or one-stage pipe), `Some(None)` when that one step's key is
-/// not closed, and `None` when the path is not a single step at all.
-fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> Option<Option<Cow<'_, Expr>>> {
+/// What [`owned_assign_single_step`] found at the head of a path.
+enum SingleStep<'e> {
+    /// `.name`, `.[n]` or `.[K]` with a closed `K`, under any parens or
+    /// one-stage pipe: the one component the write names.
+    Step(Cow<'e, Expr>),
+    /// A single `.[K]` whose `K` is not closed: the assignment declines.
+    Unclosed,
+    /// Not a single step; [`owned_assign_path_steps`] walks it.
+    Chain,
+}
+
+/// The one component a single-step [`owned_assign_step`] path names, found
+/// without allocating a step list for the common fold shape.
+fn owned_assign_single_step<S: EvalSemantics>(path: &Expr) -> SingleStep<'_> {
     match path {
-        Expr::Field(_) | Expr::Index { key: None, .. } => Some(Some(Cow::Borrowed(path))),
+        Expr::Field(_) | Expr::Index { key: None, .. } => SingleStep::Step(Cow::Borrowed(path)),
         Expr::Paren(inner) => owned_assign_single_step::<S>(inner),
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => owned_assign_single_step::<S>(only),
-            _ => None,
+            _ => SingleStep::Chain,
         },
         Expr::IndexExpr { target, key } if matches!(target.as_ref(), Expr::Identity) => {
-            Some(closed_key_component::<S>(key).map(Cow::Owned))
+            closed_key_component::<S>(key).map_or(SingleStep::Unclosed, |step| {
+                SingleStep::Step(Cow::Owned(step))
+            })
         }
-        _ => None,
+        _ => SingleStep::Chain,
     }
 }
 
@@ -9308,22 +9322,20 @@ fn closed_key_component<S: EvalSemantics>(key: &Expr) -> Option<Expr> {
     }
 }
 
-/// Where `step` lands inside `container`: `Some(child)` (`None` for a slot
-/// the write creates) when [`owned_assign_step`] may write through it, and
-/// `None` for every case jq treats specially -- a key of the wrong kind for
-/// its container, a negative index, or one past the end, which pads.
-fn owned_assign_step_child<'v>(
-    step: &Expr,
-    container: &'v OwnedValue,
-) -> Option<Option<&'v OwnedValue>> {
+/// Where `step` lands inside `container`: `Some(child)` when
+/// [`owned_assign_step`] may write through it -- `null` for a slot the
+/// write creates, which is what jq reads there too -- and `None` for every
+/// case jq treats specially: a key of the wrong kind for its container, a
+/// negative index, or one past the end, which pads.
+fn owned_assign_step_child<'v>(step: &Expr, container: &'v OwnedValue) -> Option<&'v OwnedValue> {
     match (step, container) {
-        (Expr::Field(name), OwnedValue::Object(map)) => Some(map.get(name)),
-        (Expr::Field(_), OwnedValue::Null) | (Expr::Index { idx: 0, .. }, OwnedValue::Null) => {
-            Some(None)
+        (Expr::Field(name), OwnedValue::Object(map)) => {
+            Some(map.get(name).unwrap_or(&OwnedValue::Null))
         }
+        (Expr::Field(_) | Expr::Index { idx: 0, .. }, OwnedValue::Null) => Some(&OwnedValue::Null),
         (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
             let idx = usize::try_from(*idx).ok()?;
-            (idx <= items.len()).then(|| items.get(idx))
+            (idx <= items.len()).then(|| items.get(idx).unwrap_or(&OwnedValue::Null))
         }
         _ => None,
     }
@@ -61340,6 +61352,9 @@ mod tests {
             (".[2] = 9", array.clone()),
             (".[0] = 9", OwnedValue::Null),
             (".[$r.name] = {($r.name): $r.id}", object.clone()),
+            // `[]` parses as `Array(Comma([]))`; only `[empty]` reaches the
+            // `Array(Builtin::Empty)` arm.
+            (".a = [empty]", object.clone()),
         ];
         for (src, input) in handled {
             let expr = subst(src);
@@ -61400,8 +61415,32 @@ mod tests {
             assert_eq!(format!("{returned:?}"), format!("{input:?}"), "{src}");
         }
 
-        // yq mode keeps only #3025's `.field op= <number>` shape: its `=`
-        // vivifies before the right side runs and redirects through aliases.
+        // yq mode keeps only #3025's `.field op= <number>` shape -- however
+        // the field is spelled, and with any closed number on the right --
+        // and answers it exactly as its own route does.
+        for src in [
+            ".User7 += 1",
+            ".[\"User7\"] += $r.score",
+            "(.User7) -= $r.id",
+            ".[$r.name] *= 2",
+        ] {
+            let expr = subst(src);
+            let bridge = normalize(eval_owned_input_bridge::<Vec<u64>, YqSemantics>(
+                &expr, &object, false,
+            ));
+            let OwnedStep::Handled(Ok(consumed)) =
+                try_eval_owned_step::<YqSemantics>(&expr, object.clone())
+            else {
+                panic!("yq: consuming route did not handle {src}");
+            };
+            assert_eq!(
+                format!("{:?}", (vec![consumed], "ok")),
+                format!("{bridge:?}"),
+                "yq: {src}"
+            );
+        }
+        // Everything else declines there: its `=` vivifies before the right
+        // side runs and redirects through aliases.
         for src in [".[$r.name] = 1", ".missing += 1", ".a.i += 1", ".User7 = 1"] {
             let expr = subst(src);
             assert!(
@@ -61411,6 +61450,72 @@ mod tests {
                 ),
                 "yq: {src}"
             );
+        }
+    }
+
+    /// #3138: the fold loops' own wiring around [`owned_assign_step`] --
+    /// `reduce`, `foreach`, `until`, the `?//` alternative retry, and a fold
+    /// under an `as` binding (the #2889 embed table, which skips the owned
+    /// step) -- end to end. Every expected output is captured from jq 1.7.1.
+    #[test]
+    fn owned_assign_step_fold_rows_match_jq_3138() {
+        let records =
+            br#"[{"name":"a","score":1.10},{"name":"b","score":2},{"name":"a","score":3}]"#;
+        for (json, filter, expected) in [
+            (
+                &b"null"[..],
+                r#"reduce ("a","b","a") as $k ({}; .[$k] += 1)"#,
+                r#"{"a":2,"b":1}"#,
+            ),
+            // An overwritten key keeps its position.
+            (
+                b"null",
+                r#"reduce ("b","a","b") as $k ({"a":0,"b":0,"c":0}; .[$k] = 9)"#,
+                r#"{"a":9,"b":9,"c":0}"#,
+            ),
+            (
+                b"null",
+                r"reduce (0,1,2) as $k (null; .[$k] = $k)",
+                "[0,1,2]",
+            ),
+            (
+                &records[..],
+                r"reduce .[] as $r ({}; .[$r.name] = $r.score)",
+                r#"{"a":3,"b":2}"#,
+            ),
+            (
+                &records[..],
+                r"reduce .[] as $r ({}; .[$r.name] |= . + $r.score)",
+                r#"{"a":4.1,"b":2}"#,
+            ),
+            (
+                &records[..],
+                r"reduce .[] as $r ({}; .x[$r.name] //= $r.score)",
+                r#"{"x":{"a":1.10,"b":2}}"#,
+            ),
+            (
+                &records[..],
+                r". as $d | reduce $d[] as $r ({}; .[$r.name] = $r.score)",
+                r#"{"a":3,"b":2}"#,
+            ),
+            (
+                b"null",
+                r#"[foreach ("a","b","a") as $k ({}; .[$k] += 1; .)]"#,
+                r#"[{"a":1},{"a":1,"b":1},{"a":2,"b":1}]"#,
+            ),
+            (br#"{"a":0}"#, r"until(.a == 3; .a += 1)", r#"{"a":3}"#),
+            (
+                br#"[{"a":1},{"a":2}]"#,
+                r#"reduce .[] as {a:$x} ?// {a:$y} ({}; if $x==1 then error("boom") else .[$y|tostring] = $x end)"#,
+                r#"{"1":null,"null":2}"#,
+            ),
+            (
+                br#"[{"a":1},{"a":2}]"#,
+                r"reduce .[] as [$x] ?// {a:$x} ({}; .[$x|tostring] = $x)",
+                r#"{"1":1,"2":2}"#,
+            ),
+        ] {
+            assert_eq!(outputs(json, filter), [expected], "{filter}");
         }
     }
 
@@ -105557,6 +105662,19 @@ mod share_audit_2999 {
             by_kind, expected,
             "{filter}: forced copies by site:\n{sites}"
         );
+    }
+
+    /// #3138: a `reduce` whose UPDATE assigns into the accumulator hands
+    /// the state to [`owned_assign_step`] unshared, so 1,000 steps force no
+    /// copy on write at all.
+    #[test]
+    fn fold_assign_step_copies_nothing_3138() {
+        let body: Vec<String> = (0..1000)
+            .map(|i| format!("{{\"name\":\"u{i}\",\"score\":{i}}}"))
+            .collect();
+        let json = format!("[{}]", body.join(",")).into_bytes();
+        assert_forced(&json, "reduce .[] as $r ({}; .[$r.name] = $r.score)", &[]);
+        assert_forced(&json, "reduce .[] as $r ({}; .x[$r.name] += $r.score)", &[]);
     }
 
     /// The eager single-path route owns its document outright: nothing is
