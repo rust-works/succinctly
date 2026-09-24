@@ -1939,6 +1939,29 @@ what distinguishes its call shape from its three siblings') until the real rever
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 
+A lone untracked target refuses too, although real yq deletes nothing: `del(1)` on
+`{a: 1}` prints `a: 1` in yq. succinctly cannot skip it safely, because its "untracked" is
+wider than yq's "has no path". yq's `$var` keeps node identity, so `del(.a as $y | $y)`
+deletes `.a` ([#2643](https://github.com/rust-works/succinctly/issues/2643)). yq's `tojson`
+keeps its input's path, so `del(.a | tojson)` deletes `.a` as well. Skipping untracked
+targets would turn both refusals into silently dropped deletes.
+
+The one untracked target succinctly does skip is a `null`/`true`/`false` literal
+identical to its input ([#3207](https://github.com/rust-works/succinctly/issues/3207)).
+When every target is one of those, the result matches real yq: `null | del(null)`,
+`[null] | .[] |= del(null)` and `map(del(null))` leave their input unchanged. jq's
+`jv_identical` rule answers such a literal with the root path `[]` (in jq,
+`null | path(null)` is `[[]]`), and that rule is gated to jq mode. In yq mode the root
+path used to reach yq's bare-`del(.)` rule, which printed nothing. A mix with a tracked
+target (`null | del(null, .a)`) still refuses.
+
+The test is value identity with the input, not whether the target has a path, so a literal
+that doesn't equal its input still refuses where real yq deletes nothing:
+`true | del(null)`, `true | del(. == false)`, `{a: {b: 1}} | .a.b |= del(null)`, and
+`[null, 1] | map(del(null))`, where the `1` element refuses. Skipping by the value's
+*source* (literal versus `$var`/`tojson`) instead would need that provenance at the
+resolver's terminal, which it does not have.
+
 ### `del()` with a field key against a scalar root: errors instead of no-op
 
 Deleting a field key from a scalar document raises `Cannot index <type> with string

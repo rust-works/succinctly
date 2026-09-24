@@ -24755,6 +24755,79 @@ fn test_yq_untracked_comma_branch_del_still_raises_1764() -> Result<()> {
     Ok(())
 }
 
+/// #3207: a `del()` whose every resolved target is a `null`/`true`/`false`
+/// literal identical to its input deletes nothing, as in real yq v4.53.3.
+/// #3125's jq-only identity carve-out used to resolve that literal to the
+/// root path, and yq's bare-`del(.)` rule (#1702) then printed *nothing*,
+/// exit 0 -- the document silently discarded (`map(del(null))` dropped the
+/// element). Nested in `|=`/`=`, the unchanged value is what the enclosing
+/// update writes back. Expected outputs captured from yq v4.53.3 with
+/// `-o json -I0`.
+#[test]
+fn test_yq_del_identical_null_bool_literal_is_noop_3207() -> Result<()> {
+    for (filter, doc, expected) in [
+        ("del(null)", "null\n", "null"),
+        ("del(true)", "true\n", "true"),
+        ("del(false)", "false\n", "false"),
+        ("del(null, null)", "null\n", "null"),
+        ("del(. == true)", "true\n", "true"),
+        (".[] |= del(null)", "[null]\n", "[null]"),
+        ("map(del(null))", "[null]\n", "[null]"),
+        (".[] |= del(true)", "[true]\n", "[true]"),
+        (
+            ".b = (.a | del(null))",
+            "a: null\n",
+            r#"{"a":null,"b":null}"#,
+        ),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "{filter} on {doc:?}: err={err}");
+        assert_eq!(out.trim(), expected, "{filter} on {doc:?}");
+    }
+    // The default YAML route prints the document, not nothing.
+    for (filter, doc) in [("del(null)", "null\n"), ("del(false)", "false\n")] {
+        let (out, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out, doc, "{filter}");
+    }
+    Ok(())
+}
+
+/// #3207: every other untracked `del()` target still refuses, as before.
+/// A mix of the identical literal with a tracked target is #1865's
+/// order-dependent case (`del(., null)` keeps a `null` document in yq,
+/// `del(null, .)` deletes it) -- these used to discard the document too.
+/// And succinctly's "untracked" is wider than yq's "pathless": yq's `$var`
+/// keeps node identity and `tojson` keeps its input's path, so both of
+/// these *delete `.a`* in yq; a no-op here would silently drop the delete.
+#[test]
+fn test_yq_del_other_untracked_targets_still_refuse_3207() -> Result<()> {
+    for (filter, doc) in [
+        ("del(null, .a)", "null\n"),
+        ("del(., null)", "null\n"),
+        ("del(null, .)", "null\n"),
+        ("del(false)", "null\n"),
+        ("del(1)", "a: 1\n"),
+        ("del(.a as $y | $y)", "a: {b: 1}\nc: 2\n"),
+        ("del(.a | tojson)", "a: {b: 1}\n"),
+        // Recorded divergences: the skip keys on value identity with the
+        // input, so a literal that is *not* identical refuses where yq
+        // deletes nothing (docs/compliance/yq/limitations.md).
+        ("del(null)", "true\n"),
+        ("del(. == false)", "true\n"),
+        (".a.b |= del(null)", "a: {b: 1}\n"),
+        ("map(del(null))", "[null, 1]\n"),
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter} on {doc:?}");
+        assert!(
+            err.contains("Invalid path expression"),
+            "{filter} on {doc:?}: err={err}"
+        );
+    }
+    Ok(())
+}
+
 /// #1764: the no-op is not specific to a multi-branch `Expr::Comma` --
 /// a single bare untracked expression, with no comma at all, is the
 /// identical no-op. Confirmed live against yq v4.53.3: `(1) = 5` on

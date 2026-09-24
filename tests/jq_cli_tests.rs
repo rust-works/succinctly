@@ -56470,6 +56470,32 @@ fn test_jq_mode_null_ordering_keeps_total_order_2483() -> Result<()> {
     Ok(())
 }
 
+/// #3207: #3125's identical-null/bool carve-out is gated to jq mode, and jq
+/// mode must keep it -- `del()` of the identical literal deletes the root, the
+/// same `[]` path `path(null)` answers. Captured against jq 1.7.1.
+#[test]
+fn test_jq_mode_del_identical_null_bool_literal_deletes_root_3207() -> Result<()> {
+    for (doc, filter, expected) in [
+        ("null", "del(null)", "null"),
+        ("true", "del(true)", "null"),
+        ("false", "del(false)", "null"),
+        // Nested: the inner `del` deletes its root and yields `null`.
+        ("[true]", ".[] |= del(true)", "[null]"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {doc}");
+        assert_eq!(out.trim(), expected, "`{filter}` on {doc}");
+    }
+    // A non-identical pairing still refuses.
+    let (_out, err, code) = run_jq_full(&["-c", "del(false)"], Some("null"))?;
+    assert_eq!(code, 5);
+    assert!(
+        err.contains("Invalid path expression with result false"),
+        "err={err}"
+    );
+    Ok(())
+}
+
 /// #2484: yq mode's new "leave the target untouched" rule for a zero-output
 /// `|=` filter (`update_path`'s terminal `Expr::Identity` arm) must not
 /// leak into jq mode -- jq 1.7.1 (since 1.7) deletes the key/element
