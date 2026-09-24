@@ -16814,23 +16814,28 @@ impl<V: DocumentValue> PathContextTrail<V> {
         }
     }
 
-    /// One link of the initial seed itself (#3020) -- every level `from_climb`
-    /// climbs below [`PATH_CONTEXT_SEED_MIN_LEVELS`] is real document ancestry,
-    /// not a step [`recursion_depth`](StepTrail::recursion_depth) should ever
-    /// charge, so unlike [`extend_from`](StepTrail::extend_from) this sets the
-    /// new link's own `seed` to its own `depth` rather than inheriting the
-    /// parent's.
-    fn seeded_link(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        let depth = self.depth() + 1;
+    /// One link below `self`, at an explicit `seed` -- shared by
+    /// [`seeded_link`](Self::seeded_link) and
+    /// [`extend_from`](StepTrail::extend_from), which differ only in what
+    /// they pass here (#3020 review: keeps the two `PathContextLink`
+    /// constructions from drifting out of sync on a future field).
+    fn link(&self, component: OwnedValue, from: &PathNode<V>, seed: usize) -> Self {
         Self::Link(Rc::new(PathContextLink {
             parent: self.clone(),
             step: PathContextStep {
                 component,
                 from: from.clone(),
             },
-            depth,
-            seed: depth,
+            depth: self.depth() + 1,
+            seed,
         }))
+    }
+
+    /// One link of the initial seed itself -- see `PathContextLink`'s own
+    /// `seed` field doc comment for why this passes a different `seed` than
+    /// [`extend_from`](StepTrail::extend_from) does.
+    fn seeded_link(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
+        self.link(component, from, self.depth() + 1)
     }
 
     /// `depth` at the point this trail was seeded from a nested input's real
@@ -16925,15 +16930,7 @@ impl<V: DocumentValue> StepTrail<V> for PathContextTrail<V> {
     }
 
     fn extend_from(&self, component: OwnedValue, from: &PathNode<V>) -> Self {
-        Self::Link(Rc::new(PathContextLink {
-            parent: self.clone(),
-            step: PathContextStep {
-                component,
-                from: from.clone(),
-            },
-            depth: self.depth() + 1,
-            seed: self.seed_depth(),
-        }))
+        self.link(component, from, self.seed_depth())
     }
 }
 
