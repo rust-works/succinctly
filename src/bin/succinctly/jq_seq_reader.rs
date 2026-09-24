@@ -86,6 +86,10 @@ const MAX_PARSING_DEPTH: usize = 256;
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 const JQ_FGETS_CHUNK: usize = 4095;
 
+/// The prefix jq 1.7.1's `main` puts on a `--seq` parse error it skips
+/// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`).
+pub(crate) const IGNORED_PARSE_ERROR: &str = "jq: ignoring parse error: ";
+
 /// jq's `fgets` chunks over one source, as their lengths in order: each
 /// ends just after a newline or after [`JQ_FGETS_CHUNK`] bytes, whichever
 /// comes first. The one definition of that rule, shared by
@@ -388,6 +392,19 @@ pub(crate) fn walk_stream(
     let slurp_position_lost = reader.warned_in_final_buffer
         || (reader.last_warning_at_eof
             && !(reader.last_byte_yielded_value && final_buffer_start < total));
+    // #3201: jq raises the EOF branch's report in the *next* `next_input`
+    // call exactly when the terminal call returned without an error -- the
+    // same condition that keeps its position -- so it is deferred past the
+    // filter iff the position survives. Otherwise it is the reading call's,
+    // and the last warning printed.
+    let deferred_warning = match reader.pending_eof_warning.take() {
+        Some(body) if !slurp_position_lost => Some(body),
+        Some(body) => {
+            reader.emit_warning(&body);
+            None
+        }
+        None => None,
+    };
     SeqStreamWalk {
         slurp_position_lost,
         // Only non-slurp output names a location per value; `-s` would throw
@@ -398,7 +415,7 @@ pub(crate) fn walk_stream(
             debug_assert_eq!(reader.yielded_at.len(), reader.values.len());
             value_locations(raw_bytes, &reader.yielded_at)
         },
-        deferred_warning: reader.deferred_warning,
+        deferred_warning,
         values: reader.values,
     }
 }
@@ -720,11 +737,12 @@ struct Reader<'a> {
     /// terminal refill, which is what costs jq its position (#2947/#3003);
     /// see [`SeqStreamWalk::slurp_position_lost`].
     warned_in_final_buffer: bool,
-    /// [`walk_stream`]'s `slurp`: whether an EOF warning can be deferred to
-    /// jq's next `next_input` call ([`SeqStreamWalk::deferred_warning`]).
+    /// [`walk_stream`]'s `slurp`: whether the EOF branch's warning is held
+    /// in `pending_eof_warning` for [`walk_stream`] to emit or defer
+    /// ([`SeqStreamWalk::deferred_warning`]).
     defers_eof_warning: bool,
-    /// The EOF warning held back instead of emitted, per `defers_eof_warning`.
-    deferred_warning: Option<String>,
+    /// The EOF branch's warning body, held per `defers_eof_warning`.
+    pending_eof_warning: Option<String>,
     /// Whether scanning the stream's *last* byte handed a value to the
     /// caller -- jq's `jv_parser_next` returning `OK` with its buffer fully
     /// consumed, so `has_more == 0` and the EOF branch is never reached in
@@ -772,7 +790,7 @@ impl<'a> Reader<'a> {
             yielded_in_final_buffer: false,
             warned_in_final_buffer: false,
             defers_eof_warning: false,
-            deferred_warning: None,
+            pending_eof_warning: None,
             last_byte_yielded_value: false,
             stopped: false,
             emit,
@@ -787,18 +805,19 @@ impl<'a> Reader<'a> {
                 self.warned_in_final_buffer = true;
             }
         }
-        // #3201: under `-s`, a value yielded on a non-empty final buffer's
-        // last byte ends jq's terminal `next_input` call there, and the EOF
-        // branch's report waits for the next call -- after the filter ran.
-        if self.at_eof
-            && self.defers_eof_warning
-            && self.last_byte_yielded_value
-            && self.final_buffer_start < self.offset
-        {
-            self.deferred_warning = Some(body.to_string());
+        // #3201: under `-s` the EOF branch's report is held here and
+        // [`walk_stream`] decides, once the whole walk has answered
+        // `slurp_position_lost`, whether jq raises it in the reading call
+        // (emitted then) or in the next one (deferred).
+        if self.at_eof && self.defers_eof_warning {
+            self.pending_eof_warning = Some(body.to_string());
             return;
         }
-        (self.emit)(&format!("jq: ignoring parse error: {body}"));
+        self.emit_warning(body);
+    }
+
+    fn emit_warning(&mut self, body: &str) {
+        (self.emit)(&format!("{IGNORED_PARSE_ERROR}{body}"));
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a
@@ -1709,6 +1728,17 @@ mod tests {
         // The final buffer's last byte: a trailing newline starts an empty
         // final buffer, which reports in the reading call.
         assert_eq!(deferred_slurp(&[b"\x1e1{\n"]), None);
+        // A warning earlier in the final buffer means the terminal refill
+        // happened in an earlier call, which returned that error; the call
+        // yielding on the last byte then reads on to EOF itself (review).
+        assert_eq!(deferred_slurp(&[b"\x1e1{\x1e1{"]), None);
+        assert_eq!(
+            warnings_slurp(&[b"\x1e1{\x1e1{"]),
+            [
+                "Truncated value at line 1, column 4",
+                "Unfinished JSON term at EOF at line 1, column 6"
+            ]
+        );
     }
 
     /// [`final_buffer_start`]'s own boundary arithmetic: real jq's `fgets`

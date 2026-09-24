@@ -3955,7 +3955,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             locations.files().to_vec()
         });
 
-        // Read before the queue takes `trailing_error` over (#3201).
+        // Read before the queue takes `trailing_error` over (#3201). The
+        // queue holds at most this one trailing error, so whatever
+        // `InputPop::ParseError` the driver pops *is* it.
         let trailing_is_seq_warning = trailing_error.as_ref().is_some_and(|t| t.seq_warning);
         if uses_input_builtins {
             // Seed `input`/`inputs`/`input_line_number`'s shared queue
@@ -4066,7 +4068,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         // jq's main loop prints a `--seq` parse error as
                         // ignored, and reads on to the end (#3201).
                         jq::InputPop::ParseError(error) if trailing_is_seq_warning => {
-                            eprintln!("jq: ignoring parse error: {}", error.message);
+                            eprintln!(
+                                "{}{}",
+                                crate::jq_seq_reader::IGNORED_PARSE_ERROR,
+                                error.message
+                            );
                             break;
                         }
                         jq::InputPop::ParseError(error) => {
@@ -4147,7 +4153,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // jq defers past the filter (#3201).
             if let Some(t) = trailing_error {
                 if t.seq_warning {
-                    eprintln!("jq: ignoring parse error: {}", t.error.message);
+                    eprintln!(
+                        "{}{}",
+                        crate::jq_seq_reader::IGNORED_PARSE_ERROR,
+                        t.error.message
+                    );
                 } else {
                     sink.report(
                         DiagStyle::Jq,
@@ -4526,6 +4536,8 @@ fn get_inputs(
         let walk = crate::jq_seq_reader::walk_stream(&raw_bytes, args.slurp, &mut |_| {});
         seq_values = walk.values;
         seq_value_locations = walk.locations;
+        // `-n -s`'s `input`/`inputs` read the deferred warning too.
+        seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
     }
 
@@ -4867,7 +4879,10 @@ fn get_inputs(
             // A plain-JSON parse error fails `--slurp` outright instead
             // (above); only `--seq`'s deferred warning follows the array
             // (#3201).
-            trailing_error.filter(|t| t.seq_warning),
+            {
+                debug_assert!(trailing_error.as_ref().map_or(true, |t| t.seq_warning));
+                trailing_error
+            },
         )))
     } else {
         Ok(Ok((values, locations, trailing_error)))
