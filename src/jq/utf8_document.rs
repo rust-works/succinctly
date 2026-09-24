@@ -36,10 +36,11 @@
 //! path exist. Keeping the rewrite preserves all of it; only *how* the
 //! replacement buffer is built changes.
 //!
-//! It also costs nothing on valid input. Both callers reach this function
+//! It also costs nothing on valid input. Every caller reaches this function
 //! only after a whole-input `validate_utf8` (a SIMD pass, ~1.1 ms on 8.4 MB)
 //! has already failed, so a well-formed document never enters the scanner
-//! below.
+//! below. `--seq` then substitutes each value's own bytes, and only the
+//! values that fail a check of their own (#3247).
 //!
 //! # Why a byte scanner is sound here
 //!

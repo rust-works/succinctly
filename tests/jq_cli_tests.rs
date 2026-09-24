@@ -7698,6 +7698,103 @@ fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
     Ok(())
 }
 
+/// #3247: `--seq` values are ranges from the same raw-byte walk as the
+/// diagnostics, and UTF-8 substitution is applied to each value on its own.
+/// Substituting the whole stream first let jq's short-tail rule fold an
+/// invalid lead byte outside a string *and* the RS or space after it into
+/// one U+FFFD, so the value after it was lost. An invalid byte inside a
+/// string is still substituted as jq does, including the dropped tail byte
+/// (`"\xe1Ax"` -> `"\u{fffd}Ax"`, `"\xe1y"` at a string's end -> U+FFFD
+/// only). Captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_seq_invalid_utf8_outside_strings_keeps_record_boundaries_3247() -> Result<()> {
+    for (input, plain, slurp) in [
+        (
+            &b"\xe0\x1e\"a\"\n"[..],
+            &b"\x1e\"a\"\n"[..],
+            &b"\x1e[\"a\"]\n"[..],
+        ),
+        (
+            b"\x1e1\n\xe0\x1e\"a\"\n",
+            b"\x1e1\n\x1e\"a\"\n",
+            b"\x1e[1,\"a\"]\n",
+        ),
+        (b"\xef\xbb\xe0 \"a\"", b"\x1e\"a\"\n", b"\x1e[\"a\"]\n"),
+        (
+            b"\xef\xbb1 \xe0 \"a\" 2",
+            b"\x1e1\n\x1e\"a\"\n",
+            b"\x1e[1,\"a\"]\n",
+        ),
+        (
+            b"\x1e[\"\xe1\x41x\", \"\xff\"]\n",
+            "\x1e[\"\u{fffd}Ax\",\"\u{fffd}\"]\n".as_bytes(),
+            "\x1e[[\"\u{fffd}Ax\",\"\u{fffd}\"]]\n".as_bytes(),
+        ),
+    ] {
+        for (args, expected) in [
+            (&["--seq", "-c", "."][..], plain),
+            (&["--seq", "-s", "-c", "."][..], slurp),
+        ] {
+            let (output, code) = spawn_jq(args, Some(input))?;
+            assert_eq!(code, 0, "input {input:?} {args:?}");
+            assert_eq!(
+                output.stdout,
+                expected,
+                "input {input:?} {args:?}: got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    // A valid two-byte character split across two files inside one string:
+    // jq reads the files as one stream, so it stays `é`. Substituting each
+    // file on its own gave two U+FFFDs.
+    let dir = tempfile::tempdir()?;
+    let u1 = dir.path().join("u1");
+    let u2 = dir.path().join("u2");
+    std::fs::write(&u1, b"\x1e\"a\xc3")?;
+    std::fs::write(&u2, b"\xa9b\"\n")?;
+    let (output, code) = spawn_jq(
+        &[
+            "--seq",
+            "-c",
+            ".",
+            u1.to_str().unwrap(),
+            u2.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\x1e\"a\u{e9}b\"\n"
+    );
+
+    // A record split across files with an invalid byte in its string, and
+    // an invalid byte eating an RS in the second file: every value keeps
+    // its file.
+    let a = dir.path().join("m1");
+    let b = dir.path().join("m2");
+    std::fs::write(&a, b"\x1e1\n\x1e{\"a\":\"x")?;
+    std::fs::write(&b, b"\xe1y\"}\n\x1e\xe0\x1e\"z\"\n")?;
+    let (output, code) = spawn_jq(
+        &[
+            "--seq",
+            "-c",
+            "[., (input_filename | split(\"/\") | last)]",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\x1e[1,\"m1\"]\n\x1e[{\"a\":\"x\u{fffd}\"},\"m2\"]\n\x1e[\"z\",\"m2\"]\n"
+    );
+    Ok(())
+}
+
 /// #3195/#3199: a BOM prefix split across two files is swallowed whole, as
 /// jq's reader treats the file list as one stream. Captured from
 /// `/usr/bin/jq` 1.7.1.

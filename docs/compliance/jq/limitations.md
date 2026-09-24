@@ -4961,12 +4961,13 @@ Verified by `scripts/jq-seq-oracle-sweep.py`, which compares stderr, stdout and 
 jointly: **0 stderr mismatches and 0 stdout supersets** over 4,083 generated streams per
 seed.
 
-The randomized corpus doesn't generate invalid UTF-8 outside a string, and there one stdout
-gap remains. succinctly finds values by walking the stream after UTF-8 substitution, and
-outside a string jq's short-tail rule can fold an invalid lead byte *and* the RS or
-whitespace after it into one U+FFFD. The value after the lost boundary is then dropped:
-`printf '\xe0\x1e"a"\n' | jq --seq -c .` prints `"a"`, and succinctly prints nothing
-([#3247](https://github.com/rust-works/succinctly/issues/3247)). stderr still matches.
+Values and diagnostics come from one walk over jq's own raw bytes, and UTF-8 substitution
+is applied afterwards to each value's own bytes, so invalid UTF-8 anywhere in the stream
+can't move a record boundary. Before
+[#3247](https://github.com/rust-works/succinctly/issues/3247), values came from a second walk
+over the substituted stream. Outside a string, jq's short-tail rule could fold an invalid
+lead byte *and* the RS or whitespace after it into one U+FFFD, so
+`printf '\xe0\x1e"a"\n' | succinctly jq --seq -c .` printed nothing where jq prints `"a"`.
 
 One `--seq` divergence remains, an artifact of jq's 4096-byte `fgets` *line reader* rather
 than its parser, and unreachable from a newline-free chunk:
@@ -5009,12 +5010,8 @@ Real jq's own `fgets` chunks at a newline *or* after 4095 bytes, whichever comes
 the drop is observable by padding alone: `\x1e1\n\x1e` + 4093 spaces + `\x1etrue` keeps
 `true`, and one byte more of padding drops it. `succinctly jq` now matches all of this,
 modeled in [`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs)'s
-`final_buffer_start`/`drops_at_first_empty_record` and threaded through
-[`value_ranges`](../../../src/bin/succinctly/jq_seq_reader.rs) as a value-count cap rather
-than a byte offset (the value walk runs over the UTF-8-*substituted* stream, which can
-differ in length from jq's own raw bytes, but never in how many structural events it
-scans, since substitution only ever replaces already-invalid bytes and never touches,
-removes, or introduces an ASCII one). `-s` is unaffected (`has_more` keeps its own loop
+`final_buffer_start`/`drops_at_first_empty_record`. It lives in the same raw-byte walk
+that produces the values, which simply stops at the drop point (#3247). `-s` is unaffected (`has_more` keeps its own loop
 going) -- the warning this same drop would otherwise suppress still fires there:
 
 ```
@@ -5068,7 +5065,7 @@ $ printf '\x1e1}\n\x1e2{'  | jq --seq -s -c 'error("x")'   # jq: error (at <stdi
 position at 4094 and 4096 bytes and loses it at 4095, where `fgets` fills its buffer exactly
 and an *empty* final buffer follows — and across files, where the final buffer is the last
 file's own last chunk (`\x1e1` in one file and `{` in the next keeps `second:0`). The rule is
-[`jq_seq_reader::SeqWarningWalk::slurp_position_lost`](../../../src/bin/succinctly/jq_seq_reader.rs),
+[`jq_seq_reader::SeqStreamWalk::slurp_position_lost`](../../../src/bin/succinctly/jq_seq_reader.rs),
 read off the same walk that produces the warnings; `scripts/jq-seq-oracle-sweep.py
 --slurp-location` sweeps it.
 
@@ -5099,13 +5096,11 @@ $ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level num
 ```
 
 `succinctly jq` reproduces this on both stderr and stdout, including the pre-RS `1` jq
-reads, except where invalid UTF-8 after the prefix hits the
-[#3247](https://github.com/rust-works/succinctly/issues/3247) gap above. The value walk takes its BOM verdict from the raw bytes, and the swallowed prefix is
-removed before UTF-8 substitution. The substituted stream can't answer either question:
-a raw `\xef\xbb` is itself invalid UTF-8 and becomes a U+FFFD of a different width
-([#3199](https://github.com/rust-works/succinctly/issues/3199)), and a U+FFFD substituted
-for any invalid lead byte starts with `EF BF`, which reads as a malformed BOM of its own
-([#3195](https://github.com/rust-works/succinctly/issues/3195)).
+reads. Both come from the same walk over the raw bytes. A walk over the UTF-8-substituted
+stream can't decide the BOM: a raw `\xef\xbb` is itself invalid UTF-8 and becomes a U+FFFD
+of a different width ([#3199](https://github.com/rust-works/succinctly/issues/3199)), and a
+U+FFFD substituted for any invalid lead byte starts with `EF BF`, which reads as a
+malformed BOM of its own ([#3195](https://github.com/rust-works/succinctly/issues/3195)).
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
 materializes `--seq` input before evaluating, so all warnings precede all values. jq's
