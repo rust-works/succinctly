@@ -745,18 +745,18 @@ pub struct VarSite {
 /// compile-error path immediately before the process aborts.
 ///
 /// Like `call_sites`, this is a table of *references*, not of *failing*
-/// references, and carries no scope information -- a `$x` that resolved
-/// perfectly well can still be matched against an unbound-variable
-/// diagnostic for the same name. Two references of the same name that
-/// differ only by lexical scope (one bound, one not) cannot be told apart
-/// here -- `CallSite`'s own doc comment records the identical shape for
-/// calls, closed there by #2635's `occurrence_index`; this table's own
-/// version of that fix is tracked separately at #3107, since it needs the
-/// same `resolve.rs`-side scope-aware counting `UnboundVar` does not carry
-/// yet. This table still closes the more common and more misleading case on
-/// its own: a name that merely spells the same as an unrelated
-/// string-literal occurrence, which it excludes by construction (only real
-/// `$name` reference sites are ever pushed).
+/// references, and carries no scope information itself -- a `$x` that
+/// resolved perfectly well can still be matched against an unbound-variable
+/// diagnostic for the same name if indexed naively. `CallSite`'s own doc
+/// comment records the identical shape for calls, closed there by #2635's
+/// `occurrence_index`; `UnboundVar` (`resolve.rs`) carries the same
+/// scope-aware count in its own `occurrence` field, computed the same way
+/// (#3085) -- #3107 was the reporter side (`jq_runner.rs`'s
+/// `report_unbound_var` call site) not consuming it yet, indexing this table
+/// with a failures-only counter instead. This table also closes the more
+/// common and more misleading case on its own: a name that merely spells
+/// the same as an unrelated string-literal occurrence, which it excludes by
+/// construction (only real `$name` reference sites are ever pushed).
 pub fn collect_var_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<VarSite> {
     collect_sites(
         input,

@@ -2619,21 +2619,24 @@ fn report_site_error(
 
 /// Report one unbound `$name` against `source` (the main filter, or a
 /// module's own text), at its `site_index`-th recorded site -- the variable
-/// twin of [`report_unresolved_call`]. Returns whether the table had that
-/// site.
+/// twin of [`report_unresolved_call`].
 ///
 /// Unlike calls, no text-search fallback: `collect_var_sites` records every
 /// `$name` a parse sees (a `$name` token has none of the retry, shadow or
 /// builtin-fallback machinery that can make the call-site table diverge from
 /// the real parse). A text search could land on a coincidental `$name` in a
 /// string or comment, so a missing table entry gets a file-only report.
+/// `site_index` is always a resolver-computed occurrence count (#3107), so
+/// callers have nothing left to do with whether the table had that site --
+/// unlike `report_unresolved_call`'s own fallback-driving `bool`, this one
+/// had no remaining reader once that was true for both call sites.
 fn report_unbound_var(
     name: &str,
     location: &str,
     source: &str,
     var_sites: &[jq::VarSite],
     site_index: usize,
-) -> bool {
+) {
     let offset = var_sites
         .iter()
         .filter(|v| v.name == name)
@@ -2646,7 +2649,6 @@ fn report_unbound_var(
         site.as_ref()
             .map(|(line_no, line_text, column)| (*line_no, line_text.as_str(), *column)),
     );
-    site.is_some()
 }
 
 /// Report one out-of-scope `break $name` against `source` (the main filter,
@@ -2791,13 +2793,6 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
     // -- see `jq::collect_break_sites`. A module-body break uses its
     // module's own table instead, built lazily from that module's source.
     let break_sites = jq::collect_break_sites(filter, jq::ParserMode::Jq, true);
-    // How many variables of each name we have already reported, so a
-    // repeated undefined `$name` walks its own successive sites in source
-    // order -- the same rule `call_resume_from` gives the calls' fallback.
-    // Calls no longer need this (#2635): `occurrence_index` already answers
-    // "which occurrence is this" precisely, computed while resolving rather
-    // than approximated while reporting.
-    let mut vars_consumed: HashMap<&str, usize> = HashMap::new();
 
     for error in errors {
         match error {
@@ -2929,15 +2924,18 @@ fn report_compile_errors(errors: &[jq::ResolveError], filter: &str, loader: &Mod
                 // text search -- a blind search for
                 // `${name}` can land inside a string literal, or on an
                 // earlier, genuinely *bound* occurrence of the same name,
-                // neither of which is the failing reference. See
-                // `jq::VarSite`'s own doc comment for the one class of
-                // ambiguity this still can't resolve (two same-named
-                // references differing only by lexical scope) -- #2635 fixed
-                // the identical shape for calls; this one is #3107.
-                let taken = vars_consumed.entry(name.as_str()).or_insert(0);
-                if report_unbound_var(name, "<top-level>", filter, &var_sites, *taken) {
-                    *taken += 1;
-                }
+                // neither of which is the failing reference. `occurrence`
+                // (from `resolve::check`'s `Expr::Var` arm, #3085) already
+                // counts every reference to this name in source order, bound
+                // ones included, the same way `occurrence_index` does for
+                // calls (#2635) -- so this indexes `var_sites` directly,
+                // exactly like the module-body branch above already does,
+                // rather than approximating it with a failures-only counter
+                // that could pick a genuinely bound occurrence instead of
+                // the actually-unbound one (#3107; confirmed live:
+                // `(. as $x | $x),\n$x` cited line 1 -- the bound occurrence
+                // -- instead of jq's own line 2).
+                report_unbound_var(name, "<top-level>", filter, &var_sites, *occurrence);
             }
             jq::ResolveError::Break(jq::UnresolvedLabel {
                 name,

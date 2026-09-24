@@ -27874,6 +27874,27 @@ fn test_top_level_error_skips_site_in_unreferenced_def_3085() -> Result<()> {
     Ok(())
 }
 
+/// The variable twin of the test above -- an unreferenced `def`'s own `$x`
+/// reference must not steal the failing `$x`'s occurrence slot either.
+/// Closed by #3107 (`jq_runner.rs`'s `report_unbound_var` call site for the
+/// main filter used to keep its own failures-only counter instead of
+/// consuming `UnboundVar`'s already scope-aware `occurrence` field, which
+/// `check`'s unreferenced-def walk, #3085, already counts correctly).
+#[test]
+fn test_top_level_unbound_var_skips_site_in_unreferenced_def_3107() -> Result<()> {
+    let (_, stderr, code) = run_jq_with_modules(&[], &["-nc", "def u: $x; $x"])?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        format!(
+            "jq: error: $x is not defined at <top-level>, line 1:\n\
+             def u: $x; $x{}\njq: 1 compile error\n",
+            " ".repeat(11)
+        )
+    );
+    Ok(())
+}
+
 /// #2865: a module's own `include` is processed transitively -- the third
 /// module's defs are available to the second module's body.
 ///
@@ -49311,31 +49332,56 @@ fn test_unbound_variable_position_is_not_confused_by_a_string_literal_2734() -> 
 /// A second reference of the *same* name that already resolved cleanly
 /// (bound by an enclosing `as`) is a harder case than the string-literal
 /// one above: `var_sites` records every real `$x` reference, bound or not,
-/// with no scope information (same limitation `CallSite`'s own doc comment
-/// records for calls, tracked at #2635) -- so distinguishing "this `$x` is
-/// fine" from "this other `$x` is the one that's actually unbound" isn't
-/// solved by this table alone. This test pins today's honest behavior
-/// (parity with the identical, pre-existing call-site limitation
-/// demonstrated by the second filter below) rather than a false claim of
-/// full accuracy: both mis-locate to the first, harmless occurrence of the
-/// shared name, one column short of where the pinned oracle points.
+/// with no scope information, so distinguishing "this `$x` is fine" from
+/// "this other `$x` is the one that's actually unbound" needs the resolver's
+/// own occurrence count, not a text-derived one.
+///
+/// This test used to pin an *honest limitation* here (both this and the
+/// identical call-site shape mis-locating to the first, harmless occurrence,
+/// #2635/#2734) -- true when written, but stale once #2635 gave calls a
+/// resolver-computed `occurrence_index` and #3107 did the same for
+/// variables (`jq_runner.rs`'s `report_unbound_var` call site used to keep
+/// its own failures-only counter instead of consuming `UnboundVar`'s already
+/// scope-aware `occurrence` field, #3085). Both sides are byte-for-byte
+/// correct against the pinned oracle now, on the exact program structure
+/// this test always used -- pinning that instead of the old limitation.
 #[test]
-fn test_unbound_variable_position_has_the_same_shadowing_limitation_as_calls_2734() -> Result<()> {
+fn test_unbound_variable_position_matches_oracle_despite_shadowing_2734_3107() -> Result<()> {
     let (_, stderr, code) = run_jq_full(&["-n", "-c", "(1 as $x | $x), $x"], None)?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("$x is not defined at <top-level>, line 1:"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr,
+        "jq: error: $x is not defined at <top-level>, line 1:\n\
+         (1 as $x | $x), $x                \n\
+         jq: 1 compile error\n"
     );
 
-    // The pre-existing call-site mechanism has the identical shape of
-    // imprecision on the exact same program structure, confirming this
-    // isn't a new or worse gap introduced by the variable path.
+    // The call-site mechanism this mirrors is correct on the identical
+    // program structure too -- confirming this isn't a new or worse gap
+    // introduced by the variable path, the same relationship the old
+    // version of this test drew, just with both sides now fixed instead of
+    // both sides limited.
     let (_, stderr, code) = run_jq_full(&["-n", "-c", "(def f: 1; f) | f"], None)?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("f/0 is not defined at <top-level>, line 1:"),
-        "stderr: {stderr:?}"
+    assert_eq!(
+        stderr,
+        "jq: error: f/0 is not defined at <top-level>, line 1:\n\
+         (def f: 1; f) | f                \n\
+         jq: 1 compile error\n"
+    );
+
+    // #3107's own repro: unlike the single-line case above, a multi-line
+    // program actually discriminates which occurrence was picked -- the
+    // bound `$x` is on line 1, the actually-unbound one on line 2, and only
+    // a resolver-computed (not failures-only) occurrence count can tell
+    // them apart. Confirmed live against jq 1.7.1: it always cited line 2.
+    let (_, stderr, code) = run_jq_full(&["-n", "-c", "(. as $x | $x),\n$x"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr,
+        "jq: error: $x is not defined at <top-level>, line 2:\n\
+         $x\n\
+         jq: 1 compile error\n"
     );
     Ok(())
 }
