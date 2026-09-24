@@ -826,6 +826,12 @@ well-predicted branches is simply shorter.
   +17% apart on `users keys_unsorted` on the 7950X with instruction counts identical to
   the guard's 0.0% (filed as #3100). The A/B rule "the baseline must predate your
   first commit" has a companion: it must also be the base your branch is actually on.
+  #3100 traced that gap (re-measured at +12% min / +18% median) to placement. The
+  math-builtin commit between the two mains moved the JSON index builder's per-byte
+  jump-table loop (`json::simd::avx2::process_chunk_standard`) by 176 bytes. Inert
+  padding that moves it the same way, with no source change, reproduces the slowdown,
+  and the effect repeats every 64 bytes, a 15% band on this shape. See
+  [benchmarking.md § 9](../guides/benchmarking.md#what-the-pinned-profile-does-not-pin-function-placement-3100).
 - On x86_64 the probe compiles out (`PREFIX = 0`); before the inlining change the guard
   read every row at ±0.0% against `main` on the 7950X. A build with the word probe enabled on x86_64 too
   was measured and not shipped: the guard read `users_keys_unsorted` +1.2% and the 7950X
