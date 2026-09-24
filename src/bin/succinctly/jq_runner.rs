@@ -33,7 +33,7 @@ use super::m2_gate::can_use_m2_streaming;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
+    DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -8755,7 +8755,6 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         },
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
-        float_style: FloatStyle::Shortest,
         // #2852: `-S`/`-a`/`-C`/`-s` used to reformat a `NumberLiteral`
         // regardless of `--preserve-input`, disagreeing with `print_json`'s
         // `JqCompatFormatter`/`PreserveFormatter` split on the default `-c`

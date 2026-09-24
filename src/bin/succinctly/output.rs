@@ -17,7 +17,6 @@ use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
     nonfinite_display_string, EvalError, JqSemantics, NumberRepr, OwnedValue, StreamError,
 };
-use succinctly::yaml::format_float_with_fraction;
 pub use succinctly::yaml::format_float_yq;
 
 /// Which terminator follows a written value: NUL (`-0`/`--nul-output`),
@@ -473,15 +472,6 @@ pub fn escape_json_string_ascii_yq(s: &str) -> String {
     run_escaper(write_json_body_yq_ascii, s)
 }
 
-/// How to render finite floats with no fractional part.
-#[derive(Clone, Copy, Debug)]
-pub enum FloatStyle {
-    /// Rust's shortest representation: `1.0` prints as `1` (jq).
-    Shortest,
-    /// Keep a trailing `.0` on whole floats in i64 range: `1.0` prints as `1.0` (yq).
-    PreserveWholeFloat,
-}
-
 /// Options for [`format_json`].
 pub struct JsonFormatOpts<'a> {
     /// Indent unit per nesting level; empty selects compact output.
@@ -490,8 +480,6 @@ pub struct JsonFormatOpts<'a> {
     pub sort_keys: bool,
     /// Escape non-ASCII characters as \uXXXX.
     pub ascii: bool,
-    /// Rendering of whole floats.
-    pub float_style: FloatStyle,
     /// The active output convention: which tool's escape table strings go
     /// through, and whether a `NumberLiteral` echoes its source spelling or
     /// is reformatted to jq's own.
@@ -511,10 +499,9 @@ pub struct JsonFormatOpts<'a> {
     /// Whether the source document was JSON (only meaningful alongside
     /// `convention: Preserve` — see the `Float` arm's own `json_sourced`
     /// branch below). A JSON-sourced float never keeps a decimal point in
-    /// output, computed or not, compact or pretty (#978, #1398) — unlike
-    /// `float_style`, which only distinguishes compact/pretty for *jq*
-    /// mode (yq's own compact/pretty JSON output always agree with each
-    /// other on float formatting; see [`format_float_yq`]'s doc comment).
+    /// output, computed or not, compact or pretty (#978, #1398) — yq's own
+    /// compact/pretty JSON output always agree with each other on float
+    /// formatting regardless (see [`format_float_yq`]'s doc comment).
     ///
     /// Stays a separate field rather than folding into `convention`: it is a
     /// yq-only *sub*-axis of `Preserve` (which of real yq's two float
@@ -611,8 +598,7 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                             // magnitude threshold (#997),
                             // decimal-with-fraction otherwise, regardless of
                             // compact/pretty -- real yq's Float formatting
-                            // doesn't distinguish the two (`float_style`
-                            // only matters for jq mode below).
+                            // doesn't distinguish the two.
                             format_float_yq(*f)
                         }
                     }
@@ -635,22 +621,20 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                             // applies jq's rule too.
                             nonfinite_display_string::<JqSemantics>(*f).to_string()
                         } else {
-                            match opts.float_style {
-                                // #2456: was a bare `f.to_string()`, which
-                                // never switches to scientific notation --
-                                // `jq_bare_float_display` is the same
-                                // formatter `OwnedValue::to_json` and the M2
-                                // streaming writer use, so this CLI print
-                                // path stops diverging from them past the
-                                // threshold.
-                                FloatStyle::Shortest => jq_bare_float_display(*f),
-                                // Whole floats keep their decimal point at
-                                // any magnitude; the old `<= i64::MAX` guard
-                                // silently dropped it above that,
-                                // disagreeing with the YAML writers (issue
-                                // #169).
-                                FloatStyle::PreserveWholeFloat => format_float_with_fraction(*f),
-                            }
+                            // #2456: was a bare `f.to_string()`, which never
+                            // switches to scientific notation --
+                            // `jq_bare_float_display` is the same formatter
+                            // `OwnedValue::to_json` and the M2 streaming
+                            // writer use, so this CLI print path stops
+                            // diverging from them past the threshold. jq mode
+                            // has only ever had this one rendering here --
+                            // the `PreserveWholeFloat` alternative (#169's
+                            // whole-float rule) was unreachable dead code,
+                            // removed in #2988; that rule is pinned live by
+                            // `format_float_with_fraction`'s own callers and
+                            // tests (`yaml/scalar.rs`, `jq/stream.rs`,
+                            // `jq/value.rs`).
+                            jq_bare_float_display(*f)
                         }
                     }
                 }
@@ -1382,36 +1366,29 @@ mod tests {
             indent: "",
             sort_keys: true,
             ascii: false,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
     }
 
+    /// jq mode's `OwnedValue::Float` arm always uses [`jq_bare_float_display`]
+    /// (Rust's shortest representation: a whole float drops its trailing
+    /// `.0`) -- #2988 removed the dead `PreserveWholeFloat` alternative this
+    /// test used to also exercise here, since jq mode never took it (see
+    /// that issue for why: it was reachable only through a yq-mode
+    /// construction site whose result `format_json_impl` never read).
     #[test]
-    fn test_format_json_float_styles() {
-        let value = OwnedValue::Float(1.0);
-        let opts = |float_style| JsonFormatOpts {
+    fn test_format_json_float_jq_mode_shortest() {
+        let opts = JsonFormatOpts {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
-        assert_eq!(format_json(&value, &opts(FloatStyle::Shortest)), "1");
-        assert_eq!(
-            format_json(&value, &opts(FloatStyle::PreserveWholeFloat)),
-            "1.0"
-        );
-        // Non-whole floats keep the shortest form under both styles.
-        let frac = OwnedValue::Float(1.5);
-        assert_eq!(format_json(&frac, &opts(FloatStyle::Shortest)), "1.5");
-        assert_eq!(
-            format_json(&frac, &opts(FloatStyle::PreserveWholeFloat)),
-            "1.5"
-        );
+        assert_eq!(format_json(&OwnedValue::Float(1.0), &opts), "1");
+        assert_eq!(format_json(&OwnedValue::Float(1.5), &opts), "1.5");
     }
 
     /// Oracle-verified against real yq v4.53.3 (#997): threshold boundaries
@@ -1433,35 +1410,24 @@ mod tests {
         assert_eq!(format_float_yq(1e-100), "1e-100");
     }
 
-    /// yq mode's `OwnedValue::Float` arm must use [`format_float_yq`]
-    /// regardless of `float_style`/compact-vs-pretty, matching real yq's
-    /// own behavior (#997) -- distinct from the jq-mode matrix in
-    /// [`test_format_json_float_styles`] above, which stays on the
-    /// `float_style` path untouched.
+    /// yq mode's `OwnedValue::Float` arm must use [`format_float_yq`],
+    /// matching real yq's own behavior (#997) -- distinct from the jq-mode
+    /// rendering in [`test_format_json_float_jq_mode_shortest`] above (a
+    /// whole float keeps its `.0` here, unlike jq mode's shortest form,
+    /// which drops it).
     #[test]
     fn test_format_json_yq_mode_computed_float_scientific_notation_997() {
-        let opts = |float_style| JsonFormatOpts {
+        let opts = JsonFormatOpts {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style,
             convention: JsonConvention::Preserve,
             json_sourced: false,
         };
         let huge = OwnedValue::Float(1e100);
-        assert_eq!(format_json(&huge, &opts(FloatStyle::Shortest)), "1e+100");
-        assert_eq!(
-            format_json(&huge, &opts(FloatStyle::PreserveWholeFloat)),
-            "1e+100"
-        );
-        // In-range whole float keeps its `.0` under both styles in yq mode
-        // (unlike jq mode's `Shortest`, which drops it).
+        assert_eq!(format_json(&huge, &opts), "1e+100");
         let whole = OwnedValue::Float(150000.0);
-        assert_eq!(format_json(&whole, &opts(FloatStyle::Shortest)), "150000.0");
-        assert_eq!(
-            format_json(&whole, &opts(FloatStyle::PreserveWholeFloat)),
-            "150000.0"
-        );
+        assert_eq!(format_json(&whole, &opts), "150000.0");
     }
 
     #[test]
@@ -1550,7 +1516,6 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: true,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::Preserve,
             json_sourced: false,
         };
@@ -1571,7 +1536,6 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style: FloatStyle::PreserveWholeFloat,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
@@ -1625,7 +1589,6 @@ mod tests {
                 indent: "",
                 sort_keys: false,
                 ascii: false,
-                float_style: FloatStyle::Shortest,
                 convention,
                 json_sourced: false,
             };
@@ -1655,7 +1618,6 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style: FloatStyle::Shortest,
             convention,
             json_sourced: false,
         };
@@ -1686,7 +1648,6 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
@@ -1718,7 +1679,6 @@ mod tests {
             indent: "  ",
             sort_keys: false,
             ascii: false,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
@@ -1741,7 +1701,6 @@ mod tests {
             indent: "  ",
             sort_keys: false,
             ascii: true,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
@@ -1867,7 +1826,6 @@ mod tests {
             indent: "",
             sort_keys: false,
             ascii: false,
-            float_style: FloatStyle::Shortest,
             convention: JsonConvention::JqCompat,
             json_sourced: false,
         };
