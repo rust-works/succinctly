@@ -17145,26 +17145,24 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // the same constraint `preservable_float_literal_text` documents on the
     // YAML side.)
     //
-    // The digit-or-dot check is load-bearing, not defensive: `is_valid_number`
-    // accepts a leading `-` of its own, so a doubled sign (`+-1`) would
-    // otherwise strip to a perfectly valid `-1` and silently succeed where
-    // both oracles error out (jq 1.7.1: "Invalid numeric literal"; yq
-    // 4.53.3: "cannot convert node value [+-1] ... to number"). `.` joins
-    // the gate alongside the digit (#3033) so a `+`-prefixed leading-dot
-    // spelling (`+.500`) can reach the lenient check below -- jq 1.7.1
-    // accepts `+.500` and renders it `0.500`, confirmed live -- while still
-    // excluding a doubled sign (`-` is neither).
-    if let Some(unsigned) = trimmed.strip_prefix('+') {
-        if unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.')
-            && (crate::json::validate::is_valid_number(unsigned.as_bytes())
-                // #3033: the same lenient escapes the unsigned-text arm
-                // below reaches, jq mode only -- yq's own `+`-prefixed
-                // fidelity gaps (#1356, #2960) are left alone, so this half
-                // of the `||` never fires when `yq_mode` is true.
-                || (!yq_mode
-                    && crate::json::validate::is_preservable_number_literal(
-                        unsigned.as_bytes(),
-                    )))
+    // `strip_leading_plus`'s own digit-or-dot gate is load-bearing, not
+    // defensive: `is_valid_number` accepts a leading `-` of its own, so a
+    // doubled sign (`+-1`) would otherwise strip to a perfectly valid `-1`
+    // and silently succeed where both oracles error out (jq 1.7.1: "Invalid
+    // numeric literal"; yq 4.53.3: "cannot convert node value [+-1] ... to
+    // number"). Sharing that gate (#3033), not hand-rolling a second copy of
+    // it, is what lets a `+`-prefixed leading-dot spelling (`+.500`) reach
+    // the lenient check below without also letting `+-.5` through -- jq
+    // 1.7.1 accepts `+.500` (renders `0.500`) and rejects `+-.5`, both
+    // confirmed live.
+    if let Some(unsigned_bytes) = crate::json::validate::strip_leading_plus(trimmed.as_bytes()) {
+        let unsigned = &trimmed[trimmed.len() - unsigned_bytes.len()..];
+        if crate::json::validate::is_valid_number(unsigned.as_bytes())
+            // #3033: the same lenient escapes the unsigned-text arm below
+            // reaches, jq mode only -- yq's own `+`-prefixed fidelity gaps
+            // (#1356, #2960) are left alone, so this half of the `||` never
+            // fires when `yq_mode` is true.
+            || (!yq_mode && crate::json::validate::is_preservable_number_literal(unsigned.as_bytes()))
         {
             if yq_mode && yq_literal_overflows_f64(unsigned) {
                 return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
