@@ -484,7 +484,17 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
 /// call sites, which is exactly the drift risk this collapses). No stable
 /// `core`/`std` equivalent exists at this crate's MSRV (1.73.0) --
 /// `str::floor_char_boundary` is nightly-only.
+///
+/// `floor` must itself already be a `char` boundary of `s` (code review on
+/// #2984: the loop only stops descending once `idx == floor`, without ever
+/// checking `floor` itself, so a `floor` that isn't one would make this
+/// return a non-boundary index -- every current call site's `floor` is `0`
+/// or a parser cursor position, both boundaries by construction).
 pub(crate) fn floor_char_boundary(s: &str, mut idx: usize, floor: usize) -> usize {
+    debug_assert!(
+        s.is_char_boundary(floor),
+        "floor_char_boundary's own floor={floor} is not a char boundary of {s:?}"
+    );
     while idx > floor && !s.is_char_boundary(idx) {
         idx -= 1;
     }
@@ -11235,18 +11245,31 @@ mod tests {
         );
         assert_eq!(floor_char_boundary(s, 1, 0), 1, "already on a boundary");
         assert_eq!(floor_char_boundary(s, 0, 0), 0, "already on a boundary");
-        // `floor` stops the walk before it reaches 0 -- `peek_str`'s own use,
-        // where `self.pos` (not 0) is the slice's real lower bound.
+        // `floor` must itself be a char boundary of `s` (the function's own
+        // precondition, enforced by a `debug_assert!`) -- given that, the
+        // descent can never need to go below it anyway: the only boundary
+        // inside a multi-byte character's own byte span is its start, so a
+        // `floor` at or below that start changes nothing about which
+        // boundary is found. `peek_str`'s own `self.pos` is exactly this
+        // kind of already-guaranteed boundary, passed through for the
+        // loop's own bound rather than to change its answer.
         assert_eq!(
             floor_char_boundary(s, 3, 1),
             1,
-            "floor caps the descent at 1, same answer here since 1 is a boundary"
+            "floor=1 is itself a boundary here, so it agrees with the floor=0 case"
         );
-        assert_eq!(
-            floor_char_boundary("あ", 2, 1),
-            1,
-            "a single 3-byte character: floor=1 stops the walk before byte 0, \
-             even though the true nearest boundary would be 0"
-        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not a char boundary")]
+    fn test_floor_char_boundary_rejects_a_non_boundary_floor_2984() {
+        // Code review on #2984: a `floor` that isn't itself a char boundary
+        // of `s` would make the loop stop early at a non-boundary index,
+        // silently producing an invalid slice point. Every current call
+        // site's `floor` is `0` or a parser cursor position, both boundaries
+        // by construction, so this can't happen in practice today -- pins
+        // the guard directly rather than needing a real repro.
+        let _ = floor_char_boundary("あ", 2, 1);
     }
 }
