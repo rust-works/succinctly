@@ -984,6 +984,24 @@ fn to_owned_for_diagnostic<V: DocumentValue, S: EvalSemantics>(
     to_owned_with_cursor::<_, S>(value, cursor).unwrap_or(OwnedValue::Null)
 }
 
+/// The decode failure for a value the index could not read at all -- a
+/// malformed nested number (`1.2.3`, #3222) or keyword (`tru`, #3035) --
+/// or `None` for any other value.
+///
+/// jq rejects such a document at parse time, so a route that reaches the
+/// value by its *type* (`length`, `.x`, `has`, ...) raises here rather than
+/// answer a type error naming the internal `"error"` type, which `try` and
+/// `?` would swallow.
+fn unreadable_value_error<V: DocumentValue>(value: &V) -> Option<EvalError> {
+    value.is_error().then(|| {
+        EvalError::decode_failure(
+            value
+                .error_message()
+                .unwrap_or("malformed value in document"),
+        )
+    })
+}
+
 /// The shared "is this a decode failure, an optional no-op, or a genuine
 /// type error" three-way check every native-arm dispatcher (`Iterate`,
 /// `Map`, `Length`, `Keys`, `KeysUnsorted`, `ToEntries`, `ToNumber`) needs
@@ -997,6 +1015,11 @@ fn to_owned_for_diagnostic<V: DocumentValue, S: EvalSemantics>(
 /// build a builtin-specific `EvalError` (`cannot_iterate_with`,
 /// `has_no_length`, ...) without paying for it on the two more common
 /// exits above.
+///
+/// A value the index could not read at all -- a malformed nested number
+/// (`1.2.3`, #3222) or keyword (`tru`, #3035) -- is a decode failure too.
+/// Without that arm it reached `fallback`, which renders it as `null`
+/// (`null (null) has no length`), a type error `try` could catch.
 fn decode_failure_or<V: DocumentValue>(
     value: &V,
     optional: bool,
@@ -1004,6 +1027,8 @@ fn decode_failure_or<V: DocumentValue>(
 ) -> GenericResult<V> {
     if let Some(reason) = value.string_decode_error() {
         GenericResult::Error(EvalError::decode_failure(reason))
+    } else if let Some(err) = unreadable_value_error(value) {
+        GenericResult::Error(err)
     } else if optional {
         GenericResult::None
     } else {
@@ -3605,12 +3630,12 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
 }
 
 /// The one rule every cursor-backed truthiness check in this file answers
-/// by: `is_falsy(Preserve)`, negated. Pulled out so `//`/`and`/`or`/`not`
+/// by: `is_falsy()`, negated. Pulled out so `//`/`and`/`or`/`not`
 /// structurally cannot drift on what "truthy" means — previously enforced
 /// only by [`push_generic_truthiness`] and [`retain_truthy_generic`]'s
 /// matching doc comments (#2665 item 3).
 fn cursor_is_truthy<C: DocumentCursor>(c: &C) -> bool {
-    !c.is_falsy(JsonConvention::Preserve)
+    !c.is_falsy()
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -4231,7 +4256,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 owned.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy(numbers);
+                stats.last_was_falsy = owned.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
@@ -4242,7 +4267,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = c.is_falsy(numbers);
+                stats.last_was_falsy = c.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
@@ -4257,7 +4282,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     };
                     owned.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = owned.is_falsy(numbers);
+                    stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
@@ -4396,7 +4421,7 @@ impl<V: DocumentValue> GenericResult<V> {
                         return Ok(stats);
                     }
                     on_value(out)?;
-                    stats.last_was_falsy = c.is_falsy(numbers);
+                    stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = cs.len();
@@ -4414,14 +4439,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 o.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = o.is_falsy(numbers);
+                stats.last_was_falsy = o.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy(numbers);
+                    stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -4442,7 +4467,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 for o in os {
                     o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy(numbers);
+                    stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -4488,7 +4513,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 owned.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy(JsonConvention::Preserve);
+                stats.last_was_falsy = owned.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
@@ -4503,7 +4528,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = c.is_falsy(JsonConvention::Preserve);
+                stats.last_was_falsy = c.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
@@ -4518,7 +4543,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     };
                     owned.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = owned.is_falsy(JsonConvention::Preserve);
+                    stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
@@ -4534,7 +4559,7 @@ impl<V: DocumentValue> GenericResult<V> {
                         return Ok(stats);
                     }
                     on_value(out)?;
-                    stats.last_was_falsy = c.is_falsy(JsonConvention::Preserve);
+                    stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = cs.len();
@@ -4640,14 +4665,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 o.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
+                stats.last_was_falsy = o.is_falsy();
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
+                    stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -4667,7 +4692,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 for o in os {
                     o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
+                    stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -13476,7 +13501,7 @@ fn generic_item_truthiness<V: DocumentValue, S: EvalSemantics>(
 /// inside it (#1519) -- and an infinite left generator still terminates
 /// (`first(repeat(1) // 9)` is `1`, not a hang).
 ///
-/// **Every truthiness decision is [`retain_truthy_generic`]'s `is_falsy(Preserve)`
+/// **Every truthiness decision is [`retain_truthy_generic`]'s `is_falsy()`
 /// rule**, one item at a time rather than over a collected batch, so this
 /// route and `eval_single`'s cannot drift on what `//` keeps (the #106 rule:
 /// duplicated predicates diverge silently). `OneCursorValue` is the one
@@ -14697,6 +14722,9 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     key: &OwnedValue,
     optional: bool,
 ) -> GenericResult<V> {
+    if let Some(err) = unreadable_value_error(&target) {
+        return GenericResult::Error(err);
+    }
     match key {
         OwnedValue::String(s) => {
             // #2470: same rule as `Expr::Field`'s own arm -- a computed
@@ -15872,6 +15900,9 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     end: Option<i64>,
     optional: bool,
 ) -> GenericResult<V> {
+    if let Some(err) = unreadable_value_error(&target) {
+        return GenericResult::Error(err);
+    }
     if let Some(elements) = target.as_array() {
         let items = elements.collect_values();
         let range = SliceBounds::from_literals(start, end).resolve(items.len());
@@ -15920,11 +15951,11 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     // `is_null` arm below so it wins under yq mode. Classified via
     // `type_name()`, a variant-based check, not by chaining
     // `as_bool()`/`as_i64()`/`as_f64()` — those are parseability checks,
-    // and a JSON number whose scanner-accepted span isn't valid number
-    // syntax (e.g. `1.2.3`, #966) fails all three despite `type_name()`
-    // correctly still reporting `"number"`, which would silently disagree
-    // with `is_yq_slice_empty_container_scalar`'s type-based `OwnedValue`
-    // match. For YAML this also collapses what was up to two separate
+    // which would silently disagree with
+    // `is_yq_slice_empty_container_scalar`'s type-based `OwnedValue` match
+    // for any number they fail to parse. (A span that is no number at all,
+    // `1.2.3`, is an error value since #3222 and raised above.) For YAML
+    // this also collapses what was up to two separate
     // `resolve_plain` re-derivations of the same scalar into the one
     // `type_name()` already performs.
     if S::TAG == EvalTag::Yq && matches!(target.type_name(), "null" | "boolean" | "number") {
@@ -15959,6 +15990,9 @@ fn slice_one_generic_computed<S: EvalSemantics, V: DocumentValue>(
     end: &ComputedSliceBound,
     optional: bool,
 ) -> GenericResult<V> {
+    if let Some(err) = unreadable_value_error(&target) {
+        return GenericResult::Error(err);
+    }
     let kind = SliceTargetKind::of_type_name(target.type_name());
     let (s, e) = match resolve_computed_slice_bounds::<S>(kind, start, end) {
         Ok(bounds) => bounds,
@@ -16255,6 +16289,9 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
             };
             GenericResult::Owned(OwnedValue::Bool(in_bounds))
         }
+        _ if value.is_error() => GenericResult::Error(
+            unreadable_value_error(value).expect("is_error() just answered true"),
+        ),
         _ if has_type_mismatch_is_permissive::<S>() => {
             GenericResult::Owned(OwnedValue::Bool(false))
         }
@@ -22101,7 +22138,7 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
             // `Preserve`, the same convention `push_generic_truthiness`/
             // `retain_truthy_generic` read truthiness under, so `any`/`all`
             // and `select`/`//`/`not` cannot drift on what truthy means.
-            let truthy = !elem_cursor.is_falsy(JsonConvention::Preserve);
+            let truthy = !elem_cursor.is_falsy();
             if truthy == target_truthy {
                 return answer(target_truthy);
             }
@@ -22115,7 +22152,7 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         match effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
             Ok(fields) => {
                 for field in fields {
-                    let truthy = !field.value_cursor.is_falsy(JsonConvention::Preserve);
+                    let truthy = !field.value_cursor.is_falsy();
                     if truthy == target_truthy {
                         return answer(target_truthy);
                     }
@@ -22978,6 +23015,24 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // an untagged plain scalar (`as_str()` always succeeds on a
         // `YamlValue::String` node, whatever its resolved type), which
         // `type_name()`'s single-answer match doesn't have.
+        // As in `eval.rs`: a type test or type filter over a value the index
+        // could not read (`1.2.3`, #3222; `tru`, #3035) raises, as `type`
+        // does, rather than drop it or answer `false`.
+        Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Iterables
+        | Builtin::Scalars
+            if value.is_error() =>
+        {
+            GenericResult::Error(
+                unreadable_value_error(&value).expect("is_error() just answered true"),
+            )
+        }
+
         Builtin::IsNull => {
             GenericResult::Owned(OwnedValue::Bool(tagged_type_name(&value, cursor) == "null"))
         }
@@ -33131,25 +33186,33 @@ mod tests {
         // classify "is this a number" the same way `eval.rs`'s own
         // `StandardJson::Number(_)` match and `is_yq_slice_empty_container_scalar`
         // do: by variant, not by whether the raw text happens to parse as
-        // i64/f64. `1.2.3` is a JSON number span the semi-index scanner
-        // accepts leniently (#966) but that fails `as_i64`/`as_f64` parsing
-        // — an earlier version of this check used exactly that parseability
-        // test and returned an error here instead of `[]`, disagreeing with
-        // the concrete evaluator on the identical input. Uses a computed
-        // (non-literal-folding) slice so evaluation stays inside
-        // `eval_generic.rs`'s own `slice_one_generic` rather than bridging
-        // out to `eval.rs`, which is what let the divergence hide.
+        // i64/f64. `.5` is a number span jq accepts that Rust's i64 parse
+        // does not. Uses a computed (non-literal-folding) slice so
+        // evaluation stays inside `eval_generic.rs`'s own
+        // `slice_one_generic` rather than bridging out to `eval.rs`, which
+        // is what let the original divergence hide.
+        //
+        // `1.2.3` was this test's input until #3222: a span that is no
+        // number at all is now an error value, and slicing it raises the
+        // document fault rather than answering `[]` for a "number".
         use crate::jq::YqSemantics;
 
-        let json = b"1.2.3";
-        let index = JsonIndex::build(json);
         let expr = crate::jq::parse(".[(1-1):(1+0)]").unwrap();
-
+        let json = b".5";
+        let index = JsonIndex::build(json);
         let result = eval_using::<YqSemantics, _>(&expr, index.root(json).value());
         assert_eq!(
             result.into_owned::<YqSemantics>().unwrap(),
             Some(OwnedValue::array())
         );
+
+        let json = b"[1.2.3]";
+        let index = JsonIndex::build(json);
+        let element = index.root(json).first_child().expect("one element");
+        match eval_with_cursor_using::<YqSemantics, _>(&expr, element) {
+            GenericResult::Error(err) => assert!(err.is_decode_failure(), "{err:?}"),
+            other => panic!("slicing a malformed number must raise: {other:?}"), // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3222 test exists to make"
+        }
     }
 
     // Coverage follow-ups for #532: the tests above exercise the common

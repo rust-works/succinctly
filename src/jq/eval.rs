@@ -2328,15 +2328,22 @@ fn to_owned_at_depth<S: EvalSemantics, W: Clone + AsRef<[u64]>>(
 /// ordinary, catchable type-mismatch error instead of `decode_failure`
 /// (#1755). Call this first and propagate its `Some` unconditionally,
 /// before consulting `optional` at all.
+///
+/// A value the index could not read at all -- a malformed nested number
+/// (`1.2.3`, #3222) or keyword (`tru`, #3035) -- is a decode failure too;
+/// without that arm the callers' type errors rendered it as `null`
+/// (`Cannot iterate over null (null)`), catchable by `try`.
 fn scalar_decode_failure<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Option<EvalError> {
-    if let StandardJson::String(s) = value {
-        if let Err(e) = s.as_str() {
-            return Some(EvalError::decode_failure(e.message()));
-        }
+    match value {
+        StandardJson::String(s) => s
+            .as_str()
+            .err()
+            .map(|e| EvalError::decode_failure(e.message())),
+        StandardJson::Error(reason) => Some(EvalError::decode_failure(*reason)),
+        _ => None,
     }
-    None
 }
 
 /// Collapse the `scalar_decode_failure` / `optional` / type-error triplet
@@ -2389,16 +2396,17 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// jq truthiness of a borrowed value: everything except `null` and `false`.
 ///
-/// Equivalent to `to_owned_lossy::<S, _>(value).is_truthy()` — [`to_owned_lossy`] maps
-/// `StandardJson::Error` to `OwnedValue::Null`, which is falsy — but O(1)
-/// where `to_owned_lossy` deep-copies whole arrays and objects to answer a yes/no
-/// question. That matters for the stream operators, which test *every* output
-/// rather than just the first.
+/// O(1), where materializing would deep-copy whole arrays and objects to
+/// answer a yes/no question. That matters for the stream operators, which
+/// test *every* output rather than just the first.
+///
+/// A value the index could not read (`1.2.3`, #3222; `tru`, #3035) is
+/// truthy: truthiness decodes nothing (#2692), and the generic evaluator's
+/// `DocumentCursor::is_falsy` answers the same. This used to follow
+/// `to_owned_lossy`'s `Error` -> `null` mapping and call it falsy, so
+/// `select(.)` dropped it here and kept it there.
 fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
-    !matches!(
-        value,
-        StandardJson::Null | StandardJson::Bool(false) | StandardJson::Error(_)
-    )
+    !matches!(value, StandardJson::Null | StandardJson::Bool(false))
 }
 
 /// Check if an expression contains PathNoArg, Parent, or Key builtins that need path context.
@@ -11796,12 +11804,171 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Whether `builtin`'s operand is its input value itself -- the type
+/// tests, type filters, and every builtin that decodes `.` to compute its
+/// answer (`length`, `keys`, `tostring`, the string, math, date and regex
+/// families, ...).
+///
+/// `eval_builtin` raises for such a builtin over a value the index could
+/// not read (a malformed nested number `1.2.3`, #3222, or keyword `tru`,
+/// #3035): jq rejects that document at parse time, and ADR-0018's #2103
+/// amendment has a filter raise where it reads the corrupt value. Without
+/// this check the builtins' own fallbacks rendered the value as `null`
+/// (`null (null) has no keys`) or answered from its variant (`isnan` is
+/// `false`), which `try` and `?` swallow.
+///
+/// Builtins left out never read `.` as a value: those that only evaluate
+/// their arguments against it or test its truthiness (`select`, `first`,
+/// `limit`, `isvalid`, `isempty`), navigate it (`path`, `paths`,
+/// `getpath`, `del`), pass it through (`recurse`, `debug`), or ignore it
+/// (`now`, `env`, `input`, `infinite`), plus the multi-operand math
+/// builtins (`pow(a; b)`), whose operands are their arguments. Any of them
+/// still raises where its own evaluation reads the value.
+/// `unreadable_value_raises_in_both_evaluators_3222` holds the generic
+/// evaluator to the same answers.
+fn builtin_operand_is_input(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Type
+            | Builtin::IsNull
+            | Builtin::IsBoolean
+            | Builtin::IsNumber
+            | Builtin::IsString
+            | Builtin::IsArray
+            | Builtin::IsObject
+            | Builtin::Values
+            | Builtin::Nulls
+            | Builtin::Booleans
+            | Builtin::Numbers
+            | Builtin::Strings
+            | Builtin::Arrays
+            | Builtin::Objects
+            | Builtin::Iterables
+            | Builtin::Scalars
+            | Builtin::Length
+            | Builtin::Utf8ByteLength
+            | Builtin::Keys
+            | Builtin::KeysUnsorted
+            | Builtin::Has(_)
+            | Builtin::In(_)
+            | Builtin::Map(_)
+            | Builtin::MapValues(_)
+            | Builtin::Add
+            | Builtin::Any
+            | Builtin::All
+            | Builtin::Min
+            | Builtin::Max
+            | Builtin::MinBy(_)
+            | Builtin::MaxBy(_)
+            | Builtin::AsciiDowncase
+            | Builtin::AsciiUpcase
+            | Builtin::Ltrimstr(_)
+            | Builtin::Rtrimstr(_)
+            | Builtin::Startswith(_)
+            | Builtin::Endswith(_)
+            | Builtin::Split(_)
+            | Builtin::Join(_)
+            | Builtin::Contains(_)
+            | Builtin::Inside(_)
+            | Builtin::Reverse
+            | Builtin::Flatten
+            | Builtin::FlattenDepth(_)
+            | Builtin::GroupBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::ToEntries
+            | Builtin::FromEntries
+            | Builtin::WithEntries(_)
+            | Builtin::ToString
+            | Builtin::ToNumber
+            | Builtin::ToJson
+            | Builtin::FromJson
+            | Builtin::Explode
+            | Builtin::Implode
+            | Builtin::Test(_)
+            | Builtin::Indices(_)
+            | Builtin::Index(_)
+            | Builtin::Rindex(_)
+            | Builtin::ToStream
+            | Builtin::Transpose
+            | Builtin::Trim
+            | Builtin::Ltrim
+            | Builtin::Rtrim
+            | Builtin::Floor
+            | Builtin::Ceil
+            | Builtin::Round
+            | Builtin::Sqrt
+            | Builtin::Fabs
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Sin
+            | Builtin::Cos
+            | Builtin::Tan
+            | Builtin::Asin
+            | Builtin::Acos
+            | Builtin::Atan
+            | Builtin::Sinh
+            | Builtin::Cosh
+            | Builtin::Tanh
+            | Builtin::Asinh
+            | Builtin::Acosh
+            | Builtin::Atanh
+            | Builtin::Libm1(_)
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::IsFinite
+            | Builtin::Abs
+            | Builtin::Normals
+            | Builtin::Finites
+            | Builtin::Trunc
+            | Builtin::ToBoolean
+            | Builtin::Gmtime
+            | Builtin::Localtime
+            | Builtin::Mktime
+            | Builtin::Strftime(_)
+            | Builtin::Strflocaltime(_)
+            | Builtin::Strptime(_)
+            | Builtin::Todate
+            | Builtin::Fromdate
+            | Builtin::Todateiso8601
+            | Builtin::Fromdateiso8601
+            | Builtin::TestFlags(..)
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(..)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(..)
+            | Builtin::Sub(..)
+            | Builtin::SubFlags(..)
+            | Builtin::Gsub(..)
+            | Builtin::GsubFlags(..)
+            | Builtin::Scan(_)
+            | Builtin::ScanFlags(..)
+            | Builtin::SplitRegex(..)
+            | Builtin::Splits(_)
+            | Builtin::SplitsFlags(..)
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+    )
+}
+
 /// Evaluate a builtin function.
 fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     builtin: &Builtin,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if let StandardJson::Error(reason) = value {
+        if builtin_operand_is_input(builtin) {
+            return QueryResult::Error(EvalError::decode_failure(reason));
+        }
+    }
     match builtin {
         // Type functions
         // #2516 (yq mode): `type` answers the YAML tag (`!!str`, `!!int`,
@@ -12393,6 +12560,10 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Bool(b) if S::TAG == EvalTag::Yq => {
             QueryResult::Owned(OwnedValue::Int(if *b { 4 } else { 5 }))
         }
+        // A value the index could not read (`1.2.3`, #3222; `tru`, #3035)
+        // raises as the document fault it is, ahead of `?` -- not as
+        // `null (null) has no length`, which `try` would catch.
+        StandardJson::Error(reason) => QueryResult::Error(EvalError::decode_failure(*reason)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy::<S, _>(&value))),
     }
@@ -12613,6 +12784,7 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // hold unchanged either way. jq keeps erroring here (`Cannot check
         // whether <container> has a <key> key`, which is correct and
         // unaffected).
+        (StandardJson::Error(reason), _) => QueryResult::Error(EvalError::decode_failure(*reason)),
         _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
@@ -22271,6 +22443,9 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         {
             QueryResult::None
         }
+        // A value the index could not read (`1.2.3`, #3222; `tru`, #3035):
+        // the document fault jq rejects at parse time, raised ahead of `?`.
+        StandardJson::Error(reason) => QueryResult::Error(EvalError::decode_failure(reason)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
     }
@@ -22328,6 +22503,8 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         {
             QueryResult::None
         }
+        // As in `index_object_by_name` (#3222).
+        StandardJson::Error(reason) => QueryResult::Error(EvalError::decode_failure(reason)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
@@ -22489,6 +22666,12 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     key: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // A value the index could not read (`1.2.3`, #3222; `tru`, #3035) is
+    // the document fault jq rejects at parse time, not a type error `?`
+    // may swallow.
+    if let StandardJson::Error(reason) = target {
+        return QueryResult::Error(EvalError::decode_failure(reason));
+    }
     let indexable_by_string = matches!(target, StandardJson::Object(_) | StandardJson::Null);
     // #2459: yq mode also indexes a mapping by number (into `null`, via
     // `index_array_by_position`'s own `Object` arm) -- see
@@ -83619,8 +83802,9 @@ mod tests {
         // A real document spelling the infinity token is *not* infinite: only
         // bridge text carries tokens (#3034,
         // `test_bridge_token_spelling_in_a_real_document_is_not_a_token_3034`).
-        query!(br"8e999e999", "isinfinite", QueryResult::Owned(OwnedValue::Bool(b)) => {
-            assert!(!b);
+        // It is a malformed number, and reading it raises (#3222).
+        query!(br"8e999e999", "isinfinite", QueryResult::Error(e) => {
+            assert!(e.is_decode_failure(), "{}", e.message);
         });
         // yq mode shares the evaluator path (the `--jq-extensions` surface): a
         // YAML `.inf` scalar resolves to `f64::INFINITY`, so the predicate must
@@ -106109,6 +106293,171 @@ mod tests {
             QueryResult::Error(e) => assert!(e.message.contains("number required")),
             other => panic!("expected number-required error, got: {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion this test exists to make (#2937)"
         }
+    }
+
+    /// #3222: a value the index could not read -- a malformed nested number
+    /// (`1.2.3`) or keyword (`tru`, #3035) -- raises an uncatchable decode
+    /// failure on every route that reads it or asks its type, in *both*
+    /// evaluators: this one (`eval`, cursor-based) and the generic one
+    /// (`eval_using`). The CLI's routing picks one evaluator or the other
+    /// by query shape, so a CLI sweep alone cannot prove both are covered.
+    /// The generic one is entered through a cursor, as the CLI enters it.
+    /// Before #3222 the type filters here dropped the value (`numbers`,
+    /// `iterables`), the type tests answered `false`, and indexing it was a
+    /// catchable `Cannot index error with ...`.
+    #[test]
+    fn unreadable_value_raises_in_both_evaluators_3222() {
+        // `.` itself is absent: it forwards the cursor, and the printer is
+        // what reads it (`test_malformed_number_route_sweep_3222`).
+        const READERS: &[&str] = &[
+            "type",
+            "length",
+            "tostring",
+            "tojson",
+            "keys",
+            "to_entries",
+            ".[]",
+            ".x",
+            ".[0]",
+            ".[1:]",
+            "has(\"a\")",
+            "has(0)",
+            "getpath([\"a\"])",
+            ". + 1",
+            "-.",
+            "floor",
+            "isnan",
+            "isinfinite",
+            "tonumber",
+            "ascii_downcase",
+            "startswith(\"a\")",
+            "contains(1)",
+            "test(\"a\")",
+            "explode",
+            "todate",
+            "sort",
+            "add",
+            "min",
+            "utf8bytelength",
+            "abs",
+            "map(.)",
+            "nulls",
+            "booleans",
+            "numbers",
+            "strings",
+            "arrays",
+            "objects",
+            "iterables",
+            "scalars",
+            "isnumber",
+            "isnull",
+            ".x?",
+            ".[0]?",
+            "length?",
+            "keys?",
+            "try .x catch 1",
+            "try length catch 1",
+            "try type catch 1",
+        ];
+        let mut escaped = Vec::new();
+        for json in ["[1.2.3]", "[tru]", "[1ee5]"] {
+            let index = JsonIndex::build(json.as_bytes());
+            let element = index
+                .root(json.as_bytes())
+                .first_child()
+                .expect("one element");
+            for filter in READERS {
+                let expr = parse(filter).expect("filter parses");
+                let concrete = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
+                    QueryResult::Error(e) => e.is_decode_failure(),
+                    _ => false,
+                };
+                let generic = match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(
+                    &expr, element,
+                ) {
+                    crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
+                    _ => false,
+                };
+                for (evaluator, raised) in [("eval", concrete), ("eval_using", generic)] {
+                    if !raised {
+                        escaped.push(format!("{evaluator} `{filter}` on {json}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            escaped.is_empty(),
+            "answered instead of raising: {escaped:#?}"
+        );
+
+        // And a filter that never reads the value answers in both
+        // evaluators, exactly as it does for a real number (#2692: truthiness
+        // decodes nothing; #2168: navigation validates only what it
+        // navigates). `.` and `values` pass the value on to whatever reads it
+        // next, the printer included, so they are pinned by the CLI sweep.
+        const NON_READERS: &[&str] = &[
+            "not",
+            "if . then 1 else 2 end",
+            ". and true",
+            "(. // 1) | 2",
+            "select(.) | 1",
+            "first(.) | 1",
+            "isvalid(.)",
+            "empty",
+            "1",
+            // `eval` collects these into owned values -- it materializes,
+            // and materializing validates, as `-s` and `-S` do -- so only
+            // the generic evaluator, the one the CLI routes them to, is held
+            // to answering here.
+            "[limit(1; .)] | length",
+            "[.] | length",
+            "path(.)",
+            "[paths]",
+        ];
+        const MATERIALIZED_BY_EVAL: &[&str] = &[
+            "[limit(1; .)] | length",
+            "[.] | length",
+            "path(.)",
+            "[paths]",
+        ];
+        let good = b"[1]";
+        let good_index = JsonIndex::build(good);
+        let good_element = good_index.root(good).first_child().expect("one element");
+        let mut disagreed = Vec::new();
+        for json in ["[1.2.3]", "[tru]"] {
+            let index = JsonIndex::build(json.as_bytes());
+            let element = index
+                .root(json.as_bytes())
+                .first_child()
+                .expect("one element");
+            for filter in NON_READERS {
+                let expr = parse(filter).expect("filter parses");
+                if !MATERIALIZED_BY_EVAL.contains(filter) {
+                    let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
+                    let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
+                    if concrete != expected {
+                        disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
+                    }
+                }
+                let run_generic = |cursor| match crate::jq::eval_generic::eval_with_cursor_using::<
+                    JqSemantics,
+                    _,
+                >(&expr, cursor)
+                {
+                    crate::jq::eval_generic::GenericResult::Error(e) => Err(e.message),
+                    other => other.into_owned::<JqSemantics>().map_err(|e| e.message),
+                };
+                let generic = run_generic(element);
+                let expected = run_generic(good_element);
+                if generic != expected {
+                    disagreed.push(format!("eval_using `{filter}` on {json}: {generic:?}"));
+                }
+            }
+        }
+        assert!(
+            disagreed.is_empty(),
+            "a non-reader read the value: {disagreed:#?}"
+        );
     }
 }
 

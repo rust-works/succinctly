@@ -7386,25 +7386,42 @@ need a representation change; recorded here on its merits, tracked as
 NaN is compared against the very same NaN; `sort`, `unique`, `group_by` and `<` already agree
 with jq.
 
-### A malformed nested number reads as `null`; jq rejects the document (#966, #3034) — accepted uniform divergence
+### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 
 A number *inside* an array or object is recovered by a greedy span (`[0-9.eE+-]`, plus
-#2877's decNumber words), and a span that none of jq's number spellings accepts reads as
-`null` rather than failing the document. jq's parser rejects the whole document instead:
+#2877's decNumber words). A span that none of jq's number spellings accepts is an error
+value in the index. Every route that reads it raises, and a route that never reaches it
+still answers. jq's parser rejects the whole document instead:
 
 ```console
-$ printf '[1.2.3,2]' | jq -c .              # parse error: Invalid numeric literal at line 1, column 7, exit 5
-$ printf '[1.2.3,2]' | succinctly jq -c .   # [null,2], exit 0
-$ printf '[1ee5]' | succinctly jq -c .      # [null]
-$ printf '{"a":9e999e999}' | succinctly jq -c .   # {"a":null}
+$ printf '[1.2.3,2]' | jq -c .                 # parse error: Invalid numeric literal at line 1, column 7, exit 5
+$ printf '[1.2.3,2]' | succinctly jq -c .      # Invalid JSON text: expected ',' or ']', found '.', exit 5
+$ printf '[1.2.3,2]' | succinctly jq -c '.[0] | type'   # exit 5, as are length, tostring, .x, has, ...
+$ printf '[1.2.3,2]' | succinctly jq -c '.[1]'  # 2, exit 0 -- jq: exit 5
+$ printf '[1.2.3,2]' | succinctly jq -c 'length' # 2, exit 0 -- jq: exit 5
 ```
 
-This is the semi-index's "minimal validation" trade: ADR-0018's #2103 amendment sanctions a
-*uniform* divergence where the reference rejects the whole document at parse time. Whether a
-malformed number should instead raise when read, the way a malformed object member does, is
-[#3222](https://github.com/rust-works/succinctly/issues/3222) -- as is the `null` not being a
-consistent one on every route (`.[0] | type` is `"number"`, `.[0] | length` errors). A top-level malformed number is still rejected (the
-top-level splitter is strict), and `--validate` rejects the document up front (exit 3).
+This is ADR-0018's #2103 amendment: a value is validated when, and only when, something reads
+it (#2692), the rule a malformed object member already follows (#1194). The error is a decode
+failure, so neither `try` nor `?` catches it, as neither can in jq. Truthiness reads nothing
+(#2692), so `-e`, `select`, `if`, `and`/`or`, `not` and `//` still answer on the bad value
+itself (`.[0] | not` is `false`), and a slice raises because it materializes its array, as it
+does for every value the index can't read.
+
+**Until #3222 the span read as `null`** (#966). `null` was a local fallback chosen over the `0`
+the funnels made up before #966. Nobody ever compared it with jq, and it was filed here under
+the amendment afterwards. That was a misreading. The amendment accepts a *uniform* divergence
+because matching jq's up-front rejection isn't reachable, but raising on read is. It is
+uniform, and it matches jq on every filter that reads the value, while `null` matches jq on
+none. The `null` wasn't even uniform: `.[0] | type` was `"number"`, `.[0] | length` raised
+`null (null) has no length`, which `try` could catch, and the printer and funnels printed
+`null`. `--slurpfile` now rejects such a document too (exit 2), as jq does.
+
+A top-level malformed number was already rejected (the top-level splitter is strict), and
+`--validate` rejects the document up front (exit 3). `--preserve-input` with compact output
+(`--preserve-input -c .`) copies each value's source bytes without decoding them, so it echoes
+the span verbatim, as it echoes a stray trailing comma. That is the flag's deliberate
+non-validating echo, not a route that reads the value.
 
 **The reindex bridge's number tokens are in the class, not exceptions to it (#3034).**
 succinctly's evaluator round-trips computed values through JSON text, and writes a NaN, an
@@ -7413,7 +7430,8 @@ Until #3034 the same bytes in a *document* decoded as the value they stand for, 
 uniformity above: `[9e999e999]` was NaN, `[8e999e999]` was `DBL_MAX`, `[1e0e0]` was `1`, and
 routes disagreed (`isnan` true, `tostring` `"null"`). Only an index built over the bridge's own
 text decodes a token now (`JsonIndex::build_reindex`, `JsonNumber::bridge_value`), so each
-spelling reads exactly like its nearest non-token sibling (`9e999e998`, `1e0e1`) on every route.
+spelling reads exactly like its nearest non-token sibling (`9e999e998`, `1e0e1`) on every route
+-- since #3222, by raising.
 
 Pinned by `test_bridge_token_spellings_read_like_their_siblings_3034` and
 `test_bridge_tokens_still_round_trip_computed_values_3034` (`tests/jq_cli_tests.rs`),

@@ -607,6 +607,22 @@ impl EvalError {
     // `getpath(["a"])` and `. as {a:$a}` all report "Cannot index … with
     // string \"a\"".
 
+    /// The decode failure standing in for a `Cannot index ...` whose
+    /// container is a value the index could not read -- a malformed nested
+    /// number (`1.2.3`, #3222) or keyword (`tru`, #3035), whose
+    /// `DocumentValue::type_name` is the internal `"error"`, a name no jq
+    /// value has.
+    ///
+    /// jq rejects such a document at parse time, so indexing into the value
+    /// raises the document fault, which `try` does not catch, instead of a
+    /// type error naming `"error"`. The routes with the value to hand raise
+    /// its own reason ahead of `?` (`index_object_by_name`,
+    /// `index_one_generic`); this catches every other route that builds
+    /// the error from the type name alone.
+    fn unreadable_container(container_type: &str) -> Option<Self> {
+        (container_type == "error").then(|| Self::decode_failure("malformed value in document"))
+    }
+
     /// `Cannot index <container> with string "<key>"`, or, for a non-string
     /// key, `Cannot index <container> with <key type>`.
     ///
@@ -614,6 +630,9 @@ impl EvalError {
     /// truncate it. A slice reports its key as `object`, because jq models
     /// `.[a:b]` as indexing with `{"start":a,"end":b}`.
     pub fn cannot_index(container_type: &str, key: &OwnedValue) -> Self {
+        if let Some(err) = Self::unreadable_container(container_type) {
+            return err;
+        }
         match key {
             OwnedValue::String(k) => {
                 Self::new(format!("Cannot index {container_type} with string \"{k}\""))
@@ -625,12 +644,18 @@ impl EvalError {
     /// `Cannot index <container> with <key type>`, for call sites that know
     /// the key's kind but do not have the value to hand.
     pub fn cannot_index_with_type(container_type: &str, key_type: &str) -> Self {
+        if let Some(err) = Self::unreadable_container(container_type) {
+            return err;
+        }
         Self::new(format!("Cannot index {container_type} with {key_type}"))
     }
 
     /// `Cannot index <container> with string "<key>"`, for the common case of
     /// a field access whose key is already a `&str`.
     pub fn cannot_index_with_field(container_type: &str, key: &str) -> Self {
+        if let Some(err) = Self::unreadable_container(container_type) {
+            return err;
+        }
         Self::new(format!(
             "Cannot index {container_type} with string \"{key}\""
         ))

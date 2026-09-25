@@ -6345,7 +6345,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy(JsonConvention::Preserve);
+                            any_truthy |= !$cursor.is_falsy();
                         }
                     }
                 } else {
@@ -6494,7 +6494,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy(JsonConvention::Preserve);
+                            any_truthy |= !$cursor.is_falsy();
                         }
                     }
                 } else {
@@ -6725,9 +6725,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
-                                    any_truthy |= root
-                                        .first_child()
-                                        .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
+                                    any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
                                 }
                             }
                         } else {
@@ -6917,9 +6915,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     // falsiness lives on the actual document
                                     // value (#178).
                                     if args.exit_status {
-                                        any_truthy |= root
-                                            .first_child()
-                                            .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
+                                        any_truthy |=
+                                            root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
                                 }
                             } else {
@@ -7674,9 +7671,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     }
                                     write_terminator(&mut buf_writer, &output_config)?;
                                     if args.exit_status {
-                                        any_truthy |= root
-                                            .first_child()
-                                            .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
+                                        any_truthy |=
+                                            root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
                                 } else if let Some(doc_cursor) = root.first_child() {
                                     stream_cursor!(
@@ -9000,14 +8996,15 @@ mod tests {
         }
     }
 
-    /// #999 review: a lenient-but-unparseable span (multiple decimal
-    /// points, a bare minus, a trailing exponent marker with no digits, ...)
-    /// falls all the way through to the final `else` arm -- `as_i64`/
-    /// `as_f64` both decline too, since the raw text isn't a valid number by
-    /// any of Rust's own parsers either. Matches `to_owned`'s identical
-    /// degrade-to-`Null` behavior for the same inputs (confirmed live).
+    /// #999 review, flipped by #3222: a span that is no number at all
+    /// (multiple decimal points, a bare minus, a trailing exponent marker
+    /// with no digits, ...) used to fall through every arm to `Null`. The
+    /// index now reads it as an error value, so this materializer raises a
+    /// decode failure -- real yq's JSON reader rejects the document too
+    /// (`strconv.ParseFloat: parsing "1.2.3": invalid syntax`), and so does
+    /// `to_owned`.
     #[test]
-    fn to_owned_canonicalizing_numbers_degrades_unparseable_spans_to_null() {
+    fn to_owned_canonicalizing_numbers_raises_on_unparseable_spans_3222() {
         for json in [
             br#"{"n": 1.2.3}"#.as_slice(),
             br#"{"n": 1-2}"#.as_slice(),
@@ -9015,17 +9012,9 @@ mod tests {
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let owned =
-                to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0).unwrap();
-            let OwnedValue::Object(map) = owned else {
-                panic!("expected an object for {json:?}")
-            };
-            assert_eq!(
-                map.get("n"),
-                Some(&OwnedValue::Null),
-                "expected Null for {json:?}, got {:?}",
-                map.get("n")
-            );
+            let err = to_owned_canonicalizing_numbers_at_depth(&cursor.value(), &cursor, 0)
+                .expect_err("a malformed number must not materialize");
+            assert!(err.is_decode_failure(), "{json:?}: {err:?}");
         }
     }
 

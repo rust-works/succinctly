@@ -1603,8 +1603,8 @@ fn test_jq_number_spellings_builtins_2877() -> Result<()> {
 /// that is not decNumber's, a NaN followed by anything but digits, a `+`
 /// before anything but a digit, `.` or such a word -- and the whole scalar
 /// token has to validate, so `nan1.5` is not read as `nan1` plus leftovers.
-/// The bridge's own tokens with a `+` in front are user text and degrade
-/// like `+1.2.3` (#966's `null`), never to a NaN or an infinity.
+/// The bridge's own tokens with a `+` in front are user text and read like
+/// `+1.2.3` (raising since #3222), never as a NaN or an infinity.
 ///
 /// Asserted as "does not become a number" on the materializing route as
 /// well as "errors" on the identity route: #3035's pre-existing keyword
@@ -1679,30 +1679,31 @@ fn test_jq_number_spellings_reject_set_2877() -> Result<()> {
         let (stdout, _, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 5, "{input}: {stdout:?}");
     }
-    // A `+` in front of the bridge's tokens, or of a malformed span, is
-    // #966's `null` -- exactly what the unsigned spelling gives.
-    for (input, expected) in [
-        ("[+9e999e999]", "[null]"),
-        ("[+8e999e999]", "[null]"),
-        ("[+1e0e0]", "[null]"),
-        ("[+1.2.3]", "[null]"),
-        ("[1.2.3]", "[null]"),
+    // A `+` in front of the bridge's tokens, or of a malformed span, reads
+    // exactly as the unsigned spelling does: a malformed number, raised
+    // when read (#3222; #966's `null` before that), never a NaN, an
+    // infinity or a computed float.
+    for input in [
+        "[+9e999e999]",
+        "[+8e999e999]",
+        "[+1e0e0]",
+        "[+1.2.3]",
+        "[1.2.3]",
         // `-` before anything is the old number-shaped span (#966), so a
-        // doubled sign led by `-` is `null` as it was before #2877, while
-        // `+-1` above is an error: `+` is admitted only before a digit,
+        // doubled sign led by `-` is a malformed number, while `+-1` above
+        // is not number-shaped at all: `+` is admitted only before a digit,
         // `.` or a decNumber word.
-        ("[-+1]", "[null]"),
+        "[-+1]",
     ] {
-        let (stdout, _stderr, code) = run_jq_full(&["-c", "map(.)"], Some(input))?;
-        assert_eq!(code, 0, "{input}");
-        assert_eq!(stdout.trim_end(), expected, "{input}");
-        let (stdout, _stderr, _code) =
-            run_jq_full(&["-c", ".[0] | [isnan, isinfinite]"], Some(input))?;
-        assert_eq!(
-            stdout.trim_end(),
-            "[false,false]",
-            "{input} must not decode as a bridge token"
-        );
+        for filter in ["map(.)", ".[0] | [isnan, isinfinite]"] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(code, 5, "{filter} on {input}: {stdout:?}");
+            assert_eq!(stdout, "", "{filter} on {input} must not decode");
+            assert!(
+                stderr.contains("invalid numeric literal"),
+                "{input}: {stderr}"
+            );
+        }
     }
     Ok(())
 }
@@ -23900,17 +23901,15 @@ fn test_leading_zero_number_sanitizes_on_materialization_966() -> Result<()> {
 }
 
 /// #966: a number with two decimal points was silently materializing as
-/// `0`; it now correctly falls through to `null`, since neither `i64` nor
-/// `f64` parses it (matching real jq's behavior of rejecting `1.2.3`
-/// outright -- succinctly's semi-indexing architecture is deliberately
-/// lenient about accepting it as a token in the first place, but the
-/// materialized *value* should never silently be a wrong number).
+/// `0`; #966 made it `null`, and #3222 makes reading it raise, as real jq
+/// rejects `1.2.3` outright. The semi-index still accepts the token without
+/// validating the document up front; the value is never a made-up number.
 #[test]
-fn test_malformed_two_dot_number_becomes_null_not_zero_966() -> Result<()> {
+fn test_malformed_two_dot_number_raises_when_read_3222() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1.2.3}"#))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[null]\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("invalid numeric literal"), "{stderr}");
     Ok(())
 }
 
@@ -23950,14 +23949,16 @@ fn test_plain_field_access_sanitizes_leading_zero_966() -> Result<()> {
 }
 
 /// Same as above for `.[]` iteration over malformed and valid numbers
-/// mixed together -- confirms the fix applies per-element, not just to a
-/// whole-document shortcut.
+/// mixed together -- the check is per element, not a whole-document
+/// shortcut: `007` (a spelling jq accepts) streams, and the stream stops at
+/// `1.2.3` (#3222). jq rejects the document before printing anything; a
+/// filter here validates only what it reads (ADR-0018's #2103 amendment).
 #[test]
-fn test_array_iteration_sanitizes_malformed_numbers_966() -> Result<()> {
+fn test_array_iteration_raises_at_the_malformed_number_3222() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[007, 1.2.3, 42]"))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "7\nnull\n42\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "7\n");
+    assert!(stderr.contains("Invalid JSON text"), "{stderr}");
     Ok(())
 }
 
@@ -23992,17 +23993,15 @@ fn test_preserve_input_still_echoes_raw_number_text() -> Result<()> {
     Ok(())
 }
 
-/// #966 code review found that once a malformed number's cursor
-/// materializes to `Null` (`src/jq/lazy.rs::cursor_to_owned`, reached by
-/// `jq -e`'s exit-status check), `jq -e '.a'` on a document with a
-/// malformed `.a` now correctly reports failure (exit 1) instead of
-/// silently succeeding on a value that only *looked* like a number.
+/// #966 code review made `jq -e '.a'` on a malformed `.a` exit 1, for the
+/// `null` it then printed. Since #3222 printing `.a` reads the number and
+/// raises, exit 5, as real jq does -- `-e` never gets a value to test.
 #[test]
-fn test_exit_status_false_for_malformed_number_966() -> Result<()> {
+fn test_exit_status_for_malformed_number_is_the_decode_failure_3222() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-e", "-c", ".a"], Some(r#"{"a": 1.2.3}"#))?;
-    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "null\n");
-    assert_eq!(stderr, "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("invalid numeric literal"), "{stderr}");
     Ok(())
 }
 
@@ -24018,8 +24017,9 @@ fn test_arithmetic_on_malformed_number_errors_not_silent_zero_966() -> Result<()
     let (stdout, stderr, code) = run_jq_full(&["-c", ".a - 1"], Some(r#"{"a": 1.2.3}"#))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    // Since #3222 the read itself raises, before `-` sees an operand.
     assert!(
-        stderr.contains("cannot be subtracted"),
+        stderr.contains("invalid numeric literal"),
         "unexpected stderr: {stderr}"
     );
     Ok(())
@@ -32051,22 +32051,19 @@ fn test_jq_leading_dot_number_preserves_trailing_zeros_1171() -> Result<()> {
     Ok(())
 }
 
-/// A malformed number *nested* inside an otherwise well-formed container
-/// keeps this crate's own established #966 precedent (materialize as
-/// `null`, don't error the whole document) even after #1171's stricter
-/// top-level handling -- the two code paths (`find_json_values`'s
-/// top-level document splitter vs. `light.rs`'s per-value materializer)
-/// deliberately have different error-vs-null conventions. Regression
+/// A malformed number *nested* inside an otherwise well-formed container is
+/// judged on its whole greedy span, never a valid prefix of it. Regression
 /// guard: an earlier draft of #1171's fix used one shared, strict
-/// number-span function for both paths, which truncated `1.2.3` after
-/// `1.2` and silently fabricated the wrong value `1.2` instead of `null`
-/// (caught by review before merge -- see `nested_number_span`'s own doc
-/// comment in `src/json/light.rs`).
+/// number-span function for the top-level splitter and `light.rs`'s nested
+/// values, which truncated `1.2.3` after `1.2` and silently fabricated the
+/// value `1.2` (caught by review before merge -- see `nested_number_span`'s
+/// own doc comment in `src/json/light.rs`). The whole span then read as
+/// `null` (#966); since #3222 reading it raises.
 #[test]
-fn test_jq_nested_malformed_number_still_becomes_null_not_fabricated_1171() -> Result<()> {
+fn test_jq_nested_malformed_number_raises_not_fabricated_1171() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-c", "[.a]"], Some(r#"{"a": 1.2.3}"#))?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[null]");
+    assert_eq!(code, 5, "out: {out:?}");
+    assert_eq!(out, "");
 
     Ok(())
 }
@@ -32736,21 +32733,24 @@ fn test_jq_malformed_object_length_agrees_across_spellings_1194() -> Result<()> 
     Ok(())
 }
 
-/// #1194 stays out of #966's way: a malformed *number* nested inside an
-/// already-recognized container still degrades to `null` at exit 0. This
-/// fix is about object member *structure*, not number grammar, and the two
-/// have deliberately opposite conventions.
+/// A malformed *number* nested inside an already-recognized container used
+/// to degrade to `null` at exit 0 (#966), the opposite of #1194's malformed
+/// member. #3222 gave both one convention: reading the value raises. The
+/// streaming printer has already written the member's key when it meets the
+/// value, as it has for a malformed keyword (`{"a":tru}`); only the exit
+/// status and the absence of a made-up `null` are pinned here.
 ///
 /// `[xyz123]` used to sit in this same table (a structurally malformed
 /// *value*, not a malformed number, degrading to `[null]`) -- it moved out
 /// once #1641 made the identity printer raise on it instead. See
 /// `test_jq_identity_on_malformed_array_element_errors_1641` below.
 #[test]
-fn test_jq_malformed_nested_number_unaffected_by_1194() -> Result<()> {
-    let (input, expected) = (r#"{"a": 1.2.3}"#, r#"{"a":null}"#);
-    let (out, _stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
-    assert_eq!(code, 0, "{input}: out: {out:?}");
-    assert_eq!(out.trim(), expected, "{input}");
+fn test_jq_malformed_nested_number_raises_like_1194_3222() -> Result<()> {
+    let input = r#"{"a": 1.2.3}"#;
+    let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+    assert_eq!(code, 5, "{input}: out: {out:?}");
+    assert!(!out.contains("null"), "{input}: out: {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "{stderr}");
 
     Ok(())
 }
@@ -65976,12 +65976,12 @@ fn test_mixed_int_float_literal_order_stays_exact_2936() -> Result<()> {
     Ok(())
 }
 
-/// A malformed number-shaped span with 18+ digits keeps #966's `null` on
-/// the materializing route (code review of #2936: the slow path read a
-/// valid prefix out of it and printed a fabricated value). jq rejects each
-/// document outright; succinctly's recorded #966 leniency is the `null`.
+/// A malformed number-shaped span with 18+ digits is a malformed number on
+/// the materializing route, not a valid prefix read out of it (code review
+/// of #2936: the slow path printed a fabricated value). jq rejects each
+/// document outright; reading the span raises (#3222; `null` before).
 #[test]
-fn test_malformed_long_number_span_stays_null_2936() -> Result<()> {
+fn test_malformed_long_number_span_raises_when_read_2936() -> Result<()> {
     for doc in [
         "[123456789012345678901e]",
         "[123456789012345678901e+]",
@@ -65990,8 +65990,8 @@ fn test_malformed_long_number_span_stays_null_2936() -> Result<()> {
         "[1234567.2.3]",
     ] {
         let (out, _, code) = run_jq_full(&["-c", "map(.)"], Some(doc))?;
-        assert_eq!(code, 0, "{doc}");
-        assert_eq!(out.trim(), "[null]", "{doc}");
+        assert_eq!(code, 5, "{doc}");
+        assert_eq!(out, "", "{doc}");
     }
     Ok(())
 }
@@ -68475,6 +68475,95 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+    }
+    Ok(())
+}
+
+/// #3222 route sweep: a malformed nested number raises on every route that
+/// reads it -- the printer included -- as an uncatchable document error at
+/// exit 5, and a route that never reads it answers exactly as it does for a
+/// real number. jq rejects all of these documents at parse time (exit 5);
+/// the answering half is ADR-0018's #2103 amendment (#2692: truthiness and
+/// navigation decode nothing). Until #3222 the value read as `null` on some
+/// routes, `"number"` on `type`, and was dropped by `numbers`/`iterables`.
+#[test]
+fn test_malformed_number_route_sweep_3222() -> Result<()> {
+    const READERS: &[&str] = &[
+        ".",
+        ".[0]",
+        ".[]",
+        ".[0] | type",
+        ".[0] | length",
+        ".[0] | tostring",
+        ".[0] | tojson",
+        "tojson",
+        ".[0] | . + 1",
+        ".[0] | floor",
+        ".[0] | isnan",
+        ".[0] | keys",
+        ".[0] | .x",
+        ".[0] | .[0]",
+        ".[0] | has(\"a\")",
+        ".[0] | numbers",
+        ".[0] | iterables",
+        ".[0] | scalars",
+        ".[0] | values",
+        "map(.)",
+        "map(type)",
+        "[.[] | numbers]",
+        "first(.[])",
+        "sort",
+        "add",
+        "tostream",
+        "to_entries",
+        "[.[0]]",
+        "{a: .[0]}",
+        ".[0] | .x?",
+        ".[0] | length?",
+        "try (.[0] | length) catch \"caught\"",
+        "try (.[0] | .x) catch \"caught\"",
+        "try (.[0] | type) catch \"caught\"",
+        "[.[] | tostring?]",
+    ];
+    for doc in ["[1.2.3,2]", "[1ee5,2]", "[9e999e999,2]", "[+1.2.3,2]"] {
+        for filter in READERS {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 5, "{filter} on {doc}: {stdout:?} {stderr:?}");
+            assert!(
+                !stdout.contains("null") && !stdout.contains("caught"),
+                "{filter} on {doc} answered: {stdout:?}"
+            );
+        }
+        for flags in [&["-c", "-S", "."][..], &["-c", "-s", "."][..]] {
+            let (stdout, _, code) = run_jq_full(flags, Some(doc))?;
+            assert_eq!(code, 5, "{flags:?} on {doc}: {stdout:?}");
+        }
+    }
+    const NON_READERS: &[&str] = &[
+        ".[1]",
+        "length",
+        "keys",
+        "[paths]",
+        ".[0] | not",
+        ".[0] | if . then 1 else 2 end",
+        ".[0] | . and true",
+        ".[0] | select(.) | 1",
+        "[.[] | select(.)] | length",
+        ".[0] | (. // 1) | 2",
+        ".[0] | [.] | length",
+        ".[0] | path(.)",
+        ".[0] | empty",
+        "[.[0] | isvalid(.)]",
+    ];
+    for filter in NON_READERS {
+        let expected = run_jq_full(&["-c", filter], Some("[1,2]"))?;
+        for doc in ["[1.2.3,2]", "[1ee5,2]"] {
+            assert_eq!(
+                run_jq_full(&["-c", filter], Some(doc))?,
+                expected,
+                "{filter} on {doc}"
+            );
+        }
     }
     Ok(())
 }

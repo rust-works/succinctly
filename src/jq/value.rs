@@ -6324,6 +6324,66 @@ mod tests {
         }
     }
 
+    /// #3222: `number_span_decodes` is the index's test for "this nested
+    /// span is a number", and a span it refuses becomes an `Error` the
+    /// readers raise. It must refuse exactly what the funnel reads as
+    /// `null`, in both modes: refusing more would raise on a number jq
+    /// reads, refusing less would leave a `null` the funnel still makes up.
+    /// Every span over the greedy class `[0-9.eE+-]` up to six bytes (the
+    /// shapes `nested_number_span` can capture), the decNumber words, and
+    /// 18+-digit spans (jq mode's own decimal reader, #2936).
+    #[test]
+    fn number_span_decodes_agrees_with_from_number_bytes_3222() {
+        fn check(text: &[u8]) {
+            let decodes = crate::json::validate::number_span_decodes(text);
+            for (mode, value) in [
+                ("jq", OwnedValue::from_number_bytes::<JqSemantics>(text)),
+                ("yq", OwnedValue::from_number_bytes::<YqSemantics>(text)),
+            ] {
+                assert_eq!(
+                    decodes,
+                    value != OwnedValue::Null,
+                    "{mode} {:?}",
+                    String::from_utf8_lossy(text)
+                );
+            }
+        }
+        const CLASS: &[u8] = b"019.eE+-";
+        let mut frontier: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..6 {
+            let mut next = Vec::with_capacity(frontier.len() * CLASS.len());
+            for prefix in &frontier {
+                for &b in CLASS {
+                    let mut span = prefix.clone();
+                    span.push(b);
+                    check(&span);
+                    next.push(span);
+                }
+            }
+            frontier = next;
+        }
+        for word in [
+            "nan",
+            "NaN",
+            "-nan",
+            "+nan",
+            "sNaN12",
+            "inf",
+            "-Infinity",
+            "+inf",
+            "nanx",
+            "inf1",
+        ] {
+            check(word.as_bytes());
+        }
+        let long = "123456789012345678901";
+        for tail in ["", ".5", "e5", "e", ".2.3", "e5e5", "."] {
+            check(format!("{long}{tail}").as_bytes());
+            check(format!("-{long}{tail}").as_bytes());
+            check(format!("0.{long}{tail}").as_bytes());
+        }
+    }
+
     /// #2877: the input bridge writes a bare non-finite `Float` as the
     /// reindex tokens (the same ones `to_json_for_reindex` uses) and is
     /// otherwise `to_json`: a preserved literal keeps its full spelling with
