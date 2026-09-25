@@ -740,7 +740,7 @@ is the revert that established what the other one costs.
    assignment's `_modify`, as in `[.k \|= 1]`), jq raises too and only the wording differs
    (`… with result …` here). Three shapes jq answers still refuse here. The first is an array
    holding anything outside that list that jq accepts: a shape the resolver still evaluates
-   by value (`getpath`, or a `$var` on an untracked input: #2759;
+   by value (`getpath`:
    `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), or one it resolves but does not count as
    checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)`). The second is an array
    nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The
