@@ -733,13 +733,15 @@ is the revert that established what the other one costs.
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
    navigation, `..`, `select`, an `if`'s branches, and pipes, commas and subexp shapes of
-   those. So `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Two shapes jq answers still
-   refuse here. The first is any other array: one holding a builtin call, an update
-   assignment (`[.k \|= 1]`), a `def`, `getpath`, a postfix `?`, a `$var` on an untracked
-   input, or parameterized recursion (#2759, #2764). Navigation hidden in a builtin jq
-   defines in jq (`with_entries`, `walk`, `sub`) or in `_modify` is never checked there, so
-   such an array can carry no register (`path(. as $x \| [.a?] \| $x)`). The same goes for
-   an array nested in another stage (`if true then [.a] else 1 end`). The second shape is
+   those. So `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Any other array carries no
+   register. Where it holds navigation this resolver can't see (a builtin jq defines in jq,
+   such as `with_entries` or `walk`, or an update assignment's `_modify`, as in `[.k \|= 1]`),
+   jq raises too and only the wording differs (`… with result …` here). Two shapes jq
+   answers still refuse here. The first is an array holding a shape the resolver still
+   evaluates by value when jq accepts it (a postfix `?`, `getpath`, a `$var` on an untracked
+   input, parameterized recursion: #2759, #2764; `path(. as $x \| [.a?] \| $x)`), or an
+   array nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`).
+   The second shape is
    a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
    body is not something a syntactic predicate can do from a name). Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays

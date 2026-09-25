@@ -33745,10 +33745,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ResolveFlow::Exhausted | ResolveFlow::Stopped => {
                     // #3263: jq's collect backtracks to where it began, so the
                     // register is where it was entering -- `value` itself when
-                    // trackable, or whatever the enclosing pipe is carrying.
+                    // trackable -- but only when every navigation inside was
+                    // checked here too; otherwise no register is claimed.
                     let array = untracked_at_register(
                         Cow::Owned(OwnedValue::Array(items.into())),
-                        trackable,
+                        trackable && array_contents_are_checked(inner),
                         value,
                     );
                     match sink(array) {
@@ -35426,9 +35427,9 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
 /// contents it checks as jq does. What remains refused: an array holding
 /// anything outside that allowlist (a builtin call, an assignment, a
 /// `def`, `getpath`, a postfix `?`, a `$var` on an untracked input,
-/// parameterized recursion), an array nested inside another stage (`if
-/// true then [.a] else 1 end`, `[.a] | select(true)`), and an array in a
-/// fold, which consults only this predicate. A refusal is not a fabricated
+/// parameterized recursion), an array nested inside another stage's
+/// expression (`if true then [.a] else 1 end`, `([.a], [.k])`, `try [.a]`),
+/// and an array in a fold, which consults only this predicate. A refusal is not a fabricated
 /// path, but it was not free either: under `try`/`?` it used to be caught as
 /// though it were jq's own path error, so the write was lost where jq
 /// writes. Since #3267 a refusal this predicate's `false` leads to is
@@ -100027,6 +100028,8 @@ mod tests {
             (r"path(. as $x | [..] | $x)", "[]"),
             (r"path(. as $x | [.a.b] | $x | .a)", r#"["a"]"#),
             (r"path(. as $x | [.a | select(.b)] | $x)", "[]"),
+            (r"path(. as $x | 5 | [select(true)] | $x)", "[]"),
+            (r"path(. as $x | [.[.k | tostring]] | $x)", "[]"),
             (r"path(. as $x | [if .k then .a else .k end] | $x)", "[]"),
             (r"path(.a as $y | .a | [.b] | $y | .b)", r#"["a","b"]"#),
         ] {
@@ -100036,6 +100039,14 @@ mod tests {
                 "{filter}"
             );
         }
+        // A computed slice's target is navigation too; its bounds are subexps.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"c":[1,2]},"k":1}"#,
+                r"path(. as $x | [.a.c[.k:]] | $x)"
+            ),
+            ["[]"]
+        );
         // Its contents are still checked: a navigation inside it on a
         // computed value raises as in jq, and the array itself is no path.
         for filter in [
@@ -100047,7 +100058,9 @@ mod tests {
             // `_modify`, or a builtin jq defines in jq but this evaluates
             // natively -- keeps the array off the register (review: each
             // fabricated a path, `[.k |= . + 1]` a write, before
-            // `array_contents_are_checked`).
+            // `array_contents_are_checked`). jq raises too, with different
+            // wording ("near attempt to ..." vs "with result"); what is
+            // pinned here is only that neither answers.
             r"path(. as $x | [.k |= . + 1] | $x)",
             r"path(. as $x | [.[] |= 1] | $x)",
             r"path(. as $x | [with_entries(.)] | $x)",
