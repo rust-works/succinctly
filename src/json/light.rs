@@ -916,17 +916,29 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
     /// `Number` that the funnels read as `null` (#966) and `type` read as
     /// `"number"`.
     ///
-    /// [`JsonNumber::decodes`] makes the call: a strict scan settles the
-    /// common case without taking the greedy span, so a well-formed number
-    /// pays one pass over its digits.
+    /// The span is measured once, here, and kept in the `JsonNumber`, so the
+    /// check costs no extra pass over the digits: a strict scan settles an
+    /// ordinary number and yields its end, which `raw_bytes` would otherwise
+    /// have found with the greedy scan. Anything else -- a lenient spelling,
+    /// a decNumber word, a bridge token, a malformed span -- takes the
+    /// greedy span and asks
+    /// [`number_span_decodes`](crate::json::validate::number_span_decodes),
+    /// after [`JsonNumber::bridge_value`], which alone may decode a bridge
+    /// token (#3034).
     #[inline]
     fn number_at(&self, text_pos: usize) -> StandardJson<'a, W> {
+        let strict_end = strict_number_end(self.text, text_pos);
+        let end = strict_end.unwrap_or_else(|| nested_number_span(self.text, text_pos));
         let n = JsonNumber {
             text: self.text,
             start: text_pos,
+            len: u32::try_from(end - text_pos).unwrap_or(UNMEASURED_SPAN),
             bridge: self.index.bridge_tokens,
         };
-        if n.decodes() {
+        if strict_end.is_some()
+            || n.bridge_value().is_some()
+            || crate::json::validate::number_span_decodes(&self.text[text_pos..end])
+        {
             StandardJson::Number(n)
         } else {
             StandardJson::Error(MALFORMED_NUMBER)
@@ -2382,7 +2394,7 @@ fn word_special_mask(word: u64) -> u64 {
 /// (a byte that begins a candidate number: `-`, an ASCII digit, or a
 /// leading `.`), for a value reached while materializing an
 /// already-recognized container's nested field/element (`value()`,
-/// `text_range()`, [`JsonNumber::find_end`] below).
+/// `text_range()`, [`nested_number_span`] below).
 ///
 /// Deliberately permissive, unlike [`number_literal_end`]: greedily
 /// consumes every subsequent `[0-9.eE+-]` byte with no grammar
@@ -2451,54 +2463,43 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
 /// precisely; this is what the rest print.
 const MALFORMED_NUMBER: &str = "invalid numeric literal";
 
-/// Whether the token at `start` is `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`
-/// and ends exactly where [`nested_number_span`] would end it -- i.e. the
-/// next byte is not in that span's greedy class. Such a span is a number to
-/// every decoder (RFC 8259 plus jq's redundant leading zeros, #1149), so
-/// [`JsonNumber::decodes`] can answer without taking the span; every other
-/// shape, valid or not, answers `false` here and is decided on the whole
-/// span.
+/// Where the token at `start` ends, if it is
+/// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` and ends exactly where
+/// [`nested_number_span`] would end it -- i.e. the next byte is not in that
+/// span's greedy class. Such a span is a number to every decoder (RFC 8259
+/// plus jq's redundant leading zeros, #1149), so `JsonCursor::number_at`
+/// accepts it without taking the greedy span; every other shape, valid or
+/// not, answers `None` here and is decided on the whole span.
 #[inline]
-fn strict_number_fills_span(text: &[u8], start: usize) -> bool {
+fn strict_number_end(text: &[u8], start: usize) -> Option<usize> {
     #[inline]
-    fn digits(text: &[u8], mut i: usize) -> (usize, bool) {
+    fn digits(text: &[u8], mut i: usize) -> Option<usize> {
         let from = i;
         while i < text.len() && text[i].is_ascii_digit() {
             i += 1;
         }
-        (i, i > from)
+        (i > from).then_some(i)
     }
     let mut i = start;
     if text.get(i) == Some(&b'-') {
         i += 1;
     }
-    let (next, any) = digits(text, i);
-    if !any {
-        return false;
-    }
-    i = next;
+    i = digits(text, i)?;
     if text.get(i) == Some(&b'.') {
-        let (next, any) = digits(text, i + 1);
-        if !any {
-            return false;
-        }
-        i = next;
+        i = digits(text, i + 1)?;
     }
     if matches!(text.get(i), Some(b'e' | b'E')) {
         i += 1;
         if matches!(text.get(i), Some(b'+' | b'-')) {
             i += 1;
         }
-        let (next, any) = digits(text, i);
-        if !any {
-            return false;
-        }
-        i = next;
+        i = digits(text, i)?;
     }
-    !matches!(
+    (!matches!(
         text.get(i),
         Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-    )
+    ))
+    .then_some(i)
 }
 
 /// Where the token starting at `start` ends, if it is one of decNumber's
@@ -2627,10 +2628,20 @@ pub fn jq_number_token_end(text: &[u8], start: usize) -> Option<usize> {
 pub struct JsonNumber<'a> {
     text: &'a [u8],
     start: usize,
+    /// The span's length, measured once by `JsonCursor::number_at` while it
+    /// decides whether the span is a number (#3222), so
+    /// [`raw_bytes`](Self::raw_bytes) never rescans it. `u32` so the struct
+    /// stays 32 bytes; [`UNMEASURED_SPAN`] (a span that doesn't fit) sends
+    /// `raw_bytes` back to the scan.
+    len: u32,
     /// Copied from the index's `bridge_tokens` (#3034): whether this span
     /// may be one of the reindex bridge's number tokens.
     bridge: bool,
 }
+
+/// [`JsonNumber::len`]'s "not stored" value: a span of `u32::MAX` bytes or
+/// more, which `raw_bytes` measures again instead.
+const UNMEASURED_SPAN: u32 = u32::MAX;
 
 impl<'a> JsonNumber<'a> {
     /// The byte offset of the number's first character in the document
@@ -2642,8 +2653,13 @@ impl<'a> JsonNumber<'a> {
     }
 
     /// Get the raw bytes of the number.
+    #[inline]
     pub fn raw_bytes(&self) -> &'a [u8] {
-        let end = self.find_end();
+        let end = if self.len == UNMEASURED_SPAN {
+            nested_number_span(self.text, self.start)
+        } else {
+            self.start + self.len as usize
+        };
         &self.text[self.start..end]
     }
 
@@ -2732,31 +2748,6 @@ impl<'a> JsonNumber<'a> {
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
-    }
-
-    /// Whether this span is a number at all -- `false` exactly when
-    /// [`OwnedValue::from_json_number`](crate::jq::OwnedValue::from_json_number)
-    /// would read it as `null` (#3222).
-    ///
-    /// A span the strict fast scan accepts outright (`[-]digits[.digits]
-    /// [e[+-]digits]`, leading zeros included, ending where the greedy span
-    /// would) is a number without taking that span. Anything else -- a
-    /// lenient spelling, a decNumber word, a bridge token, a malformed span
-    /// -- takes the greedy span and asks
-    /// [`number_span_decodes`](crate::json::validate::number_span_decodes),
-    /// after [`bridge_value`](Self::bridge_value), which alone may decode a
-    /// bridge token (#3034).
-    #[inline]
-    pub fn decodes(&self) -> bool {
-        if strict_number_fills_span(self.text, self.start) {
-            return true;
-        }
-        self.bridge_value().is_some()
-            || crate::json::validate::number_span_decodes(self.raw_bytes())
-    }
-
-    fn find_end(&self) -> usize {
-        nested_number_span(self.text, self.start)
     }
 }
 
@@ -9227,11 +9218,11 @@ mod tests {
         }
     }
 
-    /// #3222: `strict_number_fills_span` is `JsonNumber::decodes`' shortcut,
-    /// taken without the greedy span. It may only ever answer `true` for a
-    /// span the full decision also accepts, and only where the greedy span
-    /// ends where the strict grammar does. Every string over the greedy
-    /// class up to five bytes, followed by a delimiter.
+    /// #3222: `strict_number_end` is `JsonCursor::number_at`'s shortcut,
+    /// taken without the greedy span. It may only ever accept a span the
+    /// full decision also accepts, and the end it reports must be the one
+    /// the greedy span finds, since `raw_bytes` trusts it. Every string over
+    /// the greedy class up to five bytes, followed by a delimiter.
     #[test]
     fn strict_number_fast_path_implies_the_full_decision_3222() {
         const CLASS: &[u8] = b"019.eE+-";
@@ -9244,7 +9235,8 @@ mod tests {
                     span.push(b);
                     let mut text = span.clone();
                     text.push(b',');
-                    if strict_number_fills_span(&text, 0) {
+                    if let Some(end) = strict_number_end(&text, 0) {
+                        assert_eq!(end, span.len(), "{:?}", String::from_utf8_lossy(&span));
                         assert_eq!(
                             nested_number_span(&text, 0),
                             span.len(),

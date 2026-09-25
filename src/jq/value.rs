@@ -3848,7 +3848,7 @@ impl ReindexedDoc {
 /// ordinary number (so it is never mistaken for a *valid* document
 /// literal), recognized by [`is_infinity_sentinel`] the same way
 /// `is_nan_sentinel` recognizes its sibling, and still built entirely from
-/// `[0-9-+.eE]` so `JsonNumber::find_end()`'s span scan captures it whole.
+/// `[0-9-+.eE]` so `nested_number_span`'s span scan captures it whole.
 /// A malformed document span can still spell it; what keeps that from
 /// reading as infinity is provenance, not spelling -- only a number read
 /// through an index built over bridge text decodes a token
@@ -3934,7 +3934,7 @@ fn yq_infinite_float_json_text(_negative: bool) -> &'static str {
 /// so `JsonCursor::value()`'s dispatcher (`src/json/light.rs`, which only
 /// recognizes `-`/an ASCII digit as the start of a `Number`) routes it to
 /// `StandardJson::Number` rather than `Error`; built entirely from
-/// `[0-9-+.eE]`, so `JsonNumber::find_end()`'s greedy span scan captures it
+/// `[0-9-+.eE]`, so `nested_number_span`'s greedy span scan captures it
 /// whole; and carrying two exponent markers, so `str::parse::<f64>()`/
 /// `::<i64>()` both reject it outright rather than silently overflowing to
 /// something else -- see `test_nan_sentinel_is_unparseable_as_a_real_number`.
