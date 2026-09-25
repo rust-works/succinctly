@@ -53649,6 +53649,19 @@ mod remaining_inputs {
             line => Some(line),
         }
     }
+
+    /// [`current_location`]'s source index alone, gated the same way
+    /// [`last_line`] gates its line: `None` when the current position
+    /// carries [`UNKNOWN_LINE`] (#3202), not just when nothing has been
+    /// read yet. A source index by itself can't tell "this document's file
+    /// is genuinely stdin" apart from "no file is known at all" -- both
+    /// read back the same way once looked up by index -- so the caller
+    /// needs this gate applied before the index is trusted at all, the
+    /// same reason `last_line` exists rather than leaving the
+    /// `UNKNOWN_LINE` comparison to each caller of `current_location`.
+    pub fn current_source() -> Option<u32> {
+        current_location().and_then(|(source, line)| (line != UNKNOWN_LINE).then_some(source))
+    }
 }
 
 /// The CLI facts `input_filename` and the `get_*` origin builtins read (#3046).
@@ -53733,21 +53746,17 @@ pub mod cli_context {
     ///
     /// Also `null` once the position is genuinely lost (`UNKNOWN_LINE`,
     /// e.g. a dropped `--seq -s` trailing record whose read closed the
-    /// stream, #3202) -- mirroring `remaining_inputs::last_line`'s own
-    /// `UNKNOWN_LINE` check (#1549) for `input_line_number`, which this
-    /// builtin never got the equivalent fix for. A source index alone
-    /// (`Some(source)`) can't distinguish "this document's file is
-    /// genuinely stdin" from "no file is known at all" -- both read back
-    /// as `INPUT_NAMES[source] == None` -- so the line has to gate this
-    /// before the source index is trusted, the same way it already gates
-    /// `last_line`.
+    /// stream, #3202), via `remaining_inputs::current_source`'s own gate --
+    /// mirroring `last_line`'s identical `UNKNOWN_LINE` check (#1549) for
+    /// `input_line_number`, which this builtin never got the equivalent fix
+    /// for. A source index alone (`Some(source)`) can't distinguish "this
+    /// document's file is genuinely stdin" from "no file is known at all"
+    /// -- both read back as `INPUT_NAMES[source] == None`.
     pub fn input_filename() -> OwnedValue {
         #[cfg(feature = "std")]
         {
             let source = if super::remaining_inputs::is_active() {
-                super::remaining_inputs::current_location().and_then(|(source, line)| {
-                    (line != super::remaining_inputs::UNKNOWN_LINE).then_some(source)
-                })
+                super::remaining_inputs::current_source()
             } else {
                 state::CURRENT_SOURCE.with(std::cell::Cell::get)
             };
