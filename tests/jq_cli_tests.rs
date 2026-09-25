@@ -56335,6 +56335,63 @@ fn test_and_or_short_circuit_skips_the_untaken_operand_on_untracked_input_2760()
     Ok(())
 }
 
+/// #2760 review regression: a `TrackedVar` on one operand must not blind
+/// checking for its *sibling*. An earlier draft of this fix gated the whole
+/// `And`/`Or` arm on **both** operands being `TrackedVar`-free, so `$v0 and
+/// .k` silently stopped checking `.k`'s own navigation the moment `$v0`
+/// (correctly, per #2759) disqualified itself -- caught live in review,
+/// confirmed against jq 1.7.1.
+#[test]
+fn test_and_or_tracked_var_on_one_side_does_not_blind_the_other_2760() -> Result<()> {
+    for (filter, doc) in [
+        (
+            "path(. as {a:$v0} | ($v0 and .k) | empty)",
+            r#"{"a":true,"k":2}"#,
+        ),
+        (
+            "path(. as {a:$v0} | ($v0 or .k) | empty)",
+            r#"{"a":false,"k":2}"#,
+        ),
+        (
+            "path(. as {a:$v0} | (.k and $v0) | empty)",
+            r#"{"a":true,"k":2}"#,
+        ),
+        (
+            "path(. as {a:$v0} | (.k or $v0) | empty)",
+            r#"{"a":false,"k":2}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter} on {doc}: stdout {stdout:?}");
+        assert!(
+            stderr.contains(r#"near attempt to access element "k""#),
+            "{filter} on {doc}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2760's own scope boundary, recorded so it stays a deliberate choice: a
+/// **trackable** input's `and`/`or` has a materially different gap (jq's
+/// path-mode refuses whenever more than one operand genuinely navigates the
+/// register, not merely whenever one does) that this fix does not attempt.
+/// Confirmed unchanged before and after this fix, both diverging from jq
+/// 1.7.1 the same way. If this ever starts passing, the scope comment on
+/// the `And`/`Or`/`Negate` arms in `src/jq/eval.rs` needs updating, not
+/// just this assertion.
+#[test]
+fn test_and_or_trackable_input_register_conflict_remains_unfixed_2760() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((.a and .b) | empty)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(
+        code, 0,
+        "trackable-input and/or register-conflict gap is scoped out of #2760; \
+         if this now fails, the gap may have been closed -- update this test \
+         and the arm's own scope comment together. stdout={stdout:?} stderr={stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2760 seen from the side that does damage: `del()` and `|=` consume the
 /// same resolution, so the missing refusal was a **refused edit reported as
 /// a successful no-op** -- the document came back unchanged at exit 0 where
