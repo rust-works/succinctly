@@ -117,6 +117,58 @@ fn test_unbound_variable_is_not_a_compile_error_here_2734() -> Result<()> {
     Ok(())
 }
 
+/// #2760's own jq-mode fix (untracked-input `and`/`or`/unary-minus now
+/// path-check their operands instead of evaluating by value) must not leak
+/// into yq mode: real yq's `and`/`or` are ordinary operators, not a lexer
+/// rejection like `empty`/`leaf_paths`, so a live divergence here is not an
+/// ADR-0018 extension exemption. Confirmed live against yq v4.53.3: each of
+/// these silently no-ops (exit 0, document unchanged) -- caught in code
+/// review as a regression from an earlier draft of the #2760 fix that was
+/// missing the `S::TAG == EvalTag::Jq` guard `array_resolves_live` already
+/// has for the sibling `[E]` arm, and raised
+/// `Invalid path expression near attempt to access element "a" of 1`
+/// instead.
+#[test]
+fn test_and_or_negate_untracked_navigation_stays_unfixed_in_yq_mode_2760() -> Result<()> {
+    for (filter, doc) in [
+        ("del(1 | (.a and true) | select(false))", "a: false\nk: 2\n"),
+        ("del(1 | (.a or false) | select(false))", "a: true\nk: 2\n"),
+        (
+            "(1 | (.a and true) | select(false)) |= 5",
+            "a: false\nk: 2\n",
+        ),
+        ("del(1 | -(.a) | select(false))", "a: false\nk: 2\n"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, doc, "{filter}: document must be unchanged");
+    }
+    Ok(())
+}
+
+/// #2760: succinctly's own documented yq-mode equivalence `-E == E * -1`
+/// (real yq has no unary-minus operator at all, confirmed live: `yq '(-
+/// .a)'` errors `'-' expects 2 args but there is 1`; `docs/compliance/yq/
+/// limitations.md` records `-E` as succinctly's extension spelling) must
+/// hold on an untracked-and-navigating operand too, not just on a plain
+/// value -- an earlier draft of the #2760 fix left `Expr::Negate` reachable
+/// in yq mode while `Expr::Arithmetic`'s `* -1` path was untouched, so the
+/// two spellings disagreed (`-(.a)` raised, `.a * -1` silently no-op'd) on
+/// exactly the shape this test uses. Caught in code review.
+#[test]
+fn test_yq_unary_minus_extension_agrees_with_times_negative_one_on_untracked_navigation_2760(
+) -> Result<()> {
+    let doc = "a: false\nk: 2\n";
+    let (neg_out, neg_err, neg_code) =
+        run_yq_stdin_with_stderr("del(1 | -(.a) | select(false))", doc, &[])?;
+    let (mul_out, mul_err, mul_code) =
+        run_yq_stdin_with_stderr("del(1 | (.a * -1) | select(false))", doc, &[])?;
+    assert_eq!(neg_code, mul_code, "neg: {neg_err:?} mul: {mul_err:?}");
+    assert_eq!(neg_out, mul_out);
+    assert_eq!(neg_out, doc);
+    Ok(())
+}
+
 /// #2591: real yq's own `Preserve` output convention leaves a raw DEL byte
 /// unescaped (confirmed live against yq v4.53.3) -- unlike jq's
 /// `JqCompat` table, which always escapes it. The fix to

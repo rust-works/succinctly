@@ -33842,6 +33842,188 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             }
         }
 
+        // #2760: on an untracked input, every navigating stage inside
+        // `and`/`or`/unary minus was falling to the eager catch-all below,
+        // which evaluates by value and never checks navigation at all --
+        // the same accept-where-jq-refuses shape #2689 closed for `[E]`.
+        // Gated to `S::TAG == EvalTag::Jq` first, mirroring the `Array` arm's
+        // own `array_resolves_live` guard just above: real yq's `and`/`or`
+        // ARE real operators (unlike `empty`/`leaf_paths`, which its lexer
+        // rejects outright), so this isn't an ADR-0018 extension exemption
+        // -- without the guard, this arm changes yq-mode behavior too, and
+        // diverges from the pinned oracle (confirmed live against yq
+        // v4.53.3: `del(1 | (.a and true) | select(false))` on `a: false`
+        // silently no-ops in real yq, exit 0; this arm without the guard
+        // raised "attempt to access element \"a\" of 1", exit 1 -- caught in
+        // review before merge). Leaving yq mode on the pre-existing eager
+        // catch-all is not a new divergence: that catch-all's own behavior
+        // is unchanged by this fix, so yq mode's `and`/`or` fidelity (or
+        // lack of it) here is exactly what it was on `main`.
+        //
+        // Then gated to `!trackable` deliberately: a **trackable** input's
+        // `and`/`or` has a materially different, deeper correctness gap
+        // (jq's path-mode refuses whenever *more than one* operand
+        // genuinely navigates the register -- `path((.a and .b) | empty)`
+        // on `{"a":1}` raises even though both sides read cleanly by value;
+        // `path((.a and 5) | empty)` does not, because only one side
+        // navigates -- confirmed live against jq 1.7.1). That is a
+        // "detect a register conflict between two live operands" problem,
+        // not "resolve one operand instead of evaluating it by value", and
+        // is out of this fix's scope; filed as #3289. `right` runs only for
+        // the `left` outputs that need it (jq's own short-circuit) -- a
+        // nested `resolve_node_sink` call inside the outer sink, the same
+        // shape `resolve_index_expr_sink` already drives for `E[K]`'s
+        // per-pair `key`/`target`.
+        //
+        // Both operands resolve through plain `resolve_node_sink` with no
+        // `TrackedVar` guard at all, mirroring `//`'s own arm
+        // ([`resolve_alternative_sink`]) just below -- `resolve_node_sink`'s
+        // own `Expr::TrackedVar` arm already certifies (or correctly
+        // declines to) a marked `$var` using the very `snapshot`/`frame`
+        // this call carries, the same as it would for any other direct
+        // resolution; unlike #2689's `[E]` array arm, this one never
+        // *claims* a register from what it resolves (every emitted branch
+        // is a fresh `untracked_at_register` boolean regardless), so #2759's
+        // register-claim rationale for excluding `TrackedVar` there does not
+        // carry over here. Two earlier drafts got this wrong in opposite
+        // directions, both caught live in review: gating the *whole* arm on
+        // both operands being `TrackedVar`-free let a marked `$var` on
+        // either side blind checking for its untainted sibling too
+        // (`. as {a:$v0} | ($v0 and .k)` stopped checking `.k`); a
+        // follow-up that instead scanned each operand's *whole subtree* for
+        // a `TrackedVar` before deciding whether to resolve it live broke on
+        // a compound operand containing one only in part
+        // (`. as {a:$v0} | ((.a and $v0) and .k)` stopped checking `.a`'s
+        // own navigation, nested two `and`s deep, because the scan saw
+        // `$v0` anywhere inside the left operand and gave up on all of it).
+        // Both are symptoms of the same mistake: deciding an operand's
+        // fate from outside `resolve_node_sink` instead of letting its own
+        // recursive dispatch -- which reaches this very arm again for a
+        // nested `and`/`or`, and the dedicated `TrackedVar` arm for a bare
+        // one -- decide per node, the way every other composite arm here
+        // already does.
+        //
+        // Confirmed live against jq 1.7.1: `path(. as {a:$v0} | (.a and
+        // true) | empty)` on `{"a":false}` raises "near attempt to access
+        // element \"a\"" (exit 5); this arm was added because succinctly
+        // answered exit 0 for it, evaluating `.a` by value through the
+        // eager catch-all instead of checking its navigation.
+        Expr::And(left, right) if S::TAG == EvalTag::Jq && !trackable => {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow =
+                resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
+                    if !l.value.is_truthy() {
+                        return sink(untracked_at_register(
+                            Cow::Owned(OwnedValue::Bool(false)),
+                            false,
+                            value,
+                        ));
+                    }
+                    match resolve_node_sink::<S>(
+                        right,
+                        value,
+                        trackable,
+                        snapshot,
+                        frame,
+                        keep,
+                        &mut |r| {
+                            sink(untracked_at_register(
+                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
+                                false,
+                                value,
+                            ))
+                        },
+                    ) {
+                        ResolveFlow::Exhausted => Demand::Continue,
+                        other => {
+                            inner_flow = Some(other);
+                            Demand::Stop
+                        }
+                    }
+                });
+            inner_flow.unwrap_or(flow)
+        }
+        // #2760: mirror image of `And` just above -- `or` short-circuits on
+        // a truthy `left` instead of a falsy one. See `And`'s own comment
+        // for the `S::TAG == EvalTag::Jq`/`!trackable` scope and why there
+        // is no `TrackedVar` guard.
+        Expr::Or(left, right) if S::TAG == EvalTag::Jq && !trackable => {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow =
+                resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
+                    if l.value.is_truthy() {
+                        return sink(untracked_at_register(
+                            Cow::Owned(OwnedValue::Bool(true)),
+                            false,
+                            value,
+                        ));
+                    }
+                    match resolve_node_sink::<S>(
+                        right,
+                        value,
+                        trackable,
+                        snapshot,
+                        frame,
+                        keep,
+                        &mut |r| {
+                            sink(untracked_at_register(
+                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
+                                false,
+                                value,
+                            ))
+                        },
+                    ) {
+                        ResolveFlow::Exhausted => Demand::Continue,
+                        other => {
+                            inner_flow = Some(other);
+                            Demand::Stop
+                        }
+                    }
+                });
+            inner_flow.unwrap_or(flow)
+        }
+        // #2760: unary minus has one operand, always evaluated -- no
+        // short-circuit, and (see `And`'s own comment) no `TrackedVar`
+        // guard either; still gated to `S::TAG == EvalTag::Jq` and
+        // `!trackable` for the same reasons `And`/`Or` are. Real yq has no
+        // unary-minus operator at all (confirmed live: `yq '(- .a)'` errors
+        // "'-' expects 2 args but there is 1"), so succinctly's `-E` in yq
+        // mode is a documented extension (docs/compliance/yq/limitations.md)
+        // and exempt from ADR-0018's divergence rule on that count alone --
+        // but leaving this arm reachable in yq mode still broke succinctly's
+        // own documented equivalence `-E == E * -1` (used by that same
+        // limitations-doc section) on an untracked-and-navigating operand,
+        // since `Expr::Arithmetic`'s `* -1` path is untouched by this fix:
+        // caught in review before merge. Gating to jq mode keeps both
+        // spellings on the same (unchanged) eager catch-all in yq mode.
+        // Its wrong answer wasn't a missing refusal (it
+        // already raised) but the *wrong* error: evaluating `.a` by value
+        // first reports "boolean (false) cannot be negated" where jq's live
+        // path-tracked evaluation reaches `.a`'s own navigation refusal
+        // first. Resolving `inner` live surfaces that refusal the same way
+        // every other arm here does; `arith_negate`'s own error (an
+        // ordinary catchable `EvalError`, unrelated to path-refusal) still
+        // applies once `inner` resolves to something.
+        Expr::Negate(inner) if S::TAG == EvalTag::Jq && !trackable => {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow = resolve_node_sink::<S>(
+                inner,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| match arith_negate::<S>(branch.value.into_owned()) {
+                    Ok(negated) => sink(untracked_at_register(Cow::Owned(negated), false, value)),
+                    Err(e) => {
+                        inner_flow = Some(ResolveFlow::Escaped(e.into()));
+                        Demand::Stop
+                    }
+                },
+            );
+            inner_flow.unwrap_or(flow)
+        }
+
         // #2267: both computed-navigation resolvers drive their own
         // generators (`K`/`S`/`T`) and re-resolve `target` per pair, so a
         // native arm here is what lets a bounded consumer's demand reach
