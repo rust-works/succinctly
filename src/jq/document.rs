@@ -966,9 +966,11 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// materialization. Default implementation returns false (conservative
     /// assumption); see
     /// [`StreamableValue::is_falsy`](crate::jq::stream::StreamableValue::is_falsy).
+    // omni-dev: coverage tolerate reason="unreachable: both implementors (JsonCursor, YamlCursor) override this; the default exists as the conservative-`false` contract a future implementor inherits (#3222)"
     fn is_falsy(&self) -> bool {
         false
     }
+    // omni-dev: coverage end
 }
 
 /// A value from a document (JSON value or YAML value).

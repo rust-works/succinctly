@@ -12563,7 +12563,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A value the index could not read (`1.2.3`, #3222; `tru`, #3035)
         // raises as the document fault it is, ahead of `?` -- not as
         // `null (null) has no length`, which `try` would catch.
+        // omni-dev: coverage tolerate reason="unreachable: builtin_length's sole caller is eval_builtin's `Builtin::Length` dispatch, and `Length` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before this match ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
         StandardJson::Error(reason) => QueryResult::Error(EvalError::decode_failure(*reason)),
+        // omni-dev: coverage end
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy::<S, _>(&value))),
     }
@@ -12784,7 +12786,9 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // hold unchanged either way. jq keeps erroring here (`Cannot check
         // whether <container> has a <key> key`, which is correct and
         // unaffected).
+        // omni-dev: coverage tolerate reason="unreachable: has_one_key's sole caller is builtin_has (via eval_builtin's `Builtin::Has` dispatch), and `Has` is in `builtin_operand_is_input`, so eval_builtin's own top-of-function guard already returns the identical decode_failure for an Error value before builtin_has ever runs; kept as this function's own contract in case a future caller reaches it directly (#3222)"
         (StandardJson::Error(reason), _) => QueryResult::Error(EvalError::decode_failure(*reason)),
+        // omni-dev: coverage end
         _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
@@ -106320,6 +106324,13 @@ mod tests {
             ".x",
             ".[0]",
             ".[1:]",
+            // A non-integer literal index isn't folded to `Expr::Index` at
+            // parse time (`assert!(matches!(parse(".[1.7]").unwrap(),
+            // Expr::IndexExpr { .. }))` above pins that), so this is the
+            // only filter here that reaches `index_one`/`index_one_generic`
+            // rather than the dedicated `.x`/`.[0]` arms those two already
+            // cover.
+            ".[1.7]",
             "has(\"a\")",
             "has(0)",
             "getpath([\"a\"])",
@@ -106370,17 +106381,19 @@ mod tests {
                 let expr = parse(filter).expect("filter parses");
                 let concrete = match eval::<Vec<u64>, JqSemantics>(&expr, element) {
                     QueryResult::Error(e) => e.is_decode_failure(),
-                    _ => false,
+                    _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every READERS filter raises a decode failure on every malformed json in this sweep, so this fallback never fires (#3222)"
                 };
                 let generic = match crate::jq::eval_generic::eval_with_cursor_using::<JqSemantics, _>(
                     &expr, element,
                 ) {
                     crate::jq::eval_generic::GenericResult::Error(e) => e.is_decode_failure(),
-                    _ => false,
+                    _ => false, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the `concrete` match above, same sweep (#3222)"
                 };
                 for (evaluator, raised) in [("eval", concrete), ("eval_using", generic)] {
                     if !raised {
+                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a READERS filter fails to raise (#3222)"
                         escaped.push(format!("{evaluator} `{filter}` on {json}"));
+                        // omni-dev: coverage end
                     }
                 }
             }
@@ -106436,7 +106449,9 @@ mod tests {
                     let concrete = normalize(eval::<Vec<u64>, JqSemantics>(&expr, element));
                     let expected = normalize(eval::<Vec<u64>, JqSemantics>(&expr, good_element));
                     if concrete != expected {
+                        // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- this is the failure-recording line for the assertion below, only reached if a NON_READERS filter disagrees between the malformed and well-formed document (#3222)"
                         disagreed.push(format!("eval `{filter}` on {json}: {concrete:?}"));
+                        // omni-dev: coverage end
                     }
                 }
                 let run_generic = |cursor| match crate::jq::eval_generic::eval_with_cursor_using::<
@@ -106444,13 +106459,15 @@ mod tests {
                     _,
                 >(&expr, cursor)
                 {
-                    crate::jq::eval_generic::GenericResult::Error(e) => Err(e.message),
+                    crate::jq::eval_generic::GenericResult::Error(e) => Err(e.message), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- none of NON_READERS ever raises through eval_with_cursor_using, on the malformed document or the well-formed one; kept so a filter that starts erroring is still comparable rather than panicking (#3222)"
                     other => other.into_owned::<JqSemantics>().map_err(|e| e.message),
                 };
                 let generic = run_generic(element);
                 let expected = run_generic(good_element);
                 if generic != expected {
+                    // omni-dev: coverage tolerate reason="unreachable in a passing suite by design -- see the `eval` failure-recording line above, same assertion (#3222)"
                     disagreed.push(format!("eval_using `{filter}` on {json}: {generic:?}"));
+                    // omni-dev: coverage end
                 }
             }
         }

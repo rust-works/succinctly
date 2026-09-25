@@ -6344,7 +6344,7 @@ mod tests {
                     decodes,
                     value != OwnedValue::Null,
                     "{mode} {:?}",
-                    String::from_utf8_lossy(text)
+                    String::from_utf8_lossy(text) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
                 );
             }
         }

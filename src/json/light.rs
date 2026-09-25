@@ -2655,11 +2655,13 @@ impl<'a> JsonNumber<'a> {
     /// Get the raw bytes of the number.
     #[inline]
     pub fn raw_bytes(&self) -> &'a [u8] {
+        // omni-dev: coverage tolerate reason="unreachable in practice: UNMEASURED_SPAN only arises when `end - text_pos` in `number_at` overflows u32 -- a single number span >= 4 GiB -- which no realistic (or practically constructible) test document approaches (#3222)"
         let end = if self.len == UNMEASURED_SPAN {
             nested_number_span(self.text, self.start)
         } else {
             self.start + self.len as usize
         };
+        // omni-dev: coverage end
         &self.text[self.start..end]
     }
 
@@ -9241,12 +9243,12 @@ mod tests {
                             nested_number_span(&text, 0),
                             span.len(),
                             "{:?}",
-                            String::from_utf8_lossy(&span)
+                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
                         );
                         assert!(
                             crate::json::validate::number_span_decodes(&span),
                             "{:?}",
-                            String::from_utf8_lossy(&span)
+                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the assert_eq! format argument above, same sweep (#3222)"
                         );
                     }
                     next.push(span);

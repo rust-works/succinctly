@@ -15900,9 +15900,11 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     end: Option<i64>,
     optional: bool,
 ) -> GenericResult<V> {
+    // omni-dev: coverage tolerate reason="unreachable: this function's sole caller, slice_one_generic_computed, already runs the identical unreadable_value_error(&target) check on the same target and returns before ever calling here; kept as this function's own contract in case a future literal-bounds caller reaches it directly (#3222)"
     if let Some(err) = unreadable_value_error(&target) {
         return GenericResult::Error(err);
     }
+    // omni-dev: coverage end
     if let Some(elements) = target.as_array() {
         let items = elements.collect_values();
         let range = SliceBounds::from_literals(start, end).resolve(items.len());

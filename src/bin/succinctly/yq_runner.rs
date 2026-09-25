@@ -6725,7 +6725,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
+                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
+                                    // omni-dev: coverage end
                                 }
                             }
                         } else {
@@ -6914,10 +6916,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     // `root` is the virtual document sequence;
                                     // falsiness lives on the actual document
                                     // value (#178).
+                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     if args.exit_status {
                                         any_truthy |=
                                             root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
+                                    // omni-dev: coverage end
                                 }
                             } else {
                                 // M2 path: need to get the actual document cursor
@@ -7670,10 +7674,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         }
                                     }
                                     write_terminator(&mut buf_writer, &output_config)?;
+                                    // omni-dev: coverage tolerate reason="unreachable: this whole `_ =>` arm is dead code -- `root.value()` always reports the virtual document sequence, so single-document YAML never falls through here (documented above, verified in d4c03a6ca); only the formatting changed when `is_falsy()` dropped its `JsonConvention` parameter (#3222)"
                                     if args.exit_status {
                                         any_truthy |=
                                             root.first_child().is_some_and(|c| !c.is_falsy());
                                     }
+                                    // omni-dev: coverage end
                                 } else if let Some(doc_cursor) = root.first_child() {
                                     stream_cursor!(
                                         doc_cursor,
