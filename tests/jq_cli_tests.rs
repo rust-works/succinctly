@@ -68435,6 +68435,25 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"del(. as $x | has("a") | try ({"z":1} as {a:$q} | $q))"#,
             r#"{"a":{"b":1},"k":1}"#,
         ),
+        // A step jq fails with a type error wherever its register is -- an
+        // object indexed by a number, iterating `null`, an array pattern
+        // over an object -- is refused exactly, so caught as in jq.
+        (
+            r#"del(. as $x | has("a") | try ($x | .[0]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | 0 as $i | try ($x | .[$i]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try (null | .[]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ($x as [$q] | $q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
         // #3186's subexp stage keeps the register, so there is nothing to
         // guess: `$x` re-establishes and the path is jq's.
         (r"[path(. as $x | { k: .a } | try ($x | .a))]", r#"[["a"]]"#),

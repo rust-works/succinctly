@@ -746,7 +746,10 @@ is the revert that established what the other one costs.
      `$var` snapshot or a `null`, equal to the lost register's last known value or to one
      inside it. jq's register only moves down from where it was lost, so a `$x` frozen from
      the root can't be a register lost at `.a`, and a `null` can't be one if the lost value
-     holds none.
+     holds none;
+   - the refused step would have navigated had the value been the register. A step jq fails
+     with a type error wherever its register is (`$x \| .[0]` on an object, iterating
+     `null`, an array pattern over an object) is refused exactly, and stays catchable.
 
    Uncatchable here means by the `try` beside the refusal, by any `try` further out, and by a
    value-position `?` around the whole `del`/assignment, so the refusal is a loud exit 5

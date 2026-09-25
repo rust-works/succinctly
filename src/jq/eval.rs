@@ -32885,6 +32885,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                         &frame.register_loss,
                         snapshot,
                         value,
+                        Some(NavKind::Iterate),
                     )
                     .into(),
                 );
@@ -33001,6 +33002,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                         &frame.register_loss,
                         snapshot,
                         value,
+                        Some(NavKind::Iterate),
                     )
                     .into(),
                 ),
@@ -34491,13 +34493,16 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
     if !trackable {
         // #3267: each refusal here is of `value` itself, so this is the one
         // place its guess can be told from jq's own verdict exactly.
-        let refuse = |e: EvalError| guess_refusal(e, register_loss, snapshot, value);
+        let refuse = |e: EvalError, step: Option<NavKind>| {
+            guess_refusal(e, register_loss, snapshot, value, step)
+        };
         if let Some(element) = navigation_element(expr) {
             return Some(Err((
                 Vec::new(),
-                refuse(EvalError::invalid_path_expression_near_access(
-                    &element, value,
-                ))
+                refuse(
+                    EvalError::invalid_path_expression_near_access(&element, value),
+                    NavKind::of(&element),
+                )
                 .into(),
             )));
         }
@@ -34521,15 +34526,17 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         if S::TAG == EvalTag::Jq {
             if let Expr::Builtin(builtin) = expr {
                 if let Some(navigation) = builtin_navigation(builtin, value) {
-                    let error = match navigation {
-                        BuiltinNavigation::Access(element) => {
-                            EvalError::invalid_path_expression_near_access(&element, value)
-                        }
-                        BuiltinNavigation::Iterate => {
-                            EvalError::invalid_path_expression_near_iterate(value)
-                        }
+                    let (error, step) = match navigation {
+                        BuiltinNavigation::Access(element) => (
+                            EvalError::invalid_path_expression_near_access(&element, value),
+                            NavKind::of(&element),
+                        ),
+                        BuiltinNavigation::Iterate => (
+                            EvalError::invalid_path_expression_near_iterate(value),
+                            Some(NavKind::Iterate),
+                        ),
                     };
-                    return Some(Err((Vec::new(), refuse(error).into())));
+                    return Some(Err((Vec::new(), refuse(error, step).into())));
                 }
             }
         }
@@ -37163,6 +37170,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                             &frame.register_loss,
                             bound_is_frozen,
                             bound,
+                            match pattern {
+                                Pattern::Object(_) => Some(NavKind::Field),
+                                Pattern::Array(_) => Some(NavKind::Index),
+                                _ => None,
+                            },
                         )),
                         other => other.into(),
                     });
@@ -37809,6 +37821,52 @@ fn is_resolver_refusal(e: &EvalError) -> bool {
         || e.is_guessed_path_refusal()
 }
 
+/// The kind of navigation step a refusal refused (#3267): whether it could
+/// have *succeeded* on the refused value, had that value been jq's register.
+#[derive(Debug, Clone, Copy)]
+enum NavKind {
+    /// `.k` -- a string key.
+    Field,
+    /// `.[n]` -- a numeric index.
+    Index,
+    /// `.[m:n]`.
+    Slice,
+    /// `.[]`.
+    Iterate,
+}
+
+impl NavKind {
+    /// The step a navigation element names -- the key a refusal message
+    /// quotes: a string, a number, or a `{"start":..,"end":..}` slice.
+    fn of(element: &OwnedValue) -> Option<Self> {
+        match element {
+            OwnedValue::String(_) => Some(Self::Field),
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                Some(Self::Index)
+            }
+            OwnedValue::Object(_) => Some(Self::Slice),
+            _ => None,
+        }
+    }
+
+    /// Whether this step on `value` would have navigated in jq rather than
+    /// raised a type error (`Cannot index object with number`, `Cannot
+    /// iterate over null`, ...). jq raises that error wherever its register
+    /// is, so a refusal of a step that could never succeed is exact: jq
+    /// fails it too, and a `try` catching it is what jq does.
+    fn would_succeed_on(self, value: &OwnedValue) -> bool {
+        match self {
+            Self::Field => matches!(value, OwnedValue::Object(_) | OwnedValue::Null),
+            Self::Index => matches!(value, OwnedValue::Array(_) | OwnedValue::Null),
+            Self::Slice => matches!(
+                value,
+                OwnedValue::Array(_) | OwnedValue::String(_) | OwnedValue::Null
+            ),
+            Self::Iterate => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
+        }
+    }
+}
+
 /// A navigation refusal of `value` (whose own snapshot is `snapshot`),
 /// reclassified as the resolver's *guess* when it is one (#3267) -- the one
 /// rule every refusal site applies, where the refused value is in hand.
@@ -37826,8 +37884,15 @@ fn guess_refusal(
     register_loss: &RegisterLoss,
     snapshot: &Snapshot,
     value: &OwnedValue,
+    step: Option<NavKind>,
 ) -> EvalError {
-    guess_refusal_of(e, register_loss, !matches!(snapshot, Snapshot::No), value)
+    guess_refusal_of(
+        e,
+        register_loss,
+        !matches!(snapshot, Snapshot::No),
+        value,
+        step,
+    )
 }
 
 /// [`guess_refusal`] for a refused value whose frozen-ness is known
@@ -37838,8 +37903,11 @@ fn guess_refusal_of(
     register_loss: &RegisterLoss,
     frozen: bool,
     value: &OwnedValue,
+    step: Option<NavKind>,
 ) -> EvalError {
-    if could_be_lost_register(register_loss, frozen, value) {
+    if step.is_some_and(|step| step.would_succeed_on(value))
+        && could_be_lost_register(register_loss, frozen, value)
+    {
         e.into_guessed_path_refusal()
     } else {
         e
@@ -37893,9 +37961,12 @@ fn guess_escape(
     register_loss: &RegisterLoss,
     snapshot: &Snapshot,
     value: &OwnedValue,
+    step: Option<NavKind>,
 ) -> EvalEscape {
     match escape {
-        EvalEscape::Error(e) => EvalEscape::Error(guess_refusal(e, register_loss, snapshot, value)),
+        EvalEscape::Error(e) => {
+            EvalEscape::Error(guess_refusal(e, register_loss, snapshot, value, step))
+        }
         other => other,
     }
 }
@@ -37907,10 +37978,11 @@ fn guess_refusal_flow(
     register_loss: &RegisterLoss,
     snapshot: &Snapshot,
     value: &OwnedValue,
+    step: Option<NavKind>,
 ) -> ResolveFlow {
     match flow {
         ResolveFlow::Escaped(EvalEscape::Error(e)) => ResolveFlow::Escaped(EvalEscape::Error(
-            guess_refusal(e, register_loss, snapshot, value),
+            guess_refusal(e, register_loss, snapshot, value, step),
         )),
         other => other,
     }
@@ -40705,6 +40777,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
                     &frame.register_loss,
                     snapshot,
                     value,
+                    NavKind::of(&k),
                 )
                 .into());
             }
@@ -40764,7 +40837,8 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
                     control,
                     &frame.register_loss,
                     branch_snapshot,
-                    target_value
+                    target_value,
+                    NavKind::of(k),
                 ));
             }
             // A NaN key names no element for a write to land on, so `?` does not
@@ -41079,6 +41153,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
                 &frame.register_loss,
                 snapshot,
                 value,
+                Some(NavKind::Slice),
             )
             .into());
         }
@@ -41128,7 +41203,8 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
                     control,
                     &frame.register_loss,
                     branch_snapshot,
-                    target_value
+                    target_value,
+                    Some(NavKind::Slice),
                 ));
             }
             // #2546: the bounds are ruled on against this branch's own
@@ -42306,6 +42382,10 @@ fn resolve_seq_from_seed<'a, S: EvalSemantics>(
                     &frame.register_loss,
                     &seed.snapshot,
                     &seed.value,
+                    flat.first()
+                        .and_then(navigation_element)
+                        .as_ref()
+                        .and_then(NavKind::of),
                 );
             }
         };
@@ -42412,9 +42492,16 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             Err(e) => ResolveFlow::Escaped(e),
         };
         return match refused {
-            Some((snapshot, value)) => {
-                guess_refusal_flow(flow, &frame.register_loss, &snapshot, &value)
-            }
+            Some((snapshot, value)) => guess_refusal_flow(
+                flow,
+                &frame.register_loss,
+                &snapshot,
+                &value,
+                flat.get(last_dynamic + 1)
+                    .and_then(navigation_element)
+                    .as_ref()
+                    .and_then(NavKind::of),
+            ),
             None => flow,
         };
     }
