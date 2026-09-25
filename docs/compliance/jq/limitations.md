@@ -730,13 +730,17 @@ is the revert that established what the other one costs.
    deletes every key. An array is different: jq collects it without a subexp, so its contents
    are path-checked (`path(. as $x \| {k:.a} \| [.k] \| $x)` raises on the `.k`), and then
    backtracks the register to where the collect began. Since
-   [#3263](https://github.com/rust-works/succinctly/issues/3263) an array the resolver resolves
-   live, checking its contents as jq does, carries the register too, so
-   `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Two shapes jq answers still refuse
-   here: an array holding a shape the resolver still evaluates by value (`getpath`, a postfix
-   `?`, a `$var` on an untracked input, parameterized recursion: #2759, #2764), so its
-   navigation is never checked and it can carry no register (`path(. as $x \| [.a?] \| $x)`);
-   and a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
+   [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
+   too when the resolver both resolves it live and checks everything jq checks inside it:
+   navigation, `..`, `select`, an `if`'s branches, and pipes, commas and subexp shapes of
+   those. So `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Two shapes jq answers still
+   refuse here. The first is any other array: one holding a builtin call, an update
+   assignment (`[.k \|= 1]`), a `def`, `getpath`, a postfix `?`, a `$var` on an untracked
+   input, or parameterized recursion (#2759, #2764). Navigation hidden in a builtin jq
+   defines in jq (`with_entries`, `walk`, `sub`) or in `_modify` is never checked there, so
+   such an array can carry no register (`path(. as $x \| [.a?] \| $x)`). The same goes for
+   an array nested in another stage (`if true then [.a] else 1 end`). The second shape is
+   a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
    body is not something a syntactic predicate can do from a name). Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so

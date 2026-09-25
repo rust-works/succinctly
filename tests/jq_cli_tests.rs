@@ -68349,6 +68349,7 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
+        r"del(. as $x | [.a?] | try ($x | .a))",
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;

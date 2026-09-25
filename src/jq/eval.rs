@@ -33745,10 +33745,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ResolveFlow::Exhausted | ResolveFlow::Stopped => {
                     // #3263: jq's collect backtracks to where it began, so the
                     // register is where it was entering -- `value` itself when
-                    // trackable (recorded the way `untracked_branches` does), or
-                    // whatever the enclosing pipe is already carrying.
-                    let array = PathBranch::untracked(Cow::Owned(OwnedValue::Array(items.into())))
-                        .with_register(trackable.then(|| Cow::Borrowed(value)));
+                    // trackable, or whatever the enclosing pipe is carrying.
+                    let array = untracked_at_register(
+                        Cow::Owned(OwnedValue::Array(items.into())),
+                        trackable,
+                        value,
+                    );
                     match sink(array) {
                         Demand::Continue => ResolveFlow::Exhausted,
                         Demand::Stop => ResolveFlow::Stopped,
@@ -34612,8 +34614,7 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
         Reentry::at_register(trackable),
         &mut |v| {
             delivered += 1;
-            let branch = PathBranch::untracked(Cow::Owned(v))
-                .with_register(trackable.then(|| Cow::Borrowed(value)));
+            let branch = untracked_at_register(Cow::Owned(v), trackable, value);
             // `untracked_branches`' own rule, applied one value at a time --
             // see its doc comment for why the register is recorded here.
             let demand = sink(branch);
@@ -34982,6 +34983,19 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     }
 }
 
+/// One computed value leaving the path register, recording where the
+/// register stood entering the stage -- `value` itself while `trackable` --
+/// so a later `$var` frozen from there can re-establish (#1573). The one
+/// definition of that rule: [`untracked_branches`], the bounded leaf, and
+/// the `[E]` arm's collected array (#3263) all build their branch here.
+fn untracked_at_register<'a>(
+    computed: Cow<'a, OwnedValue>,
+    trackable: bool,
+    value: &'a OwnedValue,
+) -> PathBranch<'a> {
+    PathBranch::untracked(computed).with_register(trackable.then(|| Cow::Borrowed(value)))
+}
+
 /// One deferred, untracked branch per value — #986's "defer, don't raise"
 /// shape ([`resolve_leaf`]'s general case), lifted out because that case now
 /// builds it from one value or from `keep`-many.
@@ -35014,10 +35028,7 @@ fn untracked_branches(
 ) -> Vec<PathBranch<'_>> {
     values
         .into_iter()
-        .map(|v| {
-            PathBranch::untracked(Cow::Owned(v))
-                .with_register(trackable.then(|| Cow::Borrowed(value)))
-        })
+        .map(|v| untracked_at_register(Cow::Owned(v), trackable, value))
         .collect()
 }
 
@@ -35267,13 +35278,14 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// jq collects an array with a `FORK`/`APPEND`/`BACKTRACK` loop and no
 /// subexp: `E`'s navigation is path-checked against the register, and the
 /// backtrack then puts the register back where it began. Resolving `E` live
-/// raises exactly the path errors jq raises inside it -- so an array
-/// resolved live leaves the register where it was, and a later `$x` frozen
-/// from there re-establishes (`path(. as $x | [.a] | $x)` is `[]`, as in
-/// jq). The shapes excluded here are the ones whose own untracked handling
-/// is still wrong (#2759, #2764 -- see the arm's own comment); evaluated by
-/// value, their navigation is never checked, so an array holding one
-/// carries no register it could have lost.
+/// raises the path errors of the navigation this resolver sees, but not of
+/// navigation hidden inside a shape it evaluates by value -- a native
+/// builtin jq defines in jq (`with_entries`, `walk`, `sub`), an update
+/// assignment (`|=`, whose `_modify` navigates) -- so resolving live is
+/// necessary for carrying the register but not sufficient; see
+/// [`array_contents_are_checked`]. The shapes excluded here are the ones
+/// whose own untracked handling is still wrong (#2759, #2764 -- see the
+/// arm's own comment).
 fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool {
     S::TAG == EvalTag::Jq
         && (!trackable || !cannot_move_register(inner))
@@ -35287,6 +35299,47 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
                         )
                 )
         })
+}
+
+/// Whether every navigation jq would path-check inside `[inner]` is one the
+/// resolver's `[E]` arm checks too, when it resolves `inner` live (#3263) --
+/// the second condition, beside [`array_resolves_live`], for an array to
+/// carry the path register the way jq's backtracking collect restores it.
+///
+/// An allowlist, like [`cannot_move_register`] and for the same reason: a
+/// wrong `true` carries the register past navigation jq refused and lets a
+/// later `$x` fabricate a path -- and through `del`/`=`, a write (review:
+/// `(. as $x | [.k |= . + 1] | $x | .a) |= 7` wrote `{"a":7,...}` where jq
+/// raises, and `[with_entries(.)]`, `[walk(.)]`, `[sub(..)]` fabricated
+/// paths). Admitted: the navigation primitives and `..`, which the arm
+/// resolves natively; `.` and `select`, which pass their input through; an
+/// `if`'s branches (its condition is a subexp in jq); a computed index or
+/// slice's target (its keys are subexps); pipes, commas and parens of
+/// those; and anything [`cannot_move_register`] admits, which neither moves
+/// jq's register nor is path-checked inside. Everything else -- every other
+/// builtin call, an assignment, a `def`, a fold -- keeps the array
+/// refusing, the safe direction.
+fn array_contents_are_checked(inner: &Expr) -> bool {
+    match inner {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent => true,
+        Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Paren(e) => array_contents_are_checked(e),
+        Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => array_contents_are_checked(then_branch) && array_contents_are_checked(else_branch),
+        Expr::IndexExpr { target, .. } | Expr::SliceExpr { target, .. } => {
+            array_contents_are_checked(target)
+        }
+        other => cannot_move_register(other),
+    }
 }
 
 /// Shared by every binding form's own `cannot_move_register` arm
@@ -35369,9 +35422,12 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
 /// cannot tell whether an array's contents will be checked, so here an
 /// array qualifies only when nothing inside it navigates; the pipe's own
 /// register carry adds the arrays the resolver's `[E]` arm resolves live
-/// ([`array_resolves_live`], #3263), whose contents *are* checked as jq
-/// checks them. What remains refused is an array holding a shape that arm
-/// still evaluates by value (`getpath`, a postfix `?`), and an array in a
+/// ([`array_resolves_live`] and [`array_contents_are_checked`], #3263), whose
+/// contents it checks as jq does. What remains refused: an array holding
+/// anything outside that allowlist (a builtin call, an assignment, a
+/// `def`, `getpath`, a postfix `?`, a `$var` on an untracked input,
+/// parameterized recursion), an array nested inside another stage (`if
+/// true then [.a] else 1 end`, `[.a] | select(true)`), and an array in a
 /// fold, which consults only this predicate. A refusal is not a fabricated
 /// path, but it was not free either: under `try`/`?` it used to be caught as
 /// though it were jq's own path error, so the write was lost where jq
@@ -42801,9 +42857,11 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // joined by [`getpath_preserves_register`] and this is computed after
     // the branch is in hand rather than from `element` alone.
     let stage_preserves_register = cannot_move_register(element)
-        // #3263: an array resolved live is path-checked as jq checks it, and
-        // jq's collect backtracks the register to where it began.
-        || matches!(element, Expr::Array(inner) if array_resolves_live::<S>(inner, branch_trackable))
+        // #3263: an array resolved live whose contents the resolver checks as
+        // jq does, and jq's collect backtracks the register to where it began.
+        || matches!(element, Expr::Array(inner)
+            if array_resolves_live::<S>(inner, branch_trackable)
+                && array_contents_are_checked(inner))
         || getpath_preserves_register::<S>(
             element,
             &current,
@@ -99967,8 +100025,9 @@ mod tests {
             (r"path(. as $x | [.a, .k] | $x)", "[]"),
             (r"path(. as $x | [.[]] | $x)", "[]"),
             (r"path(. as $x | [..] | $x)", "[]"),
-            (r"path(. as $x | [first(.a[])] | $x)", "[]"),
             (r"path(. as $x | [.a.b] | $x | .a)", r#"["a"]"#),
+            (r"path(. as $x | [.a | select(.b)] | $x)", "[]"),
+            (r"path(. as $x | [if .k then .a else .k end] | $x)", "[]"),
             (r"path(.a as $y | .a | [.b] | $y | .b)", r#"["a","b"]"#),
         ] {
             assert_eq!(
@@ -99984,6 +100043,16 @@ mod tests {
             r"path(. as $x | [.a] | [.a] | $x)",
             r"path(. as $x | [.a] | .[0])",
             r"path([.a])",
+            // Navigation the arm cannot see -- inside an update assignment's
+            // `_modify`, or a builtin jq defines in jq but this evaluates
+            // natively -- keeps the array off the register (review: each
+            // fabricated a path, `[.k |= . + 1]` a write, before
+            // `array_contents_are_checked`).
+            r"path(. as $x | [.k |= . + 1] | $x)",
+            r"path(. as $x | [.[] |= 1] | $x)",
+            r"path(. as $x | [with_entries(.)] | $x)",
+            r"path(. as $x | [walk(.)] | $x)",
+            r"path(. as $x | [map_values(.)] | $x)",
         ] {
             query!(br#"{"a":{"b":1},"k":1}"#, filter,
                 QueryResult::Error(e) => {
