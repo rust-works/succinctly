@@ -68242,3 +68242,73 @@ fn test_tracked_array_optional_navigation_characterize_preexisting_bug_3049() ->
     assert_eq!(stdout, "");
     Ok(())
 }
+
+/// #3186: a root snapshot read after an object construction, a string
+/// interpolation, an arithmetic stage or an `if` whose condition navigates
+/// is still jq's register -- those are all subexps in jq, which never move
+/// it -- so the write goes through. The resolver used to drop the register
+/// there and refuse, and under `try`/`?` that refusal was caught as though
+/// it were jq's own path error: `del` echoed the document unchanged, exit 0.
+/// Every row is jq 1.7.1's own output.
+#[test]
+fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            r#"{"a":false,"c":false,"d":{"b":1}}"#,
+            r"del(. as $v1 | { k: .a } | try ($v1 | .[]?))",
+            "{}",
+        ),
+        (
+            r#"{"a":{"b":1},"c":"s"}"#,
+            r"del((..) as $v1 | { k: .a } | try ($v1 | .[]? | .b?))",
+            r#"{"a":{},"c":"s"}"#,
+        ),
+        // The refuse-only half, without `try`.
+        (
+            r#"{"a":false,"c":false,"d":{"b":1}}"#,
+            r"del(. as $v1 | { k: .a } | ($v1 | .[]?))",
+            "{}",
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r"del(. as $x | (.a|length) + 1 | try ($x | .a))",
+            r#"{"k":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r"del(. as $x | if .a.b then 5 else 6 end | try ($x | .a))",
+            r#"{"k":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r"(. as $x | { k: .a } | $x | .a.b) = 7",
+            r#"{"a":{"b":7},"k":1}"#,
+        ),
+        (
+            r#"{"a":{"b":1},"k":1}"#,
+            r#"(. as $x | "\(.a)" | $x | .k) |= . + 1"#,
+            r#"{"a":{"b":1},"k":2}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
+    // The fabricating spelling the fuzz hit: with the snapshot re-established,
+    // the trailing literal is what jq refuses, and so does succinctly -- it
+    // used to exit 0 with the document unchanged.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"del(. as $v1 | { k: .a } | try ($v1 | .[]?) | "z")"#,
+        ],
+        Some(r#"{"a":false,"c":false,"d":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result "z""#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
