@@ -25221,24 +25221,24 @@ fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()
 /// around the body, as jq's own `x as $x` desugaring does, so each level
 /// reads a literal.
 ///
-/// n=13000 -- close to (but safely under) the ~13,333-level ceiling
-/// `MAX_EVAL_FRAMES` (`src/jq/eval.rs`) imposes on this exact shape (3
-/// frames/level: `if`, `Arithmetic`, `DefCall` -- #3149's `as` wrapper is
-/// deliberately not charged) -- so this also pins that neither fix
-/// regressed the *native* recursion-depth guard itself. If this test starts
-/// timing out or taking more than a couple of seconds, `$n` has regressed
-/// back toward an `O(depth^2)` chain.
+/// n=9900 -- close to (but safely under) the 10,000-level ceiling
+/// `MAX_EVAL_FRAMES` (`src/jq/eval.rs`) imposes on this exact shape (4
+/// frames/level: #3149's `as` wrapper, `if`, `Arithmetic`, `DefCall`; it was
+/// 13,333 at 3 frames before #3149 charged the wrapper for the stack it
+/// really uses) -- so this also pins that the guard still admits the depth
+/// it promises. If this test starts timing out or taking more than a couple
+/// of seconds, `$n` has regressed back toward an `O(depth^2)` chain.
 #[test]
 fn test_recursion_through_dollar_param_is_linear_not_quadratic_3012() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
-            "def d2($n): if $n == 0 then 0 else 1 + d2($n-1) end; d2(13000)",
+            "def d2($n): if $n == 0 then 0 else 1 + d2($n-1) end; d2(9900)",
         ],
         Some("null"),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "13000");
+    assert_eq!(stdout.trim_end(), "9900");
     Ok(())
 }
 
@@ -30356,6 +30356,44 @@ fn test_dollar_param_binds_each_value_of_a_generator_argument_3149() -> Result<(
         assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
 
+    // Bound from `.` itself, `$x` *is* `.`, so it stays a path: jq's
+    // `. as $x | $x` passthrough, reached through the argument's `Shared`
+    // wrapper -- as is the bare spelling's own `x as $v`, which refused
+    // before #3149 too.
+    for (input, filter, expected) in [
+        ("{\"a\":7}", "def f($x): $x; [path(f(.))]", "[[]]"),
+        (
+            "{\"a\":{\"b\":1}}",
+            "def f($x): $x | .b; [path(.a | f(.))]",
+            "[[\"a\",\"b\"]]",
+        ),
+        (
+            "{\"a\":{\"b\":1}}",
+            "def f($x): $x | .b; .a | f(.) |= 5",
+            "{\"b\":5}",
+        ),
+        (
+            "{\"a\":{\"b\":1}}",
+            "def f($x): $x | .b; del(.a | f(.))",
+            "{\"a\":{}}",
+        ),
+        (
+            "{\"a\":{\"b\":1}}",
+            "def f($x): $x as {b:$q} | $q; [path(.a | f(.))]",
+            "[[\"a\",\"b\"]]",
+        ),
+        ("{\"a\":7}", "def f(x): x as $v | $v; [path(f(.))]", "[[]]"),
+        (
+            "{\"a\":1}",
+            ". as $v | def f($x): $x; [path(f($v))]",
+            "[[]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
     // A bound `$x` is a value, not a path: every path consumer refuses it
     // exactly as jq 1.7.1 does, where the substituted `.a` used to write
     // straight through (`{"a":3}`, `{}`, `[["a"]]`).
@@ -30372,6 +30410,40 @@ fn test_dollar_param_binds_each_value_of_a_generator_argument_3149() -> Result<(
             "{filter}: stderr: {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #3149 review: each `$` parameter's `as` wrapper holds real native stack,
+/// so it is charged a frame. Uncharged, three `$` parameters overflowed the
+/// stack at 19,999 levels (crash floor 17,364, release) while the guard
+/// still admitted them; charged, the guard refuses cleanly first. jq itself
+/// answers `0` here -- the refusal is the recorded depth divergence, a
+/// catchable error rather than a process abort.
+#[test]
+fn test_dollar_param_as_wrappers_are_charged_so_deep_recursion_refuses_3149() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "def d($n;$m;$k): if $n == 0 then 0 else d($n-1;$m;$k) end; d(19999;1;2)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("d/3 exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+
+    // The same body under the guard: 5 frames a level, so 7,999 levels.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "def d($n;$m;$k): if $n == 0 then $m + $k else d($n-1;$m;$k) end; d(7999;1;2)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "3");
     Ok(())
 }
 

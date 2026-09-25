@@ -4138,7 +4138,13 @@ Three differences remain, all in the direction of erroring rather than aborting:
   recurses natively, so it is not. A body wrapping its call in 40 array constructors stops
   at ~900 levels where jq reaches 12,000+. The ceiling counts live frames rather than
   calls precisely because the two differ by 10x across body shapes — see
-  `MAX_EVAL_FRAMES` (`src/jq/eval.rs`).
+  `MAX_EVAL_FRAMES` (`src/jq/eval.rs`). Each `$`-style parameter adds a frame
+  of its own: since [#3149](https://github.com/rust-works/succinctly/issues/3149)
+  it binds through a real `x as $x` around the body, as jq's desugaring does, and
+  that binding holds ~2.9 KB of native stack per level. A thin
+  `def sum_to($n)` therefore stops at 10,000 levels, not the bare spelling's
+  13,333, and three `$` parameters at 8,000. Left uncharged, three parameters
+  overflowed the stack below the guard.
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
@@ -4156,8 +4162,10 @@ Three differences remain, all in the direction of erroring rather than aborting:
   accounting change; tracked separately as a future architectural improvement, not part of
   #1371's scope.
 
-Recursion is quadratic in time in both tools — a call-by-name parameter is re-evaluated at
-each use, so reading one at depth `d` costs `O(d)`. Measured interleaved on one machine,
+Recursion through a bare parameter is quadratic in time in both tools — a call-by-name
+parameter is re-evaluated at each use, so reading one at depth `d` costs `O(d)`. A
+`$`-style parameter is bound to a value once per call (#3149), so recursion through one is
+linear. Measured interleaved on one machine,
 `sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
 
 `MAX_EVAL_FRAMES`'s ceiling is calibrated against the 256 MB (release) / 2 GB (debug)

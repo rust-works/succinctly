@@ -31716,6 +31716,25 @@ fn unwrap_paren(expr: &Expr) -> &Expr {
     }
 }
 
+/// [`unwrap_paren`], also peeling `Expr::Shared` -- for the identity
+/// passthrough grammar ([`is_identity_passthrough`] and the matchers that
+/// mirror it), which asks what a bind source *evaluates* to, and `Shared`
+/// is as transparent to evaluation as a paren (#3149).
+///
+/// A `$`-style parameter binds as `Shared(arg) as $x | body`, and a bare one
+/// substitutes `Shared(arg)` into the body, so `def f($x): $x; path(f(.))`
+/// and `def f(x): x as $v | $v; path(f(.))` both bind a source that is `.`
+/// behind a `Shared` -- jq 1.7.1 answers `[]` for each. Kept apart from
+/// `unwrap_paren` itself, whose other callers match fast-path shapes and
+/// were never audited for a `Shared` operand.
+fn unwrap_bind_source(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(inner) => unwrap_bind_source(inner),
+        Expr::Shared(inner) => unwrap_bind_source(inner),
+        other => other,
+    }
+}
+
 /// The three outcomes of one sink-driven path resolution — the same
 /// three [`Flow`] already has for value-mode evaluation ([`Demand`] is
 /// shared verbatim), minus the `pending` field: a path resolution's
@@ -35212,7 +35231,7 @@ fn resolves_to_register<S: EvalSemantics>(
     reg: &OwnedValue,
     frame: &Frame,
 ) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => trackable,
         // #3136: [`marker_identical`], shared with `resolve_node_eager`'s
         // own `TrackedVar` arm, so a future refinement of this rule can't
@@ -42764,7 +42783,7 @@ pub(crate) fn as_var_refs(
 /// jq, even though the bound value trivially equals `.` there) -- matching
 /// jq's actual rule takes a syntactic passthrough, not mere value equality.
 pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => true,
         // #2042: only a marker frozen from `.` itself is a passthrough of
         // `.`; one bound from a navigated position is that *node*, and a
@@ -42795,7 +42814,7 @@ pub(crate) fn is_identity_passthrough(expr: &Expr) -> bool {
 /// itself runs its right side whenever its left yields nothing and not only
 /// when it raises, what `A` must satisfy directly in `A // B` too (#3129).
 fn is_raise_free_identity_passthrough(expr: &Expr) -> bool {
-    match unwrap_paren(expr) {
+    match unwrap_bind_source(expr) {
         Expr::Identity => true,
         Expr::TrackedVar(marker) => {
             matches!(marker.origin, Origin::Snapshot | Origin::SnapshotAt { .. })
@@ -42970,7 +42989,7 @@ fn identity_bind_position<S: EvalSemantics>(
         return None;
     }
     fn position(source: &Expr, trackable: bool, frame: &Frame) -> Option<Origin> {
-        match unwrap_paren(source) {
+        match unwrap_bind_source(source) {
             Expr::Identity if trackable => frame.at.as_ref().map(|at| Origin::SnapshotAt {
                 invocation: frame.invocation,
                 path: BindPath(Rc::clone(at)),
@@ -59585,13 +59604,12 @@ pub(crate) fn bind_def_call<'e>(
         let installed_body = if def.params.is_empty() {
             install_def_calls(&def.body, def, frames + 1, true)
         } else {
-            bind_def_call_params(&def.body, &def.params, args, |body| {
-                // `true`: this is `def`'s own body, the scope that repeats
-                // once per actual recursive level -- see
-                // `sibling_frame_charge`'s own doc comment (#2135 code
-                // review, Finding 1).
-                install_def_calls(body, def, frames + 1, true)
-            })
+            let body = bind_def_call_params(&def.body, &def.params, args);
+            // `true`: this is `def`'s own body, the scope that repeats
+            // once per actual recursive level -- see
+            // `sibling_frame_charge`'s own doc comment (#2135 code
+            // review, Finding 1).
+            install_def_calls(&body, def, frames + 1, true)
         };
         Ok(Rc::new(installed_body))
     })
@@ -59634,7 +59652,7 @@ pub(crate) fn bind_def_call<'e>(
 ///
 /// #2633: the bare substitution is one walk over the body carrying every
 /// parameter, not one walk per parameter.
-/// `sequential_param_substitution` below keeps the per-parameter shape, as
+/// `sequential_bare_substitution` below keeps the per-parameter shape, as
 /// the >64 fallback and the differential oracle.
 ///
 /// Measured interleaved against `c21736b2f`, 11 reps, best-of, both pinned
@@ -59653,21 +59671,25 @@ pub(crate) fn bind_def_call<'e>(
 /// after. Every row's output is byte-identical across the two binaries and
 /// against jq 1.7.1.
 ///
-/// `install` runs between the two halves -- [`bind_def_call`] passes
-/// [`install_def_calls`] -- so the `as` wrappers are not charged a frame
-/// each. An `as` over a `Shared` argument gives `install_def_calls` nothing
-/// to rewrite (`Shared` is opaque to it), so the order changes only the
-/// charge; charging them moved a thin recursive body from ~3 to ~4 frames a
-/// level and refused `sum_to(10000)`, which jq 1.7.1 answers.
-fn bind_def_call_params(
-    body: &Expr,
-    params: &[Param],
-    args: &[Expr],
-    install: impl FnOnce(&Expr) -> Expr,
-) -> Expr {
+/// The `as` wrappers are part of the body [`bind_def_call`] installs, so
+/// `install_def_calls` charges each one a frame like any other structural
+/// level. That charge is real stack: bisected with the guard disabled
+/// (release, 256 MB), every extra `$` parameter costs a thin recursive body
+/// ~2.9 KB a level, about what one charged frame stands for, and leaving
+/// the wrappers uncharged let `def d($n;$m;$k): ... d($n-1;$m;$k) ...;
+/// d(19999;1;2)` overflow the stack (crash floor 17,364 levels) while the
+/// guard still admitted 20,000. Charged, a thin body keeps a 2.1-2.4x
+/// margin from one to eight `$` parameters. The price is headroom: a
+/// `$`-parameter recursion refuses one level in four sooner than before
+/// (`def sum_to($n)` stops at 10,000 levels, not 13,333), where the bare
+/// spelling is unchanged.
+fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
     let shared = share_def_call_args(args);
-    let installed = install(&substitute_bare_params(body, params, &shared));
-    bind_dollar_params(installed, params, &shared)
+    bind_dollar_params(
+        substitute_bare_params(body, params, &shared),
+        params,
+        &shared,
+    )
 }
 
 /// Each argument of a `def` call, behind the one `Rc` both its bare
@@ -61344,9 +61366,17 @@ mod tests {
     /// so a mask bit cleared one binder too early or too late fails here
     /// even when no test query happens to reach the difference.
     ///
-    /// `sequential_param_substitution` is kept in the tree for this (it is
+    /// `sequential_bare_substitution` is kept in the tree for this (it is
     /// also the >64-parameter fallback), so the oracle is the real prior
     /// implementation rather than a re-derivation of it.
+    ///
+    /// #3149: this covers the bare half only -- the `$` half is no longer a
+    /// substitution, but one `as` per parameter ([`bind_dollar_params`]),
+    /// with no second implementation to diff it against. Its nesting order,
+    /// names and duplicate handling are pinned by
+    /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
+    /// and, end to end against jq 1.7.1, by `tests/jq_cli_tests.rs`'s
+    /// `test_dollar_param_binds_each_value_of_a_generator_argument_3149`.
     #[test]
     fn combined_param_substitution_matches_the_sequential_fold_2633() {
         let bare = |n: &str| Param::Bare(n.to_string());
@@ -61457,12 +61487,11 @@ mod tests {
                 let args: Vec<Expr> = (0..params.len())
                     .map(|i| int(i64::try_from(i).expect("small index") + 1))
                     .collect();
-                let combined = bind_def_call_params(body, params, &args, Expr::clone);
                 let shared = share_def_call_args(&args);
-                let sequential = sequential_bare_substitution(body, params, &shared);
+                let combined = substitute_bare_params(body, params, &shared);
                 assert_eq!(
                     combined,
-                    bind_dollar_params(sequential, params, &shared),
+                    sequential_bare_substitution(body, params, &shared),
                     "combined walk diverged from the sequential fold\n  body: {body:?}\n  params: {params:?}"
                 );
                 // #2633 review: `Expr`'s own `PartialEq` cannot see this.
@@ -61522,9 +61551,7 @@ mod tests {
                 Expr::Literal(Literal::Int(2)),
             ]
         };
-        let bind = |body: Expr, params: &[Param]| {
-            bind_def_call_params(&body, params, &args(), Expr::clone)
-        };
+        let bind = |body: Expr, params: &[Param]| bind_def_call_params(&body, params, &args());
         let dollar_ref = || Expr::Var("a".to_string());
         let bare_ref = || Expr::FuncCall {
             name: "a".to_string(),
