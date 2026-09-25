@@ -34606,38 +34606,55 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// qualify, each confirmed live against jq 1.7.1 to leave the register in
 /// place; everything else is `false`, which can only ever cost a refusal.
 ///
-/// `[...]`, `{...}` and string interpolation recurse into their contents
-/// even though jq wraps each of them in `SUBEXP_BEGIN`/`SUBEXP_END`, which
-/// does save and restore the register: the register is not the only thing
-/// at stake. jq *also* raises "Invalid path expression near attempt to
-/// access element" for a `.a` applied to a computed value anywhere inside
-/// `path()`, subexpression or not, and this resolver never sees the `.a`
-/// inside a construction at all — it evaluates the whole construction as
-/// one value. Letting the register through such a stage therefore lets a
-/// later `$var` re-establish on a pipeline jq had already refused:
+/// `{...}` and string interpolation always qualify, whatever they contain
+/// (#3186). jq compiles every object key and value, and every
+/// interpolated part, between `SUBEXP_BEGIN`/`SUBEXP_END`, and with
+/// `subexp_nest > 0` its `path_intact` answers "intact" and `path_append`
+/// does nothing -- so nothing inside can move the register *or* raise a
+/// path error, not a navigation, not `first`, not a `def` body. Confirmed
+/// live against jq 1.7.1 on `{"a":{"b":1},"k":1}`, every one `[]`:
 ///
 /// ```text
-/// $ jq -c 'path(. as $x | {k:.a} | [.a] | $x)'   # refuses — the second
-///                                                # `.a` is applied to the
-///                                                # constructed {"k":null}
+/// $ jq -c 'path(. as $x | {k:.a} | $x)'
+/// $ jq -c 'path(. as $x | {k:1} | {j: .zz.yy} | $x)'   # .zz on a computed value
+/// $ jq -c 'path(. as $x | {k: first(.a[])} | $x)'
+/// $ jq -c 'path(. as $x | {(.k|tostring): 1} | $x)'
+/// $ jq -c 'path(. as $x | {k:1} | "\(.zz)" | $x)'
 /// ```
 ///
-/// So a construction qualifies only when nothing inside it navigates,
-/// which costs the single-construction shapes jq does accept
-/// (`path(. as $x | [.a] | $x)` is `[]` in jq and refuses here) — a
-/// refusal, the safe direction. An `as` binding's *source* is
-/// subexp-restored the same way (`path(.a as $y | .b)` is `["b"]`) and is
-/// recursed into for the same reason. Every other composite recurses into
-/// all of its operands, which is stricter than jq needs for the ones it
-/// also subexp-wraps (an arithmetic operand, an `if` condition) — stricter
-/// is the safe direction, and a false `false` is invisible except as a
-/// refusal.
+/// Refusing them was not only a refuse-only divergence: under `try`/`?`
+/// the refusal was caught as though it were jq's own path error, so
+/// `del(. as $v | {k: .a} | try ($v | .[]?))` echoed the document where
+/// jq deletes every key (#3186).
+///
+/// `[...]` is different, and still recurses into its contents: jq collects
+/// an array with a `FORK`/`APPEND`/`BACKTRACK` loop and no subexp, so its
+/// contents *are* path-checked against the register -- `path(. as $x |
+/// {k:.a} | [.k] | $x)` raises on the `.k`, applied to the constructed
+/// object -- even though backtracking then restores the register, so that
+/// `path(. as $x | [.a] | $x)` is `[]`. This resolver evaluates the whole
+/// construction as one value and never sees an inner `.k`, so an array
+/// qualifies only when nothing inside it navigates. That costs the
+/// array shapes jq does accept (`path(. as $x | [.a] | $x)` refuses here).
+/// A refusal is not a fabricated path, but it is not free either: under
+/// `try`/`?` it is caught as though it were jq's own path error, and
+/// `del(. as $x | [.a] | try ($x | .a))` echoes the document where jq
+/// writes -- #3263 tracks resolving an array's contents instead. An `as`
+/// binding's *source* is a subexp too (`path(.a as $y | .b)` is `["b"]`),
+/// so only its body is consulted (#2042).
 ///
 /// The builtin arm is an explicit list rather than a property of the
 /// [`Builtin`] enum, because the distinction it draws — C-implemented
 /// versus defined in jq's own `builtin.jq` — is not visible from this AST:
 /// `length` and `first` are one variant each here, and only one of them
 /// indexes. Add a variant only with an oracle row to go with it.
+///
+/// The same `SUBEXP_BEGIN`/`SUBEXP_END` wrapping covers both operands of an
+/// arithmetic or comparison operator and an `if`'s condition (though not the
+/// branch that runs), so those qualify on the same evidence -- see their
+/// arms. `and`/`or`/`//` do not: they fork, and a truthy left operand that
+/// navigated leaves the register where it went, so they recurse like every
+/// other composite.
 ///
 /// A `def` and a call are always `false`, even when the body is a constant
 /// — deciding otherwise would mean resolving the call to its body here, and
@@ -34670,42 +34687,38 @@ fn cannot_move_register(expr: &Expr) -> bool {
         | Expr::Not
         | Expr::Format(_) => true,
 
-        // Subexp-restored, so the register survives — but only safe to
-        // carry when nothing inside navigates; see the doc comment.
+        // #3186: jq evaluates every key, value and interpolated part inside
+        // `SUBEXP_BEGIN`/`SUBEXP_END`, where nothing moves the register or
+        // raises a path error -- see the doc comment.
+        Expr::Object(_) | Expr::StringInterpolation(_) => true,
+        // Path-checked against the register (no subexp), then restored by
+        // backtracking -- only safe to carry when nothing inside navigates;
+        // see the doc comment.
         Expr::Array(inner) => cannot_move_register(inner),
-        Expr::Object(entries) => entries.iter().all(|entry| {
-            cannot_move_register(&entry.value)
-                && match &entry.key {
-                    ObjectKey::Literal(_) => true,
-                    ObjectKey::Expr(key) => cannot_move_register(key),
-                }
-        }),
-        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
-            StringPart::Literal(_) => true,
-            StringPart::Expr(inner) => cannot_move_register(inner),
-        }),
 
         // Composites: safe exactly when every operand is.
         Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => {
             cannot_move_register(inner)
         }
         Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(cannot_move_register),
-        Expr::Arithmetic { left, right, .. }
-        | Expr::Compare { left, right, .. }
-        | Expr::And(left, right)
-        | Expr::Or(left, right)
-        | Expr::Alternative(left, right) => {
+        // #3186: both operands of a binary operator are subexps in jq, like
+        // an object's entries -- `path(. as $x | ({k:1}|.zz) + 1 | $x)` and
+        // `path(. as $x | (.k == 1) | $x)` are both `[]`.
+        Expr::Arithmetic { .. } | Expr::Compare { .. } => true,
+        // Not subexps: `and`/`or` and `//` fork, and a truthy left operand
+        // that navigated leaves the register where it went --
+        // `path(. as $x | (.a and .k) | $x)` raises.
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
             cannot_move_register(left) && cannot_move_register(right)
         }
+        // #3186: only the condition is a subexp (`path(. as $x | if
+        // ({j:1}|.zz) then 5 else 6 end | $x)` is `[]`); the branch that
+        // runs is not (`if .k then .a else 6 end` moves it onto `.a`).
         Expr::If {
-            cond,
             then_branch,
             else_branch,
-        } => {
-            cannot_move_register(cond)
-                && cannot_move_register(then_branch)
-                && cannot_move_register(else_branch)
-        }
+            ..
+        } => cannot_move_register(then_branch) && cannot_move_register(else_branch),
         Expr::Try { expr, catch } => {
             cannot_move_register(expr)
                 && match catch {
@@ -97968,6 +97981,65 @@ mod tests {
         }
     }
 
+    /// #3186: jq compiles every object key and value, every interpolated
+    /// part, both operands of an arithmetic or comparison operator and an
+    /// `if`'s condition between `SUBEXP_BEGIN`/`SUBEXP_END`, where nothing
+    /// moves the register or raises a path error -- so these carry it even
+    /// when what they contain navigates, including onto a computed value
+    /// (`{k:1} | {j: .zz.yy}`) or through a jq-defined builtin (`first`).
+    /// Each is `[]` in jq 1.7.1; each refused here before #3186.
+    #[test]
+    fn test_path_register_survives_subexp_stages_that_navigate_3186() {
+        for filter in [
+            r"path(. as $x | {k:.a} | $x)",
+            r"path(. as $x | {k:.a} | {j:.k} | $x)",
+            r"path(. as $x | {k:1} | {j: .zz.yy} | $x)",
+            r"path(. as $x | {k: first(.a[])} | $x)",
+            r"path(. as $x | {k: (def f: .a; f)} | $x)",
+            r"path(. as $x | {(.a|tostring): 1} | $x)",
+            r#"path(. as $x | "\(.a)" | $x)"#,
+            r#"path(. as $x | {k:1} | "\(.zz)" | $x)"#,
+            r"path(. as $x | (.a.b + 1) | $x)",
+            r"path(. as $x | ({k:1}|.zz) + 1 | $x)",
+            r"path(. as $x | (first(.a[]) + 1) | $x)",
+            r"path(. as $x | (.a == 1) | $x)",
+            r"path(. as $x | if .a.b then 5 else 6 end | $x)",
+            r"path(. as $x | if ({j:1}|.zz) then 5 else 6 end | $x)",
+        ] {
+            assert_eq!(outputs(br#"{"a":{"b":1}}"#, filter), ["[]"], "{filter}");
+        }
+        // The register is a position: navigation continues off it.
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | {k:.a} | $x | .a.b)"),
+            [r#"["a","b"]"#]
+        );
+    }
+
+    /// #3186's negative controls: the shapes that are *not* subexps in jq
+    /// keep refusing, each exactly where jq 1.7.1 raises. An array's
+    /// contents are path-checked (`[.k]` on the constructed object), `and`
+    /// forks and its navigating left operand moves the register, and the
+    /// `if` branch that runs is ordinary code. A subexp stage carries the
+    /// register, but it does not un-move one a navigation already moved.
+    #[test]
+    fn test_path_register_still_refuses_after_non_subexp_navigation_3186() {
+        for filter in [
+            r"path(. as $x | {k:.a} | [.k] | $x)",
+            r"path(. as $x | {k:.a} | [.a] | $x)",
+            r"path(. as $x | {k:.a} | .k | $x)",
+            r"path(. as $x | (.a and .b) | $x)",
+            r"path(. as $x | if .a then .a else 6 end | $x)",
+            r"path(. as $x | .a | {z:.b} | $x)",
+            r"path(. as $x | .a | (.b + 1) | $x)",
+        ] {
+            query!(br#"{"a":{"b":1},"k":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(is_resolver_refusal(&e), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
     // =========================================================================
     // #2896: `getpath` is transparent to the path register. jq's `f_getpath`
     // is `_jq_path_append(jq, a, p, jv_getpath(a, p))`, so on an input that
@@ -98630,14 +98702,17 @@ mod tests {
     /// deliberate. jq answers `[]` for every one of these; succinctly
     /// refuses.
     ///
-    /// A construction that *does* navigate (`[.a]`, `{k:.a}`, `"\(.a)"`)
-    /// is excluded because jq raises for a `.a` applied to a computed value
-    /// anywhere inside `path()` — subexpression or not — and this resolver
+    /// An *array* that navigates (`[.a]`) is excluded because jq collects
+    /// it with no subexp, so its contents are path-checked -- jq raises for
+    /// a `.a` applied to a computed value inside one -- and this resolver
     /// never sees that `.a`, evaluating the construction as one value
     /// instead. `path(. as $x | {k:.a} | [.a] | $x)` is the shape that
-    /// proves it: jq raises on the *second* `.a`, applied to the
-    /// constructed `{"k":null}`, so carrying the register through the first
-    /// construction answered a pipeline jq had already refused. A `def` and
+    /// proves it: jq raises on the `[.a]`'s `.a`, applied to the
+    /// constructed `{"k":{"b":1}}`. (`{k:.a}` and `"\(.a)"` used to be
+    /// listed here on the same reasoning, but those two *are* subexps in
+    /// jq, where nothing is path-checked: #3186 moved them to
+    /// `test_path_register_survives_subexp_stages_that_navigate_3186`, and
+    /// #3263 tracks resolving an array's contents.) A `def` and
     /// a call are excluded because resolving a call to its body is not
     /// something this predicate can do from a name. (An `as` whose *source*
     /// navigates used to be listed here too; #2042 established that jq
@@ -98647,8 +98722,6 @@ mod tests {
     fn test_navigating_construction_and_def_cost_a_refusal_1573() {
         for filter in [
             r"path(. as $x | [.a] | $x)",
-            "path(. as $x | { k: .a } | $x)",
-            r#"path(. as $x | ("\(.a)") | $x)"#,
             r"path(. as $x | (def f: 5; f) | $x)",
         ] {
             query!(br#"{"a":{"b":1}}"#, filter,
