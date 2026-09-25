@@ -4788,7 +4788,7 @@ mod node_id_reindex_tests {
         let owned = OwnedValue::Array(
             vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)].into(),
         );
-        let reindexed_text = owned.to_json_for_reindex::<JqSemantics>();
+        let reindexed_text = owned.to_json_for_reindex::<JqSemantics>().unwrap();
         let reindexed_bytes = reindexed_text.as_bytes();
         let reindexed = JsonIndex::build(reindexed_bytes);
         let reindexed_root = reindexed.root(reindexed_bytes);

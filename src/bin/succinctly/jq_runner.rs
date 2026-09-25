@@ -8826,6 +8826,45 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
 mod tests {
     use super::*;
 
+    /// #3261 review: `nesting_depth_panic_message`'s whole point is telling
+    /// apart two panics that share the identical message template
+    /// (`assert_depth`, `src/jq/value.rs`) except for the interpolated
+    /// number -- exact `MAX_NESTING_DEPTH` (256) match only, `None` for
+    /// everything else, including the different-but-textually-similar
+    /// `MAX_VALUE_TREE_DEPTH` (384) guard (f2789080a's own narrowing, #1793
+    /// review). Before #3261 this was reachable end-to-end via `reduce
+    /// range(400) as $i (null; [.])`, a live 384 panic that proved the
+    /// narrowing correctly declined to catch it -- #3261 fixed that guard's
+    /// most common call site to no longer panic at all, orphaning that
+    /// live coverage. This pins the discrimination directly against the
+    /// payload shapes a real panic actually produces, independent of
+    /// whether any call site still panics with either message.
+    #[test]
+    fn nesting_depth_panic_message_distinguishes_the_two_guards_3261() {
+        let payload_256 = Box::new(format!(
+            "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+        )) as Box<dyn core::any::Any + Send>;
+        assert_eq!(
+            nesting_depth_panic_message(&*payload_256).as_deref(),
+            Some("nesting depth exceeds limit of 256")
+        );
+
+        // The exact text `assert_value_tree_depth` panics with today
+        // (`MAX_VALUE_TREE_DEPTH`, src/jq/value.rs) -- must NOT match.
+        let payload_384 = Box::new("nesting depth exceeds limit of 384".to_string())
+            as Box<dyn core::any::Any + Send>;
+        assert_eq!(nesting_depth_panic_message(&*payload_384), None);
+
+        // An unrelated panic payload, and the `&'static str` shape a bare
+        // `panic!("literal")` produces (defense-in-depth per this
+        // function's own doc comment) -- neither matches either.
+        let payload_other =
+            Box::new("some other panic".to_string()) as Box<dyn core::any::Any + Send>;
+        assert_eq!(nesting_depth_panic_message(&*payload_other), None);
+        let payload_static: Box<dyn core::any::Any + Send> = Box::new("literal panic");
+        assert_eq!(nesting_depth_panic_message(&*payload_static), None);
+    }
+
     /// #2951: run ids are interned per resolved module, and a module that
     /// cannot be resolved still gets one.
     ///

@@ -1242,7 +1242,8 @@ mod tests {
             ]
             .into(),
         )
-        .to_json_for_reindex::<JqSemantics>();
+        .to_json_for_reindex::<JqSemantics>()
+        .unwrap();
         let index = JsonIndex::build_reindex(source.as_bytes());
         let cursor = index.root(source.as_bytes());
         for owned in [

@@ -30980,17 +30980,23 @@ fn test_path_cursor_native_deep_static_chain_reports_cleanly_not_stack_overflow_
 /// Unlike the sibling test above, this route is *not* wrapped by the CLI's
 /// `catch_unwind`: `nesting_depth_panic_message`'s own doc comment records
 /// that a `MAX_VALUE_TREE_DEPTH` panic is a deliberately different failure
-/// class (filter-driven value growth, e.g. `reduce`, rather than document
-/// nesting) that this CLI leaves uncaught here on purpose, matching every
-/// other pre-existing caller of `assert_value_tree_depth` -- confirmed live
-/// and identical on unmodified `main` via
-/// `reduce range(400) as $i (null; [.])`, which panics uncaught (exit 101,
-/// no `catch_unwind` reformatting) today. So this test asserts only that
-/// the failure is an ordinary, bounded Rust panic -- a clean depth-limit
-/// message, deterministic, no corrupted process state -- rather than a
-/// stack overflow (unrecoverable, no message, `SIGABRT`); it does not (and,
-/// per the above, should not) assert a specific caught-and-reformatted exit
-/// code the way the cursor-native sibling above does.
+/// class from `MAX_NESTING_DEPTH`'s own, so this CLI's `catch_unwind` sites
+/// leave it uncaught here on purpose, matching this route specifically. So
+/// this test asserts only that the failure is an ordinary, bounded Rust
+/// panic -- a clean depth-limit message, deterministic, no corrupted
+/// process state -- rather than a stack overflow (unrecoverable, no
+/// message, `SIGABRT`); it does not (and, per the above, should not) assert
+/// a specific caught-and-reformatted exit code the way the cursor-native
+/// sibling above does.
+///
+/// `reduce range(400) as $i (null; [.])` no longer illustrates the same
+/// point: that shape hits `MAX_VALUE_TREE_DEPTH` through a *different* call
+/// site (`OwnedValue::to_json_for_reindex`'s per-iteration reindex bridge,
+/// not this one's `walk_path`/`step_into`), which #3261 fixed to pre-check
+/// depth and return a catchable `EvalError` instead of panicking --
+/// `test_reduce_growth_past_value_tree_depth_reports_cleanly_3261` now pins
+/// its exit-5 diagnostic. This route remains genuinely unfixed: `path()`'s
+/// non-cursor-native walk still panics on the exact same guard.
 #[test]
 fn test_path_non_cursor_native_deep_static_chain_panics_cleanly_not_stack_overflow_2058(
 ) -> Result<()> {
@@ -31118,20 +31124,74 @@ fn test_sort_on_non_array_is_unaffected_by_1793_fix() -> Result<()> {
 /// call (`src/jq/value.rs`) -- byte-identical apart from the interpolated
 /// number. An earlier version of this fix matched on that shared substring
 /// and silently swallowed this *different* guard's panic (filter-driven
-/// value growth, not document nesting) as if it were #1793's own condition.
-/// This must still crash uncaught -- absorbing it silently would mask a
-/// genuinely different failure class behind #1793's message.
+/// value growth, not document nesting) as if it were #1793's own condition
+/// -- `nesting_depth_panic_message`'s own exact-match narrowing (still in
+/// place) is what continues to prevent that conflation; this test no longer
+/// exercises it directly.
+///
+/// #3261 superseded this test's original premise: `reduce`/`foreach`'s own
+/// per-iteration reindex bridge (`OwnedValue::to_json_for_reindex`) used to
+/// hit this guard as an uncaught panic (exit 101) because no `catch_unwind`
+/// sat between it and the CLI's per-document loop -- not because
+/// `nesting_depth_panic_message` was catching it (it never matched this
+/// guard, by design, both before and after this fix). #3261 fixed the root
+/// cause instead: the reindex bridge now pre-checks depth
+/// (`OwnedValue::check_tree_depth`) and returns a catchable `EvalError`
+/// before ever reaching the panicking assert, so this exact repro now
+/// reports cleanly through the evaluator's ordinary error path, matching
+/// `docs/compliance/jq/limitations.md`'s own documented contract for this
+/// shape. `test_path_non_cursor_native_deep_static_chain_panics_cleanly_
+/// not_stack_overflow_2058` still pins a genuinely different call site
+/// (the non-cursor-native `path()` walk in `eval.rs`) that #3261 did not
+/// touch and that still panics uncaught by design -- that test remains the
+/// living proof `nesting_depth_panic_message`'s narrowing still matters.
 #[test]
-fn test_unrelated_value_tree_depth_panic_is_not_caught_by_1793_fix() -> Result<()> {
+fn test_reduce_growth_past_value_tree_depth_reports_cleanly_3261() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", "reduce range(400) as $i (null; [.])"], Some("null"))
             .unwrap_or_else(|e| panic!("run failed: {e}"));
-    assert_eq!(
-        code, 101,
-        "an unrelated MAX_VALUE_TREE_DEPTH panic must still crash uncaught, not be silently absorbed as #1793's own guard\nstdout: {stdout:?}\nstderr: {stderr:?}"
-    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("stack overflow"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #3261 sibling: a `with_entries(f)` pipeline over a field that grows past
+/// the limit also reports cleanly. Despite `builtin_with_entries` having its
+/// own `entry.reindexed::<S>()` call, this filter's failure is actually
+/// caught one step earlier -- converting the freshly-constructed `{a:
+/// deep}` object into the cursor `with_entries` requires reindexes the
+/// *whole* object first, and that whole-object reindex is strictly deeper
+/// than any single field's own re-reindex could be once extracted, so it
+/// always fails first. Kept as a real pipeline-level regression test
+/// despite not pinning `builtin_with_entries`'s own arm specifically --
+/// that arm's own tolerate-line annotation (`eval.rs`) explains why no
+/// input can reach it independently.
+#[test]
+fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "{a: (reduce range(400) as $i (0; [.]))} | with_entries(.)",
+        ],
+        None,
+    )
+    .unwrap_or_else(|e| panic!("run failed: {e}"));
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("stack overflow"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -62037,6 +62097,17 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
             "MAX_EVAL_FRAMES, generator",
             "def f: 1, f; f",
             "f/0 exceeded maximum recursion depth",
+        ),
+        // #3261: MAX_VALUE_TREE_DEPTH, reached via reduce/foreach's own
+        // per-iteration reindex bridge -- newly routed through the
+        // catchable EvalError machinery by that fix, so it must be tagged
+        // `resource_limit` like every other cap in this table or it
+        // silently regresses into exactly the #2089 class this test
+        // guards against.
+        (
+            "MAX_VALUE_TREE_DEPTH",
+            "reduce range(400) as $i (null; [.])",
+            "nesting depth exceeds limit of 384",
         ),
     ] {
         for spelling in [

@@ -48716,3 +48716,26 @@ fn test_key_past_a_seeded_deep_position_does_not_panic_3020() -> Result<()> {
     assert_eq!(stdout.trim_end(), r#"[["b"]]"#);
     Ok(())
 }
+
+/// #3261: `succinctly yq`'s own `evaluate_input` (`yq_runner.rs`) shares the
+/// exact `OwnedValue::reindexed` bridge `succinctly jq` does -- before this
+/// fix, a filter-driven value growing past `MAX_VALUE_TREE_DEPTH` (384) via
+/// `reduce`/`foreach` panicked uncaught (exit 101) here too, since nothing
+/// in `evaluate_input` caught it. Now it reports through the ordinary
+/// `sink.report` diagnostic path, matching an everyday evaluator error.
+#[test]
+fn test_reduce_growth_past_value_tree_depth_reports_cleanly_yq_3261() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "reduce range(400) as $i (null; [.]) | length",
+        "null",
+        &["--jq-extensions"],
+    )?;
+    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    Ok(())
+}
