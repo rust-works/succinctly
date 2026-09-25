@@ -56371,6 +56371,42 @@ fn test_and_or_tracked_var_on_one_side_does_not_blind_the_other_2760() -> Result
     Ok(())
 }
 
+/// #2760 second review regression, one level deeper than the one just
+/// above: a `TrackedVar` *nested inside a compound operand* must not blind
+/// checking for navigation elsewhere in that same operand. A second draft
+/// fixed the flat case above by scanning each operand's whole subtree for a
+/// `TrackedVar` before deciding whether to resolve it live -- which broke
+/// exactly this shape, since `(.a and $v0)` contains `$v0` *somewhere*, so
+/// the scan gave up on resolving `.a`'s own navigation too, even though
+/// `.a` has nothing to do with `$v0`. Caught live in review; confirmed
+/// against jq 1.7.1. The fix removed that whole-operand scan in favor of
+/// plain, unconditional `resolve_node_sink` recursion, which reaches this
+/// same `And`/`Or` arm again for the nested `and` and the dedicated
+/// `TrackedVar` arm for the bare `$v0` -- deciding each node's fate from
+/// inside the resolver, not from an outer predicate over the whole subtree.
+#[test]
+fn test_and_or_tracked_var_nested_in_compound_operand_does_not_blind_sibling_navigation_2760(
+) -> Result<()> {
+    for (filter, doc) in [
+        (
+            "path(. as {a:$v0} | ((.a and $v0) and .k) | empty)",
+            r#"{"a":false,"k":2}"#,
+        ),
+        (
+            "path(. as {a:$v0} | ((.a or $v0) or .k) | empty)",
+            r#"{"a":true,"k":2}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter} on {doc}: stdout {stdout:?}");
+        assert!(
+            stderr.contains(r#"near attempt to access element "a""#),
+            "{filter} on {doc}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2760's own scope boundary, recorded so it stays a deliberate choice: a
 /// **trackable** input's `and`/`or` has a materially different gap (jq's
 /// path-mode refuses whenever more than one operand genuinely navigates the
