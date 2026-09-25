@@ -31788,14 +31788,19 @@ fn may_bind_navigated(expr: &Expr) -> bool {
 ///
 /// It is a separate variant rather than a `Marked(Origin::At { .. })`
 /// precisely so [`Snapshot::is_marked`] stays `false` for it. `is_marked`
-/// does not mean "has provenance": it gates the recurse family's
-/// *deferral* (`resolve_node_sink`'s untracked guard, and the two
-/// `debug_assert!(trackable || snapshot.is_marked())` invariants that guard
-/// hands off to), where a frozen snapshot must reach the walk so the walk
-/// can emit *self* with the mark intact (#1591). A positional mark carries
-/// no such frozen-pointer guarantee, so reusing `Marked` here would
-/// silently turn several "raise now" refusals into deferred walks — a
-/// widening in the accepting direction with no oracle behind it.
+/// does not mean "has provenance": it gates deferral for the *parameterised*
+/// recurse family (`resolve_node_sink`'s untracked guard ahead of
+/// `resolve_recurse_sink`, and yq's own bare-recursion guard) and the
+/// `debug_assert!(trackable || snapshot.is_marked())` invariants those hand
+/// off to, where a frozen snapshot must reach the walk so the walk can emit
+/// *self* with the mark intact (#1591). **jq's own *bare* `..`/`recurse` no
+/// longer reads `is_marked` at all (#3048)**: that arm refuses immediately
+/// on any untracked value, marked or not, so a marked `$var` off the
+/// register raises the same iterate error a plain untracked value does
+/// instead of deferring to a walk with no iterate check. A positional mark
+/// carries no frozen-pointer guarantee either way, so reusing `Marked` here
+/// would silently turn several "raise now" refusals into deferred walks —
+/// a widening in the accepting direction with no oracle behind it.
 #[derive(Debug, Clone, PartialEq, Default)]
 enum Snapshot {
     #[default]

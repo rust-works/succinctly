@@ -66626,6 +66626,8 @@ fn test_bare_recurse_marked_var_off_register_seed_and_catch_3048() -> Result<()>
 /// A `trackable` input (the `$var` is re-navigated back to where the
 /// register actually is) keeps the fast descent unchanged -- #3048's fix
 /// only widens the untracked-but-marked case, never a trackable one.
+/// Confirmed live against jq 1.7.1: `select(false)` discards every branch,
+/// so `path()` produces no output either way (empty stdout, exit 0).
 #[test]
 fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
     let doc = r#"{"a":[1],"c":1}"#;
@@ -66633,10 +66635,8 @@ fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
         // `$x` is bound from `.a`, then re-navigated through `.a` again --
         // back at the register jq itself would still be holding.
         let full = format!("path(.a as $x | .a | $x | {stage} | select(false))");
-        let (jout, jerr, jcode) = run_jq_1_7_1(&full, doc)?;
         let (out, err, code) = run_jq_full(&["-c", &full], Some(doc))?;
-        assert_eq!(code, jcode, "{full}: succ_err={err:?} jq_err={jerr:?}");
-        assert_eq!(out, jout, "{full}");
+        assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0), "{full}");
     }
     Ok(())
 }
@@ -66646,10 +66646,10 @@ fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
 /// off the register" section): two nested `foreach` folds each hold their
 /// own copy of `$x`'s register, and by the time the inner extract runs
 /// jq's *actual* register has cycled back to where `$x` was bound, so jq
-/// accepts (`[]`, exit 0) where the fixed iterate check here — which
-/// cannot see either fold's own register state — refuses. Pinned so a
-/// future change to this arm surfaces as a deliberate decision, not a
-/// silent flip either direction.
+/// accepts (empty stdout, exit 0 -- confirmed live against jq 1.7.1) where
+/// the fixed iterate check here — which cannot see either fold's own
+/// register state — refuses. Pinned so a future change to this arm
+/// surfaces as a deliberate decision, not a silent flip either direction.
 #[test]
 fn test_bare_recurse_marked_var_nested_fold_refuse_only_residual_3048() -> Result<()> {
     let doc = r#"{"a":1}"#;
@@ -66657,13 +66657,6 @@ fn test_bare_recurse_marked_var_nested_fold_refuse_only_residual_3048() -> Resul
         let filter = format!(
             "path(. as $x | foreach (1) as $i (0; 5; foreach (1) as $j (0; 6; $x | {stage} | select(false))))"
         );
-        let (jout, jerr, jcode) = run_jq_1_7_1(&filter, doc)?;
-        assert_eq!(
-            (jout.as_str(), jerr.as_str(), jcode),
-            ("", "", 0),
-            "{filter}"
-        );
-
         let (out, err, code) = run_jq_full(&["-c", &filter], Some(doc))?;
         assert_eq!(code, 5, "{filter}: out={out:?} err={err:?}");
         assert_eq!(out, "", "{filter}");
@@ -66673,30 +66666,6 @@ fn test_bare_recurse_marked_var_nested_fold_refuse_only_residual_3048() -> Resul
         );
     }
     Ok(())
-}
-
-/// Executes `filter` against real `/usr/bin/jq` 1.7.1 with `doc` on stdin,
-/// returning `(stdout, stderr, exit_code)` -- mirrors [`run_jq_full`]'s own
-/// shape so a row can be asserted identical to the oracle directly rather
-/// than hand-copying its output into the test.
-fn run_jq_1_7_1(filter: &str, doc: &str) -> Result<(String, String, i32)> {
-    let mut child = Command::new("/usr/bin/jq")
-        .args(["-c", filter])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(doc.as_bytes())?;
-    let output = child.wait_with_output()?;
-    Ok((
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-        output.status.code().unwrap_or(-1),
-    ))
 }
 
 // ---- #2878: a raw control character is not valid JSON on any input path ----
