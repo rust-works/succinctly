@@ -35378,6 +35378,17 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         // keeps them apart; the inside is checked exactly when it would be
         // without the `?`.
         Expr::Paren(e) | Expr::Optional(e) => array_contents_are_checked(e),
+        // #2764: `try E` is the same jq program as `(E)?`, so it is checked
+        // exactly when `E` is. A handler runs live against the error
+        // message, where its own navigation raises as in jq --
+        // `path(. as $x | [try .a catch .k] | $x)` is `[]` in jq 1.7.1.
+        Expr::Try { expr, catch } => {
+            array_contents_are_checked(expr)
+                && match catch {
+                    Some(handler) => array_contents_are_checked(handler),
+                    None => true,
+                }
+        }
         Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
         Expr::If {
             then_branch,

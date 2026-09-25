@@ -732,17 +732,21 @@ is the revert that established what the other one costs.
    backtracks the register to where the collect began. Since
    [#3263](https://github.com/rust-works/succinctly/issues/3263) an array carries the register
    too when the resolver both resolves it live and checks everything jq checks inside it:
-   navigation, `..`, `select`, an `if`'s branches, and pipes, commas and subexp shapes of
-   those. So `path(. as $x \| [.a] \| $x)` is `[]` in both tools. Any other array carries no
-   register. Where it holds navigation this resolver can't see (a builtin jq defines in jq,
-   such as `with_entries` or `walk`, or an update assignment's `_modify`, as in `[.k \|= 1]`),
-   jq raises too and only the wording differs (`… with result …` here). Two shapes jq
-   answers still refuse here. The first is an array holding a shape the resolver still
-   evaluates by value when jq accepts it (`getpath`, or a `$var` on an untracked input:
-   #2759; `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), or an array nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`).
-   The second shape is
-   a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
-   body is not something a syntactic predicate can do from a name). Every such refusal is
+   navigation, `..`, `select`, an `if`'s branches, both of jq's `?`s and `try`/`catch`,
+   `recurse(f)`/`recurse(f; cond)` (#2764), and pipes, commas and subexp shapes of those. So
+   `path(. as $x \| [.a] \| $x)` and `path(. as $x \| [try .a] \| $x)` are `[]` in both
+   tools. Any other array carries no register. Where it holds navigation this resolver can't
+   see (a builtin jq defines in jq, such as `with_entries` or `walk`, or an update
+   assignment's `_modify`, as in `[.k \|= 1]`), jq raises too and only the wording differs
+   (`… with result …` here). Three shapes jq answers still refuse here. The first is an array
+   holding anything outside that list that jq accepts: a shape the resolver still evaluates
+   by value (`getpath`, or a `$var` on an untracked input: #2759;
+   `path(. as $x \| [.a \| getpath(["b"])] \| $x)`), or one it resolves but does not count as
+   checked (`//`, `first(f)`: `path(. as $x \| [first(.a)] \| $x)`). The second is an array
+   nested in another stage's expression (`if true then [.a] else 1 end`, `([.a], [.k])`). The
+   third is a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` —
+   resolving a call to its body is not something a syntactic predicate can do from a name).
+   Every such refusal is
    refuse-only, and since [#3267](https://github.com/rust-works/succinctly/issues/3267) it stays
    refuse-only under `try`/`?` too. It used to be caught as if it were jq's own path error, so
    the write was silently lost at exit 0 where jq writes:

@@ -68700,5 +68700,16 @@ fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
         (r"del(. as $x | 1 | [(.a)?] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
         (r"del(. as $x | [.a?] | try ($x | .a))", "{\"c\":2}\n", "", 0),
         (r"del(.a | [(.b)? | type] | select(false))", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+        // `try E` is the same jq program as `(E)?`; a handler runs live
+        // against the error message, where its own navigation raises.
+        (r"path(. as $x | [try .a] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [try .a] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try (.a | .b)] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try .a catch .] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try .a catch .k] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try (.c | .[0]) catch .] | $x)", "[]\n", "", 0),
+        (r"path(1 | [try .a catch .x] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"x\" of \"Invalid path expression n...\n", 5),
+        (r"path(. as $x | [try error({}) catch .a] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {}\n", 5),
+        (r"del(. as $x | 1 | [try .a] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
     ])
 }
