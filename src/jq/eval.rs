@@ -30695,11 +30695,50 @@ fn slice_bound_component_value(bound: Option<i64>, key: Option<&SliceBoundKey>) 
 /// that moves or forgets the position, so the same one-directional
 /// invariant covers it: a wrong `Some` would re-establish a value on a
 /// register it is not identical to.
+///
+/// `register_loss` (#3267) records that a live register did not come out of
+/// a stage upstream of this branch that did not navigate -- whether
+/// [`cannot_move_register`] said `false` or the stage's route simply handed
+/// no register back (a `reduce` stage). jq may still hold that register
+/// where it was, or anywhere inside it, so a refusal of a value that could
+/// have been it is this resolver's guess, not jq's verdict, and must not be
+/// caught -- see [`guess_refusal`]. It keeps the register's last known value
+/// ([`RegisterLoss::LostAt`]) so that "could have been it" can be answered
+/// rather than assumed. Set by `resolve_seq_stage`'s step placement and handed
+/// down the depth-first recursion in the frame each next stage receives;
+/// unlike `register`, it survives a moved position (it is knowledge about
+/// the branch, not about the node under it). Cleared when the branch is
+/// trackable again, and by a fresh invocation.
 #[derive(Debug, Clone)]
 pub(crate) struct Frame {
     invocation: u64,
     at: Option<Rc<PathPrefix>>,
     register: Option<Rc<OwnedValue>>,
+    register_loss: RegisterLoss,
+}
+
+/// Whether, and where, a branch's path register was lost (#3267) -- see
+/// [`Frame`]'s `register_loss`.
+#[derive(Debug, Clone, Default)]
+enum RegisterLoss {
+    /// Not lost: the register is known, or absent for a reason that makes
+    /// every refusal exact.
+    #[default]
+    Kept,
+    /// Lost where it held this value. jq's register moves only *down* from
+    /// there -- navigation appends to its path, backtracking restores an
+    /// earlier position within the same stage -- so it is this node or one
+    /// inside it.
+    LostAt(Rc<OwnedValue>),
+    /// Lost by a route that handed back no register value at all (a
+    /// `reduce` stage): anywhere.
+    LostSomewhere,
+}
+
+impl RegisterLoss {
+    fn is_lost(&self) -> bool {
+        !matches!(self, Self::Kept)
+    }
 }
 
 /// Next [`Frame::invocation`]. A plain atomic rather than a
@@ -30717,6 +30756,7 @@ impl Frame {
             invocation,
             at,
             register: None,
+            register_loss: RegisterLoss::Kept,
         }
     }
 
@@ -30727,6 +30767,7 @@ impl Frame {
             invocation,
             at: Some(path),
             register: None,
+            register_loss: RegisterLoss::Kept,
         }
     }
 
@@ -30736,6 +30777,7 @@ impl Frame {
             invocation: self.invocation,
             at: None,
             register: None,
+            register_loss: self.register_loss.clone(),
         }
     }
 
@@ -30748,6 +30790,21 @@ impl Frame {
             // Structural sharing (#2999) makes this clone a refcount bump
             // for a container, and the register is nearly always one.
             register: register.map(|value| Rc::new(value.clone())),
+            register_loss: self.register_loss.clone(),
+        }
+    }
+
+    /// This frame, recording whether the branch's register was dropped by a
+    /// stage this resolver could not see inside (#3267). Borrows `self`
+    /// unchanged when the answer is the same, the common case.
+    fn with_register_loss(&self, register_loss: RegisterLoss) -> Cow<'_, Self> {
+        if !register_loss.is_lost() && !self.register_loss.is_lost() {
+            Cow::Borrowed(self)
+        } else {
+            Cow::Owned(Self {
+                register_loss,
+                ..self.clone()
+            })
         }
     }
 
@@ -30779,6 +30836,7 @@ impl Frame {
             } else {
                 None
             },
+            register_loss: self.register_loss.clone(),
         }
     }
 
@@ -32820,8 +32878,16 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // ordinary "Cannot iterate over number".
         Expr::Iterate => {
             if !trackable {
+                // #3267: of `value` itself, so its guess is exact here.
                 return ResolveFlow::Escaped(
-                    EvalError::invalid_path_expression_near_iterate(value).into(),
+                    guess_refusal(
+                        EvalError::invalid_path_expression_near_iterate(value),
+                        &frame.register_loss,
+                        snapshot,
+                        value,
+                        Some(NavKind::Iterate),
+                    )
+                    .into(),
                 );
             }
             resolve_iterate_sink::<S>(value, sink)
@@ -32931,7 +32997,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             match sink(recurse_family_root_seed(value, trackable, snapshot)) {
                 Demand::Stop => ResolveFlow::Stopped,
                 Demand::Continue => ResolveFlow::Escaped(
-                    EvalError::invalid_path_expression_near_iterate(value).into(),
+                    guess_refusal(
+                        EvalError::invalid_path_expression_near_iterate(value),
+                        &frame.register_loss,
+                        snapshot,
+                        value,
+                        Some(NavKind::Iterate),
+                    )
+                    .into(),
                 ),
             }
         }
@@ -33340,7 +33413,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // ordinary eager evaluator — see the guarded arms' own doc comment
         // above `Expr::Reduce` for why.
         Expr::Reduce { .. } | Expr::Foreach { .. } => drain_path_result(
-            resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+            resolve_leaf::<S>(expr, value, trackable, snapshot, &frame.register_loss, keep),
             sink,
         ),
 
@@ -33515,12 +33588,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // what makes a failed write stop the key/bound generator instead
         // of merely discarding paths it has already fired side effects to
         // produce.
-        Expr::IndexExpr { target, key } => {
-            resolve_index_expr_sink::<S>(target, key, value, false, trackable, frame, keep, sink)
-        }
+        Expr::IndexExpr { target, key } => resolve_index_expr_sink::<S>(
+            target, key, value, false, trackable, snapshot, frame, keep, sink,
+        ),
 
         Expr::SliceExpr { target, start, end } => resolve_slice_expr_sink::<S>(
-            target, start, end, value, false, trackable, frame, keep, sink,
+            target, start, end, value, false, trackable, snapshot, frame, keep, sink,
         ),
 
         // Two fall-throughs, not one. A shape `resolve_node_eager` still
@@ -33535,7 +33608,15 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         other => match resolve_node_eager::<S>(other, value, trackable, snapshot, frame, keep) {
             Some(result) => drain_path_result(result, sink),
             // #2694: the general leaf shape, which has a lazy form.
-            None => resolve_leaf_sink::<S>(other, value, trackable, snapshot, keep, sink),
+            None => resolve_leaf_sink::<S>(
+                other,
+                value,
+                trackable,
+                snapshot,
+                &frame.register_loss,
+                keep,
+                sink,
+            ),
         },
     }
 }
@@ -33625,12 +33706,14 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 // creates its own fresh snapshot fact from `marker_value`,
                 // independent of whatever `value` it's being compared
                 // against (#1591).
-                resolve_leaf::<S>(expr, value, trackable, snapshot, keep).map(|branches| {
-                    branches
-                        .into_iter()
-                        .map(|b| b.into_marked(&marker.origin))
-                        .collect()
-                })
+                resolve_leaf::<S>(expr, value, trackable, snapshot, &frame.register_loss, keep).map(
+                    |branches| {
+                        branches
+                            .into_iter()
+                            .map(|b| b.into_marked(&marker.origin))
+                            .collect()
+                    },
+                )
             }
         }
 
@@ -33859,7 +33942,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             if let Some(e) = escape {
                 return Some(Err((Vec::new(), e)));
             }
-            resolve_leaf::<S>(expr, value, trackable, snapshot, keep)
+            resolve_leaf::<S>(expr, value, trackable, snapshot, &frame.register_loss, keep)
         }
 
         // #2694: `None` means "this is the general leaf shape" -- the one
@@ -33938,11 +34021,11 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
         // #2267: streamed, not drained -- `.[K]?`/`.[S:T]?` carry the same
         // per-key/per-pair generators as their non-optional spellings, so a
         // consumer's demand has to reach them identically.
-        Expr::IndexExpr { target, key } => {
-            resolve_index_expr_sink::<S>(target, key, value, true, trackable, frame, keep, sink)
-        }
+        Expr::IndexExpr { target, key } => resolve_index_expr_sink::<S>(
+            target, key, value, true, trackable, snapshot, frame, keep, sink,
+        ),
         Expr::SliceExpr { target, start, end } => resolve_slice_expr_sink::<S>(
-            target, start, end, value, true, trackable, frame, keep, sink,
+            target, start, end, value, true, trackable, snapshot, frame, keep, sink,
         ),
         _ => {
             let bare_navigation_primitive = matches!(
@@ -34325,19 +34408,22 @@ fn resolve_leaf_sink<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
+    register_loss: &RegisterLoss,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let Keep::AtMost(limit) = keep else {
         return drain_path_result(
-            resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+            resolve_leaf::<S>(expr, value, trackable, snapshot, register_loss, keep),
             sink,
         );
     };
     // The bounded prefix (untrackable navigation, an untracked `.`, and the
     // `is_primitive` shapes) produces at most one branch and is shared with
     // the collecting form rather than restated.
-    if let Some(bounded) = resolve_leaf_bounded::<S>(expr, value, trackable, snapshot) {
+    if let Some(bounded) =
+        resolve_leaf_bounded::<S>(expr, value, trackable, snapshot, register_loss)
+    {
         return drain_path_result(bounded, sink);
     }
 
@@ -34402,12 +34488,22 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
+    register_loss: &RegisterLoss,
 ) -> Option<PathResolveResult<'a>> {
     if !trackable {
+        // #3267: each refusal here is of `value` itself, so this is the one
+        // place its guess can be told from jq's own verdict exactly.
+        let refuse = |e: EvalError, step: Option<NavKind>| {
+            guess_refusal(e, register_loss, snapshot, value, step)
+        };
         if let Some(element) = navigation_element(expr) {
             return Some(Err((
                 Vec::new(),
-                EvalError::invalid_path_expression_near_access(&element, value).into(),
+                refuse(
+                    EvalError::invalid_path_expression_near_access(&element, value),
+                    NavKind::of(&element),
+                )
+                .into(),
             )));
         }
         // #2646: the same check for a builtin jq defines *in jq*, in terms
@@ -34430,15 +34526,17 @@ fn resolve_leaf_bounded<'a, S: EvalSemantics>(
         if S::TAG == EvalTag::Jq {
             if let Expr::Builtin(builtin) = expr {
                 if let Some(navigation) = builtin_navigation(builtin, value) {
-                    let error = match navigation {
-                        BuiltinNavigation::Access(element) => {
-                            EvalError::invalid_path_expression_near_access(&element, value)
-                        }
-                        BuiltinNavigation::Iterate => {
-                            EvalError::invalid_path_expression_near_iterate(value)
-                        }
+                    let (error, step) = match navigation {
+                        BuiltinNavigation::Access(element) => (
+                            EvalError::invalid_path_expression_near_access(&element, value),
+                            NavKind::of(&element),
+                        ),
+                        BuiltinNavigation::Iterate => (
+                            EvalError::invalid_path_expression_near_iterate(value),
+                            Some(NavKind::Iterate),
+                        ),
                     };
-                    return Some(Err((Vec::new(), error.into())));
+                    return Some(Err((Vec::new(), refuse(error, step).into())));
                 }
             }
         }
@@ -34581,9 +34679,12 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: &Snapshot,
+    register_loss: &RegisterLoss,
     keep: Keep,
 ) -> PathResolveResult<'a> {
-    if let Some(bounded) = resolve_leaf_bounded::<S>(expr, value, trackable, snapshot) {
+    if let Some(bounded) =
+        resolve_leaf_bounded::<S>(expr, value, trackable, snapshot, register_loss)
+    {
         return bounded;
     }
 
@@ -35062,11 +35163,13 @@ fn patterns_all_bare(patterns: &[Pattern]) -> bool {
 /// construction as one value and never sees an inner `.k`, so an array
 /// qualifies only when nothing inside it navigates. That costs the
 /// array shapes jq does accept (`path(. as $x | [.a] | $x)` refuses here).
-/// A refusal is not a fabricated path, but it is not free either: under
-/// `try`/`?` it is caught as though it were jq's own path error, and
-/// `del(. as $x | [.a] | try ($x | .a))` echoes the document where jq
-/// writes -- #3263 tracks resolving an array's contents instead, and #3267
-/// the class: a refusal this predicate guessed must not be catchable. An `as`
+/// A refusal is not a fabricated path, but it was not free either: under
+/// `try`/`?` it used to be caught as though it were jq's own path error, so
+/// `del(. as $x | [.a] | try ($x | .a))` echoed the document where jq
+/// writes. Since #3267 a refusal this predicate's `false` leads to is
+/// uncatchable wherever the refused value could have been the register
+/// ([`guess_refusal`]), so it is a loud refusal instead; #3263 tracks
+/// resolving an array's contents. An `as`
 /// binding's *source* is a subexp too (`path(.a as $y | .b)` is `["b"]`),
 /// so only its body is consulted (#2042).
 ///
@@ -36878,6 +36981,11 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
     // arm's pre-#3119 behavior for a bare `.`/`TrackedVar` head exactly.
     let head_resolves_to_register =
         register.is_some_and(|reg| resolves_to_register::<S>(head, trackable, reg, frame));
+    let bound_is_frozen = match head {
+        Expr::TrackedVar(_) => true,
+        Expr::Identity => !matches!(snapshot, Snapshot::No),
+        _ => false,
+    };
     for bound in &sources {
         // A shape `resolves_to_register` refuses (including one it was
         // never asked about, for `Expr::Identity`/`TrackedVar`) still gets
@@ -37054,7 +37162,22 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                     if walk_escape_retries(&control, is_last, !trackable && !refusal_is_exact) {
                         continue;
                     }
-                    return ResolveFlow::Escaped(control.into());
+                    // #3267: a first-step refusal is of `bound` itself, frozen
+                    // when the head is a `$var` marker or a `.` over one.
+                    return ResolveFlow::Escaped(match control {
+                        Control::Error(e) => EvalEscape::Error(guess_refusal_of(
+                            e,
+                            &frame.register_loss,
+                            bound_is_frozen,
+                            bound,
+                            match pattern {
+                                Pattern::Object(_) => Some(NavKind::Field),
+                                Pattern::Array(_) => Some(NavKind::Index),
+                                _ => None,
+                            },
+                        )),
+                        other => other.into(),
+                    });
                 }
             }
         }
@@ -37693,7 +37816,176 @@ fn fold_walk_refusal_is_guess(elem: &FoldSourceValue, reg: &FoldRegister) -> boo
 /// `?//` walk sites below, plus [`resolve_bind_source_in`]'s witness route
 /// -- agrees on what "the resolver's own refusal" means (#3112).
 fn is_resolver_refusal(e: &EvalError) -> bool {
-    e.is_untracked_navigation_error() || e.is_invalid_path_expression()
+    e.is_untracked_navigation_error()
+        || e.is_invalid_path_expression()
+        || e.is_guessed_path_refusal()
+}
+
+/// The kind of navigation step a refusal refused (#3267): whether it could
+/// have *succeeded* on the refused value, had that value been jq's register.
+#[derive(Debug, Clone, Copy)]
+enum NavKind {
+    /// `.k` -- a string key.
+    Field,
+    /// `.[n]` -- a numeric index.
+    Index,
+    /// `.[m:n]`.
+    Slice,
+    /// `.[]`.
+    Iterate,
+}
+
+impl NavKind {
+    /// The step a navigation element names -- the key a refusal message
+    /// quotes: a string, a number, or a `{"start":..,"end":..}` slice.
+    fn of(element: &OwnedValue) -> Option<Self> {
+        match element {
+            OwnedValue::String(_) => Some(Self::Field),
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                Some(Self::Index)
+            }
+            OwnedValue::Object(_) => Some(Self::Slice),
+            _ => None,
+        }
+    }
+
+    /// Whether this step on `value` would have navigated in jq rather than
+    /// raised a type error (`Cannot index object with number`, `Cannot
+    /// iterate over null`, ...). jq raises that error wherever its register
+    /// is, so a refusal of a step that could never succeed is exact: jq
+    /// fails it too, and a `try` catching it is what jq does.
+    fn would_succeed_on(self, value: &OwnedValue) -> bool {
+        match self {
+            Self::Field => matches!(value, OwnedValue::Object(_) | OwnedValue::Null),
+            Self::Index => matches!(value, OwnedValue::Array(_) | OwnedValue::Null),
+            Self::Slice => matches!(
+                value,
+                OwnedValue::Array(_) | OwnedValue::String(_) | OwnedValue::Null
+            ),
+            Self::Iterate => matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)),
+        }
+    }
+}
+
+/// A navigation refusal of `value` (whose own snapshot is `snapshot`),
+/// reclassified as the resolver's *guess* when it is one (#3267) -- the one
+/// rule every refusal site applies, where the refused value is in hand.
+///
+/// A refusal is exact when jq's register is known, or when `value` could
+/// not be the register this resolver lost ([`could_be_lost_register`]):
+/// then jq refuses the same step, and catching it is what jq does too
+/// (`has("a") | try (5 | .a)` is empty in both). Otherwise it is a guess.
+/// Caught, a guess silently lost the write jq makes -- `del(. as $x |
+/// has("a") | try ($x | .a))` echoed the document where jq deletes `.a` --
+/// so [`EvalError::into_guessed_path_refusal`] makes it uncatchable in path
+/// and value position alike: ADR-0018's rule 4.
+fn guess_refusal(
+    e: EvalError,
+    register_loss: &RegisterLoss,
+    snapshot: &Snapshot,
+    value: &OwnedValue,
+    step: Option<NavKind>,
+) -> EvalError {
+    guess_refusal_of(
+        e,
+        register_loss,
+        !matches!(snapshot, Snapshot::No),
+        value,
+        step,
+    )
+}
+
+/// [`guess_refusal`] for a refused value whose frozen-ness is known
+/// directly rather than through a [`Snapshot`] -- a destructuring walk's
+/// source, evaluated by value (#3267).
+fn guess_refusal_of(
+    e: EvalError,
+    register_loss: &RegisterLoss,
+    frozen: bool,
+    value: &OwnedValue,
+    step: Option<NavKind>,
+) -> EvalError {
+    if step.is_some_and(|step| step.would_succeed_on(value))
+        && could_be_lost_register(register_loss, frozen, value)
+    {
+        e.into_guessed_path_refusal()
+    } else {
+        e
+    }
+}
+
+/// Whether jq could be holding `value` as a path register this resolver
+/// lost (#3267) -- [`guess_refusal`]'s test.
+///
+/// Only two kinds of value can be jq's register at all once it is not
+/// known: a frozen snapshot (a `$var`, or a `getpath`/fold position -- a
+/// value jq still holds by the very pointer it was bound from), and `null`,
+/// which `jv_identical` compares by kind. A computed string, number or
+/// container never can: jq compares those by pointer or raw
+/// representation, which a computation never reproduces. A boolean is
+/// identical by kind too, but navigating one raises in jq whether or not it
+/// is the register, so its refusal is exact either way.
+///
+/// Where the loss is known ([`RegisterLoss::LostAt`]), jq's register is
+/// that value or one inside it, so a candidate must equal one of those
+/// nodes: `$x` frozen from the root cannot be a register lost at `.a`
+/// (`.a | has("b") | try ($x | .k)` is caught in both tools), and a `null`
+/// can only be one where the lost value holds a `null`. Equality rather than
+/// storage identity, so the test only ever errs toward calling a refusal a
+/// guess -- the loud direction.
+fn could_be_lost_register(register_loss: &RegisterLoss, frozen: bool, value: &OwnedValue) -> bool {
+    let candidate = frozen || matches!(value, OwnedValue::Null);
+    match register_loss {
+        RegisterLoss::Kept => false,
+        RegisterLoss::LostSomewhere => candidate,
+        RegisterLoss::LostAt(register) => candidate && holds_node_equal_to(register, value),
+    }
+}
+
+/// Whether `tree` is, or holds anywhere inside it, a value equal to `node`.
+/// Bounded by `MAX_VALUE_TREE_DEPTH` like every other walk over a built
+/// value, and only reached on a refusal.
+fn holds_node_equal_to(tree: &OwnedValue, node: &OwnedValue) -> bool {
+    tree == node
+        || tree
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| holds_node_equal_to(item, node)))
+        || tree
+            .as_object()
+            .is_some_and(|map| map.values().any(|item| holds_node_equal_to(item, node)))
+}
+
+/// [`guess_refusal`] over one [`EvalEscape`].
+fn guess_escape(
+    escape: EvalEscape,
+    register_loss: &RegisterLoss,
+    snapshot: &Snapshot,
+    value: &OwnedValue,
+    step: Option<NavKind>,
+) -> EvalEscape {
+    match escape {
+        EvalEscape::Error(e) => {
+            EvalEscape::Error(guess_refusal(e, register_loss, snapshot, value, step))
+        }
+        other => other,
+    }
+}
+
+/// [`guess_refusal`] over an escaped [`ResolveFlow`] -- for the static
+/// navigation tails, whose refusal is always of the tail's own input.
+fn guess_refusal_flow(
+    flow: ResolveFlow,
+    register_loss: &RegisterLoss,
+    snapshot: &Snapshot,
+    value: &OwnedValue,
+    step: Option<NavKind>,
+) -> ResolveFlow {
+    match flow {
+        ResolveFlow::Escaped(EvalEscape::Error(e)) => ResolveFlow::Escaped(EvalEscape::Error(
+            guess_refusal(e, register_loss, snapshot, value, step),
+        )),
+        other => other,
+    }
 }
 
 /// Whether an escape out of one `?//` alternative's body retries the next
@@ -40263,10 +40555,13 @@ fn resolve_target_for_pair<'a, S: EvalSemantics>(
     target: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
+    snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
 ) -> (Vec<PathBranch<'a>>, Option<EvalEscape>) {
-    match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
+    // #3267: `value`'s own snapshot, so a refusal of it is judged a guess
+    // or not on the value it really is.
+    match resolve_node::<S>(target, value, trackable, snapshot, frame, keep) {
         Ok(branches) => (branches, None),
         Err((prefix, e)) => (prefix, Some(e)),
     }
@@ -40347,6 +40642,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
@@ -40476,12 +40772,19 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
         if first_key {
             first_key = false;
             if !trackable && is_passthrough_target(target) {
-                escape!(EvalError::invalid_path_expression_near_access(&k, value).into());
+                escape!(guess_refusal(
+                    EvalError::invalid_path_expression_near_access(&k, value),
+                    &frame.register_loss,
+                    snapshot,
+                    value,
+                    NavKind::of(&k),
+                )
+                .into());
             }
         }
         let k = &k;
         let (branches, this_escape) =
-            resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
+            resolve_target_for_pair::<S>(target, value, trackable, snapshot, frame, keep);
 
         // No per-key reservation here any more (#2267 step 3). A streaming
         // resolver has no accumulator of its own to reserve into -- that is
@@ -40509,6 +40812,7 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             path: components,
             value: target_value,
             trackable: branch_trackable,
+            snapshot: branch_snapshot,
             ..
         } in &branches
         {
@@ -40528,7 +40832,14 @@ fn resolve_index_expr_sink<'a, S: EvalSemantics>(
             if let Some(control) =
                 untrackable_branch_escape(trackable, *branch_trackable, k, target_value)
             {
-                escape!(control);
+                // #3267: of this branch's own value.
+                escape!(guess_escape(
+                    control,
+                    &frame.register_loss,
+                    branch_snapshot,
+                    target_value,
+                    NavKind::of(k),
+                ));
             }
             // A NaN key names no element for a write to land on, so `?` does not
             // save it — but only where a number addresses an element at all. On
@@ -40665,6 +40976,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
@@ -40828,7 +41140,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
         // that used to sit alongside it is gone; nothing accumulates in
         // either resolver any more.
         let (branches, this_escape) =
-            resolve_target_for_pair::<S>(target, value, trackable, frame, keep);
+            resolve_target_for_pair::<S>(target, value, trackable, snapshot, frame, keep);
         // #2546: rendered from the bounds' own values, not from a
         // resolved `Expr::Slice` -- a bound whose classification failed
         // has no integer to build one from, and jq still names it here
@@ -40836,7 +41148,14 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
         let descriptor =
             || slice::literal_component_from_values(s.component_value(), e.component_value());
         if target_is_passthrough {
-            escape!(EvalError::invalid_path_expression_near_access(&descriptor(), value).into());
+            escape!(guess_refusal(
+                EvalError::invalid_path_expression_near_access(&descriptor(), value),
+                &frame.register_loss,
+                snapshot,
+                value,
+                Some(NavKind::Slice),
+            )
+            .into());
         }
         // Keeps `target`'s own partial prefix, not just discarding it
         // via `?`, the same fix #896's review applied to
@@ -40854,6 +41173,7 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
             path: components,
             value: target_value,
             trackable: branch_trackable,
+            snapshot: branch_snapshot,
             ..
         } in &branches
         {
@@ -40878,7 +41198,14 @@ fn resolve_slice_expr_sink<'a, S: EvalSemantics>(
             if let Some(control) =
                 untrackable_branch_escape(trackable, *branch_trackable, &descriptor(), target_value)
             {
-                escape!(control);
+                // #3267: of this branch's own value.
+                escape!(guess_escape(
+                    control,
+                    &frame.register_loss,
+                    branch_snapshot,
+                    target_value,
+                    Some(NavKind::Slice),
+                ));
             }
             // #2546: the bounds are ruled on against this branch's own
             // target kind, jq's `INDEX` order (`resolve_computed_slice_bounds`
@@ -42048,7 +42375,19 @@ fn resolve_seq_from_seed<'a, S: EvalSemantics>(
             // fabricated `null` one; see `value_after_components`'s own
             // doc comment for why zero can only mean that here.
             Ok(None) => return ResolveFlow::Exhausted,
-            Err((_, e)) => return ResolveFlow::Escaped(e),
+            // #3267: as `resolve_seq_stage`'s own static tail.
+            Err((_, e)) => {
+                return guess_refusal_flow(
+                    ResolveFlow::Escaped(e),
+                    &frame.register_loss,
+                    &seed.snapshot,
+                    &seed.value,
+                    flat.first()
+                        .and_then(navigation_element)
+                        .as_ref()
+                        .and_then(NavKind::of),
+                );
+            }
         };
         // `resolve_static_tail` above already raised for an untracked
         // value, so this is `true` in practice — carried rather than
@@ -42137,13 +42476,33 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     if stage_index > last_dynamic {
-        return match apply_static_tail_one::<S>(branch, &flat[last_dynamic + 1..]) {
+        // #3267: the static tail is navigation this pipe's stages never
+        // see, so a guessed refusal of `branch` has to be made uncatchable
+        // here rather than by the per-stage check below.
+        // Kept only when a refusal could be a guess: the tail runs on every
+        // branch, and nearly all of them have not lost a register.
+        let refused = (frame.register_loss.is_lost() && !branch.trackable)
+            .then(|| (branch.snapshot.clone(), branch.value.clone()));
+        let flow = match apply_static_tail_one::<S>(branch, &flat[last_dynamic + 1..]) {
             Ok(Some(b)) => match sink(b) {
                 Demand::Continue => ResolveFlow::Exhausted,
                 Demand::Stop => ResolveFlow::Stopped,
             },
             Ok(None) => ResolveFlow::Exhausted,
             Err(e) => ResolveFlow::Escaped(e),
+        };
+        return match refused {
+            Some((snapshot, value)) => guess_refusal_flow(
+                flow,
+                &frame.register_loss,
+                &snapshot,
+                &value,
+                flat.get(last_dynamic + 1)
+                    .and_then(navigation_element)
+                    .as_ref()
+                    .and_then(NavKind::of),
+            ),
+            None => flow,
         };
     }
 
@@ -42294,21 +42653,53 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
         };
         let trackable =
             reestablished || ((branch_trackable || step_may_reestablish) && step_trackable);
+        // #3267: read before `step_register` moves into `carry_register`.
+        // The value is kept only when this step may be about to lose it; a
+        // clone of an `Rc`-shared container is a refcount bump (#2999).
+        let register_was_live = branch_trackable || register_entering.is_some();
+        let register_entering_value = (S::TAG == EvalTag::Jq
+            && !facts.navigated
+            && !reestablished
+            && !frame.register_loss.is_lost())
+        .then(|| register_entering.map(|v| Rc::new(v.clone())))
+        .flatten();
+        // A trackable branch is its own register (`with_register`'s
+        // invariant); only an untracked one carries the live register
+        // forward.
+        let register = if trackable {
+            None
+        } else {
+            carry_register(
+                &facts,
+                reestablished,
+                trackable_step_eligible,
+                &carried_register,
+                step_register,
+            )
+        };
+        // #3267: a live register that does not come out of a stage that did
+        // not navigate is *lost*, not moved -- jq may still hold it where it
+        // was -- and stays lost for the rest of this branch. Whether the
+        // stage was one this resolver cannot see inside
+        // (`!stage_preserves_register`) or a route that simply hands back
+        // no register (a `reduce` stage), the refusal it leads to is a
+        // guess either way. A trackable branch is its own register, known
+        // again.
+        let register_loss = if trackable {
+            RegisterLoss::Kept
+        } else if frame.register_loss.is_lost() {
+            frame.register_loss.clone()
+        } else if S::TAG == EvalTag::Jq
+            && !facts.navigated
+            && register.is_none()
+            && register_was_live
+        {
+            register_entering_value.map_or(RegisterLoss::LostSomewhere, RegisterLoss::LostAt)
+        } else {
+            RegisterLoss::Kept
+        };
         let placed = PathBranch {
-            // A trackable branch is its own register (`with_register`'s
-            // invariant); only an untracked one carries the live register
-            // forward.
-            register: if trackable {
-                None
-            } else {
-                carry_register(
-                    &facts,
-                    reestablished,
-                    trackable_step_eligible,
-                    &carried_register,
-                    step_register,
-                )
-            },
+            register,
             path,
             value: resulting,
             // Untracked is absorbing: nothing downstream can
@@ -42348,7 +42739,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             last_dynamic,
             stage_index + 1,
             placed,
-            frame,
+            &frame.with_register_loss(register_loss),
             keep,
             sink,
         ) {

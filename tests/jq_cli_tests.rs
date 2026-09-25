@@ -68312,3 +68312,169 @@ fn test_write_through_root_snapshot_after_subexp_stage_under_try_3186() -> Resul
     );
     Ok(())
 }
+
+/// #3267: inside `path()`/`del()`/assignment, a stage this resolver cannot
+/// see inside (`has`, `test`, a `reduce`, a `def` call, `//`, an array) loses
+/// jq's path register, and a later `$x` frozen from it can no longer
+/// re-establish -- a refusal where jq may well answer. Under `try`/`?` that
+/// refusal used to be caught as though jq had raised it, so the write
+/// vanished: every row below returned the document unchanged at exit 0,
+/// where jq 1.7.1 writes. A refusal of a value that could have been the
+/// register (a frozen `$x`, or `null`) after the register was lost is now
+/// uncatchable -- by the `try` beside it, by any `try` further out, and by a
+/// value-position `?` around the whole `del` -- so each is a loud exit 5
+/// instead (ADR-0018 rule 4).
+#[test]
+fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
+    for filter in [
+        r#"del(. as $x | has("a") | try ($x | .a))"#,
+        r#"del(. as $x | ("a"|test("a")) | try ($x | .a))"#,
+        r#"del(. as $x | has("a") | ($x | .a)?)"#,
+        r#"del(. as $x | has("a") | ($x.a)?)"#,
+        r#"del(. as $x | has("a") | try $x["a"])"#,
+        r#"del(. as $x | has("a") | try ($x | .[]))"#,
+        r#"del(. as $x | has("a") | "a" as $k | try ($x | .[$k]))"#,
+        r#"del(. as $x | has("a") | 0 as $i | try ($x | .l[$i:1]))"#,
+        r#"del(. as $x | has("a") | try ($x as {a:$q} | $q))"#,
+        r#"del(. as $x | has("a") | try ($x | .a) catch empty)"#,
+        r#"del(. as $x | has("a") | $x | try .a)"#,
+        r#"del(. as $x | has("a") | label $out | try ($x | .a))"#,
+        // The loss happens *inside* the `try`: its own frame predates it.
+        r#"del(try (. as $x | has("a") | $x | .a))"#,
+        r#"del((. as $x | has("a") | $x | .a)?)"#,
+        // And a value-position `?` around the whole write catches nothing.
+        r#"[del(. as $x | has("a") | try ($x | .a))?]"#,
+        r"del(. as $x | reduce (1) as $i (.; 5) | try ($x | .k))",
+        r"del(. as $x | foreach (1) as $i (.; 5) | try ($x | .k))",
+        r"del(. as $x | (.zz // 5) | try ($x | .k))",
+        r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
+        r"del(. as $x | (def f: 5; f) | try ($x | .k))",
+        r"del(. as $x | [.a] | try ($x | .a))",
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+        assert!(stdout.is_empty(), "{filter}: stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+
+    // Controls: a refusal jq raises too stays catchable, exactly as in jq
+    // 1.7.1 -- decided by the value actually refused, not by what the `try`
+    // was handed. A computed `5`, string, empty array or boolean can never
+    // be the register, even inside a `try` whose input is `$x` or after the
+    // register was lost; after `.a` the register provably moved.
+    for (filter, expected) in [
+        (
+            r#"del(. as $x | has("a") | try (5 | .a))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try (.a))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | $x | try (5 | .a))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | $x | (5 | .a)?)"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | $x | try ("s" | .a))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r"del(. as $x | [.a] | $x | try ([] | .[0]))",
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try (5 | .[]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ($x | if true then 5 | .a else . end))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ($x | reduce (1) as $i (5; .a)))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r"del(. as $x | .a | try ($x | .k))",
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r"del(.a | ascii_downcase? | try .x)",
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (r"del(.[] | try (.b))", r#"{"a":{},"k":1}"#),
+        // Where the register was lost is known, so a `$x` or `null` that is
+        // not that value or inside it cannot be it: jq's refusal is exact.
+        (
+            r#"del(. as $x | .a | has("b") | try ($x | .k))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(.a.zz as $x | has("a") | try ($x | .q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(.a | has("b") | try (null | .x))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (r"[path(.arr[0:1]? as $v0 | (abs?) | ($v0 | .b?)?)]", "[]"),
+        (
+            r#"del(. as $x | has("a") | "a" as $k | try (5 | .[$k]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ({"z":1} as {a:$q} | $q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        // A step jq fails with a type error wherever its register is -- an
+        // object indexed by a number, iterating `null`, an array pattern
+        // over an object -- is refused exactly, so caught as in jq.
+        (
+            r#"del(. as $x | has("a") | try ($x | .[0]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | 0 as $i | try ($x | .[$i]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try (null | .[]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ($x as [$q] | $q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        // #3186's subexp stage keeps the register, so there is nothing to
+        // guess: `$x` re-establishes and the path is jq's.
+        (r"[path(. as $x | { k: .a } | try ($x | .a))]", r#"[["a"]]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
+    // The recorded price (docs/compliance/jq/limitations.md, #3267): a value
+    // at or inside the lost register that jq's register did *not* land on --
+    // its refusal is exact and caught in jq 1.7.1, which prints the document
+    // unchanged -- but this resolver cannot tell the stage that left the
+    // register alone (`has`) from one that moved it there (`first(.a)`), so
+    // it refuses loudly rather than risk the silent loss above.
+    for filter in [
+        r"del(. as $x | (def f: .a; f) | try ($x | .k))",
+        r#"del(.a as $y | has("z") | try ($y | .b))"#,
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+    }
+    Ok(())
+}
