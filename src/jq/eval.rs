@@ -4818,11 +4818,25 @@ where
             };
             match push_owned_values::<_, S>(body(o.clone(), i), &mut out) {
                 Some(control) => stop_with_escape(&mut escape, control),
-                None => Demand::Continue,
+                // #2952: also supersedes any `escape` an *earlier* call to
+                // this same closure (a retried-past `?//` alternative, via
+                // `inner`) already stashed -- see `fanout_arg_each_inner`'s
+                // identical fix.
+                None => {
+                    escape = None;
+                    Demand::Continue
+                }
             }
         });
         match inner_flow {
-            Flow::Exhausted => Demand::Continue,
+            // #2952: same supersession as above -- a clean `inner_flow` for
+            // *this* outer item means any `escape` still sitting from a
+            // `?//` this outer item's own generator (`outer`) already
+            // retried past is stale.
+            Flow::Exhausted => {
+                escape = None;
+                Demand::Continue
+            }
             // `body` already recorded its own control above.
             Flow::Stopped { .. } => Demand::Stop,
             // The inner generator's own control unwinds the outer loop too.

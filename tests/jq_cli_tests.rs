@@ -67394,18 +67394,18 @@ fn test_skip_count_binding_retries_past_a_body_error_2952() -> Result<()> {
         // own `error("BODY")` is ever reached.
         (
             r#"[limit(2;skip((1 as $x ?// $y | 0);10,error("BODY")))]"#,
-            r#"[10,10]"#,
+            r"[10,10]",
         ),
         // A destructuring `?//` count source, same shape.
         (
             r#"[limit(2;skip(([1] as [$a] ?// [$b,$c] | 0);10,error("BODY")))]"#,
-            r#"[10,10]"#,
+            r"[10,10]",
         ),
         // Three-alternative chain: the first two both fail; only the third
         // (last) is where `limit`'s demand is met, and no error escapes.
         (
             r#"[limit(3;skip((1 as $x ?// $y ?// $z | 0);10,error("BODY")))]"#,
-            r#"[10,10,10]"#,
+            r"[10,10,10]",
         ),
     ] {
         let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
@@ -67438,6 +67438,43 @@ fn test_skip_count_binding_retries_past_a_body_error_2952() -> Result<()> {
     assert_eq!(out.trim_end(), "", "stderr: {err}");
     assert_eq!(code, 5);
     assert!(err.contains("ONLY_ONE"), "stderr: {err}");
+    Ok(())
+}
+
+/// #2952 code review: the fix's other two reachable sites, unguarded by
+/// [`test_skip_count_binding_retries_past_a_body_error_2952`] above, which
+/// only exercises `fanout_arg_each`/`fanout_arg_each_generic` via `skip`'s
+/// count binding.
+///
+/// - A plain `EXPR as $v | BODY` bind (`Expr::As`, not `Expr::AsPattern`)
+///   fans out through `fanout_arg_each_with_origin`/
+///   `fanout_arg_each_generic_with_origin` -- the far more common binding
+///   path than `skip`'s own count argument -- and shares the identical
+///   stale-`escape` shape this issue fixed.
+/// - `fanout_two_args_lazy` (`ArgFanout::All`, e.g. `pow`/`atan2`/`setpath`)
+///   has its own independent `escape` variable with the same shape, missed
+///   by this PR's first pass and confirmed live in review.
+///
+/// Both rows verified live against jq 1.7.1.
+#[test]
+fn test_as_binding_and_two_arg_builtins_retry_past_a_body_error_2952() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-cn",
+            r#"[limit(2;(1 as $x ?// $y | 0) as $n | $n, error("BODY"))]"#,
+        ],
+        None,
+    )?;
+    assert_eq!((out.trim_end(), code), ("[0,0]", 0), "stderr: {err:?}");
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-n",
+            r#"pow(3, (if input == 1 then error("E") else empty end); (1 as $x ?// $y | 2))"#,
+        ],
+        Some("1\n2\n"),
+    )?;
+    assert_eq!((out.as_str(), code), ("9\n9\n", 0), "stderr: {err:?}");
     Ok(())
 }
 
