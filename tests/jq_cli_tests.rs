@@ -68230,16 +68230,18 @@ fn test_tracked_array_accepting_controls_3049() -> Result<()> {
     Ok(())
 }
 
-/// #2764 is a separate optional-navigation limitation, verified unchanged
-/// before and after #3049. Update this characterization when #2764 is fixed.
+/// A postfix `.[]?` inside an array is jq's `EACH_OPT`, whose `?` does not
+/// catch the path error an untracked `5` raises. This was accepted here,
+/// unchanged by #3049, until #2764 let the `[E]` arm resolve a `?` live.
 #[test]
-fn test_tracked_array_optional_navigation_characterize_preexisting_bug_3049() -> Result<()> {
+fn test_tracked_array_optional_navigation_refuses_as_jq_2764() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "path([5 | .[]?] | empty)"], Some("null"))?;
-    assert_eq!(
-        code, 0,
-        "#2764 fix should update this characterization: {stderr:?}"
-    );
+    assert_eq!(code, 5, "{stderr:?}");
     assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): Invalid path expression near attempt to iterate through 5\n"
+    );
     Ok(())
 }
 
@@ -68349,7 +68351,6 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r"del(. as $x | (.zz // 5) | try ($x | .k))",
         r"del(. as $x | if .k then 5 else .a end | try ($x | .k))",
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
-        r"del(. as $x | [.a?] | try ($x | .a))",
     ] {
         let (stdout, stderr, code) =
             run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
@@ -68569,4 +68570,146 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---- #2764: untracked-input `path()` arms refuse only where jq does ----
+
+/// The document every #2764 row below runs against. `.a.b.b` is `null`, so
+/// `recurse(.b; . != null)` terminates, and `.c` is a number for the
+/// arithmetic recursions to start from.
+const DOC_2764: &str = "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n";
+
+/// Runs each `(filter, stdout, stderr, exit code)` row against [`DOC_2764`];
+/// every expectation was captured from `/usr/bin/jq` 1.7.1.
+fn assert_rows_2764(rows: &[(&str, &str, &str, i32)]) -> Result<()> {
+    for &(filter, stdout, stderr, code) in rows {
+        let (out, err, got) = run_jq_full(&["-c", filter], Some(DOC_2764))?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), got),
+            (stdout, stderr, code),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// #2764 (b): `recurse(f)`/`recurse(f; cond)` on an untracked input deliver
+/// the seed as a passthrough and refuse only when `f` navigates -- catchably
+/// -- instead of refusing on sight. `recurse(empty)`, `recurse(.+1; .<3)` and
+/// a caught recursion are accepted, and a non-navigating `f` (and `empty`)
+/// leaves jq's register where it was for a later `$x`.
+#[test]
+fn test_recurse_f_untracked_defers_to_navigation_2764() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(1 | recurse(empty) | empty)", "", "", 0),
+        (r"path(1 | recurse(empty))", "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r"path(1 | recurse(.+1; .<3) | empty)", "", "", 0),
+        (r"path(1 | recurse(.+1; .<3))", "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r"path(1 | recurse(.; false) | empty)", "", "", 0),
+        (r"path(1 | recurse(.[]) | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | recurse(.[]?) | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | recurse(.a; false) | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | recurse(.a; true) | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | first(recurse(.[])))", "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r"path(1 | first(recurse(.a)) | empty)", "", "", 0),
+        (r"path(1 | limit(2; recurse(.+1)) | empty)", "", "", 0),
+        (r"path(1 | try recurse(.[]) | empty)", "", "", 0),
+        (r"path(1 | (recurse(.[]))? | empty)", "", "", 0),
+        (r"path(1 | try recurse(.a) catch .)", "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r#"path(1 | recurse(error("x")) | empty)"#, "", "jq: error (at <stdin>:1): x\n", 5),
+        (r#"path(1 | try recurse(error("x")) catch .)"#, "", "jq: error (at <stdin>:1): Invalid path expression with result 1\n", 5),
+        (r"path(null | recurse(.a) | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of null\n", 5),
+        (r"path(1 | (recurse(.a) | empty), .b)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | 1 | recurse(empty) | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | recurse(.+1; .<3) | $x)", "[]\n[]\n", "", 0),
+        (r"path(.a as $y | .a | 5 | recurse(.+1; . < 7) | $y)", "[\"a\"]\n[\"a\"]\n", "", 0),
+        (r"path(. as $x | [empty] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | .c | recurse(.+1; .<4) | $x)", "", "jq: error (at <stdin>:1): Invalid path expression with result {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"del(1 | recurse(empty) | empty)", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+        (r"del(. as $x | 1 | recurse(.+1; .<3) | $x | .a)", "{\"c\":2}\n", "", 0),
+        (r"(. as $x | .c | recurse(.+1; .<4) | $x | .c) |= . + 1", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"c\" of {\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", 5),
+        (r"(.a | 1 | recurse(empty) | empty) |= 5", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+    ])
+}
+
+/// #2764 (c): `(E)?` is jq's `try E`, which catches the path error an
+/// untracked input raises; postfix `.a?`/`.[]?` is `INDEX_OPT`/`EACH_OPT`,
+/// which does not. The flatten that distributes a group's `?` used to turn
+/// the former into the latter.
+#[test]
+fn test_try_scoped_optional_catches_untracked_path_error_2764() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(1 | (.a)? | empty)", "", "", 0),
+        (r"path(1 | (.a)?)", "", "", 0),
+        (r"path(1 | .a? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | (.[])? | empty)", "", "", 0),
+        (r"path(1 | .[]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | (.[0])? | empty)", "", "", 0),
+        (r"path(1 | .[0]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element 0 of 1\n", 5),
+        (r#"path(1 | (.["a"])? | empty)"#, "", "", 0),
+        (r#"path(1 | .["a"]? | empty)"#, "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | (.[1:])? | empty)", "", "", 0),
+        (r"path(1 | .[1:]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element {\"start\":1,... of 1\n", 5),
+        (r"path(1 | (.a.b)? | empty)", "", "", 0),
+        (r"path(1 | (.a | .b)? | empty)", "", "", 0),
+        (r"path(1 | ((.a))? | empty)", "", "", 0),
+        (r"path(1 | (. | .a)? | empty)", "", "", 0),
+        (r"path(1 | .x.a? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"x\" of 1\n", 5),
+        (r"path(.a | (.b)?)", "[\"a\",\"b\"]\n", "", 0),
+        (r"path(.c | (.a)?)", "", "", 0),
+        (r"path(.c | .a?)", "", "", 0),
+        (r"path(. as $x | 1 | (.a)? | $x)", "", "", 0),
+        (r"path(. as $x | 1 | .a? | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"del(1 | (.a)? | empty)", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+        (r"del((.a), (1 | (.b)?))", "{\"c\":2}\n", "", 0),
+        (r"(.a, (1 | (.b)?)) |= 5", "{\"a\":5,\"c\":2}\n", "", 0),
+        (r"del(.[] | (.b)?)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"del(.[] | .b?)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r#"path(.. | .[error("boom")]?)"#, "", "jq: error (at <stdin>:1): boom\n", 5),
+        (r#"path(1 | .[error("boom")]?)"#, "", "jq: error (at <stdin>:1): boom\n", 5),
+        (r#"path(1 | (.[error("boom")])?)"#, "", "", 0),
+        (r"path(1 | .[.a]? | empty)", "", "jq: error (at <stdin>:1): Cannot index number with string \"a\"\n", 5),
+        (r"path(1 | (.[.a])? | empty)", "", "", 0),
+        (r"path(.a | .[.b:]?)", "", "", 0),
+    ])
+}
+
+/// #2764 / #2689: with (b) and (c) fixed, the `[...]` arm resolves `?` and
+/// parameterized recursion live, so `[.a?]`/`[.[]?]` refuse as jq does and
+/// an array of them carries the register to a later `$x`.
+#[test]
+fn test_array_admits_optional_and_recurse_2764() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(1 | [.a?] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | [.[]?] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | [.a?, 2] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | [(.a)?] | empty)", "", "", 0),
+        (r"path(1 | [(.[])?] | empty)", "", "", 0),
+        (r"path(1 | [recurse(empty)] | empty)", "", "", 0),
+        (r"path(1 | [recurse(.[])] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | try [.a?])", "", "", 0),
+        (r"path(. as $x | [.a?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [(.a)?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [(.a)?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [.a?] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(. as $x | [.[]?] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [recurse(.b; . != null)] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [1 | recurse(.+1; .<3)] | $x)", "[]\n", "", 0),
+        (r"del(. as $x | [.a?] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | 1 | [.a?] | $x | .c)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"del(. as $x | 1 | [(.a)?] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+        (r"del(. as $x | [.a?] | try ($x | .a))", "{\"c\":2}\n", "", 0),
+        (r"del(.a | [(.b)? | type] | select(false))", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+        // `try E` is the same jq program as `(E)?`; a handler runs live
+        // against the error message, where its own navigation raises.
+        (r"path(. as $x | [try .a] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | 1 | [try .a] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try (.a | .b)] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try .a catch .] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try .a catch .k] | $x)", "[]\n", "", 0),
+        (r"path(. as $x | [try (.c | .[0]) catch .] | $x)", "[]\n", "", 0),
+        (r"path(1 | [try .a catch .x] | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"x\" of \"Invalid path expression n...\n", 5),
+        (r"path(. as $x | [try error({}) catch .a] | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of {}\n", 5),
+        (r"del(. as $x | 1 | [try .a] | $x | .c)", "{\"a\":{\"b\":{\"b\":null}}}\n", "", 0),
+    ])
 }

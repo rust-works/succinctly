@@ -30438,6 +30438,32 @@ fn optional_group_is_scope_safe(inner: &Expr) -> bool {
     seen < 2 || safe
 }
 
+/// Whether `inner`, the operand of an [`Expr::Optional`], is one of the
+/// navigation steps the parser attaches a postfix `?` to directly --
+/// jq's `INDEX_OPT`/`EACH_OPT`, whose `?` covers indexing errors but not a
+/// path error (#2764), nor an error raised by a computed key
+/// (`.[error("x")]?` raises in jq). Every other operand is jq's `try`.
+/// `resolve_optional_sink` handles the computed `IndexExpr`/`SliceExpr`
+/// pair in their own arms, and the rest as its `bare_navigation_primitive`.
+fn is_postfix_optional_primitive(inner: &Expr) -> bool {
+    matches!(
+        inner,
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Iterate
+            | Expr::Slice { .. }
+            | Expr::IndexExpr { .. }
+            | Expr::SliceExpr { .. }
+    )
+}
+
+/// Whether a flattened path component is a `try`-scoped `?` step --
+/// `Optional(Paren(_))`, as [`push_path_components`] marks one (#2764) --
+/// whose path error on an untracked input jq catches rather than raises.
+fn is_try_scoped_component(component: &Expr) -> bool {
+    matches!(component, Expr::Optional(inner) if !is_postfix_optional_primitive(inner))
+}
+
 /// Flatten an expression into the list of path components it denotes.
 ///
 /// `Pipe` and `Paren` are transparent and `Identity` contributes nothing, so
@@ -30471,10 +30497,26 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         // abort scope by staying one opaque element, which
         // `needs_path_prepass`/`needs_fanout_pass` route to
         // `resolve_optional_sink` -- the arm that was already right.
+        //
+        // #2764: the distributed `?` keeps which of jq's two `?`s it was. A
+        // postfix `?` on a navigation primitive (`.a?`, `.[]?`, `.[0]?`) is
+        // jq's `INDEX_OPT`/`EACH_OPT`, which does not catch a path error;
+        // `?` on anything else (`(.a)?`, `(.a | .b)?`) is `try`, which does.
+        // The parser keeps the two apart (`Optional(Field)` vs
+        // `Optional(Paren(Field))`), so a `try` group's components are
+        // re-wrapped as `Optional(Paren(e))` to carry that across the
+        // flatten; see [`is_try_scoped_component`].
         Expr::Optional(inner) if optional_group_is_scope_safe(inner) => {
             let mut group = Vec::new();
             push_path_components(&mut group, inner);
-            out.extend(group.into_iter().map(|e| Expr::Optional(Box::new(e))));
+            let try_scoped = !is_postfix_optional_primitive(inner);
+            out.extend(group.into_iter().map(|e| {
+                Expr::Optional(Box::new(if try_scoped && !matches!(e, Expr::Paren(_)) {
+                    Expr::Paren(Box::new(e))
+                } else {
+                    e
+                }))
+            }));
         }
         other => out.push(other.clone()),
     }
@@ -33195,11 +33237,18 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 ),
             }
         }
-        // Parameterized recursion (and every yq-mode recurse spelling)
-        // retains the eager guard introduced by #843 and shared in #2696.
-        // Its deferred-navigation gap is tracked in #2764: an arbitrary
-        // `f` may navigate differently or not at all. Bare jq recursion is
-        // handled above (#2761), where the next operation is always `.[]?`.
+        // yq mode retains the eager guard introduced by #843 and shared in
+        // #2696 for every recurse spelling: real yq's lexer rejects
+        // `recurse(f)`, so there is no oracle for a deferred shape, and
+        // yq's scalar-write no-op convention would turn a wrong acceptance
+        // into silent corruption rather than a loud error. Bare jq
+        // recursion is handled above (#2761); parameterized jq recursion
+        // (#2764) falls through to `resolve_recurse_sink`, whose walk
+        // delivers the untracked seed as a passthrough (refused only by a
+        // terminal that reaches it) and resolves `f` against it untracked,
+        // so a navigating `f` raises jq's catchable "near attempt" error
+        // and a non-navigating one (`recurse(empty)`, `recurse(.+1; .<3)`)
+        // navigates nothing -- as jq's `def r: ., (f | r)` does.
         //
         // `&& !snapshot` (#1591): a deferred `$x` snapshot must still reach
         // the walks below (which then correctly emit *self* with the mark
@@ -33211,7 +33260,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             | Builtin::RecurseDown
             | Builtin::RecurseF(_)
             | Builtin::RecurseCond(_, _),
-        ) if !trackable && !snapshot.is_marked() => {
+        ) if S::TAG != EvalTag::Jq && !trackable && !snapshot.is_marked() => {
             ResolveFlow::Escaped(recurse_untracked_error(value).1)
         }
         // `..`/bare `recurse`/`recurse_down` (#2696, following #2235's
@@ -33712,18 +33761,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         //   nor `getpath_result_position` has anything to work from and the
         //   bracket would refuse where jq accepts -- the same shape as
         //   `TrackedVar` above, and the same #2759/#2764 bracket.
-        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2764.
-        // - `RecurseF`/`RecurseCond`: the shared `recurse_untracked_error`
-        //   guard refuses eagerly whether or not
-        //   `f` navigates -- `recurse(empty)`, `recurse(.+1; .<3)` and a
-        //   caught parameterized recursions are accepted by jq. #2764.
-        //   Bare recursion now defers its navigation error (#2761) and is
-        //   safe to resolve inside brackets.
-        // - `Optional`: the parser erases the parentheses in `(.a)?`, which
-        //   is jq's `try .a` (a *caught* path error), into `.a?`, which is
-        //   jq's `INDEX_OPT` (an uncaught one). Bare `[.a?]` happens to agree
-        //   with jq either way, but `[(.a)? | f]` does not, and this function
-        //   cannot tell the two spellings apart. #2764.
+        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2759.
+        //
+        // The recurse family and `Optional` were excluded here too until
+        // #2764 made each defer its refusal the way jq does: parameterized
+        // recursion resolves `f` against an untracked seed instead of
+        // refusing on sight, and a `try`-scoped `(E)?` keeps its catching
+        // `?` through `push_path_components`'s flatten rather than turning
+        // into the non-catching postfix `E?`.
         //
         // The scan is O(|inner|), the same order as resolving it.
         Expr::Array(inner) if array_resolves_live::<S>(inner, trackable) => {
@@ -34451,7 +34496,7 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
             *end,
             end_key.as_ref(),
         )),
-        Expr::Optional(inner) => navigation_element(inner),
+        Expr::Optional(inner) | Expr::Paren(inner) => navigation_element(inner),
         _ => None,
     }
 }
@@ -34548,10 +34593,10 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
     }
 }
 
-/// The remaining eager recursion guard's terminal error (#843).
-/// Parameterized jq recursion and yq retain it; bare jq recursion instead
-/// delivers its seed before reporting navigation in `resolve_node_sink`
-/// (#2761). The remaining deferred-navigation gap is tracked in #2764.
+/// The remaining eager recursion guard's terminal error (#843), now yq mode
+/// only. Bare jq recursion delivers its seed before reporting navigation in
+/// `resolve_node_sink` (#2761), and parameterized jq recursion resolves `f`
+/// against the untracked seed in `resolve_recurse_sink` (#2764).
 fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, EvalEscape) {
     (Vec::new(), EvalError::invalid_path_expression(value).into())
 }
@@ -35292,13 +35337,7 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
         && (!trackable || !cannot_move_register(inner))
         && !any_subexpr(inner, &mut |e| {
             (!trackable && matches!(e, Expr::TrackedVar(_)))
-                || matches!(
-                    e,
-                    Expr::Optional(_)
-                        | Expr::Builtin(
-                            Builtin::GetPath(_) | Builtin::RecurseF(_) | Builtin::RecurseCond(_, _)
-                        )
-                )
+                || matches!(e, Expr::Builtin(Builtin::GetPath(_)))
         })
 }
 
@@ -35329,7 +35368,27 @@ fn array_contents_are_checked(inner: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent => true,
         Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Paren(e) => array_contents_are_checked(e),
+        // #2764: the resolver resolves `f` live against every node, and
+        // `cond` runs as `select(cond)`'s condition, a subexp in jq.
+        Expr::Builtin(Builtin::RecurseF(f) | Builtin::RecurseCond(f, _)) => {
+            array_contents_are_checked(f)
+        }
+        // #2764: both of jq's `?`s -- `INDEX_OPT` on a primitive and `try`
+        // on anything else -- are resolved by `resolve_optional_sink`, which
+        // keeps them apart; the inside is checked exactly when it would be
+        // without the `?`.
+        Expr::Paren(e) | Expr::Optional(e) => array_contents_are_checked(e),
+        // #2764: `try E` is the same jq program as `(E)?`, so it is checked
+        // exactly when `E` is. A handler runs live against the error
+        // message, where its own navigation raises as in jq --
+        // `path(. as $x | [try .a catch .k] | $x)` is `[]` in jq 1.7.1.
+        Expr::Try { expr, catch } => {
+            array_contents_are_checked(expr)
+                && match catch {
+                    Some(handler) => array_contents_are_checked(handler),
+                    None => true,
+                }
+        }
         Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(array_contents_are_checked),
         Expr::If {
             then_branch,
@@ -35566,7 +35625,17 @@ fn cannot_move_register(expr: &Expr) -> bool {
             | Builtin::ToString
             | Builtin::ToNumber
             | Builtin::ToJson
-            | Builtin::FromJson => true,
+            | Builtin::FromJson
+            // #2764: produces nothing, so it navigates nothing --
+            // `path(. as $x | [empty] | $x)` is `[]` in jq 1.7.1.
+            | Builtin::Empty => true,
+            // #2764: jq's `def recurse(f): def r: ., (f | r); r;` moves the
+            // register only through `f`, and `recurse(f; cond)`'s `cond`
+            // runs as `select(cond)`'s `if` condition, a subexp. Live
+            // against jq 1.7.1 on `{}`, both `[]`: `path(. as $x | 1 |
+            // recurse(empty) | $x)` and `path(. as $x | 1 | recurse(.+1;
+            // .<3) | $x)` (`[]` twice).
+            Builtin::RecurseF(f) | Builtin::RecurseCond(f, _) => cannot_move_register(f),
             _ => false,
         },
 
@@ -40302,25 +40371,27 @@ fn resolve_recurse_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
-    // Every caller in `resolve_node_sink` already short-circuits on the
-    // shared recurse-family untracked guard before ever reaching here
-    // (#843's "recurse's first output is `.` itself" rule) — this loop
+    // In yq mode every caller in `resolve_node_sink` already short-circuits
+    // on the shared recurse-family untracked guard before ever reaching
+    // here (#843's "recurse's first output is `.` itself" rule) — this loop
     // should only ever run starting from a value already known-trackable,
     // *or* one the guard deliberately deferred because it's a frozen `$x`
     // snapshot (#1591 loosened the guard to `!trackable && !snapshot`,
     // specifically so this function's own seed can still emit *self* with
-    // the mark intact). `trackable`/`snapshot` are threaded as real
-    // parameters (not just documented as an invariant in prose)
+    // the mark intact). jq mode admits an untracked value too (#2764): its
+    // seed is a passthrough and `f` is resolved against it untracked, which
+    // is where jq's own refusal happens. `trackable`/`snapshot` are threaded
+    // as real parameters (not just documented as an invariant in prose)
     // specifically so this assertion can catch a future refactor of that
     // guard silently letting a value through that is neither, instead of
     // depending on every call site to keep re-deriving the same guarantee
     // (review finding on #843: an invariant that only lives in a comment is
     // one a later edit can quietly break).
     debug_assert!(
-        trackable || snapshot.is_marked(),
-        "resolve_recurse_sink called with trackable=false, snapshot=false; the \
-         untracked recurse-family guard in resolve_node_sink should have caught \
-         this first"
+        S::TAG == EvalTag::Jq || trackable || snapshot.is_marked(),
+        "resolve_recurse_sink called with trackable=false, snapshot=false in yq \
+         mode; the untracked recurse-family guard in resolve_node_sink should \
+         have caught this first"
     );
     // #2235: each node is delivered to `sink` as soon as it is popped, and
     // `f`/`cond` are resolved for a node only *after* that node's own
@@ -40493,13 +40564,11 @@ impl<'a, S: EvalSemantics> PathRecurseWalk<'_, 'a, '_, S> {
             path: Rc::clone(&node.path),
             value: node.value.clone(),
             register: None,
-            // Propagated rather than assumed `true`. The shared
-            // recurse-family guard means only a trackable value can enter
-            // this walk today, so this is `true` in practice — but carrying
-            // it keeps that a fact about the guard rather than a second
-            // place the invariant has to be independently maintained
-            // (#1023's `MAX_ITEMS` triplication is what the other way looks
-            // like). See #986's Stage 3 open risk.
+            // Propagated rather than assumed `true`: in jq mode an
+            // untracked seed enters this walk (#2764) and is delivered as
+            // the passthrough it is, for a terminal to refuse "with result"
+            // and a later `$x` to re-establish from. See #986's Stage 3
+            // open risk.
             trackable: node.trackable,
             // Carried, not assumed `false` (#1591): this is the value the
             // caller actually observes, so it is the one whose provenance a
@@ -42179,6 +42248,14 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     trackable: bool,
 ) -> Result<Option<OwnedValue>, (Vec<PathBranch<'a>>, EvalEscape)> {
     if !trackable {
+        // #2764: a `try`-scoped first step (`(.a)?`, flattened) catches the
+        // path error jq raises for it, pruning the branch -- the `Ok(None)`
+        // a `?`-suppressed step already means here. jq mode only: yq has no
+        // `try`, and its scalar-write no-op convention would turn a wrong
+        // acceptance into silent corruption.
+        if S::TAG == EvalTag::Jq && components.first().is_some_and(is_try_scoped_component) {
+            return Ok(None);
+        }
         let error = match components.first().and_then(navigation_element) {
             Some(element) => EvalError::invalid_path_expression_near_access(&element, value),
             None => EvalError::invalid_path_expression(value),
@@ -42876,8 +42953,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // re-establishment rather than something "untracked is absorbing" must
     // demote (#3120, generalised by #3133). From an untracked input, no route
     // can produce a trackable branch except by re-establishing against a
-    // register -- `resolve_leaf` hands back untracked branches, the recurse
-    // family refuses -- and the only register any nested route has is the
+    // register -- `resolve_leaf` and the recurse family (#2764) hand back
+    // untracked branches -- and the only register any nested route has is the
     // one this stage handed down (`stage_frame.register()`: the `AsPattern`
     // route's walk and seeded body, a pipe under `try`/`if`/`,`, a `catch`
     // handler). So when this stage carried one, the step's own verdict
@@ -43645,7 +43722,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     fn is_bare_iterate(expr: &Expr) -> bool {
         match expr {
             Expr::Iterate => true,
-            Expr::Optional(inner) => matches!(inner.as_ref(), Expr::Iterate),
+            Expr::Optional(_) => matches!(unwrap_path_component(expr).0, Expr::Iterate),
             _ => false,
         }
     }
@@ -43743,7 +43820,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
 /// `resolve_seq` rather than a computed key).
 fn strip_resolved_optional(component: Expr) -> Expr {
     match component {
-        Expr::Optional(inner) => strip_resolved_optional(*inner),
+        Expr::Optional(inner) | Expr::Paren(inner) => strip_resolved_optional(*inner),
         Expr::Pipe(exprs) => Expr::Pipe(exprs.into_iter().map(strip_resolved_optional).collect()),
         other => other,
     }
@@ -52008,7 +52085,7 @@ fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<(Vec<Expr>, bool)> {
     let last = flat.last()?;
     let trailing_optional = match last {
         Expr::Iterate => false,
-        Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Iterate) => true,
+        Expr::Optional(_) if matches!(unwrap_path_component(last).0, Expr::Iterate) => true,
         _ => return None,
     };
     let prefix = &flat[..flat.len() - 1];
@@ -86386,6 +86463,34 @@ mod tests {
         }
     }
 
+    /// #2764: jq mode defers this refusal (parameterized recursion now
+    /// resolves `f` against the untracked seed instead, see
+    /// `resolve_recurse_sink`'s own doc comment), but yq mode keeps #843's
+    /// eager guard for every `recurse` spelling — real yq's lexer rejects
+    /// `recurse(f)` outright, so there is no oracle for a deferred shape.
+    /// Mirrors `test_path_catch_handler_recursive_descent_raises_with_result_843`
+    /// above under `YqSemantics`.
+    #[test]
+    fn test_yq_path_catch_handler_recursive_descent_raises_with_result_843() {
+        for filter in [
+            r"path(try (.a, error([1,2,3])) catch ..)",
+            r"path(try (.a, error([1,2,3])) catch recurse)",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]))",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]; true))",
+        ] {
+            yq_query!(br#"{"a":10}"#, filter,
+                QueryResult::Partial(vs, Control::Error(e)) => {
+                    assert_eq!(prefix_json(&vs), [r#"["a"]"#], "{filter}");
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                    assert_eq!(
+                        e.message, "Invalid path expression with result [1,2,3]",
+                        "{filter}"
+                    );
+                }
+            );
+        }
+    }
+
     /// #843: a genuine navigation attempt against the untracked value still
     /// raises correctly when it is reached through `resolve_seq`'s
     /// dedicated static-chain fast path (`.a.b`, i.e. `Expr::Pipe([Field,
@@ -99988,9 +100093,12 @@ mod tests {
     /// A `def` and a call are excluded because resolving a call to its body
     /// is not something this predicate can do from a name. An array whose
     /// contents hold a shape the `[E]` arm still evaluates by value
-    /// (`getpath`, a postfix `?` -- see [`array_resolves_live`]) is excluded
-    /// too: its navigation is never checked, so it may not carry the
-    /// register. (`[.a]`, `{k:.a}` and `"\(.a)"` used to be listed here:
+    /// (`getpath` -- see [`array_resolves_live`]) is excluded too: its
+    /// navigation is never checked, so it may not carry the register.
+    /// (`[.a?]` was listed here until #2764 let the arm resolve a `?`
+    /// live; it moved to
+    /// `test_path_register_survives_an_array_resolved_live_3263`.
+    /// `[.a]`, `{k:.a}` and `"\(.a)"` used to be listed here:
     /// #3186 moved the two subexp shapes to
     /// `test_path_register_survives_subexp_stages_that_navigate_3186`, and
     /// #3263 the array, resolved live, to
@@ -100003,7 +100111,6 @@ mod tests {
         for filter in [
             r"path(. as $x | (def f: 5; f) | $x)",
             r#"path(. as $x | [.a | getpath(["b"])] | $x)"#,
-            r"path(. as $x | [.a?] | $x)",
         ] {
             query!(br#"{"a":{"b":1}}"#, filter,
                 QueryResult::Error(e) => {
@@ -100032,6 +100139,9 @@ mod tests {
             (r"path(. as $x | [.[.k | tostring]] | $x)", "[]"),
             (r"path(. as $x | [if .k then .a else .k end] | $x)", "[]"),
             (r"path(.a as $y | .a | [.b] | $y | .b)", r#"["a","b"]"#),
+            // #2764: a `?` inside, of either kind, is resolved live too.
+            (r"path(. as $x | [.a?] | $x)", "[]"),
+            (r"path(. as $x | [(.a)?] | $x)", "[]"),
         ] {
             assert_eq!(
                 outputs(br#"{"a":{"b":1},"k":1}"#, filter),
