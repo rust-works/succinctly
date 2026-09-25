@@ -38735,6 +38735,52 @@ fn test_jq_input_line_number_after_seq_slurp_dropped_trailing_record_1549() -> R
     Ok(())
 }
 
+/// #3202: `input_filename`'s own *value* -- like `input_line_number` (#1549)
+/// above -- must report real jq's own answer for "no position known" (`null`)
+/// for a dropped `--seq -s` trailing record, not the CLI driver's fallback
+/// name for the source index the record's row still occupies (`"<stdin>"`
+/// here, since `INPUT_NAMES[0] == None` reads as stdin when the line marker
+/// isn't checked first). `input_filename` and `input_line_number` share the
+/// identical `UNKNOWN_LINE`-tagged per-value row (`InputLocations::single`),
+/// so the same #1549 fix pattern applies. Verified live against jq 1.7.1:
+/// `null`, same input shape as #1549's own test.
+#[test]
+fn test_jq_input_filename_after_seq_slurp_dropped_trailing_record_3202() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "-c", "-s", "input_filename"],
+        Some("\x1e1\n\x1e{\"a\":1"),
+    )
+    .expect("input_filename after a dropped --seq -s trailing record still runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // `--seq` RS-prefixes output too (RFC 7464), not just input.
+    assert_eq!(stdout, "\x1enull\n", "{stderr}");
+
+    Ok(())
+}
+
+/// #3202 sibling: the `input` builtin's own EOF-lost read (#3201's deferred
+/// warning path, not this file's dropped-trailing-record one above) hits
+/// the identical bug through `remaining_inputs::current_location` instead
+/// of `CURRENT_SOURCE` -- `input_filename` after reading past a `--seq -s`
+/// stream whose position was lost mid-read must still answer `null`, not
+/// the stdin/file name the lost row's source index happens to occupy.
+/// Verified live against jq 1.7.1.
+#[test]
+fn test_jq_input_filename_after_input_builtin_loses_seq_slurp_position_3202() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "-c", "-s", "(try input catch .), input_filename"],
+        Some("\x1e1{"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    // `--seq` RS-prefixes output too (RFC 7464), not just input.
+    assert_eq!(
+        stdout, "\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #1550: #1542's drop check only ever inspected `raw_inputs.last()` -- the
 /// *physically* last file on the command line. Real jq's `-s` reader treats
 /// every file as one continuous byte stream, so a truncated record's own

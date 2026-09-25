@@ -4113,9 +4113,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             }
         } else {
             for (idx, input) in inputs.iter().enumerate() {
-                jq::cli_context::set_current_source(
-                    locations.per_value().get(idx).map(|&(source, _)| source),
-                );
+                // `UNKNOWN_LINE`, not just any missing entry, must clear the
+                // source too (#3202): `input_filename` can't otherwise tell
+                // "this value's file is genuinely stdin" apart from "no
+                // position at all" -- both read back as `INPUT_NAMES[0] ==
+                // None` once `InputLocations::single` has folded a lost
+                // slurp position (`--seq -s`) down to source index `0`
+                // unconditionally (#1542's own invariant, kept for
+                // `input`/`inputs`). Mirrors `remaining_inputs::last_line`'s
+                // own `UNKNOWN_LINE` check for `input_line_number` (#1549).
+                // `source_at` shares `resolve`'s own gate rather than
+                // re-deriving it here.
+                jq::cli_context::set_current_source(locations.source_at(idx));
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
                 let at = ErrorAt::Fixed(locations.get(idx));
@@ -5090,6 +5099,19 @@ impl InputLocations {
 
     fn per_value(&self) -> &[(u32, u32)] {
         &self.per_value
+    }
+
+    /// The value at `idx`'s own source index, gated the same way
+    /// [`resolve`](Self::resolve) gates it for the `(at <file>:<line>)`
+    /// marker: `None` when that row's line is [`UNKNOWN_LINE`] (#3202), not
+    /// just when `idx` is out of range. Shares `resolve`'s own
+    /// `line == UNKNOWN_LINE` check rather than re-deriving it, so
+    /// `jq::cli_context::set_current_source`'s caller can't drift from what
+    /// `get`/`resolve` already treat as "no real position" the way #1549
+    /// found `input_line_number` had.
+    fn source_at(&self, idx: usize) -> Option<u32> {
+        let &(src, line) = self.per_value.get(idx)?;
+        (line != UNKNOWN_LINE).then_some(src)
     }
 
     /// Turn a raw `(source, line)` -- as handed back by
