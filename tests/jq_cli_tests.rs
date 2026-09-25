@@ -31163,6 +31163,33 @@ fn test_reduce_growth_past_value_tree_depth_reports_cleanly_3261() -> Result<()>
     Ok(())
 }
 
+/// #3261 sibling: `with_entries(f)` (`builtin_with_entries`) re-indexes each
+/// entry's *value* independently via the same reindex bridge -- a distinct
+/// call site from the bare-filter case above, reached only when the field
+/// value itself (not the whole document) grows past the limit.
+#[test]
+fn test_with_entries_entry_value_past_depth_limit_reports_cleanly_3261() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "{a: (reduce range(400) as $i (0; [.]))} | with_entries(.)",
+        ],
+        None,
+    )
+    .unwrap_or_else(|e| panic!("run failed: {e}"));
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("stack overflow"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1818: `run_jq`'s *other* top-level branch -- taken whenever
 /// `can_use_lazy_path` is `false` (`--slurp`/`-s`, `-S`/`--sort-keys`,
 /// `-C`/`--color-output`, `--ascii-output`, `--slurpfile`, or a filter using
