@@ -3735,10 +3735,10 @@ impl OwnedValue {
     /// recorded upstream, at [`from_document_float`](Self::from_document_float),
     /// as a `NumberLiteral` that echoes verbatim below.
     /// Returns [`EvalError`] rather than panicking past
-    /// [`MAX_VALUE_TREE_DEPTH`] (#3261) -- see
-    /// [`to_json_for_reindex_at_depth`](Self::to_json_for_reindex_at_depth),
-    /// which checks depth once per node in the same pass that builds the
-    /// text, rather than a separate pre-flight walk.
+    /// [`MAX_VALUE_TREE_DEPTH`] (#3261) -- see this function's own private
+    /// `to_json_for_reindex_at_depth`, which checks depth once per node in
+    /// the same pass that builds the text, rather than a separate
+    /// pre-flight walk.
     pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> Result<String, EvalError> {
         self.to_json_for_reindex_at_depth::<S>(0)
     }
