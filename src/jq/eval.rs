@@ -30438,6 +30438,32 @@ fn optional_group_is_scope_safe(inner: &Expr) -> bool {
     seen < 2 || safe
 }
 
+/// Whether `inner`, the operand of an [`Expr::Optional`], is one of the
+/// navigation steps the parser attaches a postfix `?` to directly --
+/// jq's `INDEX_OPT`/`EACH_OPT`, whose `?` covers indexing errors but not a
+/// path error (#2764), nor an error raised by a computed key
+/// (`.[error("x")]?` raises in jq). Every other operand is jq's `try`.
+/// `resolve_optional_sink` handles the computed `IndexExpr`/`SliceExpr`
+/// pair in their own arms, and the rest as its `bare_navigation_primitive`.
+fn is_postfix_optional_primitive(inner: &Expr) -> bool {
+    matches!(
+        inner,
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Iterate
+            | Expr::Slice { .. }
+            | Expr::IndexExpr { .. }
+            | Expr::SliceExpr { .. }
+    )
+}
+
+/// Whether a flattened path component is a `try`-scoped `?` step --
+/// `Optional(Paren(_))`, as [`push_path_components`] marks one (#2764) --
+/// whose path error on an untracked input jq catches rather than raises.
+fn is_try_scoped_component(component: &Expr) -> bool {
+    matches!(component, Expr::Optional(inner) if !is_postfix_optional_primitive(inner))
+}
+
 /// Flatten an expression into the list of path components it denotes.
 ///
 /// `Pipe` and `Paren` are transparent and `Identity` contributes nothing, so
@@ -30471,10 +30497,26 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         // abort scope by staying one opaque element, which
         // `needs_path_prepass`/`needs_fanout_pass` route to
         // `resolve_optional_sink` -- the arm that was already right.
+        //
+        // #2764: the distributed `?` keeps which of jq's two `?`s it was. A
+        // postfix `?` on a navigation primitive (`.a?`, `.[]?`, `.[0]?`) is
+        // jq's `INDEX_OPT`/`EACH_OPT`, which does not catch a path error;
+        // `?` on anything else (`(.a)?`, `(.a | .b)?`) is `try`, which does.
+        // The parser keeps the two apart (`Optional(Field)` vs
+        // `Optional(Paren(Field))`), so a `try` group's components are
+        // re-wrapped as `Optional(Paren(e))` to carry that across the
+        // flatten; see [`is_try_scoped_component`].
         Expr::Optional(inner) if optional_group_is_scope_safe(inner) => {
             let mut group = Vec::new();
             push_path_components(&mut group, inner);
-            out.extend(group.into_iter().map(|e| Expr::Optional(Box::new(e))));
+            let try_scoped = !is_postfix_optional_primitive(inner);
+            out.extend(group.into_iter().map(|e| {
+                Expr::Optional(Box::new(if try_scoped && !matches!(e, Expr::Paren(_)) {
+                    Expr::Paren(Box::new(e))
+                } else {
+                    e
+                }))
+            }));
         }
         other => out.push(other.clone()),
     }
@@ -34458,7 +34500,7 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
             *end,
             end_key.as_ref(),
         )),
-        Expr::Optional(inner) => navigation_element(inner),
+        Expr::Optional(inner) | Expr::Paren(inner) => navigation_element(inner),
         _ => None,
     }
 }
@@ -42196,6 +42238,14 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     trackable: bool,
 ) -> Result<Option<OwnedValue>, (Vec<PathBranch<'a>>, EvalEscape)> {
     if !trackable {
+        // #2764: a `try`-scoped first step (`(.a)?`, flattened) catches the
+        // path error jq raises for it, pruning the branch -- the `Ok(None)`
+        // a `?`-suppressed step already means here. jq mode only: yq has no
+        // `try`, and its scalar-write no-op convention would turn a wrong
+        // acceptance into silent corruption.
+        if S::TAG == EvalTag::Jq && components.first().is_some_and(is_try_scoped_component) {
+            return Ok(None);
+        }
         let error = match components.first().and_then(navigation_element) {
             Some(element) => EvalError::invalid_path_expression_near_access(&element, value),
             None => EvalError::invalid_path_expression(value),
@@ -43662,7 +43712,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
     fn is_bare_iterate(expr: &Expr) -> bool {
         match expr {
             Expr::Iterate => true,
-            Expr::Optional(inner) => matches!(inner.as_ref(), Expr::Iterate),
+            Expr::Optional(_) => matches!(unwrap_path_component(expr).0, Expr::Iterate),
             _ => false,
         }
     }
@@ -43760,7 +43810,7 @@ fn resolve_dynamic_indexes_sink<S: EvalSemantics>(
 /// `resolve_seq` rather than a computed key).
 fn strip_resolved_optional(component: Expr) -> Expr {
     match component {
-        Expr::Optional(inner) => strip_resolved_optional(*inner),
+        Expr::Optional(inner) | Expr::Paren(inner) => strip_resolved_optional(*inner),
         Expr::Pipe(exprs) => Expr::Pipe(exprs.into_iter().map(strip_resolved_optional).collect()),
         other => other,
     }
@@ -52025,7 +52075,7 @@ fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<(Vec<Expr>, bool)> {
     let last = flat.last()?;
     let trailing_optional = match last {
         Expr::Iterate => false,
-        Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Iterate) => true,
+        Expr::Optional(_) if matches!(unwrap_path_component(last).0, Expr::Iterate) => true,
         _ => return None,
     };
     let prefix = &flat[..flat.len() - 1];

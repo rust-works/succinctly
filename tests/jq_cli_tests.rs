@@ -68630,3 +68630,45 @@ fn test_recurse_f_untracked_defers_to_navigation_2764() -> Result<()> {
         (r"(.a | 1 | recurse(empty) | empty) |= 5", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
     ])
 }
+
+/// #2764 (c): `(E)?` is jq's `try E`, which catches the path error an
+/// untracked input raises; postfix `.a?`/`.[]?` is `INDEX_OPT`/`EACH_OPT`,
+/// which does not. The flatten that distributes a group's `?` used to turn
+/// the former into the latter.
+#[test]
+fn test_try_scoped_optional_catches_untracked_path_error_2764() -> Result<()> {
+    assert_rows_2764(&[
+        (r"path(1 | (.a)? | empty)", "", "", 0),
+        (r"path(1 | (.a)?)", "", "", 0),
+        (r"path(1 | .a? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | (.[])? | empty)", "", "", 0),
+        (r"path(1 | .[]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through 1\n", 5),
+        (r"path(1 | (.[0])? | empty)", "", "", 0),
+        (r"path(1 | .[0]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element 0 of 1\n", 5),
+        (r#"path(1 | (.["a"])? | empty)"#, "", "", 0),
+        (r#"path(1 | .["a"]? | empty)"#, "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"path(1 | (.[1:])? | empty)", "", "", 0),
+        (r"path(1 | .[1:]? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element {\"start\":1,... of 1\n", 5),
+        (r"path(1 | (.a.b)? | empty)", "", "", 0),
+        (r"path(1 | (.a | .b)? | empty)", "", "", 0),
+        (r"path(1 | ((.a))? | empty)", "", "", 0),
+        (r"path(1 | (. | .a)? | empty)", "", "", 0),
+        (r"path(1 | .x.a? | empty)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"x\" of 1\n", 5),
+        (r"path(.a | (.b)?)", "[\"a\",\"b\"]\n", "", 0),
+        (r"path(.c | (.a)?)", "", "", 0),
+        (r"path(.c | .a?)", "", "", 0),
+        (r"path(. as $x | 1 | (.a)? | $x)", "", "", 0),
+        (r"path(. as $x | 1 | .a? | $x)", "", "jq: error (at <stdin>:1): Invalid path expression near attempt to access element \"a\" of 1\n", 5),
+        (r"del(1 | (.a)? | empty)", "{\"a\":{\"b\":{\"b\":null}},\"c\":2}\n", "", 0),
+        (r"del((.a), (1 | (.b)?))", "{\"c\":2}\n", "", 0),
+        (r"(.a, (1 | (.b)?)) |= 5", "{\"a\":5,\"c\":2}\n", "", 0),
+        (r"del(.[] | (.b)?)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r"del(.[] | .b?)", "{\"a\":{},\"c\":2}\n", "", 0),
+        (r#"path(.. | .[error("boom")]?)"#, "", "jq: error (at <stdin>:1): boom\n", 5),
+        (r#"path(1 | .[error("boom")]?)"#, "", "jq: error (at <stdin>:1): boom\n", 5),
+        (r#"path(1 | (.[error("boom")])?)"#, "", "", 0),
+        (r"path(1 | .[.a]? | empty)", "", "jq: error (at <stdin>:1): Cannot index number with string \"a\"\n", 5),
+        (r"path(1 | (.[.a])? | empty)", "", "", 0),
+        (r"path(.a | .[.b:]?)", "", "", 0),
+    ])
+}
