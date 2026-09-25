@@ -33846,7 +33846,21 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `and`/`or`/unary minus was falling to the eager catch-all below,
         // which evaluates by value and never checks navigation at all --
         // the same accept-where-jq-refuses shape #2689 closed for `[E]`.
-        // Gated to `!trackable` deliberately: a **trackable** input's
+        // Gated to `S::TAG == EvalTag::Jq` first, mirroring the `Array` arm's
+        // own `array_resolves_live` guard just above: real yq's `and`/`or`
+        // ARE real operators (unlike `empty`/`leaf_paths`, which its lexer
+        // rejects outright), so this isn't an ADR-0018 extension exemption
+        // -- without the guard, this arm changes yq-mode behavior too, and
+        // diverges from the pinned oracle (confirmed live against yq
+        // v4.53.3: `del(1 | (.a and true) | select(false))` on `a: false`
+        // silently no-ops in real yq, exit 0; this arm without the guard
+        // raised "attempt to access element \"a\" of 1", exit 1 -- caught in
+        // review before merge). Leaving yq mode on the pre-existing eager
+        // catch-all is not a new divergence: that catch-all's own behavior
+        // is unchanged by this fix, so yq mode's `and`/`or` fidelity (or
+        // lack of it) here is exactly what it was on `main`.
+        //
+        // Then gated to `!trackable` deliberately: a **trackable** input's
         // `and`/`or` has a materially different, deeper correctness gap
         // (jq's path-mode refuses whenever *more than one* operand
         // genuinely navigates the register -- `path((.a and .b) | empty)`
@@ -33894,7 +33908,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // element \"a\"" (exit 5); this arm was added because succinctly
         // answered exit 0 for it, evaluating `.a` by value through the
         // eager catch-all instead of checking its navigation.
-        Expr::And(left, right) if !trackable => {
+        Expr::And(left, right) if S::TAG == EvalTag::Jq && !trackable => {
             let mut inner_flow: Option<ResolveFlow> = None;
             let flow =
                 resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
@@ -33931,8 +33945,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         }
         // #2760: mirror image of `And` just above -- `or` short-circuits on
         // a truthy `left` instead of a falsy one. See `And`'s own comment
-        // for the `!trackable` scope and why there is no `TrackedVar` guard.
-        Expr::Or(left, right) if !trackable => {
+        // for the `S::TAG == EvalTag::Jq`/`!trackable` scope and why there
+        // is no `TrackedVar` guard.
+        Expr::Or(left, right) if S::TAG == EvalTag::Jq && !trackable => {
             let mut inner_flow: Option<ResolveFlow> = None;
             let flow =
                 resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
@@ -33969,8 +33984,19 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         }
         // #2760: unary minus has one operand, always evaluated -- no
         // short-circuit, and (see `And`'s own comment) no `TrackedVar`
-        // guard either; still gated to `!trackable` for the same reason
-        // `And`/`Or` are. Its wrong answer wasn't a missing refusal (it
+        // guard either; still gated to `S::TAG == EvalTag::Jq` and
+        // `!trackable` for the same reasons `And`/`Or` are. Real yq has no
+        // unary-minus operator at all (confirmed live: `yq '(- .a)'` errors
+        // "'-' expects 2 args but there is 1"), so succinctly's `-E` in yq
+        // mode is a documented extension (docs/compliance/yq/limitations.md)
+        // and exempt from ADR-0018's divergence rule on that count alone --
+        // but leaving this arm reachable in yq mode still broke succinctly's
+        // own documented equivalence `-E == E * -1` (used by that same
+        // limitations-doc section) on an untracked-and-navigating operand,
+        // since `Expr::Arithmetic`'s `* -1` path is untouched by this fix:
+        // caught in review before merge. Gating to jq mode keeps both
+        // spellings on the same (unchanged) eager catch-all in yq mode.
+        // Its wrong answer wasn't a missing refusal (it
         // already raised) but the *wrong* error: evaluating `.a` by value
         // first reports "boolean (false) cannot be negated" where jq's live
         // path-tracked evaluation reaches `.a`'s own navigation refusal
@@ -33978,7 +34004,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // every other arm here does; `arith_negate`'s own error (an
         // ordinary catchable `EvalError`, unrelated to path-refusal) still
         // applies once `inner` resolves to something.
-        Expr::Negate(inner) if !trackable => {
+        Expr::Negate(inner) if S::TAG == EvalTag::Jq && !trackable => {
             let mut inner_flow: Option<ResolveFlow> = None;
             let flow = resolve_node_sink::<S>(
                 inner,
