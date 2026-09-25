@@ -56459,10 +56459,9 @@ fn test_write_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() 
 /// #2760's boundary, so the arm cannot degrade into "refuse every and/or/
 /// negate on an untracked input". Each row is something jq accepts, and
 /// each is unchanged by the fix -- a trackable input, a literal operand, no
-/// navigation at all, and a `TrackedVar` operand (the same #2759 exclusion
-/// #2689's own array arm needs, for the identical reason: a marked `$var`
-/// this arm cannot certify against the ambient register would be refused
-/// here where jq accepts it). All captured live from jq 1.7.1.
+/// navigation at all, and a `TrackedVar` operand, correctly certified (or
+/// declined) by `resolve_node_sink`'s own dedicated `Expr::TrackedVar` arm
+/// rather than by any exclusion here. All captured live from jq 1.7.1.
 #[test]
 fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
     for (filter, doc) in [
@@ -56482,6 +56481,81 @@ fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "{filter}: must stay accepted; stderr {stderr:?}");
         assert_eq!(stdout.trim_end(), "", "{filter}");
+    }
+    Ok(())
+}
+
+/// #3290: `array_resolves_live`'s `TrackedVar` exclusion used to scan
+/// `[E]`'s *whole* subtree (`any_subexpr`), so a `TrackedVar` anywhere in a
+/// mixed array disqualified live resolution for the entire array -- silently
+/// un-checking real navigation elsewhere in the same brackets. Confirmed
+/// live against jq 1.7.1: `path(. as {a:$v0} | [.a, $v0] | empty)` on
+/// `{"a":false}` raises "near attempt to access element \"a\"" (exit 5);
+/// this arm was accepting it (exit 0) before the fix, the same
+/// accept-where-jq-refuses shape #2760 closed for `and`/`or`.
+#[test]
+fn test_array_tracked_var_exclusion_does_not_blind_sibling_navigation_3290() -> Result<()> {
+    let doc = r#"{"a":false}"#;
+    for filter in [
+        "path(. as {a:$v0} | [.a, $v0] | empty)",
+        "path(. as {a:$v0} | [$v0, .a] | empty)",
+        "path(. as {a:$v0} | [[$v0, .a]] | empty)",
+        "path(. as {a:$v0} | [.a, [$v0]] | empty)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter}: must refuse; stdout {stdout:?}");
+        assert!(
+            stderr.contains(r#"near attempt to access element "a""#),
+            "{filter}: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+    }
+    Ok(())
+}
+
+/// #3290 seen from the side that does damage: `del()`/`|=` consume the same
+/// resolution, so the missing refusal was a **refused edit reported as a
+/// successful no-op**. Captured live from jq 1.7.1.
+#[test]
+fn test_array_tracked_var_exclusion_write_position_3290() -> Result<()> {
+    let doc = r#"{"a":false}"#;
+    for filter in [
+        "del(. as {a:$v0} | [.a, $v0] | empty)",
+        "(. as {a:$v0} | [.a, $v0] | empty) |= 5",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(
+            code, 0,
+            "{filter}: must refuse, not no-op; stdout {stdout:?}"
+        );
+        assert!(
+            stderr.contains(r#"near attempt to access element "a" of {"a":false}"#),
+            "{filter}: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "", "{filter}: nothing written");
+    }
+    Ok(())
+}
+
+/// #3290's boundary: a bare `TrackedVar` array element (no other navigation
+/// alongside it) must stay accepted -- the fix must not degrade into
+/// "refuse every array containing a `$var`". Also pins the pre-existing
+/// register-carry case (`[$v0]` alone lets a later `$v0.a` navigate through
+/// the carried register, #2759/#3263) stays correct with the exclusion gone.
+/// All captured live from jq 1.7.1.
+#[test]
+fn test_array_tracked_var_alone_stays_accepted_3290() -> Result<()> {
+    for (filter, doc, expected) in [
+        ("path(. as {a:$v0} | [$v0] | empty)", r#"{"a":false}"#, ""),
+        (
+            "path(. as {a:$v0} | [$v0] | $v0.a)",
+            r#"{"a":{"a":1}}"#,
+            r#"["a","a"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: must stay accepted; stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
     Ok(())
 }

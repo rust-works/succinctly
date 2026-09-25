@@ -33773,32 +33773,38 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // only (ADR-0018): real yq's lexer rejects every shape that reaches
         // here, so there is no yq oracle, and yq mode keeps `Untracked::Skip`.
         //
-        // **Also keyed on `inner` containing none of the shapes whose own
-        // untracked handling is wrong.** Evaluating by value had been
-        // *masking* those bugs inside brackets, and routing the brackets
-        // through the resolver unmasks them -- turning working programs into
-        // errors, the one direction this fix must never move. Each is a
-        // pre-existing bare-stage bug with its own oracle bracket, kept on
-        // the catch-all here rather than fixed in passing:
+        // **Also keyed on `inner` containing no `GetPath`, the one remaining
+        // shape whose own untracked handling is wrong.** Evaluating by value
+        // had been *masking* that bug inside brackets, and routing the
+        // brackets through the resolver would unmask it -- turning a working
+        // program into an error, the one direction this fix must never move.
+        // #2896 made the `keys.is_empty()` arm *defer* in jq mode -- the only
+        // mode this guard runs in -- so the eager refusal this exclusion was
+        // originally written against is gone. It is kept because the reason
+        // is now a different one: resolved from here, a `getpath` stage is
+        // handed no `carried_register` and no ambient positional mark, so
+        // neither `getpath_preserves_register` nor `getpath_result_position`
+        // has anything to work from and the bracket would refuse where jq
+        // accepts. `path(1 | [getpath([])] | empty)` is accepted by jq.
+        // #2759.
         //
-        // - `TrackedVar` on an untracked input: a marker *re-establishes*
-        //   tracking -- `$v` whose
-        //   frozen value is still the live register is not navigation, it is
-        //   the register (#1573) -- but that comparison happens one level up
-        //   in `resolve_seq_stage`, against a `carried_register` this
-        //   function is not handed. Resolved from here, `[$v.b?]` saw `$v` as
-        //   just another untracked value and refused `.b` where jq accepts.
-        //   #2759. On a tracked input, the ambient register is available.
-        // - `GetPath`: #2896 made the `keys.is_empty()` arm *defer* in jq
-        //   mode -- the only mode this guard runs in -- so the eager refusal
-        //   this exclusion was originally written against is gone. It is
-        //   kept because the reason is now a different one: resolved from
-        //   here, a `getpath` stage is handed no `carried_register` and no
-        //   ambient positional mark, so neither `getpath_preserves_register`
-        //   nor `getpath_result_position` has anything to work from and the
-        //   bracket would refuse where jq accepts -- the same shape as
-        //   `TrackedVar` above, and the same #2759/#2764 bracket.
-        //   `path(1 | [getpath([])] | empty)` is accepted by jq. #2759.
+        // A bare `TrackedVar` anywhere in `inner` used to be excluded here
+        // too (#2759), on the theory that resolving it live would see it as
+        // just another untracked value and refuse navigation jq accepts
+        // through it. That exclusion scanned `inner`'s *whole* subtree, so a
+        // `TrackedVar` anywhere in a mixed array disqualified live
+        // resolution for every other element too -- silently un-checking
+        // real navigation elsewhere in the same array (`[.a, $v0]`'s `.a`
+        // stopped refusing the moment `$v0` existed anywhere in the
+        // brackets). #3290: removed. `resolve_node_sink`'s own
+        // `Expr::TrackedVar` arm already certifies (or correctly declines to
+        // certify) a marked `$var` against the ambient `snapshot`/`frame`
+        // wherever it's reached, the same as it would for any other direct
+        // resolution -- there was never a real gap here once the resolver's
+        // own recursive dispatch is trusted to decide per node, the same
+        // lesson #2760 (PR #3288) learned for `and`/`or`. Confirmed live
+        // against jq 1.7.1 across `[$v0, .a]`, `[.a, $v0]`, `[[$v0, .a]]`
+        // and the `del()`/`|=` write-position forms.
         //
         // The recurse family and `Optional` were excluded here too until
         // #2764 made each defer its refusal the way jq does: parameterized
@@ -35703,15 +35709,16 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// builtin jq defines in jq (`with_entries`, `walk`, `sub`), an update
 /// assignment (`|=`, whose `_modify` navigates) -- so resolving live is
 /// necessary for carrying the register but not sufficient; see
-/// [`array_contents_are_checked`]. The shapes excluded here are the ones
-/// whose own untracked handling is still wrong (#2759, #2764 -- see the
-/// arm's own comment).
+/// [`array_contents_are_checked`]. The one shape excluded here (`GetPath`) is
+/// the one whose own untracked handling is still wrong (#2759 -- see the
+/// arm's own comment). A `TrackedVar` exclusion lived here too until #3290
+/// found it disqualified live resolution for a whole mixed array the moment
+/// a marker appeared anywhere inside it, not just at the marker itself.
 fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool {
     S::TAG == EvalTag::Jq
         && (!trackable || !cannot_move_register(inner))
         && !any_subexpr(inner, &mut |e| {
-            (!trackable && matches!(e, Expr::TrackedVar(_)))
-                || matches!(e, Expr::Builtin(Builtin::GetPath(_)))
+            matches!(e, Expr::Builtin(Builtin::GetPath(_)))
         })
 }
 
