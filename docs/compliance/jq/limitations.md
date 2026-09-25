@@ -7293,7 +7293,7 @@ magnitude error, a narrower divergence from real jq than #2240's own issue text 
 scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
 be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
 
-### A plain decimal and an overflowing literal render with decNumber's notation (#3212) — divergence closed, one cap residual
+### A plain decimal and an overflowing literal render with decNumber's notation (#3212) — divergence closed
 
 jq 1.7.1 renders every number literal with decNumber's to-scientific-string rule: scientific
 notation when the exponent is positive or the adjusted exponent (`exponent + digits - 1`) is
@@ -7305,10 +7305,13 @@ a literal that overflows `f64` (`1e400`) keeps its literal as jq does (`"1E+400"
 substituted `DBL_MAX` text. Only a *computed* infinity (`1e400 + 0`) still takes the
 `DBL_MAX` text, as in jq.
 
-**Residual:** the scientific path renders at most 100,000 mantissa digits
-(`MAX_RENDERED_MANTISSA_DIGITS`), so a literal with more significant digits than that comes
-out truncated where jq renders every one —
-[#3257](https://github.com/rust-works/succinctly/issues/3257).
+The scientific path used to render at most 100,000 mantissa digits
+(`MAX_RENDERED_MANTISSA_DIGITS`), so a literal with more significant digits than that came out
+truncated where jq renders every one. [#3257](https://github.com/rust-works/succinctly/issues/3257)
+removed that cap — real jq itself has none (oracle-verified past 500,000 digits, no ceiling
+found) — so every notation path now renders every given digit unconditionally, matching jq's
+own cost profile: the input already had to contain that many bytes to trigger the cost, so
+it's linear in the caller's own paid-for input, not an amplification.
 
 ### A magnitude-overflowing literal is no longer rejected by `--argjson`/`--jsonargs` (#2052) — divergence closed
 
