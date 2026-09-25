@@ -86463,6 +86463,34 @@ mod tests {
         }
     }
 
+    /// #2764: jq mode defers this refusal (parameterized recursion now
+    /// resolves `f` against the untracked seed instead, see
+    /// `resolve_recurse_sink`'s own doc comment), but yq mode keeps #843's
+    /// eager guard for every `recurse` spelling — real yq's lexer rejects
+    /// `recurse(f)` outright, so there is no oracle for a deferred shape.
+    /// Mirrors `test_path_catch_handler_recursive_descent_raises_with_result_843`
+    /// above under `YqSemantics`.
+    #[test]
+    fn test_yq_path_catch_handler_recursive_descent_raises_with_result_843() {
+        for filter in [
+            r"path(try (.a, error([1,2,3])) catch ..)",
+            r"path(try (.a, error([1,2,3])) catch recurse)",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]))",
+            r"path(try (.a, error([1,2,3])) catch recurse(.[0]; true))",
+        ] {
+            yq_query!(br#"{"a":10}"#, filter,
+                QueryResult::Partial(vs, Control::Error(e)) => {
+                    assert_eq!(prefix_json(&vs), [r#"["a"]"#], "{filter}");
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                    assert_eq!(
+                        e.message, "Invalid path expression with result [1,2,3]",
+                        "{filter}"
+                    );
+                }
+            );
+        }
+    }
+
     /// #843: a genuine navigation attempt against the untracked value still
     /// raises correctly when it is reached through `resolve_seq`'s
     /// dedicated static-chain fast path (`.a.b`, i.e. `Expr::Pipe([Field,
