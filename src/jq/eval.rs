@@ -31788,14 +31788,19 @@ fn may_bind_navigated(expr: &Expr) -> bool {
 ///
 /// It is a separate variant rather than a `Marked(Origin::At { .. })`
 /// precisely so [`Snapshot::is_marked`] stays `false` for it. `is_marked`
-/// does not mean "has provenance": it gates the recurse family's
-/// *deferral* (`resolve_node_sink`'s untracked guard, and the two
-/// `debug_assert!(trackable || snapshot.is_marked())` invariants that guard
-/// hands off to), where a frozen snapshot must reach the walk so the walk
-/// can emit *self* with the mark intact (#1591). A positional mark carries
-/// no such frozen-pointer guarantee, so reusing `Marked` here would
-/// silently turn several "raise now" refusals into deferred walks — a
-/// widening in the accepting direction with no oracle behind it.
+/// does not mean "has provenance": it gates deferral for the *parameterised*
+/// recurse family (`resolve_node_sink`'s untracked guard ahead of
+/// `resolve_recurse_sink`, and yq's own bare-recursion guard) and the
+/// `debug_assert!(trackable || snapshot.is_marked())` invariants those hand
+/// off to, where a frozen snapshot must reach the walk so the walk can emit
+/// *self* with the mark intact (#1591). **jq's own *bare* `..`/`recurse` no
+/// longer reads `is_marked` at all (#3048)**: that arm refuses immediately
+/// on any untracked value, marked or not, so a marked `$var` off the
+/// register raises the same iterate error a plain untracked value does
+/// instead of deferring to a walk with no iterate check. A positional mark
+/// carries no frozen-pointer guarantee either way, so reusing `Marked` here
+/// would silently turn several "raise now" refusals into deferred walks —
+/// a widening in the accepting direction with no oracle behind it.
 #[derive(Debug, Clone, PartialEq, Default)]
 enum Snapshot {
     #[default]
@@ -33238,8 +33243,22 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `try` catch the later navigation error. `recurse_down` retains its
         // internal alias behavior; jq 1.7.1 has no such spelling.
         // jq only: yq and parameterized recursion keep the guard below.
+        //
+        // #3048: no `!snapshot.is_marked()` restriction here, unlike the yq
+        // arm below -- a marked but untracked `$var` (one `TrackedVar`
+        // couldn't certify against the current register) must refuse the
+        // same way an ordinary untracked value does. `recurse_family_root_seed`
+        // still passes `snapshot` through unchanged, so the emitted seed
+        // keeps its mark (a bound consumer can still stop on it, and an
+        // outer fold register can still recognise it) -- only the *descent*
+        // past that seed is refused, matching `recurse(.[]?)` and jq's own
+        // `def r: ., (f | r); r;` unfolding of `.[]?` at the register.
+        // Falling through to `resolve_recursive_descent_sink` instead (as a
+        // marked snapshot did before this fix) skipped that check entirely,
+        // silently answering where jq exits 5 with "Invalid path expression
+        // near attempt to iterate".
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
-            if S::TAG == EvalTag::Jq && !trackable && !snapshot.is_marked() =>
+            if S::TAG == EvalTag::Jq && !trackable =>
         {
             match sink(recurse_family_root_seed(value, trackable, snapshot)) {
                 Demand::Stop => ResolveFlow::Stopped,
