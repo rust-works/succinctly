@@ -33007,7 +33007,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // #3049: a tracked input needs the same live resolution when its
         // body can move the register. A navigation-free body such as `[1]`
         // keeps the old catch-all: `path(. as $x | [1] | $x)` relies on
-        // preserving the register for the later `$x`. Pass ambient tracking
+        // preserving the register for the later `$x`. So, since #3186, does
+        // a body whose navigation all sits inside jq subexps (`[{k:.a}]`,
+        // `[.a + 1]`, `[if .a then 1 else 2 end]`): nothing in a subexp can
+        // raise a path error or move the register, so value evaluation
+        // answers exactly what live resolution would. Pass ambient tracking
         // into a resolved `inner`; its constructed array is untracked. The
         // seq-level register handling
         // (`cannot_move_register`'s own `Array` arm) is unchanged. jq mode
@@ -34569,6 +34573,19 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
     }
 }
 
+/// Shared by every binding form's own `cannot_move_register` arm
+/// (`Expr::AsPattern`, `Expr::Reduce`, `Expr::Foreach`): `false` the moment
+/// any alternative destructures (`{...}`/`[...]`), since matching one
+/// performs its own tracked index steps that move the register — a bare
+/// `$var` (`Pattern::Var`) or an alternation of only those performs none.
+/// One definition rather than the identical inline check copied at each
+/// call site.
+fn patterns_all_bare(patterns: &[Pattern]) -> bool {
+    !patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+}
+
 /// Whether evaluating `expr` as one pipe stage provably leaves jq's path
 /// register (`value_at_path`) exactly where it was (#1573).
 ///
@@ -34639,7 +34656,8 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// A refusal is not a fabricated path, but it is not free either: under
 /// `try`/`?` it is caught as though it were jq's own path error, and
 /// `del(. as $x | [.a] | try ($x | .a))` echoes the document where jq
-/// writes -- #3263 tracks resolving an array's contents instead. An `as`
+/// writes -- #3263 tracks resolving an array's contents instead, and #3267
+/// the class: a refusal this predicate guessed must not be catchable. An `as`
 /// binding's *source* is a subexp too (`path(.a as $y | .b)` is `["b"]`),
 /// so only its body is consulted (#2042).
 ///
@@ -34662,19 +34680,6 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
 /// `path(. as $x | (def f: 5; f) | $x)`, which jq answers `[]` and this
 /// refuses: one more refusal on a shape nothing writes, versus a rule that
 /// has to be right about every `def` anyone does write.
-/// Shared by every binding form's own `cannot_move_register` arm
-/// (`Expr::AsPattern`, `Expr::Reduce`, `Expr::Foreach`): `false` the moment
-/// any alternative destructures (`{...}`/`[...]`), since matching one
-/// performs its own tracked index steps that move the register — a bare
-/// `$var` (`Pattern::Var`) or an alternation of only those performs none.
-/// One definition rather than the identical inline check copied at each
-/// call site.
-fn patterns_all_bare(patterns: &[Pattern]) -> bool {
-    !patterns
-        .iter()
-        .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
-}
-
 fn cannot_move_register(expr: &Expr) -> bool {
     match expr {
         // Nothing here reads the document's structure at all.

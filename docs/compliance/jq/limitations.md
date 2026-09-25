@@ -717,22 +717,29 @@ is the revert that established what the other one costs.
    the resolver as one opaque computed value. Assuming those left the register alone made
    `path(. as $x \| ([.a]\|first) \| $x)` answer `[]` where jq refuses, and `=`/`|=`/`del()`
    then wrote through the fabricated path, so the allowlist is deliberately narrow and
-   everything outside it drops the register. What jq compiles as a subexp is inside the
-   allowlist whatever it contains ([#3186](https://github.com/rust-works/succinctly/issues/3186)):
+   everything outside it drops the register. Four shapes jq compiles as subexps are in the
+   allowlist whatever they contain ([#3186](https://github.com/rust-works/succinctly/issues/3186)):
    an object construction, a string interpolation, both operands of an arithmetic or
    comparison operator, and an `if` condition. Nothing within `SUBEXP_BEGIN`/`SUBEXP_END`
    moves jq's register or raises a path error, so `path(. as $x \| {k:.a} \| $x)` is `[]`
-   in both tools. Before #3186 these refused, and under `try` the refusal was caught as if it
+   in both tools. jq has more subexps than these four (a C-implemented builtin's arguments,
+   so `path(. as $x \| has("a") \| $x)` is `[]` in jq), and a `reduce`/`foreach` stage or a
+   `//` also leaves jq's register where it was on inputs this predicate can't tell apart
+   statically. Those still drop the register here. Before #3186 these refused, and under `try` the refusal was caught as if it
    were jq's own: `del(. as $v \| {k: .a} \| try ($v \| .[]?))` echoed the document where jq
    deletes every key. Two shapes jq answers still refuse here:
    an *array* whose contents navigate (`path(. as $x \| [.a] \| $x)` — jq collects an array
    without a subexp, so its contents are path-checked, and this resolver never sees them:
    `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the `[.a]`'s `.a`), and a `def`
    whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its
-   body is not something a syntactic predicate can do from a name). Both are refuse-only,
-   but not harmless: under `try` the array one discards a write too
-   (`del(. as $x \| [.a] \| try ($x \| .a))`), tracked in
-   [#3263](https://github.com/rust-works/succinctly/issues/3263). (A third shape used to sit here too — an `as` whose bind source navigates —
+   body is not something a syntactic predicate can do from a name). Every such refusal is
+   refuse-only on its own, but not harmless: `try`/`?` catches it as if it were jq's own path
+   error, so the write is silently discarded, exit 0, where jq writes:
+   `del(. as $x \| has("a") \| try ($x \| .a))` returns the document unchanged, jq returns
+   `{"k":1}`. The class is tracked in [#3267](https://github.com/rust-works/succinctly/issues/3267)
+   (a guessed refusal must not be catchable), and the array shape
+   (`del(. as $x \| [.a] \| try ($x \| .a))`) in
+   [#3263](https://github.com/rust-works/succinctly/issues/3263) (resolving an array's contents). (A third shape used to sit here too — an `as` whose bind source navigates —
    but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq
    evaluates an `as` source with path tracking suspended, so the source alone never moves the
    register; `cannot_move_register`'s `Expr::As` arm now consults only the body, and
