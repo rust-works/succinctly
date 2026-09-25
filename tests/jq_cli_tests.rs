@@ -25211,25 +25211,23 @@ fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()
 }
 
 /// #3012: recursion through a `$`-bound parameter used to be `O(depth^2)` --
-/// `bind_def_call_params` (`src/jq/eval.rs`) substitutes each `$`-bound
+/// `bind_def_call_params` (`src/jq/eval.rs`) substituted each `$`-bound
 /// occurrence with an `Expr::Shared` wrapping the call-site's argument
-/// *expression*, and each recursion level nests the previous level's
-/// `Shared` one layer deeper (`Shared(Arithmetic(Shared(prev), Sub,
-/// Literal(1)))`), so dereferencing `$n` at level `i` used to re-walk all
-/// `i` prior levels from scratch every time -- 13.4s at n=11000 before this
-/// fix (measured on Apple Silicon, release build), 0.007s in real jq. A
-/// zero-arity recursive `def` was always linear (`bind_def_call` skips
-/// `bind_def_call_params` entirely when there are no parameters), which is
-/// what pointed at parameter substitution specifically rather than
-/// recursion itself.
+/// *expression*, and each recursion level nested the previous level's
+/// `Shared` one layer deeper, so dereferencing `$n` at level `i` re-walked
+/// all `i` prior levels -- 13.4s at n=11000 (Apple Silicon, release build),
+/// 0.007s in real jq. #3012 memoized the chain; #3149 removed the chain
+/// itself (and the memo with it): `$n` is now bound to a value by an `as`
+/// around the body, as jq's own `x as $x` desugaring does, so each level
+/// reads a literal.
 ///
 /// n=13000 -- close to (but safely under) the ~13,333-level ceiling
 /// `MAX_EVAL_FRAMES` (`src/jq/eval.rs`) imposes on this exact shape (3
-/// frames/level: `if`, `Arithmetic`, `DefCall`) -- so this also pins that
-/// the fix doesn't regress the *native* recursion-depth guard itself, only
-/// the per-level dereference cost. If this test starts timing out or
-/// taking more than a couple of seconds, the fix in this commit has
-/// regressed back toward `O(depth^2)`.
+/// frames/level: `if`, `Arithmetic`, `DefCall` -- #3149's `as` wrapper is
+/// deliberately not charged) -- so this also pins that neither fix
+/// regressed the *native* recursion-depth guard itself. If this test starts
+/// timing out or taking more than a couple of seconds, `$n` has regressed
+/// back toward an `O(depth^2)` chain.
 #[test]
 fn test_recursion_through_dollar_param_is_linear_not_quadratic_3012() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -25244,24 +25242,18 @@ fn test_recursion_through_dollar_param_is_linear_not_quadratic_3012() -> Result<
     Ok(())
 }
 
-/// #3012 regression guard: the cache #3012 added must apply only to a
-/// `$`-scoped substitution, never to a bare one.
+/// #3012 regression guard: a bare parameter must never be frozen to one
+/// value the way a `$`-style one is.
 ///
-/// A `$`-bound parameter is evaluated exactly once per invocation in real
-/// jq (`def f($x): BODY` desugars to `def f(x): x as $x | BODY`, and `x as
-/// $x` binds once, up front), so caching its dereference is a safe
-/// refinement. A **bare** reference to the same declared name is the
-/// opposite: real jq re-evaluates it fresh at every reference site, using
-/// whatever `.` is ambient *there* -- confirmed live against jq 1.7.1,
-/// which answers `[2,3]` for the query below, not `[1,2,3]`. An earlier,
-/// less careful version of the #3012 fix cached the `n | d(n-1)` chain
-/// link indiscriminately (gated only on `is_pure_chain_link`'s shape check,
-/// not on which namespace produced it), and answered `[1,2,3]` --
-/// confirmed by temporarily building that version and running this exact
-/// query. `bind_def_call_params` now gives a `$`-scoped substitution its
-/// own, separately-`Rc`'d `Expr::Shared` (via `dollar_safe_shared`) so a
-/// bare occurrence of the same parameter name is never mistaken for one
-/// safe to cache.
+/// A `$`-bound parameter is evaluated once per value per invocation in real
+/// jq (`def f($x): BODY` desugars to `def f(x): x as $x | BODY`). A **bare**
+/// reference to the same declared name is the opposite: real jq
+/// re-evaluates it fresh at every reference site, using whatever `.` is
+/// ambient *there* -- confirmed live against jq 1.7.1, which answers
+/// `[2,3]` for the query below, not `[1,2,3]`. An earlier version of the
+/// #3012 fix cached the `n | d(n-1)` chain link indiscriminately and
+/// answered `[1,2,3]`; #3149 then removed that cache, binding only the `$`
+/// namespace by value, and this keeps the bare namespace honest.
 #[test]
 fn test_bare_param_recursion_keeps_dynamic_dot_not_cached_3012() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -30296,6 +30288,90 @@ fn test_duplicate_named_param_three_occurrences_2560() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a;$a;a): $a + a; f(1;2;3)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
+/// #3149: jq compiles `def g($x): body` to `def g(x): x as $x | body`, so a
+/// generator argument runs `body` once per value -- `$x` is bound, not
+/// substituted. succinctly substituted the argument *expression* for `$x`,
+/// so `def g($x): $x + $x; g(1,2)` re-ran the generator at each read and
+/// answered `2,3,3,4` for jq's `2,4`; an `empty` argument still ran the body,
+/// an erroring one never raised, and several `$` parameters did not combine
+/// as a cartesian product. Every row below is jq 1.7.1's own output.
+#[test]
+fn test_dollar_param_binds_each_value_of_a_generator_argument_3149() -> Result<()> {
+    for (filter, expected) in [
+        ("def g($x; f): [$x, f]; [g(1,2; 3,4)]", "[[1,3,4],[2,3,4]]"),
+        ("def g($x): $x + $x; [g(1,2)]", "[2,4]"),
+        // Left to right, the first parameter outermost.
+        (
+            "def g($a; $b): [$a,$b]; [g(1,2;3,4)]",
+            "[[1,3],[1,4],[2,3],[2,4]]",
+        ),
+        // The body runs once per value whether or not it reads `$x`.
+        ("def g($x): 5; [g(1,2)]", "[5,5]"),
+        ("def g($x): 5; [g(empty)]", "[]"),
+        ("def g($x): 5; try g(error(\"boom\")) catch .", "\"boom\""),
+        ("def g($x): reduce $x as $i (0; .+$i); [g(1,2)]", "[1,2]"),
+        // The bare name is still the closure, re-run at each reference.
+        ("def g($x): [$x, x]; [g(1,2)]", "[[1,1,2],[2,1,2]]"),
+        // Through a forwarding bare-parameter def.
+        (
+            "def g($x; f): [$x, f]; def s(x; f): g(x; f); [s(1,2; 3,4)]",
+            "[[1,3,4],[2,3,4]]",
+        ),
+        // Each `$` binding takes its own parameter's argument, even where a
+        // later same-named bare parameter owns the bare name.
+        (
+            "def f($a; $b; a): [$a, $b, a]; [f(1,2; 3,4; 5,6)]",
+            "[[1,3,5,6],[1,4,5,6],[2,3,5,6],[2,4,5,6]]",
+        ),
+        // A duplicated `$` name: the outer binding still iterates, the inner
+        // one shadows it.
+        ("def f($a; $a): [$a]; [f(1,2; 3,4)]", "[[3],[4],[3],[4]]"),
+        ("def f(a; $a): [a, $a]; [f(1,2; 3,4)]", "[[3,4,3],[3,4,4]]"),
+        ("def f($a; a): [a, $a]; [f(1,2; 3,4)]", "[[3,4,1],[3,4,2]]"),
+        // A nested def closes over the bound value.
+        ("def f($x): def h: $x; [h, h]; [f(1,2)]", "[[1,1],[2,2]]"),
+        // Path mode and update-assignment see through the binding.
+        ("def g($x): .[$x]; [[1,2] | path(g(0,1))]", "[[0],[1]]"),
+        (
+            "{\"a\":1,\"b\":2} | def f($k): .[$k]; f(\"a\",\"b\") |= . + 10",
+            "{\"a\":11,\"b\":12}",
+        ),
+        // Still demand-driven: the second value is never produced.
+        ("[limit(1; def g($x): $x; g(1, error(\"no\")))]", "[1]"),
+        ("[isempty(def f($x): 1; f(1, error(\"x\")))]", "[false]"),
+        // `$x` is the value the *call site's* `.` produced, whatever `.` is
+        // where it is read -- the substituted expression re-ran against the
+        // reader's `.` instead (`1`, `[1,2]`, `null`).
+        ("5 | def f($x): 1 | $x; f(.)", "5"),
+        ("[1,2] | def f($x): .[] | $x; [f(.)]", "[[1,2],[1,2]]"),
+        ("{\"a\":7} | def f($x): {b: 1} | $x; f(.a)", "7"),
+        // The bare name is still a path expression.
+        ("{\"a\":1} | def f($x): x |= 3; f(.a)", "{\"a\":3}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+
+    // A bound `$x` is a value, not a path: every path consumer refuses it
+    // exactly as jq 1.7.1 does, where the substituted `.a` used to write
+    // straight through (`{"a":3}`, `{}`, `[["a"]]`).
+    for filter in [
+        "{\"a\":1} | def f($x): $x; [path(f(.a))]",
+        "{\"a\":1} | def f($x): $x; f(.a) |= 3",
+        "{\"a\":1} | def f($x): $x |= 3; f(.a)",
+        "{\"a\":1} | def f($x): del($x); f(.a)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression with result 1"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
     Ok(())
 }
 
