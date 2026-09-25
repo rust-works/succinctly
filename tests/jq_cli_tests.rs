@@ -56249,6 +56249,150 @@ fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
     Ok(())
 }
 
+/// #2760: `and`/`or`/unary minus on an **untracked** input resolve their
+/// operand(s) live, so navigation inside them is refused as jq refuses it --
+/// the same gap #2689 closed for `[E]`. Unlike `[E]`, `and`/`or` are not
+/// subexps in jq (`cannot_move_register`'s own doc comment): they fork with
+/// short-circuit, so the fix is a nested `resolve_node_sink` call per
+/// operand rather than a resolve-then-collect. Unary minus needs no
+/// short-circuit (one operand, always evaluated); its wrong answer was not a
+/// missing refusal but the *wrong* error (`"boolean (false) cannot be
+/// negated"`, from evaluating the operand by value first, instead of the
+/// operand's own navigation refusal). All captured live from jq 1.7.1.
+#[test]
+fn test_path_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() -> Result<()> {
+    for (filter, doc, element) in [
+        (
+            "path(. as {a:$v0} | (.a and true) | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | (true and .a) | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | (.a or true) | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            // `or`'s left must be falsy to force the right side, unlike
+            // `and`'s truthy-left row above -- `true or .a` short-circuits
+            // and never reaches `.a` at all (see the boundary test below).
+            "path(. as {a:$v0} | (false or .a) | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | -(.a) | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        // no destructuring: the real root cause, same as #2689's own control
+        (
+            "path(1 | (.a and true) | empty)",
+            "null",
+            r#"element "a" of 1"#,
+        ),
+        ("path(1 | -(.a) | empty)", "null", r#"element "a" of 1"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter} on {doc}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to "),
+            "{filter} on {doc}: {stderr:?}"
+        );
+        assert!(stderr.contains(element), "{filter} on {doc}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2760's short-circuit half: the operand `and`/`or` never reaches must
+/// never be evaluated either -- confirmed live that jq itself raises
+/// nothing for these (the un-taken side's own navigation is simply never
+/// attempted), so a refusal here would be a regression, not the fix.
+#[test]
+fn test_and_or_short_circuit_skips_the_untaken_operand_on_untracked_input_2760() -> Result<()> {
+    for (filter, doc) in [
+        (
+            "path(. as {a:$v0} | ($v0 and .b) | empty)",
+            r#"{"a":false,"b":true}"#,
+        ),
+        (
+            "path(. as {b:$v0} | ($v0 or .a) | empty)",
+            r#"{"a":false,"b":true}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            code, 0,
+            "{filter}: must not evaluate the short-circuited side; stderr {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2760 seen from the side that does damage: `del()` and `|=` consume the
+/// same resolution, so the missing refusal was a **refused edit reported as
+/// a successful no-op** -- the document came back unchanged at exit 0 where
+/// jq exits 5. Captured live from jq 1.7.1.
+#[test]
+fn test_write_refuses_navigation_inside_and_or_negate_on_untracked_input_2760() -> Result<()> {
+    let doc = r#"{"a":false}"#;
+    for filter in [
+        "del(. as {a:$v0} | (.a and true) | empty)",
+        "del(. as {a:$v0} | (.a or true) | empty)",
+        "del(. as {a:$v0} | -(.a) | empty)",
+        "(. as {a:$v0} | (.a and true) | empty) |= 5",
+        "(. as {a:$v0} | -(.a) | empty) |= 5",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(
+            code, 0,
+            "{filter}: must refuse, not no-op; stdout {stdout:?}"
+        );
+        assert!(
+            stderr.contains(r#"near attempt to access element "a" of {"a":false}"#),
+            "{filter}: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "", "{filter}: nothing written");
+    }
+    Ok(())
+}
+
+/// #2760's boundary, so the arm cannot degrade into "refuse every and/or/
+/// negate on an untracked input". Each row is something jq accepts, and
+/// each is unchanged by the fix -- a trackable input, a literal operand, no
+/// navigation at all, and a `TrackedVar` operand (the same #2759 exclusion
+/// #2689's own array arm needs, for the identical reason: a marked `$var`
+/// this arm cannot certify against the ambient register would be refused
+/// here where jq accepts it). All captured live from jq 1.7.1.
+#[test]
+fn test_and_or_negate_on_untracked_input_boundary_2760() -> Result<()> {
+    for (filter, doc) in [
+        ("path((.a and true) | empty)", r#"{"a":false}"#),
+        ("1 as $x | path(($x and false) | empty)", "null"),
+        ("1 as $x | path(($x or false) | empty)", "null"),
+        (
+            "path(. as {a:$v0} | ($v0 and true) | empty)",
+            r#"{"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | ($v0 or false) | empty)",
+            r#"{"a":false}"#,
+        ),
+        ("path(. as $v0 | -$v0 | empty)", "5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: must stay accepted; stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+    }
+    Ok(())
+}
+
 /// #2349 control: the same gate's *array* elements must also validate the
 /// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
 /// stray-comma cases above -- a distinct `#1677` check

@@ -33842,6 +33842,136 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             }
         }
 
+        // #2760: `and`/`or` fork the way jq's own `gen_and`/`gen_or` do --
+        // unlike `[E]`'s backtracking collect just above, a truthy left
+        // operand's navigation genuinely moves jq's register onto wherever
+        // it left off rather than restoring it (`cannot_move_register`'s own
+        // doc comment: "not subexps"), so this arm cannot reuse the array
+        // arm's resolve-then-restore shape. It exists only to give an
+        // *untracked* input's operands the same live navigation checking the
+        // array arm gives `[E]`'s contents: on an untracked input there is
+        // no register to carry either way, so every emitted boolean is a
+        // fresh, unregistered value regardless of which operand decided it.
+        // `right` runs only for the `left` outputs that need it (jq's own
+        // short-circuit) -- a nested `resolve_node_sink` call inside
+        // the outer sink, the same shape `resolve_index_expr_sink` already
+        // drives for `E[K]`'s per-pair `key`/`target`.
+        //
+        // Confirmed live against jq 1.7.1: `path(. as {a:$v0} | (.a and
+        // true) | empty)` on `{"a":false}` raises "near attempt to access
+        // element \"a\"" (exit 5); this arm was added because succinctly
+        // answered exit 0 for it, evaluating `.a` by value through the
+        // eager catch-all instead of checking its navigation.
+        Expr::And(left, right)
+            if !trackable
+                && untracked_operand_resolves_live::<S>(left)
+                && untracked_operand_resolves_live::<S>(right) =>
+        {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow =
+                resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
+                    if !l.value.is_truthy() {
+                        return sink(untracked_at_register(
+                            Cow::Owned(OwnedValue::Bool(false)),
+                            false,
+                            value,
+                        ));
+                    }
+                    match resolve_node_sink::<S>(
+                        right,
+                        value,
+                        trackable,
+                        snapshot,
+                        frame,
+                        keep,
+                        &mut |r| {
+                            sink(untracked_at_register(
+                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
+                                false,
+                                value,
+                            ))
+                        },
+                    ) {
+                        ResolveFlow::Exhausted => Demand::Continue,
+                        other => {
+                            inner_flow = Some(other);
+                            Demand::Stop
+                        }
+                    }
+                });
+            inner_flow.unwrap_or(flow)
+        }
+        // #2760: mirror image of `And` just above -- `or` short-circuits on
+        // a truthy `left` instead of a falsy one.
+        Expr::Or(left, right)
+            if !trackable
+                && untracked_operand_resolves_live::<S>(left)
+                && untracked_operand_resolves_live::<S>(right) =>
+        {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow =
+                resolve_node_sink::<S>(left, value, trackable, snapshot, frame, keep, &mut |l| {
+                    if l.value.is_truthy() {
+                        return sink(untracked_at_register(
+                            Cow::Owned(OwnedValue::Bool(true)),
+                            false,
+                            value,
+                        ));
+                    }
+                    match resolve_node_sink::<S>(
+                        right,
+                        value,
+                        trackable,
+                        snapshot,
+                        frame,
+                        keep,
+                        &mut |r| {
+                            sink(untracked_at_register(
+                                Cow::Owned(OwnedValue::Bool(r.value.is_truthy())),
+                                false,
+                                value,
+                            ))
+                        },
+                    ) {
+                        ResolveFlow::Exhausted => Demand::Continue,
+                        other => {
+                            inner_flow = Some(other);
+                            Demand::Stop
+                        }
+                    }
+                });
+            inner_flow.unwrap_or(flow)
+        }
+        // #2760: unary minus has one operand, always evaluated -- no
+        // short-circuit, so this is the simpler half of the fix. Its
+        // current wrong answer isn't a missing refusal (it already raises)
+        // but the *wrong* error: evaluating `.a` by value first reports
+        // "boolean (false) cannot be negated" where jq's live path-tracked
+        // evaluation reaches `.a`'s own navigation refusal first. Resolving
+        // `inner` live surfaces that refusal the same way every other arm
+        // here does; `arith_negate`'s own error (an ordinary catchable
+        // `EvalError`, unrelated to path-refusal) still applies once `inner`
+        // resolves to something.
+        Expr::Negate(inner) if !trackable && untracked_operand_resolves_live::<S>(inner) => {
+            let mut inner_flow: Option<ResolveFlow> = None;
+            let flow = resolve_node_sink::<S>(
+                inner,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| match arith_negate::<S>(branch.value.into_owned()) {
+                    Ok(negated) => sink(untracked_at_register(Cow::Owned(negated), false, value)),
+                    Err(e) => {
+                        inner_flow = Some(ResolveFlow::Escaped(e.into()));
+                        Demand::Stop
+                    }
+                },
+            );
+            inner_flow.unwrap_or(flow)
+        }
+
         // #2267: both computed-navigation resolvers drive their own
         // generators (`K`/`S`/`T`) and re-resolve `target` per pair, so a
         // native arm here is what lets a bounded consumer's demand reach
@@ -35531,6 +35661,26 @@ fn array_resolves_live<S: EvalSemantics>(inner: &Expr, trackable: bool) -> bool 
             (!trackable && matches!(e, Expr::TrackedVar(_)))
                 || matches!(e, Expr::Builtin(Builtin::GetPath(_)))
         })
+}
+
+/// Whether `path()`'s `Expr::And`/`Expr::Or`/`Expr::Negate` arms (#2760) may
+/// resolve `operand` live, rather than falling to the eager catch-all that
+/// evaluates it by value and never checks navigation inside for an
+/// untracked input. Callers already restrict this to the `!trackable` case,
+/// so unlike [`array_resolves_live`] there is no `cannot_move_register`
+/// half to check here -- an untracked input has no register for the result
+/// to carry either way, whatever `operand` does inside it.
+///
+/// Shares only [`array_resolves_live`]'s `TrackedVar` exclusion, for the
+/// identical #2759 reason: a marked `$var` this arm cannot certify against
+/// the ambient register would be refused here where jq accepts it (an outer
+/// fold register might still recognise it once control returns above this
+/// arm). `GetPath`'s exclusion is specific to `[E]`'s own collected
+/// register-carry ([`array_contents_are_checked`]); and/or/negate's boolean
+/// or numeric result never claims one, so there is nothing for that
+/// exclusion to protect here.
+fn untracked_operand_resolves_live<S: EvalSemantics>(operand: &Expr) -> bool {
+    S::TAG == EvalTag::Jq && !any_subexpr(operand, &mut |e| matches!(e, Expr::TrackedVar(_)))
 }
 
 /// Whether every navigation jq would path-check inside `[inner]` is one the
