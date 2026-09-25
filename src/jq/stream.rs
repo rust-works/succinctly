@@ -33,8 +33,8 @@ use super::eval_generic::key_owned_value;
 // mode passed at the three `keys` writers below is yq's (#2936).
 use super::eval::YqSemantics;
 use super::value::{
-    assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
-    jq_bare_float_display, NumberRepr, OwnedValue,
+    assert_value_tree_depth, format_number_for_preview, format_number_jq_compat,
+    infinite_float_preview_text, jq_bare_float_display, NumberRepr, OwnedValue,
 };
 use crate::yaml::{format_float_with_fraction, format_float_yq_yaml, format_float_yq_yaml_nested};
 
@@ -340,6 +340,12 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
 ) -> core::fmt::Result {
     // Always compact: this is the jq-error-message convention, which never
     // pretty-prints.
+    //
+    // `format_number_for_preview`, not `format_number_jq_compat` (PR #3281
+    // review): every call site of this function funnels straight into
+    // `dump_truncated`'s own tiny (14-29 byte) `PreviewSink` budget (see
+    // that function's own doc comment), so a number literal here must stay
+    // cheap to *construct* regardless of how large its source text is.
     stream_owned_value_json_with(
         value,
         out,
@@ -351,7 +357,7 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         jq_bare_float_display,
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
-        format_number_jq_compat,
+        format_number_for_preview,
     )
 }
 
@@ -447,11 +453,16 @@ fn preview_infinite_literal(raw: &[u8]) -> String {
     // The document literal this overflowed from is right here, so unlike
     // the plain-`Float` case this can do better than `DBL_MAX` text: reuse
     // the same jq-canonical-formatting path finite `NumberLiteral`s already
-    // go through — `format_number_jq_compat` now handles a non-finite input
-    // via `format_overflow_literal_mantissa` instead of the finite path's
-    // `log10`/`pow` (see that function's doc comment for why the split is
-    // necessary), so this can call it unconditionally.
-    format_number_jq_compat(raw)
+    // go through, via `format_overflow_literal_mantissa` instead of the
+    // finite path's `log10`/`pow` (see that function's doc comment for why
+    // the split is necessary).
+    //
+    // `format_number_for_preview`, not `format_number_jq_compat` (PR #3281
+    // review): this function is `stream_owned_value_json_jq`'s own
+    // `infinite_literal` -- reached only from `dump_truncated`'s tiny
+    // preview budget, same as `finite_literal` just below it in that call,
+    // so it needs the identical construction-cost bound.
+    format_number_for_preview(raw)
 }
 
 /// Stream an OwnedValue as JSON without intermediate string allocation, using
