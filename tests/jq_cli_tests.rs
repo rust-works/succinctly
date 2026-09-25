@@ -68333,6 +68333,9 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r#"del(. as $x | has("a") | ($x.a)?)"#,
         r#"del(. as $x | has("a") | try $x["a"])"#,
         r#"del(. as $x | has("a") | try ($x | .[]))"#,
+        r#"del(. as $x | has("a") | "a" as $k | try ($x | .[$k]))"#,
+        r#"del(. as $x | has("a") | 0 as $i | try ($x | .l[$i:1]))"#,
+        r#"del(. as $x | has("a") | try ($x as {a:$q} | $q))"#,
         r#"del(. as $x | has("a") | try ($x | .a) catch empty)"#,
         r#"del(. as $x | has("a") | $x | try .a)"#,
         r#"del(. as $x | has("a") | label $out | try ($x | .a))"#,
@@ -68348,7 +68351,8 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         r"del(. as $x | (def f: 5; f) | try ($x | .k))",
         r"del(. as $x | [.a] | try ($x | .a))",
     ] {
-        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1,"l":[1,2]}"#))?;
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");
         assert!(stdout.is_empty(), "{filter}: stdout: {stdout:?}");
         assert!(
@@ -68408,6 +68412,29 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
             r#"{"a":{"b":1},"k":1}"#,
         ),
         (r"del(.[] | try (.b))", r#"{"a":{},"k":1}"#),
+        // Where the register was lost is known, so a `$x` or `null` that is
+        // not that value or inside it cannot be it: jq's refusal is exact.
+        (
+            r#"del(. as $x | .a | has("b") | try ($x | .k))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(.a.zz as $x | has("a") | try ($x | .q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(.a | has("b") | try (null | .x))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (r"[path(.arr[0:1]? as $v0 | (abs?) | ($v0 | .b?)?)]", "[]"),
+        (
+            r#"del(. as $x | has("a") | "a" as $k | try (5 | .[$k]))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
+        (
+            r#"del(. as $x | has("a") | try ({"z":1} as {a:$q} | $q))"#,
+            r#"{"a":{"b":1},"k":1}"#,
+        ),
         // #3186's subexp stage keeps the register, so there is nothing to
         // guess: `$x` re-establishes and the path is jq's.
         (r"[path(. as $x | { k: .a } | try ($x | .a))]", r#"[["a"]]"#),
@@ -68417,14 +68444,15 @@ fn test_guessed_path_refusal_is_not_caught_by_try_3267() -> Result<()> {
         assert_eq!(stdout.trim_end(), expected, "{filter}");
     }
 
-    // The recorded price (docs/compliance/jq/limitations.md, #3267): a stage
-    // that *did* move jq's register, invisibly to this resolver, makes jq's
-    // refusal exact and caught -- jq 1.7.1 prints the document unchanged --
-    // but this resolver cannot tell it from one that did not, so it refuses
-    // loudly rather than risk the silent loss above.
+    // The recorded price (docs/compliance/jq/limitations.md, #3267): a value
+    // at or inside the lost register that jq's register did *not* land on --
+    // its refusal is exact and caught in jq 1.7.1, which prints the document
+    // unchanged -- but this resolver cannot tell the stage that left the
+    // register alone (`has`) from one that moved it there (`first(.a)`), so
+    // it refuses loudly rather than risk the silent loss above.
     for filter in [
         r"del(. as $x | (def f: .a; f) | try ($x | .k))",
-        r"[path(.arr[0:1]? as $v0 | (abs?) | ($v0 | .b?)?)]",
+        r#"del(.a as $y | has("z") | try ($y | .b))"#,
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1},"k":1}"#))?;
         assert_eq!(code, 5, "{filter}: stdout: {stdout:?}");

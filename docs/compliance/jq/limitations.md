@@ -743,7 +743,10 @@ is the revert that established what the other one costs.
      one this resolver can't see inside, or its route hands back no register, like a `reduce`
      stage);
    - the value being refused is one jq could still have held as the register: a frozen
-     `$var` snapshot or `null`.
+     `$var` snapshot or a `null`, equal to the lost register's last known value or to one
+     inside it. jq's register only moves down from where it was lost, so a `$x` frozen from
+     the root can't be a register lost at `.a`, and a `null` can't be one if the lost value
+     holds none.
 
    Uncatchable here means by the `try` beside the refusal, by any `try` further out, and by a
    value-position `?` around the whole `del`/assignment, so the refusal is a loud exit 5
@@ -752,17 +755,25 @@ is the revert that established what the other one costs.
    the register (`$x \| try (5 \| .a)` is caught in both), and after `.a` the register
    provably moved.
 
-   The price is the case this resolver can't tell apart: a stage that *did* move jq's register,
-   invisibly. There jq's refusal is exact and caught, and this refuses loudly:
-   - `del(. as $x \| (def f: .a; f) \| try ($x \| .k))` returns the document unchanged in jq;
-   - `path(.arr[0:1]? as $v0 \| (abs?) \| ($v0 \| .b?)?)` is `[]` in jq, whose jq-defined
-     `abs` hands a non-number back untouched, but `abs` is opaque here;
-   - `.a \| has("b") \| try (null \| .x)` is the `null` spelling.
+   The price is the case this resolver can't tell apart: a value at or inside the lost register
+   that jq's register did *not* land on. There jq's refusal is exact and caught, and this refuses
+   loudly, because the stage in between is opaque and might have moved the register there:
+   - `del(.a as $y \| has("z") \| try ($y \| .b))` returns the document unchanged in jq, since
+     `has` left the register at the root, but `first(.a)` would have moved it onto `$y`;
+   - `del(. as $x \| (def f: .a; f) \| try ($x \| .k))` is the reverse: the `def` really did move
+     the register, off `$x`;
+   - after a `reduce`/`foreach` stage, whose route hands back no register value, where the
+     register was lost isn't known at all, so every `$var` or `null` refusal after one is loud:
+     `path((.a \| ..) as $v0 \| reduce (1) as $i (.; $v0) \| ($v0 \| .b?)?)` is empty in jq
+     and refuses here.
 
    The wording can differ too, both tools refusing: jq ends
    `del(. as $x \| has("a") \| reduce (1) as $i ($x; try ($x \| .zz)))` with its try-caught
    fold's `Invalid path expression with result null`, while this raises the refusal itself
-   (`… near attempt to access element "zz" of …`).
+   (`… near attempt to access element "zz" of …`). Likewise a guess raised in an earlier
+   branch pre-empts the error jq reports from a later one:
+   `del(. as $x \| has("a") \| (try ($x \| .a)), .k)` fails in jq on the `.k` (applied to
+   `true`), and here on the guessed `$x \| .a`.
 
    One residual keeps the silent drop. A *terminal* refusal (the pipe's last value is a `$var`,
    with no navigation after it) is still decided where the per-branch knowledge is gone, so a
