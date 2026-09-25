@@ -8162,6 +8162,60 @@ filtered content of `valid` after its error line. Under `-s` the same gap lets `
 readable files into output (`[]` when none opened) while still exiting 2; succinctly emits no
 output. Both are unfiled follow-ups to the exit-code change, not part of its scope.
 
+## Bare `..`/`recurse` on a `$var` off the register: a nested-fold refuse-only residual (#3048)
+
+`resolve_node_sink`'s bare-recursion arm (#2761) emits the identity seed of an untracked
+value, then raises `invalid_path_expression_near_iterate` if the continuation discards
+that seed and asks for more — matching jq's own `def r: ., (f | r); r;` unfolding of
+`.[]?` at its own path register. Before #3048 this arm only fired when the value was
+*plainly* untracked (`!snapshot.is_marked()`); an untracked value that still carried a
+[`Snapshot`](../../../src/jq/eval.rs) mark — a `$var` bound off the register, which
+`resolve_node_sink`'s `TrackedVar` arm could not certify against the current position —
+fell through to `resolve_recursive_descent_sink` instead, whose plain structural descent
+performs no iterate check at all. That let `del()`/`|=`/`=` succeed as silent no-ops
+where jq exits 5:
+
+```console
+$ echo '{"a":[1],"c":1}' | jq 'del(.a as $x | $x | .. | select(false))'
+jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through [1]
+$ echo '{"a":[1],"c":1}' | succinctly jq 'del(.a as $x | $x | .. | select(false))'
+{"a":[1],"c":1}
+```
+
+#3048 widens the arm's guard to `!trackable` alone (dropping `!snapshot.is_marked()`):
+a marked-but-untracked `$var` now refuses through the same path a plain untracked value
+already did, `recurse_family_root_seed` still passing `snapshot` through unchanged so the
+emitted seed keeps its mark (a bound consumer can still stop on it, and an outer fold
+register can still recognise it) — only the *descent past* that seed is refused. A
+`trackable` input is unaffected: it keeps the fast structural descent
+`resolve_recursive_descent_sink` was already correct for. yq mode is unaffected too —
+its own eager `recurse_untracked_error` guard (#843/#1591) already excludes a marked
+snapshot from refusing here for a different, still-valid reason: real yq's lexer rejects
+`recurse(f)` outright, so a marked `$var` reaching the walk below and correctly re-emitting
+its own mark is the intended behaviour there, not this bug.
+
+**One residual, refuse-only row remains**, unclosed by this fix and out of its scope
+(confirmed live against jq 1.7.1, `main` `af43dc42b`):
+
+```console
+$ echo '{"a":1}' | jq 'path(. as $x | foreach (1) as $i (0; 5; foreach (1) as $j (0; 6; $x | .. | select(false))))'
+                                                                                                                    # no output, exit 0
+$ echo '{"a":1}' | succinctly jq 'path(. as $x | foreach (1) as $i (0; 5; foreach (1) as $j (0; 6; $x | .. | select(false))))'
+jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through {"a":1}   # exit 5
+```
+
+Two nested `foreach` folds each hold their own copy of `$x`'s register; by the time the
+inner fold's extract runs, jq's *actual* current register has cycled back around to where
+`$x` was bound, so jq accepts. Nothing at the point of the iterate check here can see
+either fold's own register state — the same limitation `recurse(.[]?)`'s own eager guard
+already has (#843) — so the fixed `..`/`recurse` refuses where jq would accept. `..` used
+to get this row right *by accident*, because it deferred everything to the (never-checking)
+structural descent this issue closes; `recurse(.[]?)` already refused it before this fix
+and still does after. Closing this residual needs the iterate check to see the outer fold
+register, which is out of scope here — tracked as a follow-up alongside #3048 rather than
+opened as its own issue, since no design for surfacing fold-register state to a
+`resolve_node_sink` arm exists yet.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |

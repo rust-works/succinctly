@@ -33238,8 +33238,22 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `try` catch the later navigation error. `recurse_down` retains its
         // internal alias behavior; jq 1.7.1 has no such spelling.
         // jq only: yq and parameterized recursion keep the guard below.
+        //
+        // #3048: no `!snapshot.is_marked()` restriction here, unlike the yq
+        // arm below -- a marked but untracked `$var` (one `TrackedVar`
+        // couldn't certify against the current register) must refuse the
+        // same way an ordinary untracked value does. `recurse_family_root_seed`
+        // still passes `snapshot` through unchanged, so the emitted seed
+        // keeps its mark (a bound consumer can still stop on it, and an
+        // outer fold register can still recognise it) -- only the *descent*
+        // past that seed is refused, matching `recurse(.[]?)` and jq's own
+        // `def r: ., (f | r); r;` unfolding of `.[]?` at the register.
+        // Falling through to `resolve_recursive_descent_sink` instead (as a
+        // marked snapshot did before this fix) skipped that check entirely,
+        // silently answering where jq exits 5 with "Invalid path expression
+        // near attempt to iterate".
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
-            if S::TAG == EvalTag::Jq && !trackable && !snapshot.is_marked() =>
+            if S::TAG == EvalTag::Jq && !trackable =>
         {
             match sink(recurse_family_root_seed(value, trackable, snapshot)) {
                 Demand::Stop => ResolveFlow::Stopped,

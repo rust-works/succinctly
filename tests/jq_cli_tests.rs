@@ -66519,6 +66519,186 @@ fn test_bare_recurse_untracked_seed_and_catch_2761() -> Result<()> {
     Ok(())
 }
 
+/// #3048: `.a as $x` binds `$x` from the real, connected input register,
+/// then the continuation moves `.` elsewhere before using `$x` -- so `$x`
+/// is untracked (off the register `resolve_node_sink`'s `TrackedVar` arm
+/// can certify) but still carries its own [`Snapshot`] mark. Bare
+/// `..`/`recurse` on it must refuse the same way an ordinary untracked
+/// value does (#2761's arm above) rather than falling through to
+/// `resolve_recursive_descent_sink`'s plain structural descent, which
+/// performs no iterate check at all. Every row confirmed live against jq
+/// 1.7.1 (`docs/compliance/jq/limitations.md` cross-references this issue
+/// for the one row that does *not* match, a documented refuse-only cost).
+#[test]
+fn test_bare_recurse_marked_var_off_register_refuses_iterate_3048() -> Result<()> {
+    let doc = r#"{"a":[1],"c":1}"#;
+    for stage in ["..", "recurse"] {
+        for body in [
+            format!(".a as $x | $x | {stage} | select(false)"),
+            format!(".a as $x | 5 | ($x | {stage}) | empty"),
+            format!(".a as $x | .c | $x | {stage} | select(false)"),
+            format!(".a as $x | if true then $x else . end | {stage} | select(false)"),
+            format!(".a as $x | ($x, .c) | {stage} | select(false)"),
+            format!(".a as $x | foreach (1) as $i (.c; 5; $x | {stage} | select(false))"),
+        ] {
+            let filter = format!("path({body})");
+            let (out, err, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+            assert_eq!(code, 5, "{filter}: out={out:?} err={err:?}");
+            assert_eq!(out, "", "{filter}");
+            assert!(
+                err.contains("Invalid path expression near attempt to iterate through [1]"),
+                "{filter}: err={err:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `del`/`|=` in value position reach the same refusal as `path()` — the
+/// document must come back byte-for-byte unchanged, matching jq's own
+/// all-or-nothing write semantics (an error aborts before any mutation).
+#[test]
+fn test_bare_recurse_marked_var_off_register_del_and_update_untouched_3048() -> Result<()> {
+    let doc = r#"{"a":[1],"c":1}"#;
+    for stage in ["..", "recurse"] {
+        let del_filter = format!(".a as $x | .c | $x | {stage} | select(false)");
+        let del_filter = format!("del({del_filter})");
+        let (out, err, code) = run_jq_full(&["-c", &del_filter], Some(doc))?;
+        assert_eq!(code, 5, "{del_filter}: out={out:?} err={err:?}");
+        assert_eq!(out, "", "{del_filter}: document must not print on refusal");
+
+        let update_filter = format!(".a as $x | .c | $x | {stage} | select(false)");
+        let update_filter = format!("({update_filter}) |= 5");
+        let (out, err, code) = run_jq_full(&["-c", &update_filter], Some(doc))?;
+        assert_eq!(code, 5, "{update_filter}: out={out:?} err={err:?}");
+        assert_eq!(
+            out, "",
+            "{update_filter}: document must not print on refusal"
+        );
+        let _ = err;
+    }
+    Ok(())
+}
+
+/// The explicit `recurse(.[]?)` spelling already refused this shape
+/// correctly (it never routed through the buggy `resolve_recursive_descent_sink`
+/// fallback); bare `..`/`recurse` must now agree with it on every marked
+/// shape, closing the drift #3048 flagged between the two spellings.
+#[test]
+fn test_bare_recurse_agrees_with_explicit_dot_bracket_optional_on_marked_var_3048() -> Result<()> {
+    for doc in [
+        r#"{"a":[1],"c":1}"#,
+        r#"{"a":{"k":1},"c":1}"#,
+        r#"{"a":[],"c":1}"#,
+    ] {
+        for stage in ["..", "recurse", "recurse(.[]?)"] {
+            let filter = format!(".a as $x | .c | $x | {stage} | select(false)");
+            let path_filter = format!("path({filter})");
+            let (out, err, code) = run_jq_full(&["-c", &path_filter], Some(doc))?;
+            assert_eq!(code, 5, "{doc} {path_filter}: out={out:?} err={err:?}");
+            assert_eq!(out, "", "{doc} {path_filter}");
+            let _ = err;
+        }
+    }
+    Ok(())
+}
+
+/// The seed itself performs no navigation, mirroring #2761's own
+/// seed-and-catch test for the unmarked case: a bounded consumer can still
+/// stop on it, and `try` can still catch the later iterate refusal, even
+/// though the value is a marked `$var` off the register.
+#[test]
+fn test_bare_recurse_marked_var_off_register_seed_and_catch_3048() -> Result<()> {
+    let doc = r#"{"a":[1],"c":1}"#;
+    for stage in ["..", "recurse"] {
+        for tail in [
+            format!("limit(1; {stage}) | empty"),
+            format!("try ({stage} | empty) catch empty"),
+        ] {
+            let filter = format!("path(.a as $x | .c | $x | {tail})");
+            let (out, err, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+            assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0), "{filter}");
+        }
+    }
+    Ok(())
+}
+
+/// A `trackable` input (the `$var` is re-navigated back to where the
+/// register actually is) keeps the fast descent unchanged -- #3048's fix
+/// only widens the untracked-but-marked case, never a trackable one.
+#[test]
+fn test_bare_recurse_var_back_at_register_unaffected_by_3048() -> Result<()> {
+    let doc = r#"{"a":[1],"c":1}"#;
+    for stage in ["..", "recurse"] {
+        // `$x` is bound from `.a`, then re-navigated through `.a` again --
+        // back at the register jq itself would still be holding.
+        let full = format!("path(.a as $x | .a | $x | {stage} | select(false))");
+        let (jout, jerr, jcode) = run_jq_1_7_1(&full, doc)?;
+        let (out, err, code) = run_jq_full(&["-c", &full], Some(doc))?;
+        assert_eq!(code, jcode, "{full}: succ_err={err:?} jq_err={jerr:?}");
+        assert_eq!(out, jout, "{full}");
+    }
+    Ok(())
+}
+
+/// Documented, accepted refuse-only residual of #3048's fix (recorded in
+/// `docs/compliance/jq/limitations.md`'s "Bare `..`/`recurse` on a `$var`
+/// off the register" section): two nested `foreach` folds each hold their
+/// own copy of `$x`'s register, and by the time the inner extract runs
+/// jq's *actual* register has cycled back to where `$x` was bound, so jq
+/// accepts (`[]`, exit 0) where the fixed iterate check here — which
+/// cannot see either fold's own register state — refuses. Pinned so a
+/// future change to this arm surfaces as a deliberate decision, not a
+/// silent flip either direction.
+#[test]
+fn test_bare_recurse_marked_var_nested_fold_refuse_only_residual_3048() -> Result<()> {
+    let doc = r#"{"a":1}"#;
+    for stage in ["..", "recurse"] {
+        let filter = format!(
+            "path(. as $x | foreach (1) as $i (0; 5; foreach (1) as $j (0; 6; $x | {stage} | select(false))))"
+        );
+        let (jout, jerr, jcode) = run_jq_1_7_1(&filter, doc)?;
+        assert_eq!(
+            (jout.as_str(), jerr.as_str(), jcode),
+            ("", "", 0),
+            "{filter}"
+        );
+
+        let (out, err, code) = run_jq_full(&["-c", &filter], Some(doc))?;
+        assert_eq!(code, 5, "{filter}: out={out:?} err={err:?}");
+        assert_eq!(out, "", "{filter}");
+        assert!(
+            err.contains("Invalid path expression near attempt to iterate through"),
+            "{filter}: err={err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Executes `filter` against real `/usr/bin/jq` 1.7.1 with `doc` on stdin,
+/// returning `(stdout, stderr, exit_code)` -- mirrors [`run_jq_full`]'s own
+/// shape so a row can be asserted identical to the oracle directly rather
+/// than hand-copying its output into the test.
+fn run_jq_1_7_1(filter: &str, doc: &str) -> Result<(String, String, i32)> {
+    let mut child = Command::new("/usr/bin/jq")
+        .args(["-c", filter])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(doc.as_bytes())?;
+    let output = child.wait_with_output()?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    ))
+}
+
 // ---- #2878: a raw control character is not valid JSON on any input path ----
 
 /// Writes `["a<byte>b"]` to a temp file and returns it.
