@@ -1254,6 +1254,51 @@ pub fn is_preservable_number_literal(bytes: &[u8]) -> bool {
     has_trailing_dot_before_exponent(zero_stripped.as_deref().unwrap_or(bytes))
 }
 
+/// Whether a nested number span, read as **user text**, is a number at all.
+///
+/// `false` exactly when
+/// [`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes)
+/// would fall through every gate to `Null`.
+///
+/// jq's parser rejects the whole document for such a span (`[1.2.3]`,
+/// `[1ee5]`, `[9e999e999]`). The semi-index does not validate up front, so
+/// the span reaches a reader instead, and a reader raises on it (#3222) --
+/// the "validates what it decodes" rule ADR-0018's #2103 amendment settles
+/// on. Until #3222 the funnels read it as `null` (#966).
+///
+/// The gates are the funnel's own, in its order: a preservable literal, a
+/// decNumber special word (#2877), the leading-`+` peel, and the plain
+/// `i64`/`f64` parse the lossy fallback makes (which admits a bare trailing
+/// `.`, `1.`, as jq does). The reindex bridge's tokens are *not* decoded
+/// here -- that needs provenance (`JsonNumber::bridge_value`, #3034).
+/// `number_span_decodes_agrees_with_from_number_bytes_3222` pins the
+/// equivalence with the funnel in both modes.
+///
+/// # Example
+///
+/// ```
+/// use succinctly::json::validate::number_span_decodes;
+///
+/// assert!(number_span_decodes(b"1.500"));
+/// assert!(number_span_decodes(b"007"));
+/// assert!(number_span_decodes(b"1."));
+/// assert!(number_span_decodes(b"+.5"));
+/// assert!(number_span_decodes(b"-Infinity"));
+/// assert!(!number_span_decodes(b"1.2.3"));
+/// assert!(!number_span_decodes(b"1ee5"));
+/// assert!(!number_span_decodes(b"9e999e999"));
+/// ```
+#[must_use]
+pub fn number_span_decodes(bytes: &[u8]) -> bool {
+    if is_preservable_number_literal(bytes) || jq_special_number(bytes).is_some() {
+        return true;
+    }
+    if strip_leading_plus(bytes).is_some_and(is_preservable_number_literal) {
+        return true;
+    }
+    core::str::from_utf8(bytes).is_ok_and(|s| s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok())
+}
+
 /// The suffix [`computed_float_token`] appends to Rust's `{:e}` rendering,
 /// giving the token its second exponent marker.
 const COMPUTED_FLOAT_TOKEN_SUFFIX: &str = "e0";

@@ -869,56 +869,79 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
                     // unchanged, so a genuine null takes no new branch;
                     // the word test runs only once that prefix test has
                     // already failed, i.e. in what was the error arm.
-                    StandardJson::Number(JsonNumber {
-                        text: self.text,
-                        start: text_pos,
-                        bridge: self.index.bridge_tokens,
-                    })
+                    self.number_at(text_pos)
                 } else {
                     StandardJson::Error("invalid null")
                 }
             }
             // A leading `.` is accepted here too (in addition to `-`/an
             // ASCII digit) -- real jq's own number reader is lenient
-            // beyond strict JSON (`.5` -> `0.5`, #1171). No grammar
-            // validation here beyond the leading byte: this is a nested
-            // container's own field/element, and `nested_number_span`'s
-            // own doc comment explains why a malformed trailing shape
-            // must still resolve to one `Number` span rather than
-            // `Error`, matching this crate's established #966 precedent.
-            c if c == b'-' || c == b'.' || c.is_ascii_digit() => StandardJson::Number(JsonNumber {
-                text: self.text,
-                start: text_pos,
-                bridge: self.index.bridge_tokens,
-            }),
+            // beyond strict JSON (`.5` -> `0.5`, #1171). `number_at`
+            // decides from the whole span whether it is a number at all;
+            // a malformed one (`1.2.3`) is an `Error`, raised by whatever
+            // reads it (#3222).
+            c if c == b'-' || c == b'.' || c.is_ascii_digit() => self.number_at(text_pos),
             // jq's remaining number spellings (#2877), each an error arm
             // until now so valid RFC 8259 input still reaches none of
             // them: a leading `+` before a digit or `.` (`+1`, `+.5`,
-            // `+1.2.3` -- the last resolving to one span and then `null`
-            // downstream, exactly as `1.2.3` does), and decNumber's
-            // special words starting with `i`/`I`/`N`/`s`/`S` (`inf`,
-            // `Infinity`, `NaN`, `sNaN12`) or with `+` (`+inf`, `+nan`).
-            // A word that isn't one of those (`infx`, `nanx`, `Nope`) and
-            // a `+` before anything else (`+`, `+-1`, `+x`) stay errors:
-            // #966's "malformed span becomes `null`" precedent covers a
-            // number-*shaped* span only and must not grow to letters.
+            // `+1.2.3` -- the last resolving to one span and then an
+            // `Error`, exactly as `1.2.3` does), and decNumber's special
+            // words starting with `i`/`I`/`N`/`s`/`S` (`inf`, `Infinity`,
+            // `NaN`, `sNaN12`) or with `+` (`+inf`, `+nan`). A word that
+            // isn't one of those (`infx`, `nanx`, `Nope`) and a `+` before
+            // anything else (`+`, `+-1`, `+x`) stay errors here, before any
+            // span is taken, so the #1643 delimiter-gap check keeps seeing
+            // the span it always did.
             b'+' if matches!(self.text.get(text_pos + 1), Some(b'0'..=b'9' | b'.')) => {
-                StandardJson::Number(JsonNumber {
-                    text: self.text,
-                    start: text_pos,
-                    bridge: self.index.bridge_tokens,
-                })
+                self.number_at(text_pos)
             }
             b'+' | b'i' | b'I' | b'N' | b's' | b'S'
                 if special_number_end(self.text, text_pos).is_some() =>
             {
-                StandardJson::Number(JsonNumber {
-                    text: self.text,
-                    start: text_pos,
-                    bridge: self.index.bridge_tokens,
-                })
+                self.number_at(text_pos)
             }
             _ => StandardJson::Error("unexpected character"),
+        }
+    }
+
+    /// The number whose span starts at `text_pos`, or an `Error` when the
+    /// span is not a number jq reads (#3222).
+    ///
+    /// jq's parser rejects the whole document for a malformed number
+    /// (`[1.2.3]`, `[1ee5]`). The semi-index does not validate up front, so
+    /// the rejection happens here instead, where the value is read -- as a
+    /// malformed object member's does (#1194) -- and every route that reads
+    /// the value raises, while one that never reaches it (`.[1]`, `length`)
+    /// still answers: ADR-0018's #2103 amendment. Until #3222 the span was a
+    /// `Number` that the funnels read as `null` (#966) and `type` read as
+    /// `"number"`.
+    ///
+    /// The span is measured once, here, and kept in the `JsonNumber`, so the
+    /// check costs no extra pass over the digits: a strict scan settles an
+    /// ordinary number and yields its end, which `raw_bytes` would otherwise
+    /// have found with the greedy scan. Anything else -- a lenient spelling,
+    /// a decNumber word, a bridge token, a malformed span -- takes the
+    /// greedy span and asks
+    /// [`number_span_decodes`](crate::json::validate::number_span_decodes),
+    /// after [`JsonNumber::bridge_value`], which alone may decode a bridge
+    /// token (#3034).
+    #[inline]
+    fn number_at(&self, text_pos: usize) -> StandardJson<'a, W> {
+        let strict_end = strict_number_end(self.text, text_pos);
+        let end = strict_end.unwrap_or_else(|| nested_number_span(self.text, text_pos));
+        let n = JsonNumber {
+            text: self.text,
+            start: text_pos,
+            len: u32::try_from(end - text_pos).unwrap_or(UNMEASURED_SPAN),
+            bridge: self.index.bridge_tokens,
+        };
+        if strict_end.is_some()
+            || n.bridge_value().is_some()
+            || crate::json::validate::number_span_decodes(&self.text[text_pos..end])
+        {
+            StandardJson::Number(n)
+        } else {
+            StandardJson::Error(MALFORMED_NUMBER)
         }
     }
 
@@ -2371,7 +2394,7 @@ fn word_special_mask(word: u64) -> u64 {
 /// (a byte that begins a candidate number: `-`, an ASCII digit, or a
 /// leading `.`), for a value reached while materializing an
 /// already-recognized container's nested field/element (`value()`,
-/// `text_range()`, [`JsonNumber::find_end`] below).
+/// `text_range()`, [`nested_number_span`] below).
 ///
 /// Deliberately permissive, unlike [`number_literal_end`]: greedily
 /// consumes every subsequent `[0-9.eE+-]` byte with no grammar
@@ -2432,6 +2455,51 @@ fn nested_number_span(text: &[u8], start: usize) -> usize {
         }
     }
     i
+}
+
+/// The reason a nested number span that is not a number carries as a
+/// [`StandardJson::Error`] (#3222). A route that re-validates the document
+/// for its message (`EvalError::malformed_json_text`) names the fault more
+/// precisely; this is what the rest print.
+const MALFORMED_NUMBER: &str = "invalid numeric literal";
+
+/// Where the token at `start` ends, if it is
+/// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` and ends exactly where
+/// [`nested_number_span`] would end it -- i.e. the next byte is not in that
+/// span's greedy class. Such a span is a number to every decoder (RFC 8259
+/// plus jq's redundant leading zeros, #1149), so `JsonCursor::number_at`
+/// accepts it without taking the greedy span; every other shape, valid or
+/// not, answers `None` here and is decided on the whole span.
+#[inline]
+fn strict_number_end(text: &[u8], start: usize) -> Option<usize> {
+    #[inline]
+    fn digits(text: &[u8], mut i: usize) -> Option<usize> {
+        let from = i;
+        while i < text.len() && text[i].is_ascii_digit() {
+            i += 1;
+        }
+        (i > from).then_some(i)
+    }
+    let mut i = start;
+    if text.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    i = digits(text, i)?;
+    if text.get(i) == Some(&b'.') {
+        i = digits(text, i + 1)?;
+    }
+    if matches!(text.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(text.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        i = digits(text, i)?;
+    }
+    (!matches!(
+        text.get(i),
+        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+    ))
+    .then_some(i)
 }
 
 /// Where the token starting at `start` ends, if it is one of decNumber's
@@ -2560,10 +2628,20 @@ pub fn jq_number_token_end(text: &[u8], start: usize) -> Option<usize> {
 pub struct JsonNumber<'a> {
     text: &'a [u8],
     start: usize,
+    /// The span's length, measured once by `JsonCursor::number_at` while it
+    /// decides whether the span is a number (#3222), so
+    /// [`raw_bytes`](Self::raw_bytes) never rescans it. `u32` so the struct
+    /// stays 32 bytes; [`UNMEASURED_SPAN`] (a span that doesn't fit) sends
+    /// `raw_bytes` back to the scan.
+    len: u32,
     /// Copied from the index's `bridge_tokens` (#3034): whether this span
     /// may be one of the reindex bridge's number tokens.
     bridge: bool,
 }
+
+/// [`JsonNumber::len`]'s "not stored" value: a span of `u32::MAX` bytes or
+/// more, which `raw_bytes` measures again instead.
+const UNMEASURED_SPAN: u32 = u32::MAX;
 
 impl<'a> JsonNumber<'a> {
     /// The byte offset of the number's first character in the document
@@ -2575,8 +2653,15 @@ impl<'a> JsonNumber<'a> {
     }
 
     /// Get the raw bytes of the number.
+    #[inline]
     pub fn raw_bytes(&self) -> &'a [u8] {
-        let end = self.find_end();
+        // omni-dev: coverage tolerate reason="unreachable in practice: UNMEASURED_SPAN only arises when `end - text_pos` in `number_at` overflows u32 -- a single number span >= 4 GiB -- which no realistic (or practically constructible) test document approaches (#3222)"
+        let end = if self.len == UNMEASURED_SPAN {
+            nested_number_span(self.text, self.start)
+        } else {
+            self.start + self.len as usize
+        };
+        // omni-dev: coverage end
         &self.text[self.start..end]
     }
 
@@ -2665,10 +2750,6 @@ impl<'a> JsonNumber<'a> {
                 .or_else(|| crate::json::validate::jq_special_number(bytes))
                 .ok_or(JsonError::InvalidNumber)
         })
-    }
-
-    fn find_end(&self) -> usize {
-        nested_number_span(self.text, self.start)
     }
 }
 
@@ -3684,40 +3765,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
 
-    /// #966 follow-up (#1576 review): a structurally invalid number
-    /// (`1.2.3`) that `write_json_number` (`JsonConvention::JqCompat`)
-    /// sanitizes to `null` in *output* must also report falsy *here* under
-    /// that same convention, or `-e` on `.a` over `{"a": 1.2.3}` would exit
-    /// 0 despite the printed `null` -- inconsistent with the older
-    /// `to_owned`-based materializing path (still used whenever
-    /// `can_json_fast_path` excludes a query, e.g. `-S`), which already
-    /// correctly exits 1. `--preserve-input`/`Preserve` echoes the same
-    /// span unsanitized (still nominally a `Number`), so it stays truthy
-    /// there -- only `JqCompat` treats a malformed number as falsy.
-    ///
-    /// "Malformed" is "decodes to no number at all" (`as_f64` is `None`,
-    /// i.e. `from_number_bytes` gives `Null`), not "has no preservable
-    /// literal": since #2877 a document `nan`/`Infinity` is a number with no
-    /// literal spelling, and it is truthy in jq even though a NaN *prints*
-    /// as `null` (`jq -ne '[nan] | .[0]'` exits 0). The old literal-based
-    /// test also called `[1.]`'s element falsy while printing it as `1`.
-    ///
-    /// This runs once per streamed output value (`.[]` over a large array
-    /// reaches it per element), so the ordinary case is settled by the
-    /// `is_valid_number` scan alone -- a valid RFC 8259 span always decodes
-    /// -- and only a lenient span pays for the decode.
+    /// Decodes nothing (#2692). A malformed number is an `Error` value since
+    /// #3222 and so truthy here, as every value the index cannot read is;
+    /// it raises where something reads it. Until then it was a `Number` the
+    /// printer rendered as `null`, and this answered falsy for it under the
+    /// output's `JsonConvention` to keep `-e` consistent (#1576).
     #[inline]
-    fn is_falsy(&self, numbers: JsonConvention) -> bool {
-        match self.value() {
-            StandardJson::Null | StandardJson::Bool(false) => true,
-            StandardJson::Number(n) => {
-                numbers == JsonConvention::JqCompat && {
-                    let raw = n.raw_bytes();
-                    !crate::json::validate::is_valid_number(raw) && n.as_f64().is_err()
-                }
-            }
-            _ => false,
-        }
+    fn is_falsy(&self) -> bool {
+        matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
     }
 
     /// #1576: `JsonCursor` now implements both `stream_sequence_*` methods
@@ -9049,9 +9104,9 @@ mod tests {
 
     /// #3034: the bridge's number tokens decode only under the index built
     /// over bridge text. The same bytes in a user document are an ordinary
-    /// malformed span: `as_f64` refuses them like their neighbour spellings
-    /// (`9e999e998`, `1e0e1`), and neither `bridge_value` nor the
-    /// materializer's `bridge_computed_float` reads a value out of them.
+    /// malformed span, read like their neighbour spellings (`9e999e998`,
+    /// `1e0e1`): since #3222 that is an `Error` value, not a `Number` any
+    /// reader could take a value out of.
     #[test]
     fn bridge_tokens_decode_only_under_the_bridge_index_3034() {
         let tokens = [
@@ -9064,21 +9119,30 @@ mod tests {
         for token in &tokens {
             let json = format!("[{token}]");
             let bytes = json.as_bytes();
-            let number_under = |index: &JsonIndex| -> (Option<f64>, Result<f64, JsonError>, bool) {
-                let root = index.root(bytes);
-                let value = root.first_child().expect("one child").value();
-                let StandardJson::Number(n) = value else {
-                    panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
-                };
-                let computed = value.bridge_computed_float().is_some();
-                (n.bridge_value(), n.as_f64(), computed)
+            let bridge_index = JsonIndex::build_reindex(bytes);
+            let value = bridge_index
+                .root(bytes)
+                .first_child()
+                .expect("one child")
+                .value();
+            let StandardJson::Number(n) = value else {
+                panic!("expected a number"); // omni-dev: coverage tolerate-line reason="failure message for the assertion this #3034 test exists to make"
             };
-            let (bridge, as_f64, _) = number_under(&JsonIndex::build_reindex(bytes));
-            assert!(bridge.is_some(), "{token} must decode as bridge text");
-            assert!(as_f64.is_ok(), "{token} must decode as bridge text");
-            assert_eq!(
-                number_under(&JsonIndex::build(bytes)),
-                (None, Err(JsonError::InvalidNumber), false),
+            assert!(
+                n.bridge_value().is_some(),
+                "{token} must decode as bridge text"
+            );
+            assert!(n.as_f64().is_ok(), "{token} must decode as bridge text");
+            let user_index = JsonIndex::build(bytes);
+            assert!(
+                matches!(
+                    user_index
+                        .root(bytes)
+                        .first_child()
+                        .expect("one child")
+                        .value(),
+                    StandardJson::Error(MALFORMED_NUMBER)
+                ),
                 "{token} in a user document is a malformed number"
             );
         }
@@ -9096,6 +9160,101 @@ mod tests {
                 assert!(n.as_f64().is_ok(), "{word}");
                 assert_eq!(n.bridge_value(), None, "{word}");
             }
+        }
+    }
+
+    /// #3222: a nested span that is not a number jq reads is an `Error`
+    /// value, so every route that reads it raises, rather than a `Number`
+    /// the funnels read as `null` and `type` as `"number"` (#966). Its
+    /// siblings are untouched, and every lenient spelling jq accepts is
+    /// still a `Number`.
+    #[test]
+    fn malformed_nested_number_is_an_error_value_3222() {
+        for span in [
+            "1.2.3",
+            "1ee5",
+            "1-2",
+            "9e999e998",
+            "+1.2.3",
+            "-",
+            "1e",
+            "1.5e+",
+        ] {
+            for json in [format!("[{span},2]"), format!("{{\"a\":{span},\"b\":2}}")] {
+                let bytes = json.as_bytes();
+                let index = JsonIndex::build(bytes);
+                let first = index.root(bytes).first_child().expect("a child");
+                let value = if json.starts_with('{') {
+                    first.next_sibling().expect("a value").value()
+                } else {
+                    first.value()
+                };
+                assert!(
+                    matches!(value, StandardJson::Error(MALFORMED_NUMBER)),
+                    "{json}: {value:?}"
+                );
+            }
+        }
+        for span in [
+            "1",
+            "-0",
+            "007",
+            "1.500",
+            ".5",
+            "-.5",
+            "1.",
+            "1.e5",
+            "+1",
+            "+.5",
+            "nan",
+            "-Infinity",
+        ] {
+            let json = format!("[{span},2]");
+            let bytes = json.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let value = index.root(bytes).first_child().expect("a child").value();
+            assert!(
+                matches!(value, StandardJson::Number(_)),
+                "{json}: {value:?}"
+            );
+        }
+    }
+
+    /// #3222: `strict_number_end` is `JsonCursor::number_at`'s shortcut,
+    /// taken without the greedy span. It may only ever accept a span the
+    /// full decision also accepts, and the end it reports must be the one
+    /// the greedy span finds, since `raw_bytes` trusts it. Every string over
+    /// the greedy class up to five bytes, followed by a delimiter.
+    #[test]
+    fn strict_number_fast_path_implies_the_full_decision_3222() {
+        const CLASS: &[u8] = b"019.eE+-";
+        let mut frontier: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for prefix in &frontier {
+                for &b in CLASS {
+                    let mut span = prefix.clone();
+                    span.push(b);
+                    let mut text = span.clone();
+                    text.push(b',');
+                    if let Some(end) = strict_number_end(&text, 0) {
+                        assert_eq!(end, span.len(), "{:?}", String::from_utf8_lossy(&span));
+                        assert_eq!(
+                            nested_number_span(&text, 0),
+                            span.len(),
+                            "{:?}",
+                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
+                        );
+                        assert!(
+                            crate::json::validate::number_span_decodes(&span),
+                            "{:?}",
+                            String::from_utf8_lossy(&span) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- see the assert_eq! format argument above, same sweep (#3222)"
+                        );
+                    }
+                    next.push(span);
+                }
+            }
+            frontier = next;
         }
     }
 

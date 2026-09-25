@@ -8119,24 +8119,30 @@ where
                             index: c.index(),
                         };
                         let base = array_scratch.len();
-                        // #1676: tracks the last element's own end position
-                        // (cheap for a scalar; `None` for a container --
-                        // see `scalar_text_end`'s own doc comment) so a
-                        // trailing `,` before `]` (`[1,2,]`) can be caught
+                        // #1676: the last element's own end position (cheap
+                        // for a scalar; `None` for a container -- see
+                        // `scalar_text_end`'s own doc comment) lets a
+                        // trailing `,` before `]` (`[1,2,]`) be caught
                         // below, before anything is written. Reuses `pos`
                         // (already resolved by `check_preceding_delimiter`)
                         // via `value_at` rather than `child_cursor.value()`,
                         // which would re-derive the same position a second
                         // time -- see `scalar_text_end`'s own doc comment on
                         // why that matters on this hot path specifically.
-                        let mut last_gap_end = None;
+                        // Resolved for the last element only, after the
+                        // loop: every element's value used to be built here
+                        // and discarded, and since #3222 building a number
+                        // validates its span.
+                        let mut last_child = None;
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
                             let pos = check_preceding_delimiter(&child_cursor, i)?;
                             array_scratch
                                 .push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
-                            last_gap_end =
-                                pos.and_then(|s| child_cursor.value_at(s).scalar_text_end(s));
+                            last_child = Some((child_cursor, pos));
                         }
+                        let last_gap_end = last_child.and_then(|(child_cursor, pos)| {
+                            pos.and_then(|s| child_cursor.value_at(s).scalar_text_end(s))
+                        });
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b']') {
                                 array_scratch.truncate(base);
@@ -8261,8 +8267,9 @@ where
                         let mut remaining = fields;
                         let mut field_index = 0usize;
                         // #1676: mirrors the array arm's own tracking, for
-                        // the last field's *value* rather than an element.
-                        let mut last_gap_end = None;
+                        // the last field's *value* rather than an element --
+                        // resolved after the loop, for the last field only.
+                        let mut last_value = None;
                         while let Some((field, rest)) = remaining.uncons() {
                             // The `_` arm is *not* unreachable, whatever this
                             // comment used to claim: nothing enforces the JSON
@@ -8312,8 +8319,7 @@ where
                             // arm, reusing `value_start` via `value_at`
                             // rather than `field.value_cursor().value()`,
                             // which would re-derive it.
-                            last_gap_end = value_start
-                                .and_then(|s| field.value_cursor().value_at(s).scalar_text_end(s));
+                            last_value = Some((field.value_cursor(), value_start));
                             let (raw, escaped, has_del) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
@@ -8344,6 +8350,9 @@ where
                             ))
                             .into());
                         }
+                        let last_gap_end = last_value.and_then(|(value_cursor, value_start)| {
+                            value_start.and_then(|s| value_cursor.value_at(s).scalar_text_end(s))
+                        });
                         if let Some(gap_start) = last_gap_end {
                             if !c.trailing_element_gap_ok(gap_start, b'}') {
                                 scratch.truncate(base);

@@ -74,15 +74,12 @@ pub trait StreamableValue {
     /// Check if this value is falsy (null or false).
     ///
     /// Used for `--exit-status` flag handling without requiring full
-    /// materialization. `numbers` is the same convention `stream_json`
-    /// renders under (#966 follow-up, review of #1576): a structurally
-    /// invalid number span (`1.2.3`) sanitizes to `null` in `JsonCursor`'s
-    /// own `JqCompat` output, so it must also answer falsy *here* under
-    /// that convention to keep `-e`'s exit code consistent with what
-    /// actually got printed -- `Preserve` echoes the same span unsanitized
-    /// (still nominally a number), so it stays truthy there. Every other
-    /// implementor ignores the parameter; it exists only for `JsonCursor`.
-    fn is_falsy(&self, numbers: JsonConvention) -> bool;
+    /// materialization. Decodes nothing (#2692): a value the index could not
+    /// read is neither `null` nor `false`, so it is truthy here, and raises
+    /// only where something reads it. (Until #3222 this took the output's
+    /// `JsonConvention`, so a malformed number printed as `null` could
+    /// answer falsy to match.)
+    fn is_falsy(&self) -> bool;
 }
 
 /// Statistics returned from streaming operations.
@@ -248,7 +245,7 @@ impl StreamableValue for OwnedValue {
         stream_owned_value_yaml(self, out, "", indent.width, indent.unit, sort_keys)
     }
 
-    fn is_falsy(&self, _numbers: JsonConvention) -> bool {
+    fn is_falsy(&self) -> bool {
         matches!(self, Self::Null | Self::Bool(false))
     }
 }
@@ -2317,11 +2314,11 @@ mod tests {
 
     #[test]
     fn test_is_falsy() {
-        assert!(OwnedValue::Null.is_falsy(JsonConvention::JqCompat));
-        assert!(OwnedValue::Bool(false).is_falsy(JsonConvention::JqCompat));
-        assert!(!OwnedValue::Bool(true).is_falsy(JsonConvention::JqCompat));
-        assert!(!OwnedValue::Int(0).is_falsy(JsonConvention::JqCompat));
-        assert!(!OwnedValue::String(String::new()).is_falsy(JsonConvention::JqCompat));
+        assert!(OwnedValue::Null.is_falsy());
+        assert!(OwnedValue::Bool(false).is_falsy());
+        assert!(!OwnedValue::Bool(true).is_falsy());
+        assert!(!OwnedValue::Int(0).is_falsy());
+        assert!(!OwnedValue::String(String::new()).is_falsy());
     }
 
     /// `depth` levels of single-element array nesting: `[[[...[null]...]]]`.

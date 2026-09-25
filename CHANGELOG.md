@@ -230,6 +230,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **jq: a malformed nested number raises when read instead of reading as `null`** (#3222).
+  jq rejects `[1.2.3,2]` at parse time. succinctly used to print `[null,2]` for it, while
+  `.[0] | type` answered `"number"` and `.[0] | length` raised an error `try` could catch.
+  Now any route that reads such a number (`1.2.3`, `1ee5`, `9e999e998`, or a reindex-bridge
+  token in a user document) raises a document error at exit 5, and neither `try` nor `?` can
+  catch it. This matches how a malformed object member already behaved (#1194), under
+  ADR-0018's #2103 amendment. A route that never reaches the value (`.[1]`, `length`, `keys`)
+  still answers, and so does a truthiness test (`-e`, `select`, `not`). `--slurpfile` now
+  rejects such a document, as jq does.
+
+  Indexing into any value the index can't read (`.x`, `.[0]`, `has`, `getpath`, `length`),
+  including a malformed keyword like `tru`, now raises the same uncatchable document error.
+  Before, it was a type error naming an internal `error` type (`Cannot index error with
+  string "x"`), which `try` swallowed.
+
 - **jq `|=` now defers zero-output deletions across multiple paths** (#3030).
   Empty updates collect their target paths and delete them together after the
   last update, matching jq 1.7.1. Earlier deletions no longer shift later

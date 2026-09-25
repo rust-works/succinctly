@@ -964,14 +964,13 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     ///
     /// Used for `--exit-status` flag handling without requiring full
     /// materialization. Default implementation returns false (conservative
-    /// assumption). `numbers` is the same convention `stream_json` renders
-    /// under (#966 follow-up, review of #1576) -- see
-    /// [`StreamableValue::is_falsy`](crate::jq::stream::StreamableValue::is_falsy)'s
-    /// own doc comment for why a cursor's falsiness can depend on it.
-    fn is_falsy(&self, numbers: JsonConvention) -> bool {
-        let _ = numbers;
+    /// assumption); see
+    /// [`StreamableValue::is_falsy`](crate::jq::stream::StreamableValue::is_falsy).
+    // omni-dev: coverage tolerate reason="unreachable: both implementors (JsonCursor, YamlCursor) override this; the default exists as the conservative-`false` contract a future implementor inherits (#3222)"
+    fn is_falsy(&self) -> bool {
         false
     }
+    // omni-dev: coverage end
 }
 
 /// A value from a document (JSON value or YAML value).

@@ -3848,7 +3848,7 @@ impl ReindexedDoc {
 /// ordinary number (so it is never mistaken for a *valid* document
 /// literal), recognized by [`is_infinity_sentinel`] the same way
 /// `is_nan_sentinel` recognizes its sibling, and still built entirely from
-/// `[0-9-+.eE]` so `JsonNumber::find_end()`'s span scan captures it whole.
+/// `[0-9-+.eE]` so `nested_number_span`'s span scan captures it whole.
 /// A malformed document span can still spell it; what keeps that from
 /// reading as infinity is provenance, not spelling -- only a number read
 /// through an index built over bridge text decodes a token
@@ -3934,7 +3934,7 @@ fn yq_infinite_float_json_text(_negative: bool) -> &'static str {
 /// so `JsonCursor::value()`'s dispatcher (`src/json/light.rs`, which only
 /// recognizes `-`/an ASCII digit as the start of a `Number`) routes it to
 /// `StandardJson::Number` rather than `Error`; built entirely from
-/// `[0-9-+.eE]`, so `JsonNumber::find_end()`'s greedy span scan captures it
+/// `[0-9-+.eE]`, so `nested_number_span`'s greedy span scan captures it
 /// whole; and carrying two exponent markers, so `str::parse::<f64>()`/
 /// `::<i64>()` both reject it outright rather than silently overflowing to
 /// something else -- see `test_nan_sentinel_is_unparseable_as_a_real_number`.
@@ -6321,6 +6321,66 @@ mod tests {
                 OwnedValue::Null,
                 "{text}"
             );
+        }
+    }
+
+    /// #3222: `number_span_decodes` is the index's test for "this nested
+    /// span is a number", and a span it refuses becomes an `Error` the
+    /// readers raise. It must refuse exactly what the funnel reads as
+    /// `null`, in both modes: refusing more would raise on a number jq
+    /// reads, refusing less would leave a `null` the funnel still makes up.
+    /// Every span over the greedy class `[0-9.eE+-]` up to six bytes (the
+    /// shapes `nested_number_span` can capture), the decNumber words, and
+    /// 18+-digit spans (jq mode's own decimal reader, #2936).
+    #[test]
+    fn number_span_decodes_agrees_with_from_number_bytes_3222() {
+        fn check(text: &[u8]) {
+            let decodes = crate::json::validate::number_span_decodes(text);
+            for (mode, value) in [
+                ("jq", OwnedValue::from_number_bytes::<JqSemantics>(text)),
+                ("yq", OwnedValue::from_number_bytes::<YqSemantics>(text)),
+            ] {
+                assert_eq!(
+                    decodes,
+                    value != OwnedValue::Null,
+                    "{mode} {:?}",
+                    String::from_utf8_lossy(text) // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #3222 sweep's own assertion, only evaluated if the assert's own condition is false (#3222)"
+                );
+            }
+        }
+        const CLASS: &[u8] = b"019.eE+-";
+        let mut frontier: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..6 {
+            let mut next = Vec::with_capacity(frontier.len() * CLASS.len());
+            for prefix in &frontier {
+                for &b in CLASS {
+                    let mut span = prefix.clone();
+                    span.push(b);
+                    check(&span);
+                    next.push(span);
+                }
+            }
+            frontier = next;
+        }
+        for word in [
+            "nan",
+            "NaN",
+            "-nan",
+            "+nan",
+            "sNaN12",
+            "inf",
+            "-Infinity",
+            "+inf",
+            "nanx",
+            "inf1",
+        ] {
+            check(word.as_bytes());
+        }
+        let long = "123456789012345678901";
+        for tail in ["", ".5", "e5", "e", ".2.3", "e5e5", "."] {
+            check(format!("{long}{tail}").as_bytes());
+            check(format!("-{long}{tail}").as_bytes());
+            check(format!("0.{long}{tail}").as_bytes());
         }
     }
 
