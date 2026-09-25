@@ -25324,18 +25324,23 @@ pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // Same throwaway document `eval_owned_input_bridge` builds, and the
     // same `to_json_for_reindex` (not `to_json`) for the same reason (#561) --
-    // one per input document rather than one for a combined array.
-    let mut docs: Vec<Option<super::value::ReindexedDoc>> = vec_with_capacity(documents.len());
-    for (value, _, _) in documents {
-        if reindex_bridge_is_identity(value) {
-            match value.reindexed::<S>() {
-                Ok(doc) => docs.push(Some(doc)),
-                Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable via --eval-all: every document here comes straight from parse_input, whose own MAX_NESTING_DEPTH (256) guard already rejects anything deep enough to reach MAX_VALUE_TREE_DEPTH (384) here -- confirmed live, a 300-level document fails parse_input's guard before ever reaching this reindex (#3261)"
-            }
-        } else {
-            docs.push(None);
-        }
-    }
+    // one per input document rather than one for a combined array. No
+    // partial-result contract to preserve here (unlike #1989's own
+    // `.collect` avoidance elsewhere in this file): on any reindex error
+    // this returns `QueryResult::Error` unconditionally, the same outcome
+    // `.collect::<Result<_, _>>()` produces on its own first `Err`.
+    let docs: Vec<Option<super::value::ReindexedDoc>> = match documents
+        .iter()
+        .map(|(value, _, _)| {
+            reindex_bridge_is_identity(value)
+                .then(|| value.reindexed::<S>())
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(docs) => docs,
+        Err(e) => return QueryResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable via --eval-all: every document here comes straight from parse_input, whose own MAX_NESTING_DEPTH (256) guard already rejects anything deep enough to reach MAX_VALUE_TREE_DEPTH (384) here -- confirmed live, a 300-level document fails parse_input's guard before ever reaching this reindex (#3261)"
+    };
     let inputs: Vec<YqDocument<_>> = documents
         .iter()
         .zip(&docs)

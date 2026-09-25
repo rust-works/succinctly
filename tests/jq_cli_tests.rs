@@ -62064,6 +62064,17 @@ fn test_resource_limit_caps_are_uncatchable_2132() -> Result<()> {
             "def f: 1, f; f",
             "f/0 exceeded maximum recursion depth",
         ),
+        // #3261: MAX_VALUE_TREE_DEPTH, reached via reduce/foreach's own
+        // per-iteration reindex bridge -- newly routed through the
+        // catchable EvalError machinery by that fix, so it must be tagged
+        // `resource_limit` like every other cap in this table or it
+        // silently regresses into exactly the #2089 class this test
+        // guards against.
+        (
+            "MAX_VALUE_TREE_DEPTH",
+            "reduce range(400) as $i (null; [.])",
+            "nesting depth exceeds limit of 384",
+        ),
     ] {
         for spelling in [
             format!("[{expr}?] | length"),

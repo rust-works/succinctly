@@ -121,12 +121,19 @@ pub fn assert_value_tree_depth(depth: usize) {
 /// already has to [`eval_generic::assert_nesting_depth`](super::eval_generic::assert_nesting_depth)
 /// -- for `lazy.rs`'s `JqValue::try_materialize`, a CLI-output-boundary
 /// caller rather than the evaluator's own hot recursion, where a panic stays
-/// deliberate.
+/// deliberate. Since #3261, also reached from inside a running filter
+/// (`to_json_for_reindex`'s per-node check), so this has to be
+/// [`EvalError::resource_limit`] like every other succinctly-only cap
+/// (#2132) rather than a plain [`EvalError::new`] -- `MAX_VALUE_TREE_DEPTH`
+/// has no jq counterpart, so a `try`/`catch`/`?` written against jq
+/// semantics cannot have meant "accept a truncated value here either" (the
+/// same `[range(100001)?]` reasoning #2089/#2132 already established for
+/// every other internal ceiling).
 pub fn check_value_tree_depth(depth: usize) -> Result<(), EvalError> {
     if depth < MAX_VALUE_TREE_DEPTH {
         Ok(())
     } else {
-        Err(EvalError::new(nesting_depth_exceeded_message(
+        Err(EvalError::resource_limit(nesting_depth_exceeded_message(
             MAX_VALUE_TREE_DEPTH,
         )))
     }
@@ -3728,36 +3735,32 @@ impl OwnedValue {
     /// recorded upstream, at [`from_document_float`](Self::from_document_float),
     /// as a `NumberLiteral` that echoes verbatim below.
     /// Returns [`EvalError`] rather than panicking past
-    /// [`MAX_VALUE_TREE_DEPTH`] (#3261): `check_tree_depth`'s own allocation-
-    /// free walk shares [`to_json_for_reindex_at_depth`](Self::to_json_for_reindex_at_depth)'s
-    /// exact per-node depth semantics (both recurse into `Array`/`Object`
-    /// only, incrementing by one per level), so an `Ok` here guarantees that
-    /// function's own internal `assert_value_tree_depth` cannot fire
-    /// afterward -- a pre-flight check rather than threading `Result`
-    /// through the self-recursive formatter itself.
+    /// [`MAX_VALUE_TREE_DEPTH`] (#3261) -- see
+    /// [`to_json_for_reindex_at_depth`](Self::to_json_for_reindex_at_depth),
+    /// which checks depth once per node in the same pass that builds the
+    /// text, rather than a separate pre-flight walk.
     pub fn to_json_for_reindex<S: EvalSemantics>(&self) -> Result<String, EvalError> {
-        self.check_tree_depth()?;
-        Ok(self.to_json_for_reindex_at_depth::<S>(0))
+        self.to_json_for_reindex_at_depth::<S>(0)
     }
 
-    /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005) — see
-    /// that constant's own doc comment for why, and
-    /// [`to_json_at_depth`](Self::to_json_at_depth), which this mirrors.
+    /// Reports [`EvalError`] rather than panicking past
+    /// [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005, made catchable by
+    /// #3261) — see that constant's own doc comment for why, and
+    /// [`to_json_at_depth`](Self::to_json_at_depth), which this mirrors but
+    /// does not delegate the depth check to: `to_json_at_depth` still
+    /// panics (#1005's original CLI-output-boundary contract, unchanged),
+    /// so the `other` fallback arm below re-validates via
+    /// `check_value_tree_depth` first rather than calling it directly.
     /// This function's own callers (`reduce`/`foreach`/etc.'s per-iteration
     /// reindex bridge) are exactly the ones that grow a value one level
     /// deeper per loop iteration with no adversarial document involved, so
     /// it needs the same guard [`to_json`](Self::to_json) does.
-    ///
-    /// In practice this never fires (#3261): the only public entry point,
-    /// [`to_json_for_reindex`](Self::to_json_for_reindex), pre-checks the
-    /// identical depth condition via `check_tree_depth` and returns a
-    /// catchable [`EvalError`] before ever reaching this recursion. Kept as
-    /// a panicking backstop rather than removed, matching
-    /// [`to_json_at_depth`](Self::to_json_at_depth)'s own convention, in
-    /// case a future caller reaches this private function some other way.
-    fn to_json_for_reindex_at_depth<S: EvalSemantics>(&self, depth: usize) -> String {
-        assert_value_tree_depth(depth);
-        match self {
+    fn to_json_for_reindex_at_depth<S: EvalSemantics>(
+        &self,
+        depth: usize,
+    ) -> Result<String, EvalError> {
+        check_value_tree_depth(depth)?;
+        Ok(match self {
             Self::Float(f) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => NAN_SENTINEL.to_string(),
             Self::Float(f) if f.is_infinite() => overflow_literal(*f).to_string(),
@@ -3767,20 +3770,20 @@ impl OwnedValue {
                 let elements: Vec<String> = arr
                     .iter()
                     .map(|v| v.to_json_for_reindex_at_depth::<S>(depth + 1))
-                    .collect();
+                    .collect::<Result<Vec<String>, EvalError>>()?;
                 format!("[{}]", elements.join(","))
             }
             Self::Object(obj) => {
                 let entries: Vec<String> = obj
                     .iter()
                     .map(|(k, v)| {
-                        format!(
+                        Ok(format!(
                             "\"{}\":{}",
                             escape_json_body(write_json_body_jq, k),
-                            v.to_json_for_reindex_at_depth::<S>(depth + 1)
-                        )
+                            v.to_json_for_reindex_at_depth::<S>(depth + 1)?
+                        ))
                     })
-                    .collect();
+                    .collect::<Result<Vec<String>, EvalError>>()?;
                 format!("{{{}}}", entries.join(","))
             }
             // A bare finite `Float` is a *computed* value (or a tag-forced
@@ -3794,7 +3797,9 @@ impl OwnedValue {
             // `infinite_fmt` and `nan_text` are unreachable from here --
             // every NaN/infinite case is already handled by the arms above,
             // before this fallback -- so which are passed only matters for
-            // reading.
+            // reading. `check_value_tree_depth` above already validated
+            // `depth`, so `to_json_at_depth`'s own internal
+            // `assert_value_tree_depth` at this same depth cannot fire.
             other => other.to_json_at_depth(
                 depth,
                 format_number_jq_compat,
@@ -3802,7 +3807,7 @@ impl OwnedValue {
                 infinite_float_preview_text,
                 "null",
             ),
-        }
+        })
     }
 
     /// [`to_json_for_reindex`](Self::to_json_for_reindex)'s text, indexed as
