@@ -53730,11 +53730,24 @@ pub mod cli_context {
     /// '[input_filename, (input|input_filename)]'` is `[null,"in.json"]`), else
     /// the document the driver is evaluating. Stdin is `"<stdin>"`; nothing
     /// read yet is `null`.
+    ///
+    /// Also `null` once the position is genuinely lost (`UNKNOWN_LINE`,
+    /// e.g. a dropped `--seq -s` trailing record whose read closed the
+    /// stream, #3202) -- mirroring `remaining_inputs::last_line`'s own
+    /// `UNKNOWN_LINE` check (#1549) for `input_line_number`, which this
+    /// builtin never got the equivalent fix for. A source index alone
+    /// (`Some(source)`) can't distinguish "this document's file is
+    /// genuinely stdin" from "no file is known at all" -- both read back
+    /// as `INPUT_NAMES[source] == None` -- so the line has to gate this
+    /// before the source index is trusted, the same way it already gates
+    /// `last_line`.
     pub fn input_filename() -> OwnedValue {
         #[cfg(feature = "std")]
         {
             let source = if super::remaining_inputs::is_active() {
-                super::remaining_inputs::current_location().map(|(source, _)| source)
+                super::remaining_inputs::current_location().and_then(|(source, line)| {
+                    (line != super::remaining_inputs::UNKNOWN_LINE).then_some(source)
+                })
             } else {
                 state::CURRENT_SOURCE.with(std::cell::Cell::get)
             };

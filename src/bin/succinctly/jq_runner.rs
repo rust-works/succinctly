@@ -4113,8 +4113,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             }
         } else {
             for (idx, input) in inputs.iter().enumerate() {
+                // `UNKNOWN_LINE`, not just any missing entry, must clear the
+                // source too (#3202): `input_filename` can't otherwise tell
+                // "this value's file is genuinely stdin" apart from "no
+                // position at all" -- both read back as `INPUT_NAMES[0] ==
+                // None` once `InputLocations::single` has folded a lost
+                // slurp position (`--seq -s`) down to source index `0`
+                // unconditionally (#1542's own invariant, kept for
+                // `input`/`inputs`). Mirrors `remaining_inputs::last_line`'s
+                // own `UNKNOWN_LINE` check for `input_line_number` (#1549).
                 jq::cli_context::set_current_source(
-                    locations.per_value().get(idx).map(|&(source, _)| source),
+                    locations
+                        .per_value()
+                        .get(idx)
+                        .and_then(|&(source, line)| (line != UNKNOWN_LINE).then_some(source)),
                 );
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
