@@ -9172,9 +9172,14 @@ enum OwnedAssignRhs {
 ///   key of the wrong kind for its container -- declines.
 /// - A combine or alternative that fails declines too.
 ///
-/// The write itself goes through [`set_path`] with the component
-/// [`key_to_path_component`] would produce for the key, so there is one
-/// definition of what the write does.
+/// Each step is the component [`key_to_path_component`] would produce for
+/// its key. A single step writes through [`set_field`]/[`set_index`], the
+/// arms [`set_path`] itself dispatches to; a longer path goes through
+/// [`set_path`]. Either way there is one definition of what the write does.
+///
+/// Not only the fold loops reach this: [`eval_owned_reindex_free`] answers
+/// the same shapes for any owned input (`map(.k = 1)` over a constructed
+/// array), on a copy-on-write clone of it.
 fn owned_assign_step<S: EvalSemantics>(
     expr: &Expr,
     state: &mut OwnedValue,

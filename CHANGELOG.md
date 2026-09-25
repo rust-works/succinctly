@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Output is unchanged, and every case the new path does not cover (padding
   or negative indexes, float or `null` keys, multi-output or `.`-reading right
   sides) still takes the evaluator's own route with its own diagnostics.
+  The same assignments on any other owned value (`map(.k = 1)` over a
+  constructed array) skip the re-index too.
   `foreach`/`while` get a constant-factor win only, and yq mode is unchanged;
   see `docs/compliance/jq/limitations.md`.
 

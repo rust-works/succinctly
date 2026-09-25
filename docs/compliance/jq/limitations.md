@@ -6307,7 +6307,11 @@ side, a string key into an object or `null`, and an integer key
 `0 <= k <= len` into an array. Everything else is left to the evaluator
 untouched, so every diagnostic is unchanged: a negative or padding index,
 a float or `null` key, a key of the wrong kind, a combine that fails, a
-multi-output or `.`-reading right side.
+multi-output or `.`-reading right side. The same shapes are answered
+outside a fold too: `eval_owned_reindex_free`, which evaluates any
+expression against an owned input without the reindex bridge, runs
+`owned_assign_step` on a copy-on-write clone of that input, so
+`map(.k = 1)` over a constructed array also skips the re-index.
 
 Measured (Apple M5 Max, release build, `json generate 2mb -p users`, 13,981
 records; interleaved A/B against the merge-base `82e73c6f9`, min of 2-3
